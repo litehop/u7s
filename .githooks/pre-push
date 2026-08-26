@@ -12,7 +12,11 @@ cargo clippy --workspace --tests --quiet --no-deps -- -D warnings
 # fresh sonobuoy --focus PASS (not just unit tests) before a push touching
 # them is allowed through. See that file's header for the registry schema and
 # bd memory `conformance-pr-merge-gate` / `prefer-local-hook-over-ci-runner-
-# for-conformance-gate` for the full rationale.
+# for-conformance-gate` for the full rationale. The gate itself (registry
+# parsing, comment-only-diff fast path, junit-reuse fast path, fresh-run
+# fallback) lives in scripts/sensitive-conformance-gate.sh, factored out so
+# it's independently testable without also running this hook's own `cargo
+# test`/`cargo clippy` prefix -- see that script's header comment.
 #
 # This also prints a non-blocking test-file-change summary for EVERY push
 # (not just sensitive-registry matches) -- workers legitimately edit tests, so
@@ -21,33 +25,8 @@ cargo clippy --workspace --tests --quiet --no-deps -- -D warnings
 # goes unreviewed. See bd memory `surface-test-edits-for-review-not-block`.
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
-REGISTRY="$REPO_ROOT/.githooks/sensitive-conformance-focus.yaml"
 ZERO_OID=0000000000000000000000000000000000000000
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
-
-# Emits one "<file-pattern><TAB><focus-regex>" line per registry entry.
-# Deliberately NOT a general YAML parser -- see the registry's own header
-# comment for why a git hook can't depend on yq/python being installed, and
-# the exact schema (2 meaningful lines per entry: "- file:" then "  focus:")
-# this parser depends on. The "function:" line is intentionally not matched
-# here -- it exists in the registry only as human-readable audit trail.
-parse_registry() {
-  [ -f "$REGISTRY" ] || return 0
-  awk '
-    /^[[:space:]]*-[[:space:]]*file:/ {
-      sub(/^[[:space:]]*-[[:space:]]*file:[[:space:]]*/, "")
-      file = $0
-      next
-    }
-    /^[[:space:]]*focus:/ {
-      sub(/^[[:space:]]*focus:[[:space:]]*/, "")
-      focus = $0
-      gsub(/^"|"$/, "", focus)
-      if (file != "") { print file "\t" focus; file = "" }
-      next
-    }
-  ' "$REGISTRY"
-}
 
 # Prints a prominent, NON-BLOCKING summary of test-file changes in diff range
 # $1. Scope: files under tests/ or matching *_test.rs are reported whole-file;
@@ -134,116 +113,6 @@ print_test_change_summary() {
   echo ""
 }
 
-# Blocking gate: if diff range $1 touches a file pattern in the
-# sensitive-conformance registry, require a FRESH sonobuoy --focus PASS for
-# the matching spec(s) before letting the push through. Runs
-# scripts/conformance/run-all.sh on the VM/port named by
-# U7S_CONFORMANCE_GATE_{VM,PORT,KUBELET_PORT} -- these have NO default. A
-# fallback here would silently reuse a shared/possibly-in-use slot (e.g. the
-# mayor's own lima-node:6443) instead of the pusher's actually-assigned VM,
-# which is exactly the hazard this gate exists to avoid elsewhere. There is
-# no way to auto-detect "the pusher's assigned VM slot" from inside a git
-# hook, so the pusher must set these three explicitly before pushing a
-# sensitive-file change -- see the error message below for the exact form.
-check_sensitive_conformance_gate() {
-  range="$1"
-  changed_tmp=$(mktemp)
-  git diff --name-only "$range" >"$changed_tmp" 2>/dev/null || true
-  if [ ! -s "$changed_tmp" ]; then
-    rm -f "$changed_tmp"
-    return 0
-  fi
-
-  registry_tmp=$(mktemp)
-  parse_registry >"$registry_tmp" 2>/dev/null || true
-  if [ ! -s "$registry_tmp" ]; then
-    rm -f "$changed_tmp" "$registry_tmp"
-    return 0
-  fi
-
-  focus=""
-  matched=""
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    pattern=$(printf '%s' "$line" | cut -f1)
-    entry_focus=$(printf '%s' "$line" | cut -f2)
-    [ -z "$pattern" ] && continue
-    if grep -qF "$pattern" "$changed_tmp"; then
-      matched="$matched $pattern"
-      if [ -z "$focus" ]; then
-        focus="$entry_focus"
-      else
-        focus="$focus|$entry_focus"
-      fi
-    fi
-  done <"$registry_tmp"
-  rm -f "$changed_tmp" "$registry_tmp"
-
-  [ -z "$focus" ] && return 0
-
-  echo ""
-  echo "================================================================"
-  echo "[pre-push] BLOCKING GATE: push touches known-recurring-regression"
-  echo "file(s):$matched"
-  echo "[pre-push] Requires a fresh sonobuoy PASS for focus:"
-  echo "    $focus"
-  echo "================================================================"
-
-  gate_vm="${U7S_CONFORMANCE_GATE_VM:-}"
-  gate_port="${U7S_CONFORMANCE_GATE_PORT:-}"
-  gate_kubelet_port="${U7S_CONFORMANCE_GATE_KUBELET_PORT:-}"
-
-  if [ -z "$gate_vm" ] || [ -z "$gate_port" ] || [ -z "$gate_kubelet_port" ]; then
-    echo "[pre-push] BLOCKED: U7S_CONFORMANCE_GATE_VM/_PORT/_KUBELET_PORT are not" >&2
-    echo "all set in this shell -- refusing to guess (a silent default would risk" >&2
-    echo "reusing a shared/in-use VM slot, e.g. the mayor's own lima-node:6443)." >&2
-    echo "Set them to YOUR assigned VM slot before pushing, e.g.:" >&2
-    echo "  U7S_CONFORMANCE_GATE_VM=lima-node-2 U7S_CONFORMANCE_GATE_PORT=6444 \\" >&2
-    echo "  U7S_CONFORMANCE_GATE_KUBELET_PORT=10251 git push ..." >&2
-    return 1
-  fi
-
-  run_out=$(mktemp)
-  set +e
-  scripts/conformance/run-all.sh \
-    --vm "$gate_vm" --port "$gate_port" --kubelet-port "$gate_kubelet_port" \
-    --focus "$focus" >"$run_out" 2>&1
-  run_rc=$?
-  set -e
-  cat "$run_out"
-
-  if [ "$run_rc" -ne 0 ]; then
-    echo "[pre-push] BLOCKED: run-all.sh exited $run_rc -- see output above." >&2
-    rm -f "$run_out"
-    return 1
-  fi
-
-  run_dir=$(grep -m1 '^Results: ' "$run_out" | awk '{print $2}' | sed 's/\.tar\.gz$//')
-  rm -f "$run_out"
-
-  e2e_txt=""
-  if [ -n "$run_dir" ]; then
-    e2e_txt=$(find "$run_dir" -path '*/logs/e2e.txt' 2>/dev/null | head -1)
-  fi
-
-  if [ -z "$e2e_txt" ] || [ ! -f "$e2e_txt" ]; then
-    echo "[pre-push] BLOCKED: could not locate e2e.txt for the focus run -- cannot confirm PASS." >&2
-    return 1
-  fi
-
-  if ! grep -qE '^Ran [1-9][0-9]* of [0-9]+ Specs' "$e2e_txt"; then
-    echo "[pre-push] BLOCKED: 0 specs matched focus regex -- cannot confirm PASS. See $e2e_txt" >&2
-    return 1
-  fi
-
-  if ! grep -q '^SUCCESS! --' "$e2e_txt"; then
-    echo "[pre-push] BLOCKED: focus run did NOT report SUCCESS -- see $e2e_txt" >&2
-    return 1
-  fi
-
-  echo "[pre-push] Sensitive-conformance gate PASSED ($e2e_txt)."
-}
-
 while read -r local_ref local_oid remote_ref remote_oid; do
   [ "$local_oid" = "$ZERO_OID" ] && continue
 
@@ -259,5 +128,5 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   fi
 
   print_test_change_summary "$range"
-  check_sensitive_conformance_gate "$range"
+  bash "$REPO_ROOT/scripts/sensitive-conformance-gate.sh" "$range" "$REPO_ROOT"
 done

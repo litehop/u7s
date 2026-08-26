@@ -64,3 +64,13 @@ To run the Kubernetes conformance suite against u7s locally:
    ```
 
 **Architecture:** u7s runs on the Mac host for a fast `cargo build` → restart loop. kubelet and sonobuoy run inside the lima VM (Linux, cri-o+crun) for reproducibility. sonobuoy reaches u7s via `host.lima.internal:6443`.
+
+## Comment-only-diff fast path (difftastic)
+
+`.githooks/pre-push`'s sensitive-conformance gate uses [difftastic](https://difftastic.wilfred.me.uk/) (`difft`) to skip the sonobuoy requirement when a push to a sensitive file is a pure comment/whitespace edit. It's a dev-environment tool only — not an install.sh/production dependency:
+
+```sh
+brew install difftastic
+```
+
+Without it, the gate falls back to the full check (never silently skips) — see `scripts/sensitive-conformance-gate.sh`.
