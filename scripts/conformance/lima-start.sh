@@ -256,10 +256,14 @@ fi
 # routes added near the end of this script). Skip the crio restart + IPAM-lease
 # wipe when the subnet is already correct so a plain reconnect never risks
 # recycling an IP a live pod still holds.
-if [ -z "$NODE_SUFFIX" ]; then
-  POD_SUBNET_OCTET=0
-else
+# node_suffix_for() (_lib.sh) now also derives non-numeric suffixes (e.g.
+# lima-node-smoke -> "-smoke") to keep resource names collision-free -- but
+# arithmetic on a non-numeric suffix would abort this script under `set -u`,
+# so treat any non-numeric NODE_SUFFIX the same as the empty (primary) case.
+if [[ "$NODE_SUFFIX" =~ ^-[0-9]+$ ]]; then
   POD_SUBNET_OCTET=$(( ${NODE_SUFFIX#-} - 1 ))
+else
+  POD_SUBNET_OCTET=0
 fi
 POD_SUBNET="10.85.${POD_SUBNET_OCTET}.0/24"
 # `|| true` here is safe: a failure to read the current subnet (e.g. a transient
