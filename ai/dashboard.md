@@ -6,8 +6,7 @@ Stance: pre-alpha/greenfield, no backward compatibility, break freely, merge-on-
 ## Session summary
 
 Deep CNI/Service-LB/manifest-packaging investigation, ending in 3 formalized
-ADRs and a real merged fix. Full detail: `ai/findings/cni-svclb-landscape-2026-08-25.md`
-(gitignored — the exploratory research trail), `docs/decisions/flannel-for-cni.md`,
+ADRs and a real merged fix: `docs/decisions/flannel-for-cni.md`,
 `docs/decisions/well-known-manifest-folder.md`, `docs/decisions/network-policy-engine.md`
 (amended). Also: `ai/extended-context/lima-gvisor-cri-o-pull-defect-postmortem-2026-08-25.md`
 (new Lima dev-tooling defect, dev-only, does not affect production).

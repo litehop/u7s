@@ -17,7 +17,7 @@ Generate `json_to_<type>_proto` / `gen_<type>_to_json` at build time by walking 
 
 ## Rationale
 
-Options weighed (`ai/findings/0xbre-schema-driven-encoder-codegen-design-2026-08-14.md`):
+Options weighed:
 
 - **Runtime reflection** — one generic walker at each call site. Rejected: regresses per-call CPU and destroys profileability on a hot path.
 - **Macro-derive** — `#[derive(JsonProto)]` on prost types. Rejected: prost erases `json_name` and other JSON-specific info before a derive macro could see it, and prost's generated types are downstream — attaching a derive without vendoring prost is awkward.

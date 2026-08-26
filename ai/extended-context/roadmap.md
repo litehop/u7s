@@ -158,14 +158,13 @@ individual ADRs:
   initial scope) — settled, see
   `docs/decisions/systemd-install-contract.md`.
 - Binary distribution/tarball shape (what exactly the release tarball
-  contains and how large it is) — still needs-data, tracked in
-  `ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md` §2.
+  contains and how large it is) — needs-data: one tarball (binary +
+  kubelet/KCM/CoreDNS, pinned, no first-run fetch); kube-proxy excluded
+  (DaemonSet above); size TBD.
 - Multi-node scale-out shape (join token mechanics, CA-trust bootstrap and
-  rotation on a long-lived cluster) — join-token shape is settled but the
-  underlying trust/rotation mechanics are still needs-data, tracked in
-  `ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md` §5
-  and its companion
-  `ai/findings/mayor-xk0pa-ca-trust-bootstrap-and-rotation-2026-08-20.md`.
+  rotation) — join-token settled (shared token, k3s-style); trust/rotation
+  needs-data. Recommended: k0s-style CA-in-token + kubeadm's manual
+  runbook.
 - Distribution hosting (where the install script and release tarball are
   actually served from) — settled, see
   `docs/decisions/distribution-hosting-shape.md`.
