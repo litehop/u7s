@@ -78,7 +78,32 @@ KUBE_PROXY_V=2
 [ "$VERBOSE" -eq 1 ] && KUBE_PROXY_V=5
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
-NETWORK="${_NETWORK_OVERRIDE:-user-v2}"
+
+# For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
+# instead — it skips VM provisioning and just reconnects the kubelet.
+VM_NAME="${U7S_VM_NAME:-lima-node}"
+
+# No --network override: default to this VM's slot in the Phase-B worker-network
+# split instead of the single shared `user-v2` -- the shared `limactl usernet`
+# daemon backing one network intermittently stops
+# answering ARP under concurrent-VM load (confirmed upstream gvisor-tap-vsock
+# defect, not backported), and splitting workers across separate per-network
+# daemons reduces that shared contention. lima-node keeps its own Phase-A
+# isolated network (PR #1194); lima-node-2/3/4 and lima-node-5/-smoke split
+# 3-2 across the two worker networks rather than 1-4, since -2/-3 are the pair
+# most commonly joined via --extra-node for 2-node topologies (dispatch-prompt-
+# template.md) and a 3-way network still covers that pairing. Mirrors the
+# Network column in the dispatch-prompt-template.md doc's Lima VM protocol
+# table -- keep both in sync. Any VM name outside this known set (a one-off
+# scratch VM) falls back to the original flat "user-v2" default.
+case "$VM_NAME" in
+  lima-node) _DEFAULT_NETWORK="user-v2-mayor" ;;
+  lima-node-2|lima-node-3|lima-node-4) _DEFAULT_NETWORK="user-v2-workers-a" ;;
+  lima-node-5|lima-node-smoke) _DEFAULT_NETWORK="user-v2-workers-b" ;;
+  *) _DEFAULT_NETWORK="user-v2" ;;
+esac
+NETWORK="${_NETWORK_OVERRIDE:-$_DEFAULT_NETWORK}"
+
 # Suffixes the per-node resource names below (konnectivity-agent Pod/Secret, kubelet
 # serving cert) so a 2nd node can join the same cluster without colliding with — or,
 # for the Pod's immutable spec.nodeName, 403'ing against — node 1's.
@@ -91,10 +116,6 @@ else
 fi
 # Agent port: server_port-3 (matches the layout 8135/8132 and slot offsets 8235/8232, etc.)
 KONNECTIVITY_AGENT_PORT=$(( KONNECTIVITY_SERVER_PORT - 3 ))
-
-# For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
-# instead — it skips VM provisioning and just reconnects the kubelet.
-VM_NAME="${U7S_VM_NAME:-lima-node}"
 
 # When a non-default kubelet port is requested, write a patched yaml with the
 # correct hostPort into the worktree temp dir so each worker VM uses its own
@@ -377,10 +398,14 @@ limactl shell "$VM_NAME" sudo systemctl restart logrotate.timer
 # LAST 1h54m of an 11h run (measured directly off that node's timestamps,
 # 20:08-22:02) under 16-way load — losing the 09:33-09:35 DiskPressure incident
 # entirely. 6G buys a fresh run roughly 5-6x that headroom at the same growth
-# rate; going further eats into the 20GiB VM disk conformance tests themselves
-# need (~14G free observed with only base images pulled — DiskPressure
-# investigations already show that margin gets tight mid-run), so 6G is a
-# deliberate compromise, not full 11h coverage.
+# rate; going further eats into the VM disk conformance tests themselves need.
+# That margin was the original constraint: at the 20GiB disk ceiling this
+# drop-in was written against, only ~14G was free with base images pulled —
+# tight enough that it's part of what tripped the DiskPressure storm above.
+# The disk ceiling (lima/kubelet.yaml) has since doubled to 40GiB specifically
+# to fix that trigger (~33G free now observed with only base images pulled),
+# so 6G stays a deliberate compromise against overall journal disk usage, not
+# one forced by a tight VM-disk margin anymore.
 limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/journald.conf.d && cat > /etc/systemd/journald.conf.d/conformance.conf' <<'EOF'
 [Journal]
 RateLimitBurst=100000

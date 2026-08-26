@@ -6,7 +6,8 @@
 #   02-start-apiserver.sh  — start apiserver (or reuse running instance)
 #   lima-start.sh          — provision lima VM and join kubelet
 #   04-start-kcm.sh        — start kube-controller-manager inside lima VM
-#   05-start-scheduler.sh  — start u7s-scheduler on the host
+#   05-start-scheduler.sh  — start u7s-scheduler on the host (skipped if
+#                            --embedded-scheduler true, see below)
 #   06-run-sonobuoy.sh     — run sonobuoy and print results
 #
 # Usage:
@@ -15,6 +16,15 @@
 #                                  [--binary <path>] [--port <N>] [--workdir <path>]
 #                                  [--konnectivity-server-port <N>] [--procs <N>]
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
+#                                  [--embedded-scheduler <true|false>]
+#
+#   --embedded-scheduler  Passthrough to u7s-apiserver's own --embedded-scheduler flag:
+#                run u7s-scheduler as a supervised task inside the
+#                apiserver process instead of the standalone binary Step 5 otherwise
+#                starts. Given `true`, Step 5 is skipped entirely (starting the
+#                standalone binary too would double-schedule every pod). Omit to keep
+#                today's default: standalone scheduler via Step 5, apiserver's own
+#                --embedded-scheduler left at its own default (false).
 #
 #   --reset      Run reset.sh before building — kills host processes, deletes the
 #                lima-node VM (and the --extra-node VM too, if one is given on
@@ -88,8 +98,11 @@
 #             same VM. Allows multiple workers to run in parallel against their
 #             own isolated VMs. Also settable via U7S_VM_NAME env var.
 #   --network Lima network to provision the VM's `networks:` stanza with (default:
-#             unset -- lima-start.sh itself falls back to user-v2). Forwarded
-#             verbatim to lima-start.sh (Step 3) and, if --extra-node is also
+#             unset -- lima-start.sh itself falls back to a per-VM-name default,
+#             e.g. lima-node-2/3/4 -> user-v2-workers-a, splitting worker VMs
+#             across separate networks to reduce shared-usernet-daemon load; see
+#             lima-start.sh's own VM_NAME case statement for the full mapping).
+#             Forwarded verbatim to lima-start.sh (Step 3) and, if --extra-node is also
 #             given, to that node's add-node.sh/lima-start.sh too, so both nodes
 #             of a 2-node stack land on the same isolated network instead of a
 #             primary on its own network and a peer silently defaulting back to
@@ -191,6 +204,7 @@ PROFILE=0
 DHAT_DEPTH=""
 SAMPLE_INTERVAL=""
 PROCS=""
+EMBEDDED_SCHEDULER=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -216,6 +230,7 @@ while [[ $# -gt 0 ]]; do
     --dhat-depth) DHAT_DEPTH="$2"; shift 2 ;;
     --sample-interval) SAMPLE_INTERVAL="$2"; shift 2 ;;
     --procs) PROCS="$2"; shift 2 ;;
+    --embedded-scheduler) EMBEDDED_SCHEDULER="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -352,6 +367,8 @@ _SAMPLE_INTERVAL_ARG=""
 [ -n "$SAMPLE_INTERVAL" ] && _SAMPLE_INTERVAL_ARG="--interval $SAMPLE_INTERVAL"
 _PROCS_ARG=""
 [ -n "$PROCS" ] && _PROCS_ARG="--procs $PROCS"
+_EMBEDDED_SCHEDULER_ARG=""
+[ -n "$EMBEDDED_SCHEDULER" ] && _EMBEDDED_SCHEDULER_ARG="--embedded-scheduler $EMBEDDED_SCHEDULER"
 
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
@@ -390,11 +407,11 @@ if [ "$PROFILE" -eq 1 ] && [ -n "$DHAT_DEPTH" ]; then
   # here at all -- main.rs's own default of 10 applies.
   # shellcheck source=02-start-apiserver.sh
   # shellcheck disable=SC2086
-  U7S_DHAT_BACKTRACE_DEPTH="$DHAT_DEPTH" source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG}
+  U7S_DHAT_BACKTRACE_DEPTH="$DHAT_DEPTH" source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG}
 else
   # shellcheck source=02-start-apiserver.sh
   # shellcheck disable=SC2086
-  source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG}
+  source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG}
 fi
 
 # KUBECONFIG is now set (either from the running instance or newly started).
@@ -425,10 +442,16 @@ banner "Step 4/6: Start kube-controller-manager"
 # shellcheck disable=SC2086
 bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG}
 
-# Step 05: Start scheduler inside VM.
-banner "Step 5/6: Start u7s-scheduler"
-# shellcheck disable=SC2086
-bash "$DIR/05-start-scheduler.sh" ${_WORKDIR_ARG}
+# Step 05: Start the standalone u7s-scheduler binary — skipped when --embedded-scheduler
+# true already made the apiserver itself schedule: starting both would
+# double-schedule every pod, and defeats the whole point of the flag (one process, not two).
+if [ "$EMBEDDED_SCHEDULER" = "true" ]; then
+  banner "Step 5/6: Start u7s-scheduler (skipped — --embedded-scheduler true)"
+else
+  banner "Step 5/6: Start u7s-scheduler"
+  # shellcheck disable=SC2086
+  bash "$DIR/05-start-scheduler.sh" ${_WORKDIR_ARG}
+fi
 
 # Extra node: join a 2nd VM to the same cluster (opt-in). Runs after KCM/scheduler
 # are up (those must run exactly once) and before sonobuoy so the target tests see

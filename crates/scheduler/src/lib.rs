@@ -10,6 +10,12 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info};
 use u7s_kubeconfig::HyperApiClient;
 
+mod run;
+/// The scheduler's watch/schedule loop as a callable library function — see
+/// `run.rs` for why (`u7s-apiserver`'s `--embedded-scheduler` task calls this
+/// directly).
+pub use run::run_scheduler;
+
 // ---------------------------------------------------------------------------
 // HTTP helpers — delegates to HyperApiClient in kubeconfig.
 // ---------------------------------------------------------------------------
@@ -168,6 +174,15 @@ struct PodSpec {
     /// The pod's `spec.topologySpreadConstraints` — see `TopologySpreadConstraint`.
     #[serde(default)]
     topology_spread_constraints: Vec<TopologySpreadConstraint>,
+    /// The pod's `spec.overhead` — cpu/memory/ephemeral-storage (plus any
+    /// extended resource) that the apiserver's RuntimeClass admission plugin
+    /// copies in from `RuntimeClass.overhead.podFixed` when the pod names a
+    /// sandboxed runtime (e.g. gVisor/Kata). Added on top of
+    /// `sum_container_requests` by `pod_total_requests` — without it, a
+    /// sandboxed pod's true footprint is undercounted and its node can be
+    /// over-subscribed.
+    #[serde(default)]
+    overhead: std::collections::HashMap<String, String>,
 }
 
 /// One `spec.volumes[]` entry — only the two sources that reference a PVC
@@ -611,6 +626,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         .namespace
         .unwrap_or_else(|| "default".to_owned());
     let labels = watch_event.object.metadata.labels;
+    let requests = pod_total_requests(&watch_event.object.spec);
     let node_selector = watch_event.object.spec.node_selector.unwrap_or_default();
     let priority = watch_event.object.spec.priority.unwrap_or(0);
     let tolerations = watch_event.object.spec.tolerations.unwrap_or_default();
@@ -632,7 +648,6 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         })
         .unwrap_or_default();
     let node_affinity = affinity.and_then(|a| a.node_affinity);
-    let requests = sum_container_requests(&watch_event.object.spec.containers);
     let host_ports = container_host_ports(&watch_event.object.spec.containers);
     let pvc_names = referenced_pvc_names(
         pod_name,
@@ -1138,6 +1153,20 @@ fn parse_quantity_milli(s: &str) -> i64 {
     s.parse::<i64>().map(|n| n * 1000).unwrap_or(0)
 }
 
+/// Add one `(resourceName, quantityString)` pair into `total` — shared by
+/// `sum_container_requests` (container `resources.requests`) and
+/// `pod_total_requests` (pod `spec.overhead`): cpu/memory/ephemeral-storage
+/// get dedicated fields, everything else falls into `extended`.
+fn accumulate_request(total: &mut ResourceRequests, name: &str, quantity: &str) {
+    let milli = parse_quantity_milli(quantity);
+    match name {
+        "cpu" => total.cpu_milli += milli,
+        "memory" => total.memory_milli += milli,
+        "ephemeral-storage" => total.ephemeral_storage_milli += milli,
+        _ => *total.extended.entry(name.to_owned()).or_insert(0) += milli,
+    }
+}
+
 /// Sum `resources.requests.{cpu,memory,ephemeral-storage}` plus every other
 /// (extended) resource key across a pod's containers. Init containers are not
 /// accounted for — this MVP sums the steady-state (regular) containers only,
@@ -1147,14 +1176,24 @@ fn sum_container_requests(containers: &[ContainerSpec]) -> ResourceRequests {
     let mut total = ResourceRequests::default();
     for c in containers {
         for (name, quantity) in &c.resources.requests {
-            let milli = parse_quantity_milli(quantity);
-            match name.as_str() {
-                "cpu" => total.cpu_milli += milli,
-                "memory" => total.memory_milli += milli,
-                "ephemeral-storage" => total.ephemeral_storage_milli += milli,
-                _ => *total.extended.entry(name.clone()).or_insert(0) += milli,
-            }
+            accumulate_request(&mut total, name, quantity);
         }
+    }
+    total
+}
+
+/// A pod's total resource footprint for the NodeResourcesFit predicate:
+/// `sum_container_requests` plus `spec.overhead`. Mirrors upstream's
+/// `noderesources.computePodResourceRequest`, which adds `pod.Spec.Overhead`
+/// on top of the container sum rather than folding it into any one
+/// container — `spec.overhead` is the RuntimeClass admission plugin's
+/// per-pod sandboxing tax (e.g. gVisor/Kata), not a per-container cost.
+/// Without this, a sandboxed pod's true footprint is undercounted and its
+/// node can be over-subscribed.
+fn pod_total_requests(spec: &PodSpec) -> ResourceRequests {
+    let mut total = sum_container_requests(&spec.containers);
+    for (name, quantity) in &spec.overhead {
+        accumulate_request(&mut total, name, quantity);
     }
     total
 }
@@ -1378,7 +1417,7 @@ impl NodeTally {
             "Succeeded" | "Failed"
         );
         let priority = watch_event.object.spec.priority.unwrap_or(0);
-        let requests = sum_container_requests(&watch_event.object.spec.containers);
+        let requests = pod_total_requests(&watch_event.object.spec);
         let host_ports = container_host_ports(&watch_event.object.spec.containers);
         let node_name = watch_event.object.spec.node_name.filter(|n| !n.is_empty());
         match node_name {
@@ -8543,6 +8582,42 @@ mod tests {
         assert!(
             resource_fits(&allocatable, &used, &pending),
             "an unknown (empty) allocatable dimension must not block scheduling"
+        );
+    }
+
+    /// A pod's `spec.overhead` (set by the apiserver's RuntimeClass admission
+    /// plugin from `RuntimeClass.overhead.podFixed`, e.g. gVisor/Kata sandbox
+    /// tax) must be added on top of its container requests: the container sum
+    /// alone (900m cpu) fits a 1-core node, but the true footprint including
+    /// the 200m overhead (1100m) does not. Before this fix `needs_scheduling`
+    /// dropped `spec.overhead` entirely, so this pod would be bound to a node
+    /// it actually over-subscribes.
+    #[test]
+    fn resource_fits_false_when_runtime_class_overhead_pushes_pod_over_capacity() {
+        let allocatable = node_allocatable("1", "", "");
+        let used = requests(0, 0, 0);
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "sandboxed-pod", "namespace": "default" },
+                "spec": {
+                    "containers": [
+                        { "resources": { "requests": { "cpu": "900m" } } }
+                    ],
+                    "overhead": { "cpu": "200m" }
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("unscheduled pod must be schedulable");
+        assert_eq!(
+            pending.requests.cpu_milli, 1100,
+            "spec.overhead must be added on top of the container request sum"
+        );
+        assert!(
+            !resource_fits(&allocatable, &used, &pending.requests),
+            "a pod whose container requests alone fit, but whose RuntimeClass \
+             overhead pushes it past allocatable cpu, must be rejected — \
+             otherwise the scheduler over-subscribes the node"
         );
     }
 

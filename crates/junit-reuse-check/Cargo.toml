@@ -1,0 +1,16 @@
+[package]
+name    = "u7s-junit-reuse-check"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "u7s_junit_reuse_check"
+path = "src/lib.rs"
+
+[[bin]]
+name = "u7s-junit-reuse-check"
+path = "src/main.rs"
+
+[dependencies]

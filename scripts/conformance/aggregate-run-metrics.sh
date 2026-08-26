@@ -114,6 +114,12 @@ rss_peak_for() {
 # multi-word process names (kube-controller-manager, kube-network-policies)
 # are matched by prefix, not exact equality -- an exact match would silently
 # report "not observed" for every real run, the opposite of the bead's intent.
+#
+# The "u7s-scheduler" category below reads "not observed" for any run started with
+# --embedded-scheduler true: scheduling then runs as a task inside
+# u7s-apiserver rather than its own process, so its RSS is folded into the
+# "u7s-apiserver" row instead of a separate "u7s-scheduler" one -- that is the
+# expected, memory-saving outcome this flag exists for, not a missing sample.
 peak_rss_section() {
   echo "## Peak RSS per component"
   echo ""

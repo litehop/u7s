@@ -11,8 +11,15 @@
 #
 #   rss.csv       ts,scope,pid,comm,rss_kb,footprint_kb,cpu_seconds_cumulative
 #                 One row per sampled process per tick. scope is "host" for
-#                 the three host processes (apiserver, scheduler,
-#                 konnectivity-server) or a VM name for the --top-n busiest
+#                 the host processes (apiserver, konnectivity-server, plus a
+#                 separate "scheduler" row IF u7s-scheduler is running as its
+#                 own standalone process -- run-all.sh's default pipeline
+#                 still does this via 05-start-scheduler.sh, but
+#                 --embedded-scheduler true folds scheduling into the
+#                 apiserver's own RSS instead; in that mode
+#                 resolve_scheduler_pid() below simply finds no PID and the
+#                 "scheduler" row has 0 samples for the whole run, which is
+#                 correct, not a sampler bug) or a VM name for the --top-n busiest
 #                 processes inside that VM (kubelet, crio, kube-proxy,
 #                 kube-controller-manager, ...). footprint_kb is macOS-only
 #                 (from `footprint -p <pid>`, which needs no VM/host
@@ -158,6 +165,10 @@ resolve_apiserver_pid() {
 }
 
 resolve_scheduler_pid() {
+  # Finds nothing (harmlessly -- sample_one_host_process already skips an empty pid) when
+  # u7s-scheduler is running embedded in the apiserver (--embedded-scheduler true)
+  # rather than as its own process; that's a real "no separate PID exists"
+  # answer, not a resolver bug.
   pgrep -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null | head -1 || true
 }
 

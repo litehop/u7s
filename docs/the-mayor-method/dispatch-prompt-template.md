@@ -634,6 +634,15 @@ recorded network and now fails loud on a mismatch instead of silently
 programming a route with no L2 path behind it. Pick two slots from the same
 column above (e.g. `lima-node-2` + `lima-node-3`, both `user-v2-workers-a`).
 
+The Network column is now `lima-start.sh`'s own DEFAULT for each of these VM
+names (mayor-o61zz activation) — a bare `run-all.sh --vm <name>` with no
+`--network` flag lands on the value shown above; you only need `--network`
+explicitly for a VM name outside this table. A VM still recorded on the old
+shared `user-v2` (check `grep -A1 '^networks:' ~/.lima/<vm-name>/lima.yaml`)
+needs `limactl delete <vm-name>` (or `run-all.sh --reset`) to reprovision onto
+its new default — `lima-start.sh`'s staleness check fails loud rather than
+silently reusing it on the wrong network.
+
 **Before assigning a slot, verify the LIVE port, not just this table**: run
 `grep -A1 guestPort ~/.lima/<vm-name>/lima.yaml` for the VM you're about to assign —
 this table records intent, but a VM's actual port can drift from it (see the

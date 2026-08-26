@@ -3749,12 +3749,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "u7s-proto-generated",
+ "u7s-scheduler",
  "u7s-sentinel",
  "u7s-store",
  "uuid",
  "x509-cert",
  "yaml-rust2",
 ]
+
+[[package]]
+name = "u7s-junit-reuse-check"
+version = "0.1.0"
 
 [[package]]
 name = "u7s-kubeconfig"
