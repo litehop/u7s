@@ -182,6 +182,47 @@ jobs:
             | tar -xz -C ~/bin sonobuoy
           chmod +x ~/bin/sonobuoy
 
+      - name: Install skopeo
+        run: sudo apt-get install -y skopeo
+
+      - name: Restore conformance image cache
+        id: cache-conformance-image
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/conformance-image-${{ matrix.k8s }}.tar
+          key: conformance-image-${{ matrix.k8s }}-${{ runner.arch }}
+
+      - name: Pull conformance image to archive
+        # A failed pull must never populate the cache below -- per the
+        # postmortem, caching a failed/partial pull would make the
+        # registry.k8s.io CDN-staleness failure deterministic forever
+        # instead of self-healing on the next run (same reasoning as the
+        # release-bin-cache split above).
+        if: steps.cache-conformance-image.outputs.cache-hit != 'true'
+        run: |
+          skopeo copy \
+            "docker://registry.k8s.io/conformance:v${{ matrix.k8s }}" \
+            "docker-archive:/tmp/conformance-image-${{ matrix.k8s }}.tar:registry.k8s.io/conformance:v${{ matrix.k8s }}"
+
+      - name: Save conformance image cache
+        if: steps.cache-conformance-image.outputs.cache-hit != 'true' && success()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/conformance-image-${{ matrix.k8s }}.tar
+          key: conformance-image-${{ matrix.k8s }}-${{ runner.arch }}
+
+      - name: Load conformance image into cri-o storage
+        # Writes straight into the containers/storage graph cri-o's image
+        # service reads from (same mechanism as `podman load`), so the
+        # sonobuoy e2e-job pod's image pull is answered from local storage
+        # and cri-o never touches registry.k8s.io for it -- this is what
+        # actually avoids the CDN-staleness pulls, not just the archive
+        # cache above.
+        run: |
+          sudo skopeo copy \
+            "docker-archive:/tmp/conformance-image-${{ matrix.k8s }}.tar" \
+            "containers-storage:registry.k8s.io/conformance:v${{ matrix.k8s }}"
+
       - name: Start apiserver
         env:
           RUST_LOG: info
@@ -596,7 +637,28 @@ jobs:
             --wait \
             --skip-preflight=existingnamespace \
             --kubeconfig "$KUBECONFIG" \
-            --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones|Kubectl logs logs should be able to retrieve and filter logs|Job should adopt matching orphans and release non-matching pods|ConfigMap should be consumable in multiple volumes in the same pod"
+            --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones|Kubectl logs logs should be able to retrieve and filter logs|Job should adopt matching orphans and release non-matching pods|ConfigMap should be consumable in multiple volumes in the same pod" &
+          SONOBUOY_PID=$!
+
+          # Watchdog: an image-pull failure otherwise burns the full
+          # 5-minute step timeout above before failing, and the real
+          # registry error only ever surfaces via `kubectl describe pod`
+          # (see the postmortem) -- poll for it and fail immediately with
+          # that error instead of waiting the timeout out.
+          while kill -0 "$SONOBUOY_PID" 2>/dev/null; do
+            REASON=$(kubectl get pods -n sonobuoy -l sonobuoy-component=plugin \
+              -o jsonpath='{.items[0].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || true)
+            case "$REASON" in
+              *ImagePullBackOff*|*ErrImagePull*)
+                echo "ERROR: conformance image pull failed (reason: $REASON)" >&2
+                kubectl describe pods -n sonobuoy -l sonobuoy-component=plugin >&2 || true
+                kill "$SONOBUOY_PID" 2>/dev/null || true
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+          wait "$SONOBUOY_PID"
 
       - name: Diagnose sonobuoy on failure
         # cancelled() too: interrupting a hung run mid-debug (gh run cancel)
