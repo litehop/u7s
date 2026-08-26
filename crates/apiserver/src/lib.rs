@@ -386,6 +386,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
     state.proxy_client_identity_pem = Some(Arc::new(proxy_client_identity_pem));
     state.node_kubelet_ports = parse_node_kubelet_ports(&args.node_kubelet_port)?;
+    // Not ready until the boot-time manifest-apply task (12a below) resolves successfully —
+    // see the field's own doc. Overwrites new_with_config's ready-by-default value.
+    state.boot_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Resolve the SA-JWT signature-verify cache capacity: --sa-sig-cache-size, then
     // U7S_SA_SIG_CACHE_SIZE, then the default. Overwrites the AppStateConfig-default cache
     // AppState::new_with_config already built — see sa_sig_cache field's doc for why this
@@ -579,15 +582,19 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // operator-supplied manifest, no bespoke code path. A bad manifest here is fatal — an
     // operator who dropped a broken manifest needs the apiserver to refuse to start, not run
     // half-configured — so its result is threaded back via well_known_manifest_rx and raced
-    // against serve_tls below instead of being discarded.
+    // against serve_tls below instead of being discarded. On success it also flips
+    // `state.boot_ready` so `/healthz` starts reporting 200 (see the field's doc) — on failure
+    // it stays `false` forever, since the `tokio::select!` below tears the process down anyway.
     let (well_known_manifest_tx, well_known_manifest_rx) = tokio::sync::oneshot::channel();
     let well_known_manifest_dir = args.manifest_dir.clone();
+    let boot_ready = Arc::clone(&state.boot_ready);
     tokio::spawn(async move {
         let result = bootstrap_apply::apply_well_known_manifest_dir(
             &bootstrap_installer_kubeconfig_path,
             std::path::Path::new(&well_known_manifest_dir),
         )
         .await;
+        record_manifest_apply_outcome(&boot_ready, &result);
         let _ = well_known_manifest_tx.send(result);
     });
 
@@ -604,11 +611,50 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Flips `boot_ready` to ready only when the boot-time manifest apply actually succeeded.
+/// Pulled out of the `tokio::spawn`ed task above so the "only success marks ready" rule is
+/// testable without spinning up a real boot sequence — see `record_manifest_apply_outcome_*`
+/// tests below.
+fn record_manifest_apply_outcome(
+    boot_ready: &std::sync::atomic::AtomicBool,
+    result: &anyhow::Result<()>,
+) {
+    if result.is_ok() {
+        boot_ready.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Reports the apiserver's own listener as up, but only once the boot-time bootstrap manifest
+/// apply (`state.boot_ready`, see its doc) has resolved successfully. Before that, requests
+/// return 503 rather than 200 — the previous behavior of always answering "ok" here is exactly
+/// what forced `scripts/install.sh`'s `wait_for_apiserver` to bolt on a fixed sleep-and-recheck
+/// to guess whether the manifest apply had finished; gating the response itself instead makes
+/// the first 200 a deterministic "boot is fully done" signal, so that heuristic is no longer
+/// needed.
+async fn healthz(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    if state.boot_ready.load(std::sync::atomic::Ordering::Acquire) {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "boot-time manifest apply in progress",
+        )
+            .into_response()
+    }
+}
+
 fn build_router(state: AppState) -> Router {
     Router::new()
         // Health endpoints — no auth required; kube-controller-manager polls these
         // before declaring the apiserver ready. Listed in is_exempt() in auth.rs.
-        .route("/healthz", get(|| async { "ok" }))
+        // /healthz alone gates on boot_ready (see healthz's doc) — /livez and /readyz stay
+        // unconditional "ok" so a slow boot-time manifest apply can't trip a liveness-probe
+        // restart loop.
+        .route("/healthz", get(healthz))
         .route("/livez", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ok" }))
         // Prometheus text-exposition metrics — RBAC-gated like every other route (NOT listed
@@ -7623,6 +7669,93 @@ mod tests {
                 .expect("body collect must not fail");
             assert_eq!(body.as_ref(), b"ok", "{path} body must be 'ok'");
         }
+    }
+
+    /// `/healthz` must distinguish "boot-time manifest apply still running" from "boot
+    /// complete" (mayor-ajgaj) — unlike `/livez`/`/readyz`, which stay unconditional "ok".
+    /// Before this gate, `/healthz` answered 200 the instant the listener came up, racing the
+    /// boot-time `apply_well_known_manifest_dir` task; `scripts/install.sh`'s
+    /// `wait_for_apiserver` could only paper over that with a fixed sleep-and-recheck. If this
+    /// regresses to an unconditional "ok" handler, a since-crashed apiserver (manifest apply
+    /// failed) would again look healthy to install.sh for however long the race window is.
+    #[tokio::test]
+    async fn healthz_reflects_boot_ready_state() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state
+            .boot_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut router = build_router(state.clone());
+
+        let req = Request::builder()
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
+            .expect("request build must not fail");
+        let resp = router.call(req).await.expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/healthz must not report 200 while the boot-time manifest apply is still running \
+             — install.sh's wait loop needs this to distinguish a booting apiserver from one \
+             that already crashed applying a bad manifest"
+        );
+
+        // Simulate the manifest-apply task's own success signal (record_manifest_apply_outcome).
+        state
+            .boot_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        let req = Request::builder()
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
+            .expect("request build must not fail");
+        let resp = router.call(req).await.expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/healthz must report 200 once boot is actually complete"
+        );
+        let body = to_bytes(resp.into_body(), 64)
+            .await
+            .expect("body collect must not fail");
+        assert_eq!(
+            body.as_ref(),
+            b"ok",
+            "/healthz body must be 'ok' once ready"
+        );
+    }
+
+    /// `record_manifest_apply_outcome` is the only place that flips `boot_ready` to true, so a
+    /// failed boot-time manifest apply must never mark the apiserver ready — that's what makes
+    /// `/healthz` a deterministic "boot complete" signal instead of the old always-200 handler.
+    /// Extracted to a pure function (Rule 14) since the real call site is inside a spawned task
+    /// racing `serve_tls` and isn't independently testable there.
+    #[test]
+    fn record_manifest_apply_outcome_never_marks_ready_on_failure() {
+        let boot_ready = std::sync::atomic::AtomicBool::new(false);
+        record_manifest_apply_outcome(&boot_ready, &Err(anyhow::anyhow!("bad manifest")));
+        assert!(
+            !boot_ready.load(std::sync::atomic::Ordering::Acquire),
+            "a failed manifest apply must not mark boot ready — otherwise /healthz would \
+             report 200 for an apiserver that's about to be torn down by the fatal \
+             tokio::select! path in run(), exactly the race this fix closes"
+        );
+
+        record_manifest_apply_outcome(&boot_ready, &Ok(()));
+        assert!(
+            boot_ready.load(std::sync::atomic::Ordering::Acquire),
+            "a successful manifest apply must mark boot ready, or /healthz would never leave \
+             503 and every real deployment would time out in wait_for_apiserver"
+        );
     }
 
     /// The body size limit must be at least 1 MiB (to accommodate real kubectl
