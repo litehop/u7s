@@ -4,9 +4,10 @@
 //! `run()` spawns [`apply_yaml_bundle`] once its own listen socket is bound, authenticating
 //! as the `system:bootstrap-installer` x509 identity (see `tls.rs` / `mayor-1pwxi`) to
 //! Server-Side-Apply a fixed manifest bundle against itself, then does the same for every file
-//! in [`WELL_KNOWN_MANIFEST_DIR`] via [`apply_well_known_manifest_dir`]. This is deliberately
-//! not a generic "apply any manifest" API: it understands only the small, fixed set of Kinds a
-//! kubeadm-style addon bundle uses (see [`kind_to_resource`]).
+//! in the well-known manifest directory (`--manifest-dir`, defaulting to `/etc/u7s/manifests`)
+//! via [`apply_well_known_manifest_dir`]. This is deliberately not a generic "apply any
+//! manifest" API: it understands only the small, fixed set of Kinds a kubeadm-style addon
+//! bundle uses (see [`kind_to_resource`]).
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -22,12 +23,6 @@ const FIELD_MANAGER: &str = "bootstrap-installer";
 /// ConfigMap, Deployment, Service) `run()`'s post-bind hook applies via [`apply_yaml_bundle`].
 /// See `manifests/coredns.yaml` for provenance and the departures from upstream.
 pub const COREDNS_MANIFEST: &[u8] = include_bytes!("../manifests/coredns.yaml");
-
-/// Well-known folder for operator-supplied vendored manifests, scanned and applied at boot
-/// after [`COREDNS_MANIFEST`] so an operator-supplied override here wins — matches kubelet's
-/// own `/etc/kubernetes/manifests/` static-pod convention. See
-/// `docs/decisions/well-known-manifest-folder.md`.
-pub const WELL_KNOWN_MANIFEST_DIR: &str = "/etc/u7s/manifests";
 
 /// Total time budget for retrying transient errors on a single document. The only realistic
 /// cause of a transient error here is this apiserver's own listener having just bound but not
@@ -781,6 +776,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: dir.join("manifests").to_string_lossy().into_owned(),
         };
 
         let tls = crate::tls::generate_tls(&args).expect("generate_tls must succeed");

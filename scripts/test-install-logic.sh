@@ -229,7 +229,7 @@ assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cl
 
 # ---------------------------------------------------------------------------
 # Tarball sourcing: --tarball (local path) / --tarball-url / the URL baked in
-# at release time. A script piped into `sh` cannot discover the URL it came
+# at release time. A script piped into `bash` cannot discover the URL it came
 # from, so the published copy carries it as a literal that
 # .github/workflows/release-tarball.yaml substitutes in -- these assertions
 # pin the two halves of that contract together.
@@ -237,7 +237,7 @@ assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cl
 
 # The single most damaging way this can regress: someone commits a real URL
 # here. Every git checkout would then silently fetch and install THAT
-# release's binaries instead of failing loud, and `curl | sh` users of a
+# release's binaries instead of failing loud, and `curl | bash` users of a
 # later release would get a script pinned to an older one. This literal is
 # also the exact anchor the release workflow's sed matches on, so renaming
 # the variable breaks publishing -- caught here at commit time rather than
