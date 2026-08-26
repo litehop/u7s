@@ -45,11 +45,8 @@ same CI and review gate — there is no separate human fast path today.
 
 ## Licensing
 
-This repository has no LICENSE file yet — the choice of license is a
-pending operator decision (tracked in `mayor-sm91b.1`), not an engineering
-one. Contribution licensing terms (and any signoff requirement) will be
-finalized once that decision lands. This does not block accepting
-well-scoped contributions in the meantime.
+u7s is licensed under [Apache License 2.0](LICENSE). By contributing, you
+agree that your contributions will be licensed under the same terms.
 
 ## Questions
 
