@@ -71,7 +71,7 @@ provision:
       #!/bin/bash
       set -euo pipefail
 
-      # First-boot race (mayor-44z9j): cloud-init always waits for network
+      # First-boot race: cloud-init always waits for network
       # here because Lima's generated cloud-config includes a `mounts:` key
       # (cloud-init treats ANY mounts as potentially network-based). That
       # wait invokes systemd-networkd-wait-online, which can lose a race
