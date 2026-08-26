@@ -637,10 +637,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             tracing::info!(
                 "SIGHUP received; re-applying well-known manifest directory {reload_manifest_dir}"
             );
-            bootstrap_apply::reload_well_known_manifest_dir(
-                &reload_kubeconfig_path,
-                std::path::Path::new(&reload_manifest_dir),
-            )
+            let kubeconfig_path = reload_kubeconfig_path.clone();
+            let manifest_dir = reload_manifest_dir.clone();
+            run_supervised_reload(async move {
+                bootstrap_apply::reload_well_known_manifest_dir(
+                    &kubeconfig_path,
+                    std::path::Path::new(&manifest_dir),
+                )
+                .await;
+            })
             .await;
         }
     });
@@ -656,6 +661,26 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Runs one SIGHUP-triggered reload attempt on a fresh `tokio::spawn`ed task so a panic inside
+/// `reload` (a bug in a future change to `reload_well_known_manifest_dir`'s internals, or an
+/// unexpected I/O panic) is caught by that task's own unwind boundary instead of unwinding the
+/// long-lived SIGHUP-listening loop above. Without this, one panicking reload would silently and
+/// permanently kill every future `systemctl reload u7s-apiserver` for the rest of the process's
+/// life — `ExecReload=/bin/kill -HUP $MAINPID` always reports success to systemd regardless, so
+/// nothing else would ever surface the loss. Pulled out to a pure function (Rule 14) since the
+/// real call site is inside a `tokio::spawn`ed task racing `serve_tls` and isn't independently
+/// testable there — see `run_supervised_reload_survives_a_panicking_reload` below.
+async fn run_supervised_reload<F>(reload: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(e) = tokio::spawn(reload).await {
+        tracing::error!(
+            "SIGHUP reload: reload task panicked ({e}); the next SIGHUP will still be handled"
+        );
+    }
 }
 
 /// Flips `boot_ready` to ready only when the boot-time manifest apply actually succeeded.
@@ -7778,6 +7803,34 @@ mod tests {
             body.as_ref(),
             b"ok",
             "/healthz body must be 'ok' once ready"
+        );
+    }
+
+    /// A panic partway through one SIGHUP-triggered reload (e.g. a future bug in
+    /// `reload_well_known_manifest_dir`'s internals) must not take the long-lived
+    /// SIGHUP-listening loop in `run()` down with it — otherwise `systemctl reload
+    /// u7s-apiserver` keeps reporting success forever (per `ExecReload`'s `kill -HUP` semantics)
+    /// while every reload after the first panicking one silently does nothing, with no signal to
+    /// the operator (critical-reviewer finding on PR #1398, mayor-bh36n). Proven here by driving
+    /// `run_supervised_reload` directly with a panicking future — a real panic can't be forced
+    /// out of `reload_well_known_manifest_dir` itself, which never panics by design — and then
+    /// asserting the *next* call still runs to completion, standing in for the next SIGHUP.
+    #[tokio::test]
+    async fn run_supervised_reload_survives_a_panicking_reload() {
+        run_supervised_reload(async { panic!("simulated bug in a reload attempt") }).await;
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_clone = ran.clone();
+        run_supervised_reload(async move {
+            ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a subsequent SIGHUP-triggered reload must still execute after a prior one \
+             panicked — a bare `.await` on the reload future (no panic isolation) would instead \
+             let the panic unwind out of run_supervised_reload and never reach this second call"
         );
     }
 
