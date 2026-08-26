@@ -111,16 +111,13 @@ NETWORK="${_NETWORK_OVERRIDE:-$_DEFAULT_NETWORK}"
 # Auto-derive from VM_NAME for the numbered slots (lima-node-2..5) instead of
 # defaulting to "" unconditionally: a bare `--vm lima-node-3` reprovision (e.g.
 # after `limactl delete lima-node-3` to pick up a new network default) bypasses
-# add-node.sh — the only other place that sets --node-suffix — so without this
-# it silently fell back to "", re-applying the Pod named plain
-# "konnectivity-agent" that already belongs to whichever OTHER node in this stack
-# was started without a suffix, and 422'd on spec.nodeName immutability. lima-node
-# and lima-node-smoke keep the empty default: their names carry no slot number, and
-# POD_SUBNET_OCTET below only knows how to parse a numeric "-N" suffix.
-case "$VM_NAME" in
-  lima-node-[0-9]*) NODE_SUFFIX="${_NODE_SUFFIX_OVERRIDE:-"-${VM_NAME#lima-node-}"}" ;;
-  *) NODE_SUFFIX="${_NODE_SUFFIX_OVERRIDE:-}" ;;
-esac
+# add-node.sh — the other place that sets --node-suffix — so without this it
+# silently fell back to "", re-applying the Pod named plain "konnectivity-agent"
+# that already belongs to whichever OTHER node in this stack was started
+# without a suffix, and 422'd on spec.nodeName immutability. node_suffix_for()
+# (_lib.sh) is shared with add-node.sh so both scripts always compute the same
+# suffix for the same VM_NAME.
+NODE_SUFFIX=$(node_suffix_for "$VM_NAME" "$_NODE_SUFFIX_OVERRIDE")
 if [ -n "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}" ]; then
   KONNECTIVITY_SERVER_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"
 else

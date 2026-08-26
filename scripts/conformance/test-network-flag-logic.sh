@@ -99,7 +99,7 @@ assert_true "run-all.sh forwards _NETWORK_ARG to add-node.sh (2nd node, --extra-
 assert_true "add-node.sh parses --network into a _NETWORK_OVERRIDE variable" \
   grep -qE '^\s*--network\)\s*_NETWORK_OVERRIDE="\$2"; shift 2 ;;\s*$' "$ADD_NODE"
 assert_true "add-node.sh forwards --network to its own lima-start.sh call" \
-  grep -qF 'bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} ${_NETWORK_ARG} --node-suffix "-2" ${_VERBOSE_ARG}' "$ADD_NODE"
+  grep -qF 'bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} ${_NETWORK_ARG} --node-suffix "$NODE_SUFFIX" ${_VERBOSE_ARG}' "$ADD_NODE"
 
 # Regression guard: prove the PRE-FIX invocation lines (no _NETWORK_ARG at
 # all) are gone, not just that a working line also happens to be present
