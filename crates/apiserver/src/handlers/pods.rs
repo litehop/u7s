@@ -736,6 +736,31 @@ pub(crate) async fn replace_pod<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    // Stale-resourceVersion PUTs must 409, not fall through into
+    // validate_pod_spec_immutable using the freshly-read `stored` below — mirrors
+    // check_replace_resource_version_precondition's doc comment in resource.rs (mayor-nw9hj).
+    // Concrete pod instance (mayor-um883): a controller GETs a pod, then PUTs it back with
+    // only e.g. metadata.labels changed to release it from a selector. If the scheduler binds
+    // spec.nodeName via /binding in between, the stored spec has moved on by the time this PUT
+    // arrives — the controller's PUT body still carries the pre-bind (blank) nodeName it read.
+    // Comparing that stale body's spec against the just-fetched, already-scheduled `stored`
+    // spec makes validate_pod_spec_immutable see a genuine nodeName change and permanently
+    // reject with 422, instead of the retryable 409 a resourceVersion mismatch should give —
+    // which is what tells the controller's own conflict-retry loop to re-GET and resubmit
+    // against the now-scheduled pod.
+    if let Some(expected) = expected_revision {
+        if expected != stored.revision {
+            return Err(store_err_to_status(
+                StoreError::RevisionMismatch {
+                    expected,
+                    current: stored.revision,
+                },
+                &name,
+            ));
+        }
+    }
+
     let stored_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
     let spec_before = stored_obj.body["spec"].clone();
@@ -14363,6 +14388,97 @@ mod handler_tests {
             StatusCode::CONFLICT,
             "stale resourceVersion on replace_pod must return 409 Conflict — \
              OCC prevents lost-update races when multiple controllers update the same pod"
+        );
+    }
+
+    /// A stale-resourceVersion release PUT that also happens to diverge on spec.nodeName
+    /// (because the scheduler bound the pod after the controller's GET, but before its PUT)
+    /// must return 409 Conflict, not 422 spec-immutability-violation.
+    ///
+    /// Reproduces mayor-um883: the RC controller's release path (rc.go's release-not-matching
+    /// test) GETs a pod, changes only its labels, and PUTs the result back declaring the
+    /// resourceVersion it read. If the u7s-scheduler's /binding write lands in between, the
+    /// stored pod now has a real spec.nodeName the controller's PUT body doesn't carry (it
+    /// read the pod before scheduling). Comparing that stale body against the just-fetched,
+    /// already-scheduled stored spec makes validate_pod_spec_immutable see a genuine nodeName
+    /// change and permanently reject with 422 — instead of the 409 a resourceVersion mismatch
+    /// should give, which is what tells the controller's own conflict-retry loop to re-GET and
+    /// resubmit against the now-scheduled pod. A 422 here is not retried by client-go's
+    /// Update-on-conflict loop, so the conformance test fails outright ~75% of the time
+    /// (whenever scheduling wins the race against the controller's stale PUT).
+    #[tokio::test]
+    async fn replace_pod_returns_409_not_422_when_stale_put_diverges_on_nodename() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "pod-release",
+            serde_json::json!({"metadata": {"labels": {"name": "pod-release"}}}),
+        )
+        .await;
+        let key = "/registry/pods/default/pod-release";
+        let rv0 = store.get(key).await.unwrap().unwrap().revision;
+
+        // Simulate the scheduler's /binding write landing after the controller's GET (rv0)
+        // but before the controller's release PUT reaches the apiserver.
+        let scheduled = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "pod-release",
+                "namespace": "default",
+                "resourceVersion": rv0.to_string(),
+                "labels": {"name": "pod-release"}
+            },
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}],
+                "nodeName": "lima-node-2"
+            },
+            "status": {"phase": "Pending"}
+        });
+        store
+            .put(
+                key,
+                Bytes::from(serde_json::to_vec(&scheduled).unwrap()),
+                Some(rv0),
+            )
+            .await
+            .expect("simulated scheduler bind");
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        // The controller's release PUT: based on the pre-bind read (rv0), spec has no
+        // nodeName at all — it never intended to touch nodeName, only labels.
+        let release_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "pod-release",
+                "namespace": "default",
+                "resourceVersion": rv0.to_string(),
+                "labels": {"name": "not-matching-name"}
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/pod-release")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&release_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a stale-resourceVersion release PUT racing the scheduler's bind must return 409 \
+             Conflict (retryable) — a 422 here permanently fails the RC controller's release \
+             instead of letting it re-GET and resubmit against the now-scheduled pod"
         );
     }
 
