@@ -40,6 +40,11 @@ structure.
    down.
 9. **Prescriptive phrasing.** "Create the namespace before deploying,"
    not "some operators create the namespace first."
-10. **Depart from any rule above when it makes a doc clearer.** These
+10. **No minimizing words.** Avoid "just," "simply," "easily," and
+    "obviously" when describing a step — if it needed documenting, it
+    wasn't trivial to the reader. (The adverbial "just" meaning "only,"
+    as in "returns just the metadata," is fine; the ban targets
+    minimizing a step's difficulty, not the word itself.)
+11. **Depart from any rule above when it makes a doc clearer.** These
     are defaults, not a lint gate — judgment beats mechanical
     compliance.
