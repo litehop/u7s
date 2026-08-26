@@ -32,7 +32,7 @@ configuration surface exists.
 ## Rationale
 
 No measurement decided this; it applies the north star's packaging
-philosophy. The `curl | sh` shape reuses a convention users already recognize
+philosophy. The `curl | bash` shape reuses a convention users already recognize
 from k3s — the north star's objection to k3s is its configuration surface and
 defaults, not its invocation shape. Restricting the knobs to node identity
 and interface is that philosophy applied directly rather than a fresh
