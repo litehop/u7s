@@ -92,7 +92,7 @@ enum OnBadManifest {
     /// over one bad manifest edit is a much bigger blast radius than skipping that file —
     /// matches the universal Unix reload convention (nginx/sshd/systemd-reload all
     /// validate-then-log-and-keep-running on a bad reload config). Operator decision recorded on
-    /// mayor-bh36n, 2026-08-26.
+    /// 2026-08-26.
     LogAndSkip,
 }
 
@@ -1227,13 +1227,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // reload_well_known_manifest_dir (mayor-bh36n) — the SIGHUP-triggered reload path. Shares
+    // reload_well_known_manifest_dir — the SIGHUP-triggered reload path. Shares
     // the folder-scanning mechanics covered above; these tests cover only what's different from
     // apply_well_known_manifest_dir: a bad file is logged and skipped instead of aborting the
     // whole scan, and the function itself never returns an error the caller could propagate.
     // -----------------------------------------------------------------------
 
-    /// The entire reason mayor-bh36n exists: a bad manifest hit during a SIGHUP-triggered
+    /// The entire reason this reload path exists: a bad manifest hit during a SIGHUP-triggered
     /// reload must not stop the rest of the folder from applying. If this regressed to the
     /// boot path's fatal-on-first-error behavior, `02-more.yaml` would never be reached and
     /// this test would fail exactly like

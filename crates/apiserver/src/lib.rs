@@ -589,8 +589,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // `state.boot_ready` so `/healthz` starts reporting 200 (see the field's doc) — on failure
     // it stays `false` forever, since the `tokio::select!` below tears the process down anyway.
     // This fatal-at-boot behavior is unchanged by the SIGHUP-triggered reload spawned right
-    // below, which reuses the same manifest directory but with log-and-skip semantics instead
-    // (mayor-bh36n).
+    // below, which reuses the same manifest directory but with log-and-skip semantics instead.
     let (well_known_manifest_tx, well_known_manifest_rx) = tokio::sync::oneshot::channel();
     let well_known_manifest_dir = args.manifest_dir.clone();
     let boot_ready = Arc::clone(&state.boot_ready);
@@ -615,7 +614,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // in-flight request, it only re-invokes the same apply routine boot used. Unlike that
     // boot-time apply, a bad manifest hit during a SIGHUP reload is logged and skipped rather
     // than fatal (bootstrap_apply::reload_well_known_manifest_dir — operator decision on
-    // mayor-bh36n, 2026-08-26) — crashing an already-serving apiserver over a bad manifest edit
+    // 2026-08-26) — crashing an already-serving apiserver over a bad manifest edit
     // is a far bigger blast radius than at cold boot, where fatal-and-refuse-to-start remains
     // correct. Because `kill -HUP` reports success to systemd the moment the signal is
     // delivered, regardless of what this async re-scan finds, reload failure is visible only
@@ -7811,7 +7810,7 @@ mod tests {
     /// SIGHUP-listening loop in `run()` down with it — otherwise `systemctl reload
     /// u7s-apiserver` keeps reporting success forever (per `ExecReload`'s `kill -HUP` semantics)
     /// while every reload after the first panicking one silently does nothing, with no signal to
-    /// the operator (critical-reviewer finding on PR #1398, mayor-bh36n). Proven here by driving
+    /// the operator (critical-reviewer finding on PR #1398). Proven here by driving
     /// `run_supervised_reload` directly with a panicking future — a real panic can't be forced
     /// out of `reload_well_known_manifest_dir` itself, which never panics by design — and then
     /// asserting the *next* call still runs to completion, standing in for the next SIGHUP.
@@ -10881,7 +10880,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SIGHUP-triggered manifest reload (mayor-bh36n). Unlike every other test in this file,
+    // SIGHUP-triggered manifest reload. Unlike every other test in this file,
     // this one drives the real, unmodified `run()` end-to-end (live TLS listener,
     // mTLS-authenticated requests) — that's the only way to prove the signal-handler wiring
     // inside `run()` itself reacts to a real OS SIGHUP without a process restart, rather than
@@ -10949,7 +10948,7 @@ mod tests {
         panic!("{} never appeared within 5s", path.display());
     }
 
-    /// Regression test for mayor-bh36n: SIGHUP must re-scan and re-apply the well-known
+    /// Regression test: SIGHUP must re-scan and re-apply the well-known
     /// manifest directory in the SAME process — no restart, no dropped listener — and a bad
     /// manifest hit during that reload must be logged and skipped rather than crashing the
     /// apiserver, unlike a bad manifest at cold boot (which stays fatal, unchanged by this

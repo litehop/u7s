@@ -87,7 +87,7 @@ assert_true "u7s-kcm.service's ExecStart invokes kube-controller-manager directl
   grep -qF 'ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig' "$INSTALL"
 
 # ---------------------------------------------------------------------------
-# mayor-bh36n: without ExecReload=, systemd has no reload mechanism for a plain unit and
+# Without ExecReload=, systemd has no reload mechanism for a plain unit and
 # 'systemctl reload u7s-apiserver' fails outright instead of delivering SIGHUP to the running
 # apiserver, which is what re-applies /etc/u7s/manifests without a restart.
 # ---------------------------------------------------------------------------
