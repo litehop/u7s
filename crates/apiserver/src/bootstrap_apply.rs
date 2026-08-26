@@ -80,6 +80,22 @@ async fn apply_yaml_bundle_inner(kubeconfig_path: &Path, yaml_bytes: &[u8]) -> a
     Ok(())
 }
 
+/// Controls how [`scan_well_known_manifest_dir`] reacts to a single bad manifest file — the
+/// scan logic is identical either way, only the two callers below need different semantics.
+enum OnBadManifest {
+    /// Cold boot ([`apply_well_known_manifest_dir`]): stop the scan and return the error
+    /// immediately, naming the offending file. An operator who dropped a broken manifest needs
+    /// the apiserver to refuse to start, not run half-configured.
+    Fatal,
+    /// SIGHUP-triggered reload ([`reload_well_known_manifest_dir`]): log the error (naming the
+    /// file) and keep scanning the rest of the directory. Crashing an already-serving apiserver
+    /// over one bad manifest edit is a much bigger blast radius than skipping that file —
+    /// matches the universal Unix reload convention (nginx/sshd/systemd-reload all
+    /// validate-then-log-and-keep-running on a bad reload config). Operator decision recorded on
+    /// mayor-bh36n, 2026-08-26.
+    LogAndSkip,
+}
+
 /// Server-side-apply every manifest file directly inside `dir`, in lexicographic filename
 /// order — deterministic, and lets a later file override fields an earlier one set on the same
 /// object (e.g. an operator-supplied file sorting after u7s's own vendored `coredns.yaml`).
@@ -93,10 +109,41 @@ async fn apply_yaml_bundle_inner(kubeconfig_path: &Path, yaml_bytes: &[u8]) -> a
 /// folder absent (`docs/decisions/well-known-manifest-folder.md`). Any other failure (a file
 /// that can't be read, isn't valid YAML, is missing required fields, or that the apiserver
 /// itself rejects) stops the scan immediately and is wrapped with the offending file's path, so
-/// a caller that treats this as fatal can name exactly which file an operator needs to fix.
+/// a caller that treats this as fatal can name exactly which file an operator needs to fix. This
+/// fatal-at-boot behavior is unchanged by [`reload_well_known_manifest_dir`] below, which reuses
+/// the same scan but with different failure semantics for the SIGHUP-triggered case.
 pub async fn apply_well_known_manifest_dir(
     kubeconfig_path: &Path,
     dir: &Path,
+) -> anyhow::Result<()> {
+    scan_well_known_manifest_dir(kubeconfig_path, dir, OnBadManifest::Fatal).await
+}
+
+/// Re-scans and re-applies `dir` for a SIGHUP-triggered reload — see `run()`'s SIGHUP handler in
+/// `lib.rs`, which calls this in place of a process restart. Unlike
+/// [`apply_well_known_manifest_dir`] (cold boot), a bad manifest file here is logged and
+/// skipped rather than fatal (see [`OnBadManifest::LogAndSkip`]). This function itself never
+/// returns an error — even a directory-level failure (e.g. permission denied) is logged the same
+/// way — because a reload must never crash an already-serving apiserver no matter what SIGHUP
+/// finds on disk. Since `ExecReload=/bin/kill -HUP $MAINPID` (see `scripts/install.sh`) reports
+/// success to systemd the instant the signal is delivered, this log output — not systemctl's
+/// reload exit status — is the only place a failed reload is visible
+/// (`journalctl -u u7s-apiserver`), matching how sshd/nginx surface a rejected reload config.
+pub async fn reload_well_known_manifest_dir(kubeconfig_path: &Path, dir: &Path) {
+    if let Err(e) =
+        scan_well_known_manifest_dir(kubeconfig_path, dir, OnBadManifest::LogAndSkip).await
+    {
+        tracing::error!(
+            "SIGHUP reload: scanning well-known manifest directory {} failed: {e:#}",
+            dir.display()
+        );
+    }
+}
+
+async fn scan_well_known_manifest_dir(
+    kubeconfig_path: &Path,
+    dir: &Path,
+    on_bad_manifest: OnBadManifest,
 ) -> anyhow::Result<()> {
     let read_dir = match std::fs::read_dir(dir) {
         Ok(read_dir) => read_dir,
@@ -138,11 +185,25 @@ pub async fn apply_well_known_manifest_dir(
     paths.sort();
 
     for path in &paths {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading manifest file {}", path.display()))?;
-        apply_yaml_bundle(kubeconfig_path, &bytes)
-            .await
-            .with_context(|| format!("applying manifest file {}", path.display()))?;
+        let result: anyhow::Result<()> = async {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading manifest file {}", path.display()))?;
+            apply_yaml_bundle(kubeconfig_path, &bytes)
+                .await
+                .with_context(|| format!("applying manifest file {}", path.display()))
+        }
+        .await;
+        if let Err(e) = result {
+            match on_bad_manifest {
+                OnBadManifest::Fatal => return Err(e),
+                OnBadManifest::LogAndSkip => {
+                    tracing::error!(
+                        "SIGHUP reload: bad manifest {}, skipping it: {e:#}",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1163,6 +1224,110 @@ mod tests {
              Namespace document was applied before the ConfigMap that depends on it, matching \
              flannel.yaml's own document order",
             );
+    }
+
+    // -----------------------------------------------------------------------
+    // reload_well_known_manifest_dir (mayor-bh36n) — the SIGHUP-triggered reload path. Shares
+    // the folder-scanning mechanics covered above; these tests cover only what's different from
+    // apply_well_known_manifest_dir: a bad file is logged and skipped instead of aborting the
+    // whole scan, and the function itself never returns an error the caller could propagate.
+    // -----------------------------------------------------------------------
+
+    /// The entire reason mayor-bh36n exists: a bad manifest hit during a SIGHUP-triggered
+    /// reload must not stop the rest of the folder from applying. If this regressed to the
+    /// boot path's fatal-on-first-error behavior, `02-more.yaml` would never be reached and
+    /// this test would fail exactly like
+    /// `apply_well_known_manifest_dir_applies_in_order_and_names_the_offending_file_on_failure`
+    /// does for the fatal path (which stays unchanged and still asserts an `Err`).
+    #[tokio::test]
+    async fn reload_well_known_manifest_dir_skips_a_bad_file_and_keeps_applying_the_rest() {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("reload-skip");
+        std::fs::write(
+            dir.join("00-good.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: reload-skip-before\n  namespace: kube-system\ndata:\n  foo: bar\n",
+        )
+        .expect("write 00-good.yaml");
+        std::fs::write(dir.join("01-bad.yaml"), "this: is: not: valid: yaml: [\n")
+            .expect("write 01-bad.yaml");
+        std::fs::write(
+            dir.join("02-more.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: reload-skip-after\n  namespace: kube-system\ndata:\n  foo: bar\n",
+        )
+        .expect("write 02-more.yaml");
+
+        // No panic and no Err to inspect -- reload_well_known_manifest_dir returns unit
+        // unconditionally, which is itself part of the "never crashes the caller" contract.
+        reload_well_known_manifest_dir(&server.kubeconfig_path, &dir).await;
+
+        for name in ["reload-skip-before", "reload-skip-after"] {
+            let key = crate::keys::object_key("configmaps", "kube-system", name);
+            server
+                .store
+                .get(&key)
+                .await
+                .expect("store get must not fail")
+                .unwrap_or_else(|| {
+                    panic!(
+                    "{name} must be applied even though 01-bad.yaml sorts between the two good \
+                     files -- a SIGHUP reload must skip only the bad file, not abandon the rest \
+                     of the directory the way a cold-boot fatal error would"
+                )
+                });
+        }
+    }
+
+    /// An operator debugging a rejected reload has only the apiserver's own logs to go on (see
+    /// this function's doc comment: `kill -HUP` always "succeeds" immediately regardless of
+    /// what the async re-scan finds). If the error log lost the offending filename, or dropped
+    /// to a level below error, an operator would have no way to find out which file broke their
+    /// `systemctl reload` short of bisecting the manifest directory by hand.
+    #[tokio::test]
+    async fn reload_well_known_manifest_dir_logs_the_offending_file_at_error_level() {
+        #[derive(Clone, Default)]
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'w self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("reload-log");
+        std::fs::write(dir.join("01-bad.yaml"), "this: is: not: valid: yaml: [\n")
+            .expect("write 01-bad.yaml");
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            reload_well_known_manifest_dir(&server.kubeconfig_path, &dir).await;
+        }
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).expect("log must be UTF-8");
+        assert!(
+            log.contains("01-bad.yaml"),
+            "the reload error log must name the offending file so an operator can find and fix \
+             it without bisecting the manifest directory by hand; got: {log}"
+        );
+        assert!(
+            log.contains("ERROR"),
+            "a bad manifest on reload must log at error level, loud enough to show up in a \
+             default-verbosity `journalctl -u u7s-apiserver`; got: {log}"
+        );
     }
 
     // -----------------------------------------------------------------------

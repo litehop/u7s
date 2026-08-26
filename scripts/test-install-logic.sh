@@ -87,6 +87,14 @@ assert_true "u7s-kcm.service's ExecStart invokes kube-controller-manager directl
   grep -qF 'ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig' "$INSTALL"
 
 # ---------------------------------------------------------------------------
+# mayor-bh36n: without ExecReload=, systemd has no reload mechanism for a plain unit and
+# 'systemctl reload u7s-apiserver' fails outright instead of delivering SIGHUP to the running
+# apiserver, which is what re-applies /etc/u7s/manifests without a restart.
+# ---------------------------------------------------------------------------
+assert_true "u7s-apiserver.service declares ExecReload=/bin/kill -HUP \$MAINPID so 'systemctl reload u7s-apiserver' actually delivers SIGHUP instead of failing outright" \
+  grep -qF 'ExecReload=/bin/kill -HUP \$MAINPID' "$INSTALL"
+
+# ---------------------------------------------------------------------------
 # Consistency: every unit that reads a file u7s-apiserver's first run
 # generates (kubeconfig, ca.crt, sa.key, ...) must wait on it the same way.
 # Previously kubelet.service was missing this despite the script's own
