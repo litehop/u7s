@@ -1247,6 +1247,63 @@ mod tests {
         );
     }
 
+    /// Regression test for mayor-6hog8: CoreDNS's "kubernetes" plugin logs "is not allowed to
+    /// list services/endpointslices/namespaces" and every cluster.local lookup returns SERVFAIL
+    /// if `system:serviceaccount:kube-system:coredns` can't actually list/watch those resources
+    /// cluster-wide. `coredns_manifest_installs_every_kind_at_its_expected_key` above only checks
+    /// that the ClusterRole/ClusterRoleBinding objects exist in the store — it never confirms
+    /// they grant anything. This rebuilds the RBAC index from the same store the bundle was just
+    /// applied to (the same step `run()` takes at boot via `AppState::init`) and asserts the
+    /// coredns identity can actually perform every list/watch its "kubernetes" plugin depends on
+    /// (pods are deliberately excluded: the vendored Corefile runs the plugin in `pods insecure`
+    /// mode, which never calls the API for pods).
+    #[tokio::test]
+    async fn coredns_manifest_grants_coredns_serviceaccount_the_rbac_its_kubernetes_plugin_needs() {
+        let server = start_test_apiserver().await;
+
+        apply_yaml_bundle(&server.kubeconfig_path, COREDNS_MANIFEST)
+            .await
+            .expect("CoreDNS bundle must apply cleanly");
+
+        let state = crate::state::AppState::new(
+            std::sync::Arc::clone(&server.store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        let coredns_sa = "system:serviceaccount:kube-system:coredns";
+        for (api_group, resource) in [
+            ("", "services"),
+            ("", "namespaces"),
+            ("discovery.k8s.io", "endpointslices"),
+        ] {
+            for verb in ["list", "watch"] {
+                let req = crate::rbac::AuthzRequest {
+                    username: coredns_sa,
+                    groups: &groups,
+                    verb,
+                    api_group,
+                    resource,
+                    subresource: "",
+                    namespace: None,
+                    name: None,
+                    non_resource_url: None,
+                };
+                assert!(
+                    state.rbac_index.is_allowed(&req),
+                    "{coredns_sa} must be allowed to {verb} {resource} (apiGroup {api_group:?}) \
+                     cluster-wide after the CoreDNS bundle applies — without this, CoreDNS's \
+                     \"kubernetes\" plugin never syncs and every cluster.local lookup returns \
+                     SERVFAIL (mayor-6hog8)"
+                );
+            }
+        }
+    }
+
     /// Re-applying the CoreDNS bundle after it's already installed — the steady-state case on
     /// every apiserver restart after the very first, since `run()` calls `apply_yaml_bundle`
     /// unconditionally on every boot — must not corrupt kube-dns's Service ports. `do_patch`'s
