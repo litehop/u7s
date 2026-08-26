@@ -13,11 +13,19 @@ single-session VMs but is not a model for a VPS or bare-metal deployment.
 ## Decision
 
 Each host-level binary gets its own systemd unit, written and enabled by the
-u7s install script: `u7s-apiserver.service` (absorbing the scheduler if the
-two native binaries are ever merged, otherwise a separate
-`u7s-scheduler.service`), `u7s-kcm.service`, and `kubelet.service`. Every
-u7s-authored unit sets `Restart=always` and is enabled at boot.
-`crio.service` comes from the CRI-O apt package, not from u7s.
+u7s install script: `u7s-apiserver.service`, `u7s-kcm.service`, and
+`kubelet.service`. Every u7s-authored unit sets `Restart=always` and is
+enabled at boot. `crio.service` comes from the CRI-O apt package, not from
+u7s.
+
+`u7s-apiserver.service` runs with `--embedded-scheduler true`, folding
+scheduling into a supervised task inside the apiserver process rather than a
+separate `u7s-scheduler.service` (mayor-kjs98) -- install.sh actively retires
+a pre-existing standalone unit on upgrade. The embedded scheduler and the
+standalone `u7s-scheduler` binary must never run against the same cluster at
+once: each keeps independent per-process preemption dedup state with no
+shared coordination, so both could decide to preempt the same node's pods
+(mayor-rzrfn).
 
 If systemd is absent the install fails loudly rather than falling back to an
 unsupervised process. Initial scope is Ubuntu LTS, which always ships
