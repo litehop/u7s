@@ -185,7 +185,19 @@ fn quantity_format_type(resource_name: &str) -> &'static str {
     }
 }
 
-/// Extract the total milli-quantity of a resource from a single pod's containers.
+/// Extract the total milli-quantity of a resource from a single pod's containers,
+/// plus `spec.overhead` (the RuntimeClass admission plugin's per-pod sandboxing tax,
+/// e.g. gVisor/Kata — see `handlers::pods::apply_runtime_class_overhead`, which runs
+/// well before ResourceQuota admission, so `spec.overhead` is already populated on
+/// both the incoming pod and any stored pod this is called on).
+///
+/// Mirrors upstream's `resourcehelper.PodRequestsAndLimits`: overhead is added to
+/// `requests` unconditionally, and to `limits` only when the pod's containers already
+/// declare a non-zero limit for `resource` — a RuntimeClass never invents a limit that
+/// wasn't there. Without this, a sandboxed pod's true resource footprint is
+/// undercounted against namespace ResourceQuotas (same bug class as the scheduler's
+/// `pod_total_requests` overhead fix in `crates/scheduler/src/lib.rs`).
+///
 /// Returns 0 if the pod is None or has no matching resource entries.
 fn pod_resource_milli(pod: Option<&Value>, field: &str, resource: &str) -> i64 {
     let pod = match pod {
@@ -201,6 +213,13 @@ fn pod_resource_milli(pod: Option<&Value>, field: &str, resource: &str) -> i64 {
                         total += milli;
                     }
                 }
+            }
+        }
+    }
+    if field == "requests" || total > 0 {
+        if let Some(val) = pod["spec"]["overhead"][resource].as_str() {
+            if let Some(milli) = parse_quantity_milli(val) {
+                total += milli;
             }
         }
     }
@@ -2079,6 +2098,57 @@ mod tests {
         assert!(
             result.is_ok(),
             "pod within remaining CPU quota must be allowed"
+        );
+    }
+
+    /// A pod's `spec.overhead` (set by the apiserver's RuntimeClass admission plugin
+    /// from `RuntimeClass.overhead.podFixed`, e.g. gVisor/Kata sandbox tax — see
+    /// `handlers::pods::apply_runtime_class_overhead`, which runs before ResourceQuota
+    /// admission) must be added on top of its container requests when checked against
+    /// a `cpu` ResourceQuota: the container request alone (900m) fits a 1-core quota,
+    /// but the true footprint including the 200m overhead (1100m) does not. Before this
+    /// fix `pod_resource_milli` dropped `spec.overhead` entirely, so this pod would be
+    /// admitted and its true footprint would be undercounted against the namespace's
+    /// ResourceQuota — mirrors the scheduler-side
+    /// `resource_fits_false_when_runtime_class_overhead_pushes_pod_over_capacity` test
+    /// in `crates/scheduler/src/lib.rs`.
+    #[tokio::test]
+    async fn check_quota_cpu_denies_when_runtime_class_overhead_pushes_pod_over_limit() {
+        let state = make_state();
+
+        // Quota: max 1 CPU total
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "cpu-quota", "namespace": "default" },
+            "spec": { "hard": { "cpu": "1" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/cpu-quota", quota).await;
+
+        // Incoming sandboxed pod: container requests 900m cpu (fits alone), plus
+        // spec.overhead of 200m cpu (as the RuntimeClass admission plugin would have
+        // already injected by the time ResourceQuota admission runs) — true total 1100m.
+        let sandboxed_pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "resources": { "requests": { "cpu": "900m" } }
+                }],
+                "overhead": { "cpu": "200m" }
+            }
+        });
+        let result =
+            check_resource_quota(&state, "default", "", "pods", Some(&sandboxed_pod)).await;
+        assert!(
+            result.is_err(),
+            "a pod whose container requests alone fit the cpu quota, but whose \
+             RuntimeClass overhead pushes it past the hard limit, must be denied — \
+             otherwise ResourceQuota under-reports the namespace's true cpu usage"
+        );
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::FORBIDDEN,
+            "cpu quota exceeded (once overhead is correctly included) must return 403"
         );
     }
 
