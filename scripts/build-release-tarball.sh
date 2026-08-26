@@ -67,6 +67,10 @@ done
 
 chmod +x "$STAGE_DIR/u7s-apiserver" "$STAGE_DIR/u7s-scheduler"
 
+# Apache-2.0 section 4 requires redistributing this license text alongside
+# the unmodified kubelet/kube-controller-manager binaries fetched above.
+cp "$ROOT_DIR/THIRD_PARTY_LICENSES.md" "$STAGE_DIR/"
+
 TARBALL="$OUT_DIR/${STAGE_NAME}.tar.gz"
 tar -czf "$TARBALL" -C "$WORK_DIR" "$STAGE_NAME"
 
