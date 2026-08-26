@@ -51,6 +51,15 @@
 #      a disposable "victim" repo -- the exact mechanism (see run_git()
 #      below) that corrupted the mayor's real repository twice before this
 #      scenario existed. Always runs (no cargo/difft dependency).
+#   H. Ambient GIT_CONFIG exported into this test's OWN shell must not
+#      redirect a `git config` WRITE made through run_git() into a decoy
+#      file, instead of the intended repo's own local config -- a
+#      critical-reviewer finding that GIT_DIR/GIT_WORK_TREE stripping
+#      (scenario G) alone does NOT close, since GIT_CONFIG is a separate
+#      documented redirection mechanism scoped to the `config` subcommand.
+#      This is the exact mechanism behind the original "silently overwrote
+#      user.name/user.email" corruption symptom. Always runs (no
+#      cargo/difft dependency).
 #
 # Exits 0 if every scenario that could run PASSED (skips are reported but do
 # not fail the run); exits 1 on any assertion failure.
@@ -83,23 +92,28 @@ skip() {
 }
 
 # GIT_* variables that redirect git's chosen repository/working-tree/index/
-# object-store location if inherited from an enclosing process (see `git
-# help git`, "THE GIT REPOSITORY" section for the full set) -- most notably
-# GIT_DIR, which per git's own docs takes precedence over both an explicit
-# `-C <dir>` and a `git init <dir>` positional argument. This test suite runs
-# from inside the SAME .githooks/pre-push context that, via exactly this
-# leakage, once corrupted the mayor's real repository (a sandbox fixture's
-# `git commit` inherited that hook's ambient GIT_DIR and landed in the real
-# repo instead of a disposable sandbox). Every git subprocess the
-# sandbox-repo helpers below spawn goes through run_git() to strip these
-# first -- see scripts/sensitive-conformance-gate.sh's own run_git() (same
-# variable set) for why an incomplete list here is a false sense of safety,
-# not a real one.
+# object-store/config location if inherited from an enclosing process. This
+# test suite runs from inside the SAME .githooks/pre-push context that, via
+# exactly this leakage, once corrupted the mayor's real repository (a
+# sandbox fixture's `git commit` inherited that hook's ambient GIT_DIR and
+# landed in the real repo instead of a disposable sandbox). Every git
+# subprocess the sandbox-repo helpers below spawn goes through run_git() to
+# strip these first -- see scripts/sensitive-conformance-gate.sh's own
+# run_git() (same variable set, and crates/junit-reuse-check/src/lib.rs's
+# git_command() for the full per-variable rationale, including why
+# HOME/XDG_CONFIG_HOME are deliberately NOT in this list) for why an
+# incomplete list here is a false sense of safety, not a real one -- a
+# critical-reviewer finding that GIT_CONFIG alone was missing from an
+# earlier version of this exact list (it still let an ambient var silently
+# redirect a `git config` WRITE -- see scenario H below) is what added the
+# second line.
 run_git() {
   env -u GIT_DIR -u GIT_WORK_TREE -u GIT_NAMESPACE -u GIT_INDEX_FILE \
     -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
     -u GIT_COMMON_DIR -u GIT_CEILING_DIRECTORIES \
     -u GIT_DISCOVERY_ACROSS_FILESYSTEM \
+    -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM \
+    -u GIT_CONFIG_NOSYSTEM -u GIT_CONFIG_COUNT \
     git "$@"
 }
 
@@ -484,6 +498,40 @@ fi
 VICTIM_HEAD_AFTER2=$(run_git -C "$SG_VICTIM" rev-parse HEAD)
 assert "...running the gate script itself under the same ambient leak still leaves the victim repo's HEAD untouched" \
   "$([ "$VICTIM_HEAD_BEFORE" = "$VICTIM_HEAD_AFTER2" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# H. Ambient GIT_CONFIG redirecting a `git config` WRITE -- the critical-
+#    review finding (PR #1408) that scenario G's GIT_DIR/GIT_WORK_TREE
+#    stripping does NOT close: git's documented (if legacy) GIT_CONFIG var
+#    makes a `git config` write "as if it were provided via --file",
+#    completely bypassing `-C <dir>` for that one subcommand -- the exact
+#    mechanism behind the original "silently overwrote user.name/
+#    user.email" corruption symptom (new_sandbox() below is precisely the
+#    helper that does those writes). Sets GIT_CONFIG (scoped to a single
+#    command, matching scenario G's own GIT_DIR/GIT_WORK_TREE convention
+#    above) pointed at a disposable decoy file (never inside any real repo)
+#    for one run_git() config write, and asserts the write landed in the
+#    target sandbox's own local config, not the decoy file.
+# ---------------------------------------------------------------------------
+SH_TARGET="$SANDBOX_ROOT/h-config-target"
+new_sandbox "$SH_TARGET"
+SH_DECOY="$SANDBOX_ROOT/h-config-decoy.cfg"
+
+GIT_CONFIG="$SH_DECOY" run_git -C "$SH_TARGET" config user.email redirect-test@example.com
+SH_TARGET_EMAIL=$(run_git -C "$SH_TARGET" config --local --get user.email || echo unset)
+assert "ambient GIT_CONFIG never redirects a hardened run_git() 'git config' write away from the -C target's own local config" \
+  "$([ "$SH_TARGET_EMAIL" = "redirect-test@example.com" ] && echo 1 || echo 0)"
+assert "...and no decoy file is created at the ambient GIT_CONFIG path (the write did not land there instead)" \
+  "$([ ! -e "$SH_DECOY" ] && echo 1 || echo 0)"
+
+# Sanity check proving this is genuinely the GIT_CONFIG bug and not
+# something else: the SAME ambient GIT_CONFIG, via a bare `git` call that
+# deliberately bypasses run_git()'s stripping (the only place in this test
+# suite that does so, and only to demonstrate the pre-fix behavior), really
+# does redirect the write into the decoy file.
+GIT_CONFIG="$SH_DECOY" git -C "$SH_TARGET" config user.name "Redirected Sanity Check"
+assert "sanity check: an UNSTRIPPED ambient GIT_CONFIG really does redirect a plain 'git -C <dir> config' write into the decoy file (confirms scenario H above tests the real bug, not a no-op)" \
+  "$([ -f "$SH_DECOY" ] && grep -q 'Redirected Sanity Check' "$SH_DECOY" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

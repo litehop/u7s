@@ -50,24 +50,32 @@ HOOK_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 REGISTRY="$HOOK_ROOT/.githooks/sensitive-conformance-focus.yaml"
 
 # GIT_* variables that redirect git's chosen repository/working-tree/index/
-# object-store location if inherited from an enclosing process (see `git
-# help git`, "THE GIT REPOSITORY" section for the full set) -- most notably
-# GIT_DIR, which per git's own docs takes precedence over an explicit
-# `-C <dir>`. This script runs from INSIDE .githooks/pre-push, which git
-# itself may export these into (this is the exact mechanism that once
-# corrupted the mayor's real repository via this hook's ambient
-# environment), so every git subprocess below goes through run_git() to
-# strip them first -- otherwise $TARGET_ROOT (the explicit argument this
-# whole gate's safety story depends on) could be silently ignored in favor
-# of whatever the enclosing hook invocation's environment happens to point
-# at. Same variable set as crates/junit-reuse-check/src/lib.rs's
-# git_command() and this script's own test harness
+# object-store/config location if inherited from an enclosing process, so
+# every git subprocess below goes through run_git() to strip them first --
+# otherwise $TARGET_ROOT (the explicit argument this whole gate's safety
+# story depends on) could be silently ignored in favor of whatever the
+# enclosing hook invocation's environment happens to point at. This script
+# runs from INSIDE .githooks/pre-push, which git itself may export these
+# into -- this is the exact mechanism that once corrupted the mayor's real
+# repository via this hook's ambient environment. Two documented families
+# (see crates/junit-reuse-check/src/lib.rs's git_command() doc comment for
+# the full per-variable rationale, including why HOME/XDG_CONFIG_HOME are
+# deliberately NOT in this list): repository-location vars per `git help
+# git`'s "THE GIT REPOSITORY" section, and config-location vars per `git
+# help git-config`'s ENVIRONMENT section -- the latter added after a
+# critical-reviewer finding that GIT_CONFIG alone (missed by the former
+# list) still let an ambient var silently redirect a `git config` WRITE,
+# which is the exact mechanism behind the original corruption symptom.
+# Same variable set as crates/junit-reuse-check/src/lib.rs's git_command()
+# and this script's own test harness
 # (scripts/test-sensitive-conformance-gate-logic.sh's run_git()).
 run_git() {
   env -u GIT_DIR -u GIT_WORK_TREE -u GIT_NAMESPACE -u GIT_INDEX_FILE \
     -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
     -u GIT_COMMON_DIR -u GIT_CEILING_DIRECTORIES \
     -u GIT_DISCOVERY_ACROSS_FILESYSTEM \
+    -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM \
+    -u GIT_CONFIG_NOSYSTEM -u GIT_CONFIG_COUNT \
     git "$@"
 }
 

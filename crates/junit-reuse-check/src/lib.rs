@@ -217,19 +217,53 @@ impl FreshnessCheck for GitFreshnessCheck {
 
 /// `GIT_*` environment variables that, if inherited from an enclosing git
 /// process, silently override `-C <dir>` and redirect git's chosen
-/// repository/working-tree/index/object-store location elsewhere -- most
-/// notably `GIT_DIR`, which per git's own docs (`git help git`, "THE GIT
-/// REPOSITORY" section) takes precedence over the `-C`-selected directory's
-/// discovered `.git`. This is the complete such set documented there, not
-/// just `GIT_DIR`/`GIT_WORK_TREE`. This binary runs from INSIDE a git hook
-/// (`.githooks/pre-push` -> scripts/sensitive-conformance-gate.sh ->
-/// u7s-junit-reuse-check), which git itself may export these into, so every
-/// `git` subprocess spawned below clears them first -- otherwise `repo_root`
-/// (the explicit argument this whole safety story depends on) could be
-/// silently ignored in favor of whatever the enclosing hook invocation's
-/// environment happens to point at. Same variable set as
-/// scripts/sensitive-conformance-gate.sh's `run_git()` and
-/// scripts/test-sensitive-conformance-gate-logic.sh's `run_git()`.
+/// repository/working-tree/index/object-store/config location elsewhere.
+/// This binary runs from INSIDE a git hook (`.githooks/pre-push` ->
+/// scripts/sensitive-conformance-gate.sh -> u7s-junit-reuse-check), which git
+/// itself may export these into, so every `git` subprocess spawned below
+/// clears them first -- otherwise `repo_root` (the explicit argument this
+/// whole safety story depends on) could be silently ignored in favor of
+/// whatever the enclosing hook invocation's environment happens to point at.
+/// Same variable set as scripts/sensitive-conformance-gate.sh's `run_git()`
+/// and scripts/test-sensitive-conformance-gate-logic.sh's `run_git()`.
+///
+/// Two documented families, both required for completeness (a prior version
+/// of this list covered only the first and was found, by review, to still
+/// leave the config-redirection gap open -- see the `GIT_CONFIG` entry):
+///
+/// - Repository-location vars, per `git help git`'s "THE GIT REPOSITORY"
+///   section: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_NAMESPACE`, `GIT_INDEX_FILE`,
+///   `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+///   `GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES`,
+///   `GIT_DISCOVERY_ACROSS_FILESYSTEM`.
+/// - Config-location vars, per `git help git-config`'s ENVIRONMENT section:
+///   `GIT_CONFIG` (legacy, undocumented in `git help git` itself -- "If no
+///   `--file` option is provided to git config, use the file given by
+///   `GIT_CONFIG` as if it were provided via `--file`", scoped to the
+///   `config` subcommand only, but that is exactly the subcommand
+///   `init_repo()`'s test fixtures below call to set `user.email`/
+///   `user.name` -- this is the EXACT mechanism a critical-reviewer
+///   empirically reproduced as still open after the repository-location fix
+///   above, and matches the original "silently overwrote user.name/
+///   user.email" corruption symptom), `GIT_CONFIG_GLOBAL`,
+///   `GIT_CONFIG_SYSTEM` (redirect which global/system file is consulted),
+///   `GIT_CONFIG_NOSYSTEM` (suppresses the system file), `GIT_CONFIG_COUNT`
+///   (if set to a positive number, git also injects config from
+///   `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs -- clearing
+///   `GIT_CONFIG_COUNT` alone is sufficient to neutralize those, since git
+///   only consults indexed pairs when `GIT_CONFIG_COUNT` names a positive
+///   count).
+///
+/// Deliberately NOT stripped: `HOME` / `XDG_CONFIG_HOME`. Those only affect
+/// which *global* config file is read as a fallback layer; a bare `git
+/// config <key> <value>` (no `--global`/`--system` scope flag, as used
+/// throughout this file) always writes to the *local* repository config
+/// resolved via `-C`/discovery, never to the global file, regardless of
+/// `$HOME`. They are outside this bug class's actual attack surface (an
+/// ambient var silently redirecting a `-C`-targeted WRITE), and stripping
+/// them would also make this process's own git invocations resolve the
+/// wrong (or no) real identity/credential-helper config for no safety
+/// benefit.
 fn git_command() -> Command {
     let mut cmd = Command::new("git");
     for var in [
@@ -242,6 +276,11 @@ fn git_command() -> Command {
         "GIT_COMMON_DIR",
         "GIT_CEILING_DIRECTORIES",
         "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
     ] {
         cmd.env_remove(var);
     }
@@ -832,27 +871,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Restores a possibly-unset `TZ` env var on drop, so the process-wide
-    /// mutation the timezone test below needs can never leak into later
-    /// tests even on assertion panic. Safe to mutate process-wide `TZ` here
-    /// specifically because every OTHER test in this file that spawns real
-    /// git either never calls `--since` at all, or (after this fix) always
-    /// passes an explicit `+00:00`-suffixed timestamp and explicit-offset
-    /// commit dates -- none of them depend on the ambient timezone, so a
-    /// concurrently-running test can't be perturbed by this one flipping it.
-    struct TzGuard(Option<String>);
-    impl TzGuard {
-        fn set(value: &str) -> Self {
-            let prev = std::env::var("TZ").ok();
-            std::env::set_var("TZ", value);
-            Self(prev)
+    /// Restores a possibly-unset env var on drop, so a process-wide mutation
+    /// a test needs (to simulate an AMBIENT var git_command() must strip --
+    /// setting it on a `Command` directly would instead land after
+    /// `git_command()`'s own `env_remove`, testing nothing) can never leak
+    /// into later tests even on assertion panic. Safe to mutate process-wide
+    /// state here specifically because both current uses (`TZ` below,
+    /// `GIT_CONFIG` in the git_command() redirection test) are each the only
+    /// test in this file that depends on that particular var, so a
+    /// concurrently-running test can't be perturbed by either one flipping
+    /// it.
+    struct EnvVarGuard {
+        name: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prev }
         }
     }
-    impl Drop for TzGuard {
+    impl Drop for EnvVarGuard {
         fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("TZ", v),
-                None => std::env::remove_var("TZ"),
+            match &self.prev {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
             }
         }
     }
@@ -874,7 +918,7 @@ mod tests {
         // this test, matching the review's own "reproduced under a
         // JST-vs-UTC mismatch" methodology without depending on the actual
         // host's real configured zone.
-        let _tz_guard = TzGuard::set("XXX8");
+        let _tz_guard = EnvVarGuard::set("TZ", "XXX8");
 
         let dir = scratch_dir("tz");
         init_repo(&dir);
@@ -925,6 +969,73 @@ mod tests {
              timezone bug, not something else"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_command_strips_git_config_so_writes_land_in_the_dash_c_repo_not_an_ambient_redirect() {
+        // Reproduces the critical-review finding on this exact function
+        // (git_command()'s own doc comment): git's documented GIT_CONFIG
+        // legacy variable makes a `git config` WRITE use that file "as if
+        // it were provided via --file", completely bypassing `-C <dir>` --
+        // the EXACT mechanism behind the original "silently overwrote
+        // user.name/user.email" corruption symptom that GIT_DIR/
+        // GIT_WORK_TREE stripping alone did not close.
+        let dir = scratch_dir("git-config-redirect");
+        init_repo(&dir);
+        let decoy = dir.join("decoy.cfg");
+
+        // Set GIT_CONFIG as an AMBIENT (process-wide) var, not chained onto
+        // the Command below via `.env()` -- the latter would apply AFTER
+        // git_command()'s own `env_remove`, silently re-adding the very
+        // variable being tested and proving nothing.
+        let _guard = EnvVarGuard::set("GIT_CONFIG", &decoy);
+
+        let status = git_command()
+            .arg("-C")
+            .arg(&dir)
+            .args(["config", "user.email", "redirect-test@example.com"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert!(
+            !decoy.exists(),
+            "git_command()'s GIT_CONFIG stripping must prevent an ambient \
+             GIT_CONFIG from redirecting this write into a throwaway file \
+             instead of the -C-selected repo's own config"
+        );
+        let out = git(&dir, &["config", "--local", "--get", "user.email"]);
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            "redirect-test@example.com",
+            "the write must land in the -C-selected repo's own local \
+             config, which is the whole point of passing -C at all"
+        );
+
+        // Sanity check proving this is genuinely the GIT_CONFIG bug and not
+        // something else: the SAME ambient GIT_CONFIG, via a bare
+        // Command::new("git") that deliberately bypasses git_command()'s
+        // stripping (the only place in this test file that does so, and
+        // only to demonstrate the pre-fix behavior), really does redirect
+        // into the decoy file.
+        let _ = std::fs::remove_file(&decoy);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["config", "user.name", "Redirected Sanity Check"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            decoy.exists(),
+            "sanity check: an unstripped ambient GIT_CONFIG really does \
+             redirect a plain `git -C <dir> config` write into the decoy \
+             file -- confirms the assertions above are testing the real \
+             bug, not a no-op"
+        );
+
+        drop(_guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
