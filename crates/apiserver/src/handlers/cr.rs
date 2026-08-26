@@ -1061,6 +1061,23 @@ impl ConcurrencyGate {
 static CEL_EVAL_THREAD_GATE: ConcurrencyGate =
     ConcurrencyGate::new(MAX_CONCURRENT_CEL_EVAL_THREADS);
 
+/// Releases a `ConcurrencyGate` slot on `Drop`, so the slot is freed whether the guarded
+/// scope returns normally or unwinds from a panic. `execute_cel_with_budget`'s spawned
+/// thread runs an untrusted, CRD-author-supplied CEL rule via `cel::Program::execute`,
+/// which has reachable `panic!` sites in the `cel` crate's evaluator (e.g. cel 0.14.3
+/// `objects.rs:1546`, `:1467`). A manually-placed `gate.release()` call *after*
+/// `execute()` would be skipped by such a panic, permanently leaking the slot -- enough
+/// leaked panics wedge `CEL_EVAL_THREAD_GATE` for every future CR write's CEL
+/// validation, the exact DoS this file exists to prevent, just triggered by malformed
+/// input instead of slow input.
+struct GateGuard<'a>(&'a ConcurrencyGate);
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// Marker: a CEL evaluation was rejected without running to completion — either it did
 /// not finish within `CEL_RULE_EVAL_BUDGET`, or evaluation was refused outright because
 /// `MAX_CONCURRENT_CEL_EVAL_THREADS` other over-budget evaluations are already in flight.
@@ -1094,8 +1111,8 @@ fn execute_cel_with_budget(
     let program = std::sync::Arc::clone(program);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let _guard = GateGuard(gate);
         let result = program.execute(&cel_ctx);
-        gate.release();
         let _ = tx.send(result);
     });
     rx.recv_timeout(budget)
@@ -9049,6 +9066,44 @@ mod tests {
             "once the gate has a free slot again, evaluation must proceed and succeed \
              exactly as it did before this fix -- the cap must not permanently wedge \
              evaluation after a burst subsides"
+        );
+    }
+
+    // Before this fix, `execute_cel_with_budget`'s spawned thread called `gate.release()`
+    // manually *after* `program.execute()` returned. The `cel` crate has reachable
+    // `panic!` sites in its evaluator (e.g. cel 0.14.3 objects.rs:1546, :1467), and a
+    // panic there would unwind straight past that manual release call, leaking the slot
+    // permanently. Enough leaked panics (up to `MAX_CONCURRENT_CEL_EVAL_THREADS`) would
+    // wedge `CEL_EVAL_THREAD_GATE` for every future CR write's CEL validation
+    // cluster-wide -- the exact DoS this file exists to prevent, just triggered by
+    // malformed/panicking CEL input instead of slow input. `GateGuard` fixes this by
+    // releasing on `Drop`, which Rust's unwind machinery runs even when the guarded
+    // scope panics (this workspace does not set `panic = "abort"`). Exercises
+    // `GateGuard` directly against a small local gate, mirroring the exact shape of the
+    // real spawned-thread body, rather than relying on the `cel` crate's internal panic
+    // sites to actually fire.
+    #[test]
+    fn gate_guard_releases_slot_even_when_guarded_scope_panics() {
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
+        assert!(GATE.try_acquire(), "gate must start with a free slot");
+
+        let panicked = std::thread::spawn(|| {
+            let _guard = GateGuard(&GATE);
+            panic!("simulated cel::Program::execute panic, e.g. cel 0.14.3 objects.rs:1546");
+        })
+        .join();
+
+        assert!(
+            panicked.is_err(),
+            "test setup bug: the spawned thread must actually panic to exercise the \
+             unwind path this test is checking"
+        );
+        assert!(
+            GATE.try_acquire(),
+            "a slot leaked across a panic inside the guarded region -- GateGuard's Drop \
+             must run gate.release() during unwinding, not only on normal return, or a \
+             handful of panicking CEL rules permanently wedges the process-wide gate and \
+             blocks every future CR write's CEL validation"
         );
     }
 
