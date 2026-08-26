@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Notify, Semaphore};
 use u7s_store::{ListOptions, SqliteStore, Store};
@@ -674,6 +674,17 @@ pub struct AppState<S = SqliteStore> {
     /// `AuthLayer` to classify requests. See `FlowControlCache` for the invalidation
     /// strategy.
     pub flowcontrol_cache: Arc<FlowControlCache>,
+    /// Whether the boot-time bootstrap manifest apply
+    /// (`bootstrap_apply::apply_well_known_manifest_dir`, raced against `serve_tls` via
+    /// `tokio::select!` in `run()`) has completed successfully. `/healthz` gates on this so a
+    /// load balancer, or `scripts/install.sh`'s `wait_for_apiserver`, can never observe a 200
+    /// before boot is actually done. A manifest-apply failure is fatal and takes the whole
+    /// process down via that same `tokio::select!`, so this flag simply never flips to `true`
+    /// in that case — closing the race a fixed sleep-and-recheck in install.sh could only
+    /// narrow. Defaults to `true` (ready): only `run()`'s production boot sequence sets this
+    /// `false` until the task resolves; no test needs the gated behavior at construction time,
+    /// same pattern as `node_kubelet_ports`/`sa_sig_cache`.
+    pub boot_ready: Arc<AtomicBool>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -743,6 +754,7 @@ impl<S> Clone for AppState<S> {
             cr_conversion_cache: self.cr_conversion_cache.clone(),
             sa_sig_cache: self.sa_sig_cache.clone(),
             flowcontrol_cache: self.flowcontrol_cache.clone(),
+            boot_ready: self.boot_ready.clone(),
         }
     }
 }
@@ -946,6 +958,11 @@ impl<S: Store> AppState<S> {
                 crate::sa_sig_cache::DEFAULT_CAPACITY,
             )),
             flowcontrol_cache: Arc::new(FlowControlCache::new()),
+            // See the field's doc: run() overwrites this with a fresh `false` flag before
+            // spawning the boot-time manifest-apply task; every test (and any caller that
+            // never boots that task) gets the ready default, matching node_kubelet_ports'
+            // pattern.
+            boot_ready: Arc::new(AtomicBool::new(true)),
         }
     }
 
