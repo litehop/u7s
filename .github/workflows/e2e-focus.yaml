@@ -231,6 +231,18 @@ jobs:
           mkdir -p "$WORKDIR"
           E2E_TOKEN="e2e-focus-admin-token-$(date +%s)"
           echo "$E2E_TOKEN,e2e-focus-admin,uid0,system:masters" > "$WORKDIR/token-auth.csv"
+          # CoreDNS moved off its compiled-in include_bytes! bundle onto
+          # bootstrap_apply::apply_well_known_manifest_dir (mayor-fiq79), which only
+          # applies manifests it finds on disk in --manifest-dir -- unlike
+          # scripts/install.sh (the production release-tarball path), this workflow
+          # never staged anything there, so CoreDNS silently stopped being applied
+          # and sonobuoy's preflight failed with "no dns pods found" (run 32922063667).
+          # Stage just the one vendored manifest this single-node runner needs;
+          # flannel.yaml/kube-proxy.yaml carry install.sh-only substitution
+          # placeholders and are irrelevant here (kube-proxy runs as its own binary
+          # below, no CNI needed for loopback networking).
+          mkdir -p "$WORKDIR/manifests"
+          cp manifests/coredns.yaml "$WORKDIR/manifests/"
           # No --konnectivity-proxy-addr: apiserver and kubelet are co-located on
           # this same runner
           ./target/release/u7s-apiserver \
@@ -244,6 +256,7 @@ jobs:
             --advertise-address https://127.0.0.1:6443 \
             --service-cluster-ip-range "10.96.0.0/12" \
             --kubelet-preferred-address 127.0.0.1 \
+            --manifest-dir "$WORKDIR/manifests" \
             >"$WORKDIR/apiserver.log" 2>&1 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
           for i in $(seq 1 30); do

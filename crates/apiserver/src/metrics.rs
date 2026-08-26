@@ -244,13 +244,11 @@ pub static DISCOVERY_BUILD_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
-/// Counter of failed `bootstrap_apply::apply_yaml_bundle` calls — every bootstrap addon
-/// manifest (e.g. CoreDNS, or a file under `/etc/u7s/manifests`) is installed via Server-Side
-/// Apply against this apiserver's own just-bound listener at boot. CoreDNS's own failure is
-/// caught and logged rather than aborting the apiserver (a missing addon is degraded-mode, not
-/// crash-worthy); a failure applying `/etc/u7s/manifests` is fatal instead (see
-/// `bootstrap_apply::apply_well_known_manifest_dir`). Either way, this counter is a signal an
-/// operator has that an install failed.
+/// Counter of failed `bootstrap_apply::apply_yaml_bundle` calls — every vendored or
+/// operator-supplied manifest under `/etc/u7s/manifests` (including CoreDNS's, mayor-fiq79) is
+/// installed via Server-Side Apply against this apiserver's own just-bound listener at boot,
+/// and a failure there is fatal (see `bootstrap_apply::apply_well_known_manifest_dir`). This
+/// counter is a signal an operator has that an install failed.
 pub static BOOTSTRAP_APPLY_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     let counter = IntCounter::new(
         "u7s_bootstrap_apply_failures_total",

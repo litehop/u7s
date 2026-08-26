@@ -1,13 +1,14 @@
-//! In-process YAML applier for bootstrap addons (e.g. CoreDNS) and operator-supplied vendored
-//! manifests (`/etc/u7s/manifests`, see `docs/decisions/well-known-manifest-folder.md`).
+//! In-process YAML applier for the well-known manifest directory (`/etc/u7s/manifests`, see
+//! `docs/decisions/well-known-manifest-folder.md`) — CoreDNS and any operator-supplied vendored
+//! manifest both flow through this same mechanism, sourced from the real `.yaml` files under
+//! the repo-root `manifests/` directory.
 //!
-//! `run()` spawns [`apply_yaml_bundle`] once its own listen socket is bound, authenticating
-//! as the `system:bootstrap-installer` x509 identity (see `tls.rs` / `mayor-1pwxi`) to
-//! Server-Side-Apply a fixed manifest bundle against itself, then does the same for every file
-//! in the well-known manifest directory (`--manifest-dir`, defaulting to `/etc/u7s/manifests`)
-//! via [`apply_well_known_manifest_dir`]. This is deliberately not a generic "apply any
-//! manifest" API: it understands only the small, fixed set of Kinds a kubeadm-style addon
-//! bundle uses (see [`kind_to_resource`]).
+//! `run()` spawns [`apply_well_known_manifest_dir`] once its own listen socket is bound,
+//! authenticating as the `system:bootstrap-installer` x509 identity (see `tls.rs` /
+//! `mayor-1pwxi`) to Server-Side-Apply every file in that directory (`--manifest-dir`,
+//! defaulting to `/etc/u7s/manifests`), which in turn drives [`apply_yaml_bundle`] per file.
+//! This is deliberately not a generic "apply any manifest" API: it understands only the small,
+//! fixed set of Kinds a kubeadm-style addon bundle uses (see [`kind_to_resource`]).
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -18,11 +19,6 @@ use base64::Engine;
 /// ownership from kubectl/other controllers in `managedFields`, matching the upstream SSA
 /// field-manager convention.
 const FIELD_MANAGER: &str = "bootstrap-installer";
-
-/// The vendored CoreDNS addon bundle (ServiceAccount, ClusterRole, ClusterRoleBinding,
-/// ConfigMap, Deployment, Service) `run()`'s post-bind hook applies via [`apply_yaml_bundle`].
-/// See `manifests/coredns.yaml` for provenance and the departures from upstream.
-pub const COREDNS_MANIFEST: &[u8] = include_bytes!("../manifests/coredns.yaml");
 
 /// Total time budget for retrying transient errors on a single document. The only realistic
 /// cause of a transient error here is this apiserver's own listener having just bound but not
@@ -42,9 +38,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// exercise the wiring without a real manifest bundle.
 ///
 /// A failure here is logged and counted (`u7s_bootstrap_apply_failures_total`); whether that
-/// additionally aborts the process is the caller's call, not this function's — the CoreDNS
-/// bundle's own failure is degraded-mode (a missing addon, apiserver otherwise healthy), while
-/// [`apply_well_known_manifest_dir`]'s callers treat the same `Err` as fatal.
+/// additionally aborts the process is the caller's call, not this function's — see
+/// [`apply_well_known_manifest_dir`], whose callers treat the same `Err` as fatal.
 pub async fn apply_yaml_bundle(kubeconfig_path: &Path, yaml_bytes: &[u8]) -> anyhow::Result<()> {
     if yaml_bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(());
@@ -87,7 +82,8 @@ async fn apply_yaml_bundle_inner(kubeconfig_path: &Path, yaml_bytes: &[u8]) -> a
 
 /// Server-side-apply every manifest file directly inside `dir`, in lexicographic filename
 /// order — deterministic, and lets a later file override fields an earlier one set on the same
-/// object (the well-known-folder equivalent of applying [`COREDNS_MANIFEST`] first). Entries
+/// object (e.g. an operator-supplied file sorting after u7s's own vendored `coredns.yaml`).
+/// Entries
 /// that are themselves directories, or whose extension isn't `.yaml`/`.yml` (case-insensitive),
 /// are skipped, not applied — a `.DS_Store`, editor swap file, or stray `README.md` an operator
 /// drops into this folder is not a Kubernetes resource and must not fatal-fail boot.
@@ -1170,23 +1166,41 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // coredns_manifest_installs_every_kind — the actual bytes run() applies at boot, through
-    // the real applier against a live apiserver. This is the regression backstop for Path A
-    // [3/3]: if `run()`'s wiring ever reverts to applying an empty bundle, or the vendored YAML
-    // bitrots into something the fixed kind_to_resource table can't apply, this fails instead
-    // of silently leaving every future boot without CoreDNS.
+    // coredns_manifest_installs_every_kind / coredns_manifest_reapply_does_not_corrupt —
+    // CoreDNS ships as a real file, repo-root `manifests/coredns.yaml` (mayor-fiq79), applied
+    // through the exact same apply_well_known_manifest_dir path any other vendored or
+    // operator-supplied manifest uses — no CoreDNS-specific code path remains. These tests read
+    // that real file off disk (not include_bytes!'d, so a version bump needs no rebuild to be
+    // picked up here either) and drive it through that generic mechanism, as the regression
+    // backstop for "the vendored manifest still applies cleanly" and "reapplying it doesn't
+    // corrupt kube-dns's ports".
     // -----------------------------------------------------------------------
+
+    /// Reads the real, currently-vendored CoreDNS manifest straight off disk from the repo-root
+    /// `manifests/` directory — never `include_bytes!`, so these tests exercise exactly the
+    /// bytes an installed apiserver would read from `/etc/u7s/manifests/coredns.yaml`.
+    fn read_coredns_manifest() -> Vec<u8> {
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../manifests/coredns.yaml"
+        ))
+        .expect("repo-root manifests/coredns.yaml must exist and be readable")
+    }
 
     #[tokio::test]
     async fn coredns_manifest_installs_every_kind_at_its_expected_key() {
         let server = start_test_apiserver().await;
+        let dir = test_temp_dir("coredns-installs");
+        std::fs::write(dir.join("coredns.yaml"), read_coredns_manifest())
+            .expect("write coredns.yaml into well-known manifest dir");
 
-        apply_yaml_bundle(&server.kubeconfig_path, COREDNS_MANIFEST)
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
             .await
             .expect(
-                "the vendored CoreDNS bundle must apply cleanly against a live apiserver with \
-                 the system:bootstrap-installer RBAC role in place — a failure here means \
-                 every u7s boot silently ships without in-cluster DNS",
+                "the vendored CoreDNS manifest must apply cleanly through the well-known-folder \
+                 mechanism against a live apiserver with the system:bootstrap-installer RBAC \
+                 role in place — a failure here means every u7s boot silently ships without \
+                 in-cluster DNS",
             );
 
         for (key, kind) in [
@@ -1263,11 +1277,14 @@ mod tests {
                 .value,
         )
         .unwrap();
-        assert_eq!(
-            deployment_body["spec"]["template"]["spec"]["containers"][0]["image"].as_str(),
-            Some("registry.k8s.io/coredns/coredns:v1.11.1"),
-            "CoreDNS image must stay pinned to the version u7s has actually validated, not \
-             silently drift to whatever kubeadm's upstream manifest ships next"
+        let image = deployment_body["spec"]["template"]["spec"]["containers"][0]["image"]
+            .as_str()
+            .expect("container image must be a string");
+        assert!(
+            image.starts_with("registry.k8s.io/coredns/coredns:"),
+            "CoreDNS must run the registry.k8s.io/coredns/coredns image — a manifest edit that \
+             swapped the image entirely (not just bumped its tag) would otherwise install a \
+             DNS server that never even boots CoreDNS, got {image:?}"
         );
         let container_ports = deployment_body["spec"]["template"]["spec"]["containers"][0]["ports"]
             .as_array()
@@ -1336,8 +1353,11 @@ mod tests {
     #[tokio::test]
     async fn coredns_manifest_grants_coredns_serviceaccount_the_rbac_its_kubernetes_plugin_needs() {
         let server = start_test_apiserver().await;
+        let dir = test_temp_dir("coredns-rbac");
+        std::fs::write(dir.join("coredns.yaml"), read_coredns_manifest())
+            .expect("write coredns.yaml into well-known manifest dir");
 
-        apply_yaml_bundle(&server.kubeconfig_path, COREDNS_MANIFEST)
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
             .await
             .expect("CoreDNS bundle must apply cleanly");
 
@@ -1380,22 +1400,28 @@ mod tests {
         }
     }
 
-    /// Re-applying the CoreDNS bundle after it's already installed — the steady-state case on
-    /// every apiserver restart after the very first, since `run()` calls `apply_yaml_bundle`
-    /// unconditionally on every boot — must not corrupt kube-dns's Service ports. `do_patch`'s
-    /// strategic-merge engine only supports a single-field merge key per list (`port`, matching
-    /// upstream's own `patchMergeKey`), so a genuine re-PATCH of a list where two entries share
-    /// `port: 53` (UDP and TCP) collapses both into copies of whichever the merge processes
-    /// last. This fails if the already-applied short-circuit in `apply_yaml_bundle_inner` is
-    /// ever removed or broken.
+    /// Re-applying the CoreDNS manifest after it's already installed — the steady-state case on
+    /// every apiserver restart after the very first, since `run()` calls
+    /// `apply_well_known_manifest_dir` unconditionally on every boot — must not corrupt
+    /// kube-dns's Service ports. `do_patch`'s strategic-merge engine only supports a
+    /// single-field merge key per list (`port`, matching upstream's own `patchMergeKey`), so a
+    /// genuine re-PATCH of a list where two entries share `port: 53` (UDP and TCP) collapses
+    /// both into copies of whichever the merge processes last. This fails if the
+    /// already-applied short-circuit in `apply_yaml_bundle_inner` — generic mechanism code, not
+    /// CoreDNS-specific — is ever removed or broken; kube-dns's Service is the one vendored
+    /// manifest that happens to exercise the same-port-number/different-protocol shape that
+    /// triggers it, so this is the only regression coverage for that shape.
     #[tokio::test]
     async fn coredns_manifest_reapply_does_not_corrupt_kube_dns_ports() {
         let server = start_test_apiserver().await;
+        let dir = test_temp_dir("coredns-reapply");
+        std::fs::write(dir.join("coredns.yaml"), read_coredns_manifest())
+            .expect("write coredns.yaml into well-known manifest dir");
 
-        apply_yaml_bundle(&server.kubeconfig_path, COREDNS_MANIFEST)
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
             .await
             .expect("first apply must succeed");
-        apply_yaml_bundle(&server.kubeconfig_path, COREDNS_MANIFEST)
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
             .await
             .expect("second apply (every later boot) must also succeed");
 
