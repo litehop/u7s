@@ -2250,6 +2250,8 @@ pub async fn replace_cr<S: Store>(
         )));
     }
 
+    let expected_revision = parse_resource_version(obj_meta.resource_version.as_deref())?;
+
     let key = cr_store_key(&group, &plural, None, &name);
 
     // Must exist before replace.
@@ -2259,6 +2261,28 @@ pub async fn replace_cr<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+
+    // Stale-resourceVersion PUTs must 409, not fall through into the CEL
+    // x-kubernetes-validations oldSelf comparison (validate_cr_schema below) against the
+    // freshly-read `existing` — mirrors check_replace_resource_version_precondition's doc
+    // comment in resource.rs and pods.rs's replace_pod, which fixed the identical race. A
+    // CRD author's oldSelf-based immutability rule comparing the incoming PUT body against
+    // `existing` (the object as it stands right now, not as of the client's own
+    // resourceVersion) would otherwise misclassify a legitimate concurrent-write race as a
+    // permanent 422 validation failure instead of the retryable 409 that tells client-go's
+    // Update-on-conflict loop to re-GET and resubmit.
+    if let Some(expected) = expected_revision {
+        if expected != stored.revision {
+            return Err(store_err_cr(
+                u7s_store::StoreError::RevisionMismatch {
+                    expected,
+                    current: stored.revision,
+                },
+                &name,
+                &ctx.kind,
+            ));
+        }
+    }
 
     // Preserve uid + creationTimestamp from stored.
     let existing: serde_json::Value =
@@ -2303,14 +2327,10 @@ pub async fn replace_cr<S: Store>(
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
-    let meta: crate::types::ObjectMeta =
-        serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
-    let expected_rv = parse_resource_version(meta.resource_version.as_deref())?;
-
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
-        .put(&key, Bytes::from(bytes), expected_rv)
+        .put(&key, Bytes::from(bytes), expected_revision)
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
     evict_cr_conversion_cache(&state, existing["metadata"]["resourceVersion"].as_str());
@@ -3095,6 +3115,8 @@ pub async fn replace_cr_namespaced<S: Store>(
         )));
     }
 
+    let expected_revision = parse_resource_version(obj_meta.resource_version.as_deref())?;
+
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
 
     let stored = state
@@ -3103,6 +3125,28 @@ pub async fn replace_cr_namespaced<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+
+    // Stale-resourceVersion PUTs must 409, not fall through into the CEL
+    // x-kubernetes-validations oldSelf comparison (validate_cr_schema below) against the
+    // freshly-read `existing` — mirrors check_replace_resource_version_precondition's doc
+    // comment in resource.rs and pods.rs's replace_pod, which fixed the identical race. A
+    // CRD author's oldSelf-based immutability rule comparing the incoming PUT body against
+    // `existing` (the object as it stands right now, not as of the client's own
+    // resourceVersion) would otherwise misclassify a legitimate concurrent-write race as a
+    // permanent 422 validation failure instead of the retryable 409 that tells client-go's
+    // Update-on-conflict loop to re-GET and resubmit.
+    if let Some(expected) = expected_revision {
+        if expected != stored.revision {
+            return Err(store_err_cr(
+                u7s_store::StoreError::RevisionMismatch {
+                    expected,
+                    current: stored.revision,
+                },
+                &name,
+                &ctx.kind,
+            ));
+        }
+    }
 
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
@@ -3146,14 +3190,10 @@ pub async fn replace_cr_namespaced<S: Store>(
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
-    let meta: crate::types::ObjectMeta =
-        serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
-    let expected_rv = parse_resource_version(meta.resource_version.as_deref())?;
-
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
-        .put(&key, Bytes::from(bytes), expected_rv)
+        .put(&key, Bytes::from(bytes), expected_revision)
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
     evict_cr_conversion_cache(&state, existing["metadata"]["resourceVersion"].as_str());
@@ -10802,6 +10842,160 @@ mod tests {
         );
     }
 
+    // A stale-resourceVersion replace_cr PUT whose body diverges from the freshly-stored CR on
+    // a CEL-immutable field (because another writer's concurrent update changed it) must return
+    // 409 Conflict, not 422 Unprocessable Entity. Mirrors pods.rs's
+    // replace_pod_returns_409_not_422_when_stale_put_diverges_on_nodename and the original
+    // resource.rs fix, applied to the identical CR-replace race. Without checking
+    // resourceVersion before validate_cr_schema's CEL oldSelf comparison, a client that read
+    // the widget before another writer's concurrent color change
+    // — and PUTs its own now-stale copy back, never intending to touch color at all — gets its
+    // stale color misclassified as a client-initiated violation of the CRD's `self == oldSelf`
+    // rule. A 422 here is a permanent failure client-go's Update-on-conflict loop never retries;
+    // 409 is the signal that tells it to re-GET and resubmit against the current object.
+    #[tokio::test]
+    async fn replace_cr_returns_409_not_422_when_stale_put_diverges_on_cel_immutable_field() {
+        let state = make_state();
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Cluster",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "spec": {
+                                        "type": "object",
+                                        "properties": {
+                                            "color": {
+                                                "type": "string",
+                                                "x-kubernetes-validations": [{
+                                                    "rule": "self == oldSelf",
+                                                    "message": "color is immutable"
+                                                }]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                crd_bytes
+            )
+            .await
+            .is_ok(),
+            "install CRD with immutability CEL rule"
+        );
+
+        let name = "race-widget".to_string();
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string()
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "example.io/v1",
+                        "kind": "Widget",
+                        "metadata": { "name": &name },
+                        "spec": { "color": "blue" }
+                    })
+                    .to_string()
+                ),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let key = cr_store_key("example.io", "widgets", None, &name);
+        let rv0 = state.store.get(&key).await.unwrap().unwrap().revision;
+
+        // Simulate a concurrent writer's legitimate update landing between the stale client's
+        // GET (at rv0) and its PUT below: color changes from blue to green.
+        let concurrent_update = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": &name, "resourceVersion": rv0.to_string() },
+            "spec": { "color": "green" }
+        });
+        state
+            .store
+            .put(
+                &key,
+                Bytes::from(serde_json::to_vec(&concurrent_update).unwrap()),
+                Some(rv0),
+            )
+            .await
+            .expect("simulated concurrent update");
+
+        // The stale client's PUT: still carries the pre-race color (blue) it read at rv0. It
+        // never intended to touch color at all.
+        let stale_put = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name, "resourceVersion": rv0.to_string() },
+                "spec": { "color": "blue" }
+            })
+            .to_string(),
+        );
+
+        let err = expect_err_status(
+            replace_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    name.clone(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                stale_put,
+            )
+            .await,
+            "a stale-resourceVersion PUT racing a concurrent color change must be rejected",
+        );
+
+        assert_eq!(
+            err.0,
+            StatusCode::CONFLICT,
+            "a stale-resourceVersion PUT racing a concurrent CEL-immutable field change must \
+             return 409 Conflict (retryable) — a 422 here permanently fails the caller instead \
+             of letting it re-GET and resubmit against the now-current object"
+        );
+    }
+
     // replace_cr_namespaced with a stale resourceVersion must return 409 Conflict.
     // Optimistic concurrency control (OCC) protects against lost updates: if a client sends
     // a PUT with a resourceVersion that no longer matches the stored revision, the server
@@ -10870,6 +11064,158 @@ mod tests {
         assert_eq!(
             json["reason"], "Conflict",
             "reason must be Conflict (got: {json})"
+        );
+    }
+
+    // Namespaced counterpart of
+    // replace_cr_returns_409_not_422_when_stale_put_diverges_on_cel_immutable_field: verifies
+    // replace_cr_namespaced independently, since it is a distinct code path from replace_cr
+    // (own key derivation, own stored-object read) that could regress separately even if
+    // replace_cr's ordering is fixed.
+    #[tokio::test]
+    async fn replace_cr_namespaced_returns_409_not_422_when_stale_put_diverges_on_cel_immutable_field(
+    ) {
+        let state = make_state();
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "gadgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "gadgets",
+                        "singular": "gadget",
+                        "kind": "Gadget",
+                        "listKind": "GadgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "spec": {
+                                        "type": "object",
+                                        "properties": {
+                                            "color": {
+                                                "type": "string",
+                                                "x-kubernetes-validations": [{
+                                                    "rule": "self == oldSelf",
+                                                    "message": "color is immutable"
+                                                }]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                crd_bytes
+            )
+            .await
+            .is_ok(),
+            "install namespaced CRD with immutability CEL rule"
+        );
+
+        let ns = "default".to_string();
+        let name = "race-gadget".to_string();
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    ns.clone(),
+                    "gadgets".to_string()
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "example.io/v1",
+                        "kind": "Gadget",
+                        "metadata": { "name": &name, "namespace": &ns },
+                        "spec": { "color": "blue" }
+                    })
+                    .to_string()
+                ),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let key = cr_store_key("example.io", "gadgets", Some(&ns), &name);
+        let rv0 = state.store.get(&key).await.unwrap().unwrap().revision;
+
+        // Simulate a concurrent writer's legitimate update landing between the stale client's
+        // GET (at rv0) and its PUT below: color changes from blue to green.
+        let concurrent_update = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Gadget",
+            "metadata": { "name": &name, "namespace": &ns, "resourceVersion": rv0.to_string() },
+            "spec": { "color": "green" }
+        });
+        state
+            .store
+            .put(
+                &key,
+                Bytes::from(serde_json::to_vec(&concurrent_update).unwrap()),
+                Some(rv0),
+            )
+            .await
+            .expect("simulated concurrent update");
+
+        // The stale client's PUT: still carries the pre-race color (blue) it read at rv0. It
+        // never intended to touch color at all.
+        let stale_put = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Gadget",
+                "metadata": { "name": &name, "namespace": &ns, "resourceVersion": rv0.to_string() },
+                "spec": { "color": "blue" }
+            })
+            .to_string(),
+        );
+
+        let err = expect_err_status(
+            replace_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    ns.clone(),
+                    "gadgets".to_string(),
+                    name.clone(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                stale_put,
+            )
+            .await,
+            "a stale-resourceVersion PUT racing a concurrent color change must be rejected",
+        );
+
+        assert_eq!(
+            err.0,
+            StatusCode::CONFLICT,
+            "a stale-resourceVersion PUT racing a concurrent CEL-immutable field change must \
+             return 409 Conflict (retryable) — a 422 here permanently fails the caller instead \
+             of letting it re-GET and resubmit against the now-current object"
         );
     }
 
