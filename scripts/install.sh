@@ -851,6 +851,10 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$STATE_DIR
 ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --token-auth-file $STATE_DIR/token-auth-file
+# SIGHUP re-scans /etc/u7s/manifests in place (mayor-bh36n) instead of restarting -- 'kill -HUP'
+# reports success the instant the signal is delivered, so a failed reload is only visible via
+# 'journalctl -u u7s-apiserver', never through this reload job's own exit status.
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=2
 
