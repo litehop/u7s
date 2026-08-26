@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 u7s-store       = { path = "../store" }
+u7s-scheduler   = { path = "../scheduler" }
 axum            = { version = "0.8", features = ["ws"] }
 tower           = "0.5"
 tower-service   = "0.3"

@@ -10,6 +10,12 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info};
 use u7s_kubeconfig::HyperApiClient;
 
+mod run;
+/// The scheduler's watch/schedule loop as a callable library function — see
+/// `run.rs` for why (`u7s-apiserver`'s `--embedded-scheduler` task calls this
+/// directly).
+pub use run::run_scheduler;
+
 // ---------------------------------------------------------------------------
 // HTTP helpers — delegates to HyperApiClient in kubeconfig.
 // ---------------------------------------------------------------------------

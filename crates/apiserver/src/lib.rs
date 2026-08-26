@@ -554,6 +554,38 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         });
     }
 
+    // 10h. Optionally run u7s-scheduler's watch/schedule loop as a supervised background
+    // task inside this process instead of relying on a separately launched `u7s-scheduler`
+    // binary (see --embedded-scheduler's own doc in args.rs for the default-false rationale
+    // and the honest trade-off: an apiserver restart now also interrupts scheduling, since
+    // the two no longer restart independently). Dials out over loopback TLS to this same
+    // apiserver using the scheduler's own dedicated system:kube-scheduler kubeconfig already
+    // written above (5a) — exactly like the standalone binary does today — rather than an
+    // in-process client, since that would touch far more of the apiserver's internals for no
+    // benefit proportionate to this change's scope.
+    if args.embedded_scheduler {
+        tracing::info!("embedded scheduler enabled (--embedded-scheduler true)");
+        let scheduler_kubeconfig = scheduler_kubeconfig_path.to_string_lossy().into_owned();
+        tokio::spawn(async move {
+            loop {
+                let path = scheduler_kubeconfig.clone();
+                if let Err(e) = run_supervised_scheduler_attempt(async move {
+                    u7s_scheduler::run_scheduler(&path, None).await
+                })
+                .await
+                {
+                    tracing::error!(
+                        "embedded scheduler task ended ({e:#}); restarting in 5s — the \
+                         scheduler's own resync/retry design (RESYNC_INTERVAL, \
+                         MAX_PREEMPTION_ATTEMPTS) re-drives in-flight scheduling decisions \
+                         safely from scratch once it reconnects"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+
     // 11. Build axum router and attach tower layers.
     //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
     //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
@@ -679,6 +711,30 @@ where
         tracing::error!(
             "SIGHUP reload: reload task panicked ({e}); the next SIGHUP will still be handled"
         );
+    }
+}
+
+/// Runs one embedded-scheduler task attempt with panic isolation, mirroring
+/// `run_supervised_reload`'s pattern above but for `u7s_scheduler::run_scheduler`: a panic
+/// inside `scheduler_task` (an unexpected internals panic — `run_scheduler`'s own code never
+/// panics by design) is caught by this fresh `tokio::spawn`'s own unwind boundary instead of
+/// unwinding the caller's supervising loop, so one panic doesn't permanently end scheduling for
+/// the rest of the apiserver process's life. Unlike `run_supervised_reload` (which always
+/// succeeds or panics, never returns a real error), `run_scheduler` can also return `Err` on a
+/// setup failure (e.g. a malformed kubeconfig) — that error is propagated here rather than
+/// swallowed, so the caller's log message covers both cases uniformly. Pulled out to its own
+/// function (Rule 14) since the real call site is inside a `tokio::spawn`ed supervising loop
+/// and isn't independently testable there — see the `run_supervised_scheduler_attempt_*` tests
+/// below.
+async fn run_supervised_scheduler_attempt<F>(scheduler_task: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    match tokio::spawn(scheduler_task).await {
+        Ok(result) => result,
+        Err(join_err) => Err(anyhow::anyhow!(
+            "embedded scheduler task panicked: {join_err}"
+        )),
     }
 }
 
@@ -7833,6 +7889,54 @@ mod tests {
         );
     }
 
+    /// Mirrors `run_supervised_reload_survives_a_panicking_reload` above but for
+    /// `run_supervised_scheduler_attempt`: a panic inside the embedded scheduler
+    /// task (an unexpected internals bug — `run_scheduler` never panics by design) must be
+    /// caught and reported as an `Err`, not left to unwind into the caller's supervising loop
+    /// in `run()` — without this, one panic would silently and permanently end scheduling for
+    /// the rest of the apiserver process's life while it kept serving every other request fine,
+    /// with nothing in the logs pointing at scheduling specifically.
+    #[tokio::test]
+    async fn run_supervised_scheduler_attempt_survives_a_panicking_task() {
+        let result =
+            run_supervised_scheduler_attempt(async { panic!("simulated scheduler bug") }).await;
+        assert!(
+            result.is_err(),
+            "a panicking scheduler task must come back as an Err the caller can log and retry \
+             on, not unwind out of run_supervised_scheduler_attempt itself"
+        );
+    }
+
+    /// `run_supervised_scheduler_attempt` must also propagate a genuine `Err` from
+    /// `run_scheduler` itself (e.g. a malformed kubeconfig at startup) rather than only
+    /// handling the panic case — a caller that only checked for panics would silently treat a
+    /// real setup failure as success and never log or retry it.
+    #[tokio::test]
+    async fn run_supervised_scheduler_attempt_propagates_a_real_error() {
+        let result =
+            run_supervised_scheduler_attempt(async { Err(anyhow::anyhow!("bad kubeconfig")) })
+                .await;
+        assert_eq!(
+            result.err().map(|e| e.to_string()),
+            Some("bad kubeconfig".to_owned()),
+            "a real Err from the scheduler task must reach the caller unchanged, not be \
+             swallowed or replaced by run_supervised_scheduler_attempt's own panic handling"
+        );
+    }
+
+    /// A successful scheduler task attempt (in production, `run_scheduler` returning `Ok` —
+    /// which its own infinite loop never actually does, but the type permits it) must come back
+    /// as `Ok`, not be misreported as a failure that triggers an unnecessary restart-and-log.
+    #[tokio::test]
+    async fn run_supervised_scheduler_attempt_propagates_success() {
+        let result = run_supervised_scheduler_attempt(async { Ok(()) }).await;
+        assert!(
+            result.is_ok(),
+            "a successful scheduler task attempt must come back as Ok, not be misreported as a \
+             failure"
+        );
+    }
+
     /// `record_manifest_apply_outcome` is the only place that flips `boot_ready` to true, so a
     /// failed boot-time manifest apply must never mark the apiserver ready — that's what makes
     /// `/healthz` a deterministic "boot complete" signal instead of the old always-200 handler.
@@ -10398,6 +10502,7 @@ mod tests {
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
             manifest_dir: "/etc/u7s/manifests".into(),
+            embedded_scheduler: false,
         };
         let tls = crate::tls::generate_tls(&args).expect("generate_tls must succeed");
 
@@ -11001,6 +11106,7 @@ mod tests {
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
             manifest_dir: manifest_dir.to_string_lossy().into_owned(),
+            embedded_scheduler: false,
         };
         let kubeconfig_path = std::path::PathBuf::from(&args.kubeconfig);
 
@@ -11140,6 +11246,229 @@ mod tests {
             "state applied by the FIRST successful reload must survive a later reload that \
              hits a bad manifest — a bad edit must not roll back or disturb already-applied \
              state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // --embedded-scheduler. Like the SIGHUP test above, these drive the real,
+    // unmodified `run()` end-to-end against a live TLS listener — the only way to prove the
+    // scheduler task `run()` conditionally spawns actually schedules a real pod through this
+    // process's own mTLS-authenticated HTTP surface, not just that
+    // `u7s_scheduler::run_scheduler` works in isolation (already covered by the scheduler
+    // crate's own tests against a mock server).
+    // -----------------------------------------------------------------------
+
+    /// Builds the `Args` both `--embedded-scheduler` tests below share, varying only the flag
+    /// itself — isolates each test to that one variable.
+    fn embedded_scheduler_test_args(embedded_scheduler: bool) -> (Args, std::path::PathBuf, u16) {
+        let dir = std::env::temp_dir().join(format!(
+            "u7s-embedded-scheduler-test-{}-{}-{:?}",
+            embedded_scheduler,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos(),
+            std::thread::current().id()
+        ));
+        let manifest_dir = dir.join("manifests");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        // Bind-then-drop to find a free port: run() binds its own listener internally with no
+        // injection point for a test-owned one (same approach as the SIGHUP test above).
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            listener.local_addr().expect("local addr").port()
+        };
+        let args = Args {
+            db: dir.join("state.db").to_string_lossy().into_owned(),
+            listen: format!("127.0.0.1:{port}"),
+            kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
+            token_auth_file: None,
+            sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
+            sa_pub: dir.join("sa.pub").to_string_lossy().into_owned(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
+            advertise_address: Some(format!("https://127.0.0.1:{port}")),
+            service_cluster_ip_range: "10.96.0.0/12".into(),
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            node_kubelet_port: vec![],
+            konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
+            manifest_dir: manifest_dir.to_string_lossy().into_owned(),
+            embedded_scheduler,
+        };
+        (args, dir, port)
+    }
+
+    /// Starts `run(args)` in the background and returns an admin-identity mTLS client + base
+    /// server URL once `/healthz` answers — shared setup for both `--embedded-scheduler` tests
+    /// below, reusing the SIGHUP test's own kubeconfig-wait/client-build helpers since both
+    /// need exactly the same "real listener, real mTLS" setup.
+    async fn start_embedded_scheduler_test_server(args: Args) -> (reqwest::Client, String) {
+        let kubeconfig_path = std::path::PathBuf::from(&args.kubeconfig);
+        tokio::spawn(run(args));
+        let raw_kubeconfig = sighup_test_wait_for_file(&kubeconfig_path).await;
+        let (client, server) = sighup_test_client_from_kubeconfig(&raw_kubeconfig);
+        let mut healthy = false;
+        for _ in 0..200 {
+            if client
+                .get(format!("{server}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                healthy = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            healthy,
+            "apiserver must become reachable within 5s of run() starting"
+        );
+        (client, server)
+    }
+
+    /// Creates a Node with enough allocatable CPU to fit `create_unschedulable_pod`'s request,
+    /// then an unscheduled Pod referencing it — the minimal fixture the embedded scheduler
+    /// needs to have anywhere to place the pod (`pick_node` GETs `/api/v1/nodes` and skips any
+    /// node whose allocatable cpu doesn't fit, same as the standalone scheduler).
+    async fn create_node_and_unschedulable_pod(
+        client: &reqwest::Client,
+        server: &str,
+        node_name: &str,
+        pod_name: &str,
+    ) {
+        let node_resp = client
+            .post(format!("{server}/api/v1/nodes"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {"name": node_name},
+                    "status": {"allocatable": {"cpu": "1000m"}}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("POST node must not fail transport-wise");
+        assert!(
+            node_resp.status().is_success(),
+            "creating the fixture Node must succeed; got {}",
+            node_resp.status()
+        );
+
+        let pod_resp = client
+            .post(format!("{server}/api/v1/namespaces/default/pods"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"name": pod_name, "namespace": "default"},
+                    "spec": {
+                        "containers": [{
+                            "name": "c",
+                            "image": "does-not-matter:latest",
+                            "resources": {"requests": {"cpu": "100m"}}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("POST pod must not fail transport-wise");
+        assert!(
+            pod_resp.status().is_success(),
+            "creating the fixture Pod must succeed; got {}",
+            pod_resp.status()
+        );
+    }
+
+    /// Regression: proves the embedded scheduler task `run()` conditionally
+    /// spawns under `--embedded-scheduler true` actually drives a real pod from Pending to
+    /// bound, through this same process's own API surface — not just that
+    /// `u7s_scheduler::run_scheduler` works against a mock server (already covered in the
+    /// scheduler crate). If the `tokio::spawn` wiring in `run()` were ever dropped, or gated on
+    /// the wrong flag, this pod would stay Pending forever and this test would time out.
+    #[tokio::test]
+    async fn embedded_scheduler_true_schedules_a_pod_through_this_process() {
+        let (args, _dir, _port) = embedded_scheduler_test_args(true);
+        let (client, server) = start_embedded_scheduler_test_server(args).await;
+
+        create_node_and_unschedulable_pod(&client, &server, "worker-0", "embedded-sched-pod").await;
+
+        let pod_url = format!("{server}/api/v1/namespaces/default/pods/embedded-sched-pod");
+        let mut node_name = String::new();
+        for _ in 0..200 {
+            if let Ok(resp) = client.get(&pod_url).send().await {
+                if let Ok(text) = resp.text().await {
+                    if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(n) = body["spec"]["nodeName"].as_str() {
+                            if !n.is_empty() {
+                                node_name = n.to_owned();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            node_name, "worker-0",
+            "--embedded-scheduler true must actually bind the pod to the only fitting node \
+             within 5s — an empty spec.nodeName here means the embedded scheduler task never \
+             ran (or never reached this apiserver), the exact regression this bead's tokio::spawn \
+             wiring must prevent"
+        );
+    }
+
+    /// The other half of the same regression: `--embedded-scheduler false` (the default) must
+    /// NOT spawn the scheduler task, so a pod created against this apiserver alone stays
+    /// Pending — proving the flag genuinely gates the task rather than the task always running
+    /// regardless of the flag's value (which `embedded_scheduler_true_schedules_a_pod_through_
+    /// this_process` alone could not distinguish from "the flag is ignored and it always runs").
+    #[tokio::test]
+    async fn embedded_scheduler_false_leaves_the_pod_pending() {
+        let (args, _dir, _port) = embedded_scheduler_test_args(false);
+        let (client, server) = start_embedded_scheduler_test_server(args).await;
+
+        create_node_and_unschedulable_pod(&client, &server, "worker-0", "unscheduled-pod").await;
+
+        // Generous relative to how fast the companion test above observes a real bind (well
+        // under 5s) — if the flag were ignored and the scheduler ran anyway, it would have
+        // bound this pod many times over within this window.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let pod_url = format!("{server}/api/v1/namespaces/default/pods/unscheduled-pod");
+        let text = client
+            .get(&pod_url)
+            .send()
+            .await
+            .expect("GET pod must not fail transport-wise")
+            .text()
+            .await
+            .expect("pod GET response must be readable");
+        let body: serde_json::Value =
+            serde_json::from_str(&text).expect("pod GET must return JSON");
+        assert!(
+            body["spec"]["nodeName"].as_str().unwrap_or("").is_empty(),
+            "--embedded-scheduler false must never spawn the scheduler task — a non-empty \
+             spec.nodeName here means something scheduled this pod despite the flag, which \
+             would silently double-schedule every pod in a deployment that also runs the \
+             standalone u7s-scheduler binary against the same cluster"
         );
     }
 }
