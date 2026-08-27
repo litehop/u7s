@@ -142,6 +142,14 @@ PR when green.
    auto-drained (they post to bd notes, not a PR, and bd exposes no
    per-note timestamp to confirm against) — they always surface in
    `pending_non_pr_reviews` for the mayor to dispatch and confirm by hand.
+   It then self-heals any open `worker/agent-*` PR the SubagentStop hook
+   never queued at all (mayor-9syl7 — compensates for a push landing on a
+   non-`worker/agent-*` head, upstream anthropics/claude-code#27755, or the
+   hook exiting with an error): a PR with no active queue file naming its
+   URL and no critical-reviewer review yet gets synthesized straight into
+   `pending_reviews`, logged with a `mayor-tick reconcile:` prefix so an
+   audit can tell it apart from a hook-queued entry; a PR already covered
+   by either signal is left alone.
 2. Read the state file and act on the script's exit code (non-zero codes
    are OR-able; the highest fires if more than one condition matched):
    - **0** — noop, nothing for this tick.
@@ -160,8 +168,9 @@ PR when green.
      investigate why it didn't qualify (no review yet vs. a
      needs-changes/needs-discussion verdict on record) — do not merge it
      yourself without resolving that first; for each `queue_warnings`
-     entry, investigate the malformed queue file (a broken `queued_at` —
-     it will never auto-drain until fixed or removed by hand).
+     entry, investigate the queue file — either a broken/missing
+     `queued_at` or an unrecognized `deliverable_type` (mayor-s7nn6), both
+     of which never auto-drain until fixed or removed by hand.
    - **30** — `worktree_anomalies` lists a worker branch with no PR at
      all; investigate whether that dispatch stalled or crashed.
 3. If you ever merge a PR by hand instead of letting the script queue it
