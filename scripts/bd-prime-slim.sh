@@ -48,8 +48,21 @@ render_slim_prime() {
   # awk) -- bash 5 does the same expansion in milliseconds, but operators
   # can't be assumed to be on bash 5. awk finds the marker LINE and slices
   # around it in place, so both splits run in ms regardless of bash version.
+  #
+  # header: takes the FIRST marker occurrence. Safe because the header
+  # marker structurally precedes every memory body in bd's template -- a
+  # memory body containing that literal string can only appear AFTER it.
+  #
+  # footer: must take the LAST marker occurrence, not the first. A memory
+  # body can legitimately quote the footer marker string (e.g. a memory
+  # ABOUT the session-close protocol) and bd renders bodies verbatim with
+  # no indent, so a body's copy of the marker lands at column 1, same as
+  # the real one -- column-position alone can't disambiguate them. The
+  # real footer is always the LAST occurrence because it's the template's
+  # trailing section, rendered only after every memory body.
   header="$(awk -v marker="$MEMORY_HEADER_MARKER" 'index($0, marker) > 0 {exit} {print}' "$export_file")"
-  footer="$(awk -v marker="$FOOTER_MARKER" 'index($0, marker) > 0 {p=1} p' "$export_file")"
+  footer_line="$(awk -v marker="$FOOTER_MARKER" 'index($0, marker) > 0 {n=NR} END{print n+0}' "$export_file")"
+  footer="$(awk -v n="$footer_line" 'NR>=n' "$export_file")"
   # `bd memories --json` mixes in a non-memory `schema_version` metadata key
   # (numeric value) alongside the actual string-bodied memories -- filter it
   # out or jq's gsub/slicing below aborts on a non-string .value.
