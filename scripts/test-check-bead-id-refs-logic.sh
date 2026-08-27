@@ -221,6 +221,35 @@ assert "sanity check: an UNSTRIPPED ambient GIT_CONFIG really does redirect a pl
   "$([ -f "$S7_DECOY" ] && grep -q 'Redirected Sanity Check' "$S7_DECOY" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 8. scripts/test-critical-reviewer-hook.sh's own bead-ID-shaped fixture
+#    ("mayor-abc12") is whole-file-skipped from the blanket sweep above (it's
+#    synthetic test input, not a real bead ID) -- but a real, closeable
+#    bead-ID reference DID land in that file undetected via that same
+#    whole-file skip (mayor-kfabq, from PR #1420) because, unlike
+#    scripts/mayor-tick.sh, this file had no match-by-match re-scan behind
+#    its whole-file skip. This scenario recreates that file's path inside
+#    the sandbox to prove the fix: the fixture token still passes, but any
+#    OTHER bead-ID-shaped token in the same file is now caught.
+# ---------------------------------------------------------------------------
+S8_CLEAN="$SANDBOX_ROOT/8-critical-reviewer-hook-fixture"
+new_sandbox "$S8_CLEAN"
+mkdir -p "$S8_CLEAN/scripts"
+printf '#!/usr/bin/env bash\n# fixture: bd close mayor-abc12\n' > "$S8_CLEAN/scripts/test-critical-reviewer-hook.sh"
+commit_tree "$S8_CLEAN"
+RC8_CLEAN=$(run_gate "$S8_CLEAN")
+assert "test-critical-reviewer-hook.sh's own synthetic fixture (mayor-abc12) still passes (allowlist doesn't over-restrict)" \
+  "$([ "$RC8_CLEAN" -eq 0 ] && echo 1 || echo 0)"
+
+S8_ROT="$SANDBOX_ROOT/8-critical-reviewer-hook-rot"
+new_sandbox "$S8_ROT"
+mkdir -p "$S8_ROT/scripts"
+printf '#!/usr/bin/env bash\n# Case 16: stale-lock liveness check (mayor-kfabq).\n' > "$S8_ROT/scripts/test-critical-reviewer-hook.sh"
+commit_tree "$S8_ROT"
+RC8_ROT=$(run_gate "$S8_ROT")
+assert "a REAL bead-ID reference (mayor-kfabq) in test-critical-reviewer-hook.sh is caught, not masked by the whole-file skip" \
+  "$([ "$RC8_ROT" -ne 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

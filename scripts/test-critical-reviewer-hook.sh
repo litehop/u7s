@@ -451,7 +451,7 @@ else
   fail "$RACE_MISSING_TOTAL of $((RACE_ROUNDS * 5)) concurrent decisions were silently dropped across $RACE_ROUNDS rounds"
 fi
 
-# Case 16: stale-lock liveness check (mayor-kfabq). The steal mechanism
+# Case 16: stale-lock liveness check regression case. The steal mechanism
 # above must only evict a holder whose recorded PID is actually dead --
 # stealing from a live holder past STALE_LOCK_TIMEOUT_SEC would reintroduce
 # the exact unlocked-mv race case 15 above proves is fixed. Uses a short
