@@ -142,6 +142,14 @@ PR when green.
    auto-drained (they post to bd notes, not a PR, and bd exposes no
    per-note timestamp to confirm against) — they always surface in
    `pending_non_pr_reviews` for the mayor to dispatch and confirm by hand.
+   It then self-heals any open `worker/agent-*` PR the SubagentStop hook
+   never queued at all (mayor-9syl7 — compensates for a push landing on a
+   non-`worker/agent-*` head, upstream anthropics/claude-code#27755, or the
+   hook exiting with an error): a PR with no active queue file naming its
+   URL and no critical-reviewer review yet gets synthesized straight into
+   `pending_reviews`, logged with a `mayor-tick reconcile:` prefix so an
+   audit can tell it apart from a hook-queued entry; a PR already covered
+   by either signal is left alone.
 2. Read the state file and act on the script's exit code (non-zero codes
    are OR-able; the highest fires if more than one condition matched):
    - **0** — noop, nothing for this tick.

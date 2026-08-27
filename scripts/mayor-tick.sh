@@ -12,10 +12,12 @@
 # Split point: this script does `ls
 # .claude/review-queue`, `gh pr list --json`, review-verdict parse, `gh pr
 # merge` on gated CLEAN/BEHIND PRs, post-merge `git pull`/prune/worktree/branch
-# cleanup, and the deterministic slices of ai/dashboard.md. The mayor still
-# does: dispatching critical-reviewer for undrained queue entries (this
-# script cannot invoke a Claude subagent), cluster-shape decisions on new
-# `bd ready` beads, and investigating anything below couldn't gate cleanly.
+# cleanup, a self-heal reconciliation pass for any open worker PR the
+# SubagentStop hook never queued at all (mayor-9syl7), and the deterministic
+# slices of ai/dashboard.md. The mayor still does: dispatching
+# critical-reviewer for undrained queue entries (this script cannot invoke a
+# Claude subagent), cluster-shape decisions on new `bd ready` beads, and
+# investigating anything below couldn't gate cleanly.
 #
 # Exit code taxonomy (OR-able -- if multiple signals fire, the HIGHEST wins):
 #   0  = noop, nothing for the mayor to do this tick.
@@ -189,6 +191,22 @@ route_deliverable() {
       printf 'warning\t%s' "$(jq -nc --arg file "$file" --arg dtype "$dtype" --arg reason "unrecognized-deliverable-type" '{file:$file, deliverable_type:$dtype, reason:$reason}')"
       ;;
   esac
+}
+
+# True (exit 0) iff an active review-queue file's deliverable_ref names this
+# exact PR URL -- mayor-9syl7's no-double-queue guard: a PR already tracked
+# by an (undrained) queue file must not also get a reconciliation-synthesized
+# duplicate pending_reviews entry. `processed/` is not checked -- it was
+# deleted (mayor-hkhq0); a drained file's audit trail is git history plus
+# the review on the PR itself, not an archive directory.
+pr_already_queued() {
+  local url="$1" f dref
+  for f in "$QUEUE_DIR"/*.md; do
+    [ -e "$f" ] || continue
+    dref=$(frontmatter_field "$f" deliverable_ref)
+    [ "$dref" = "$url" ] && return 0
+  done
+  return 1
 }
 
 json_array() {  # plain strings -> JSON array of strings
@@ -530,8 +548,39 @@ check_worktree_anomalies() {
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
 }
 
+# Step 6 (mayor-9syl7): self-heal reconciliation. Compensating layer for the
+# SubagentStop hook missing a fire entirely (a push landing on a non-
+# worker/agent-* head, upstream anthropics/claude-code#27755, or the hook
+# exiting with an error) -- without this, an open worker PR with no queue
+# entry AND no review sits invisible to the mayor until a manual audit
+# catches it. Runs after process_review_queue so pr_already_queued sees
+# this tick's queue state. Logged with the "mayor-tick reconcile:" prefix
+# (distinct from process_review_queue's hook-fed path) so an audit can tell
+# script-detected self-heal from hook-queued.
+reconcile_missing_queue_entries() {
+  local prs_json n url reviews_json latest
+  prs_json=$(gh pr list --state open --json number,url,headRefName --jq \
+    '[.[] | select(.headRefName | startswith("worker/agent-"))]' 2>/dev/null || echo '[]')
+
+  for n in $(printf '%s' "$prs_json" | jq -r '.[].number' 2>/dev/null || true); do
+    url=$(printf '%s' "$prs_json" | jq -r --argjson n "$n" '.[] | select(.number==$n) | .url')
+
+    pr_already_queued "$url" && continue
+
+    reviews_json=$(gh pr view "$n" --json reviews --jq '.reviews' 2>/dev/null || echo '[]')
+    latest=$(latest_reviewer_review "$reviews_json")
+    if [ -n "$latest" ] && [ "$latest" != "null" ]; then
+      continue  # already reviewed despite no queue file -- nothing to self-heal
+    fi
+
+    echo "mayor-tick reconcile: PR #$n ($url) has no review-queue entry and no critical-reviewer review -- synthesizing pending_reviews entry" >&2
+    PENDING_REVIEW_PRS+=("$n")
+  done
+}
+
 main() {
   process_review_queue
+  reconcile_missing_queue_entries
   gate_and_merge_prs
   cleanup_merged_worktrees
   check_bd_ready
@@ -539,7 +588,12 @@ main() {
   refresh_dashboard
 
   local bd_ready_count=${#BD_READY_IDS[@]}
-  local exception_count=$(( ${#GATE_EXCEPTIONS[@]} + ${#QUEUE_FILES_REMAINING[@]} ))
+  # PENDING_REVIEW_PRS is included here (not just QUEUE_FILES_REMAINING)
+  # because reconcile_missing_queue_entries can append to it for a PR with
+  # NO backing queue file at all -- without counting it directly, a
+  # self-healed entry would leave exit_code at 0 (noop) and the mayor would
+  # never read pending_reviews to dispatch it, defeating mayor-9syl7 outright.
+  local exception_count=$(( ${#GATE_EXCEPTIONS[@]} + ${#QUEUE_FILES_REMAINING[@]} + ${#PENDING_REVIEW_PRS[@]} ))
   local worktree_count=${#WORKTREE_ANOMALIES[@]}
   local exit_code
   exit_code=$(compute_exit_code "$bd_ready_count" "$exception_count" "$worktree_count")
