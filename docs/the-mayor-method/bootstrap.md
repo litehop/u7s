@@ -116,33 +116,46 @@ max 5, `allow_auto_merge=true`, verified end-to-end since PR #1347). The
 queue runs its own CI cycle against a synthetic merge commit and lands the
 PR when green.
 
-1. Run `scripts/mayor-tick.sh`. It drains the review queue (removes a
-   queue file once it confirms the deliverable's review actually posted —
-   `rm`, not `mv` to an archive dir: the audit trail is git history plus
-   the review itself on the PR, both durable, mayor-hkhq0), gates every
-   open `worker/agent-*` PR on the LATEST (by `submittedAt`, never by mere
-   header presence — an older superseded LGTM must not mask a newer
-   needs-changes) critical-reviewer verdict, issues a bare `gh pr merge
-   <N>` for anything CLEAN with a qualifying LGTM/LGTM-with-suggestions
-   verdict, runs post-merge `git pull --ff-only` + `git remote prune
-   origin` + worktree/branch cleanup for PRs it confirms merged, refreshes
-   `ai/dashboard.md`'s deterministic sections, and writes
-   `.claude/mayor-tick-state.json`. `operator/*` branches are exempt from
-   the gate — they never trigger the SubagentStop hook that feeds the
-   review queue, so no review is ever queued for them.
+1. Run `scripts/mayor-tick.sh`. It drains `pr`-type review-queue entries
+   (removes a queue file once it confirms the deliverable's review
+   actually posted — `rm`, not `mv` to an archive dir: the audit trail is
+   git history plus the review itself on the PR, both durable,
+   mayor-hkhq0), gates every open `worker/agent-*` PR that's CLEAN or
+   BEHIND (a BEHIND PR is the merge queue's job to rebase, not the
+   mayor's, so it's queued the same way, never silently skipped) on the
+   LATEST (by `submittedAt`, never by mere header presence — an older
+   superseded LGTM must not mask a newer needs-changes) critical-reviewer
+   verdict, issues a bare `gh pr merge <N>` for anything qualifying
+   LGTM/LGTM-with-suggestions, runs post-merge `git pull --ff-only` +
+   `git remote prune origin` + worktree/branch cleanup for PRs it confirms
+   merged, refreshes `ai/dashboard.md`'s deterministic sections, and
+   writes `.claude/mayor-tick-state.json`. `operator/*` branches are
+   exempt from the gate — they never trigger the SubagentStop hook that
+   feeds the review queue, so no review is ever queued for them.
+   `findings`/`bead-close`/`bead-supersede`-type queue entries are never
+   auto-drained (they post to bd notes, not a PR, and bd exposes no
+   per-note timestamp to confirm against) — they always surface in
+   `pending_non_pr_reviews` for the mayor to dispatch and confirm by hand.
 2. Read the state file and act on the script's exit code (non-zero codes
    are OR-able; the highest fires if more than one condition matched):
    - **0** — noop, nothing for this tick.
    - **10** — `bd_ready_ids` holds new dispatchable beads. Apply the usual
      cluster-shape judgment (filter out decisions/EPICs/release-coupled/
      v1.x/hot-zone) and dispatch per the discipline above.
-   - **20** — `pending_reviews` and/or `gate_exceptions` need a mayor
-     turn: the script cannot invoke a Claude subagent, so for each
-     `pending_reviews` PR, invoke `.claude/agents/critical-reviewer.md`
-     directly (same as if you'd drained the queue by hand). For each
-     `gate_exceptions` entry, investigate why it didn't qualify (no
-     review yet vs. a needs-changes/needs-discussion verdict on record) —
-     do not merge it yourself without resolving that first.
+   - **20** — one or more of `pending_reviews`, `pending_non_pr_reviews`,
+     `gate_exceptions`, or `queue_warnings` is non-empty; the script
+     cannot invoke a Claude subagent, so: for each `pending_reviews` PR,
+     invoke `.claude/agents/critical-reviewer.md` directly (same as if
+     you'd drained the queue by hand); for each `pending_non_pr_reviews`
+     entry, invoke it the same way per its `deliverable_type` (see
+     `.claude/agents/critical-reviewer.md`'s "Output & posting"), then
+     confirm via `bd show <deliverable_ref>` and `rm` the queue file
+     yourself once the note lands; for each `gate_exceptions` entry,
+     investigate why it didn't qualify (no review yet vs. a
+     needs-changes/needs-discussion verdict on record) — do not merge it
+     yourself without resolving that first; for each `queue_warnings`
+     entry, investigate the malformed queue file (a broken `queued_at` —
+     it will never auto-drain until fixed or removed by hand).
    - **30** — `worktree_anomalies` lists a worker branch with no PR at
      all; investigate whether that dispatch stalled or crashed.
 3. If you ever merge a PR by hand instead of letting the script queue it

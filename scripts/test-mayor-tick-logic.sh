@@ -51,6 +51,10 @@ call() {  # runs the real script's __call entry point, capturing stdout
   bash "$SCRIPT" __call "$@"
 }
 
+file_mtime() {  # portable GNU/BSD stat, matches the idiom used elsewhere in scripts/
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+}
+
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
@@ -69,9 +73,9 @@ assert "queue entry with a review submitted AFTER queued_at is drained" \
 
 # A review submitted BEFORE the queue entry was queued (a stale review from
 # a prior round) must NOT be mistaken for having answered this entry --
-# this is the exact class of bug PR #1336 hit at the PR-verdict layer
-# (an older LGTM masking a newer needs-changes); here it's the queue side
-# of the same "resolve by time, not presence" requirement.
+# the same "resolve by time, not presence" requirement that stops an older
+# superseded verdict from masking a newer one (see git history, not a PR
+# number here that would rot once that PR closes).
 RC=0
 call queue_is_drained '2026-08-21T03-39-02Z' '2026-08-21T03:39:01Z' || RC=$?
 assert "queue entry with a review submitted BEFORE queued_at is still pending" \
@@ -83,6 +87,95 @@ assert "queue entry with a review submitted BEFORE queued_at is still pending" \
 RC=0
 call queue_is_drained '2026-08-21T03-39-02Z' '' || RC=$?
 assert "queue entry with no review at all is pending, not drained" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# A missing/malformed queued_at must fail CLOSED (pending), not open
+# (drained): an empty string normalizes to empty, and any non-empty
+# submitted_at lexicographically compares as "greater than" empty, so
+# without is_valid_queued_at's guard a broken queue file would get rm'd on
+# the next tick even though we don't actually know whether the review
+# answers it.
+RC=0
+call queue_is_drained '' '2026-08-27T10:00:00Z' || RC=$?
+assert "empty queued_at fails CLOSED (pending), not open (drained)" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call queue_is_drained 'not-a-timestamp' '2026-08-27T10:00:00Z' || RC=$?
+assert "malformed (non-ISO) queued_at also fails CLOSED, not open" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 1b. Latest-review resolution (the exact "older LGTM masks a newer
+#     needs-changes" bug class) -- extracted into latest_reviewer_review so
+#     it's directly testable with synthetic multi-review data instead of
+#     only living as untested inline jq inside a network-calling function.
+# ---------------------------------------------------------------------------
+
+# Older LGTM, newer needs-changes -> must resolve to needs-changes. If this
+# ever regressed to "first match" or "any qualifying review" instead of
+# "latest by submittedAt", a real needs-changes verdict would be masked by
+# a stale approval and the gate would merge a PR it shouldn't.
+REVIEWS_OLDER_LGTM='[
+  {"body": "## critical-reviewer findings — pr — #1\n\n**Verdict**: LGTM", "submittedAt": "2026-08-27T01:00:00Z"},
+  {"body": "## critical-reviewer findings — pr — #1\n\n**Verdict**: needs-changes", "submittedAt": "2026-08-27T02:00:00Z"}
+]'
+LATEST=$(call latest_reviewer_review "$REVIEWS_OLDER_LGTM")
+assert "older LGTM + newer needs-changes resolves to needs-changes (not the stale LGTM)" \
+  "$([ "$(call parse_verdict "$(printf '%s' "$LATEST" | jq -r '.body')")" = "needs-changes" ] && echo 1 || echo 0)"
+
+# Inverse: older needs-changes, newer LGTM -> must resolve to LGTM. Confirms
+# the resolution is genuinely time-based in both directions, not just
+# "needs-changes always wins" (which would wedge a PR forever even after a
+# real fix earned a follow-up LGTM).
+REVIEWS_OLDER_NEEDS_CHANGES='[
+  {"body": "## critical-reviewer findings — pr — #1\n\n**Verdict**: needs-changes", "submittedAt": "2026-08-27T01:00:00Z"},
+  {"body": "## critical-reviewer findings — pr — #1\n\n**Verdict**: LGTM", "submittedAt": "2026-08-27T02:00:00Z"}
+]'
+LATEST=$(call latest_reviewer_review "$REVIEWS_OLDER_NEEDS_CHANGES")
+assert "older needs-changes + newer LGTM resolves to LGTM (a real fix can un-block the gate)" \
+  "$([ "$(call parse_verdict "$(printf '%s' "$LATEST" | jq -r '.body')")" = "LGTM" ] && echo 1 || echo 0)"
+
+# A newer review that ISN'T a critical-reviewer review (no marker header)
+# must not be picked just for being newest -- it's a different review type,
+# not an update to the verdict.
+REVIEWS_NON_REVIEWER_NEWEST='[
+  {"body": "## critical-reviewer findings — pr — #1\n\n**Verdict**: LGTM", "submittedAt": "2026-08-27T01:00:00Z"},
+  {"body": "looks fine to me", "submittedAt": "2026-08-27T02:00:00Z"}
+]'
+LATEST=$(call latest_reviewer_review "$REVIEWS_NON_REVIEWER_NEWEST")
+assert "a newer non-critical-reviewer comment does not displace the actual verdict review" \
+  "$([ "$(call parse_verdict "$(printf '%s' "$LATEST" | jq -r '.body')")" = "LGTM" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 1c. PR gate eligibility -- BEHIND PRs must be queued, not silently
+#     skipped forever (the merge queue's job is to rebase them, not the
+#     mayor's).
+# ---------------------------------------------------------------------------
+
+RC=0
+call pr_gate_eligible CLEAN 0 0 || RC=$?
+assert "a CLEAN PR with 0 pending/0 failed checks is gate-eligible" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call pr_gate_eligible BEHIND 0 0 || RC=$?
+assert "a BEHIND PR with 0 pending/0 failed checks is gate-eligible too (the queue rebases it, not silently skipped forever)" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call pr_gate_eligible DIRTY 0 0 || RC=$?
+assert "a DIRTY PR is not gate-eligible" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call pr_gate_eligible CLEAN 1 0 || RC=$?
+assert "a CLEAN PR with a still-pending check is not gate-eligible yet" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call pr_gate_eligible CLEAN 0 1 || RC=$?
+assert "a CLEAN PR with a failed check is not gate-eligible" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
@@ -145,7 +238,9 @@ STATE_OUT="$WORKDIR/state.json"
 MAYOR_TICK_STATE_FILE="$STATE_OUT" call write_state 20 \
   '["a.md","b.md"]' '[123]' '[456]' '["mayor-abcd"]' \
   '[{"path":"/tmp/x","branch":"worker/agent-x","reason":"no-pr-for-branch"}]' \
-  '[{"pr":789,"reason":"no-qualifying-review"}]'
+  '[{"pr":789,"reason":"no-qualifying-review"}]' \
+  '[{"file":"c.md","deliverable_type":"findings","deliverable_ref":"mayor-efgh"}]' \
+  '[{"file":"d.md","reason":"missing-or-malformed-queued_at"}]'
 
 assert "state file is valid JSON" \
   "$(jq empty "$STATE_OUT" >/dev/null 2>&1 && echo 1 || echo 0)"
@@ -159,11 +254,18 @@ assert "state file's gate_exceptions carries the structured PR+reason payload"  
   "$([ "$(jq -r '.gate_exceptions[0].reason' "$STATE_OUT")" = "no-qualifying-review" ] && echo 1 || echo 0)"
 assert "state file's timestamp field is present and non-empty" \
   "$([ -n "$(jq -r '.timestamp' "$STATE_OUT")" ] && echo 1 || echo 0)"
+# Non-PR queue entries (findings/bead-close/bead-supersede) must be visible
+# to the mayor with their deliverable_type, not silently dropped from the
+# queue with no trace -- the whole point of this field.
+assert "state file's pending_non_pr_reviews carries deliverable_type + ref, not just a bare path" \
+  "$([ "$(jq -r '.pending_non_pr_reviews[0].deliverable_type' "$STATE_OUT")" = "findings" ] && [ "$(jq -r '.pending_non_pr_reviews[0].deliverable_ref' "$STATE_OUT")" = "mayor-efgh" ] && echo 1 || echo 0)"
+assert "state file's queue_warnings surfaces a malformed-frontmatter file for investigation" \
+  "$([ "$(jq -r '.queue_warnings[0].reason' "$STATE_OUT")" = "missing-or-malformed-queued_at" ] && echo 1 || echo 0)"
 
 # Empty-everything case -- must still be valid JSON with empty arrays, not a
 # jq error from an unquoted/malformed empty-array literal.
 STATE_EMPTY="$WORKDIR/state-empty.json"
-MAYOR_TICK_STATE_FILE="$STATE_EMPTY" call write_state 0 '[]' '[]' '[]' '[]' '[]' '[]'
+MAYOR_TICK_STATE_FILE="$STATE_EMPTY" call write_state 0 '[]' '[]' '[]' '[]' '[]' '[]' '[]' '[]'
 assert "state file with every field empty is still valid JSON" \
   "$(jq empty "$STATE_EMPTY" >/dev/null 2>&1 && echo 1 || echo 0)"
 assert "state file with every field empty has exit_code 0" \
@@ -231,6 +333,30 @@ assert "a section with no matching heading yet is appended fresh" \
   "$(grep -q 'BEGIN AUTO: review-queue' "$DASH" && echo 1 || echo 0)"
 assert "...still leaves the DECISION POINT section untouched" \
   "$(grep -q 'Mayor-owned content that must survive untouched' "$DASH" && echo 1 || echo 0)"
+
+# A "dry run" that still mutates the dashboard on disk defeats both this
+# test suite's own no-side-effects guarantee and the operator-preview use
+# case run_cmd is advertised for. Cover both write paths: the in-place
+# replace (sentinel already exists, from the steady-state re-run above) and
+# the fresh-append (brand-new sentinel id, never seen before).
+DASH_BEFORE_CONTENT=$(cat "$DASH")
+DASH_BEFORE_MTIME=$(file_mtime "$DASH")
+MAYOR_TICK_DASHBOARD_FILE="$DASH" MAYOR_TICK_DRY_RUN=1 call splice_dashboard_section \
+  "open-prs" '^## .*Open PRs' '🔎 Open PRs' "- #999 should never actually be written" >/dev/null
+MAYOR_TICK_DASHBOARD_FILE="$DASH" MAYOR_TICK_DRY_RUN=1 call splice_dashboard_section \
+  "brand-new-dry-run-section" '^## .*Nonexistent Heading' 'Nonexistent Heading' "should never actually be written" >/dev/null
+DASH_AFTER_CONTENT=$(cat "$DASH")
+DASH_AFTER_MTIME=$(file_mtime "$DASH")
+assert "MAYOR_TICK_DRY_RUN=1 leaves the dashboard file's mtime unchanged (replace path)" \
+  "$([ "$DASH_BEFORE_MTIME" = "$DASH_AFTER_MTIME" ] && echo 1 || echo 0)"
+assert "MAYOR_TICK_DRY_RUN=1 leaves the dashboard file's content byte-identical (replace + append paths)" \
+  "$([ "$DASH_BEFORE_CONTENT" = "$DASH_AFTER_CONTENT" ] && echo 1 || echo 0)"
+assert "...the dry-run replace content never actually lands in the file" \
+  "$(! grep -q '#999 should never actually be written' "$DASH" && echo 1 || echo 0)"
+assert "...the dry-run append content never actually lands in the file" \
+  "$(! grep -q 'brand-new-dry-run-section\|Nonexistent Heading' "$DASH" && echo 1 || echo 0)"
+assert "...no leftover .tmp file from the dry-run replace path" \
+  "$([ ! -e "${DASH}.tmp" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
