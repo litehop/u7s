@@ -55,6 +55,37 @@ file_mtime() {  # portable GNU/BSD stat, matches the idiom used elsewhere in scr
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
 }
 
+# Runs the REAL end-to-end main() (mayor-tick.sh __call main) -- not a
+# single __call'd pure function -- inside an isolated single-worktree
+# scratch git repo with `gh`/`bd` replaced by fixtures under $1 (a
+# directory of executable stub scripts prepended to PATH) and the review
+# queue seeded from $2 (a directory of .md fixtures, or empty/omitted).
+# Copying the script into its own throwaway repo (one worktree, no queue
+# files, no worker PRs, no beads) is what makes "genuinely empty state" and
+# "exactly this one fixture PR" possible at all: this actual dev checkout
+# has live sibling worktrees/PRs/beads that would otherwise leak into any
+# of the three assertions below and mask a real regression. Sets
+# TICK_RC/TICK_OUT/TICK_STATE for the caller to assert on.
+run_full_tick() {
+  local stub_bin="$1" queue_seed="${2:-}"
+  local scratch="$WORKDIR/tick-$RANDOM$RANDOM" repo
+  repo="$scratch/repo"
+  mkdir -p "$repo/scripts" "$repo/.claude/review-queue"
+  cp "$SCRIPT" "$repo/scripts/mayor-tick.sh"
+  git init -q "$repo"
+  if [ -n "$queue_seed" ]; then
+    cp "$queue_seed"/*.md "$repo/.claude/review-queue/" 2>/dev/null || true
+  fi
+  TICK_STATE="$scratch/state.json"
+  TICK_RC=0
+  TICK_OUT=$(PATH="$stub_bin:$PATH" \
+    MAYOR_TICK_QUEUE_DIR="$repo/.claude/review-queue" \
+    MAYOR_TICK_STATE_FILE="$TICK_STATE" \
+    MAYOR_TICK_DASHBOARD_FILE="$repo/no-such-dashboard.md" \
+    MAYOR_TICK_DRY_RUN=1 \
+    bash "$repo/scripts/mayor-tick.sh" __call main 2>&1) || TICK_RC=$?
+}
+
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
@@ -357,6 +388,119 @@ assert "...the dry-run append content never actually lands in the file" \
   "$(! grep -q 'brand-new-dry-run-section\|Nonexistent Heading' "$DASH" && echo 1 || echo 0)"
 assert "...no leftover .tmp file from the dry-run replace path" \
   "$([ ! -e "${DASH}.tmp" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 7. route_deliverable -- process_review_queue's dtype-routing case
+#    statement, extracted so each dtype's routing decision is directly
+#    testable without a gh network call or global-array mutation
+#    (mayor-s7nn6b). A regression here either drops a real finding/
+#    bead-close/bead-supersede review off the mayor's radar entirely, or
+#    (for "pr") merges the wrong PR's review verdict onto the wrong number.
+# ---------------------------------------------------------------------------
+
+ROUTE=$(call route_deliverable 'q/pr.md' pr 'https://github.com/example/repo/pull/777')
+assert "pr dtype routes to the 'pr' bucket with the PR number extracted from deliverable_ref" \
+  "$([ "$ROUTE" = "$(printf 'pr\t777')" ] && echo 1 || echo 0)"
+
+ROUTE=$(call route_deliverable 'q/findings.md' findings 'mayor-aaaa')
+assert "findings dtype routes to the 'non-pr' bucket with deliverable_type+ref preserved" \
+  "$([ "$(printf '%s' "$ROUTE" | cut -f2 | jq -r '.deliverable_type')" = "findings" ] && [ "$(printf '%s' "$ROUTE" | cut -f2 | jq -r '.deliverable_ref')" = "mayor-aaaa" ] && echo 1 || echo 0)"
+
+ROUTE=$(call route_deliverable 'q/close.md' bead-close 'mayor-bbbb')
+assert "bead-close dtype routes to the 'non-pr' bucket" \
+  "$([ "$(printf '%s' "$ROUTE" | cut -f1)" = "non-pr" ] && [ "$(printf '%s' "$ROUTE" | cut -f2 | jq -r '.deliverable_type')" = "bead-close" ] && echo 1 || echo 0)"
+
+ROUTE=$(call route_deliverable 'q/supersede.md' bead-supersede 'mayor-cccc')
+assert "bead-supersede dtype routes to the 'non-pr' bucket" \
+  "$([ "$(printf '%s' "$ROUTE" | cut -f1)" = "non-pr" ] && [ "$(printf '%s' "$ROUTE" | cut -f2 | jq -r '.deliverable_type')" = "bead-supersede" ] && echo 1 || echo 0)"
+
+# The suspicion this cluster resolves (mayor-s7nn6c): an unrecognized dtype
+# used to leave pending_reviews/pending_non_pr_reviews/gate_exceptions/
+# queue_warnings ALL empty while still forcing exit 20 via queue_files --
+# the mayor would see "something's wrong" with zero clues why. Routing it
+# into queue_warnings means it now always has a clue.
+ROUTE=$(call route_deliverable 'q/mystery.md' mystery-type 'mayor-dddd')
+assert "an unrecognized deliverable_type routes to the 'warning' bucket, not silently dropped" \
+  "$([ "$(printf '%s' "$ROUTE" | cut -f1)" = "warning" ] && echo 1 || echo 0)"
+assert "...the warning payload names the file, the unrecognized dtype itself, and a stable reason string" \
+  "$([ "$(printf '%s' "$ROUTE" | cut -f2 | jq -r '.file')" = "q/mystery.md" ] && [ "$(printf '%s' "$ROUTE" | cut -f2 | jq -r '.deliverable_type')" = "mystery-type" ] && [ "$(printf '%s' "$ROUTE" | cut -f2 | jq -r '.reason')" = "unrecognized-deliverable-type" ] && echo 1 || echo 0)"
+
+# Malformed frontmatter (frontmatter_field found no dtype at all) must
+# degrade the same way as an unrecognized dtype -- surfaced, not dropped.
+ROUTE=$(call route_deliverable 'q/malformed.md' '' '')
+assert "an empty (malformed-frontmatter) deliverable_type also routes to 'warning', not dropped" \
+  "$([ "$(printf '%s' "$ROUTE" | cut -f1)" = "warning" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 9. Bash-3.2 empty-array guard mutation canary (mayor-s7nn6a). See the
+#    comment above the write_state call in main() (mayor-tick.sh) for why
+#    the "${ARR[@]+"${ARR[@]}"}" idiom exists at all 8 call sites: macOS
+#    ships bash 3.2 as /bin/bash (this script's own shebang target), and
+#    3.2's `set -u` treats a *zero-element* array's `[@]` word-expansion as
+#    an unbound variable. PR #1414's review proved this had ZERO coverage
+#    by reverting all 8 guards to the bare form and confirming the
+#    (then-)52-assertion suite still passed in full. This runs the REAL
+#    main() against a queue with zero files, a stubbed gh/bd that always
+#    report empty, and the isolated single-worktree scratch repo run_full_tick
+#    builds -- the one combination that leaves every one of the 8 arrays
+#    genuinely zero-length. Revert any one guard and this crashes with
+#    "unbound variable" under bash 3.2 before ever reaching write_state
+#    (mutation-verified manually before shipping: reverting all 8 produces
+#    exactly that crash and a nonzero exit instead of the clean exit 0
+#    below).
+# ---------------------------------------------------------------------------
+
+STUB_EMPTY_BIN="$WORKDIR/stub-empty-bin"
+mkdir -p "$STUB_EMPTY_BIN"
+# Always "fail" so every mayor-tick.sh gh/bd call site's own `|| echo
+# '<empty-default>'` / `|| true` fallback fires -- simpler and just as
+# deterministic as replicating gh's per-call `--jq` post-processing for an
+# empty result.
+cat > "$STUB_EMPTY_BIN/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+cp "$STUB_EMPTY_BIN/gh" "$STUB_EMPTY_BIN/bd"
+chmod +x "$STUB_EMPTY_BIN/gh" "$STUB_EMPTY_BIN/bd"
+
+run_full_tick "$STUB_EMPTY_BIN"
+assert "empty queue + empty PR list + empty bd ready: main() completes (exit 0), not an 'unbound variable' bash-3.2 crash" \
+  "$([ "$TICK_RC" -eq 0 ] && echo 1 || echo 0)"
+assert "...and never prints bash 3.2's 'unbound variable' error (the exact symptom of a reverted array guard)" \
+  "$(! printf '%s' "$TICK_OUT" | grep -qi 'unbound variable' && echo 1 || echo 0)"
+assert "...and the state file is actually written and valid (execution reached write_state, not an early abort)" \
+  "$(jq empty "$TICK_STATE" >/dev/null 2>&1 && echo 1 || echo 0)"
+assert "...with every one of the 8 guarded array fields empty, matching the genuinely-empty input state" \
+  "$([ "$(jq -c '[.queue_files,.pending_reviews,.merged_prs,.bd_ready_ids,.worktree_anomalies,.gate_exceptions,.pending_non_pr_reviews,.queue_warnings] | map(length) | add' "$TICK_STATE" 2>/dev/null)" = "0" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 10. process_review_queue dtype routing, end-to-end through the REAL
+#     main() pipeline (mayor-s7nn6b) -- one fixture file per dtype plus one
+#     with no frontmatter at all, proving the routing in section 7 actually
+#     lands in the write_state fields the mayor reads, not just in
+#     route_deliverable's own return value.
+# ---------------------------------------------------------------------------
+
+QSEED_DTYPE="$WORKDIR/qseed-dtype-routing"
+mkdir -p "$QSEED_DTYPE"
+printf -- '---\ndeliverable_type: pr\ndeliverable_ref: https://github.com/example/repo/pull/100\nqueued_at: 2026-01-01T00-00-00Z\n---\nbody\n' > "$QSEED_DTYPE/pr-100.md"
+printf -- '---\ndeliverable_type: findings\ndeliverable_ref: mayor-abc1\nqueued_at: 2026-01-01T00-00-00Z\n---\nbody\n' > "$QSEED_DTYPE/findings-1.md"
+printf -- '---\ndeliverable_type: bead-close\ndeliverable_ref: mayor-abc2\nqueued_at: 2026-01-01T00-00-00Z\n---\nbody\n' > "$QSEED_DTYPE/bead-close-1.md"
+printf -- '---\ndeliverable_type: bead-supersede\ndeliverable_ref: mayor-abc3\nqueued_at: 2026-01-01T00-00-00Z\n---\nbody\n' > "$QSEED_DTYPE/bead-supersede-1.md"
+printf -- '---\ndeliverable_type: mystery\ndeliverable_ref: mayor-abc4\nqueued_at: 2026-01-01T00-00-00Z\n---\nbody\n' > "$QSEED_DTYPE/unknown-1.md"
+printf 'this file has no frontmatter markers at all\n' > "$QSEED_DTYPE/malformed.md"
+
+run_full_tick "$STUB_EMPTY_BIN" "$QSEED_DTYPE"
+assert "pr dtype (gh reports no review yet): PR number lands in pending_reviews" \
+  "$([ "$(jq -r '.pending_reviews | index(100) != null' "$TICK_STATE")" = "true" ] && echo 1 || echo 0)"
+assert "findings/bead-close/bead-supersede dtypes: all three land in pending_non_pr_reviews with their real deliverable_type+ref, not dropped" \
+  "$([ "$(jq -c '[.pending_non_pr_reviews[] | .deliverable_type] | sort' "$TICK_STATE")" = '["bead-close","bead-supersede","findings"]' ] && echo 1 || echo 0)"
+assert "an unrecognized dtype ('mystery') surfaces in queue_warnings naming the actual dtype, not silently dropped" \
+  "$([ "$(jq -r '.queue_warnings[] | select(.file | endswith("unknown-1.md")) | .deliverable_type' "$TICK_STATE")" = "mystery" ] && echo 1 || echo 0)"
+assert "a totally malformed (no frontmatter) file is still handled correctly: surfaced in queue_warnings, not a crash" \
+  "$([ "$(jq -r '[.queue_warnings[] | select(.file | endswith("malformed.md"))] | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
+assert "every queue file (even the malformed one) stays visible in queue_files, so exit_code reflects it" \
+  "$([ "$(jq -r '.queue_files | length' "$TICK_STATE")" = "6" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -165,6 +165,32 @@ frontmatter_field() {
   ' "$file"
 }
 
+# Pure dtype-routing decision behind process_review_queue's case statement:
+# given one queue entry's frontmatter (file/dtype/dref), decides which state
+# bucket it belongs in -- "pr" (payload is the extracted PR number, empty if
+# dref didn't end in one), "non-pr" (payload is the JSON object for
+# pending_non_pr_reviews), or "warning" (payload is the JSON object for
+# queue_warnings, covering any dtype -- missing or unrecognized -- this
+# script doesn't know how to drain; see the queue_warnings comment on why
+# that must surface for the mayor instead of silently vanishing). Extracted
+# from process_review_queue so dtype routing is directly testable without a
+# gh network call or global-array mutation. Output is "<bucket>\t<payload>"
+# on one line.
+route_deliverable() {
+  local file="$1" dtype="$2" dref="$3"
+  case "$dtype" in
+    pr)
+      printf 'pr\t%s' "$(printf '%s' "$dref" | grep -oE '[0-9]+$' || true)"
+      ;;
+    findings|bead-close|bead-supersede)
+      printf 'non-pr\t%s' "$(jq -nc --arg file "$file" --arg dtype "$dtype" --arg dref "$dref" '{file:$file, deliverable_type:$dtype, deliverable_ref:$dref}')"
+      ;;
+    *)
+      printf 'warning\t%s' "$(jq -nc --arg file "$file" --arg dtype "$dtype" --arg reason "unrecognized-deliverable-type" '{file:$file, deliverable_type:$dtype, reason:$reason}')"
+      ;;
+  esac
+}
+
 json_array() {  # plain strings -> JSON array of strings
   if [ "$#" -eq 0 ]; then printf '[]'; return; fi
   printf '%s\n' "$@" | jq -R . | jq -s -c .
@@ -362,7 +388,7 @@ WORKTREE_ANOMALIES=()
 # always surfaced in PENDING_NON_PR_REVIEWS for the mayor to confirm by
 # hand instead of silently sitting undrained with no visibility.
 process_review_queue() {
-  local f dtype dref queued_at prnum submitted_at reviews_json latest
+  local f dtype dref queued_at prnum submitted_at reviews_json latest route bucket payload
   for f in "$QUEUE_DIR"/*.md; do
     [ -e "$f" ] || continue
     dtype=$(frontmatter_field "$f" deliverable_type)
@@ -371,9 +397,12 @@ process_review_queue() {
     if ! is_valid_queued_at "$queued_at"; then
       QUEUE_WARNINGS+=("$(jq -nc --arg file "$f" --arg reason "missing-or-malformed-queued_at" '{file:$file, reason:$reason}')")
     fi
-    case "$dtype" in
+    route=$(route_deliverable "$f" "$dtype" "$dref")
+    bucket="${route%%$'\t'*}"
+    payload="${route#*$'\t'}"
+    case "$bucket" in
       pr)
-        prnum=$(printf '%s' "$dref" | grep -oE '[0-9]+$' || true)
+        prnum="$payload"
         if [ -n "$prnum" ]; then
           reviews_json=$(gh pr view "$prnum" --json reviews --jq '.reviews' 2>/dev/null || echo '[]')
           latest=$(latest_reviewer_review "$reviews_json")
@@ -385,10 +414,16 @@ process_review_queue() {
           PENDING_REVIEW_PRS+=("$prnum")
         fi
         ;;
-      findings|bead-close|bead-supersede)
-        PENDING_NON_PR_REVIEWS+=("$(jq -nc --arg file "$f" --arg dtype "$dtype" --arg dref "$dref" '{file:$file, deliverable_type:$dtype, deliverable_ref:$dref}')")
+      non-pr)
+        PENDING_NON_PR_REVIEWS+=("$payload")
         ;;
-      *)
+      warning)
+        # An unrecognized (or missing) deliverable_type: never auto-drained,
+        # so it must surface here -- not silently leave all four
+        # newly-documented state fields empty while still forcing exit 20
+        # via queue_files (mayor-s7nn6's suspicion). See bootstrap.md's
+        # queue_warnings bullet.
+        QUEUE_WARNINGS+=("$payload")
         ;;
     esac
     QUEUE_FILES_REMAINING+=("$f")

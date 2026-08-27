@@ -160,8 +160,9 @@ PR when green.
      investigate why it didn't qualify (no review yet vs. a
      needs-changes/needs-discussion verdict on record) — do not merge it
      yourself without resolving that first; for each `queue_warnings`
-     entry, investigate the malformed queue file (a broken `queued_at` —
-     it will never auto-drain until fixed or removed by hand).
+     entry, investigate the queue file — either a broken/missing
+     `queued_at` or an unrecognized `deliverable_type` (mayor-s7nn6), both
+     of which never auto-drain until fixed or removed by hand.
    - **30** — `worktree_anomalies` lists a worker branch with no PR at
      all; investigate whether that dispatch stalled or crashed.
 3. If you ever merge a PR by hand instead of letting the script queue it
