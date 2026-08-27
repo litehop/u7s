@@ -225,6 +225,46 @@ assert "...and the real gate still catches the over-budget growth in that correc
   "$([ "$RC7" -ne 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 8. Ambient GIT_CONFIG leakage -- a SEPARATE redirection mechanism from
+#    scenario 7's GIT_DIR/GIT_WORK_TREE, scoped to the `git config`
+#    subcommand specifically (git's documented, if legacy, behavior: GIT_CONFIG
+#    makes a config write behave "as if it were provided via --file",
+#    bypassing `-C <dir>` even when GIT_DIR/GIT_WORK_TREE are correctly
+#    stripped). This is exactly the codepath new_sandbox()'s `git config
+#    user.email`/`user.name` calls exercise, and exactly the gap PR #1408's
+#    own scenario H exists to close (its earlier GIT_DIR/GIT_WORK_TREE-only
+#    test did not prove GIT_CONFIG stripping worked either). Points ambient
+#    GIT_CONFIG at a decoy file for the duration of new_sandbox(), then
+#    asserts the sandbox's own local config -- not the decoy -- recorded the
+#    expected identity.
+# ---------------------------------------------------------------------------
+S8_TARGET="$SANDBOX_ROOT/8-config-target"
+S8_DECOY="$SANDBOX_ROOT/8-config-decoy.cfg"
+(
+  export GIT_CONFIG="$S8_DECOY"
+  new_sandbox "$S8_TARGET"
+)
+S8_EMAIL=$(run_git -C "$S8_TARGET" config --local --get user.email || echo unset)
+S8_NAME=$(run_git -C "$S8_TARGET" config --local --get user.name || echo unset)
+assert "ambient GIT_CONFIG never redirects new_sandbox()'s git-config write away from the target's own local config (user.email)" \
+  "$([ "$S8_EMAIL" = "test@example.com" ] && echo 1 || echo 0)"
+assert "...same for user.name" \
+  "$([ "$S8_NAME" = "Test" ] && echo 1 || echo 0)"
+assert "...and no decoy file is created at the ambient GIT_CONFIG path (the write did not land there instead)" \
+  "$([ ! -e "$S8_DECOY" ] && echo 1 || echo 0)"
+
+# Sanity check proving this is genuinely the GIT_CONFIG bug and not
+# something else: the SAME ambient GIT_CONFIG, via a bare `git` call that
+# deliberately bypasses run_git()'s stripping, really does redirect the
+# write into the decoy file (mirrors scripts/test-sensitive-conformance-
+# gate-logic.sh's own scenario H sanity check).
+S8_SANITY="$SANDBOX_ROOT/8-config-sanity"
+git init -q -b main "$S8_SANITY" >/dev/null
+GIT_CONFIG="$S8_DECOY" git -C "$S8_SANITY" config user.name "Redirected Sanity Check"
+assert "sanity check: an UNSTRIPPED ambient GIT_CONFIG really does redirect a plain 'git -C <dir> config' write into the decoy file (confirms the scenario above tests the real bug, not a no-op)" \
+  "$([ -f "$S8_DECOY" ] && grep -q 'Redirected Sanity Check' "$S8_DECOY" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
