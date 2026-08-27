@@ -24,6 +24,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/check-bead-id-refs.sh"
+source "$REPO/scripts/_git-env-guard.sh"
 
 PASS=0
 FAIL=0
@@ -41,18 +42,21 @@ assert() {
 
 # Fresh sandbox git repo at $1 -- check-bead-id-refs.sh scans the whole
 # tracked tree (no base-ref argument), so each scenario commits a single
-# source file and runs the gate against it.
+# source file and runs the gate against it. Every git call here goes through
+# run_git() (see scripts/_git-env-guard.sh) so an ambient GIT_DIR/GIT_CONFIG
+# from this test's own enclosing .githooks/pre-commit invocation can't
+# redirect these commands into the real repo instead of $dir.
 new_sandbox() {
   local dir="$1"
-  git init -q -b main "$dir"
-  git -C "$dir" config user.email test@example.com
-  git -C "$dir" config user.name "Test"
+  run_git init -q -b main "$dir"
+  run_git -C "$dir" config user.email test@example.com
+  run_git -C "$dir" config user.name "Test"
 }
 
 commit_tree() {
   local dir="$1"
-  git -C "$dir" add -A
-  git -C "$dir" commit -q -m snapshot
+  run_git -C "$dir" add -A
+  run_git -C "$dir" commit -q -m snapshot
 }
 
 # Runs the real gate inside sandbox $1. Returns the gate's exit code without
@@ -135,6 +139,86 @@ printf '// exactly the bug mayor-a1b2.6 fixed\nfn f() {}\n' > "$S5/src/lib.rs"
 commit_tree "$S5"
 RC5=$(run_gate "$S5")
 assert "dotted sub-ID (mayor-a1b2.6) is caught" "$([ "$RC5" -ne 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 6. Ambient GIT_DIR/GIT_WORK_TREE leakage (simulating this test's own
+#    .githooks/pre-commit invocation) must not redirect new_sandbox()/
+#    commit_tree()'s git calls away from the intended sandbox dir -- the
+#    exact mechanism (see scripts/_git-env-guard.sh) that corrupted the
+#    mayor's real repository twice: a `git init`/`git commit` in a sandbox
+#    fixture silently honoring an inherited GIT_DIR/GIT_WORK_TREE instead of
+#    its own explicit -C target/positional path. Exports GIT_DIR/GIT_WORK_TREE
+#    pointed at a disposable "victim" repo (never the real u7s repo) for the
+#    duration of building the target sandbox, then asserts the victim's HEAD
+#    is untouched AND the target sandbox was actually built (proving
+#    run_git() fails safe by actually working, not merely by erroring out).
+# ---------------------------------------------------------------------------
+S6_VICTIM="$SANDBOX_ROOT/6-ambient-victim"
+new_sandbox "$S6_VICTIM"
+mkdir -p "$S6_VICTIM/src"
+printf 'fn victim() {}\n' > "$S6_VICTIM/src/lib.rs"
+commit_tree "$S6_VICTIM"
+VICTIM_HEAD_BEFORE=$(run_git -C "$S6_VICTIM" rev-parse HEAD)
+
+S6_TARGET="$SANDBOX_ROOT/6-ambient-target"
+S6_HELPER_RC=0
+(
+  export GIT_DIR="$S6_VICTIM/.git"
+  export GIT_WORK_TREE="$S6_VICTIM"
+  new_sandbox "$S6_TARGET"
+  mkdir -p "$S6_TARGET/src"
+  printf '// worked around the race here (mayor-9zk)\nfn f() {}\n' > "$S6_TARGET/src/lib.rs"
+  commit_tree "$S6_TARGET"
+) || S6_HELPER_RC=$?
+
+VICTIM_HEAD_AFTER=$(run_git -C "$S6_VICTIM" rev-parse HEAD)
+assert "ambient GIT_DIR/GIT_WORK_TREE never redirects the sandbox helpers' git calls into the victim repo (HEAD unchanged)" \
+  "$([ "$VICTIM_HEAD_BEFORE" = "$VICTIM_HEAD_AFTER" ] && echo 1 || echo 0)"
+assert "...and the sandbox helpers still build a working target repo despite the ambient leak (not just 'fails safe by erroring')" \
+  "$([ "$S6_HELPER_RC" -eq 0 ] && run_git -C "$S6_TARGET" rev-parse HEAD >/dev/null 2>&1 && echo 1 || echo 0)"
+RC6=$(run_gate "$S6_TARGET")
+assert "...and the real gate still catches the bead-ID ref in that correctly-built target" \
+  "$([ "$RC6" -ne 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 7. Ambient GIT_CONFIG leakage -- a SEPARATE redirection mechanism from
+#    scenario 6's GIT_DIR/GIT_WORK_TREE, scoped to the `git config`
+#    subcommand specifically (git's documented, if legacy, behavior: GIT_CONFIG
+#    makes a config write behave "as if it were provided via --file",
+#    bypassing `-C <dir>` even when GIT_DIR/GIT_WORK_TREE are correctly
+#    stripped). This is exactly the codepath new_sandbox()'s `git config
+#    user.email`/`user.name` calls exercise, and exactly the gap PR #1408's
+#    own scenario H exists to close (its earlier GIT_DIR/GIT_WORK_TREE-only
+#    test did not prove GIT_CONFIG stripping worked either). Points ambient
+#    GIT_CONFIG at a decoy file for the duration of new_sandbox(), then
+#    asserts the sandbox's own local config -- not the decoy -- recorded the
+#    expected identity.
+# ---------------------------------------------------------------------------
+S7_TARGET="$SANDBOX_ROOT/7-config-target"
+S7_DECOY="$SANDBOX_ROOT/7-config-decoy.cfg"
+(
+  export GIT_CONFIG="$S7_DECOY"
+  new_sandbox "$S7_TARGET"
+)
+S7_EMAIL=$(run_git -C "$S7_TARGET" config --local --get user.email || echo unset)
+S7_NAME=$(run_git -C "$S7_TARGET" config --local --get user.name || echo unset)
+assert "ambient GIT_CONFIG never redirects new_sandbox()'s git-config write away from the target's own local config (user.email)" \
+  "$([ "$S7_EMAIL" = "test@example.com" ] && echo 1 || echo 0)"
+assert "...same for user.name" \
+  "$([ "$S7_NAME" = "Test" ] && echo 1 || echo 0)"
+assert "...and no decoy file is created at the ambient GIT_CONFIG path (the write did not land there instead)" \
+  "$([ ! -e "$S7_DECOY" ] && echo 1 || echo 0)"
+
+# Sanity check proving this is genuinely the GIT_CONFIG bug and not
+# something else: the SAME ambient GIT_CONFIG, via a bare `git` call that
+# deliberately bypasses run_git()'s stripping, really does redirect the
+# write into the decoy file (mirrors scripts/test-sensitive-conformance-
+# gate-logic.sh's own scenario H sanity check).
+S7_SANITY="$SANDBOX_ROOT/7-config-sanity"
+git init -q -b main "$S7_SANITY" >/dev/null
+GIT_CONFIG="$S7_DECOY" git -C "$S7_SANITY" config user.name "Redirected Sanity Check"
+assert "sanity check: an UNSTRIPPED ambient GIT_CONFIG really does redirect a plain 'git -C <dir> config' write into the decoy file (confirms the scenario above tests the real bug, not a no-op)" \
+  "$([ -f "$S7_DECOY" ] && grep -q 'Redirected Sanity Check' "$S7_DECOY" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
