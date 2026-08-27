@@ -18,14 +18,13 @@
 # ignored in favor of whatever the enclosing hook invocation's environment
 # happens to point at.
 #
-# Same variable set as scripts/sensitive-conformance-gate.sh's own run_git()
-# (see crates/junit-reuse-check/src/lib.rs's git_command() doc comment for
-# the full per-variable rationale, including why HOME/XDG_CONFIG_HOME are
-# deliberately NOT in this list). scripts/test-sensitive-conformance-gate-
-# logic.sh predates this shared file and keeps its own inline copy of the
-# same wrapper -- not consolidated onto this file to avoid touching that
-# script's already-reviewed hardening (PR #1408) in an unrelated change; a
-# follow-on issue tracks consolidating it too.
+# Also sourced by scripts/sensitive-conformance-gate.sh and its test harness
+# scripts/test-sensitive-conformance-gate-logic.sh (PR #1408 predates this
+# shared file and originally kept its own inline copy of the identical
+# wrapper; consolidated here once this file existed). See
+# crates/junit-reuse-check/src/lib.rs's git_command() doc comment for the
+# full per-variable rationale, including why HOME/XDG_CONFIG_HOME are
+# deliberately NOT in this list.
 run_git() {
   env -u GIT_DIR -u GIT_WORK_TREE -u GIT_NAMESPACE -u GIT_INDEX_FILE \
     -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
