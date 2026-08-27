@@ -106,11 +106,24 @@ Keep AI working material out of the product tree:
 
 - `/ai/prompts/` — durable AI instructions: implementation, decision, review.
 - `/ai/findings/` — audits, research notes, design drafts, second opinions.
-  **Gitignored.** Never commit one. Convert actionable findings into beads,
-  spec, or docs.
+  **Git-tracked under bead lifecycle** (see below).
 - `/ai/extended-context/` — durable project context not obvious from code.
   The mayor consults it on bootstrap and contributes on retrospectives.
 - `/ai/dashboard.md` — my dashboard.
+
+## Findings lifecycle
+
+Findings are named `ai/findings/<YYYY-MM-DD>-<bead-id>-<slug>.md` and start
+with `Bead: <bead-id>` in their first 5 lines — a pre-commit hook rejects
+new findings without it.
+
+A finding is committed alongside the bead's work, referenced from the
+bead's notes, and deleted from the working tree in the close commit. Git
+history is the archive — retrieve a removed finding with `git show
+<sha>:ai/findings/<file>.md`.
+
+Pre-convention files live in `ai/findings/legacy/`, which stays gitignored
+until migrated to this scheme.
 
 ## Beads are the work queue
 
