@@ -166,6 +166,61 @@ assert "the scale fixture's footer still survives the split, not just the timing
 echo "  (render_slim_prime on ${FIXTURE_BYTES}-byte fixture: ${ELAPSED_MS}ms)"
 
 # ---------------------------------------------------------------------------
+# 5. MARKER-COLLISION regression: a memory body that itself quotes the
+#    footer marker literally (e.g. a memory ABOUT the session-close
+#    protocol) must not fool the footer split into firing early. Column
+#    position can't disambiguate -- bd renders bodies verbatim, unindented,
+#    so a body's copy of the marker lands at the same column as the real
+#    one. Only "last occurrence wins" correctly picks the real footer,
+#    which always renders after every memory body.
+# ---------------------------------------------------------------------------
+EXPORT_COLLISION="$SANDBOX/export-collision.md"
+cat > "$EXPORT_COLLISION" <<EOF
+# Beads Workflow Context
+
+> some header prose
+
+## Persistent Memories (2)
+
+Stored via \`bd remember\`.
+
+### about-session-close
+A memory that quotes the marker verbatim:
+# 🚨 SESSION CLOSE PROTOCOL 🚨
+This line is memory BODY content, not the real footer -- it must not leak
+the remaining memory bodies below into the slim index.
+
+### zzz-last-memory
+$LONG_BODY_2
+
+
+# 🚨 SESSION CLOSE PROTOCOL 🚨
+
+real footer prose that must survive
+EOF
+
+MEM_COLLISION="$SANDBOX/memories-collision.json"
+cat > "$MEM_COLLISION" <<EOF
+{
+  "about-session-close": "A memory that quotes the marker verbatim:\n# 🚨 SESSION CLOSE PROTOCOL 🚨\nThis line is memory BODY content, not the real footer -- it must not leak the remaining memory bodies below into the slim index.",
+  "zzz-last-memory": $(printf '%s' "$LONG_BODY_2" | jq -Rs .),
+  "schema_version": 1
+}
+EOF
+
+OUT_COLLISION=$(render_slim_prime "$EXPORT_COLLISION" "$MEM_COLLISION")
+OUT_COLLISION_BYTES=$(printf '%s' "$OUT_COLLISION" | wc -c | tr -d ' ')
+
+assert "a memory body quoting the footer marker does NOT trigger an early split (real footer prose still present)" \
+  "$(printf '%s' "$OUT_COLLISION" | grep -qF 'real footer prose that must survive' && echo 1 || echo 0)"
+assert "zzz-last-memory's full body is NOT leaked -- proves the split didn't fire at the body's fake marker" \
+  "$(printf '%s' "$OUT_COLLISION" | grep -qF "$LONG_BODY_2" && echo 0 || echo 1)"
+assert "zzz-last-memory still appears as a truncated index entry, same as any other memory" \
+  "$(printf '%s' "$OUT_COLLISION" | grep -qE '^- zzz-last-memory: ' && echo 1 || echo 0)"
+assert "marker-collision fixture stays well under the 50KB slim-output ceiling (proves no leak-driven bloat)" \
+  "$([ "$OUT_COLLISION_BYTES" -lt 51200 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

@@ -13,7 +13,7 @@
 # .claude/review-queue`, `gh pr list --json`, review-verdict parse, `gh pr
 # merge` on gated CLEAN/BEHIND PRs, post-merge `git pull`/prune/worktree/branch
 # cleanup, a self-heal reconciliation pass for any open worker PR the
-# SubagentStop hook never queued at all (mayor-9syl7), and the deterministic
+# SubagentStop hook never queued at all, and the deterministic
 # slices of ai/dashboard.md. The mayor still does: dispatching
 # critical-reviewer for undrained queue entries (this script cannot invoke a
 # Claude subagent), cluster-shape decisions on new `bd ready` beads, and
@@ -194,11 +194,11 @@ route_deliverable() {
 }
 
 # True (exit 0) iff an active review-queue file's deliverable_ref names this
-# exact PR URL -- mayor-9syl7's no-double-queue guard: a PR already tracked
-# by an (undrained) queue file must not also get a reconciliation-synthesized
-# duplicate pending_reviews entry. `processed/` is not checked -- it was
-# deleted (mayor-hkhq0); a drained file's audit trail is git history plus
-# the review on the PR itself, not an archive directory.
+# exact PR URL -- the no-double-queue guard: a PR already tracked by an
+# (undrained) queue file must not also get a reconciliation-synthesized
+# duplicate pending_reviews entry. `processed/` is not checked -- that
+# archive directory was deleted; a drained file's audit trail is git
+# history plus the review on the PR itself, not an archive directory.
 pr_already_queued() {
   local url="$1" f dref
   for f in "$QUEUE_DIR"/*.md; do
@@ -439,8 +439,7 @@ process_review_queue() {
         # An unrecognized (or missing) deliverable_type: never auto-drained,
         # so it must surface here -- not silently leave all four
         # newly-documented state fields empty while still forcing exit 20
-        # via queue_files (mayor-s7nn6's suspicion). See bootstrap.md's
-        # queue_warnings bullet.
+        # via queue_files. See bootstrap.md's queue_warnings bullet.
         QUEUE_WARNINGS+=("$payload")
         ;;
     esac
@@ -548,7 +547,7 @@ check_worktree_anomalies() {
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
 }
 
-# Step 6 (mayor-9syl7): self-heal reconciliation. Compensating layer for the
+# Step 6: self-heal reconciliation. Compensating layer for the
 # SubagentStop hook missing a fire entirely (a push landing on a non-
 # worker/agent-* head, upstream anthropics/claude-code#27755, or the hook
 # exiting with an error) -- without this, an open worker PR with no queue
@@ -592,7 +591,7 @@ main() {
   # because reconcile_missing_queue_entries can append to it for a PR with
   # NO backing queue file at all -- without counting it directly, a
   # self-healed entry would leave exit_code at 0 (noop) and the mayor would
-  # never read pending_reviews to dispatch it, defeating mayor-9syl7 outright.
+  # never read pending_reviews to dispatch it, defeating self-heal outright.
   local exception_count=$(( ${#GATE_EXCEPTIONS[@]} + ${#QUEUE_FILES_REMAINING[@]} + ${#PENDING_REVIEW_PRS[@]} ))
   local worktree_count=${#WORKTREE_ANOMALIES[@]}
   local exit_code

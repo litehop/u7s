@@ -35,35 +35,27 @@ mechanically; you produce the narrative the mayor reads to decide what
 If nothing changed since the previous tick, say so in one sentence instead
 of inventing content.
 
-## Output schema
+## Output
 
-Return ONLY this JSON, no additional prose outside it:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "narrative": { "type": "string" }
-  },
-  "required": ["narrative"]
-}
-```
-
-`narrative` itself is free-form prose — a few sentences, not a template.
+Return the narrative itself as plain prose — a few sentences, not a
+template, and not wrapped in JSON. The output IS the narrative; there is
+no envelope or field to unwrap. (A JSON `{narrative: string}` wrapper was
+considered and rejected: the caller only ever reads the prose, so the
+envelope added a parse step with no consumer for the structure it implied.)
 
 ## Example
 
-Input: previous dashboard shows PR #1400 and #1408 as "in review"; current
-PR state shows #1400 merged, #1408 still in review, and a new PR #1412
+Input: previous dashboard shows PR #NNN1 and #NNN2 as "in review"; current
+PR state shows #NNN1 merged, #NNN2 still in review, and a new PR #NNN3
 opened; current dispatch state shows one new worker dispatched for a
 backlog-triage task.
 
 Output:
 
-```json
-{
-  "narrative": "PR #1400 merged since the last tick. PR #1408 is still awaiting review, unchanged. PR #1412 opened this tick (not yet reviewed). One new worker was dispatched for a backlog-triage task."
-}
+```
+PR #NNN1 merged since the last tick. PR #NNN2 is still awaiting review,
+unchanged. PR #NNN3 opened this tick (not yet reviewed). One new worker
+was dispatched for a backlog-triage task.
 ```
 
 ## Called by

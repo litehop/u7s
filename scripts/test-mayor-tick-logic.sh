@@ -392,8 +392,8 @@ assert "...no leftover .tmp file from the dry-run replace path" \
 # ---------------------------------------------------------------------------
 # 7. route_deliverable -- process_review_queue's dtype-routing case
 #    statement, extracted so each dtype's routing decision is directly
-#    testable without a gh network call or global-array mutation
-#    (mayor-s7nn6b). A regression here either drops a real finding/
+#    testable without a gh network call or global-array mutation.
+#    A regression here either drops a real finding/
 #    bead-close/bead-supersede review off the mayor's radar entirely, or
 #    (for "pr") merges the wrong PR's review verdict onto the wrong number.
 # ---------------------------------------------------------------------------
@@ -414,7 +414,7 @@ ROUTE=$(call route_deliverable 'q/supersede.md' bead-supersede 'mayor-cccc')
 assert "bead-supersede dtype routes to the 'non-pr' bucket" \
   "$([ "$(printf '%s' "$ROUTE" | cut -f1)" = "non-pr" ] && [ "$(printf '%s' "$ROUTE" | cut -f2 | jq -r '.deliverable_type')" = "bead-supersede" ] && echo 1 || echo 0)"
 
-# The suspicion this cluster resolves (mayor-s7nn6c): an unrecognized dtype
+# The suspicion this cluster resolves: an unrecognized dtype
 # used to leave pending_reviews/pending_non_pr_reviews/gate_exceptions/
 # queue_warnings ALL empty while still forcing exit 20 via queue_files --
 # the mayor would see "something's wrong" with zero clues why. Routing it
@@ -432,7 +432,7 @@ assert "an empty (malformed-frontmatter) deliverable_type also routes to 'warnin
   "$([ "$(printf '%s' "$ROUTE" | cut -f1)" = "warning" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 8. pr_already_queued -- mayor-9syl7's no-double-queue guard: a PR already
+# 8. pr_already_queued -- the no-double-queue guard: a PR already
 #    tracked by an active queue file must not also get a
 #    reconciliation-synthesized duplicate pending_reviews entry. Tested
 #    directly against a real (but throwaway) filesystem -- no network.
@@ -465,7 +465,7 @@ assert "pr_already_queued is false (not a crash) when the queue directory itself
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 9. Bash-3.2 empty-array guard mutation canary (mayor-s7nn6a). See the
+# 9. Bash-3.2 empty-array guard mutation canary. See the
 #    comment above the write_state call in main() (mayor-tick.sh) for why
 #    the "${ARR[@]+"${ARR[@]}"}" idiom exists at all 8 call sites: macOS
 #    ships bash 3.2 as /bin/bash (this script's own shebang target), and
@@ -508,7 +508,7 @@ assert "...with every one of the 8 guarded array fields empty, matching the genu
 
 # ---------------------------------------------------------------------------
 # 10. process_review_queue dtype routing, end-to-end through the REAL
-#     main() pipeline (mayor-s7nn6b) -- one fixture file per dtype plus one
+#     main() pipeline -- one fixture file per dtype plus one
 #     with no frontmatter at all, proving the routing in section 7 actually
 #     lands in the write_state fields the mayor reads, not just in
 #     route_deliverable's own return value.
@@ -536,7 +536,7 @@ assert "every queue file (even the malformed one) stays visible in queue_files, 
   "$([ "$(jq -r '.queue_files | length' "$TICK_STATE")" = "6" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 11. Self-heal reconciliation (mayor-9syl7): an open worker PR with no
+# 11. Self-heal reconciliation: an open worker PR with no
 #     review-queue entry at all gets synthesized into pending_reviews, and
 #     a PR that already HAS an active queue entry does not get
 #     double-queued. Runs the REAL main() (reconcile_missing_queue_entries
@@ -593,6 +593,54 @@ assert "a PR already covered by an active queue file is NOT double-queued by rec
   "$([ "$(jq -c '.pending_reviews' "$TICK_STATE")" = "[4242]" ] && echo 1 || echo 0)"
 assert "...and reconciliation does not even log a synthesis message for a PR that's already queued" \
   "$(! printf '%s' "$TICK_OUT" | grep -q 'mayor-tick reconcile:' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 12. Self-heal reconciliation's OTHER skip branch: a PR with
+#     NO active queue file but a critical-reviewer review ALREADY submitted
+#     (mayor-tick.sh:570-573) must not be re-synthesized into pending_reviews
+#     -- re-queuing an already-reviewed PR would waste a second reviewer
+#     dispatch on a PR the mayor can just merge (or already merged/rejected).
+#     pr_already_queued() only covers the active-queue-file case (section 11
+#     above); this is the review-history case, previously uncovered --
+#     deleting this branch left all other assertions green (reviewer
+#     confirmed empirically), which is exactly what this test now closes.
+# ---------------------------------------------------------------------------
+
+STUB_PR_REVIEWED_BIN="$WORKDIR/stub-pr-reviewed-bin"
+mkdir -p "$STUB_PR_REVIEWED_BIN"
+# Canned single open worker PR (#4343, DIRTY so gate_and_merge_prs skips it
+# without a merge attempt, isolating this test to reconciliation) whose
+# `pr view --json reviews` already carries a critical-reviewer LGTM.
+cat > "$STUB_PR_REVIEWED_BIN/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" view "* ]]; then
+  base='{"reviews":[{"body":"## critical-reviewer findings\n**Verdict**: LGTM","submittedAt":"2026-01-01T00:00:00Z"}]}'
+else
+  base='[{"number":4343,"url":"https://github.com/example/repo/pull/4343","headRefName":"worker/agent-reviewed-test","mergeStateStatus":"DIRTY","statusCheckRollup":[]}]'
+fi
+jq_filter=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--jq" ] && jq_filter="$a"
+  prev="$a"
+done
+if [ -n "$jq_filter" ]; then
+  printf '%s' "$base" | jq "$jq_filter"
+else
+  printf '%s' "$base"
+fi
+EOF
+cat > "$STUB_PR_REVIEWED_BIN/bd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$STUB_PR_REVIEWED_BIN/gh" "$STUB_PR_REVIEWED_BIN/bd"
+
+run_full_tick "$STUB_PR_REVIEWED_BIN"
+assert "a PR with no queue file but an already-submitted critical-reviewer review is NOT synthesized into pending_reviews" \
+  "$([ "$(jq -r '.pending_reviews | index(4343) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
+assert "...and reconciliation does not log a synthesis message for it either -- the skip is silent by design" \
+  "$(! printf '%s' "$TICK_OUT" | grep -q 'mayor-tick reconcile:.*4343' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
