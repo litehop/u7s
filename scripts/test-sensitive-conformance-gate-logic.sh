@@ -67,6 +67,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/sensitive-conformance-gate.sh"
+source "$REPO/scripts/_git-env-guard.sh"
 SENSITIVE_FILE="crates/apiserver/src/handlers/pods.rs"
 REQUIRED_FOCUS="ReplicationController should release no longer matching pods|Job should adopt matching orphans and release non-matching pods"
 
@@ -97,25 +98,15 @@ skip() {
 # exactly this leakage, once corrupted the mayor's real repository (a
 # sandbox fixture's `git commit` inherited that hook's ambient GIT_DIR and
 # landed in the real repo instead of a disposable sandbox). Every git
-# subprocess the sandbox-repo helpers below spawn goes through run_git() to
-# strip these first -- see scripts/sensitive-conformance-gate.sh's own
-# run_git() (same variable set, and crates/junit-reuse-check/src/lib.rs's
-# git_command() for the full per-variable rationale, including why
-# HOME/XDG_CONFIG_HOME are deliberately NOT in this list) for why an
-# incomplete list here is a false sense of safety, not a real one -- a
-# critical-reviewer finding that GIT_CONFIG alone was missing from an
-# earlier version of this exact list (it still let an ambient var silently
-# redirect a `git config` WRITE -- see scenario H below) is what added the
-# second line.
-run_git() {
-  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_NAMESPACE -u GIT_INDEX_FILE \
-    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
-    -u GIT_COMMON_DIR -u GIT_CEILING_DIRECTORIES \
-    -u GIT_DISCOVERY_ACROSS_FILESYSTEM \
-    -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM \
-    -u GIT_CONFIG_NOSYSTEM -u GIT_CONFIG_COUNT \
-    git "$@"
-}
+# subprocess the sandbox-repo helpers below spawn goes through run_git() (see
+# scripts/_git-env-guard.sh, sourced above -- same variable set as
+# scripts/sensitive-conformance-gate.sh's own run_git() and
+# crates/junit-reuse-check/src/lib.rs's git_command() for the full
+# per-variable rationale, including why HOME/XDG_CONFIG_HOME are deliberately
+# NOT in this list) to strip these first -- an incomplete list here is a
+# false sense of safety, not a real one, per the critical-reviewer finding
+# that GIT_CONFIG alone was once missing (it still let an ambient var
+# silently redirect a `git config` WRITE -- see scenario H below).
 
 new_sandbox() {
   local dir="$1"

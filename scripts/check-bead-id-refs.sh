@@ -15,9 +15,15 @@
 #     not a bead ID; mayor-[a-z0-9]{3,5} happens to also match its first letters
 #     ("mayor-metho"). git grep's -E engine has no \b support to disambiguate,
 #     so the file is excluded outright rather than false-positiving forever.
-#   scripts/test-critical-reviewer-hook.sh -- its "mayor-abc12" fixture exercises
+#   scripts/test-critical-reviewer-hook.sh -- excluded from the blanket sweep
+#     below because its "mayor-abc12" fixture (exercising
 #     critical-reviewer-dispatch.sh's own hardcoded `bd close (mayor-[a-z0-9]+)`
-#     regex; it is synthetic test input, not a reference to a real, closeable bead.
+#     regex) is synthetic test input, not a reference to a real, closeable
+#     bead -- but a whole-file skip once masked a REAL bead-ID reference too
+#     (mayor-kfabq, landed in a comment by the very PR that tightened
+#     mayor-tick.sh's own exclusion below, then stripped once discovered).
+#     Same fix as mayor-tick.sh: CRITICAL_REVIEWER_HOOK_ALLOWED_TOKENS below
+#     re-scans this file match-by-match and only tolerates "mayor-abc12".
 #   scripts/test-check-bead-id-refs-logic.sh -- this guard's own regression test;
 #     its fixtures are synthetic bead-ID-shaped strings (one per real length,
 #     3/4/5-char plus dotted sub-ID) that must trip the regex to prove it works,
@@ -77,6 +83,21 @@ mayor_tick_matches=$(git grep -n -oE 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- \
 if [ -n "$mayor_tick_matches" ]; then
   matches="${matches:+$matches
 }$mayor_tick_matches"
+fi
+
+# scripts/test-critical-reviewer-hook.sh is skipped above (its "mayor-abc12"
+# fixture is synthetic test input, not a real bead ID), but the same
+# whole-file-skip-can't-tell-fixture-from-rot flaw as mayor-tick.sh applies --
+# see the exclusion-list comment above for the real bead ID (mayor-kfabq)
+# it once let rot undetected. Re-scan match-by-match and only tolerate the
+# fixture token.
+CRITICAL_REVIEWER_HOOK_ALLOWED_TOKENS='mayor-abc12$'
+critical_reviewer_hook_matches=$(git grep -n -oE 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- \
+  scripts/test-critical-reviewer-hook.sh 2>/dev/null \
+  | grep -vE ":${CRITICAL_REVIEWER_HOOK_ALLOWED_TOKENS}" || true)
+if [ -n "$critical_reviewer_hook_matches" ]; then
+  matches="${matches:+$matches
+}$critical_reviewer_hook_matches"
 fi
 
 if [ -n "$matches" ]; then

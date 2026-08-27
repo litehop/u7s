@@ -57,27 +57,13 @@ REGISTRY="$HOOK_ROOT/.githooks/sensitive-conformance-focus.yaml"
 # enclosing hook invocation's environment happens to point at. This script
 # runs from INSIDE .githooks/pre-push, which git itself may export these
 # into -- this is the exact mechanism that once corrupted the mayor's real
-# repository via this hook's ambient environment. Two documented families
-# (see crates/junit-reuse-check/src/lib.rs's git_command() doc comment for
-# the full per-variable rationale, including why HOME/XDG_CONFIG_HOME are
-# deliberately NOT in this list): repository-location vars per `git help
-# git`'s "THE GIT REPOSITORY" section, and config-location vars per `git
-# help git-config`'s ENVIRONMENT section -- the latter added after a
-# critical-reviewer finding that GIT_CONFIG alone (missed by the former
-# list) still let an ambient var silently redirect a `git config` WRITE,
-# which is the exact mechanism behind the original corruption symptom.
-# Same variable set as crates/junit-reuse-check/src/lib.rs's git_command()
-# and this script's own test harness
-# (scripts/test-sensitive-conformance-gate-logic.sh's run_git()).
-run_git() {
-  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_NAMESPACE -u GIT_INDEX_FILE \
-    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
-    -u GIT_COMMON_DIR -u GIT_CEILING_DIRECTORIES \
-    -u GIT_DISCOVERY_ACROSS_FILESYSTEM \
-    -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM \
-    -u GIT_CONFIG_NOSYSTEM -u GIT_CONFIG_COUNT \
-    git "$@"
-}
+# repository via this hook's ambient environment. run_git() (see
+# scripts/_git-env-guard.sh for the full per-variable rationale, including
+# why HOME/XDG_CONFIG_HOME are deliberately NOT in this list) is shared with
+# this script's own test harness (scripts/test-sensitive-conformance-gate-
+# logic.sh) and crates/junit-reuse-check/src/lib.rs's git_command().
+# shellcheck source=scripts/_git-env-guard.sh
+source "$HOOK_ROOT/scripts/_git-env-guard.sh"
 
 # Emits one "<file-pattern><TAB><focus-regex>" line per registry entry.
 # Deliberately NOT a general YAML parser -- see the registry's own header

@@ -28,6 +28,18 @@
 # can put the 2nd node on the SAME network instead of silently defaulting to
 # lima-start.sh's own user-v2 fallback, which would leave the two nodes with no
 # route to each other.
+#
+# WARNING: this script only provisions the VM and joins the kubelet -- it does
+# NOT update an already-running apiserver's --node-kubelet-port mapping (that
+# mapping is read once at apiserver startup; there is no hot-reload path). Run
+# standalone against a live apiserver, any pod later scheduled on <vm-name>
+# falls back to the primary node's kubelet port, and `kubectl logs`/`kubectl
+# exec` against it will 404. To add a node whose pods have working logs/exec,
+# either start the whole stack fresh via run-all.sh --extra-node <vm>
+# --extra-kubelet-port <port> (which wires --node-kubelet-port into
+# 02-start-apiserver.sh before this script joins the node), or restart
+# 02-start-apiserver.sh with an added --node-kubelet-port <vm-name>=<port>
+# entry.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -64,6 +76,10 @@ fi
 KUBECONFIG_PATH="$WORKDIR/kubeconfig"
 
 echo "=== [add-node] Joining $VM_NAME (kubelet port $KUBELET_PORT) ==="
+echo "WARNING: this does not update the running apiserver's --node-kubelet-port mapping." >&2
+echo "kubectl logs/exec against pods on $VM_NAME will 404 until the apiserver is restarted" >&2
+echo "with --node-kubelet-port $VM_NAME=$KUBELET_PORT (or start fresh via run-all.sh" >&2
+echo "--extra-node/--extra-kubelet-port instead)." >&2
 
 # Verify the primary stack is reachable before touching the 2nd VM (mirror lima-start.sh).
 if ! kubectl --kubeconfig="$KUBECONFIG_PATH" get namespaces &>/dev/null; then
