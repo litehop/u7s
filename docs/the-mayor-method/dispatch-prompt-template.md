@@ -148,6 +148,35 @@ Agent(
    git -C <ASSIGNED_WORKTREE> status --short
    ```
 
+## Reviewer effort tiering
+
+Not every critical-reviewer dispatch needs Sonnet. Rule: a PR whose diff is
+**≤50 changed lines** (`gh pr diff <N> --stat` total, additions + deletions)
+AND touches **only doc/config surfaces** — `docs/`, `*.md`, `.claude/agents/*.md`,
+`ai/dashboard.md`, CI YAML, `Cargo.toml` version/dependency bumps with no
+code behind them — with **no changes to code or any public-API surface**
+(handler signatures, protobuf/JSON encoders, CRD schemas, RBAC rules, any
+`src/**/*.rs` logic) qualifies for the low-effort tier: dispatch
+critical-reviewer with `model="haiku", effort="low"`. Every other PR — larger
+diff, or any diff touching code or a public-API surface, regardless of size —
+stays on critical-reviewer.md's Sonnet default. A one-line `src/` fix does
+NOT qualify just because it's small; the surface criterion is independent of
+the size criterion and both must hold.
+
+Concrete invocation for a low-risk case (a 12-line `docs/decisions/` typo fix):
+
+```python
+Agent(
+    subagent_type="critical-reviewer",
+    model="haiku",
+    effort="low",
+    prompt="Review PR https://github.com/litehop/u7s/pull/<N> ...",
+)
+```
+
+For everything else, omit `model`/`effort` and let critical-reviewer.md's own
+frontmatter (`model: sonnet`) apply.
+
 ## Common preamble (every dispatch)
 
 ```
