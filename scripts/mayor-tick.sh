@@ -280,8 +280,21 @@ splice_dashboard_section() {
   local begin="<!-- BEGIN AUTO: ${id} -->"
   local end="<!-- END AUTO: ${id} -->"
 
+  # $content is frequently multi-line (2+ worktrees, 2+ open PRs, ...).
+  # BSD awk (macOS's /usr/bin/awk) rejects an embedded newline in a -v
+  # scalar with "newline in string", killing the whole tick before the
+  # state file is written. Route the body through a temp file and
+  # getline it inside awk's BEGIN block instead of passing it via -v.
+  local body_tmp
+  body_tmp="$(mktemp "${DASHBOARD_FILE}.body.XXXXXX")"
+  printf '%s\n' "$content" > "$body_tmp"
+
   if grep -qF "$begin" "$DASHBOARD_FILE"; then
-    awk -v b="$begin" -v e="$end" -v body="$content" '
+    awk -v b="$begin" -v e="$end" -v bodyfile="$body_tmp" '
+      BEGIN {
+        n=0
+        while ((getline line < bodyfile) > 0) { body = (n==0 ? line : body "\n" line); n++ }
+      }
       $0==b {print; print body; skip=1; next}
       $0==e {print; skip=0; next}
       skip {next}
@@ -289,6 +302,7 @@ splice_dashboard_section() {
     ' "$DASHBOARD_FILE" > "${DASHBOARD_FILE}.tmp"
     run_cmd _dashboard_replace_from_tmp "${DASHBOARD_FILE}.tmp"
     rm -f "${DASHBOARD_FILE}.tmp"  # no-op if already mv'd; cleans up a dry-run's leftover
+    rm -f "$body_tmp"
     return
   fi
 
@@ -298,8 +312,11 @@ splice_dashboard_section() {
     # heading up to (not including) the next "## " heading or EOF with the
     # sentinel-wrapped body, so the section becomes script-owned in place
     # instead of duplicating a second copy of the heading at the file end.
-    awk -v re="$heading_re" -v b="$begin" -v e="$end" -v body="$content" '
-      BEGIN{done=0}
+    awk -v re="$heading_re" -v b="$begin" -v e="$end" -v bodyfile="$body_tmp" '
+      BEGIN {
+        done=0; n=0
+        while ((getline line < bodyfile) > 0) { body = (n==0 ? line : body "\n" line); n++ }
+      }
       !done && $0 ~ re { print; print b; print body; print e; done=1; skip=1; next }
       skip && /^## / { skip=0 }
       skip { next }
@@ -310,6 +327,7 @@ splice_dashboard_section() {
   else
     run_cmd _dashboard_append_section "$(printf '\n## %s\n%s\n%s\n%s\n' "$heading_text" "$begin" "$content" "$end")"
   fi
+  rm -f "$body_tmp"
 }
 
 dashboard_open_prs() {

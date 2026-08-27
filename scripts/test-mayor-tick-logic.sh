@@ -390,6 +390,50 @@ assert "...no leftover .tmp file from the dry-run replace path" \
   "$([ ! -e "${DASH}.tmp" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 6b. Multi-line splice body -- regression coverage for the BSD-awk newline
+#     bug. BSD awk
+#     (macOS's /usr/bin/awk -- what the pre-push hook and CI actually run)
+#     rejects a newline embedded in an `-v name=value` scalar with "newline
+#     in string" and exits 2. `$content` IS multi-line whenever 2+ worker
+#     worktrees or 2+ open PRs exist, so this crashed the real 15m tick loop
+#     with no state-file write, silently, exactly when multi-worker
+#     parallelism most needed it (observed live 2026-08-28). Exercise both
+#     awk call sites (existing-sentinel replace, freeform-heading migration)
+#     with a 2-line body so a regression here fails loud instead of quietly
+#     killing the loop again.
+# ---------------------------------------------------------------------------
+
+MULTI=$'- `worker/agent-a` (`branch-a`)\n- `worker/agent-b` (`branch-b`)'
+
+RC=0
+MAYOR_TICK_DASHBOARD_FILE="$DASH" call splice_dashboard_section \
+  "open-prs" '^## .*Open PRs' '🔎 Open PRs' "$MULTI" || RC=$?
+assert "multi-line body on the existing-sentinel replace path does not crash awk" \
+  "$([ "$RC" = "0" ] && echo 1 || echo 0)"
+assert "...both lines of the multi-line body land between the sentinels" \
+  "$(grep -q 'worker/agent-a' "$DASH" && grep -q 'worker/agent-b' "$DASH" && echo 1 || echo 0)"
+assert "...still exactly one sentinel pair (no half-written file from an awk crash)" \
+  "$([ "$(grep -c 'BEGIN AUTO: open-prs' "$DASH")" = "1" ] && echo 1 || echo 0)"
+
+DASH2="$WORKDIR/dashboard-migrate.md"
+cat > "$DASH2" <<'EOF'
+# Dashboard
+
+## 🌲 Worktrees / hygiene
+Stale freeform text from before mayor-tick.sh existed.
+EOF
+
+RC=0
+MAYOR_TICK_DASHBOARD_FILE="$DASH2" call splice_dashboard_section \
+  "worktrees" '^## .*Worktrees' '🌲 Worktrees / hygiene' "$MULTI" || RC=$?
+assert "multi-line body on the freeform-heading migration path does not crash awk" \
+  "$([ "$RC" = "0" ] && echo 1 || echo 0)"
+assert "...both lines of the multi-line body land in the migrated section" \
+  "$(grep -q 'worker/agent-a' "$DASH2" && grep -q 'worker/agent-b' "$DASH2" && echo 1 || echo 0)"
+assert "...replaces the stale freeform text instead of leaving it alongside the new body" \
+  "$(! grep -q 'Stale freeform text' "$DASH2" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 7. route_deliverable -- process_review_queue's dtype-routing case
 #    statement, extracted so each dtype's routing decision is directly
 #    testable without a gh network call or global-array mutation.
