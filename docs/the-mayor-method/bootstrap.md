@@ -98,106 +98,71 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 **Set up loops.** If they don't exist already, create:
 - 60m — reread this file + siblings; reassert posture to operator
 - 60m — worktree hygiene (worker worktrees, origin orphan branches, stale tracking refs, orphaned host processes — see body below)
-- 30m — cluster review (3+ same-surface beads → one PR; 8–12 sweet spot)
-- 5m — merge PRs (green only; no --admin; queue-native workflow — see body below)
-- 15m — bead dispatch pass (filter out decisions/EPICs/release-coupled/v1.x/hot-zone)
-- 10m — dashboard refresh (REPLACE stale content, don't append — see the
-  Dashboard section's snapshot/≤40-line rules; the loop body must say "rewrite
-  in place / collapse finished blocks", not just "update")
+- 15m — mayor tick: run `scripts/mayor-tick.sh`, then act on its exit code
+  and `.claude/mayor-tick-state.json` — see body below. Replaces the prior
+  5m merge-PR / 10m dashboard-refresh / 15m bead-dispatch / 30m
+  cluster-review loops (mayor-zhwjg): that mechanical work is now
+  deterministic script output, and this one loop only wakes the mayor for
+  what the exit code says still needs judgment.
 
 The canonical loop bodies live in `dispatch-prompt-template.md` and prior
 session output; paste verbatim or adapt as needed.
 
-**Merge PR loop body — GitHub Merge Queue is active on this repo.**
-The main-branch ruleset (18156794) requires up-to-date branches
-(`strict_required_status_checks_policy: true`), and the queue satisfies
-that automatically (MERGE method, all-green grouping, min 1 / max 5,
-`allow_auto_merge=true`, verified end-to-end since PR #1347). The queue
-runs its own CI cycle against a synthetic merge commit and lands the PR
-when green. Two consequences for the mayor:
+**Mayor tick loop body (mayor-zhwjg) — GitHub Merge Queue is active on
+this repo.** The main-branch ruleset (18156794) requires up-to-date
+branches (`strict_required_status_checks_policy: true`), and the queue
+satisfies that automatically (MERGE method, all-green grouping, min 1 /
+max 5, `allow_auto_merge=true`, verified end-to-end since PR #1347). The
+queue runs its own CI cycle against a synthetic merge commit and lands the
+PR when green.
 
-- **Use bare `gh pr merge <N>`.** `--merge` is rejected ("merge strategy
-  is set by the queue"); `--delete-branch` is rejected ("cannot use
-  `--delete-branch` when merge queue enabled" — the queue deletes the
-  remote branch itself post-merge).
-- **Never run `gh pr update-branch`.** A BEHIND PR is the queue's
-  problem — queue it with `gh pr merge <N>` and the queue will rebase
-  it as part of its own cycle. A manual `update-branch` triggers a
-  redundant CI cycle whose results the queue-cycle will invalidate
-  anyway (triple CI: push + update-branch + queue-synthetic). The
-  serialization-guard logic that used to live here (pre-queue) is moot.
-
-0. **Drain the review queue (mayor-oec8e).** For each file in
-   `.claude/review-queue/*.md` (oldest `queued_at` first; cap 5 per tick so a
-   large backlog doesn't blow out this tick's latency — the rest drain over
-   subsequent ticks), read its `deliverable_type`/`deliverable_ref`
-   frontmatter and invoke `.claude/agents/critical-reviewer.md` with that
-   deliverable — it now self-posts its findings (an inline-anchored PR
-   review, or bead notes + a follow-on bead for non-PR types; see the agent
-   file's "Output & posting" section). The hook
-   (`scripts/critical-reviewer-dispatch.sh`) filters out `agent_type:
-   critical-reviewer` completions before they ever reach this queue, so a
-   review's own completion report echoing the PR URL it just reviewed can
-   never re-queue itself — if you never see critical-reviewer-sourced
-   entries here, that's the filter working, not a broken hook. Only THEN,
-   after confirming the post actually landed — `gh pr view <N> --json
-   reviews` shows a new review whose body starts with `## critical-reviewer
-   findings` for `pr` deliverables (NOT `--json comments`: a Review's body
-   does not surface there, only under `reviews`), or `bd show <id>` shows
-   the appended note for the others — `mv` the queue file into
-   `.claude/review-queue/processed/` (create the dir first if absent), never
-   delete, this is the audit trail. If the confirmation check fails (auth
-   hiccup, rate limit, the agent not actually executing its posting
-   instructions), leave the file in place for the next tick to retry —
-   moving it to `processed/` unconditionally would make a failed post
-   indistinguishable from a real one and quietly reintroduce the exact
-   "PR never gets reviewed" risk this whole mechanism exists to close, just
-   via a different failure mode. Drain ALL deliverable types here
-   (pr/findings/bead-close/bead-supersede), not just PRs: only the PR type is
-   load-bearing for step 2's merge gate below, but leaving the
-   findings/bead-close/bead-supersede share of the backlog (~30% historically)
-   permanently undrained would just reintroduce the same "queue nobody
-   drains" bug for a subset of deliverables.
-1. Enumerate open PRs and their check state:
-   `gh pr list --state open --json number,title,mergeStateStatus,statusCheckRollup | jq`.
-2. **Review gate (mayor-oec8e), then merge any CLEAN PR.** For a
-   `worker/agent-*`-branch PR (NOT `operator/*` — see below), take the
-   LATEST (highest `submittedAt`) review whose body starts with `##
-   critical-reviewer findings`: `gh pr view <N> --json reviews`. Parse that
-   review's `**Verdict**:` line — only `LGTM` or `LGTM-with-suggestions`
-   satisfies the gate; `needs-changes`/`needs-discussion` does NOT, even
-   though the header is present. Resolve by `submittedAt`, never by mere
-   header presence: an older superseded LGTM must not mask a newer
-   needs-changes, and a newer LGTM does supersede an older needs-changes.
-   This exact gap let PR #1336 sit CLEAN with an unaddressed needs-changes
-   verdict still on record on 2026-08-21, caught only by manual attention,
-   not by this gate. If no qualifying review exists, do not merge this
-   PR THIS tick — step 0 above (same tick) should have just posted one if a
-   queue entry existed for it, so the NEXT tick can merge. `operator/*`
-   branches are exempt: they're authored directly by the mayor's own
-   top-level turn, which never triggers the SubagentStop hook that feeds the
-   queue in the first place, so no review is ever queued for them — that's
-   the hook's actual trigger condition, not a gap to patch.
-   Fallback for a CLEAN `worker/agent-*` PR with NO matching queue entry at
-   all (checked by grepping the PR's URL across both
-   `.claude/review-queue/*.md` and `.claude/review-queue/processed/*.md`):
-   verified 2026-08-21 that every currently-open worker PR has a matching
-   queue file, and every currently-open PR's branch is either
-   `worker/agent-*` or `operator/*` (no third category exists in this repo),
-   so a true no-queue-entry PR should be rare — a missed SubagentStop hook
-   fire (upstream anthropics/claude-code#27755) or a worker's return message
-   that didn't paste the literal `.../pull/<N>` URL the hook's regex matches.
-   When it happens: invoke the critical-reviewer directly for that PR in the
-   SAME tick (same as if a queue file existed) rather than waiting on a
-   queue file that will never arrive.
-   Once gated: `gh pr merge <N>` (bare) for any CLEAN PR (checks_pending=0
-   AND checks_failed=0 AND mergeStateStatus=CLEAN). This enables auto-merge
-   if not immediately mergeable; the queue lands it once its own CI cycle
-   is green. NEVER `--admin`; the queue is the gate. Queue any BEHIND PR
-   the same way — it's the queue's job to rebase, not the mayor's. After
-   the queue lands a PR: `git pull --ff-only` + `git remote prune origin`
-   (the queue auto-deletes the remote branch), then remove the merged
-   worker's worktree and its local branch (`git branch -D` if it survives).
+1. Run `scripts/mayor-tick.sh`. It drains `pr`-type review-queue entries
+   (removes a queue file once it confirms the deliverable's review
+   actually posted — `rm`, not `mv` to an archive dir: the audit trail is
+   git history plus the review itself on the PR, both durable,
+   mayor-hkhq0), gates every open `worker/agent-*` PR that's CLEAN or
+   BEHIND (a BEHIND PR is the merge queue's job to rebase, not the
+   mayor's, so it's queued the same way, never silently skipped) on the
+   LATEST (by `submittedAt`, never by mere header presence — an older
+   superseded LGTM must not mask a newer needs-changes) critical-reviewer
+   verdict, issues a bare `gh pr merge <N>` for anything qualifying
+   LGTM/LGTM-with-suggestions, runs post-merge `git pull --ff-only` +
+   `git remote prune origin` + worktree/branch cleanup for PRs it confirms
+   merged, refreshes `ai/dashboard.md`'s deterministic sections, and
+   writes `.claude/mayor-tick-state.json`. `operator/*` branches are
+   exempt from the gate — they never trigger the SubagentStop hook that
+   feeds the review queue, so no review is ever queued for them.
+   `findings`/`bead-close`/`bead-supersede`-type queue entries are never
+   auto-drained (they post to bd notes, not a PR, and bd exposes no
+   per-note timestamp to confirm against) — they always surface in
+   `pending_non_pr_reviews` for the mayor to dispatch and confirm by hand.
+2. Read the state file and act on the script's exit code (non-zero codes
+   are OR-able; the highest fires if more than one condition matched):
+   - **0** — noop, nothing for this tick.
+   - **10** — `bd_ready_ids` holds new dispatchable beads. Apply the usual
+     cluster-shape judgment (filter out decisions/EPICs/release-coupled/
+     v1.x/hot-zone) and dispatch per the discipline above.
+   - **20** — one or more of `pending_reviews`, `pending_non_pr_reviews`,
+     `gate_exceptions`, or `queue_warnings` is non-empty; the script
+     cannot invoke a Claude subagent, so: for each `pending_reviews` PR,
+     invoke `.claude/agents/critical-reviewer.md` directly (same as if
+     you'd drained the queue by hand); for each `pending_non_pr_reviews`
+     entry, invoke it the same way per its `deliverable_type` (see
+     `.claude/agents/critical-reviewer.md`'s "Output & posting"), then
+     confirm via `bd show <deliverable_ref>` and `rm` the queue file
+     yourself once the note lands; for each `gate_exceptions` entry,
+     investigate why it didn't qualify (no review yet vs. a
+     needs-changes/needs-discussion verdict on record) — do not merge it
+     yourself without resolving that first; for each `queue_warnings`
+     entry, investigate the malformed queue file (a broken `queued_at` —
+     it will never auto-drain until fixed or removed by hand).
+   - **30** — `worktree_anomalies` lists a worker branch with no PR at
+     all; investigate whether that dispatch stalled or crashed.
+3. If you ever merge a PR by hand instead of letting the script queue it
+   (e.g. resolving a gate exception), stay queue-native: bare `gh pr merge
+   <N>` only — `--merge`/`--delete-branch` are rejected by the queue, and
+   `gh pr update-branch` on a BEHIND PR just triggers a redundant CI cycle
+   the queue's own synthetic-merge cycle will invalidate anyway.
 
 **Inline sync after every task-notification — transport-conditional (mayor-t79kb).**
 Standing cron loops fire reliably on the terminal CLI (Claude Code invoked as
@@ -215,17 +180,19 @@ CLI, though cheap enough as belt-and-suspenders if uncertain which transport
 this session is on): after EVERY task-notification received while 1+ workers
 are still active, inline the following before either dispatching the next
 worker or ending the turn:
-1. `gh pr list --state open --json number,title,mergeStateStatus` — merge
-   any CLEAN PR with bare `gh pr merge <N>` (queue-native — see main body).
-2. Refresh `ai/dashboard.md` with a fresh `date -u` timestamp.
-3. If a PR merged, `git remote prune origin` to clear the stale tracking ref.
-4. Verify the returning worker's worktree is cleaned up and its bead is
-   closed (close it if the worker didn't).
+1. Run `scripts/mayor-tick.sh` — same script, same exit-code/state-file
+   contract as the mayor tick loop body above, just triggered by a
+   notification instead of a timer.
+2. Act on its exit code per the mayor tick loop body above.
+3. Verify the returning worker's worktree is cleaned up and its bead is
+   closed (close it if the worker didn't) — the script only cleans up
+   worktrees for PRs it has itself confirmed merged.
 
-Cost when the pattern applies: ~5-10 additional tool calls per notification.
-If you don't know which transport you're on, run the pattern anyway — cheap
-on the CLI, load-bearing in the extension. See bd memory
-`claude-code-cron-loops-blocked-by-background-workers-in-stream-json-transport`.
+Cost when the pattern applies: ~1-3 additional tool calls per notification
+(down from the pre-mayor-tick.sh inline gh/dashboard/prune sequence, now
+one script call). If you don't know which transport you're on, run the
+pattern anyway — cheap on the CLI, load-bearing in the extension. See bd
+memory `claude-code-cron-loops-blocked-by-background-workers-in-stream-json-transport`.
 
 **Worktree hygiene loop body — STEP A: orphaned host processes (mayor-yfvxn).**
 `git worktree remove` does not kill the host-side processes a worker's

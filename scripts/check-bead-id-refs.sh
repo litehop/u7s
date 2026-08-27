@@ -29,6 +29,13 @@
 #     (comment-only or not) is blocked by .githooks/pre-push without a fresh
 #     sonobuoy PASS on an owned VM slot. Tracked in mayor-e49sl -- remove this
 #     exclusion once that bead lands the remaining 7 refs (5 distinct IDs).
+#   scripts/mayor-tick.sh, scripts/test-mayor-tick-logic.sh, .gitignore --
+#     same "mayor-metho" class of false positive as CONTRIBUTING.md above:
+#     the script's own name, "mayor-tick", matches mayor-[a-z0-9]{3,5} by
+#     coincidence, and it's a permanent script name, not a bead ID that
+#     will close and rot. test-mayor-tick-logic.sh also has a synthetic
+#     "mayor-abcd" fixture (same rationale as test-critical-reviewer-hook.sh
+#     above) plus the prose word "mayor-owned" (an adjective, not an ID).
 #
 # Bead IDs are `mayor-` + a 3-5 char alphanumeric suffix (bd's ID generator;
 # see .beads/issues.jsonl for the observed range), optionally followed by a
@@ -44,6 +51,8 @@ matches=$(git grep -n -E 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- . \
   ':!scripts/test-check-bead-id-refs-logic.sh' \
   ':!scripts/check-bead-id-refs.sh' \
   ':!crates/apiserver/src/handlers/pods.rs' \
+  ':!scripts/mayor-tick.sh' ':!scripts/test-mayor-tick-logic.sh' \
+  ':!.gitignore' \
   2>/dev/null || true)
 
 if [ -n "$matches" ]; then
