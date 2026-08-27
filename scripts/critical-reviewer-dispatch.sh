@@ -13,6 +13,15 @@
 #
 # Never spawn a reviewer synchronously from here. Never edit files outside
 # .claude/review-queue/.
+#
+# Retention policy (2026-08-27): decisions.tsv rotates via simple counter
+# rotation (.tsv -> .1 -> .2, oldest generation discarded)
+# once it reaches ~1 MiB, so a long-running mayor session cannot grow it
+# unbounded. Both "queued" and "skip" entries rotate together -- skips are
+# already the majority of lines and untangling the two isn't worth the
+# complexity. Queued (auditable) entries survive at least two rotations
+# before being dropped, since nothing is discarded until it ages past the
+# .2 generation.
 
 set -euo pipefail
 
@@ -33,6 +42,27 @@ LOG_DIR="$QUEUE_DIR/log"
 
 mkdir -p "$LOG_DIR"
 
+DECISIONS_LOG="$LOG_DIR/decisions.tsv"
+DECISIONS_LOG_MAX_BYTES=$((1024 * 1024)) # 1 MiB; see retention policy above.
+
+# Counter rotation: decisions.tsv -> .1 -> .2, oldest (.2) discarded. Runs
+# before every append so the live file never grows past
+# DECISIONS_LOG_MAX_BYTES.
+rotate_decisions_log() {
+  [ -f "$DECISIONS_LOG" ] || return 0
+  local size
+  size=$(wc -c < "$DECISIONS_LOG" | tr -d ' ')
+  [ "${size:-0}" -ge "$DECISIONS_LOG_MAX_BYTES" ] || return 0
+  rm -f "$DECISIONS_LOG.2"
+  [ -f "$DECISIONS_LOG.1" ] && mv "$DECISIONS_LOG.1" "$DECISIONS_LOG.2"
+  mv "$DECISIONS_LOG" "$DECISIONS_LOG.1"
+}
+
+log_decision() {
+  rotate_decisions_log
+  printf '%s\n' "$1" >> "$DECISIONS_LOG"
+}
+
 TS=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
 
 # Detect reviewable deliverables. Empty MSG → nothing to review.
@@ -47,8 +77,8 @@ TS=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
 # re-queuing again unboundedly. Skip before running deliverable detection at
 # all; there is nothing to discard, so no reason to regex the message first.
 if [ "$AGENT_TYPE" = "critical-reviewer" ]; then
-  printf '%s\t%s\tskip\tself-review-echo\tagent_type=%s\n' \
-    "$TS" "$AGENT_ID" "$AGENT_TYPE" >> "$LOG_DIR/decisions.tsv"
+  log_decision "$(printf '%s\t%s\tskip\tself-review-echo\tagent_type=%s' \
+    "$TS" "$AGENT_ID" "$AGENT_TYPE")"
   exit 0
 fi
 
@@ -94,8 +124,8 @@ fi
 # No reviewable deliverable → skip. Log the reason so a future audit can tell
 # "hook fired but had nothing to do" from "hook never fired" (upstream #27755).
 if [ -z "$DELIVERABLE_TYPE" ]; then
-  printf '%s\t%s\tskip\tno-deliverable\tagent_type=%s\n' \
-    "$TS" "$AGENT_ID" "$AGENT_TYPE" >> "$LOG_DIR/decisions.tsv"
+  log_decision "$(printf '%s\t%s\tskip\tno-deliverable\tagent_type=%s' \
+    "$TS" "$AGENT_ID" "$AGENT_TYPE")"
   exit 0
 fi
 
@@ -126,7 +156,7 @@ QUEUE_FILE="$QUEUE_DIR/$TS-$AGENT_ID.md"
   printf '```\n%s\n```\n' "$MSG"
 } > "$QUEUE_FILE"
 
-printf '%s\t%s\tqueued\t%s\t%s\n' \
-  "$TS" "$AGENT_ID" "$DELIVERABLE_TYPE" "$DELIVERABLE_REF" >> "$LOG_DIR/decisions.tsv"
+log_decision "$(printf '%s\t%s\tqueued\t%s\t%s' \
+  "$TS" "$AGENT_ID" "$DELIVERABLE_TYPE" "$DELIVERABLE_REF")"
 
 exit 0
