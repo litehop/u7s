@@ -31,6 +31,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/check-doc-budget.sh"
+source "$REPO/scripts/_git-env-guard.sh"
 
 PASS=0
 FAIL=0
@@ -55,17 +56,21 @@ words() {
 # Fresh sandbox git repo at $1 with a single "old" commit on branch main.
 # Scenarios then edit the working tree (without committing) to produce the
 # "new" state the gate evaluates -- mirroring a real pre-push working tree.
+# Every git call here goes through run_git() (see scripts/_git-env-guard.sh)
+# so an ambient GIT_DIR/GIT_CONFIG from this test's own enclosing
+# .githooks/pre-push invocation can't redirect these commands into the real
+# repo instead of $dir.
 new_sandbox() {
   local dir="$1"
-  git init -q -b main "$dir"
-  git -C "$dir" config user.email test@example.com
-  git -C "$dir" config user.name "Test"
+  run_git init -q -b main "$dir"
+  run_git -C "$dir" config user.email test@example.com
+  run_git -C "$dir" config user.name "Test"
 }
 
 commit_old_state() {
   local dir="$1"
-  git -C "$dir" add -A
-  git -C "$dir" commit -q -m old
+  run_git -C "$dir" add -A
+  run_git -C "$dir" commit -q -m old
 }
 
 # Runs the real gate against sandbox $1 with the old commit as base ref.
@@ -177,6 +182,47 @@ printf '%s\n' "$(words 450)" > "$S6/docs/decisions/adr.md"
 RC6=$(run_gate "$S6")
 assert "real compression of an over-budget (still-over-budget) doc passes" \
   "$([ "$RC6" -eq 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 7. Ambient GIT_DIR/GIT_WORK_TREE leakage (simulating this test's own
+#    .githooks/pre-push invocation) must not redirect new_sandbox()/
+#    commit_old_state()'s git calls away from the intended sandbox dir -- the
+#    exact mechanism (see scripts/_git-env-guard.sh) that corrupted the
+#    mayor's real repository twice: a `git init`/`git commit` in a sandbox
+#    fixture silently honoring an inherited GIT_DIR/GIT_WORK_TREE instead of
+#    its own explicit -C target/positional path. Exports GIT_DIR/GIT_WORK_TREE
+#    pointed at a disposable "victim" repo (never the real u7s repo) for the
+#    duration of building the target sandbox, then asserts the victim's HEAD
+#    is untouched AND the target sandbox was actually built (proving
+#    run_git() fails safe by actually working, not merely by erroring out).
+# ---------------------------------------------------------------------------
+S7_VICTIM="$SANDBOX_ROOT/7-ambient-victim"
+new_sandbox "$S7_VICTIM"
+mkdir -p "$S7_VICTIM/docs/decisions"
+printf '%s\n' "$(words 10)" > "$S7_VICTIM/docs/decisions/adr.md"
+commit_old_state "$S7_VICTIM"
+VICTIM_HEAD_BEFORE=$(run_git -C "$S7_VICTIM" rev-parse HEAD)
+
+S7_TARGET="$SANDBOX_ROOT/7-ambient-target"
+S7_HELPER_RC=0
+(
+  export GIT_DIR="$S7_VICTIM/.git"
+  export GIT_WORK_TREE="$S7_VICTIM"
+  new_sandbox "$S7_TARGET"
+  mkdir -p "$S7_TARGET/docs/decisions"
+  printf '%s\n' "$(words 350)" > "$S7_TARGET/docs/decisions/adr.md"
+  commit_old_state "$S7_TARGET"
+) || S7_HELPER_RC=$?
+
+VICTIM_HEAD_AFTER=$(run_git -C "$S7_VICTIM" rev-parse HEAD)
+assert "ambient GIT_DIR/GIT_WORK_TREE never redirects the sandbox helpers' git calls into the victim repo (HEAD unchanged)" \
+  "$([ "$VICTIM_HEAD_BEFORE" = "$VICTIM_HEAD_AFTER" ] && echo 1 || echo 0)"
+assert "...and the sandbox helpers still build a working target repo despite the ambient leak (not just 'fails safe by erroring')" \
+  "$([ "$S7_HELPER_RC" -eq 0 ] && run_git -C "$S7_TARGET" rev-parse HEAD >/dev/null 2>&1 && echo 1 || echo 0)"
+printf '%s\n' "$(words 450)" > "$S7_TARGET/docs/decisions/adr.md"
+RC7=$(run_gate "$S7_TARGET")
+assert "...and the real gate still catches the over-budget growth in that correctly-built target" \
+  "$([ "$RC7" -ne 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
