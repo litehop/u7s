@@ -66,8 +66,12 @@ other in-flight workers and their write surfaces so the receiver pattern-matches
 for collisions; explicit "do not edit the mayor checkout" and "do not merge PRs";
 require tests + final report (changed files, commands run, branch/PR, risks).
 Worker may close its own bead after opening the PR with a cross-ref reason.
-Before dispatching, grep for the alleged broken symbol / missing file / stale
-convention — if already landed, close as `verified-duplicate of #NNNN`.
+Before dispatching, run `scripts/bead-premise-check.sh <bead-id>`. Exit 0
+(still-broken) — proceed with dispatch. Exit 1 (no-longer-broken) — the
+alleged broken symbol/missing file/stale convention already landed; close
+as `verified-duplicate of #NNNN` instead of dispatching. Exit 2
+(cannot-verify — e.g. the bead's description is too abstract for the
+script's pattern extraction) — fall back to a manual grep.
 For any bead that touches RBAC, auth, collection delete, namespace drain, or any
 handler the sonobuoy smoke test exercises: inject the Lima VM protocol block from
 `dispatch-prompt-template.md` and require sonobuoy smoke verification in the
