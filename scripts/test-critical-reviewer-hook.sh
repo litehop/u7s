@@ -365,8 +365,8 @@ fi
 # overlapping subagents in one session). Without a lock serializing
 # read-size -> rotate -> append, concurrent hook processes race the file
 # renames and can silently discard an entry the retention policy promises
-# survives two rotations -- reproduced by critical-reviewer with 5
-# overlapping invocations against a >1 MiB file (PR #1416 review). A race
+# survives two rotations -- reproduced with 5 concurrent hook invocations
+# against a >1 MiB file. A race
 # is timing-dependent: one round of 5 concurrent invocations does not
 # reliably reproduce it on every machine/run, so this repeats 3 independent
 # rounds and fails if ANY round loses or duplicates an entry -- with the
@@ -450,6 +450,90 @@ if [ "$RACE_MISSING_TOTAL" -eq 0 ]; then
 else
   fail "$RACE_MISSING_TOTAL of $((RACE_ROUNDS * 5)) concurrent decisions were silently dropped across $RACE_ROUNDS rounds"
 fi
+
+# Case 16: stale-lock liveness check (mayor-kfabq). The steal mechanism
+# above must only evict a holder whose recorded PID is actually dead --
+# stealing from a live holder past STALE_LOCK_TIMEOUT_SEC would reintroduce
+# the exact unlocked-mv race case 15 above proves is fixed. Uses a short
+# STALE_LOCK_TIMEOUT_SEC (env override) so both branches run in ~1-2s
+# instead of the real 5s default.
+DECISIONS_LOG_LIVENESS="$SANDBOX/.claude/review-queue/log/decisions.tsv"
+LOCK_DIR_LIVENESS="$DECISIONS_LOG_LIVENESS.lock.d"
+
+# 16a. A DEAD holder PID: the lockdir must be stolen once the timeout
+# elapses, and the hook must complete normally (not hang).
+clear_sandbox
+rm -f "$DECISIONS_LOG_LIVENESS" "$DECISIONS_LOG_LIVENESS.1" "$DECISIONS_LOG_LIVENESS.2"
+rm -rf "$LOCK_DIR_LIVENESS"
+( : ) & DEAD_PID=$!
+wait "$DEAD_PID" 2>/dev/null || true  # guarantees DEAD_PID has already exited
+mkdir -p "$LOCK_DIR_LIVENESS"
+printf '%s' "$DEAD_PID" > "$LOCK_DIR_LIVENESS/pid"
+
+INPUT_DEAD=$(jq -n --arg msg 'Nothing to review here.' \
+  '{agent_id:"agent-deadlock", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessDead", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+# No `timeout` binary here (not on stock macOS, same constraint the lock
+# itself works around) -- backgrounded + polled with a bounded wait instead,
+# so a broken fix (infinite retry) fails this test rather than hanging the
+# suite.
+DEAD_RC_FILE="$SANDBOX/dead-lock-rc"
+(
+  RC=0
+  STALE_LOCK_TIMEOUT_SEC=1 CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$STUBDIR:$PATH" \
+    bash "$HOOK" <<< "$INPUT_DEAD" >/dev/null 2>&1 || RC=$?
+  echo "$RC" > "$DEAD_RC_FILE"
+) &
+DEAD_HOOK_PID=$!
+DEAD_WAITED=0
+while [ ! -f "$DEAD_RC_FILE" ] && [ "$DEAD_WAITED" -lt 50 ]; do
+  sleep 0.1
+  DEAD_WAITED=$((DEAD_WAITED + 1))
+done
+kill "$DEAD_HOOK_PID" 2>/dev/null || true
+wait "$DEAD_HOOK_PID" 2>/dev/null || true
+DEAD_RC=$(cat "$DEAD_RC_FILE" 2>/dev/null || echo "timed-out")
+
+if [ "$DEAD_RC" = "0" ] && [ ! -d "$LOCK_DIR_LIVENESS" ] && grep -q 'agent-deadlock' "$DECISIONS_LOG_LIVENESS" 2>/dev/null; then
+  pass "a lockdir whose recorded PID is dead is stolen once the timeout elapses, and the hook completes normally"
+else
+  fail "dead-PID lockdir was not stolen within the timeout: hook_rc=$DEAD_RC, lockdir present=$([ -d "$LOCK_DIR_LIVENESS" ] && echo yes || echo no)"
+fi
+rm -rf "$LOCK_DIR_LIVENESS"
+
+# 16b. A LIVE holder PID: the lockdir must survive PAST the timeout
+# unchanged -- the exact bug this bead fixes (the old unconditional steal
+# would have evicted this live holder at the timeout regardless).
+clear_sandbox
+rm -f "$DECISIONS_LOG_LIVENESS" "$DECISIONS_LOG_LIVENESS.1" "$DECISIONS_LOG_LIVENESS.2"
+rm -rf "$LOCK_DIR_LIVENESS"
+sleep 30 & LIVE_PID=$!
+mkdir -p "$LOCK_DIR_LIVENESS"
+printf '%s' "$LIVE_PID" > "$LOCK_DIR_LIVENESS/pid"
+
+INPUT_LIVE=$(jq -n --arg msg 'Nothing to review here.' \
+  '{agent_id:"agent-livelock", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessLive", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+# Backgrounded, not timeout-wrapped (no `timeout` binary on stock macOS):
+# with the fix, this hook invocation never acquires the lock on its own
+# (the holder never releases it) and would wait forever -- the explicit
+# `kill` after the assertion below is what reaps it, same as the live
+# holder process itself.
+STALE_LOCK_TIMEOUT_SEC=1 CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$STUBDIR:$PATH" \
+  bash "$HOOK" <<< "$INPUT_LIVE" >/dev/null 2>&1 &
+LIVE_HOOK_PID=$!
+sleep 2.5  # >2x the 1s timeout: the steal decision point has fired at least twice
+
+LIVE_SURVIVED_PID=$(cat "$LOCK_DIR_LIVENESS/pid" 2>/dev/null || true)
+if [ -d "$LOCK_DIR_LIVENESS" ] && [ "$LIVE_SURVIVED_PID" = "$LIVE_PID" ]; then
+  pass "a lockdir whose recorded PID is still alive is NOT stolen even after the timeout elapses"
+else
+  fail "live-PID lockdir was stolen despite the holder still being alive (lockdir present=$([ -d "$LOCK_DIR_LIVENESS" ] && echo yes || echo no), pid=$LIVE_SURVIVED_PID, expected=$LIVE_PID)"
+fi
+
+kill "$LIVE_PID" 2>/dev/null || true
+kill "$LIVE_HOOK_PID" 2>/dev/null || true
+wait "$LIVE_PID" 2>/dev/null || true
+wait "$LIVE_HOOK_PID" 2>/dev/null || true
+rm -rf "$LOCK_DIR_LIVENESS"
 
 if [ "$FAILURES" -eq 0 ]; then
   printf '\nall tests passed\n'
