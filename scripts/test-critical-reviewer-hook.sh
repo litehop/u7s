@@ -188,10 +188,30 @@ else
   fail "raw input log dir missing"
 fi
 
-# Case 8: decisions.tsv rotation (mayor-p4ol7). Without rotation, a
-# long-running mayor session grows this file unbounded (8856 lines and
-# counting at bead file time) -- once it crosses ~1 MiB the hook must
-# rotate it out of the way before appending, not just keep growing it.
+# Case 8: agent_type is a literal empty string (not missing) -- the
+# upstream #27755 spurious SubagentStop harness event. Must exit before
+# touching the log at all: a log write here would misrepresent "the hook
+# genuinely fired and had nothing to do" as this noise event's fault.
+clear_sandbox
+DECISIONS_LOG_PRE="$SANDBOX/.claude/review-queue/log/decisions.tsv"
+LINES_BEFORE=0
+[ -f "$DECISIONS_LOG_PRE" ] && LINES_BEFORE=$(wc -l < "$DECISIONS_LOG_PRE" | tr -d ' ')
+INPUT_EMPTY_TYPE=$(jq -n \
+  --arg msg 'Opened PR https://github.com/litehop/u7s/pull/1 for review.' \
+  '{agent_id:"agent-test8", agent_type:"", cwd:"/tmp/wt", session_id:"sess8", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+run_hook "$INPUT_EMPTY_TYPE"
+LINES_AFTER=0
+[ -f "$DECISIONS_LOG_PRE" ] && LINES_AFTER=$(wc -l < "$DECISIONS_LOG_PRE" | tr -d ' ')
+if [ "$(count_queue_files)" = "0" ] && [ "$LINES_AFTER" = "$LINES_BEFORE" ]; then
+  pass "empty agent_type → exits 0, no queue file, no log write (even with a real PR URL present)"
+else
+  fail "empty agent_type: expected 0 queue files and no new log line, got $(count_queue_files) queue file(s), decisions.tsv $LINES_BEFORE -> $LINES_AFTER lines"
+fi
+
+# Case 9: decisions.tsv rotation. Without rotation, a long-running mayor
+# session grows this file unbounded (8856 lines and counting when this was
+# written) -- once it crosses ~1 MiB the hook must rotate it out of the
+# way before appending, not just keep growing it.
 DECISIONS_LOG="$SANDBOX/.claude/review-queue/log/decisions.tsv"
 dd if=/dev/zero of="$DECISIONS_LOG" bs=1024 count=1100 2>/dev/null
 printf 'OLD_GEN0_MARKER\n' >> "$DECISIONS_LOG"
@@ -211,7 +231,7 @@ else
   fail "post-rotation decisions.tsv unexpectedly still carries old content or is missing the new entry"
 fi
 
-# Case 9: a second rotation with a pre-existing .1 pushes it to .2 and
+# Case 10: a second rotation with a pre-existing .1 pushes it to .2 and
 # discards whatever .2 already held -- the "oldest generation is dropped,
 # not accumulated forever" half of the bound.
 printf 'OLD_GEN2_MARKER_TO_BE_DISCARDED\n' > "$DECISIONS_LOG.2"
@@ -234,7 +254,7 @@ else
   fail "second rotation: .1 does not carry the just-rotated decisions.tsv content"
 fi
 
-# Case 10: below the threshold, no rotation -- entries keep accumulating in
+# Case 11: below the threshold, no rotation -- entries keep accumulating in
 # the same file (the common case; rotation must not fire on every write).
 rm -f "$DECISIONS_LOG.1" "$DECISIONS_LOG.2"
 printf 'SMALL_FILE_MARKER\n' > "$DECISIONS_LOG"

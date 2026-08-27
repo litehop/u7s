@@ -22,6 +22,14 @@
 # complexity. Queued (auditable) entries survive at least two rotations
 # before being dropped, since nothing is discarded until it ages past the
 # .2 generation.
+#
+# Empty-agent_type filter (2026-08-27): a SubagentStop payload with an
+# empty (not missing) agent_type is a spurious harness event per upstream
+# anthropics/claude-code#27755 (closed not-planned) -- confirmed by a
+# 2026-08-27 investigation into a ~32-33s empty-agent_type firing cadence
+# with no backing transcript, invisible in the mayor's own turn loop. Every
+# genuine deliverable-bearing payload populates agent_type, so this case
+# never carries a reviewable message; exit before mkdir/log/anything else.
 
 set -euo pipefail
 
@@ -35,6 +43,10 @@ AGENT_TYPE=$(printf '%s' "$INPUT" | jq -r '.agent_type // "unknown"')
 CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
 MSG=$(printf '%s' "$INPUT" | jq -r '.last_assistant_message // empty')
 SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // "unknown"')
+
+# See "Empty-agent_type filter" above. This is a literal empty string, not
+# the "unknown" fallback above (which only fires for a missing/null field).
+[ -z "$AGENT_TYPE" ] && exit 0
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 QUEUE_DIR="$PROJECT_DIR/.claude/review-queue"
