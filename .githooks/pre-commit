@@ -1,4 +1,17 @@
 #!/bin/sh
 set -e
+
+# ai/findings/*.md (root only, not legacy/) must reference the originating
+# bead in its first 5 lines -- see "Findings lifecycle" in the workflow
+# docs. Without it, deleted findings are unretrievable via bead notes and
+# the file just becomes silent git bloat.
+new_findings=$(git diff --cached --name-only --diff-filter=AM -- 'ai/findings/*.md' | grep -v '^ai/findings/legacy/' || true)
+for f in $new_findings; do
+    if ! head -n 5 "$f" | grep -qE '^Bead: '; then
+        echo "ERROR: $f missing 'Bead: <bead-id>' reference in first 5 lines" >&2
+        exit 1
+    fi
+done
+
 cargo fmt --all -- --check
 bash scripts/check-bead-id-refs.sh
