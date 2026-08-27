@@ -60,7 +60,11 @@ bd show <id>
 cargo test --workspace --quiet 2>&1 | tail -30
 cargo clippy --workspace --tests --quiet --no-deps -- -D warnings 2>&1 | tail -20
 
-# 6. Commit
+# 6. Commit — draft the message from your own diff, not from memory of what
+# you wrote. For a non-trivial diff, ground the message with
+# Agent(subagent_type="diff-summarizer", prompt="<your `git diff` output>")
+# instead of re-reading the whole diff yourself; use its summary/
+# breaking_change fields when drafting the commit message and PR body.
 git add <files>
 git commit -m "feat(<area>): <what and why>"
 

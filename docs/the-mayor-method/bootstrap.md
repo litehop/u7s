@@ -87,7 +87,9 @@ bypass a failing check — read the log first; if it is a transient GitHub infra
 flake, rerun with `gh run rerun <run-id> --failed` and wait for green; only
 merge when ALL checks pass. Post-merge: `git pull --ff-only`, verify worker
 closed the bead (close it if not), update `ai/dashboard.md`, mention follow-on
-beads filed by the worker.
+beads filed by the worker. For each merged PR's "merged this session"
+dashboard entry, invoke `Agent(subagent_type="diff-summarizer", prompt="gh pr
+diff <N>")` instead of re-reading the full diff yourself.
 
 **Operator decisions.** Surface design / product / security / taste decisions
 explicitly. Explain options + trade-offs; recommend when useful; let the
@@ -153,9 +155,12 @@ PR when green.
 2. Read the state file and act on the script's exit code (non-zero codes
    are OR-able; the highest fires if more than one condition matched):
    - **0** — noop, nothing for this tick.
-   - **10** — `bd_ready_ids` holds new dispatchable beads. Apply the usual
-     cluster-shape judgment (filter out decisions/EPICs/release-coupled/
-     v1.x/hot-zone) and dispatch per the discipline above.
+   - **10** — `bd_ready_ids` holds new dispatchable beads. Invoke
+     `Agent(subagent_type="bead-triager", prompt="<bd ready --json output
+     for bd_ready_ids, plus any in-flight worker write-surfaces>")` to sort
+     them into actionable vs. deferred (decision-awaiting/epic/release-
+     coupled/v1.x/hot-surface) before reasoning over the raw bead JSON
+     yourself, then dispatch the actionable set per the discipline above.
    - **20** — one or more of `pending_reviews`, `pending_non_pr_reviews`,
      `gate_exceptions`, or `queue_warnings` is non-empty; the script
      cannot invoke a Claude subagent, so: for each `pending_reviews` PR,

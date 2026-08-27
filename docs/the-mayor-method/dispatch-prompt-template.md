@@ -154,7 +154,8 @@ Not every critical-reviewer dispatch needs Sonnet. Rule: a PR whose diff is
 **≤50 changed lines** (`gh pr diff <N> --stat` total, additions + deletions)
 AND touches **only doc/config surfaces** — `docs/`, `*.md`, `.claude/agents/*.md`,
 `ai/dashboard.md`, CI YAML, `Cargo.toml` version/dependency bumps with no
-code behind them — with **no changes to code or any public-API surface**
+code behind them, `scripts/*.sh`, non-`src/` test dirs (e.g. `tests/`,
+`scripts/test-*.sh` fixtures) — with **no changes to code or any public-API surface**
 (handler signatures, protobuf/JSON encoders, CRD schemas, RBAC rules, any
 `src/**/*.rs` logic) qualifies for the low-effort tier: dispatch
 critical-reviewer with `model="haiku", effort="low"`. Every other PR — larger
@@ -176,6 +177,15 @@ Agent(
 
 For everything else, omit `model`/`effort` and let critical-reviewer.md's own
 frontmatter (`model: sonnet`) apply.
+
+**UNVERIFIED (mayor-p6sj7):** `effort="low"` as a per-call `Agent()` override
+has no prior precedent anywhere in this repo, and worker agents cannot
+smoke-test it themselves (`Agent` is in every worker's `disallowedTools`).
+Only the mayor can run the actual smoke test. Until that's confirmed, don't
+assume this tier fires as documented — if the harness rejects or silently
+ignores `effort`, fall back to omitting it (still dispatch `model="haiku"`
+for the size/surface win, just without the effort override) and file that
+finding back to mayor-p6sj7.
 
 ## Common preamble (every dispatch)
 
