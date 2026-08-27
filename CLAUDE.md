@@ -109,6 +109,8 @@ bd close <id>         # Complete work
 
 **Architecture:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export.
 
+**Memory access pattern:** `bd prime`'s Persistent Memories section is an INDEX ONLY — one line per memory (`key: snippet`), not full bodies — to keep every SessionStart/PreCompact small. When a listed key looks relevant to the task at hand, or a prior conversation references a concept you don't fully recall, pull the full body with `bd recall <key>` (exact key from the index), or `bd memories <keyword>` first if you need to search for the key. Example: the index shows `- ca-cn-load-path-must-read-from-cert-not-hardcode: When changing CA Subject CN...`; run `bd recall ca-cn-load-path-must-read-from-cert-not-hardcode` before touching CA/cert code. Anti-pattern: never run a bare `bd memories` to dump the whole bank into a turn — that reintroduces the exact bloat the index avoids.
+
 ## Session Completion
 
 Work is NOT complete until `git push` succeeds.
