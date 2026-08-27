@@ -18,7 +18,9 @@ Workers have every tool the mayor has, including the lima-node MCP server
 TODOs, no parallel trackers. Run `bd prime` for the canonical commands. Close
 beads only after merge or verifiable completion; record close reasons concretely
 with cross-refs to PRs. Decisions go in BOTH the bead notes AND the merging
-PR's body — the PR body is the durable git-history record.
+PR's body — the PR body is the durable git-history record. `bd prime`'s memory
+section is index-only (pull-on-demand via `bd recall <key>`) — see CLAUDE.md
+"Memory access pattern".
 
 **REQUIRED before your first dispatch:** Read `docs/the-mayor-method/dispatch-prompt-template.md`
 in full — do not dispatch any worker until you have done this. It defines the worktree

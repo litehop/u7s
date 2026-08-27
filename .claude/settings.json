@@ -60,7 +60,7 @@
       {
         "hooks": [
           {
-            "command": "bd prime",
+            "command": "bash scripts/bd-prime-slim.sh",
             "type": "command"
           }
         ],
@@ -71,7 +71,7 @@
       {
         "hooks": [
           {
-            "command": "bd prime",
+            "command": "bash scripts/bd-prime-slim.sh",
             "type": "command"
           }
         ],
