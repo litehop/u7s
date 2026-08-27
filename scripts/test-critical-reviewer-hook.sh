@@ -28,13 +28,26 @@ pass() {
 # Sandbox: run the hook against a scratch project dir so we do not pollute the
 # real .claude/review-queue/ with test artefacts.
 SANDBOX=$(mktemp -d)
-trap 'rm -rf "$SANDBOX"' EXIT
+STUBDIR=$(mktemp -d)
+trap 'rm -rf "$SANDBOX" "$STUBDIR"' EXIT
 
 mkdir -p "$SANDBOX/.claude"
 
+# Stub `gh` on PATH so the branch-lookup fallback (mayor-ks2z2) never makes a
+# live GitHub API call from this test suite -- that would make the suite
+# network- and auth-dependent, and flaky in CI. Emulates exactly the one
+# invocation the hook makes (`gh pr list --head <branch> --json url --limit 1
+# --jq '.[0].url // ""'`); set TEST_GH_PR_LIST_URL to simulate a found PR,
+# leave it unset to simulate "no PR for this branch" (the common case).
+cat > "$STUBDIR/gh" <<'STUBEOF'
+#!/usr/bin/env bash
+printf '%s' "${TEST_GH_PR_LIST_URL:-}"
+STUBEOF
+chmod +x "$STUBDIR/gh"
+
 run_hook() {
   local input="$1"
-  CLAUDE_PROJECT_DIR="$SANDBOX" bash "$HOOK" <<< "$input"
+  CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$STUBDIR:$PATH" bash "$HOOK" <<< "$input"
 }
 
 count_queue_files() {
@@ -61,6 +74,15 @@ if [ "$(count_queue_files)" = "1" ]; then
     pass "PR URL → queued with correct type + ref"
   else
     fail "PR URL detection: type=$TYPE ref=$REF (expected pr / …/pull/9999)"
+  fi
+  # A fresh worker whose message contains the URL directly must still go
+  # through the primary path, not the branch-lookup fallback -- distinct
+  # decision labels are how an audit tells the two apart (mayor-ks2z2
+  # acceptance #3: no regression to the primary path).
+  if grep -q $'agent-test1\tqueued-via-url' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+    pass "PR URL match is logged as queued-via-url, not the branch-lookup label"
+  else
+    fail "PR URL match: decisions.tsv missing the queued-via-url label for agent-test1"
   fi
 else
   fail "PR URL: expected 1 queue file, got $(count_queue_files)"
@@ -267,6 +289,52 @@ if [ ! -f "$DECISIONS_LOG.1" ] && grep -q 'SMALL_FILE_MARKER' "$DECISIONS_LOG" &
   pass "decisions.tsv under threshold appends in place without rotating"
 else
   fail "sub-threshold write unexpectedly rotated, or failed to append the new decision"
+fi
+
+# Case 12: resumed worker fallback. A worker resumed via SendMessage after a
+# needs-changes fix reports a bare commit sha, not the full PR URL the
+# primary regex needs -- without the branch-lookup fallback this would skip
+# with no-deliverable and the mayor would never notice the follow-up fix was
+# ready for re-review (mayor-ks2z2 acceptance #1). The stub `gh` above
+# stands in for the real GitHub API so this stays network-free.
+clear_sandbox
+INPUT_RESUMED=$(jq -n \
+  --arg msg 'Pushed a new commit abc1234 on PR #4242 addressing the review feedback.' \
+  '{agent_id:"agent-resumed1", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessResumed", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+TEST_GH_PR_LIST_URL="https://github.com/litehop/u7s/pull/4242" run_hook "$INPUT_RESUMED"
+if [ "$(count_queue_files)" = "1" ]; then
+  QFILE=$(find "$SANDBOX/.claude/review-queue" -maxdepth 1 -name '*.md' | head -1)
+  TYPE=$(grep -m1 '^deliverable_type:' "$QFILE" | awk '{print $2}')
+  REF=$(grep -m1 '^deliverable_ref:' "$QFILE" | cut -d' ' -f2-)
+  if [ "$TYPE" = "pr" ] && [ "$REF" = "https://github.com/litehop/u7s/pull/4242" ]; then
+    pass "resumed worker with no URL in message → queued via branch lookup with correct PR ref"
+  else
+    fail "branch-lookup fallback: type=$TYPE ref=$REF (expected pr / …/pull/4242)"
+  fi
+  # The distinct label is the whole point of the fallback (mayor-ks2z2
+  # acceptance #2) -- without it, an audit can't tell "the worker's message
+  # itself proved the deliverable" from "we had to ask GitHub directly".
+  if grep -q $'agent-resumed1\tqueued-via-branch-lookup' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+    pass "branch-lookup fallback is logged with the distinct queued-via-branch-lookup label"
+  else
+    fail "branch-lookup fallback: decisions.tsv missing the queued-via-branch-lookup label"
+  fi
+else
+  fail "branch-lookup fallback: expected 1 queue file, got $(count_queue_files)"
+fi
+
+# Case 13: resumed worker whose branch genuinely has no open PR yet (stub
+# returns empty, the default) -- must still fall through to the ordinary
+# no-deliverable skip, not error out or fabricate a deliverable.
+clear_sandbox
+INPUT_NO_PR_YET=$(jq -n \
+  --arg msg 'Pushed a new commit abc5678, still working on it.' \
+  '{agent_id:"agent-resumed2", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessResumed2", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+run_hook "$INPUT_NO_PR_YET"
+if [ "$(count_queue_files)" = "0" ] && grep -q $'agent-resumed2\tskip\tno-deliverable' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+  pass "branch-lookup fallback finding no PR falls through to the ordinary no-deliverable skip"
+else
+  fail "branch-lookup fallback with no PR found: expected a no-deliverable skip, got $(count_queue_files) queue file(s)"
 fi
 
 if [ "$FAILURES" -eq 0 ]; then

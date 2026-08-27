@@ -30,6 +30,13 @@
 # with no backing transcript, invisible in the mayor's own turn loop. Every
 # genuine deliverable-bearing payload populates agent_type, so this case
 # never carries a reviewable message; exit before mkdir/log/anything else.
+#
+# Branch-lookup PR fallback (2026-08-27): a worker resumed via SendMessage
+# after a needs-changes fix typically reports "New commit <sha> on PR #<N>"
+# instead of the full PR URL the primary regex below matches, so the hook
+# used to skip these with no-deliverable and the mayor had to notice the
+# gap manually. If nothing else matches for a worker payload, ask GitHub
+# for an open PR on that worker's own branch before giving up.
 
 set -euo pipefail
 
@@ -96,12 +103,14 @@ fi
 
 DELIVERABLE_TYPE=""
 DELIVERABLE_REF=""
+DECISION_LABEL="queued"
 
 # 1. PR opened. Repo slug is github.com/litehop/u7s
 PR_URL=$(printf '%s' "$MSG" | grep -oE 'https?://github\.com/litehop/u7s/pull/[0-9]+' | head -1 || true)
 if [ -n "$PR_URL" ]; then
   DELIVERABLE_TYPE="pr"
   DELIVERABLE_REF="$PR_URL"
+  DECISION_LABEL="queued-via-url"
 fi
 
 # 2. Findings doc. Look for absolute paths to ai/findings/*.md that the worker
@@ -130,6 +139,16 @@ if [ -z "$DELIVERABLE_TYPE" ]; then
   if [ -n "$SUPERSEDE" ]; then
     DELIVERABLE_TYPE="bead-supersede"
     DELIVERABLE_REF="$SUPERSEDE"
+  fi
+fi
+
+# 5. Resumed worker fallback. See "Branch-lookup PR fallback" in the header.
+if [ -z "$DELIVERABLE_TYPE" ] && [ "$AGENT_TYPE" = "worker" ] && [ "$AGENT_ID" != "unknown" ]; then
+  BRANCH_PR_URL=$(gh pr list --head "worker/agent-$AGENT_ID" --json url --limit 1 --jq '.[0].url // ""' 2>/dev/null || true)
+  if [ -n "$BRANCH_PR_URL" ]; then
+    DELIVERABLE_TYPE="pr"
+    DELIVERABLE_REF="$BRANCH_PR_URL"
+    DECISION_LABEL="queued-via-branch-lookup"
   fi
 fi
 
@@ -168,7 +187,7 @@ QUEUE_FILE="$QUEUE_DIR/$TS-$AGENT_ID.md"
   printf '```\n%s\n```\n' "$MSG"
 } > "$QUEUE_FILE"
 
-log_decision "$(printf '%s\t%s\tqueued\t%s\t%s' \
-  "$TS" "$AGENT_ID" "$DELIVERABLE_TYPE" "$DELIVERABLE_REF")"
+log_decision "$(printf '%s\t%s\t%s\t%s\t%s' \
+  "$TS" "$AGENT_ID" "$DECISION_LABEL" "$DELIVERABLE_TYPE" "$DELIVERABLE_REF")"
 
 exit 0
