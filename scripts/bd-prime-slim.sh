@@ -42,15 +42,23 @@ render_slim_prime() {
     return
   fi
 
-  header="${full%%"$MEMORY_HEADER_MARKER"*}"
-  footer="${full#*"$FOOTER_MARKER"}"
-  footer="${FOOTER_MARKER}${footer}"
+  # bash 3.2 (stock on macOS) is catastrophically slow at `${var#*pattern}`
+  # / `${var%%pattern*}` on a ~300KB string when the match is near the far
+  # end (measured: ~40s for the footer split alone, vs single-digit ms in
+  # awk) -- bash 5 does the same expansion in milliseconds, but operators
+  # can't be assumed to be on bash 5. awk finds the marker LINE and slices
+  # around it in place, so both splits run in ms regardless of bash version.
+  header="$(awk -v marker="$MEMORY_HEADER_MARKER" 'index($0, marker) > 0 {exit} {print}' "$export_file")"
+  footer="$(awk -v marker="$FOOTER_MARKER" 'index($0, marker) > 0 {p=1} p' "$export_file")"
   # `bd memories --json` mixes in a non-memory `schema_version` metadata key
   # (numeric value) alongside the actual string-bodied memories -- filter it
   # out or jq's gsub/slicing below aborts on a non-string .value.
   count="$(jq '[to_entries[] | select(.value | type == "string")] | length' "$memories_json")"
 
-  printf '%s' "$header"
+  # `$(...)` strips header's trailing blank line(s) before the marker (they
+  # were pure newlines); force exactly one back so the heading below isn't
+  # glued directly to the preceding prose.
+  printf '%s\n\n' "$header"
   printf '## Persistent Memories (%s) — INDEX ONLY\n\n' "$count"
   printf 'Full bodies are pulled on demand, not preloaded: `bd memories <keyword>` returns the complete entry. See CLAUDE.md "Memory access pattern". Do NOT run a bare `bd memories` to dump the whole bank into a turn -- that defeats the point of this index.\n\n'
   jq -r --argjson n "$DESC_LEN" '

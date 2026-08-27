@@ -123,6 +123,49 @@ assert "marker-drift fallback warns on stderr instead of failing silently" \
   "$(grep -qF 'marker not found' "$SANDBOX/stderr-2" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 4. SCALE regression: a synthetic ~300KB fixture with the footer marker
+#    positioned near the FAR END of the string, matching the one property of
+#    a real `bd prime --export` transcript that actually triggers the bug
+#    this test guards against: bash 3.2 (stock on macOS) took ~40s on
+#    `${var#*pattern}` to find a marker that far into a large string, vs
+#    single-digit ms once render_slim_prime() switched to awk. The small
+#    fixtures in scenarios 1-3 are too short to ever exercise that path --
+#    this is the one that would have caught the regression before review.
+# ---------------------------------------------------------------------------
+EXPORT_BIG="$SANDBOX/export-big.md"
+{
+  printf '# Beads Workflow Context\n\n> some header prose\n\n'
+  printf '## Persistent Memories (1)\n\nStored via `bd remember`.\n\n'
+  printf '### padding-memory\n'
+  # ~300KB of body padding between the header and the footer marker -- the
+  # exact shape (large content, THEN the marker) that reproduced the bash
+  # 3.2 slowdown on the real ~300KB `bd prime --export` output.
+  # `|| true`: under `set -o pipefail`, `yes`'s SIGPIPE (141) when `head`
+  # closes the pipe early would otherwise be reported as the pipeline's
+  # exit status and abort this script under `set -e`.
+  yes 'padding padding padding padding padding padding padding padding' | head -n 5000 || true
+  printf '\n\n# 🚨 SESSION CLOSE PROTOCOL 🚨\n\nfooter content that must survive\n'
+} > "$EXPORT_BIG"
+
+MEM_BIG="$SANDBOX/memories-big.json"
+printf '{"padding-memory": "short body", "schema_version": 1}' > "$MEM_BIG"
+
+FIXTURE_BYTES=$(wc -c < "$EXPORT_BIG" | tr -d ' ')
+assert "scale fixture is realistically sized (>=300KB, matching live bd prime --export)" \
+  "$([ "$FIXTURE_BYTES" -ge 300000 ] && echo 1 || echo 0)"
+
+START_NS=$(date +%s%N)
+OUT_BIG=$(render_slim_prime "$EXPORT_BIG" "$MEM_BIG")
+END_NS=$(date +%s%N)
+ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
+
+assert "render_slim_prime() on a ~300KB fixture completes well under bd's own per-call latency (<2000ms; regressed to ~40000ms before the awk fix)" \
+  "$([ "$ELAPSED_MS" -lt 2000 ] && echo 1 || echo 0)"
+assert "the scale fixture's footer still survives the split, not just the timing" \
+  "$(printf '%s' "$OUT_BIG" | grep -qF 'footer content that must survive' && echo 1 || echo 0)"
+echo "  (render_slim_prime on ${FIXTURE_BYTES}-byte fixture: ${ELAPSED_MS}ms)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
