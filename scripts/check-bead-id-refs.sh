@@ -29,13 +29,23 @@
 #     (comment-only or not) is blocked by .githooks/pre-push without a fresh
 #     sonobuoy PASS on an owned VM slot. Tracked in mayor-e49sl -- remove this
 #     exclusion once that bead lands the remaining 7 refs (5 distinct IDs).
-#   scripts/mayor-tick.sh, scripts/test-mayor-tick-logic.sh, .gitignore --
-#     same "mayor-metho" class of false positive as CONTRIBUTING.md above:
-#     the script's own name, "mayor-tick", matches mayor-[a-z0-9]{3,5} by
-#     coincidence, and it's a permanent script name, not a bead ID that
-#     will close and rot. test-mayor-tick-logic.sh also has a synthetic
-#     "mayor-abcd" fixture (same rationale as test-critical-reviewer-hook.sh
-#     above) plus the prose word "mayor-owned" (an adjective, not an ID).
+#   .gitignore -- same "mayor-metho" class of false positive as
+#     CONTRIBUTING.md above: the script name "mayor-tick" it references
+#     matches mayor-[a-z0-9]{3,5} by coincidence and is a permanent script
+#     name, not a bead ID that will close and rot.
+#   scripts/mayor-tick.sh, scripts/test-mayor-tick-logic.sh -- excluded from
+#     the blanket sweep below for the same "mayor-tick" self-reference
+#     reason as .gitignore, but a whole-file exclusion here once silently
+#     masked THREE real, since-closed bead-ID references in these files'
+#     own comments (mayor-9syl7, mayor-s7nn6, mayor-hkhq0 -- all stripped).
+#     A blanket per-file skip can't tell "permanent self-reference" apart
+#     from "real bead ID that will rot" -- only an exact-token allowlist
+#     can. MAYOR_TICK_ALLOWED_TOKENS below re-scans just these two files
+#     and only tolerates the specific known-safe tokens (the "mayor-tick"
+#     self-reference, the prose adjective "mayor-owned", and this test
+#     file's synthetic bead-ID-shaped fixtures -- same rationale as
+#     test-critical-reviewer-hook.sh's fixture above); anything else still
+#     fails the guard.
 #
 # Bead IDs are `mayor-` + a 3-5 char alphanumeric suffix (bd's ID generator;
 # see .beads/issues.jsonl for the observed range), optionally followed by a
@@ -54,6 +64,20 @@ matches=$(git grep -n -E 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- . \
   ':!scripts/mayor-tick.sh' ':!scripts/test-mayor-tick-logic.sh' \
   ':!.gitignore' \
   2>/dev/null || true)
+
+# scripts/mayor-tick.sh + scripts/test-mayor-tick-logic.sh are skipped
+# above (their own name matches the regex), but that must not silently
+# swallow a real bead-ID reference landing in their body content -- see
+# the exclusion-list comment above. Re-scan the two files match-by-match
+# (not whole-file) and only tolerate the exact known-safe tokens.
+MAYOR_TICK_ALLOWED_TOKENS='mayor-(tick|owned|abcd|efgh|aaaa|bbbb|cccc|dddd|abc[1-4])$'
+mayor_tick_matches=$(git grep -n -oE 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- \
+  scripts/mayor-tick.sh scripts/test-mayor-tick-logic.sh 2>/dev/null \
+  | grep -vE ":${MAYOR_TICK_ALLOWED_TOKENS}" || true)
+if [ -n "$mayor_tick_matches" ]; then
+  matches="${matches:+$matches
+}$mayor_tick_matches"
+fi
 
 if [ -n "$matches" ]; then
   echo "bead-id-refs: found bead-ID reference(s) that will rot once the bead closes:" >&2
