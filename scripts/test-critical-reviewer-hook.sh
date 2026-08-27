@@ -33,14 +33,20 @@ trap 'rm -rf "$SANDBOX" "$STUBDIR"' EXIT
 
 mkdir -p "$SANDBOX/.claude"
 
-# Stub `gh` on PATH so the branch-lookup fallback (mayor-ks2z2) never makes a
-# live GitHub API call from this test suite -- that would make the suite
-# network- and auth-dependent, and flaky in CI. Emulates exactly the one
-# invocation the hook makes (`gh pr list --head <branch> --json url --limit 1
-# --jq '.[0].url // ""'`); set TEST_GH_PR_LIST_URL to simulate a found PR,
-# leave it unset to simulate "no PR for this branch" (the common case).
+# Stub `gh` on PATH so the branch-lookup fallback never makes a live GitHub
+# API call from this test suite -- that would make the suite network- and
+# auth-dependent, and flaky in CI. Emulates exactly the one invocation the
+# hook makes (`gh pr list --head <branch> --json url --limit 1 --jq
+# '.[0].url // ""'`). Set TEST_GH_PR_LIST_URL to simulate a found PR, leave
+# both unset to simulate "no PR for this branch yet" (exit 0, empty output
+# -- the common case), or set TEST_GH_PR_LIST_FAIL to simulate an
+# auth/network failure (non-zero exit) distinct from "genuinely no PR".
 cat > "$STUBDIR/gh" <<'STUBEOF'
 #!/usr/bin/env bash
+if [ -n "${TEST_GH_PR_LIST_FAIL:-}" ]; then
+  printf 'gh: authentication failed\n' >&2
+  exit 1
+fi
 printf '%s' "${TEST_GH_PR_LIST_URL:-}"
 STUBEOF
 chmod +x "$STUBDIR/gh"
@@ -77,8 +83,8 @@ if [ "$(count_queue_files)" = "1" ]; then
   fi
   # A fresh worker whose message contains the URL directly must still go
   # through the primary path, not the branch-lookup fallback -- distinct
-  # decision labels are how an audit tells the two apart (mayor-ks2z2
-  # acceptance #3: no regression to the primary path).
+  # decision labels are how an audit tells the two apart (no regression to
+  # the primary path once a branch-lookup fallback exists).
   if grep -q $'agent-test1\tqueued-via-url' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
     pass "PR URL match is logged as queued-via-url, not the branch-lookup label"
   else
@@ -295,8 +301,8 @@ fi
 # needs-changes fix reports a bare commit sha, not the full PR URL the
 # primary regex needs -- without the branch-lookup fallback this would skip
 # with no-deliverable and the mayor would never notice the follow-up fix was
-# ready for re-review (mayor-ks2z2 acceptance #1). The stub `gh` above
-# stands in for the real GitHub API so this stays network-free.
+# ready for re-review. The stub `gh` above stands in for the real GitHub
+# API so this stays network-free.
 clear_sandbox
 INPUT_RESUMED=$(jq -n \
   --arg msg 'Pushed a new commit abc1234 on PR #4242 addressing the review feedback.' \
@@ -311,9 +317,9 @@ if [ "$(count_queue_files)" = "1" ]; then
   else
     fail "branch-lookup fallback: type=$TYPE ref=$REF (expected pr / …/pull/4242)"
   fi
-  # The distinct label is the whole point of the fallback (mayor-ks2z2
-  # acceptance #2) -- without it, an audit can't tell "the worker's message
-  # itself proved the deliverable" from "we had to ask GitHub directly".
+  # The distinct label is the whole point of the fallback -- without it, an
+  # audit can't tell "the worker's message itself proved the deliverable"
+  # from "we had to ask GitHub directly".
   if grep -q $'agent-resumed1\tqueued-via-branch-lookup' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
     pass "branch-lookup fallback is logged with the distinct queued-via-branch-lookup label"
   else
@@ -335,6 +341,114 @@ if [ "$(count_queue_files)" = "0" ] && grep -q $'agent-resumed2\tskip\tno-delive
   pass "branch-lookup fallback finding no PR falls through to the ordinary no-deliverable skip"
 else
   fail "branch-lookup fallback with no PR found: expected a no-deliverable skip, got $(count_queue_files) queue file(s)"
+fi
+
+# Case 14: gh auth/network failure during the branch-lookup fallback must be
+# distinguishable from "genuinely no PR yet" -- an operator staring at
+# decisions.tsv otherwise cannot tell an outage from normal steady-state,
+# which is the exact silent-failure mode this fallback exists to avoid. The
+# hook must also still exit 0 (never crash) even though `gh` itself failed.
+clear_sandbox
+INPUT_GH_FAIL=$(jq -n \
+  --arg msg 'Pushed a new commit def9999, addressing feedback.' \
+  '{agent_id:"agent-ghfail", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessGhFail", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+GH_FAIL_RC=0
+TEST_GH_PR_LIST_FAIL=1 run_hook "$INPUT_GH_FAIL" || GH_FAIL_RC=$?
+if [ "$GH_FAIL_RC" -eq 0 ] && [ "$(count_queue_files)" = "0" ] && grep -q $'agent-ghfail\tskip\tbranch-lookup-failed' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+  pass "gh failure during branch-lookup is logged as branch-lookup-failed (distinct from no-deliverable) and the hook still exits 0"
+else
+  fail "gh failure during branch-lookup: expected exit 0 + a branch-lookup-failed skip line, got hook_rc=$GH_FAIL_RC, $(count_queue_files) queue file(s)"
+fi
+
+# Case 15: concurrency stress. Multiple subagents can hit SubagentStop
+# within the same second (real: .claude/review-queue/log/*.jsonl shows
+# overlapping subagents in one session). Without a lock serializing
+# read-size -> rotate -> append, concurrent hook processes race the file
+# renames and can silently discard an entry the retention policy promises
+# survives two rotations -- reproduced by critical-reviewer with 5
+# overlapping invocations against a >1 MiB file (PR #1416 review). A race
+# is timing-dependent: one round of 5 concurrent invocations does not
+# reliably reproduce it on every machine/run, so this repeats 3 independent
+# rounds and fails if ANY round loses or duplicates an entry -- with the
+# lock in place this is fully deterministic (every round is serialized), so
+# there is no added flakiness on the passing side.
+DECISIONS_LOG_RACE="$SANDBOX/.claude/review-queue/log/decisions.tsv"
+RACE_ROUNDS=3
+RACE_CRASH_TOTAL=0
+RACE_LOSS_TOTAL=0
+RACE_MISSING_TOTAL=0
+for round in 1 2 3; do
+  rm -f "$DECISIONS_LOG_RACE" "$DECISIONS_LOG_RACE.1" "$DECISIONS_LOG_RACE.2" "$DECISIONS_LOG_RACE.lock.d"
+  dd if=/dev/zero of="$DECISIONS_LOG_RACE" bs=1024 count=1100 2>/dev/null
+  printf 'RACE_SURVIVOR_MARKER_%s\n' "$round" >> "$DECISIONS_LOG_RACE"
+  clear_sandbox
+
+  RACE_PIDS=()
+  RACE_RC_FILES=()
+  for i in 1 2 3 4 5; do
+    RC_FILE="$SANDBOX/race-rc-$round-$i"
+    RACE_RC_FILES+=("$RC_FILE")
+    (
+      INPUT_RACE=$(jq -n \
+        --arg msg "Race round $round invocation $i, nothing to do." \
+        --arg agent_id "agent-race${round}-${i}" \
+        --arg session_id "sessRace${round}${i}" \
+        '{agent_id:$agent_id, agent_type:"worker", cwd:"/tmp/wt", session_id:$session_id, hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+      # `|| RC=$?`, not a bare call: an unlocked rotation can make the hook
+      # itself exit non-zero mid-race (an `mv` racing another process's
+      # rename). Under this subshell's inherited `set -e`, an unguarded
+      # failure here would skip the RC_FILE write entirely, and the
+      # unguarded `wait` below would then abort the whole test script
+      # before any assertion ran -- silently defeating the very check this
+      # case exists to make (a crash IS a finding, not a reason to bail).
+      RC=0
+      run_hook "$INPUT_RACE" >/dev/null 2>&1 || RC=$?
+      echo "$RC" > "$RC_FILE"
+    ) &
+    RACE_PIDS+=($!)
+  done
+  for pid in "${RACE_PIDS[@]}"; do
+    wait "$pid" || true
+  done
+
+  for rc_file in "${RACE_RC_FILES[@]}"; do
+    [ -f "$rc_file" ] && [ "$(cat "$rc_file")" = "0" ] || RACE_CRASH_TOTAL=$((RACE_CRASH_TOTAL + 1))
+  done
+
+  SURVIVOR_COUNT=0
+  for f in "$DECISIONS_LOG_RACE" "$DECISIONS_LOG_RACE.1" "$DECISIONS_LOG_RACE.2"; do
+    [ -f "$f" ] && grep -q "RACE_SURVIVOR_MARKER_$round" "$f" && SURVIVOR_COUNT=$((SURVIVOR_COUNT + 1))
+  done
+  [ "$SURVIVOR_COUNT" -eq 1 ] || RACE_LOSS_TOTAL=$((RACE_LOSS_TOTAL + 1))
+
+  for i in 1 2 3 4 5; do
+    FOUND=0
+    for f in "$DECISIONS_LOG_RACE" "$DECISIONS_LOG_RACE.1" "$DECISIONS_LOG_RACE.2"; do
+      if [ -f "$f" ] && grep -q "agent-race${round}-${i}" "$f"; then
+        FOUND=1
+        break
+      fi
+    done
+    [ "$FOUND" -eq 1 ] || RACE_MISSING_TOTAL=$((RACE_MISSING_TOTAL + 1))
+  done
+done
+
+if [ "$RACE_CRASH_TOTAL" -eq 0 ]; then
+  pass "$((RACE_ROUNDS * 5)) concurrent hook invocations across $RACE_ROUNDS rounds all exit 0 (no crash from an unlocked mv race)"
+else
+  fail "$RACE_CRASH_TOTAL concurrent hook invocation(s) crashed (non-zero exit) during rotation across $RACE_ROUNDS rounds"
+fi
+
+if [ "$RACE_LOSS_TOTAL" -eq 0 ]; then
+  pass "concurrent rotation preserves the pre-race entry exactly once in every one of $RACE_ROUNDS rounds (no data loss, no duplication)"
+else
+  fail "concurrent rotation lost or duplicated the pre-race entry in $RACE_LOSS_TOTAL of $RACE_ROUNDS rounds"
+fi
+
+if [ "$RACE_MISSING_TOTAL" -eq 0 ]; then
+  pass "all concurrent decisions across $RACE_ROUNDS rounds are recorded somewhere in the rotated log tree (no silently dropped append)"
+else
+  fail "$RACE_MISSING_TOTAL of $((RACE_ROUNDS * 5)) concurrent decisions were silently dropped across $RACE_ROUNDS rounds"
 fi
 
 if [ "$FAILURES" -eq 0 ]; then

@@ -77,9 +77,44 @@ rotate_decisions_log() {
   mv "$DECISIONS_LOG" "$DECISIONS_LOG.1"
 }
 
+DECISIONS_LOG_LOCK_DIR="$DECISIONS_LOG.lock.d"
+
+# `mkdir` is atomic on every POSIX filesystem, so it doubles as a lock
+# primitive without an extra binary -- unlike `flock`, which ships on Linux
+# but not on a stock macOS install (this hook runs on both). Bounded retry:
+# a holder that crashed mid-critical-section (the critical section is a
+# handful of syscalls, so this should never legitimately take 5s) has its
+# lock stolen rather than wedging every future hook fire forever.
+acquire_decisions_lock() {
+  local attempts=0
+  until mkdir "$DECISIONS_LOG_LOCK_DIR" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 50 ]; then
+      rmdir "$DECISIONS_LOG_LOCK_DIR" 2>/dev/null || true
+      attempts=0
+    fi
+    sleep 0.1
+  done
+}
+
+release_decisions_lock() {
+  rmdir "$DECISIONS_LOG_LOCK_DIR" 2>/dev/null || true
+}
+
+# Concurrent subagents can hit SubagentStop within the same second (multiple
+# workers finishing in one session against the same CLAUDE_PROJECT_DIR).
+# Without serializing read-size -> rotate -> append as one critical section,
+# overlapping invocations race the file renames: one process's in-flight
+# `mv decisions.tsv decisions.tsv.1` can be clobbered by another's, silently
+# discarding an entry the retention policy above promises survives two
+# rotations (confirmed by critical-reviewer with 5 overlapping invocations
+# against a >1 MiB file).
 log_decision() {
+  local line="$1"
+  acquire_decisions_lock
   rotate_decisions_log
-  printf '%s\n' "$1" >> "$DECISIONS_LOG"
+  printf '%s\n' "$line" >> "$DECISIONS_LOG"
+  release_decisions_lock
 }
 
 TS=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
@@ -144,10 +179,23 @@ fi
 
 # 5. Resumed worker fallback. See "Branch-lookup PR fallback" in the header.
 if [ -z "$DELIVERABLE_TYPE" ] && [ "$AGENT_TYPE" = "worker" ] && [ "$AGENT_ID" != "unknown" ]; then
-  BRANCH_PR_URL=$(gh pr list --head "worker/agent-$AGENT_ID" --json url --limit 1 --jq '.[0].url // ""' 2>/dev/null || true)
-  if [ -n "$BRANCH_PR_URL" ]; then
+  # `&& GH_RC=0 || GH_RC=$?`, not two statements: under `set -e`, a failing
+  # command substitution trips the shell on the assignment line itself,
+  # before a separate `GH_RC=$?` line would ever run -- exiting the whole
+  # hook non-zero on a `gh` failure instead of reaching the handling below.
+  GH_OUT=$(gh pr list --head "worker/agent-$AGENT_ID" --json url --limit 1 --jq '.[0].url // ""' 2>&1) && GH_RC=0 || GH_RC=$?
+  if [ "$GH_RC" -ne 0 ]; then
+    # An auth/network failure looks identical to "genuinely no PR yet"
+    # unless logged separately -- exactly the silent-failure mode this
+    # fallback exists to avoid. tr collapses any embedded tab/newline from
+    # gh's error text so it can't split into extra TSV rows/columns.
+    GH_ERR_ONELINE=$(printf '%s' "$GH_OUT" | tr '\t\n' '  ')
+    log_decision "$(printf '%s\t%s\tskip\tbranch-lookup-failed\tagent_type=%s;rc=%s;err=%s' \
+      "$TS" "$AGENT_ID" "$AGENT_TYPE" "$GH_RC" "$GH_ERR_ONELINE")"
+    exit 0
+  elif [ -n "$GH_OUT" ]; then
     DELIVERABLE_TYPE="pr"
-    DELIVERABLE_REF="$BRANCH_PR_URL"
+    DELIVERABLE_REF="$GH_OUT"
     DECISION_LABEL="queued-via-branch-lookup"
   fi
 fi
