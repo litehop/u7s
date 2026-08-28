@@ -64,15 +64,29 @@ file_mtime() {  # portable GNU/BSD stat, matches the idiom used elsewhere in scr
 # files, no worker PRs, no beads) is what makes "genuinely empty state" and
 # "exactly this one fixture PR" possible at all: this actual dev checkout
 # has live sibling worktrees/PRs/beads that would otherwise leak into any
-# of the three assertions below and mask a real regression. Sets
-# TICK_RC/TICK_OUT/TICK_STATE for the caller to assert on.
+# of the three assertions below and mask a real regression. $3, if given,
+# is a number of seconds; a second worktree on branch
+# worker/agent-worktree-age-test is added with its HEAD commit backdated
+# that far, so check_worktree_anomalies has a real branch/commit-age pair
+# to evaluate. Sets TICK_RC/TICK_OUT/TICK_STATE for the caller to assert
+# on.
 run_full_tick() {
-  local stub_bin="$1" queue_seed="${2:-}"
+  local stub_bin="$1" queue_seed="${2:-}" worker_age_seconds="${3:-}"
   local scratch="$WORKDIR/tick-$RANDOM$RANDOM" repo
   repo="$scratch/repo"
   mkdir -p "$repo/scripts" "$repo/.claude/review-queue"
   cp "$SCRIPT" "$repo/scripts/mayor-tick.sh"
   git init -q "$repo"
+  git -C "$repo" config user.email test@example.com
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" commit -q --allow-empty -m init
+  if [ -n "$worker_age_seconds" ]; then
+    local wpath="$scratch/worker-worktree" commit_epoch
+    commit_epoch=$(( $(date -u +%s) - worker_age_seconds ))
+    git -C "$repo" worktree add -q -b worker/agent-worktree-age-test "$wpath"
+    GIT_AUTHOR_DATE="@${commit_epoch} +0000" GIT_COMMITTER_DATE="@${commit_epoch} +0000" \
+      git -C "$wpath" commit -q --allow-empty -m "worker commit"
+  fi
   if [ -n "$queue_seed" ]; then
     cp "$queue_seed"/*.md "$repo/.claude/review-queue/" 2>/dev/null || true
   fi
@@ -722,6 +736,104 @@ assert "a PR with no queue file but an already-submitted critical-reviewer revie
   "$([ "$(jq -r '.pending_reviews | index(4343) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
 assert "...and reconciliation does not log a synthesis message for it either -- the skip is silent by design" \
   "$(! printf '%s' "$TICK_OUT" | grep -q 'mayor-tick reconcile:.*4343' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 13. In-flight awareness (age-threshold pure functions). Both queue-drain
+#     detection (section 1) and these two share the same reason for
+#     existing: exit 30 firing on EVERY healthy worker dispatch, and
+#     pending_reviews re-surfacing a PR whose reviewer is already running,
+#     both train the mayor to ignore a signal that's supposed to mean
+#     something -- and the pending_reviews case is worse, since acting on
+#     it means dispatching a second reviewer that can race the first one.
+# ---------------------------------------------------------------------------
+
+NOW_EPOCH=$(date -u +%s)
+
+# queue_entry_in_flight: a review queued 2 minutes ago is well within the
+# 15m in-flight window -- the reviewer is plausibly still running, so this
+# entry must not be re-surfaced in pending_reviews yet.
+RECENT_QUEUED_AT=$(date -u -d "@$(( NOW_EPOCH - 120 ))" +%Y-%m-%dT%H-%M-%SZ 2>/dev/null || date -u -j -f %s "$(( NOW_EPOCH - 120 ))" +%Y-%m-%dT%H-%M-%SZ)
+RC=0
+call queue_entry_in_flight "$RECENT_QUEUED_AT" "$NOW_EPOCH" || RC=$?
+assert "a review queued 2 minutes ago is still in-flight -- must not be re-surfaced for a duplicate reviewer dispatch" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+# A review queued 20 minutes ago has outlived a full 15m tick cycle without
+# posting -- worth surfacing as possibly stalled, not silently hidden
+# forever.
+OLD_QUEUED_AT=$(date -u -d "@$(( NOW_EPOCH - 1200 ))" +%Y-%m-%dT%H-%M-%SZ 2>/dev/null || date -u -j -f %s "$(( NOW_EPOCH - 1200 ))" +%Y-%m-%dT%H-%M-%SZ)
+RC=0
+call queue_entry_in_flight "$OLD_QUEUED_AT" "$NOW_EPOCH" || RC=$?
+assert "a review queued 20 minutes ago (past one full tick cycle) is no longer treated as in-flight" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# A malformed queued_at must fail toward SURFACING the PR, not hiding it --
+# the opposite fail direction from queue_is_drained, since silently
+# treating a broken timestamp as "still running" would hide a real PR
+# forever instead of just delaying it one tick.
+RC=0
+call queue_entry_in_flight 'not-a-timestamp' "$NOW_EPOCH" || RC=$?
+assert "a malformed queued_at fails toward surfacing the PR (not in-flight), never toward permanently hiding it" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# worktree_dispatch_in_flight: a dispatch 6 minutes old is well within the
+# observed 10-40m diagnose-edit-test window -- exit 30 firing here is
+# exactly the alarm-fatigue bug this fix closes.
+RC=0
+call worktree_dispatch_in_flight 360 || RC=$?
+assert "a 6-minute-old worker dispatch with no PR yet is still in-flight -- a healthy dispatch must not trip exit 30" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+# A dispatch 50 minutes old has outlived even the high end of the observed
+# working window (plus headroom) -- a genuinely stalled/crashed dispatch
+# must still surface.
+RC=0
+call worktree_dispatch_in_flight 3000 || RC=$?
+assert "a 50-minute-old worker dispatch with no PR yet is past the working window -- a genuinely stalled dispatch must still surface" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 14. pending_reviews in-flight suppression, end-to-end through the REAL
+#     main() pipeline -- proves the section-13 pure function actually
+#     changes what lands in the state file the mayor reads, not just its
+#     own return value.
+# ---------------------------------------------------------------------------
+
+QSEED_INFLIGHT="$WORKDIR/qseed-review-inflight"
+mkdir -p "$QSEED_INFLIGHT"
+NOW_QUEUED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+printf -- '---\ndeliverable_type: pr\ndeliverable_ref: https://github.com/example/repo/pull/5001\nqueued_at: %s\n---\nbody\n' "$NOW_QUEUED_AT" > "$QSEED_INFLIGHT/pr-5001.md"
+
+run_full_tick "$STUB_EMPTY_BIN" "$QSEED_INFLIGHT"
+assert "a PR whose review was queued moments ago is NOT re-surfaced in pending_reviews -- dispatching a second reviewer here would race the one already running, and the merge gate keys on whichever posts LAST" \
+  "$([ "$(jq -r '.pending_reviews | index(5001) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
+assert "...but the queue file itself stays visible in queue_files (still genuinely undrained, just not re-dispatched)" \
+  "$([ "$(jq -r '.queue_files | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
+
+QSEED_STALLED="$WORKDIR/qseed-review-stalled"
+mkdir -p "$QSEED_STALLED"
+printf -- '---\ndeliverable_type: pr\ndeliverable_ref: https://github.com/example/repo/pull/5002\nqueued_at: 2026-01-01T00-00-00Z\n---\nbody\n' > "$QSEED_STALLED/pr-5002.md"
+
+run_full_tick "$STUB_EMPTY_BIN" "$QSEED_STALLED"
+assert "a PR whose review has sat undrained for months (a genuinely stalled/crashed reviewer) still surfaces in pending_reviews -- the in-flight suppression must not become a permanent hide" \
+  "$([ "$(jq -r '.pending_reviews | index(5002) != null' "$TICK_STATE")" = "true" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 15. Worktree-anomaly in-flight suppression, end-to-end through the REAL
+#     main() pipeline against a real second git worktree with a controlled
+#     commit age -- proves check_worktree_anomalies' age check (not just
+#     the section-13 pure function) actually gates the tick's exit code.
+# ---------------------------------------------------------------------------
+
+run_full_tick "$STUB_EMPTY_BIN" "" 360
+assert "a tick during a 6-minute-old healthy in-flight worker does not return exit 30 -- alarm fatigue trains the mayor to ignore an exit code that fires on every routine dispatch" \
+  "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
+assert "...the in-flight worktree still appears in worktree_anomalies for visibility (not silently dropped), just not escalated" \
+  "$([ "$(jq -r '[.worktree_anomalies[] | select(.branch == "worker/agent-worktree-age-test")] | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
+
+run_full_tick "$STUB_EMPTY_BIN" "" 3000
+assert "a tick against a genuinely abandoned 50-minute-old worker branch with no PR still returns exit 30" \
+  "$([ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

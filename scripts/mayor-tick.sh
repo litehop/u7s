@@ -104,6 +104,54 @@ queue_is_drained() {
   [[ "$submitted_at" > "$norm" ]]
 }
 
+# A critical-reviewer review typically posts within minutes of being
+# dispatched -- one full 15m tick cycle is enough headroom that an entry
+# still undrained past it is worth surfacing as possibly stalled, rather
+# than the reviewer simply still running.
+QUEUE_ENTRY_IN_FLIGHT_MAX_AGE_SECONDS=$((15 * 60))
+
+# Portable ISO-8601 (colon form, e.g. what normalize_queued_at produces) ->
+# Unix epoch seconds. GNU `date -d` (Linux CI) and BSD/macOS `date -j -f`
+# (this script's own shebang target, and the pre-push hook's runtime) parse
+# timestamps incompatibly, so both forms are tried.
+iso8601_to_epoch() {
+  date -u -d "$1" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null
+}
+
+# True (exit 0) iff a not-yet-drained review-queue entry is still young
+# enough that its reviewer is plausibly still running, and so must NOT be
+# re-surfaced in pending_reviews -- acting on that signal means dispatching
+# a second reviewer at the same PR, and since the merge gate keys on the
+# latest verdict by submittedAt, whichever reviewer finishes last silently
+# wins. False (not in-flight, so it DOES surface) on a missing/malformed
+# queued_at or unparseable timestamp -- the opposite fail direction from
+# queue_is_drained's fail-closed, because treating a broken timestamp as
+# "still running" would hide the PR indefinitely instead of just one tick.
+queue_entry_in_flight() {
+  local queued_at="$1" now_epoch="$2"
+  is_valid_queued_at "$queued_at" || return 1
+  local queued_epoch
+  queued_epoch=$(iso8601_to_epoch "$(normalize_queued_at "$queued_at")") || return 1
+  [ -z "$queued_epoch" ] && return 1
+  [ $(( now_epoch - queued_epoch )) -lt "$QUEUE_ENTRY_IN_FLIGHT_MAX_AGE_SECONDS" ]
+}
+
+# A healthy worker's diagnose-edit-test window is observed at 10-40
+# minutes with no PR open yet -- 45m (~3 tick cycles) gives headroom above
+# that so a routine dispatch never trips exit 30, while a dispatch stalled
+# well past its own working window still does.
+WORKTREE_ANOMALY_MAX_AGE_SECONDS=$((45 * 60))
+
+# True (exit 0) iff a worker worktree with no PR yet is still within its
+# plausible working window and must be reported informationally without
+# escalating the tick's exit code -- exit 30 firing on every routine
+# dispatch trains the mayor to ignore it, so a genuinely stalled dispatch
+# goes unnoticed.
+worktree_dispatch_in_flight() {
+  local age_seconds="$1"
+  [ "$age_seconds" -lt "$WORKTREE_ANOMALY_MAX_AGE_SECONDS" ]
+}
+
 # Extracts the value after "**Verdict**:" from a critical-reviewer findings
 # body. Only LGTM / LGTM-with-suggestions satisfy the merge gate; anything
 # else (needs-changes, needs-discussion, or no match at all -> empty) does
@@ -412,6 +460,7 @@ GATE_EXCEPTIONS=()
 MERGED_PRS=()
 BD_READY_IDS=()
 WORKTREE_ANOMALIES=()
+WORKTREE_STALE_COUNT=0  # subset of WORKTREE_ANOMALIES old enough to escalate the exit code
 
 # Step 0: drain the review queue. This is NOT reviewer dispatch (this
 # script cannot invoke a Claude subagent) -- it only confirms whether a
@@ -454,7 +503,14 @@ process_review_queue() {
             run_cmd rm -f "$f"
             continue
           fi
-          PENDING_REVIEW_PRS+=("$prnum")
+          # Still undrained but freshly queued: the reviewer is plausibly
+          # still running. Leave the queue file in place (still counted via
+          # QUEUE_FILES_REMAINING below) but don't add it to pending_reviews
+          # -- re-surfacing it there risks the mayor dispatching a second
+          # reviewer for a PR already being reviewed.
+          if ! queue_entry_in_flight "$queued_at" "$(date -u +%s)"; then
+            PENDING_REVIEW_PRS+=("$prnum")
+          fi
         fi
         ;;
       non-pr)
@@ -554,9 +610,13 @@ check_bd_ready() {
 # the (operator-kept, not scriptified here) 60m worktree-hygiene loop. This
 # only flags a live worker worktree/branch with NO PR at all, which that
 # loop's checks don't cover: it means a dispatch stalled before ever
-# opening one.
+# opening one -- UNLESS the branch is still within its plausible working
+# window (worktree_dispatch_in_flight), in which case it's reported here
+# for visibility but excluded from WORKTREE_STALE_COUNT, so it never
+# escalates the tick's exit code.
 check_worktree_anomalies() {
-  local path branch count
+  local path branch count now commit_epoch age_seconds
+  now=$(date -u +%s)
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     [ "$path" = "$REPO_ROOT" ] && continue
@@ -567,7 +627,14 @@ check_worktree_anomalies() {
     esac
     count=$(gh pr list --head "$branch" --state all --json number --jq 'length' 2>/dev/null || echo 0)
     if [ "${count:-0}" -eq 0 ]; then
-      WORKTREE_ANOMALIES+=("$(jq -nc --arg path "$path" --arg branch "$branch" '{path:$path, branch:$branch, reason:"no-pr-for-branch"}')")
+      commit_epoch=$(git -C "$path" log -1 --format=%ct 2>/dev/null || echo "$now")
+      age_seconds=$(( now - commit_epoch ))
+      if worktree_dispatch_in_flight "$age_seconds"; then
+        WORKTREE_ANOMALIES+=("$(jq -nc --arg path "$path" --arg branch "$branch" '{path:$path, branch:$branch, reason:"no-pr-for-branch-in-flight"}')")
+      else
+        WORKTREE_ANOMALIES+=("$(jq -nc --arg path "$path" --arg branch "$branch" '{path:$path, branch:$branch, reason:"no-pr-for-branch"}')")
+        WORKTREE_STALE_COUNT=$(( WORKTREE_STALE_COUNT + 1 ))
+      fi
     fi
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
 }
@@ -618,7 +685,10 @@ main() {
   # self-healed entry would leave exit_code at 0 (noop) and the mayor would
   # never read pending_reviews to dispatch it, defeating self-heal outright.
   local exception_count=$(( ${#GATE_EXCEPTIONS[@]} + ${#QUEUE_FILES_REMAINING[@]} + ${#PENDING_REVIEW_PRS[@]} ))
-  local worktree_count=${#WORKTREE_ANOMALIES[@]}
+  # Not ${#WORKTREE_ANOMALIES[@]}: that count includes in-flight dispatches
+  # reported for visibility only (see check_worktree_anomalies) -- only the
+  # stale subset should escalate the exit code.
+  local worktree_count=$WORKTREE_STALE_COUNT
   local exit_code
   exit_code=$(compute_exit_code "$bd_ready_count" "$exception_count" "$worktree_count")
 
