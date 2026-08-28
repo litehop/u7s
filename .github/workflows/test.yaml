@@ -2,6 +2,10 @@ name: Test
 
 on:
   push:
+  # Explicit, not accidental: this previously only ran on merge-queue
+  # branches because push: was unrestricted. Making it explicit means it
+  # keeps working even if push: is later scoped to specific branches.
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
