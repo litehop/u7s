@@ -391,6 +391,12 @@ run_with_timeout() {
   local cmd_pid=$! waited=0
   while kill -0 "$cmd_pid" 2>/dev/null; do
     if [ "$waited" -ge "$secs" ]; then
+      # pkill -P before kill -9: $cmd_pid's own children (a stalled
+      # kubectl/limactl call can itself fork, e.g. an ssh multiplexer) are
+      # only findable by PPID while $cmd_pid is still alive -- killing
+      # $cmd_pid first would reparent them to init before pkill -P got a
+      # chance to look them up, leaving them running as untracked orphans.
+      pkill -9 -P "$cmd_pid" 2>/dev/null || true
       kill -9 "$cmd_pid" 2>/dev/null
       wait "$cmd_pid" 2>/dev/null || true
       echo "error: '$label' timed out after ${secs}s" >&2

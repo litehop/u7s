@@ -52,6 +52,12 @@ run_with_timeout() {
   local cmd_pid=$! waited=0
   while kill -0 "$cmd_pid" 2>/dev/null; do
     if [ "$waited" -ge "$secs" ]; then
+      # pkill -P before kill -9: $cmd_pid's own children (e.g. the
+      # 'sleep 300' a wrapping 'sh -c "...; sleep 300"' forks) are only
+      # findable by PPID while $cmd_pid is still alive -- killing $cmd_pid
+      # first would reparent them to init before pkill -P got a chance to
+      # look them up, leaving them running as untracked orphans.
+      pkill -9 -P "$cmd_pid" 2>/dev/null || true
       kill -9 "$cmd_pid" 2>/dev/null
       wait "$cmd_pid" 2>/dev/null || true
       echo "error: '$label' timed out after ${secs}s" >&2
@@ -178,6 +184,23 @@ assert "a clear, specific message names which call timed out (was: total silence
 HUNG_PID="$(cat "$PIDFILE" 2>/dev/null || echo "")"
 assert "the hung process is actually killed, not left running as an orphan" \
   "$([ -n "$HUNG_PID" ] && ! kill -0 "$HUNG_PID" 2>/dev/null && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 3b. Bug 2's grandchild-orphan corollary: killing only
+#    $cmd_pid (the 'sh -c' wrapper) does nothing to a child 'sh' itself
+#    forked -- that grandchild is never explicitly signalled and survives,
+#    reparented, for its full 300s. This is a distinct process from
+#    HUNG_PID above (the wrapper), captured here by having the wrapped
+#    command background its own child and record that child's PID before
+#    run_with_timeout's 1s deadline fires.
+# ---------------------------------------------------------------------------
+GRANDCHILD_PIDFILE="$TMPDIR_TEST/grandchild.pid"
+run_with_timeout "hung call with a forked grandchild" 1 0 \
+  sh -c "sleep 300 & echo \$! > '$GRANDCHILD_PIDFILE'; wait" 2>/dev/null || true
+
+GRANDCHILD_PID="$(cat "$GRANDCHILD_PIDFILE" 2>/dev/null || echo "")"
+assert "run_with_timeout kills the wrapped command's own forked grandchild too, not just the direct child it spawned -- otherwise every real timeout on a forking call (e.g. a stalled limactl/kubectl invocation) leaks a 300s orphan" \
+  "$([ -n "$GRANDCHILD_PID" ] && ! kill -0 "$GRANDCHILD_PID" 2>/dev/null && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 4. suppress_stderr must hide only the wrapped command's own stderr, never
