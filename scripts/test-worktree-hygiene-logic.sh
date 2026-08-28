@@ -184,6 +184,51 @@ assert "a squash-merged branch (same patch, different SHA) still produces cherry
   "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 3b. STEP C -- open-PR guard. Observed 2026-08-28: PR #1433's
+#    commits reached main via a DIFFERENT PR (#1435) while #1433 itself was
+#    still open -- patch-id alone would call #1433's branch safe to delete,
+#    but deleting it would auto-close the still-open PR and destroy its
+#    review state. This must be judged on PR state, not patch-id.
+# ---------------------------------------------------------------------------
+OPEN_PRS='worker/agent-has-open-pr
+worker/agent-other-open-pr'
+
+RC=0
+call has_open_pr 'worker/agent-has-open-pr' "$OPEN_PRS" || RC=$?
+assert "a branch with an open PR is guarded, even though its commits might already be merged elsewhere by patch-id" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call has_open_pr 'worker/agent-no-pr' "$OPEN_PRS" || RC=$?
+assert "a branch with no open PR is not guarded by the open-PR check" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 3c. STEP C -- live-worktree-directory guard. Observed
+#    2026-08-28: a worker switched its worktree to a scratch branch
+#    mid-dispatch, leaving worker/agent-<id> checked out nowhere --
+#    is_checked_out alone is blind to this since it only sees what's
+#    checked out RIGHT NOW, not which worktree directories still exist.
+# ---------------------------------------------------------------------------
+LIVE_AGENT_DIR="$SANDBOX_ROOT/live-agent-worktrees/ai/worktrees/agent-live123"
+mkdir -p "$LIVE_AGENT_DIR"
+
+RC=0
+call has_live_worktree_dir 'worker/agent-live123' "$SANDBOX_ROOT/live-agent-worktrees" || RC=$?
+assert "a worker/agent-<id> branch with a live worktree directory is guarded, regardless of what that worktree currently has checked out" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call has_live_worktree_dir 'worker/agent-gone456' "$SANDBOX_ROOT/live-agent-worktrees" || RC=$?
+assert "a worker/agent-<id> branch with no matching worktree directory is not guarded by this check" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call has_live_worktree_dir 'main' "$SANDBOX_ROOT/live-agent-worktrees" || RC=$?
+assert "a non-worker/agent-* branch name (e.g. main) never matches this check, even if a coincidentally-named directory existed" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 4. STEP D -- gone-upstream match.
 # ---------------------------------------------------------------------------
 
