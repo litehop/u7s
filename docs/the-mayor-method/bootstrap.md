@@ -194,6 +194,29 @@ verified end-to-end since PR #1347).
    admit a BLOCKED PR — so "let the queue handle it" isn't available; update
    its branch, since it can never go green on its own.
 
+**Dismissing a stale blocking review.** A `REQUEST_CHANGES` review from
+`litehop-reviewer[bot]` that has been addressed by a fix commit, but never
+got a fresh review to clear it (a known `SubagentStop`-hook reliability
+gap), needs a manual dismissal: `gh api
+repos/litehop/u7s/pulls/<N>/reviews/<REVIEW_ID>/dismissals -X PUT -f
+message='<why>' -f event=DISMISS`. The merge gate's
+`latest_reviewer_review()` (`scripts/mayor-tick.sh`) already excludes
+`DISMISSED` reviews before picking the latest verdict by `submittedAt`, so
+it falls back to the PR's previous non-blocking verdict, or treats it as
+awaiting review if none exists.
+
+**Per-operator reviewer-bot key.** `scripts/gh-app-token.sh` reads the App
+ID and private-key path from `U7S_REVIEWER_APP_ID` / `U7S_REVIEWER_APP_KEY`,
+set in `.claude/settings.local.json`'s (untracked) `env` map. Each operator
+generates their own private key from the `litehop-reviewer` App's GitHub
+settings page and points `U7S_REVIEWER_APP_KEY` at their own local copy —
+keys are per-operator and individually revocable, so none is ever shared.
+`.claude/settings.local.json` at mode 644 plus the PEM at `chmod 600` blocks
+a different OS user from reading the key, but not a worker subagent running
+as the same OS user — the threat model here is accidental exposure (logs,
+transcripts, env dumps), not process isolation between an operator and
+their own subagents.
+
 **Inline sync after every task-notification — transport-conditional (mayor-t79kb).**
 Standing cron loops fire reliably on the terminal CLI (Claude Code invoked as
 `claude` from the shell) and the compensating pattern below is NOT required
