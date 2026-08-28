@@ -1494,7 +1494,13 @@ pub(crate) fn eval_cel_apply_config(
 ) -> Option<serde_json::Value> {
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
-    parse_cel_value(&tokens, &mut pos, object)
+    let val = parse_cel_value(&tokens, &mut pos, object)?;
+    // See eval_cel_bool_expr: a valid prefix followed by unconsumed trailing tokens
+    // must be a hard parse error, not a silent truncation to the prefix's value.
+    if pos != tokens.len() {
+        return None;
+    }
+    Some(val)
 }
 
 /// Evaluate a CEL boolean expression for ValidatingAdmissionPolicy validations.
@@ -8361,6 +8367,28 @@ mod tests {
             result.unwrap(),
             "my-deploy",
             "field access must return the correct value from the admitted object"
+        );
+    }
+
+    /// A valid-prefix MAP apply-config expression followed by a trailing literal must be a
+    /// hard parse error, not silently truncated to the prefix's value. `parse_cel_value` (the
+    /// separate, simpler parser eval_cel_apply_config uses for MAP-type ApplyConfiguration
+    /// expressions) only recognizes a trailing `+` as a valid continuation after a primary; any
+    /// other trailing token — here `== "bar" true` after `object.foo` — was previously just
+    /// left unconsumed and silently dropped, returning `Some("bar")` (the value of the valid
+    /// `object.foo` prefix) instead of erroring on the garbled remainder. Same truncation class
+    /// fixed earlier in eval_cel_bool_expr/eval_cel_vap_value, but that fix didn't cover this
+    /// parser since it's a distinct code path.
+    #[test]
+    fn eval_cel_apply_config_rejects_trailing_garbage_after_valid_prefix() {
+        let object = json!({"foo": "bar"});
+        let result = eval_cel_apply_config(r#"object.foo == "bar" true"#, &object);
+        assert_eq!(
+            result, None,
+            "trailing unconsumed tokens after a valid prefix must be a parse error; \
+             returning Some(\"bar\") here means the evaluator silently truncated the \
+             garbled `== \"bar\" true` remainder and mistook a broken apply-config \
+             expression for a valid one"
         );
     }
 
