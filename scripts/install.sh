@@ -932,7 +932,10 @@ ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE
 # fix below, measured independently for KCM rather than assumed to
 # transfer. GOMEMLIMIT is a soft cap (GC works harder as it's approached,
 # never OOM-kills), so this is safe to trial and fully reversible.
-Environment=GOMEMLIMIT=200MiB
+# Round-2: 200MiB->128MiB. Two tuned full-conformance samples measured
+# KCM peak at 109.2MB/112.8MB (transient 115.48MB) -- 128MiB still clears
+# that by 19-25MB while giving GC less headroom to coast on.
+Environment=GOMEMLIMIT=128MiB
 Environment=GOGC=50
 Environment=GOMAXPROCS=2
 # -clusterrole-aggregation-controller: u7s never sets ClusterRole.aggregationRule

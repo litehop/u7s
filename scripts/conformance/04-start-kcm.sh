@@ -77,7 +77,10 @@ export TZ=UTC
 # inherit it as ordinary child processes. GOMEMLIMIT is a soft cap: GC works
 # harder as it's approached, it never OOM-kills, so this is safe to trial and
 # fully reversible.
-export GOMEMLIMIT=200MiB
+# Round-2: 200MiB->128MiB. Two tuned full-conformance samples measured
+# KCM peak at 109.2MB/112.8MB (transient 115.48MB) -- 128MiB still clears
+# that by 19-25MB while giving GC less headroom to coast on.
+export GOMEMLIMIT=128MiB
 export GOGC=50
 export GOMAXPROCS=2
 # Verbosity flag: when run-all.sh is invoked with --verbose it passes --kcm-v <N>,
