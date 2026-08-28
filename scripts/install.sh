@@ -766,6 +766,15 @@ Requires=crio.service
 [Service]
 Type=simple
 WorkingDirectory=$STATE_DIR
+# Go-runtime memory tuning ported from the conformance dev-loop
+# (scripts/conformance/lima-start.sh), proven there: default GOGC=100 +
+# unbounded heap let kubelet's RSS sawtooth up to 235MB; this tuple measured
+# 167.5MB->104.6MB (and stayed flat, no delayed step-up) on a 31-pod
+# create/delete cycle, with pod-actuation timing unchanged. GOMEMLIMIT is a
+# soft cap (GC works harder as it's approached, never OOM-kills).
+Environment=GOMEMLIMIT=200MiB
+Environment=GOGC=50
+Environment=GOMAXPROCS=2
 ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP
 Restart=always
 RestartSec=2
@@ -918,6 +927,14 @@ WorkingDirectory=$STATE_DIR
 # literal argv entry: systemd's own line-splitting never globs, but a real
 # shell would expand that "*" against WorkingDirectory's contents.
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
+# Go-runtime memory tuning ported from the conformance dev-loop
+# (scripts/conformance/04-start-kcm.sh), same lever class as kubelet's own
+# fix below, measured independently for KCM rather than assumed to
+# transfer. GOMEMLIMIT is a soft cap (GC works harder as it's approached,
+# never OOM-kills), so this is safe to trial and fully reversible.
+Environment=GOMEMLIMIT=200MiB
+Environment=GOGC=50
+Environment=GOMAXPROCS=2
 ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,-cloud-node-lifecycle-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
@@ -936,6 +953,12 @@ Requires=crio.service u7s-apiserver.service
 [Service]
 Type=simple
 WorkingDirectory=$STATE_DIR
+# Go-runtime memory tuning ported from the conformance dev-loop
+# (scripts/conformance/lima-start.sh) -- see the worker-mode kubelet.service
+# block above for the measured before/after numbers this tuple is based on.
+Environment=GOMEMLIMIT=200MiB
+Environment=GOGC=50
+Environment=GOMAXPROCS=2
 # Without a CA-signed serving cert (wired via kubelet-config.yaml's
 # tlsCertFile), kubelet self-signs for :10250, and the apiserver's
 # kubelet-client -- pinned to the cluster CA by build_kubelet_tls_config in
