@@ -106,6 +106,10 @@ finding against your own output, not just the deliverable you reviewed.
 
 ## Output & posting
 
+Do NOT hard-wrap the findings block — GFM renders a manual newline inside a
+PR review body as a hard line break, so wrapped prose can never reflow in
+the browser. Write each bullet/paragraph as one line.
+
 First, build the findings block below internally (do not just return it — this
 is an intermediate artefact, not your final action):
 

@@ -428,6 +428,13 @@ this repo. When you need it:
 
 ## Code style rules (mandatory)
 
+- Do NOT hard-wrap text destined for the GitHub UI — PR bodies, PR/issue
+  comments, critical-reviewer review bodies. GFM renders a manual newline
+  inside a paragraph there as a hard line break, so wrapped text can never
+  reflow. Write each paragraph as one line and let the browser wrap it.
+  Repo markdown (`docs/`, `ai/`, READMEs, ADRs) is the opposite: standard
+  markdown collapses single newlines at render time, so keep hard-wrapping
+  those — it costs nothing rendered and gives cleaner line-oriented diffs.
 - Write no comments by default. Only add one when the WHY is non-obvious: a hidden
   constraint, a subtle invariant, a workaround for a specific bug.
 - Never reference bead IDs, PR numbers, issue refs, or task identifiers in source
