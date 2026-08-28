@@ -107,6 +107,18 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        # Same GOMEMLIMIT/GOGC/GOMAXPROCS tuple already proven on kubelet and
+        # kube-controller-manager (scripts/install.sh) and ported to the
+        # conformance dev-loop's kube-proxy systemd unit
+        # (scripts/conformance/lima-start.sh) -- applied here as a first-cut,
+        # not yet independently measured for kube-proxy's own (smaller)
+        # footprint.
+        - name: GOMEMLIMIT
+          value: "200MiB"
+        - name: GOGC
+          value: "50"
+        - name: GOMAXPROCS
+          value: "2"
         volumeMounts:
         - name: kube-proxy
           mountPath: /var/lib/kube-proxy

@@ -566,7 +566,7 @@ else
     # snapshot + the rss/ring CSVs-so-far into this run's temp/e2e/ dir; this
     # is the FINAL snapshot, taken right at the point dhat's own heap capture
     # also considers "the run is over".
-    bash "$DIR/sample-run-metrics.sh" snapshot --workdir "$WORKDIR" --label pre-teardown
+    bash "$DIR/sample-run-metrics.sh" snapshot --workdir "$WORKDIR" --label pre-teardown --vm "${U7S_VM_NAME:-lima-node}"
     bash "$DIR/sample-run-metrics.sh" stop --workdir "$WORKDIR"
 
     # shellcheck disable=SC2207 # word-split intentionally: lsof -ti can return multiple PIDs, one per line.
@@ -672,7 +672,7 @@ if [ "$PROFILE" -eq 0 ]; then
   # run-all.sh; re-run "sample-run-metrics.sh start" by hand to keep
   # monitoring a --stack-only session left running for manual investigation.
   # shellcheck disable=SC2086
-  bash "$DIR/sample-run-metrics.sh" snapshot ${_WORKDIR_ARG} --label pre-teardown
+  bash "$DIR/sample-run-metrics.sh" snapshot ${_WORKDIR_ARG} --label pre-teardown ${_VM_ARG}
   # shellcheck disable=SC2086
   bash "$DIR/sample-run-metrics.sh" stop ${_WORKDIR_ARG}
 fi
@@ -699,6 +699,7 @@ if [ -n "${RUN_DIR:-}" ]; then
   [ -f "$WORKDIR/vm-free.csv" ]  && cp "$WORKDIR/vm-free.csv" "$MONITORING_DIR/vm-free.csv"
   [ -f "$WORKDIR/ring-age.csv" ] && cp "$WORKDIR/ring-age.csv" "$MONITORING_DIR/ring-age.csv"
   cp "$WORKDIR"/metrics-*.prom "$MONITORING_DIR/" 2>/dev/null || true
+  cp "$WORKDIR"/kcm-metrics-*.prom "$MONITORING_DIR/" 2>/dev/null || true
   echo "Monitoring artifacts: $MONITORING_DIR"
 fi
 
