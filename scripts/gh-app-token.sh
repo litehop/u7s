@@ -36,9 +36,16 @@ SIGNING_INPUT="$HEADER.$PAYLOAD"
 SIGNATURE=$(printf '%s' "$SIGNING_INPUT" | openssl dgst -sha256 -binary -sign "$APP_KEY" | b64url)
 JWT="$SIGNING_INPUT.$SIGNATURE"
 
-INSTALLATION_ID=$(curl -sSf \
-  -H "Authorization: Bearer $JWT" \
-  -H "Accept: application/vnd.github+json" \
+# Authorization is sent via a stdin-fed curl config (`-K -`) rather than a
+# `-H` argument so the JWT never appears in this process's argv, readable
+# via `ps` by any process running as the same user for the call's lifetime
+# (same pattern gh-app-review.sh uses for the installation token).
+curl_auth_config() {
+  printf 'header = "Authorization: Bearer %s"\n' "$JWT"
+  printf 'header = "Accept: application/vnd.github+json"\n'
+}
+
+INSTALLATION_ID=$(curl_auth_config | curl -sSf -K - \
   https://api.github.com/repos/litehop/u7s/installation | jq -r '.id')
 
 if [ -z "$INSTALLATION_ID" ] || [ "$INSTALLATION_ID" = "null" ]; then
@@ -46,9 +53,7 @@ if [ -z "$INSTALLATION_ID" ] || [ "$INSTALLATION_ID" = "null" ]; then
   exit 1
 fi
 
-TOKEN=$(curl -sSf -X POST \
-  -H "Authorization: Bearer $JWT" \
-  -H "Accept: application/vnd.github+json" \
+TOKEN=$(curl_auth_config | curl -sSf -X POST -K - \
   "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" | jq -r '.token')
 
 if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
