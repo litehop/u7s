@@ -10,6 +10,11 @@
 #   - no priorityClassName -- u7s seeds no PriorityClass objects.
 #   - no Service port / prometheus.io annotations for :9153 -- this is a pod-direct-scrape
 #     correlation signal, not a ServiceMonitor target.
+#   - GOMEMLIMIT=512MiB env var on the container -- a Go-runtime soft heap
+#     target (not a cgroup memory.limit_in_bytes; does not interact with
+#     resources.limits.memory above). Triggers more aggressive GC instead of
+#     an OOM-kill when approached, as a hedge against a repeat of an observed
+#     867MB RSS burst (steady-state is ~163MB).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -105,6 +110,9 @@ spec:
       - name: coredns
         image: registry.k8s.io/coredns/coredns:v1.14.7
         args: ["-conf", "/etc/coredns/Corefile"]
+        env:
+        - name: GOMEMLIMIT
+          value: "512MiB"
         ports:
         - containerPort: 53
           name: dns
