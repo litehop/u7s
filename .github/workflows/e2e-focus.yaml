@@ -5,6 +5,10 @@ on:
     branches:
       - main
   pull_request:
+  # Without this, the merge queue's temporary branch never fires this
+  # workflow, so its required check can never report and the queue
+  # deadlocks waiting forever for a check that will never arrive.
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
