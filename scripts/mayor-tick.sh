@@ -104,6 +104,82 @@ queue_is_drained() {
   [[ "$submitted_at" > "$norm" ]]
 }
 
+# Backstop for the pending_reviews dispatch marker (see
+# queue_entry_dispatch_suppressed below): once a marker is this old, treat
+# the earlier presumed dispatch as dead -- a crashed/stuck reviewer, or the
+# mayor never actually acted on the prior pending_reviews listing -- and
+# surface the entry again rather than trusting the marker forever.
+QUEUE_DISPATCH_MARKER_MAX_AGE_SECONDS=$((15 * 60))
+
+# Path to the on-disk marker recording "this script already surfaced this
+# queue entry in pending_reviews". Lives in its own subdirectory, never
+# touched by the SubagentStop hook, so this script is the sole reader AND
+# writer -- keyed on the queue file's basename, which is unique per active
+# entry (pr_already_queued's no-double-queue invariant already relies on
+# this).
+dispatch_marker_path() {
+  printf '%s/.dispatched/%s.marker' "$QUEUE_DIR" "$(basename "$1")"
+}
+
+# Epoch seconds recorded in a queue entry's dispatch marker, or empty if
+# none exists (or it's unreadable). Empty is the FIRST-SIGHTING case and
+# must be treated as immediately dispatchable, never as in-flight.
+read_dispatch_marker() {
+  local marker_file
+  marker_file=$(dispatch_marker_path "$1")
+  # No matching-branch `if` returns 0, unlike `[ -f ... ] && cat ...`, whose
+  # short-circuit on a missing marker (the routine first-sighting case)
+  # would return 1 and abort the whole script under `set -e` at the caller.
+  if [ -f "$marker_file" ]; then
+    cat "$marker_file" 2>/dev/null
+  fi
+}
+
+# True (exit 0) iff a not-yet-drained review-queue entry must be SUPPRESSED
+# from pending_reviews this tick because a dispatch was already recorded
+# for it recently. The discriminator is dispatch STATE (does a marker
+# exist and is it fresh), not the queue entry's own age: dispatch happens
+# ONLY via pending_reviews (see the mayor's own bootstrap doc), so a
+# brand-new entry with no marker yet must surface on its very FIRST
+# sighting. An age-only gate has this exactly backwards -- a fresh entry's
+# age is always near zero, which an age gate would misread as "already
+# handled", delaying every entry's first dispatch by a full tick. False
+# (surface it) on a missing marker (first sighting) OR a marker older than
+# the backstop -- fails toward surfacing, matching queue_is_drained's
+# neighbors, never toward a permanent hide.
+queue_entry_dispatch_suppressed() {
+  local marker_epoch="$1" now_epoch="$2"
+  [ -z "$marker_epoch" ] && return 1
+  [ $(( now_epoch - marker_epoch )) -lt "$QUEUE_DISPATCH_MARKER_MAX_AGE_SECONDS" ]
+}
+
+# A healthy worker's diagnose-edit-test window is observed at 10-40
+# minutes with no PR open yet -- 45m (~3 tick cycles) gives headroom above
+# that so a routine dispatch never trips exit 30, while a dispatch stalled
+# well past its own working window still does.
+WORKTREE_ANOMALY_MAX_AGE_SECONDS=$((45 * 60))
+
+# True (exit 0) iff a worker worktree with no PR yet is still within its
+# plausible working window and must be reported informationally without
+# escalating the tick's exit code -- exit 30 firing on every routine
+# dispatch trains the mayor to ignore it, so a genuinely stalled dispatch
+# goes unnoticed.
+worktree_dispatch_in_flight() {
+  local age_seconds="$1"
+  [ "$age_seconds" -lt "$WORKTREE_ANOMALY_MAX_AGE_SECONDS" ]
+}
+
+# Epoch seconds of a worktree path's last commit, or epoch 0 (maximally
+# OLD, not "just now") if the git lookup itself fails. Fails toward
+# SURFACING a worktree anomaly, never toward silently hiding one: for this
+# script a false positive is noisy but visible, while a false negative
+# (a lookup failure misread as "brand new, still in-flight") is silent --
+# the wrong polarity for a check whose whole purpose is not missing a
+# genuinely stalled dispatch.
+worktree_commit_epoch() {
+  git -C "$1" log -1 --format=%ct 2>/dev/null || printf '0'
+}
+
 # Extracts the value after "**Verdict**:" from a critical-reviewer findings
 # body. Only LGTM / LGTM-with-suggestions satisfy the merge gate; anything
 # else (needs-changes, needs-discussion, or no match at all -> empty) does
@@ -113,6 +189,17 @@ parse_verdict() {
     | sed -E 's/^\*\*Verdict\*\*:[[:space:]]*//'
 }
 
+# True (exit 0) iff a verdict string blocks the merge gate -- needs-changes
+# or needs-discussion. An empty/unrecognized verdict is NOT blocking here
+# (it's a malformed body, not a confirmed blocking signal); shared by the
+# stale-blocking-verdict reconcile check below.
+verdict_is_blocking() {
+  case "$1" in
+    needs-changes|needs-discussion) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Given a JSON array of GitHub PR reviews (the `reviews` field from `gh pr
 # view --json reviews`), returns the latest (by submittedAt) review object
 # whose body starts with the critical-reviewer marker, as compact JSON --
@@ -120,9 +207,16 @@ parse_verdict() {
 # what stops an older superseded LGTM from masking a newer needs-changes
 # verdict (a real incident hit this exact gap at the PR-verdict layer; see
 # git history, not a citation here that would rot once that PR closes).
+#
+# DISMISSED reviews are excluded before the latest-by-time pick: once a
+# needs-changes verdict becomes a native REQUEST_CHANGES review, dismissing
+# it clears GitHub's own merge block but the review body's text still reads
+# needs-changes -- without this filter the text-parse gate below would keep
+# refusing the PR even after the operator dismissed it, a deadlock neither
+# gate could release.
 latest_reviewer_review() {
   printf '%s' "$1" | jq -c \
-    '[.[] | select(.body | startswith("## critical-reviewer findings"))] | sort_by(.submittedAt) | last // empty'
+    '[.[] | select(.body | startswith("## critical-reviewer findings")) | select(.state != "DISMISSED")] | sort_by(.submittedAt) | last // empty'
 }
 
 # True (exit 0) iff a PR's merge-queue/check state makes it eligible for
@@ -207,6 +301,18 @@ pr_already_queued() {
     [ "$dref" = "$url" ] && return 0
   done
   return 1
+}
+
+# True (exit 0) iff any commit's committedDate in the given JSON array of
+# commits (the `commits` field from `gh pr view --json commits`) is newer
+# than `cutoff` -- the discriminator the stale-blocking-verdict reconcile
+# check uses between "fixed but never re-reviewed" (queue a re-review) and
+# "reviewed, nothing has changed since" (nothing new for a reviewer to look
+# at). Compares real ISO-8601 timestamps, never array position or count.
+has_commit_after() {
+  local commits_json="$1" cutoff="$2"
+  printf '%s' "$commits_json" | jq -e --arg cutoff "$cutoff" \
+    'any(.[]; .committedDate > $cutoff)' >/dev/null 2>&1
 }
 
 json_array() {  # plain strings -> JSON array of strings
@@ -405,6 +511,7 @@ GATE_EXCEPTIONS=()
 MERGED_PRS=()
 BD_READY_IDS=()
 WORKTREE_ANOMALIES=()
+WORKTREE_STALE_COUNT=0  # subset of WORKTREE_ANOMALIES old enough to escalate the exit code
 
 # Step 0: drain the review queue. This is NOT reviewer dispatch (this
 # script cannot invoke a Claude subagent) -- it only confirms whether a
@@ -424,7 +531,7 @@ WORKTREE_ANOMALIES=()
 # always surfaced in PENDING_NON_PR_REVIEWS for the mayor to confirm by
 # hand instead of silently sitting undrained with no visibility.
 process_review_queue() {
-  local f dtype dref queued_at prnum submitted_at reviews_json latest route bucket payload
+  local f dtype dref queued_at prnum submitted_at reviews_json latest route bucket payload marker_epoch
   for f in "$QUEUE_DIR"/*.md; do
     [ -e "$f" ] || continue
     dtype=$(frontmatter_field "$f" deliverable_type)
@@ -445,9 +552,21 @@ process_review_queue() {
           submitted_at=$(printf '%s' "$latest" | jq -r '.submittedAt // empty' 2>/dev/null || true)
           if queue_is_drained "$queued_at" "$submitted_at"; then
             run_cmd rm -f "$f"
+            run_cmd rm -f "$(dispatch_marker_path "$f")"
             continue
           fi
-          PENDING_REVIEW_PRS+=("$prnum")
+          # Still undrained: surface it UNLESS a dispatch was already
+          # recorded for it recently. The discriminator is dispatch STATE
+          # (a marker), not the entry's own age -- dispatch happens ONLY
+          # via pending_reviews (see the mayor's own bootstrap doc), so a
+          # brand-new entry with no marker yet must surface immediately, on
+          # its very first sighting. Re-surfacing a marked-and-fresh entry
+          # risks the mayor dispatching a second reviewer for a PR already
+          # being reviewed.
+          marker_epoch=$(read_dispatch_marker "$f")
+          if ! queue_entry_dispatch_suppressed "$marker_epoch" "$(date -u +%s)"; then
+            surface_pending_review "$prnum" "$f"
+          fi
         fi
         ;;
       non-pr)
@@ -547,9 +666,13 @@ check_bd_ready() {
 # the (operator-kept, not scriptified here) 60m worktree-hygiene loop. This
 # only flags a live worker worktree/branch with NO PR at all, which that
 # loop's checks don't cover: it means a dispatch stalled before ever
-# opening one.
+# opening one -- UNLESS the branch is still within its plausible working
+# window (worktree_dispatch_in_flight), in which case it's reported here
+# for visibility but excluded from WORKTREE_STALE_COUNT, so it never
+# escalates the tick's exit code.
 check_worktree_anomalies() {
-  local path branch count
+  local path branch count now commit_epoch age_seconds
+  now=$(date -u +%s)
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     [ "$path" = "$REPO_ROOT" ] && continue
@@ -560,9 +683,54 @@ check_worktree_anomalies() {
     esac
     count=$(gh pr list --head "$branch" --state all --json number --jq 'length' 2>/dev/null || echo 0)
     if [ "${count:-0}" -eq 0 ]; then
-      WORKTREE_ANOMALIES+=("$(jq -nc --arg path "$path" --arg branch "$branch" '{path:$path, branch:$branch, reason:"no-pr-for-branch"}')")
+      commit_epoch=$(worktree_commit_epoch "$path")
+      age_seconds=$(( now - commit_epoch ))
+      if worktree_dispatch_in_flight "$age_seconds"; then
+        WORKTREE_ANOMALIES+=("$(jq -nc --arg path "$path" --arg branch "$branch" '{path:$path, branch:$branch, reason:"no-pr-for-branch-in-flight"}')")
+      else
+        WORKTREE_ANOMALIES+=("$(jq -nc --arg path "$path" --arg branch "$branch" '{path:$path, branch:$branch, reason:"no-pr-for-branch"}')")
+        WORKTREE_STALE_COUNT=$(( WORKTREE_STALE_COUNT + 1 ))
+      fi
     fi
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
+}
+
+# Generic file write, isolated into its own tiny function like the
+# dashboard replace/append helpers, purely so run_cmd's dry-run gate can
+# cover a raw file write the same as every other side effect in this
+# script. Shared by the reconcile stale-blocking-verdict write and the
+# dispatch-marker stamp below.
+_write_file_contents() {  # $1=path $2=contents
+  printf '%s' "$2" > "$1"
+}
+
+# Atomic create-if-absent write (shell noclobber semantics): fails without
+# touching the file if it already exists. Used for the reconcile
+# stale-blocking-verdict write below so two overlapping mayor-tick.sh runs
+# racing on the SAME PR (this script runs on a 15m cron AND can be invoked
+# inline on a task notification, so overlap is real, not hypothetical)
+# can't both write a duplicate queue file -- paired with a deterministic
+# (not wall-clock) filename, both racing processes compute the SAME path
+# and only the first writer wins.
+_write_file_contents_if_absent() {  # $1=path $2=contents
+  ( set -C; printf '%s' "$2" > "$1" ) 2>/dev/null
+}
+
+# Records that this tick surfaced `prnum` (backed by `queue_file`) into
+# pending_reviews, by stamping a fresh dispatch marker -- so subsequent
+# ticks treat it as already-dispatched (queue_entry_dispatch_suppressed)
+# instead of re-surfacing it every tick. Shared by process_review_queue's
+# per-file loop and reconcile's stale-blocking-verdict branch, which also
+# creates a queue file that process_review_queue will examine on the VERY
+# NEXT tick -- without stamping here too, that next tick would see no
+# marker yet and surface the same PR again immediately, defeating the
+# purpose of the marker.
+surface_pending_review() {
+  local prnum="$1" queue_file="$2" marker_file
+  PENDING_REVIEW_PRS+=("$prnum")
+  marker_file=$(dispatch_marker_path "$queue_file")
+  run_cmd mkdir -p "$(dirname "$marker_file")"
+  run_cmd _write_file_contents "$marker_file" "$(date -u +%s)"
 }
 
 # Step 6: self-heal reconciliation. Compensating layer for the
@@ -574,8 +742,28 @@ check_worktree_anomalies() {
 # this tick's queue state. Logged with the "mayor-tick reconcile:" prefix
 # (distinct from process_review_queue's hook-fed path) so an audit can tell
 # script-detected self-heal from hook-queued.
+#
+# Also covers a narrower gap: a PR that already has a review, but that
+# review is a stale BLOCKING verdict (needs-changes/needs-discussion) and
+# commits landed on the head branch after it was submitted -- fixed, but
+# never re-reviewed, because the hook only fires from a worker's own
+# SubagentStop and this fix can land any other way (a direct push, or a
+# hook miss). A real queue file (not just an in-memory pending_reviews
+# entry) is written for this case specifically: writing it means
+# pr_already_queued's existing no-double-queue guard also covers THIS
+# branch on every subsequent tick, so a re-review that comes back blocking
+# again does not requeue every tick forever -- it only requeues once a
+# genuinely NEW commit lands after that re-review's own submittedAt.
+#
+# That queue file's name is derived from the PR number + the review's own
+# submittedAt, not wall-clock time: this script runs on a 15m cron AND can
+# be invoked inline on a task notification, so two overlapping runs
+# reconciling the SAME PR is real, not hypothetical. Both racing processes
+# observe the identical latest review and so compute the identical name;
+# the noclobber write below (_write_file_contents_if_absent) then lets only
+# the first one through instead of both writing distinct duplicate files.
 reconcile_missing_queue_entries() {
-  local prs_json n url reviews_json latest
+  local prs_json n url reviews_json latest verdict body submitted_at commits_json queued_at qfile
   prs_json=$(gh pr list --state open --json number,url,headRefName --jq \
     '[.[] | select(.headRefName | startswith("worker/agent-"))]' 2>/dev/null || echo '[]')
 
@@ -586,12 +774,28 @@ reconcile_missing_queue_entries() {
 
     reviews_json=$(gh pr view "$n" --json reviews --jq '.reviews' 2>/dev/null || echo '[]')
     latest=$(latest_reviewer_review "$reviews_json")
-    if [ -n "$latest" ] && [ "$latest" != "null" ]; then
-      continue  # already reviewed despite no queue file -- nothing to self-heal
+    if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+      echo "mayor-tick reconcile: PR #$n ($url) has no review-queue entry and no critical-reviewer review -- synthesizing pending_reviews entry" >&2
+      PENDING_REVIEW_PRS+=("$n")
+      continue
     fi
 
-    echo "mayor-tick reconcile: PR #$n ($url) has no review-queue entry and no critical-reviewer review -- synthesizing pending_reviews entry" >&2
-    PENDING_REVIEW_PRS+=("$n")
+    body=$(printf '%s' "$latest" | jq -r '.body')
+    verdict=$(parse_verdict "$body")
+    verdict_is_blocking "$verdict" || continue  # LGTM/LGTM-with-suggestions -- nothing to self-heal
+
+    submitted_at=$(printf '%s' "$latest" | jq -r '.submittedAt // empty')
+    commits_json=$(gh pr view "$n" --json commits --jq '.commits' 2>/dev/null || echo '[]')
+    has_commit_after "$commits_json" "$submitted_at" || continue  # blocking verdict but nothing changed since -- nothing for a reviewer to look at yet
+
+    queued_at=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+    qfile="$QUEUE_DIR/mayor-tick-reconcile-pr${n}-$(printf '%s' "$submitted_at" | tr ':' '-').md"
+    if run_cmd _write_file_contents_if_absent "$qfile" "$(printf -- '---\ndeliverable_type: pr\ndeliverable_ref: %s\nqueued_at: %s\n---\nmayor-tick reconcile: stale %s verdict (submitted %s) with commits landed after -- re-review needed\n' "$url" "$queued_at" "$verdict" "$submitted_at")"; then
+      echo "mayor-tick reconcile: PR #$n ($url) has a stale $verdict verdict (submitted $submitted_at) with commits landed after -- queuing re-review" >&2
+      surface_pending_review "$n" "$qfile"
+    else
+      echo "mayor-tick reconcile: PR #$n ($url) stale-verdict queue file already exists (concurrent mayor-tick run) -- not duplicating" >&2
+    fi
   done
 }
 
@@ -611,7 +815,10 @@ main() {
   # self-healed entry would leave exit_code at 0 (noop) and the mayor would
   # never read pending_reviews to dispatch it, defeating self-heal outright.
   local exception_count=$(( ${#GATE_EXCEPTIONS[@]} + ${#QUEUE_FILES_REMAINING[@]} + ${#PENDING_REVIEW_PRS[@]} ))
-  local worktree_count=${#WORKTREE_ANOMALIES[@]}
+  # Not ${#WORKTREE_ANOMALIES[@]}: that count includes in-flight dispatches
+  # reported for visibility only (see check_worktree_anomalies) -- only the
+  # stale subset should escalate the exit code.
+  local worktree_count=$WORKTREE_STALE_COUNT
   local exit_code
   exit_code=$(compute_exit_code "$bd_ready_count" "$exception_count" "$worktree_count")
 
