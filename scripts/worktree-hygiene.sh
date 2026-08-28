@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Worktree hygiene loop body -- see the bootstrap doc's worktree-hygiene
 # section for WHEN this runs (60m cron) and WHY it's auto-run instead of
-# approval-gated. This file is the WHAT: the mechanical STEP A-D body,
+# approval-gated. This file is the WHAT: the mechanical STEP A-E body,
 # extracted out of that doc so a routine hygiene tick no longer costs an
 # orchestrator model turn parsing `ps`/`git` output by hand.
 #
@@ -27,13 +27,19 @@
 # STEP D: delete non-worker branches whose tracked upstream is gone, via
 #   `-d` (refuses anything unmerged -- an extra safety net on top of D's
 #   own scope, which never matches branches with no upstream at all).
+# STEP E: warn (never delete) about tracked ai/findings/*.md files whose
+#   `Bead:` header is closed or absent from LIVE bd state -- the drift
+#   backstop for check-findings-closed-bead-refs.sh's CI-side check, which
+#   can only see the git-tracked bd export and so misses a bead closed
+#   since the export's last commit, or pruned after closing.
 #
 # Exit codes: 0 = clean tick, nothing found. Non-zero = an anomaly for the
 # mayor to look at -- currently only STEP A's kill-verify failure (a process
 # that survives its kill signal may be zombied/reparented and needs manual
 # investigation, not an automatic retry); STEP B-D failures surface via this
 # script's own `set -e` (a `git fetch`/`branch` failure aborts the run with
-# git's exit code, which is itself already non-zero).
+# git's exit code, which is itself already non-zero). STEP E never
+# contributes to the exit code -- it only reports, it never mutates.
 #
 # DRY_RUN=1 turns every destructive command (pkill, git branch -D/-d) into a
 # logged no-op via run_cmd() -- same idiom the sibling merge/dashboard
@@ -238,12 +244,74 @@ step_d_gone_upstream_branches() {
   done < <(gone_upstream_branches "$refs")
 }
 
+# ---------------------------------------------------------------------------
+# STEP E -- findings-enforcement drift backstop.
+#
+# CI's check-findings-closed-bead-refs.sh reads .beads/issues.jsonl, the
+# git-tracked bd export, which only refreshes at session-wrap commits and
+# loses a bead entirely once it closes AND is later `bd prune`-d -- two
+# documented holes on that check's own bead. This step reads LIVE bd
+# state instead (bd IS available in the mayor's own environment, unlike
+# CI's), closing both: a bead closed since the export was last committed,
+# and a bead pruned after closing, which the export-based check can only
+# treat as "no signal" since it can't tell "pruned" apart from "not
+# exported yet". Live bd has no such staleness excuse, so this step
+# treats "no live record at all" as ALSO stale, unlike the CI check.
+#
+# WARN-ONLY, not auto-delete: unlike STEP A-D (process kills, worktree
+# metadata pruning, branch deletion -- none of which touch the tracked
+# tree or need a commit), deleting a findings/*.md file requires
+# committing that deletion. An unattended cron sweep committing tree
+# changes on its own is a materially bigger action than anything else in
+# this loop, so this step reports loudly and leaves the delete-and-commit
+# to a human or a follow-up workflow.
+# ---------------------------------------------------------------------------
+
+# Bead ID from a findings file's `Bead: <id>` header (first 5 lines), or
+# empty if absent. Mirrors check-findings-closed-bead-refs.sh's own
+# extraction exactly so this step flags the same files that gate would.
+bead_id_from_finding() {
+  local f="$1" bead_line
+  bead_line=$(head -n 5 "$f" | grep -m1 -E '^Bead: ' || true)
+  printf '%s' "$bead_line" | sed -E 's/^Bead: *//' | tr -d '[:space:]'
+}
+
+# True (exit 0) iff a bead in the given live-bd status is stale enough to
+# warn about: closed, or an empty status (bd has no live record at all --
+# pruned after closing, or a bad reference; either way there's nothing left
+# to cross-reference).
+is_stale_bead_status() {
+  local status="$1"
+  [ "$status" = "closed" ] || [ -z "$status" ]
+}
+
+step_e_stale_findings() {
+  local findings f bead_id status
+  findings=$(git -C "$REPO_ROOT" ls-files 'ai/findings/*.md' | grep -v '^ai/findings/legacy/') || true
+  [ -n "$findings" ] || return 0
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    bead_id=$(bead_id_from_finding "$REPO_ROOT/$f")
+    [ -n "$bead_id" ] || continue
+    status=$(bd -C "$REPO_ROOT" show "$bead_id" --json 2>/dev/null | jq -r '.[0]?.status // empty') || true
+    if is_stale_bead_status "$status"; then
+      if [ -z "$status" ]; then
+        echo "[hygiene] stale-finding: $f references $bead_id, which bd has no live record of (pruned, or a bad reference) -- delete it, git history is the archive"
+      else
+        echo "[hygiene] stale-finding: $f references $bead_id, which is closed -- delete it, git history is the archive"
+      fi
+    fi
+  done <<< "$findings"
+}
+
 main() {
   local rc=0
   step_a_orphaned_processes || rc=1
   step_b_prune_worktrees
   step_c_stale_worker_branches
   step_d_gone_upstream_branches
+  step_e_stale_findings
   exit "$rc"
 }
 

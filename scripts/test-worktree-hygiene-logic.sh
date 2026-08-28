@@ -220,6 +220,53 @@ assert "without DRY_RUN, run_cmd executes the real command" \
   "$([ -e "$MARKER" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 6. STEP E -- findings-enforcement drift backstop. Only the two pure
+#    functions are covered here (bead-id extraction and staleness
+#    classification, which together fully capture the branching logic);
+#    step_e_stale_findings() itself isn't, since it calls live `bd show`
+#    against this repo's real, mutable bead state -- referencing a real
+#    bead ID here would make the test's outcome depend on that bead's
+#    status at whatever moment CI happens to run, silently flipping
+#    PASS/FAIL as unrelated bead lifecycle events occur elsewhere. This was
+#    instead verified manually against real live bd state during
+#    development (a scratch ai/findings/*.md staged against a genuinely
+#    closed bead, a genuinely open bead, and a nonexistent bead ID all
+#    produced the expected warn/silent split) -- the same "exercise the
+#    real thing, not a synthetic stand-in" principle this suite follows
+#    elsewhere, just not automatable here without a disposable bd database.
+# ---------------------------------------------------------------------------
+
+FINDING_CLOSED="$SANDBOX_ROOT/finding-closed.md"
+printf 'Bead: fixture-closed-1\n\nBody text.\n' > "$FINDING_CLOSED"
+assert "bead_id_from_finding extracts the bead id from a well-formed header" \
+  "$([ "$(call bead_id_from_finding "$FINDING_CLOSED")" = "fixture-closed-1" ] && echo 1 || echo 0)"
+
+FINDING_NO_HEADER="$SANDBOX_ROOT/finding-no-header.md"
+printf 'Just prose, no bead reference.\n' > "$FINDING_NO_HEADER"
+assert "bead_id_from_finding returns empty for a file with no Bead: header (must not be treated as a match for any bead)" \
+  "$([ -z "$(call bead_id_from_finding "$FINDING_NO_HEADER")" ] && echo 1 || echo 0)"
+
+RC=0
+call is_stale_bead_status "closed" || RC=$?
+assert "is_stale_bead_status flags a closed bead as stale (the case check-findings-closed-bead-refs.sh already catches via the export)" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call is_stale_bead_status "" || RC=$?
+assert "is_stale_bead_status flags an empty (no live bd record) status as stale -- the pruned-bead hole the export-based CI check cannot see" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call is_stale_bead_status "open" || RC=$?
+assert "is_stale_bead_status does NOT flag an open bead -- must not warn on every routine in-flight finding" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call is_stale_bead_status "in_progress" || RC=$?
+assert "is_stale_bead_status does NOT flag an in_progress bead" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
