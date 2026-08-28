@@ -458,8 +458,14 @@ fi
 # both nodes.
 if [ -n "$EXTRA_NODE" ]; then
   banner "Extra node: join $EXTRA_NODE"
+  # U7S_ADD_NODE_FROM_RUN_ALL tells add-node.sh to skip its "restart the apiserver"
+  # warning: this call site is the exact case that warning doesn't apply to, since
+  # _NODE_KUBELET_PORT_ARG (above) already wired --node-kubelet-port into
+  # 02-start-apiserver.sh before this script ran. Command-scoped, not exported,
+  # so it can't leak into any later step (sonobuoy, etc.) -- same reasoning as
+  # U7S_DHAT_BACKTRACE_DEPTH above.
   # shellcheck disable=SC2086
-  bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
+  U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
 fi
 
 # kube-network-policies DaemonSet-Ready wait: lima-start.sh (Step 3, above) applies
