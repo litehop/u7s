@@ -836,6 +836,204 @@ assert "a tick against a genuinely abandoned 50-minute-old worker branch with no
   "$([ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 16. Stale-blocking-verdict reconcile -- pure-function building blocks.
+#     verdict_is_blocking/has_commit_after are what let
+#     reconcile_missing_queue_entries tell "fixed but never re-reviewed"
+#     (queue a re-review) apart from "reviewed, nothing has changed since"
+#     (leave it alone) and "already cleared" (leave it alone).
+# ---------------------------------------------------------------------------
+
+RC=0
+call verdict_is_blocking needs-changes || RC=$?
+assert "needs-changes blocks the gate (a self-heal target)" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+RC=0
+call verdict_is_blocking needs-discussion || RC=$?
+assert "needs-discussion blocks the gate too (a self-heal target)" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+RC=0
+call verdict_is_blocking LGTM || RC=$?
+assert "LGTM does not block the gate -- nothing to self-heal" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+RC=0
+call verdict_is_blocking LGTM-with-suggestions || RC=$?
+assert "LGTM-with-suggestions does not block the gate -- nothing to self-heal" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+RC=0
+call verdict_is_blocking "" || RC=$?
+assert "an empty/malformed verdict is treated as non-blocking, not a false self-heal trigger" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+COMMITS_AFTER='[{"oid":"a","committedDate":"2026-08-24T12:43:45Z"}]'
+RC=0
+call has_commit_after "$COMMITS_AFTER" "2026-08-24T12:25:12Z" || RC=$?
+assert "a commit landed after the review's submittedAt is detected -- the discriminator for 'fixed but never re-reviewed'" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+COMMITS_BEFORE='[{"oid":"a","committedDate":"2026-08-24T12:00:00Z"}]'
+RC=0
+call has_commit_after "$COMMITS_BEFORE" "2026-08-24T12:25:12Z" || RC=$?
+assert "no commit after the review's submittedAt -- nothing has changed since the blocking verdict, so nothing to re-review" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 17. Stale-blocking-verdict reconcile, end-to-end through the REAL main()
+#     pipeline. This is the reconcile gap: a PR reviewed with a blocking
+#     verdict, then fixed, previously sat invisible forever because
+#     reconcile's old check only fired on "no review at all" -- ANY review,
+#     even a stale blocking one, made it `continue`.
+# ---------------------------------------------------------------------------
+
+# Case A: blocking verdict + a commit landed after it -- the exact
+# "fixed but never re-reviewed" gap. Must be queued.
+STUB_STALE_BLOCKING_FIXED="$WORKDIR/stub-stale-blocking-fixed"
+mkdir -p "$STUB_STALE_BLOCKING_FIXED"
+cat > "$STUB_STALE_BLOCKING_FIXED/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" view "* ]]; then
+  if [[ " $* " == *"commits"* ]]; then
+    base='{"commits":[{"oid":"deadbeef","committedDate":"2026-08-24T12:43:45Z"}]}'
+  else
+    base='{"reviews":[{"body":"## critical-reviewer findings\n**Verdict**: needs-changes","submittedAt":"2026-08-24T12:25:12Z","state":"COMMENTED"}]}'
+  fi
+else
+  base='[{"number":6001,"url":"https://github.com/example/repo/pull/6001","headRefName":"worker/agent-stale-blocking-fixed","mergeStateStatus":"DIRTY","statusCheckRollup":[]}]'
+fi
+jq_filter=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--jq" ] && jq_filter="$a"
+  prev="$a"
+done
+if [ -n "$jq_filter" ]; then
+  printf '%s' "$base" | jq "$jq_filter"
+else
+  printf '%s' "$base"
+fi
+EOF
+cat > "$STUB_STALE_BLOCKING_FIXED/bd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$STUB_STALE_BLOCKING_FIXED/gh" "$STUB_STALE_BLOCKING_FIXED/bd"
+
+run_full_tick "$STUB_STALE_BLOCKING_FIXED"
+assert "a PR with a stale blocking verdict AND a commit landed after it is queued for re-review -- the fix earned another look, but nothing would ever trigger it otherwise" \
+  "$([ "$(jq -r '.pending_reviews | index(6001) != null' "$TICK_STATE")" = "true" ] && echo 1 || echo 0)"
+assert "...and reconciliation logs the distinct stale-verdict reason, not the generic no-review-at-all message" \
+  "$(printf '%s' "$TICK_OUT" | grep -q 'stale needs-changes verdict' && echo 1 || echo 0)"
+
+# Case B: same blocking verdict, but NO commit landed after it -- nothing
+# has changed for a reviewer to look at. Must NOT be queued.
+STUB_STALE_BLOCKING_UNFIXED="$WORKDIR/stub-stale-blocking-unfixed"
+mkdir -p "$STUB_STALE_BLOCKING_UNFIXED"
+cat > "$STUB_STALE_BLOCKING_UNFIXED/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" view "* ]]; then
+  if [[ " $* " == *"commits"* ]]; then
+    base='{"commits":[{"oid":"deadbeef","committedDate":"2026-08-24T12:00:00Z"}]}'
+  else
+    base='{"reviews":[{"body":"## critical-reviewer findings\n**Verdict**: needs-changes","submittedAt":"2026-08-24T12:25:12Z","state":"COMMENTED"}]}'
+  fi
+else
+  base='[{"number":6002,"url":"https://github.com/example/repo/pull/6002","headRefName":"worker/agent-stale-blocking-unfixed","mergeStateStatus":"DIRTY","statusCheckRollup":[]}]'
+fi
+jq_filter=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--jq" ] && jq_filter="$a"
+  prev="$a"
+done
+if [ -n "$jq_filter" ]; then
+  printf '%s' "$base" | jq "$jq_filter"
+else
+  printf '%s' "$base"
+fi
+EOF
+cat > "$STUB_STALE_BLOCKING_UNFIXED/bd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$STUB_STALE_BLOCKING_UNFIXED/gh" "$STUB_STALE_BLOCKING_UNFIXED/bd"
+
+run_full_tick "$STUB_STALE_BLOCKING_UNFIXED"
+assert "a PR with a blocking verdict and NO commit after it is NOT queued -- nothing has changed for the reviewer to look at" \
+  "$([ "$(jq -r '.pending_reviews | index(6002) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
+
+# Case C: latest verdict is non-blocking (LGTM), with a commit after it
+# too -- must be left alone regardless of commit timing, since a
+# non-blocking verdict was never something to self-heal in the first
+# place.
+STUB_NON_BLOCKING_WITH_COMMIT="$WORKDIR/stub-non-blocking-with-commit"
+mkdir -p "$STUB_NON_BLOCKING_WITH_COMMIT"
+cat > "$STUB_NON_BLOCKING_WITH_COMMIT/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" view "* ]]; then
+  if [[ " $* " == *"commits"* ]]; then
+    base='{"commits":[{"oid":"deadbeef","committedDate":"2026-08-24T12:43:45Z"}]}'
+  else
+    base='{"reviews":[{"body":"## critical-reviewer findings\n**Verdict**: LGTM","submittedAt":"2026-08-24T12:25:12Z","state":"COMMENTED"}]}'
+  fi
+else
+  base='[{"number":6003,"url":"https://github.com/example/repo/pull/6003","headRefName":"worker/agent-non-blocking-with-commit","mergeStateStatus":"DIRTY","statusCheckRollup":[]}]'
+fi
+jq_filter=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--jq" ] && jq_filter="$a"
+  prev="$a"
+done
+if [ -n "$jq_filter" ]; then
+  printf '%s' "$base" | jq "$jq_filter"
+else
+  printf '%s' "$base"
+fi
+EOF
+cat > "$STUB_NON_BLOCKING_WITH_COMMIT/bd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$STUB_NON_BLOCKING_WITH_COMMIT/gh" "$STUB_NON_BLOCKING_WITH_COMMIT/bd"
+
+run_full_tick "$STUB_NON_BLOCKING_WITH_COMMIT"
+assert "a PR whose latest verdict is non-blocking (LGTM) is untouched by reconcile even with a later commit -- there was never a blocking verdict to clear" \
+  "$([ "$(jq -r '.pending_reviews | index(6003) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 18. Requeue-loop guard: reconcile writes a REAL queue file for case A
+#     (not just an in-memory pending_reviews entry) specifically so
+#     pr_already_queued's existing no-double-queue guard also covers this
+#     branch -- without it, a blocking-verdict-plus-later-commit PR would
+#     be re-queued on EVERY tick until a re-review actually posts, which is
+#     exactly the second-reviewer-dispatch race section 14 guards against
+#     for the hook-fed path. Runs reconcile directly (not through
+#     run_full_tick's MAYOR_TICK_DRY_RUN=1) against a real queue dir so the
+#     written file can be inspected and reconcile can be invoked a second
+#     time against its own output.
+# ---------------------------------------------------------------------------
+
+QDIR_LOOP_GUARD="$WORKDIR/qdir-loop-guard"
+mkdir -p "$QDIR_LOOP_GUARD"
+
+run_reconcile_real() {  # $1 = queue dir (real, not dry-run)
+  MAYOR_TICK_QUEUE_DIR="$1" MAYOR_TICK_DRY_RUN=0 \
+    PATH="$STUB_STALE_BLOCKING_FIXED:$PATH" \
+    call reconcile_missing_queue_entries
+}
+
+OUT1=$(run_reconcile_real "$QDIR_LOOP_GUARD" 2>&1)
+COUNT_AFTER_FIRST=$(find "$QDIR_LOOP_GUARD" -maxdepth 1 -name '*.md' -type f | wc -l | tr -d ' ')
+assert "the first reconcile pass on a stale-blocking-plus-later-commit PR writes exactly one real queue file (not just an in-memory pending_reviews entry)" \
+  "$([ "$COUNT_AFTER_FIRST" = "1" ] && echo 1 || echo 0)"
+
+OUT2=$(run_reconcile_real "$QDIR_LOOP_GUARD" 2>&1)
+COUNT_AFTER_SECOND=$(find "$QDIR_LOOP_GUARD" -maxdepth 1 -name '*.md' -type f | wc -l | tr -d ' ')
+assert "a second reconcile pass against the SAME unchanged PR does not write a second queue file -- pr_already_queued now sees the file from pass one" \
+  "$([ "$COUNT_AFTER_SECOND" = "1" ] && echo 1 || echo 0)"
+assert "...and the second pass does not even log a new queuing message -- pr_already_queued short-circuits before reconcile re-evaluates the verdict" \
+  "$(! printf '%s' "$OUT2" | grep -q 'queuing re-review' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

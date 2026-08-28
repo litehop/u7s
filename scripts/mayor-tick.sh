@@ -161,6 +161,17 @@ parse_verdict() {
     | sed -E 's/^\*\*Verdict\*\*:[[:space:]]*//'
 }
 
+# True (exit 0) iff a verdict string blocks the merge gate -- needs-changes
+# or needs-discussion. An empty/unrecognized verdict is NOT blocking here
+# (it's a malformed body, not a confirmed blocking signal); shared by the
+# stale-blocking-verdict reconcile check below.
+verdict_is_blocking() {
+  case "$1" in
+    needs-changes|needs-discussion) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Given a JSON array of GitHub PR reviews (the `reviews` field from `gh pr
 # view --json reviews`), returns the latest (by submittedAt) review object
 # whose body starts with the critical-reviewer marker, as compact JSON --
@@ -262,6 +273,18 @@ pr_already_queued() {
     [ "$dref" = "$url" ] && return 0
   done
   return 1
+}
+
+# True (exit 0) iff any commit's committedDate in the given JSON array of
+# commits (the `commits` field from `gh pr view --json commits`) is newer
+# than `cutoff` -- the discriminator the stale-blocking-verdict reconcile
+# check uses between "fixed but never re-reviewed" (queue a re-review) and
+# "reviewed, nothing has changed since" (nothing new for a reviewer to look
+# at). Compares real ISO-8601 timestamps, never array position or count.
+has_commit_after() {
+  local commits_json="$1" cutoff="$2"
+  printf '%s' "$commits_json" | jq -e --arg cutoff "$cutoff" \
+    'any(.[]; .committedDate > $cutoff)' >/dev/null 2>&1
 }
 
 json_array() {  # plain strings -> JSON array of strings
@@ -639,6 +662,14 @@ check_worktree_anomalies() {
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
 }
 
+# Actual queue-file write for the stale-blocking-verdict branch below --
+# isolated into its own tiny function, like the dashboard replace/append
+# helpers, purely so run_cmd's dry-run gate can cover a raw file write the
+# same as every other side effect in this script.
+_write_reconcile_queue_file() {  # $1=path $2=contents
+  printf '%s' "$2" > "$1"
+}
+
 # Step 6: self-heal reconciliation. Compensating layer for the
 # SubagentStop hook missing a fire entirely (a push landing on a non-
 # worker/agent-* head, upstream anthropics/claude-code#27755, or the hook
@@ -648,8 +679,20 @@ check_worktree_anomalies() {
 # this tick's queue state. Logged with the "mayor-tick reconcile:" prefix
 # (distinct from process_review_queue's hook-fed path) so an audit can tell
 # script-detected self-heal from hook-queued.
+#
+# Also covers a narrower gap: a PR that already has a review, but that
+# review is a stale BLOCKING verdict (needs-changes/needs-discussion) and
+# commits landed on the head branch after it was submitted -- fixed, but
+# never re-reviewed, because the hook only fires from a worker's own
+# SubagentStop and this fix can land any other way (a direct push, or a
+# hook miss). A real queue file (not just an in-memory pending_reviews
+# entry) is written for this case specifically: writing it means
+# pr_already_queued's existing no-double-queue guard also covers THIS
+# branch on every subsequent tick, so a re-review that comes back blocking
+# again does not requeue every tick forever -- it only requeues once a
+# genuinely NEW commit lands after that re-review's own submittedAt.
 reconcile_missing_queue_entries() {
-  local prs_json n url reviews_json latest
+  local prs_json n url reviews_json latest verdict body submitted_at commits_json queued_at qfile
   prs_json=$(gh pr list --state open --json number,url,headRefName --jq \
     '[.[] | select(.headRefName | startswith("worker/agent-"))]' 2>/dev/null || echo '[]')
 
@@ -660,11 +703,24 @@ reconcile_missing_queue_entries() {
 
     reviews_json=$(gh pr view "$n" --json reviews --jq '.reviews' 2>/dev/null || echo '[]')
     latest=$(latest_reviewer_review "$reviews_json")
-    if [ -n "$latest" ] && [ "$latest" != "null" ]; then
-      continue  # already reviewed despite no queue file -- nothing to self-heal
+    if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+      echo "mayor-tick reconcile: PR #$n ($url) has no review-queue entry and no critical-reviewer review -- synthesizing pending_reviews entry" >&2
+      PENDING_REVIEW_PRS+=("$n")
+      continue
     fi
 
-    echo "mayor-tick reconcile: PR #$n ($url) has no review-queue entry and no critical-reviewer review -- synthesizing pending_reviews entry" >&2
+    body=$(printf '%s' "$latest" | jq -r '.body')
+    verdict=$(parse_verdict "$body")
+    verdict_is_blocking "$verdict" || continue  # LGTM/LGTM-with-suggestions -- nothing to self-heal
+
+    submitted_at=$(printf '%s' "$latest" | jq -r '.submittedAt // empty')
+    commits_json=$(gh pr view "$n" --json commits --jq '.commits' 2>/dev/null || echo '[]')
+    has_commit_after "$commits_json" "$submitted_at" || continue  # blocking verdict but nothing changed since -- nothing for a reviewer to look at yet
+
+    queued_at=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+    qfile="$QUEUE_DIR/${queued_at}-mayor-tick-reconcile-pr${n}.md"
+    run_cmd _write_reconcile_queue_file "$qfile" "$(printf -- '---\ndeliverable_type: pr\ndeliverable_ref: %s\nqueued_at: %s\n---\nmayor-tick reconcile: stale %s verdict (submitted %s) with commits landed after -- re-review needed\n' "$url" "$queued_at" "$verdict" "$submitted_at")"
+    echo "mayor-tick reconcile: PR #$n ($url) has a stale $verdict verdict (submitted $submitted_at) with commits landed after -- queuing re-review" >&2
     PENDING_REVIEW_PRS+=("$n")
   done
 }
