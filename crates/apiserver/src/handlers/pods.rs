@@ -738,9 +738,9 @@ pub(crate) async fn replace_pod<S: Store>(
         .ok_or_else(|| Status::not_found(&name, "Pod"))?;
 
     // Stale-resourceVersion PUTs must 409, not fall through into
-    // validate_pod_spec_immutable using the freshly-read `stored` below — mirrors
-    // check_replace_resource_version_precondition's doc comment in resource.rs (mayor-nw9hj).
-    // Concrete pod instance (mayor-um883): a controller GETs a pod, then PUTs it back with
+    // validate_pod_spec_immutable using the freshly-read `stored` below — see
+    // check_replace_resource_version_precondition in resource.rs for the same invariant.
+    // Concrete pod instance: a controller GETs a pod, then PUTs it back with
     // only e.g. metadata.labels changed to release it from a selector. If the scheduler binds
     // spec.nodeName via /binding in between, the stored spec has moved on by the time this PUT
     // arrives — the controller's PUT body still carries the pre-bind (blank) nodeName it read.
@@ -14395,7 +14395,7 @@ mod handler_tests {
     /// (because the scheduler bound the pod after the controller's GET, but before its PUT)
     /// must return 409 Conflict, not 422 spec-immutability-violation.
     ///
-    /// Reproduces mayor-um883: the RC controller's release path (rc.go's release-not-matching
+    /// The RC controller's release path (rc.go's release-not-matching
     /// test) GETs a pod, changes only its labels, and PUTs the result back declaring the
     /// resourceVersion it read. If the u7s-scheduler's /binding write lands in between, the
     /// stored pod now has a real spec.nodeName the controller's PUT body doesn't carry (it
