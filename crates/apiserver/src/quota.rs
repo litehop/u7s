@@ -64,7 +64,7 @@ fn parse_count(s: &str) -> Option<u64> {
 /// For memory/storage: "252Mi" → 252*1024*1024*1000, "30Gi" → 30*1024^3*1000.
 /// For plain integers: "2" → 2000.
 /// Returns None if the string cannot be parsed.
-fn parse_quantity_milli(s: &str) -> Option<i64> {
+pub(crate) fn parse_quantity_milli(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }

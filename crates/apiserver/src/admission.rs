@@ -2373,6 +2373,32 @@ fn parse_vap_call_args(
     None // unterminated call — no matching ')'
 }
 
+/// JSON object key used to tag a CEL Quantity value produced by `quantity(...)`. Kept out
+/// of the CEL surface itself (no expression can construct or read this key directly) so it
+/// can't collide with a real object field of the same name.
+const CEL_QUANTITY_MILLI_KEY: &str = "__cel_quantity_milli__";
+
+/// Classify a value for method dispatch. Only the tags a dispatch arm actually
+/// discriminates on need a name here — everything else is "any".
+fn value_tag(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Object(map) if map.contains_key(CEL_QUANTITY_MILLI_KEY) => "quantity",
+        serde_json::Value::String(_) => "string",
+        _ => "any",
+    }
+}
+
+/// Resolve a value to its milli-scaled quantity, accepting either a `quantity(...)`-tagged
+/// value or a raw Kubernetes quantity string (the shape a resource's capacity field is
+/// actually stored as in JSON, e.g. `device.capacity["<domain>"].<field>`).
+fn value_to_quantity_milli(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Object(map) => map.get(CEL_QUANTITY_MILLI_KEY)?.as_i64(),
+        serde_json::Value::String(s) => crate::quota::parse_quantity_milli(s),
+        _ => None,
+    }
+}
+
 /// Dispatch a `.method(args)` call against its receiver value. Returns the new
 /// `(current, present)` pair the field chain continues with — most methods leave
 /// `present` untouched, but `orValue` resolves it to `true` since it's the mechanism
@@ -2383,14 +2409,27 @@ fn dispatch_vap_method(
     present: bool,
     mut args: Vec<serde_json::Value>,
 ) -> Option<(serde_json::Value, bool)> {
-    match method {
-        "orValue" => {
+    match (value_tag(&current), method) {
+        (_, "orValue") => {
             if args.len() != 1 {
                 return None;
             }
             let default_val = args.remove(0);
             let result = if present { current } else { default_val };
             Some((result, true))
+        }
+        ("quantity" | "string", "compareTo") => {
+            if args.len() != 1 {
+                return None;
+            }
+            let lhs = value_to_quantity_milli(&current)?;
+            let rhs = value_to_quantity_milli(&args[0])?;
+            let cmp = match lhs.cmp(&rhs) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            Some((serde_json::Value::Number(cmp.into()), present))
         }
         _ => None,
     }
@@ -2399,8 +2438,17 @@ fn dispatch_vap_method(
 /// Dispatch a global (no-receiver) function call, e.g. `quantity("6Gi")`. Returns `None`
 /// for any unrecognized name — an unrecognized global function call is a hard eval
 /// error, not a silently-truncated no-op.
-fn dispatch_vap_function(_name: &str, _args: &[serde_json::Value]) -> Option<serde_json::Value> {
-    None
+fn dispatch_vap_function(name: &str, args: &[serde_json::Value]) -> Option<serde_json::Value> {
+    match name {
+        "quantity" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let milli = value_to_quantity_milli(&args[0])?;
+            Some(serde_json::json!({ CEL_QUANTITY_MILLI_KEY: milli }))
+        }
+        _ => None,
+    }
 }
 
 /// Parse the body of a `{key: value, ...}` object literal (caller consumed `{`).
@@ -8815,6 +8863,105 @@ mod tests {
         assert_eq!(
             result, None,
             "an unrecognized method name must be a hard eval error, not a silent no-op"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // quantity() global function + .compareTo() method — DRA capacity selectors
+    // ---------------------------------------------------------------------------
+
+    /// The real DRA selector shape: `device.capacity["<domain>"].<field>.compareTo(
+    /// quantity("<qty>")) >= 0`. A capacity field is stored as a raw Kubernetes quantity
+    /// string (e.g. "8Gi"), not a quantity()-tagged value, so compareTo must accept a
+    /// plain string receiver directly — if it only accepted quantity()-tagged values,
+    /// every real DRA capacity selector in this exact shape would hard-error.
+    #[test]
+    fn cel_device_capacity_compare_to_quantity_selects_devices_with_enough_capacity() {
+        let vars = serde_json::Map::new();
+        let req = json!({});
+        let expr = r#"device.capacity["memory"].value.compareTo(quantity("6Gi")) >= 0"#;
+
+        let big_device = json!({"capacity": {"memory": {"value": "8Gi"}}});
+        assert_eq!(
+            eval_cel_bool_expr(
+                expr,
+                &big_device,
+                &vars,
+                &req,
+                &serde_json::Value::Null,
+                &serde_json::Value::Null
+            ),
+            Some(true),
+            "an 8Gi device must satisfy a >= 6Gi capacity selector"
+        );
+
+        let small_device = json!({"capacity": {"memory": {"value": "4Gi"}}});
+        assert_eq!(
+            eval_cel_bool_expr(
+                expr,
+                &small_device,
+                &vars,
+                &req,
+                &serde_json::Value::Null,
+                &serde_json::Value::Null
+            ),
+            Some(false),
+            "a 4Gi device must NOT satisfy a >= 6Gi capacity selector"
+        );
+    }
+
+    /// quantity(...) must reject the wrong argument count and an unparseable quantity
+    /// string. A malformed quantity() call in a DRA selector must be a hard eval error,
+    /// not silently coerced to some default that could make every device match (or none).
+    #[test]
+    fn dispatch_vap_function_quantity_rejects_wrong_arity_and_unparseable_string() {
+        assert_eq!(
+            dispatch_vap_function("quantity", &[json!("6Gi"), json!("extra")]),
+            None,
+            "quantity() takes exactly one argument"
+        );
+        assert_eq!(
+            dispatch_vap_function("quantity", &[json!("not-a-quantity")]),
+            None,
+            "an unparseable quantity string must be a hard eval error, not silently 0"
+        );
+    }
+
+    /// compareTo must return -1/0/1 for less/equal/greater, matching the upstream CEL
+    /// contract VAP authors write against (`.compareTo(x) >= 0`, `== 0`, etc.) — a wrong
+    /// sign would flip a selector's polarity, turning an "at least" check into "at most".
+    #[test]
+    fn dispatch_vap_method_compare_to_returns_signed_comparison_result() {
+        let six_gi = dispatch_vap_function("quantity", &[json!("6Gi")]).unwrap();
+        let eight_gi = dispatch_vap_function("quantity", &[json!("8Gi")]).unwrap();
+
+        assert_eq!(
+            dispatch_vap_method("compareTo", six_gi.clone(), true, vec![eight_gi.clone()]),
+            Some((json!(-1), true)),
+            "6Gi.compareTo(8Gi) must be -1 (less than)"
+        );
+        assert_eq!(
+            dispatch_vap_method("compareTo", six_gi.clone(), true, vec![six_gi.clone()]),
+            Some((json!(0), true)),
+            "6Gi.compareTo(6Gi) must be 0 (equal)"
+        );
+        assert_eq!(
+            dispatch_vap_method("compareTo", eight_gi, true, vec![six_gi]),
+            Some((json!(1), true)),
+            "8Gi.compareTo(6Gi) must be 1 (greater than)"
+        );
+    }
+
+    /// compareTo on a receiver that isn't quantity-representable (neither a
+    /// quantity()-tagged object nor a raw quantity string) must be a hard eval error, not
+    /// coerced into a spurious 0/-1/1 result.
+    #[test]
+    fn dispatch_vap_method_compare_to_rejects_non_quantity_receiver() {
+        let six_gi = dispatch_vap_function("quantity", &[json!("6Gi")]).unwrap();
+        assert_eq!(
+            dispatch_vap_method("compareTo", json!(true), true, vec![six_gi]),
+            None,
+            "compareTo on a bool receiver must be a hard eval error, not a coerced comparison"
         );
     }
 
