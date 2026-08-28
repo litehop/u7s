@@ -2094,6 +2094,25 @@ fn parse_vap_primary(
                             old_object,
                         );
                     }
+                    // Global function call: `name(args)`, e.g. `quantity("6Gi")`. Before this
+                    // arm existed, `name(` fell through to the string fallback below, leaving
+                    // `(args)` unconsumed — a parse-truncation gap the pos == tokens.len()
+                    // check would now correctly turn into a hard eval error, but silently
+                    // erroring on every global-function call isn't useful either, so parse
+                    // the call properly and dispatch it.
+                    if let CelToken::LParen = &tokens[*pos] {
+                        *pos += 1;
+                        let args = parse_vap_call_args(
+                            tokens,
+                            pos,
+                            object,
+                            variables,
+                            request,
+                            namespace_object,
+                            old_object,
+                        )?;
+                        return dispatch_vap_function(&name, &args);
+                    }
                 }
                 return Some(serde_json::Value::String(name));
             };
@@ -2221,29 +2240,25 @@ fn parse_vap_field_chain(
                 }
                 if let CelToken::Ident(field) = tokens[*pos].clone() {
                     *pos += 1;
-                    if field == "orValue" {
-                        if let Some(CelToken::LParen) = tokens.get(*pos) {
-                            *pos += 1;
-                            let default_val = parse_vap_ternary(
-                                tokens,
-                                pos,
-                                object,
-                                variables,
-                                request,
-                                namespace_object,
-                                old_object,
-                            )?;
-                            if let Some(CelToken::RParen) = tokens.get(*pos) {
-                                *pos += 1;
-                            } else {
-                                return None;
-                            }
-                            if !present {
-                                current = default_val;
-                            }
-                            present = true;
-                            continue;
-                        }
+                    // Method call: `.method(args)`, e.g. `.orValue(default)` or
+                    // `.compareTo(other)`. Dispatch is keyed on (receiver-tag, method-name)
+                    // so a single table covers every method this evaluator supports.
+                    if let Some(CelToken::LParen) = tokens.get(*pos) {
+                        *pos += 1;
+                        let args = parse_vap_call_args(
+                            tokens,
+                            pos,
+                            object,
+                            variables,
+                            request,
+                            namespace_object,
+                            old_object,
+                        )?;
+                        let (new_current, new_present) =
+                            dispatch_vap_method(&field, current, present, args)?;
+                        current = new_current;
+                        present = new_present;
+                        continue;
                     }
                     // Check if this is a struct constructor (field followed by LBrace) —
                     // only meaningful for plain (non-optional) field access.
@@ -2319,6 +2334,73 @@ fn parse_vap_field_chain(
         }
     }
     Some(current)
+}
+
+/// Parse a `(arg, arg, ...)` call argument list for a method or global function call.
+/// Caller has already consumed the opening `(`. Mirrors the comma-separated-list style
+/// of the `[...]` array literal in parse_vap_primary's LBracket arm.
+fn parse_vap_call_args(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+    request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
+) -> Option<Vec<serde_json::Value>> {
+    let mut args = Vec::new();
+    while *pos < tokens.len() {
+        if let CelToken::RParen = &tokens[*pos] {
+            *pos += 1;
+            return Some(args);
+        }
+        let val = parse_vap_ternary(
+            tokens,
+            pos,
+            object,
+            variables,
+            request,
+            namespace_object,
+            old_object,
+        )?;
+        args.push(val);
+        if *pos < tokens.len() {
+            if let CelToken::Comma = &tokens[*pos] {
+                *pos += 1;
+            }
+        }
+    }
+    None // unterminated call — no matching ')'
+}
+
+/// Dispatch a `.method(args)` call against its receiver value. Returns the new
+/// `(current, present)` pair the field chain continues with — most methods leave
+/// `present` untouched, but `orValue` resolves it to `true` since it's the mechanism
+/// that ends optional-chaining absence.
+fn dispatch_vap_method(
+    method: &str,
+    current: serde_json::Value,
+    present: bool,
+    mut args: Vec<serde_json::Value>,
+) -> Option<(serde_json::Value, bool)> {
+    match method {
+        "orValue" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let default_val = args.remove(0);
+            let result = if present { current } else { default_val };
+            Some((result, true))
+        }
+        _ => None,
+    }
+}
+
+/// Dispatch a global (no-receiver) function call, e.g. `quantity("6Gi")`. Returns `None`
+/// for any unrecognized name — an unrecognized global function call is a hard eval
+/// error, not a silently-truncated no-op.
+fn dispatch_vap_function(_name: &str, _args: &[serde_json::Value]) -> Option<serde_json::Value> {
+    None
 }
 
 /// Parse the body of a `{key: value, ...}` object literal (caller consumed `{`).
@@ -8619,6 +8701,120 @@ mod tests {
             "device.attributes.driver must read from the value passed in the object slot; \
              if `device` isn't bound as a root it falls through to the unknown-identifier \
              fallback and returns the literal string \"device\" instead"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Generic `.method(args)` call syntax and bare `Ident(args)` global-function calls
+    // ---------------------------------------------------------------------------
+
+    /// `foo(1, 2)` on an identifier that isn't a known root (object/variables/request/
+    /// namespaceObject/oldObject/device) must be recognized as a function-call attempt and
+    /// have its whole `(1, 2)` argument list consumed by parse_vap_primary itself — not left
+    /// dangling for the top-level pos == tokens.len() guard to catch after the fact. Without
+    /// this call-syntax path, `(1, 2)` falls through to the "return identifier as string"
+    /// fallback and is never consumed at all.
+    #[test]
+    fn parse_vap_primary_consumes_unbound_ident_call_argument_list() {
+        let tokens = tokenize_cel("foo(1, 2)").unwrap();
+        let mut pos = 0usize;
+        let object = json!({});
+        let variables = json!({});
+        let request = json!({});
+        let ns = serde_json::Value::Null;
+        let old = serde_json::Value::Null;
+        let result = parse_vap_primary(&tokens, &mut pos, &object, &variables, &request, &ns, &old);
+        assert_eq!(
+            pos,
+            tokens.len(),
+            "the full `(1, 2)` argument list must be consumed by the call-syntax parser \
+             itself; leaving it dangling means the call syntax isn't actually recognized, \
+             it's just accidentally caught downstream by the trailing-tokens guard"
+        );
+        assert_eq!(
+            result, None,
+            "\"foo\" is not a registered global function, so calling it must be a hard \
+             eval error rather than silently returning the identifier's name as a string"
+        );
+    }
+
+    /// The comma-separated call-argument parser must parse every argument in order — this
+    /// is the exact machinery a future multi-argument method (e.g. compareTo) depends on.
+    /// If it only parsed the first argument (mirroring the old orValue-only special case),
+    /// a two-argument call would silently drop the second argument instead of parsing it.
+    #[test]
+    fn parse_vap_call_args_parses_multiple_comma_separated_arguments() {
+        let tokens = tokenize_cel("(1, 2, 3)").unwrap();
+        let mut pos = 1; // caller has already consumed the opening '('
+        let null = serde_json::Value::Null;
+        let args = parse_vap_call_args(&tokens, &mut pos, &null, &null, &null, &null, &null);
+        assert_eq!(
+            args,
+            Some(vec![json!(1), json!(2), json!(3)]),
+            "a multi-argument call list must parse every comma-separated argument in order"
+        );
+    }
+
+    /// A call missing its closing `)` must be a hard parse error, not silently treated as a
+    /// complete (but truncated) argument list — the same truncation hazard the top-level
+    /// pos == tokens.len() guard exists for, but here for the argument list itself.
+    #[test]
+    fn parse_vap_call_args_rejects_unterminated_argument_list() {
+        let tokens = tokenize_cel("(1, 2").unwrap();
+        let mut pos = 1;
+        let null = serde_json::Value::Null;
+        let args = parse_vap_call_args(&tokens, &mut pos, &null, &null, &null, &null, &null);
+        assert_eq!(
+            args, None,
+            "an unterminated call (missing ')') must be a hard parse error"
+        );
+    }
+
+    /// dispatch_vap_method's orValue arm must reproduce the exact present/absent semantics
+    /// the old hardcoded special case had: keep the receiver when present, substitute the
+    /// default only when the preceding optional-chain access was absent. This is the
+    /// contract every caller of `.?field.orValue(default)` (e.g. the by-node
+    /// ValidatingAdmissionPolicy pattern) relies on.
+    #[test]
+    fn dispatch_vap_method_or_value_uses_default_only_when_absent() {
+        let present_result = dispatch_vap_method(
+            "orValue",
+            json!("bound-value"),
+            true,
+            vec![json!("default")],
+        );
+        assert_eq!(
+            present_result,
+            Some((json!("bound-value"), true)),
+            "orValue must keep the receiver when the preceding optional-chain access was \
+             present; substituting the default here would silently discard a real value"
+        );
+
+        let absent_result = dispatch_vap_method(
+            "orValue",
+            serde_json::Value::Null,
+            false,
+            vec![json!("default")],
+        );
+        assert_eq!(
+            absent_result,
+            Some((json!("default"), true)),
+            "orValue must substitute the default when the preceding optional-chain access \
+             was absent; without this an absent optional field surfaces as a hard eval \
+             error instead of upstream's documented orValue fallback"
+        );
+    }
+
+    /// An unrecognized method name must be a hard eval error. A dispatch table that
+    /// silently falls through to some default behavior for unknown methods would mask a
+    /// VAP author's typo (e.g. `.orvalue(...)`) as a parse-error-free no-op instead of the
+    /// loud failure that lets them notice and fix the policy.
+    #[test]
+    fn dispatch_vap_method_rejects_unrecognized_method_name() {
+        let result = dispatch_vap_method("bogusMethod", json!("x"), true, vec![json!(1)]);
+        assert_eq!(
+            result, None,
+            "an unrecognized method name must be a hard eval error, not a silent no-op"
         );
     }
 
