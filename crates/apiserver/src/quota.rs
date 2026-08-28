@@ -69,16 +69,21 @@ fn parse_count(s: &str) -> Option<u64> {
 /// rounded to the nearest integer since milli is this representation's finest granularity
 /// — a deliberate, explicit choice rather than the silent truncation-to-zero that `i64`
 /// parsing alone would produce. `NaN`/`inf` are rejected: Rust's `f64::from_str` accepts
-/// them, but they are not valid Kubernetes quantity values.
+/// them, but they are not valid Kubernetes quantity values. The scaled (post-`mult`) value
+/// is also range-checked against `i64` before the final cast: `f64 as i64` SATURATES to
+/// `i64::MAX`/`i64::MIN` on overflow rather than signaling failure, so without this check a
+/// monster fractional quantity (e.g. "1e19") would be silently accepted as the saturated
+/// max/min instead of rejected as unparseable.
 fn parse_number_milli(s: &str, mult: i64) -> Option<i64> {
     if let Ok(n) = s.parse::<i64>() {
         return n.checked_mul(mult);
     }
     let f: f64 = s.parse().ok()?;
-    if !f.is_finite() {
+    let scaled = f * mult as f64;
+    if !scaled.is_finite() || scaled < i64::MIN as f64 || scaled > i64::MAX as f64 {
         return None;
     }
-    Some((f * mult as f64).round() as i64)
+    Some(scaled.round() as i64)
 }
 
 /// Parse a Kubernetes quantity string into a raw integer in milli-units.
@@ -1168,7 +1173,10 @@ mod tests {
     /// `NaN`/`inf` are not valid Kubernetes quantities even though Rust's `f64::from_str`
     /// happily parses them — without an explicit finite check, the f64 fallback path added
     /// for fractional support would silently accept them as a "valid" (nonsensical) quota
-    /// value instead of rejecting the malformed input.
+    /// value instead of rejecting the malformed input. This only exercises the
+    /// non-finite half of the fallback's guard — see
+    /// `parse_quantity_milli_rejects_overflowing_fractional` for the separate
+    /// finite-but-too-large-to-fit-in-i64 half.
     #[test]
     fn parse_quantity_milli_rejects_non_finite() {
         assert_eq!(
@@ -1180,6 +1188,49 @@ mod tests {
             parse_quantity_milli("inf"),
             None,
             "\"inf\" must be rejected, not accepted as a quantity via the fractional fallback"
+        );
+    }
+
+    /// `"1e19"` is FINITE (unlike `NaN`/`inf` above) but its milli-scaled value
+    /// (1e19 * 1000 = 1e22) overflows `i64::MAX` (~9.22e18). Rust's `f64 as i64` cast
+    /// SATURATES on overflow instead of signaling failure, so before the explicit range
+    /// check this silently returned `Some(i64::MAX)` — a monster fractional CPU/memory
+    /// request would be accepted as the saturated max instead of rejected, corrupting
+    /// ResourceQuota usage accounting with a bogus huge value.
+    #[test]
+    fn parse_quantity_milli_rejects_overflowing_fractional() {
+        assert_eq!(
+            parse_quantity_milli("1e19"),
+            None,
+            "a fractional value whose milli-scaled magnitude exceeds i64::MAX must be \
+             rejected, not silently saturated to i64::MAX"
+        );
+    }
+
+    /// Mirrors the positive-overflow case above but for the negative saturation bound
+    /// (`i64::MIN`) — a naive fix that only range-checked the upper bound would still
+    /// silently accept `"-1e19"` as the saturated minimum.
+    #[test]
+    fn parse_quantity_milli_rejects_negative_overflowing_fractional() {
+        assert_eq!(
+            parse_quantity_milli("-1e19"),
+            None,
+            "a fractional value whose milli-scaled magnitude is below i64::MIN must be \
+             rejected, not silently saturated to i64::MIN"
+        );
+    }
+
+    /// A moderate-looking fractional value combined with a binary suffix ("1e19Gi") must
+    /// also be rejected — the overflow can come from the numeric literal alone, the binary
+    /// multiplier alone, or (as tested here) their product, so the guard must run on the
+    /// fully mult-scaled value, not just the bare parsed float.
+    #[test]
+    fn parse_quantity_milli_rejects_overflowing_fractional_binary_suffix() {
+        assert_eq!(
+            parse_quantity_milli("1e19Gi"),
+            None,
+            "a fractional binary-suffixed quantity that overflows i64 once scaled by the \
+             Gi multiplier must be rejected, not silently saturated"
         );
     }
 
