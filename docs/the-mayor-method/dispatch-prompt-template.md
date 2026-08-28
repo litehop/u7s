@@ -33,8 +33,11 @@ git root. Symptoms:
 - `git status` inside the worker worktree shows no new findings file.
 - `git status` inside the mayor checkout shows a new untracked file under
   `ai/findings/` that the worker thinks it wrote to its worktree.
-- The findings file is gitignored so neither side commits it — the boundary
-  fails *silently*.
+- The findings file is git-tracked (see README's "Findings lifecycle"), so
+  the leak doesn't vanish quietly — it sits as a live untracked file in the
+  mayor's working tree, one careless `git add` away from riding into an
+  unrelated mayor commit. The `Write` itself gives no error, so only an
+  explicit check on both sides catches it before that happens.
 
 **Defence:** any `Write` of a brand-new file (especially under `ai/findings/`)
 must be IMMEDIATELY followed by verifying the file landed in the worker
@@ -104,8 +107,11 @@ to do.
 
 - Check the mayor checkout immediately after dispatching:
   `git status --short --branch`.
-- Also scan: `ls <MAYOR_CHECKOUT>/ai/findings/` to spot leaked gitignored
-  findings the worker meant to put in its own worktree.
+- Also scan: `git -C <MAYOR_CHECKOUT> status --porcelain ai/findings/` and
+  look for `??` (untracked) entries — those are leaks. A legitimately
+  tracked finding awaiting its bead's close commit is already committed, so
+  it won't appear in this output at all; a bare `ls` can't tell the two
+  apart.
 - If the mayor checkout gains unexpected code changes, interrupt the
   worker before it does more work.
 - Preserve any accidental changes into the worker worktree before
@@ -550,13 +556,17 @@ end-to-end; identify correctness drifts, perf hotspots, API hygiene, testing
 gaps, cross-artefact coupling); reference (surface paths, relevant spec
 docs, recent landings that changed the surface, prior audit findings to avoid
 re-discovering); worktree + boundary block + `--status=in_progress`;
-**WRITE THE FINDINGS DOC FIRST** to `ai/findings/<surface>-audit-YYYY-MM-DD.md`
-(gitignored — never commit findings); file follow-on beads ONE AT A TIME after
-the doc lands, appending each bead ID to the audit-bead's notes so partial
-progress is durable across a watchdog timeout; close audit-bead with verdict +
-cross-refs; no PR by default (trivial one-line obvious fixes can ride along in
-a small PR); return under 400 words with per-finding `file:line` citations +
-follow-on bead IDs + severity counts (HIGH/MED/LOW/DEFER) + verdict.
+**WRITE THE FINDINGS DOC FIRST** to
+`ai/findings/<YYYY-MM-DD>-<BEAD_ID>-<slug>.md`, starting with `Bead: <BEAD_ID>`
+in its first 5 lines (a pre-commit hook rejects a new finding without it);
+commit it with the bead's work — it is git-tracked only for the bead's
+lifetime, deleted from the working tree in the close commit; file follow-on
+beads ONE AT A TIME after the doc lands, appending each bead ID to the
+audit-bead's notes so partial progress is durable across a watchdog timeout;
+close audit-bead with verdict + cross-refs; no PR by default (trivial
+one-line obvious fixes can ride along in a small PR); return under 400 words
+with per-finding `file:line` citations + follow-on bead IDs + severity counts
+(HIGH/MED/LOW/DEFER) + verdict.
 
 Critical learnings:
 
@@ -567,7 +577,10 @@ Critical learnings:
   progress survives a watchdog timeout.
 - **Name the recent landings** so the audit reads the current reality.
 - **Severity tags** (HIGH/MED/LOW/DEFER) make later cluster-formation trivial.
-- **`ai/findings/` is gitignored.** Never open a PR that adds a findings doc.
+- **Commit the doc, don't wrap it in a PR.** It's git-tracked under the bead
+  lifecycle (see README's "Findings lifecycle"), but audit output isn't code
+  needing review-before-merge — commit it directly and reference it from the
+  bead's notes.
 
 ---
 
@@ -622,12 +635,14 @@ Critical learnings:
   editing. `Write` the whole file rather than appending to it.
 - **Words, never lines.** Do not brief a line budget: joining lines satisfies
   it with zero content change.
-- **A tracked doc must never cite `ai/findings/`.** That directory is
-  gitignored, so the path resolves to nothing in every fresh checkout and
-  every worktree — a findings citation in a committed file is a broken
-  reference, not a pointer. Anything that must survive the session gets
-  extracted into a tracked document under `docs/` or a tracked `ai/`
-  subfolder; anything still open gets a bead. The brief must say which.
+- **A tracked doc must never cite a bare `ai/findings/<file>.md` path.** The
+  file is git-tracked only for its bead's lifetime — deleted in the close
+  commit — so any checkout taken after that point (every checkout, once the
+  bead is closed) resolves the path to nothing. A findings citation in a
+  durable doc is a broken reference on a delay, not a pointer. Anything that
+  must survive the session gets extracted into a tracked document under
+  `docs/` or a tracked `ai/` subfolder; anything still open gets a bead. The
+  brief must say which.
 - **Only settled material becomes a durable doc.** Needs-data and deferred
   sections of a sketch are not ADR content. Name them in the brief as
   out-of-scope so the worker files beads for them instead of distilling
@@ -1010,8 +1025,10 @@ When a worker returns from a VM/sonobuoy-touching bead:
   burn 10+ minutes of wall-clock. Also: any such PoC should be `#[test] #[ignore]` so it
   doesn't fire in normal `cargo test`, which the project convention says completes in a few
   minutes end-to-end. See `bd memories timing-pocs-must-be-bounded`.
-- **Findings docs leak into PRs.** `ai/findings/` is gitignored; never
-  commit one.
+- **Findings docs leak into unrelated PRs.** A findings doc's `Bead:` header
+  names the audit bead that produced it — if it rides along in an unrelated
+  PR's diff, that's scope creep to catch at review time (PR-opened checklist
+  item 1), not evidence the doc shouldn't have been committed.
 - **Mayor force-merges through a failing check with `--admin`.** NEVER use
   `--admin`. If a check fails: read the log first. If it is a transient GitHub
   infra flake (e.g. `fatal: could not read Username`, checkout auth failure,

@@ -82,7 +82,7 @@ count words, so wrapping cannot affect them.
 6. **Process history git already records.** Which bead tracked it, who resolved it, what was attempted and deleted.
 7. **Consequences that restate the Decision.** In an ADR, a Consequences bullet that says the Decision again in other words is not a consequence.
 8. **ADR over 400 words.** The budget passes it only if it did not grow. Over-budget and merely unchanged still warrants a suggestion.
-9. **Citations into `ai/findings/` from a tracked file.** Grep the diff for `ai/findings/`. That directory is gitignored, so any such path is dead in every fresh checkout — the referenced content does not exist for anyone else. Every hit is a HIGH finding: the material must be extracted into a tracked doc or converted to a bead. Applies to `docs/`, `ai/extended-context/`, `ai/dashboard.md`, PR bodies, and bead notes alike.
+9. **Citations into `ai/findings/` from a tracked file.** Grep the diff for `ai/findings/`. A findings file is deleted from the working tree in its bead's close commit, so a bare path citation resolves to nothing in any checkout taken after that point — the referenced content does not exist for anyone else. Every hit is a HIGH finding: the material must be extracted into a tracked doc or converted to a bead. Applies to `docs/`, `ai/extended-context/`, `ai/dashboard.md`, PR bodies, and bead notes alike.
 
 ## Scratch worktrees
 
