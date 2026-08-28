@@ -2063,7 +2063,12 @@ fn parse_vap_primary(
         CelToken::Ident(name) => {
             *pos += 1;
             // Determine the root value for this identifier.
-            let root = if name == "object" {
+            //
+            // `device` is not a distinct evaluator parameter: DRA DeviceClass.Spec.Selectors
+            // expressions never reference object/variables/request/namespaceObject/oldObject,
+            // so callers evaluating a device selector pass the device value in the `object`
+            // slot and `device` is just an alias for it.
+            let root = if name == "object" || name == "device" {
                 object.clone()
             } else if name == "variables" {
                 variables.clone()
@@ -8586,6 +8591,34 @@ mod tests {
             "trailing unconsumed tokens after a valid prefix must be a parse error; \
              returning Some(\"bar\") here means a mistyped variable/messageExpression \
              silently evaluates to the truncated prefix instead of failing loudly"
+        );
+    }
+
+    /// `device` must resolve to the same value passed in the `object` slot — the binding
+    /// DRA DeviceClass.Spec.Selectors expressions (e.g. `device.attributes["driver"] ==
+    /// "gpu.example.com"`) will need once a real call site is wired up. Without this
+    /// binding, `device` falls through to the "unknown identifier" fallback, which
+    /// returns the string "device" instead of the device object, so every selector field
+    /// access would silently operate on the wrong root.
+    #[test]
+    fn cel_device_root_resolves_to_object_slot_value() {
+        let device = json!({"attributes": {"driver": "gpu.example.com"}});
+        let vars = serde_json::Map::new();
+        let req = json!({});
+        let result = eval_cel_vap_value(
+            r#"device.attributes.driver"#,
+            &device,
+            &vars,
+            &req,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(
+            result,
+            Some(json!("gpu.example.com")),
+            "device.attributes.driver must read from the value passed in the object slot; \
+             if `device` isn't bound as a root it falls through to the unknown-identifier \
+             fallback and returns the literal string \"device\" instead"
         );
     }
 
