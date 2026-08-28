@@ -45,12 +45,13 @@ jobs:
         run: cargo fmt --check
 
   # Regression guards for scripts/**/test-*-logic.sh (plus the standalone
-  # test-critical-reviewer-hook.sh, test-install-checksum.sh, and
-  # test-release-tarball-licenses.sh) -- pure-bash unit tests for shell-script
-  # logic (argument parsing, decision functions, process supervision), none of
-  # which touch a real Lima VM/kubectl/sonobuoy. Discovered via `find` so new
-  # sibling scripts are picked up automatically instead of silently staying
-  # untested like this whole family did before.
+  # test-critical-reviewer-hook.sh, test-install-checksum.sh,
+  # test-release-tarball-licenses.sh, and test-add-node-warning.sh) --
+  # pure-bash unit tests for shell-script logic (argument parsing, decision
+  # functions, process supervision), none of which touch a real Lima
+  # VM/kubectl/sonobuoy. Discovered via `find` so new sibling scripts are
+  # picked up automatically instead of silently staying untested like this
+  # whole family did before.
   script-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -63,10 +64,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Run scripts/**/test-*-logic.sh + test-critical-reviewer-hook.sh + test-install-checksum.sh + test-release-tarball-licenses.sh
+      - name: Run scripts/**/test-*-logic.sh + test-critical-reviewer-hook.sh + test-install-checksum.sh + test-release-tarball-licenses.sh + test-add-node-warning.sh
         run: |
           tests_file="$(mktemp)"
-          find scripts -type f \( -name 'test-*-logic.sh' -o -name 'test-critical-reviewer-hook.sh' -o -name 'test-install-checksum.sh' -o -name 'test-release-tarball-licenses.sh' \) | sort > "$tests_file"
+          find scripts -type f \( -name 'test-*-logic.sh' -o -name 'test-critical-reviewer-hook.sh' -o -name 'test-install-checksum.sh' -o -name 'test-release-tarball-licenses.sh' -o -name 'test-add-node-warning.sh' \) | sort > "$tests_file"
           count=$(wc -l < "$tests_file")
           if [ "$count" -eq 0 ]; then
             echo "no scripts/**/test-*-logic.sh regression scripts found — discovery is broken" >&2
