@@ -30,11 +30,6 @@
 #     not references to real, closeable beads.
 #   this file -- documenting the exclusions above requires spelling out
 #     the exact strings that trip the regex.
-#   crates/apiserver/src/handlers/pods.rs -- registered in
-#     .githooks/sensitive-conformance-focus.yaml; ANY push touching it
-#     (comment-only or not) is blocked by .githooks/pre-push without a fresh
-#     sonobuoy PASS on an owned VM slot. Tracked in mayor-e49sl -- remove this
-#     exclusion once that bead lands the remaining 7 refs (5 distinct IDs).
 #   .gitignore -- same "mayor-metho" class of false positive as
 #     CONTRIBUTING.md above: the script name "mayor-tick" it references
 #     matches mayor-[a-z0-9]{3,5} by coincidence and is a permanent script
@@ -66,7 +61,6 @@ matches=$(git grep -n -E 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- . \
   ':!CONTRIBUTING.md' ':!scripts/test-critical-reviewer-hook.sh' \
   ':!scripts/test-check-bead-id-refs-logic.sh' \
   ':!scripts/check-bead-id-refs.sh' \
-  ':!crates/apiserver/src/handlers/pods.rs' \
   ':!scripts/mayor-tick.sh' ':!scripts/test-mayor-tick-logic.sh' \
   ':!.gitignore' \
   2>/dev/null || true)
