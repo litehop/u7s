@@ -188,6 +188,13 @@ considered but is non-functional: the Agent tool's JSONSchema declares
 `additionalProperties: false` with property set `{description, isolation,
 model, prompt, subagent_type}` — no `effort` (verified mayor-p6sj7).
 
+**Asking the reviewer to "confirm" a claim does not mean asking it to
+re-run anything.** Confirming that a test genuinely tests the behaviour is
+a reading task the reviewer can usually answer from the diff and test
+source; critical-reviewer.md's default posture is to read first and
+execute only when reading is insufficient, naming the hypothesis when it
+does. No wording change is needed in briefs.
+
 ## Common preamble (every dispatch)
 
 ```
