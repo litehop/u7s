@@ -939,7 +939,13 @@ Environment=GOMAXPROCS=2
 # (no shipped ClusterRole uses it, no code reads it) so this controller has no
 # object to ever act on; the informer it shares (ClusterRoles) is already kept
 # warm by RBAC authorization itself.
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+# -device-taint-eviction-controller: DRA is GA (DynamicResourceAllocation) and
+# u7s fully serves resource.k8s.io/v1 (DeviceClass/ResourceClaim/
+# ResourceClaimTemplate/ResourceSlice), but the DeviceTaintRule type this
+# controller acts on lives at resource.k8s.io/v1beta2, a version u7s does not
+# serve at all -- no DeviceTaintRule can ever exist, so device-taint-based
+# eviction is structurally unreachable regardless of this flag.
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 
