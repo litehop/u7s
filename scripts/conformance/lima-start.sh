@@ -845,6 +845,17 @@ Description=Kubernetes Kube Proxy
 After=network.target
 
 [Service]
+# Same GOMEMLIMIT/GOGC/GOMAXPROCS tuple already proven on kubelet (this
+# file's own kubelet drop-in above) and KCM (04-start-kcm.sh) -- kube-proxy
+# is the third Go binary of similar shape and was the only untuned one of
+# the three. Applied here as a first-cut, NOT independently measured yet:
+# kube-proxy's own peak RSS (53.3MB) is notably smaller than kubelet/KCM's,
+# so this 200MiB/50/2 tuple may be looser than warranted -- a pending
+# follow-on bead covers the before/after RSS + sync-latency/EndpointSlice
+# measurement pass.
+Environment=GOMEMLIMIT=200MiB
+Environment=GOGC=50
+Environment=GOMAXPROCS=2
 ExecStart=/usr/local/bin/kube-proxy \\
   --config=/etc/kube-proxy/config.conf \\
   --hostname-override=${VM_NAME} \\
