@@ -6,35 +6,35 @@ Scope: non-Go-env memory options for kubelet/KCM/kube-proxy/CRI-O, post-Round-2
 
 ## Recommendation
 
-Try **per-unit cgroup v2 `MemoryHigh=`** first — still config-only, never
-OOM-kills — but retargeted against the CURRENT post-Round-1 baseline, not a
-stale one. Kubelet's peak is now **118.0MB**, not the pre-tuning 204.3MB
-(235MB untuned sawtooth already fixed by `GOMEMLIMIT=200MiB` — see
-`memory-management-state.md:22`). The honest remaining leverage is squeezing
-the ~82MB of slack GOMEMLIMIT still leaves unused, not clipping a peak that's
-already gone — weaker than a first pass, order 0-15MB. The
-other three mechanisms remain near-zero leverage (overcommit, CRI-O metrics)
-or reopen the Go-env lane Round-1/2 already owns (`GODEBUG=madvdontneed`).
+**Non-Go-env mechanisms offer bounded leverage post-Round-1.** Kubelet's peak
+is already 118.0MB — 41% under its own 200MiB GOMEMLIMIT ceiling (Round-1:
+204.3MB→118.0MB via GOMEMLIMIT; `memory-management-state.md:22`). None of the
+four found genuine current-state squeeze room: the workload isn't above any
+ceiling for cgroup/overcommit/CRI-O knobs to reclaim from. The one mechanism
+with plausible non-zero leverage today (`MADV_DONTNEED` page-return timing)
+is itself Go-env-adjacent, not purely non-Go-env. **Reserve all four as
+tools, not a to-do list**: revisit if Round-2 lands a footprint still large
+relative to target; don't spend implementation effort now. This
+bounded-leverage finding is itself the answer to the operator's north-star
+question — Round-2 is approaching the ceiling of what tuning, Go-env or
+otherwise, can add.
 
 ## Per-mechanism
 
 **1. cgroup `memory.max`/`memory.high`.** Cgroup v2: `memory.max` hard-caps
-and OOM-kills if unreclaimable; `memory.high` throttles + forces reclaim
-without OOM-killing (kernel.org `cgroup-v2.rst`). systemd maps both 1:1 to
-`MemoryMax=`/`MemoryHigh=` in the same drop-in already used for
-`Environment=GOMEMLIMIT`. Orthogonal to GOMEMLIMIT: GOMEMLIMIT is the Go GC
-pacer's internal soft target, invisible to the kernel; `memory.high` is
-external and kernel-enforced. Post-Round-1, kubelet's measured peak is
-**118.0MB — 82MB below its own 200MiB GOMEMLIMIT** (`memory-management-state.md:22`;
-Round-1 already fixed the pre-tuning 204.3MB/235MB sawtooth via GOMEMLIMIT
-itself). A `MemoryHigh` above 200MiB would never engage. The real lever is
-`MemoryHigh` *below* GOMEMLIMIT, inside that 82MB of slack (e.g. ~150MiB).
-Correction: the Go GC guide's 5-10%-headroom advice sizes GOMEMLIMIT *below*
-a pre-existing hard limit, not an external ceiling *above* an already-chosen
-GOMEMLIMIT — that direction doesn't apply here, so ~150MiB is our own
-extrapolation, not a guide citation. Magnitude: modest, order 0-15MB. Cost:
-config-only. Risk: real — 150MiB leaves only ~27% margin over a peak from a
-single tuned run with no re-run planned; start conservative.
+and OOM-kills if unreclaimable; `memory.high` throttles + forces reclaim only
+once usage **exceeds** the boundary — it does nothing below it (kernel.org
+`cgroup-v2.rst`). systemd maps both 1:1 to `MemoryMax=`/`MemoryHigh=` in the
+drop-in already used for `Environment=GOMEMLIMIT`. Post-Round-1, kubelet's
+peak (118.0MB) sits 82MB below its 200MiB GOMEMLIMIT — that gap isn't
+reclaimable slack, it's headroom Go's GC already keeps for burst safety, so a
+`MemoryHigh` anywhere in that range never engages and squeezes nothing. Its
+only honest use is as a **safety ceiling**: set just above the observed peak
+(~130MiB, ~10% margin) so it engages only if the workload tries to exceed
+today's baseline.
+Magnitude: **zero measured leverage today** — purely defensive, not a
+reduction tool. Cost: config-only. Risk: real if set too tight — 130MiB is
+thin margin over a single-run peak; re-verify before treating as a gate.
 
 **2. `/proc/sys/vm/overcommit_memory`.** Modes: 0 (heuristic, default), 1
 (always allow), 2 (never overcommit, bounded by `overcommit_ratio` +
@@ -55,11 +55,10 @@ for apiserver) is inert for us — there's nothing enabled to trim.
 requests, not CRI-O's own daemon RSS. CRI-O exposes no in-daemon
 image/layer-cache-size knob (image storage is backed by the overlay
 filesystem via containers/storage, not an in-process LRU). The one live
-lever is `runtime_type="pod"` (conmon-rs, one monitor per pod instead of
-per-container) — but sonobuoy's e2e suite is dominated by single-container
-pods, so consolidation saves nothing there. CRI-O's own Go runtime is
-untouched by Round-1/2 — a Go-env gap, not this audit's frontier (see
-follow-on #5). Magnitude: low (order 0-15MB, mostly image-pull bursts).
+lever, `runtime_type="pod"` (conmon-rs, shared monitor per pod), saves
+nothing since sonobuoy's e2e suite is dominated by single-container pods.
+CRI-O's own Go runtime is untouched by Round-1/2 — a Go-env gap, not this
+audit's frontier (see follow-on #5). Magnitude: low (order 0-15MB, mostly image-pull bursts).
 Cost: config-only. Risk: low.
 
 **4. `MADV_DONTNEED`/`MADV_FREE`.** Confirmed in Go runtime source
@@ -79,11 +78,11 @@ tuple.
 
 ## What experiments to run (priority order)
 
-1. **cgroup `MemoryHigh`** — add `MemoryHigh=150M` to kubelet.service
-   drop-in (below the 200MiB GOMEMLIMIT, ~27% above the current 118MB peak);
-   rerun the 31-pod churn cycle; measure peak RSS before/after. Expect order
-   0-15MB further reduction; watch for throttling/latency regression given
-   the tight margin.
+1. **cgroup `MemoryHigh` as a safety ceiling** — add `MemoryHigh=130M` to
+   kubelet.service (~10% above the 118MB peak); rerun the 31-pod churn cycle;
+   confirm it does NOT engage under normal load (expect 0 RSS delta) and DOES
+   throttle under an injected burst above 130MB. Validates a regression
+   alarm, not a reduction.
 2. **CRI-O baseline gap-fill** — CRI-O's own peak RSS during a full
    conformance run is missing from the measured set; sample it once before
    proposing further CRI-O changes.
@@ -103,7 +102,7 @@ tuple.
 
 ## Follow-on beads to file (mayor files, not this worker)
 
-1. Experiment: `MemoryHigh=150M` cgroup drop-in on kubelet.service (below GOMEMLIMIT), measure RSS/latency delta.
+1. Experiment: `MemoryHigh=130M` safety-ceiling drop-in on kubelet.service (regression alarm, not a reduction); confirm engage/no-engage behavior.
 2. Baseline: measure CRI-O daemon's own peak RSS during a full conformance run.
 3. Experiment: `GODEBUG=madvdontneed=1` on kubelet.service + kube-proxy.service, with latency re-verification.
 4. Experiment: `MemoryHigh=` for kube-proxy + KCM once Round-2 lands (after xpxj5/9dk3n merge).
