@@ -59,10 +59,34 @@ fn parse_count(s: &str) -> Option<u64> {
 // Resource quantity arithmetic (for resource-request quotas)
 // ---------------------------------------------------------------------------
 
+/// Parse the numeric portion of a quantity (everything before the unit suffix) scaled by
+/// `mult`, into a milli-unit integer.
+///
+/// Whole-number input is parsed as `i64` and multiplied exactly — this is the original,
+/// unchanged path and matters for large magnitudes (e.g. multi-exabyte quantities) where
+/// routing through `f64` would lose precision. Only input containing a fractional
+/// component (e.g. "1.5") falls back to `f64` parsing, and the milli-unit result is
+/// rounded to the nearest integer since milli is this representation's finest granularity
+/// — a deliberate, explicit choice rather than the silent truncation-to-zero that `i64`
+/// parsing alone would produce. `NaN`/`inf` are rejected: Rust's `f64::from_str` accepts
+/// them, but they are not valid Kubernetes quantity values.
+fn parse_number_milli(s: &str, mult: i64) -> Option<i64> {
+    if let Ok(n) = s.parse::<i64>() {
+        return n.checked_mul(mult);
+    }
+    let f: f64 = s.parse().ok()?;
+    if !f.is_finite() {
+        return None;
+    }
+    Some((f * mult as f64).round() as i64)
+}
+
 /// Parse a Kubernetes quantity string into a raw integer in milli-units.
 /// For CPU: "500m" → 500, "1" → 1000, "1.5" → 1500.
 /// For memory/storage: "252Mi" → 252*1024*1024*1000, "30Gi" → 30*1024^3*1000.
 /// For plain integers: "2" → 2000.
+/// Fractional quantities (e.g. "1.5", "1.5Gi") are rounded to the nearest milli-unit —
+/// see `parse_number_milli` for why rounding was chosen over rejection.
 /// Returns None if the string cannot be parsed.
 pub(crate) fn parse_quantity_milli(s: &str) -> Option<i64> {
     if s.is_empty() {
@@ -70,7 +94,7 @@ pub(crate) fn parse_quantity_milli(s: &str) -> Option<i64> {
     }
     // Milli suffix
     if let Some(rest) = s.strip_suffix('m') {
-        return rest.parse::<i64>().ok();
+        return parse_number_milli(rest, 1);
     }
     // Binary suffixes (Ki, Mi, Gi, Ti, Pi, Ei)
     let binary_suffixes = [
@@ -83,7 +107,7 @@ pub(crate) fn parse_quantity_milli(s: &str) -> Option<i64> {
     ];
     for (suf, mult) in &binary_suffixes {
         if let Some(rest) = s.strip_suffix(suf) {
-            return rest.parse::<i64>().ok().map(|n| n * mult * 1000);
+            return parse_number_milli(rest, mult * 1000);
         }
     }
     // Decimal SI suffixes (k, M, G, T, P, E)
@@ -97,11 +121,11 @@ pub(crate) fn parse_quantity_milli(s: &str) -> Option<i64> {
     ];
     for (suf, mult) in &decimal_suffixes {
         if let Some(rest) = s.strip_suffix(suf) {
-            return rest.parse::<i64>().ok().map(|n| n * mult * 1000);
+            return parse_number_milli(rest, mult * 1000);
         }
     }
     // Plain integer
-    s.parse::<i64>().ok().map(|n| n * 1000)
+    parse_number_milli(s, 1000)
 }
 
 /// Format a milli-quantity back to a canonical Kubernetes quantity string.
@@ -1071,6 +1095,86 @@ mod tests {
             "resource.k8s.io",
             "resourceclaims"
         ));
+    }
+
+    // -- parse_quantity_milli --
+
+    /// A fractional plain-unit quantity ("1.5" CPU cores) must parse per this function's own
+    /// doc comment. Before the fix, the "m"/binary/decimal/plain-integer branches all called
+    /// `.parse::<i64>()` directly, which rejects any string with a decimal point — so a pod
+    /// requesting "1.5" CPU was silently excluded from ResourceQuota usage accounting
+    /// entirely (contributes 0, not 1500), letting a namespace exceed its real CPU quota.
+    #[test]
+    fn parse_quantity_milli_fractional_plain() {
+        assert_eq!(
+            parse_quantity_milli("1.5"),
+            Some(1500),
+            "\"1.5\" CPU cores must resolve to 1500 milli-cores, matching this function's own \
+             documented contract — silently rejecting it would undercount quota usage"
+        );
+    }
+
+    /// A fractional quantity with a binary SI suffix ("1.5Gi" memory) must also parse — the
+    /// same rejection bug applies independently to the binary-suffix branch.
+    #[test]
+    fn parse_quantity_milli_fractional_binary_suffix() {
+        assert_eq!(
+            parse_quantity_milli("1.5Gi"),
+            Some(1_610_612_736_000),
+            "\"1.5Gi\" must resolve to 1.5 * 1024^3 * 1000 milli-bytes; rejecting fractional \
+             binary-suffixed quantities undercounts memory/storage quota usage the same way \
+             fractional CPU does"
+        );
+    }
+
+    /// A negative fractional quantity must round-trip through the same f64 fallback path as
+    /// the positive cases — the sign lives in the numeric parse, not in suffix handling, so a
+    /// naive fix that only handled positive fractions would still reject this.
+    #[test]
+    fn parse_quantity_milli_negative_fractional() {
+        assert_eq!(
+            parse_quantity_milli("-1.5"),
+            Some(-1500),
+            "a negative fractional quantity must parse to its exact negative milli-value, not \
+             be rejected — CEL's quantity().compareTo() can produce negative operands"
+        );
+    }
+
+    /// Whole-number input must stay on the exact i64 path, not get routed through f64 — large
+    /// magnitudes (e.g. multi-exabyte quantities) would lose precision if every input went
+    /// through a float, and this function's callers (quota accounting, CEL quantity()) depend
+    /// on exact integer results for the common non-fractional case.
+    #[test]
+    fn parse_quantity_milli_integer_unaffected_by_fractional_support() {
+        assert_eq!(
+            parse_quantity_milli("2"),
+            Some(2000),
+            "adding fractional support must not change the exact-integer fast path quota \
+             call sites already depend on"
+        );
+        assert_eq!(
+            parse_quantity_milli("30Gi"),
+            Some(30 * 1024 * 1024 * 1024 * 1000),
+            "existing binary-suffix integer quotas must still resolve exactly"
+        );
+    }
+
+    /// `NaN`/`inf` are not valid Kubernetes quantities even though Rust's `f64::from_str`
+    /// happily parses them — without an explicit finite check, the f64 fallback path added
+    /// for fractional support would silently accept them as a "valid" (nonsensical) quota
+    /// value instead of rejecting the malformed input.
+    #[test]
+    fn parse_quantity_milli_rejects_non_finite() {
+        assert_eq!(
+            parse_quantity_milli("NaN"),
+            None,
+            "\"NaN\" must be rejected, not accepted as a quantity via the fractional fallback"
+        );
+        assert_eq!(
+            parse_quantity_milli("inf"),
+            None,
+            "\"inf\" must be rejected, not accepted as a quantity via the fractional fallback"
+        );
     }
 
     // -- check_resource_quota --
