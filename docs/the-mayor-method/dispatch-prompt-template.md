@@ -107,8 +107,11 @@ to do.
 
 - Check the mayor checkout immediately after dispatching:
   `git status --short --branch`.
-- Also scan: `ls <MAYOR_CHECKOUT>/ai/findings/` to spot a leaked findings
-  file the worker meant to put in its own worktree.
+- Also scan: `git -C <MAYOR_CHECKOUT> status --porcelain ai/findings/` and
+  look for `??` (untracked) entries — those are leaks. A legitimately
+  tracked finding awaiting its bead's close commit is already committed, so
+  it won't appear in this output at all; a bare `ls` can't tell the two
+  apart.
 - If the mayor checkout gains unexpected code changes, interrupt the
   worker before it does more work.
 - Preserve any accidental changes into the worker worktree before
