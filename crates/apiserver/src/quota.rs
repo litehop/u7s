@@ -80,7 +80,12 @@ fn parse_number_milli(s: &str, mult: i64) -> Option<i64> {
     }
     let f: f64 = s.parse().ok()?;
     let scaled = f * mult as f64;
-    if !scaled.is_finite() || scaled < i64::MIN as f64 || scaled > i64::MAX as f64 {
+    // `i64::MAX` (2^63 - 1) needs 63 bits and isn't exactly representable in f64's 53-bit
+    // mantissa, so `i64::MAX as f64` rounds UP to 2^63. A strict `>` would let `scaled ==
+    // 2^63.0` through the guard, then saturate to `i64::MAX` on the cast below — so the
+    // upper bound must be `>=`, not `>`. `i64::MIN` (-2^63) is a power of two and IS exact,
+    // so `<` is correct there.
+    if !scaled.is_finite() || scaled < i64::MIN as f64 || scaled >= i64::MAX as f64 {
         return None;
     }
     Some(scaled.round() as i64)
@@ -1231,6 +1236,35 @@ mod tests {
             None,
             "a fractional binary-suffixed quantity that overflows i64 once scaled by the \
              Gi multiplier must be rejected, not silently saturated"
+        );
+    }
+
+    /// `9223372036854775808` is exactly `2^63`, one past `i64::MAX` (`2^63 - 1`). `i64::MAX`
+    /// itself isn't exactly representable in f64 (63 bits needed, f64 has 53), so `i64::MAX
+    /// as f64` rounds UP to `2^63.0` — a strict `scaled > i64::MAX as f64` guard would let
+    /// `scaled == 2^63.0` through, then saturate to `i64::MAX` on the cast. The upper bound
+    /// must be `>=` to close this exact-boundary hole.
+    #[test]
+    fn parse_quantity_milli_rejects_exact_two_pow_63_boundary() {
+        assert_eq!(
+            parse_quantity_milli("9223372036854775808m"),
+            None,
+            "2^63 milli-units is one past i64::MAX and must be rejected — a `>` (rather \
+             than `>=`) upper-bound check would let this saturate to i64::MAX instead"
+        );
+    }
+
+    /// Sanity check for the boundary fix above: `i64::MAX` itself (one milli-unit below
+    /// `2^63`) must still parse successfully — an overly aggressive `>=` fix applied to the
+    /// wrong operand, or an off-by-one in the other direction, would over-reject the exact
+    /// maximum valid value.
+    #[test]
+    fn parse_quantity_milli_accepts_exact_i64_max() {
+        assert_eq!(
+            parse_quantity_milli("9223372036854775807m"),
+            Some(i64::MAX),
+            "i64::MAX itself is a valid milli-quantity and must not be rejected by the \
+             overflow guard"
         );
     }
 
