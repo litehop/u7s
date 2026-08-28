@@ -2,9 +2,11 @@ name: Test
 
 on:
   push:
-  # Explicit, not accidental: this previously only ran on merge-queue
-  # branches because push: was unrestricted. Making it explicit means it
-  # keeps working even if push: is later scoped to specific branches.
+    branches-ignore:
+      # merge_group below already covers queue branches; without this,
+      # push and merge_group both fire on the same queue ref and race in
+      # the shared concurrency group, cancelling the merge_group run.
+      - 'gh-readonly-queue/**'
   merge_group:
 
 concurrency:
