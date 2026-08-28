@@ -2074,6 +2074,16 @@ fn parse_vap_primary(
             // expressions never reference object/variables/request/namespaceObject/oldObject,
             // so callers evaluating a device selector pass the device value in the `object`
             // slot and `device` is just an alias for it.
+            //
+            // Verified against upstream (kubernetes/kubernetes release-1.36,
+            // staging/src/k8s.io/dynamic-resource-allocation/cel/compile.go): the DRA
+            // selector CEL environment declares exactly one root variable, `device`
+            // (`cel.Variable(deviceVar, ...)` in newCompiler), and `DeviceMatches`'s runtime
+            // activation map passes exactly one key, `deviceVar` — there is no `object`
+            // binding in that environment at all. So aliasing `device` to whatever value
+            // flows through this evaluator's `object` slot cannot collide with or shadow a
+            // real `object` root, because no such root exists in the contexts a device
+            // selector expression actually runs in.
             let root = if name == "object" || name == "device" {
                 object.clone()
             } else if name == "variables" {
