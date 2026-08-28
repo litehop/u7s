@@ -104,36 +104,53 @@ queue_is_drained() {
   [[ "$submitted_at" > "$norm" ]]
 }
 
-# A critical-reviewer review typically posts within minutes of being
-# dispatched -- one full 15m tick cycle is enough headroom that an entry
-# still undrained past it is worth surfacing as possibly stalled, rather
-# than the reviewer simply still running.
-QUEUE_ENTRY_IN_FLIGHT_MAX_AGE_SECONDS=$((15 * 60))
+# Backstop for the pending_reviews dispatch marker (see
+# queue_entry_dispatch_suppressed below): once a marker is this old, treat
+# the earlier presumed dispatch as dead -- a crashed/stuck reviewer, or the
+# mayor never actually acted on the prior pending_reviews listing -- and
+# surface the entry again rather than trusting the marker forever.
+QUEUE_DISPATCH_MARKER_MAX_AGE_SECONDS=$((15 * 60))
 
-# Portable ISO-8601 (colon form, e.g. what normalize_queued_at produces) ->
-# Unix epoch seconds. GNU `date -d` (Linux CI) and BSD/macOS `date -j -f`
-# (this script's own shebang target, and the pre-push hook's runtime) parse
-# timestamps incompatibly, so both forms are tried.
-iso8601_to_epoch() {
-  date -u -d "$1" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null
+# Path to the on-disk marker recording "this script already surfaced this
+# queue entry in pending_reviews". Lives in its own subdirectory, never
+# touched by the SubagentStop hook, so this script is the sole reader AND
+# writer -- keyed on the queue file's basename, which is unique per active
+# entry (pr_already_queued's no-double-queue invariant already relies on
+# this).
+dispatch_marker_path() {
+  printf '%s/.dispatched/%s.marker' "$QUEUE_DIR" "$(basename "$1")"
 }
 
-# True (exit 0) iff a not-yet-drained review-queue entry is still young
-# enough that its reviewer is plausibly still running, and so must NOT be
-# re-surfaced in pending_reviews -- acting on that signal means dispatching
-# a second reviewer at the same PR, and since the merge gate keys on the
-# latest verdict by submittedAt, whichever reviewer finishes last silently
-# wins. False (not in-flight, so it DOES surface) on a missing/malformed
-# queued_at or unparseable timestamp -- the opposite fail direction from
-# queue_is_drained's fail-closed, because treating a broken timestamp as
-# "still running" would hide the PR indefinitely instead of just one tick.
-queue_entry_in_flight() {
-  local queued_at="$1" now_epoch="$2"
-  is_valid_queued_at "$queued_at" || return 1
-  local queued_epoch
-  queued_epoch=$(iso8601_to_epoch "$(normalize_queued_at "$queued_at")") || return 1
-  [ -z "$queued_epoch" ] && return 1
-  [ $(( now_epoch - queued_epoch )) -lt "$QUEUE_ENTRY_IN_FLIGHT_MAX_AGE_SECONDS" ]
+# Epoch seconds recorded in a queue entry's dispatch marker, or empty if
+# none exists (or it's unreadable). Empty is the FIRST-SIGHTING case and
+# must be treated as immediately dispatchable, never as in-flight.
+read_dispatch_marker() {
+  local marker_file
+  marker_file=$(dispatch_marker_path "$1")
+  # No matching-branch `if` returns 0, unlike `[ -f ... ] && cat ...`, whose
+  # short-circuit on a missing marker (the routine first-sighting case)
+  # would return 1 and abort the whole script under `set -e` at the caller.
+  if [ -f "$marker_file" ]; then
+    cat "$marker_file" 2>/dev/null
+  fi
+}
+
+# True (exit 0) iff a not-yet-drained review-queue entry must be SUPPRESSED
+# from pending_reviews this tick because a dispatch was already recorded
+# for it recently. The discriminator is dispatch STATE (does a marker
+# exist and is it fresh), not the queue entry's own age: dispatch happens
+# ONLY via pending_reviews (see the mayor's own bootstrap doc), so a
+# brand-new entry with no marker yet must surface on its very FIRST
+# sighting. An age-only gate has this exactly backwards -- a fresh entry's
+# age is always near zero, which an age gate would misread as "already
+# handled", delaying every entry's first dispatch by a full tick. False
+# (surface it) on a missing marker (first sighting) OR a marker older than
+# the backstop -- fails toward surfacing, matching queue_is_drained's
+# neighbors, never toward a permanent hide.
+queue_entry_dispatch_suppressed() {
+  local marker_epoch="$1" now_epoch="$2"
+  [ -z "$marker_epoch" ] && return 1
+  [ $(( now_epoch - marker_epoch )) -lt "$QUEUE_DISPATCH_MARKER_MAX_AGE_SECONDS" ]
 }
 
 # A healthy worker's diagnose-edit-test window is observed at 10-40
@@ -150,6 +167,17 @@ WORKTREE_ANOMALY_MAX_AGE_SECONDS=$((45 * 60))
 worktree_dispatch_in_flight() {
   local age_seconds="$1"
   [ "$age_seconds" -lt "$WORKTREE_ANOMALY_MAX_AGE_SECONDS" ]
+}
+
+# Epoch seconds of a worktree path's last commit, or epoch 0 (maximally
+# OLD, not "just now") if the git lookup itself fails. Fails toward
+# SURFACING a worktree anomaly, never toward silently hiding one: for this
+# script a false positive is noisy but visible, while a false negative
+# (a lookup failure misread as "brand new, still in-flight") is silent --
+# the wrong polarity for a check whose whole purpose is not missing a
+# genuinely stalled dispatch.
+worktree_commit_epoch() {
+  git -C "$1" log -1 --format=%ct 2>/dev/null || printf '0'
 }
 
 # Extracts the value after "**Verdict**:" from a critical-reviewer findings
@@ -503,7 +531,7 @@ WORKTREE_STALE_COUNT=0  # subset of WORKTREE_ANOMALIES old enough to escalate th
 # always surfaced in PENDING_NON_PR_REVIEWS for the mayor to confirm by
 # hand instead of silently sitting undrained with no visibility.
 process_review_queue() {
-  local f dtype dref queued_at prnum submitted_at reviews_json latest route bucket payload
+  local f dtype dref queued_at prnum submitted_at reviews_json latest route bucket payload marker_epoch
   for f in "$QUEUE_DIR"/*.md; do
     [ -e "$f" ] || continue
     dtype=$(frontmatter_field "$f" deliverable_type)
@@ -524,15 +552,20 @@ process_review_queue() {
           submitted_at=$(printf '%s' "$latest" | jq -r '.submittedAt // empty' 2>/dev/null || true)
           if queue_is_drained "$queued_at" "$submitted_at"; then
             run_cmd rm -f "$f"
+            run_cmd rm -f "$(dispatch_marker_path "$f")"
             continue
           fi
-          # Still undrained but freshly queued: the reviewer is plausibly
-          # still running. Leave the queue file in place (still counted via
-          # QUEUE_FILES_REMAINING below) but don't add it to pending_reviews
-          # -- re-surfacing it there risks the mayor dispatching a second
-          # reviewer for a PR already being reviewed.
-          if ! queue_entry_in_flight "$queued_at" "$(date -u +%s)"; then
-            PENDING_REVIEW_PRS+=("$prnum")
+          # Still undrained: surface it UNLESS a dispatch was already
+          # recorded for it recently. The discriminator is dispatch STATE
+          # (a marker), not the entry's own age -- dispatch happens ONLY
+          # via pending_reviews (see the mayor's own bootstrap doc), so a
+          # brand-new entry with no marker yet must surface immediately, on
+          # its very first sighting. Re-surfacing a marked-and-fresh entry
+          # risks the mayor dispatching a second reviewer for a PR already
+          # being reviewed.
+          marker_epoch=$(read_dispatch_marker "$f")
+          if ! queue_entry_dispatch_suppressed "$marker_epoch" "$(date -u +%s)"; then
+            surface_pending_review "$prnum" "$f"
           fi
         fi
         ;;
@@ -650,7 +683,7 @@ check_worktree_anomalies() {
     esac
     count=$(gh pr list --head "$branch" --state all --json number --jq 'length' 2>/dev/null || echo 0)
     if [ "${count:-0}" -eq 0 ]; then
-      commit_epoch=$(git -C "$path" log -1 --format=%ct 2>/dev/null || echo "$now")
+      commit_epoch=$(worktree_commit_epoch "$path")
       age_seconds=$(( now - commit_epoch ))
       if worktree_dispatch_in_flight "$age_seconds"; then
         WORKTREE_ANOMALIES+=("$(jq -nc --arg path "$path" --arg branch "$branch" '{path:$path, branch:$branch, reason:"no-pr-for-branch-in-flight"}')")
@@ -662,12 +695,42 @@ check_worktree_anomalies() {
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
 }
 
-# Actual queue-file write for the stale-blocking-verdict branch below --
-# isolated into its own tiny function, like the dashboard replace/append
-# helpers, purely so run_cmd's dry-run gate can cover a raw file write the
-# same as every other side effect in this script.
-_write_reconcile_queue_file() {  # $1=path $2=contents
+# Generic file write, isolated into its own tiny function like the
+# dashboard replace/append helpers, purely so run_cmd's dry-run gate can
+# cover a raw file write the same as every other side effect in this
+# script. Shared by the reconcile stale-blocking-verdict write and the
+# dispatch-marker stamp below.
+_write_file_contents() {  # $1=path $2=contents
   printf '%s' "$2" > "$1"
+}
+
+# Atomic create-if-absent write (shell noclobber semantics): fails without
+# touching the file if it already exists. Used for the reconcile
+# stale-blocking-verdict write below so two overlapping mayor-tick.sh runs
+# racing on the SAME PR (this script runs on a 15m cron AND can be invoked
+# inline on a task notification, so overlap is real, not hypothetical)
+# can't both write a duplicate queue file -- paired with a deterministic
+# (not wall-clock) filename, both racing processes compute the SAME path
+# and only the first writer wins.
+_write_file_contents_if_absent() {  # $1=path $2=contents
+  ( set -C; printf '%s' "$2" > "$1" ) 2>/dev/null
+}
+
+# Records that this tick surfaced `prnum` (backed by `queue_file`) into
+# pending_reviews, by stamping a fresh dispatch marker -- so subsequent
+# ticks treat it as already-dispatched (queue_entry_dispatch_suppressed)
+# instead of re-surfacing it every tick. Shared by process_review_queue's
+# per-file loop and reconcile's stale-blocking-verdict branch, which also
+# creates a queue file that process_review_queue will examine on the VERY
+# NEXT tick -- without stamping here too, that next tick would see no
+# marker yet and surface the same PR again immediately, defeating the
+# purpose of the marker.
+surface_pending_review() {
+  local prnum="$1" queue_file="$2" marker_file
+  PENDING_REVIEW_PRS+=("$prnum")
+  marker_file=$(dispatch_marker_path "$queue_file")
+  run_cmd mkdir -p "$(dirname "$marker_file")"
+  run_cmd _write_file_contents "$marker_file" "$(date -u +%s)"
 }
 
 # Step 6: self-heal reconciliation. Compensating layer for the
@@ -691,6 +754,14 @@ _write_reconcile_queue_file() {  # $1=path $2=contents
 # branch on every subsequent tick, so a re-review that comes back blocking
 # again does not requeue every tick forever -- it only requeues once a
 # genuinely NEW commit lands after that re-review's own submittedAt.
+#
+# That queue file's name is derived from the PR number + the review's own
+# submittedAt, not wall-clock time: this script runs on a 15m cron AND can
+# be invoked inline on a task notification, so two overlapping runs
+# reconciling the SAME PR is real, not hypothetical. Both racing processes
+# observe the identical latest review and so compute the identical name;
+# the noclobber write below (_write_file_contents_if_absent) then lets only
+# the first one through instead of both writing distinct duplicate files.
 reconcile_missing_queue_entries() {
   local prs_json n url reviews_json latest verdict body submitted_at commits_json queued_at qfile
   prs_json=$(gh pr list --state open --json number,url,headRefName --jq \
@@ -718,10 +789,13 @@ reconcile_missing_queue_entries() {
     has_commit_after "$commits_json" "$submitted_at" || continue  # blocking verdict but nothing changed since -- nothing for a reviewer to look at yet
 
     queued_at=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-    qfile="$QUEUE_DIR/${queued_at}-mayor-tick-reconcile-pr${n}.md"
-    run_cmd _write_reconcile_queue_file "$qfile" "$(printf -- '---\ndeliverable_type: pr\ndeliverable_ref: %s\nqueued_at: %s\n---\nmayor-tick reconcile: stale %s verdict (submitted %s) with commits landed after -- re-review needed\n' "$url" "$queued_at" "$verdict" "$submitted_at")"
-    echo "mayor-tick reconcile: PR #$n ($url) has a stale $verdict verdict (submitted $submitted_at) with commits landed after -- queuing re-review" >&2
-    PENDING_REVIEW_PRS+=("$n")
+    qfile="$QUEUE_DIR/mayor-tick-reconcile-pr${n}-$(printf '%s' "$submitted_at" | tr ':' '-').md"
+    if run_cmd _write_file_contents_if_absent "$qfile" "$(printf -- '---\ndeliverable_type: pr\ndeliverable_ref: %s\nqueued_at: %s\n---\nmayor-tick reconcile: stale %s verdict (submitted %s) with commits landed after -- re-review needed\n' "$url" "$queued_at" "$verdict" "$submitted_at")"; then
+      echo "mayor-tick reconcile: PR #$n ($url) has a stale $verdict verdict (submitted $submitted_at) with commits landed after -- queuing re-review" >&2
+      surface_pending_review "$n" "$qfile"
+    else
+      echo "mayor-tick reconcile: PR #$n ($url) stale-verdict queue file already exists (concurrent mayor-tick run) -- not duplicating" >&2
+    fi
   done
 }
 

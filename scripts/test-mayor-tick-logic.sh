@@ -55,49 +55,69 @@ file_mtime() {  # portable GNU/BSD stat, matches the idiom used elsewhere in scr
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
 }
 
-# Runs the REAL end-to-end main() (mayor-tick.sh __call main) -- not a
-# single __call'd pure function -- inside an isolated single-worktree
-# scratch git repo with `gh`/`bd` replaced by fixtures under $1 (a
-# directory of executable stub scripts prepended to PATH) and the review
-# queue seeded from $2 (a directory of .md fixtures, or empty/omitted).
-# Copying the script into its own throwaway repo (one worktree, no queue
-# files, no worker PRs, no beads) is what makes "genuinely empty state" and
-# "exactly this one fixture PR" possible at all: this actual dev checkout
-# has live sibling worktrees/PRs/beads that would otherwise leak into any
-# of the three assertions below and mask a real regression. $3, if given,
-# is a number of seconds; a second worktree on branch
+# Builds an isolated single-worktree scratch git repo (one worktree, no
+# queue files, no worker PRs, no beads) WITHOUT invoking main() -- this
+# actual dev checkout has live sibling worktrees/PRs/beads that would
+# otherwise leak into assertions and mask a real regression. Split out from
+# run_full_tick (below) so a caller can invoke main() more than once
+# against the SAME repo/queue dir -- needed to observe cross-tick state
+# (e.g. a dispatch marker) that a fresh scratch dir per call can't. $1, if
+# given, is a number of seconds; a second worktree on branch
 # worker/agent-worktree-age-test is added with its HEAD commit backdated
 # that far, so check_worktree_anomalies has a real branch/commit-age pair
-# to evaluate. Sets TICK_RC/TICK_OUT/TICK_STATE for the caller to assert
-# on.
-run_full_tick() {
-  local stub_bin="$1" queue_seed="${2:-}" worker_age_seconds="${3:-}"
-  local scratch="$WORKDIR/tick-$RANDOM$RANDOM" repo
-  repo="$scratch/repo"
-  mkdir -p "$repo/scripts" "$repo/.claude/review-queue"
-  cp "$SCRIPT" "$repo/scripts/mayor-tick.sh"
-  git init -q "$repo"
-  git -C "$repo" config user.email test@example.com
-  git -C "$repo" config user.name "Test"
-  git -C "$repo" commit -q --allow-empty -m init
+# to evaluate. Sets SCRATCH_REPO for the caller.
+build_scratch_repo() {
+  local worker_age_seconds="${1:-}"
+  local scratch="$WORKDIR/tick-$RANDOM$RANDOM"
+  SCRATCH_REPO="$scratch/repo"
+  mkdir -p "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/.claude/review-queue"
+  cp "$SCRIPT" "$SCRATCH_REPO/scripts/mayor-tick.sh"
+  git init -q "$SCRATCH_REPO"
+  git -C "$SCRATCH_REPO" config user.email test@example.com
+  git -C "$SCRATCH_REPO" config user.name "Test"
+  git -C "$SCRATCH_REPO" commit -q --allow-empty -m init
   if [ -n "$worker_age_seconds" ]; then
     local wpath="$scratch/worker-worktree" commit_epoch
     commit_epoch=$(( $(date -u +%s) - worker_age_seconds ))
-    git -C "$repo" worktree add -q -b worker/agent-worktree-age-test "$wpath"
+    git -C "$SCRATCH_REPO" worktree add -q -b worker/agent-worktree-age-test "$wpath"
     GIT_AUTHOR_DATE="@${commit_epoch} +0000" GIT_COMMITTER_DATE="@${commit_epoch} +0000" \
       git -C "$wpath" commit -q --allow-empty -m "worker commit"
   fi
-  if [ -n "$queue_seed" ]; then
-    cp "$queue_seed"/*.md "$repo/.claude/review-queue/" 2>/dev/null || true
-  fi
-  TICK_STATE="$scratch/state.json"
+}
+
+# Invokes the REAL end-to-end main() (mayor-tick.sh __call main) against a
+# scratch repo built by build_scratch_repo, with `gh`/`bd` replaced by
+# fixtures under $1 (a directory of executable stub scripts prepended to
+# PATH). $2=repo path. $3=dry-run flag (0 or 1, default 1 -- most callers
+# want the side-effect-free default; the dispatch-marker lifecycle test
+# below needs 0 to observe a marker actually persisting on disk across
+# ticks). $4=state file path override (default: derived from $2, one level
+# up) -- lets a caller invoking this more than once against the same repo
+# capture a separate snapshot per tick instead of each call clobbering the
+# last. Sets TICK_RC/TICK_OUT/TICK_STATE for the caller to assert on.
+invoke_tick() {
+  local stub_bin="$1" repo="$2" dry_run="${3:-1}" state_file="${4:-}"
+  TICK_STATE="${state_file:-$(dirname "$repo")/state.json}"
   TICK_RC=0
   TICK_OUT=$(PATH="$stub_bin:$PATH" \
     MAYOR_TICK_QUEUE_DIR="$repo/.claude/review-queue" \
     MAYOR_TICK_STATE_FILE="$TICK_STATE" \
     MAYOR_TICK_DASHBOARD_FILE="$repo/no-such-dashboard.md" \
-    MAYOR_TICK_DRY_RUN=1 \
+    MAYOR_TICK_DRY_RUN="$dry_run" \
     bash "$repo/scripts/mayor-tick.sh" __call main 2>&1) || TICK_RC=$?
+}
+
+# One-shot convenience: build a fresh isolated repo, seed it from $2 (a
+# directory of .md queue fixtures, or empty/omitted), and run a single
+# dry-run tick against it. $3, see build_scratch_repo. Sets
+# TICK_RC/TICK_OUT/TICK_STATE for the caller to assert on.
+run_full_tick() {
+  local stub_bin="$1" queue_seed="${2:-}" worker_age_seconds="${3:-}"
+  build_scratch_repo "$worker_age_seconds"
+  if [ -n "$queue_seed" ]; then
+    cp "$queue_seed"/*.md "$SCRATCH_REPO/.claude/review-queue/" 2>/dev/null || true
+  fi
+  invoke_tick "$stub_bin" "$SCRATCH_REPO" 1
 }
 
 WORKDIR=$(mktemp -d)
@@ -738,47 +758,51 @@ assert "...and reconciliation does not log a synthesis message for it either -- 
   "$(! printf '%s' "$TICK_OUT" | grep -q 'mayor-tick reconcile:.*4343' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 13. In-flight awareness (age-threshold pure functions). Both queue-drain
-#     detection (section 1) and these two share the same reason for
-#     existing: exit 30 firing on EVERY healthy worker dispatch, and
-#     pending_reviews re-surfacing a PR whose reviewer is already running,
-#     both train the mayor to ignore a signal that's supposed to mean
-#     something -- and the pending_reviews case is worse, since acting on
-#     it means dispatching a second reviewer that can race the first one.
+# 13. In-flight awareness -- pure building blocks. Worktree anomalies and
+#     pending_reviews are DIFFERENT problems and must NOT share a design:
+#     a young worktree really is probably a healthy in-flight dispatch, so
+#     AGE is the right signal there. But dispatch happens ONLY via
+#     pending_reviews (see the mayor's own bootstrap doc), so a brand-new
+#     queue entry's age is always near zero -- an age gate would misread
+#     "just queued, nobody has dispatched a reviewer yet" as "already
+#     dispatched, still running", delaying every entry's first dispatch by
+#     a full tick. The discriminator there has to be dispatch STATE (a
+#     marker this script itself stamps), not elapsed time.
 # ---------------------------------------------------------------------------
 
 NOW_EPOCH=$(date -u +%s)
 
-# queue_entry_in_flight: a review queued 2 minutes ago is well within the
-# 15m in-flight window -- the reviewer is plausibly still running, so this
-# entry must not be re-surfaced in pending_reviews yet.
-RECENT_QUEUED_AT=$(date -u -d "@$(( NOW_EPOCH - 120 ))" +%Y-%m-%dT%H-%M-%SZ 2>/dev/null || date -u -j -f %s "$(( NOW_EPOCH - 120 ))" +%Y-%m-%dT%H-%M-%SZ)
+# queue_entry_dispatch_suppressed: no marker at all is the FIRST-SIGHTING
+# case and must NEVER be suppressed -- this is the exact bug an age-only
+# gate had (a fresh entry's age is ~0, indistinguishable from "recently
+# dispatched"). Getting this backwards silently delays every entry's first
+# dispatch by a full tick, since dispatch happens only via pending_reviews.
 RC=0
-call queue_entry_in_flight "$RECENT_QUEUED_AT" "$NOW_EPOCH" || RC=$?
-assert "a review queued 2 minutes ago is still in-flight -- must not be re-surfaced for a duplicate reviewer dispatch" \
+call queue_entry_dispatch_suppressed '' "$NOW_EPOCH" || RC=$?
+assert "no dispatch marker at all (first sighting) is never suppressed -- it must surface immediately, since nothing else dispatches a reviewer" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# A marker stamped 2 minutes ago is still fresh -- the mayor plausibly
+# dispatched a reviewer last tick and it's still running; re-surfacing now
+# risks a second dispatch racing the first.
+RC=0
+call queue_entry_dispatch_suppressed "$(( NOW_EPOCH - 120 ))" "$NOW_EPOCH" || RC=$?
+assert "a dispatch marker stamped 2 minutes ago suppresses re-surfacing -- a reviewer was plausibly just dispatched and is still running" \
   "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
 
-# A review queued 20 minutes ago has outlived a full 15m tick cycle without
-# posting -- worth surfacing as possibly stalled, not silently hidden
-# forever.
-OLD_QUEUED_AT=$(date -u -d "@$(( NOW_EPOCH - 1200 ))" +%Y-%m-%dT%H-%M-%SZ 2>/dev/null || date -u -j -f %s "$(( NOW_EPOCH - 1200 ))" +%Y-%m-%dT%H-%M-%SZ)
+# A marker stamped 20 minutes ago has outlived the 15m backstop -- the
+# earlier presumed dispatch is treated as dead (crashed reviewer, or the
+# mayor never actually acted on the prior listing) and the entry surfaces
+# again rather than staying hidden forever.
 RC=0
-call queue_entry_in_flight "$OLD_QUEUED_AT" "$NOW_EPOCH" || RC=$?
-assert "a review queued 20 minutes ago (past one full tick cycle) is no longer treated as in-flight" \
+call queue_entry_dispatch_suppressed "$(( NOW_EPOCH - 1200 ))" "$NOW_EPOCH" || RC=$?
+assert "a dispatch marker older than the backstop no longer suppresses -- a marked-but-dead dispatch must not hide the PR forever" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
-# A malformed queued_at must fail toward SURFACING the PR, not hiding it --
-# the opposite fail direction from queue_is_drained, since silently
-# treating a broken timestamp as "still running" would hide a real PR
-# forever instead of just delaying it one tick.
-RC=0
-call queue_entry_in_flight 'not-a-timestamp' "$NOW_EPOCH" || RC=$?
-assert "a malformed queued_at fails toward surfacing the PR (not in-flight), never toward permanently hiding it" \
-  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
-
-# worktree_dispatch_in_flight: a dispatch 6 minutes old is well within the
-# observed 10-40m diagnose-edit-test window -- exit 30 firing here is
-# exactly the alarm-fatigue bug this fix closes.
+# worktree_dispatch_in_flight: age IS the right signal here (unchanged
+# design) -- a dispatch 6 minutes old is well within the observed 10-40m
+# diagnose-edit-test window, exit 30 firing here is exactly the
+# alarm-fatigue bug this fix closes.
 RC=0
 call worktree_dispatch_in_flight 360 || RC=$?
 assert "a 6-minute-old worker dispatch with no PR yet is still in-flight -- a healthy dispatch must not trip exit 30" \
@@ -792,30 +816,68 @@ call worktree_dispatch_in_flight 3000 || RC=$?
 assert "a 50-minute-old worker dispatch with no PR yet is past the working window -- a genuinely stalled dispatch must still surface" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
+# worktree_commit_epoch: a git-log lookup failure must fail toward
+# SURFACING an anomaly (epoch 0, maximally old), never toward silently
+# hiding one. The old inline fallback (`|| echo "$now"`) treated a lookup
+# failure as "brand new, still in-flight" -- a false negative that's silent
+# and exactly the failure mode this whole check exists to avoid, whereas a
+# false positive here is merely noisy but visible. A plain non-git
+# directory reliably fails `git log` on any platform, no repo corruption
+# needed to exercise this.
+NOT_A_GIT_REPO="$WORKDIR/not-a-git-repo"
+mkdir -p "$NOT_A_GIT_REPO"
+assert "a git-log lookup failure resolves to epoch 0 (maximally old), not 'now' -- the wrong polarity here would silently hide a real anomaly" \
+  "$([ "$(call worktree_commit_epoch "$NOT_A_GIT_REPO")" = "0" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
-# 14. pending_reviews in-flight suppression, end-to-end through the REAL
-#     main() pipeline -- proves the section-13 pure function actually
-#     changes what lands in the state file the mayor reads, not just its
-#     own return value.
+# 14. pending_reviews dispatch-marker lifecycle, end-to-end through the
+#     REAL main() pipeline against a REAL queue dir (MAYOR_TICK_DRY_RUN=0,
+#     not run_full_tick's always-dry-run wrapper -- dry-run would never
+#     actually stamp a marker on disk, so proving marker persistence
+#     ACROSS ticks needs a real filesystem). Uses STUB_EMPTY_BIN (every
+#     gh/bd call fails) so this exercises no real network or git mutation
+#     beyond this script's own queue-dir/marker bookkeeping -- see
+#     build_scratch_repo/invoke_tick's isolation guarantees above.
 # ---------------------------------------------------------------------------
 
-QSEED_INFLIGHT="$WORKDIR/qseed-review-inflight"
-mkdir -p "$QSEED_INFLIGHT"
-NOW_QUEUED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-printf -- '---\ndeliverable_type: pr\ndeliverable_ref: https://github.com/example/repo/pull/5001\nqueued_at: %s\n---\nbody\n' "$NOW_QUEUED_AT" > "$QSEED_INFLIGHT/pr-5001.md"
+build_scratch_repo
+QUEUED_AT_NOW=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+printf -- '---\ndeliverable_type: pr\ndeliverable_ref: https://github.com/example/repo/pull/5101\nqueued_at: %s\n---\nbody\n' "$QUEUED_AT_NOW" > "$SCRATCH_REPO/.claude/review-queue/pr-5101.md"
 
-run_full_tick "$STUB_EMPTY_BIN" "$QSEED_INFLIGHT"
-assert "a PR whose review was queued moments ago is NOT re-surfaced in pending_reviews -- dispatching a second reviewer here would race the one already running, and the merge gate keys on whichever posts LAST" \
-  "$([ "$(jq -r '.pending_reviews | index(5001) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
-assert "...but the queue file itself stays visible in queue_files (still genuinely undrained, just not re-dispatched)" \
-  "$([ "$(jq -r '.queue_files | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
+STATE_MARKER_1="$WORKDIR/state-marker-1.json"
+invoke_tick "$STUB_EMPTY_BIN" "$SCRATCH_REPO" 0 "$STATE_MARKER_1"
+assert "a brand-new queue entry (age ~0, no dispatch marker yet) surfaces in pending_reviews on its FIRST sighting -- an age-based gate would silently delay this first dispatch by a full tick, since dispatch happens only via pending_reviews" \
+  "$([ "$(jq -r '.pending_reviews | index(5101) != null' "$STATE_MARKER_1")" = "true" ] && echo 1 || echo 0)"
 
+MARKER_FILE=$(MAYOR_TICK_QUEUE_DIR="$SCRATCH_REPO/.claude/review-queue" call dispatch_marker_path "$SCRATCH_REPO/.claude/review-queue/pr-5101.md")
+assert "tick 1 actually stamped a dispatch marker on disk -- the mechanism tick 2's suppression below depends on" \
+  "$([ -f "$MARKER_FILE" ] && echo 1 || echo 0)"
+
+STATE_MARKER_2="$WORKDIR/state-marker-2.json"
+invoke_tick "$STUB_EMPTY_BIN" "$SCRATCH_REPO" 0 "$STATE_MARKER_2"
+assert "the SAME entry, on the very next tick with the review still not posted, is suppressed -- the dispatch marker from tick 1 is still fresh, so re-surfacing risks the mayor dispatching a second reviewer that races the first" \
+  "$([ "$(jq -r '.pending_reviews | index(5101) != null' "$STATE_MARKER_2")" = "false" ] && echo 1 || echo 0)"
+
+# Backdate the marker past the backstop to simulate a dead/never-acted-on
+# dispatch, without waiting 15 real minutes.
+printf '%s' "$(( $(date -u +%s) - 1200 ))" > "$MARKER_FILE"
+
+STATE_MARKER_3="$WORKDIR/state-marker-3.json"
+invoke_tick "$STUB_EMPTY_BIN" "$SCRATCH_REPO" 0 "$STATE_MARKER_3"
+assert "once the dispatch marker ages past the backstop with the review still not posted, the entry surfaces again -- a marked-but-dead dispatch must not hide the PR forever" \
+  "$([ "$(jq -r '.pending_reviews | index(5101) != null' "$STATE_MARKER_3")" = "true" ] && echo 1 || echo 0)"
+
+# A queue entry's OWN posted age is irrelevant to first-sighting
+# suppression -- only marker presence matters. An entry queued long ago but
+# never before examined by this script (no marker exists yet) must still
+# surface immediately, not be mistaken for "already handled" just because
+# its queued_at is old.
 QSEED_STALLED="$WORKDIR/qseed-review-stalled"
 mkdir -p "$QSEED_STALLED"
 printf -- '---\ndeliverable_type: pr\ndeliverable_ref: https://github.com/example/repo/pull/5002\nqueued_at: 2026-01-01T00-00-00Z\n---\nbody\n' > "$QSEED_STALLED/pr-5002.md"
 
 run_full_tick "$STUB_EMPTY_BIN" "$QSEED_STALLED"
-assert "a PR whose review has sat undrained for months (a genuinely stalled/crashed reviewer) still surfaces in pending_reviews -- the in-flight suppression must not become a permanent hide" \
+assert "a queue entry with an old queued_at but no dispatch marker yet still surfaces on first sighting -- the entry's own posted age is not the discriminator, marker presence is" \
   "$([ "$(jq -r '.pending_reviews | index(5002) != null' "$TICK_STATE")" = "true" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
@@ -1032,6 +1094,51 @@ assert "a second reconcile pass against the SAME unchanged PR does not write a s
   "$([ "$COUNT_AFTER_SECOND" = "1" ] && echo 1 || echo 0)"
 assert "...and the second pass does not even log a new queuing message -- pr_already_queued short-circuits before reconcile re-evaluates the verdict" \
   "$(! printf '%s' "$OUT2" | grep -q 'queuing re-review' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 19. True-concurrency collision guard. Section 18 above only proves the
+#     SEQUENTIAL case (pr_already_queued sees the first run's file before a
+#     second run starts) -- it doesn't cover two mayor-tick.sh processes
+#     that BOTH pass that check before either has written anything, which
+#     is the actual race: this script runs on a 15m cron AND can be
+#     invoked inline on a task notification, so genuine overlap is real,
+#     not hypothetical.
+# ---------------------------------------------------------------------------
+
+# _write_file_contents_if_absent is the atomicity primitive itself: the
+# first writer must win and the file's content must be ITS content, never
+# silently clobbered by a second racing writer.
+RACE_FILE="$WORKDIR/race-file.md"
+RC=0
+call _write_file_contents_if_absent "$RACE_FILE" "first writer" || RC=$?
+assert "the first call to the atomic create-if-absent write succeeds" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call _write_file_contents_if_absent "$RACE_FILE" "second writer (simulating a racing overlapping mayor-tick.sh run)" || RC=$?
+assert "a second racing call to the same path fails instead of clobbering the first writer's content -- this is what stops two overlapping mayor-tick.sh runs from both succeeding at writing a duplicate reconcile entry" \
+  "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
+assert "...and the file on disk still holds the FIRST writer's content, proving noclobber genuinely blocked the second write rather than erroring after writing anyway" \
+  "$([ "$(cat "$RACE_FILE")" = "first writer" ] && echo 1 || echo 0)"
+
+# The atomicity primitive above only matters if two racing processes
+# compute the SAME path to collide on in the first place -- a wall-clock
+# timestamp in the filename would let each racing run pick a different
+# name and never even engage the guard. Confirm reconcile's actual naming
+# is deterministic: two independent runs against the identical PR/review
+# fixture (same PR number, same submittedAt) must produce the same
+# basename.
+QDIR_DETERMINISM_A="$WORKDIR/qdir-determinism-a"
+QDIR_DETERMINISM_B="$WORKDIR/qdir-determinism-b"
+mkdir -p "$QDIR_DETERMINISM_A" "$QDIR_DETERMINISM_B"
+MAYOR_TICK_QUEUE_DIR="$QDIR_DETERMINISM_A" MAYOR_TICK_DRY_RUN=0 \
+  PATH="$STUB_STALE_BLOCKING_FIXED:$PATH" call reconcile_missing_queue_entries >/dev/null 2>&1
+MAYOR_TICK_QUEUE_DIR="$QDIR_DETERMINISM_B" MAYOR_TICK_DRY_RUN=0 \
+  PATH="$STUB_STALE_BLOCKING_FIXED:$PATH" call reconcile_missing_queue_entries >/dev/null 2>&1
+NAME_A=$(basename "$(find "$QDIR_DETERMINISM_A" -maxdepth 1 -name '*.md' -type f)")
+NAME_B=$(basename "$(find "$QDIR_DETERMINISM_B" -maxdepth 1 -name '*.md' -type f)")
+assert "the reconcile queue filename is deterministic (PR number + the review's own submittedAt), not wall-clock-based -- two independent runs against the identical PR/review state compute the SAME name, which is what lets the noclobber guard actually engage across genuinely overlapping processes" \
+  "$([ -n "$NAME_A" ] && [ "$NAME_A" = "$NAME_B" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
