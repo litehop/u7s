@@ -1104,12 +1104,39 @@ fn subtract_requests(total: &mut ResourceRequests, victim: &ResourceRequests) {
     }
 }
 
+/// Parse the numeric portion of a quantity (everything before the unit suffix) scaled by
+/// `mult`, into a milli-unit integer. Mirrors `crates/apiserver/src/quota.rs`'s
+/// `parse_number_milli` (kept separate — no shared types crate today), adapted to this
+/// crate's "0 means unparseable" convention instead of `Option`.
+///
+/// Whole-number input is parsed as `i64` and multiplied exactly — the original, unchanged
+/// path, so large magnitudes (e.g. multi-exabyte quantities) stay precise. Only input with a
+/// fractional component (e.g. "1.5") falls back to `f64`, and the milli-unit result is
+/// rounded to the nearest integer since milli is this representation's finest granularity —
+/// a deliberate, explicit choice rather than the silent truncation-to-zero that `i64` parsing
+/// alone would produce. `NaN`/`inf` are rejected: `f64::from_str` accepts them, but they are
+/// not valid Kubernetes quantity values.
+fn parse_number_milli(s: &str, mult: i64) -> i64 {
+    if let Ok(n) = s.parse::<i64>() {
+        return n.checked_mul(mult).unwrap_or(0);
+    }
+    let f: f64 = match s.parse() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    if !f.is_finite() {
+        return 0;
+    }
+    (f * mult as f64).round() as i64
+}
+
 /// Parse a Kubernetes resource quantity string into milli-units: for CPU,
-/// "500m" -> 500, "1" -> 1000; for memory/ephemeral-storage, "128Mi" ->
-/// 128*1024*1024*1000. Mirrors the arithmetic in
-/// `crates/apiserver/src/quota.rs`'s `parse_quantity_milli` (kept separate
-/// here — the scheduler and apiserver are independent binaries with no shared
-/// types crate today).
+/// "500m" -> 500, "1" -> 1000, "1.5" -> 1500; for memory/ephemeral-storage, "128Mi" ->
+/// 128*1024*1024*1000. Fractional quantities (e.g. "1.5", "1.5Gi") are rounded to the
+/// nearest milli-unit — see `parse_number_milli` for why rounding was chosen over rejection.
+/// Mirrors the arithmetic in `crates/apiserver/src/quota.rs`'s `parse_quantity_milli` (kept
+/// separate here — the scheduler and apiserver are independent binaries with no shared types
+/// crate today).
 ///
 /// Returns 0 for an absent/unparseable string. Callers must treat 0 as "no
 /// value was set" — for a pod's own request that means "this container
@@ -1122,7 +1149,7 @@ fn parse_quantity_milli(s: &str) -> i64 {
         return 0;
     }
     if let Some(rest) = s.strip_suffix('m') {
-        return rest.parse::<i64>().unwrap_or(0);
+        return parse_number_milli(rest, 1);
     }
     let binary_suffixes = [
         ("Ki", 1024i64),
@@ -1134,7 +1161,7 @@ fn parse_quantity_milli(s: &str) -> i64 {
     ];
     for (suf, mult) in &binary_suffixes {
         if let Some(rest) = s.strip_suffix(suf) {
-            return rest.parse::<i64>().map(|n| n * mult * 1000).unwrap_or(0);
+            return parse_number_milli(rest, mult * 1000);
         }
     }
     let decimal_suffixes = [
@@ -1147,10 +1174,10 @@ fn parse_quantity_milli(s: &str) -> i64 {
     ];
     for (suf, mult) in &decimal_suffixes {
         if let Some(rest) = s.strip_suffix(suf) {
-            return rest.parse::<i64>().map(|n| n * mult * 1000).unwrap_or(0);
+            return parse_number_milli(rest, mult * 1000);
         }
     }
-    s.parse::<i64>().map(|n| n * 1000).unwrap_or(0)
+    parse_number_milli(s, 1000)
 }
 
 /// Add one `(resourceName, quantityString)` pair into `total` — shared by
@@ -8495,6 +8522,93 @@ mod tests {
              not an error that blocks scheduling"
         );
         assert_eq!(parse_quantity_milli("not-a-quantity"), 0);
+    }
+
+    /// A fractional plain-unit quantity ("1.5" CPU cores) must parse to 1500, not 0. Before
+    /// the fix every branch called `.parse::<i64>()` directly, which rejects any decimal
+    /// point — a container requesting "1.5" CPU would contribute 0 to the node's committed
+    /// total, so NodeResourcesFit would think the node has 1.5 more free cores than it
+    /// actually does and schedule a pod onto a node that then fails to fit at the kubelet.
+    #[test]
+    fn parse_quantity_milli_fractional_plain_counts_toward_fit_check() {
+        assert_eq!(
+            parse_quantity_milli("1.5"),
+            1500,
+            "\"1.5\" CPU cores must resolve to 1500 milli-cores — silently reading this as 0 \
+             would let the scheduler over-commit a node's real CPU capacity"
+        );
+    }
+
+    /// A fractional quantity with a binary SI suffix ("1.5Gi" memory) must also parse — the
+    /// same rejection bug independently affects the binary-suffix branch, and an undercounted
+    /// memory request is exactly the kind of gap that lets a pod land on a node with too
+    /// little free memory.
+    #[test]
+    fn parse_quantity_milli_fractional_binary_suffix_counts_toward_fit_check() {
+        assert_eq!(
+            parse_quantity_milli("1.5Gi"),
+            1_610_612_736_000,
+            "\"1.5Gi\" must resolve to 1.5 * 1024^3 * 1000 milli-bytes; reading it as 0 would \
+             let the scheduler place a pod on a node without enough free memory to hold it"
+        );
+    }
+
+    /// A negative fractional quantity must round-trip through the same f64 fallback as the
+    /// positive cases — a fix that only handled positive fractions would still silently drop
+    /// this input to 0.
+    #[test]
+    fn parse_quantity_milli_negative_fractional_parses_exactly() {
+        assert_eq!(
+            parse_quantity_milli("-1.5"),
+            -1500,
+            "a negative fractional quantity must parse to its exact negative milli-value, \
+             not be silently read as 0"
+        );
+    }
+
+    /// Whole-number input must stay on the exact i64 fast path, not get routed through f64 —
+    /// large magnitudes (multi-exabyte node capacities) would lose precision if every input
+    /// went through a float, and NodeResourcesFit depends on exact integer comparisons for
+    /// the common non-fractional case.
+    #[test]
+    fn parse_quantity_milli_integer_unaffected_by_fractional_support() {
+        assert_eq!(
+            parse_quantity_milli("2"),
+            2000,
+            "adding fractional support must not change the exact-integer fast path existing \
+             scheduler fit checks already depend on"
+        );
+        assert_eq!(
+            parse_quantity_milli("30Gi"),
+            30 * 1024 * 1024 * 1024 * 1000,
+            "existing binary-suffix integer capacities/requests must still resolve exactly"
+        );
+    }
+
+    /// `NaN`/`inf` are not valid Kubernetes quantities even though `f64::from_str` happily
+    /// parses them — without an explicit finite check, the f64 fallback added for fractional
+    /// support would treat a malformed capacity/request string as a nonsensical numeric value
+    /// instead of the "unparseable" 0 every other invalid input maps to.
+    #[test]
+    fn parse_quantity_milli_rejects_non_finite() {
+        assert_eq!(
+            parse_quantity_milli("NaN"),
+            0,
+            "\"NaN\" must be treated as unparseable (0), not accepted via the fractional \
+             fallback"
+        );
+        assert_eq!(
+            parse_quantity_milli("inf"),
+            0,
+            "\"inf\" must be treated as unparseable (0), not accepted via the fractional \
+             fallback"
+        );
+        assert_eq!(
+            parse_quantity_milli("-inf"),
+            0,
+            "\"-inf\" must be treated as unparseable (0), not accepted via the fractional \
+             fallback"
+        );
     }
 
     // resource_fits / NodeResourcesFit resource-dimension tests:
