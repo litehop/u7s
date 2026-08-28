@@ -33,7 +33,18 @@ CRASH_MARKER="/tmp/kcm-crashed.marker"
 # itself — that indirection made an earlier version of this test unable to
 # tell the exec'd child apart from the supervisor wrapper (whose own argv
 # also contains the fake binary's path as an argument).
-SLEEP_BIN="$(command -v sleep)"
+SLEEP_BIN="$(command -v sleep || true)"
+if [ -z "$SLEEP_BIN" ]; then
+  # Unlike an optional external tool (e.g. limactl, absent by default on CI
+  # runners), 'sleep' is the load-bearing kcm stand-in this whole file's
+  # PID-matching design depends on -- an empty SLEEP_BIN would make
+  # FAKE_PATTERN=" 300" accidentally match the supervisor wrapper's own
+  # command line (its trailing "300" arg is always space-adjacent), turning
+  # every assertion below into a false PASS instead of a clear failure. Fail
+  # loud here instead of letting that vacuous-pass hazard through.
+  echo "FAIL: 'sleep' binary not found on PATH -- required as this test's kube-controller-manager stand-in" >&2
+  exit 1
+fi
 FAKE_PATTERN="${SLEEP_BIN} 300"
 
 PASS=0
