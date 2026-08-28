@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Worktree hygiene loop body -- see the bootstrap doc's worktree-hygiene
 # section for WHEN this runs (60m cron) and WHY it's auto-run instead of
-# approval-gated. This file is the WHAT: the mechanical STEP A-D body,
+# approval-gated. This file is the WHAT: the mechanical STEP A-E body,
 # extracted out of that doc so a routine hygiene tick no longer costs an
 # orchestrator model turn parsing `ps`/`git` output by hand.
 #
@@ -21,19 +21,29 @@
 # STEP B: `git worktree prune -v` -- safe by definition, only removes
 #   metadata for worktrees whose directories are already gone.
 # STEP C: delete stale `worker/agent-*` branches, guarded so an in-flight
-#   worker's branch (checked out in some worktree) and any branch unmerged
+#   worker's branch (checked out in some worktree, or with a live worktree
+#   directory even if currently checked out elsewhere), any branch unmerged
 #   by patch-id (catches squash-merges too, which `git branch --merged`
-#   would miss) are never touched.
+#   would miss), and any branch with an open PR (patch-id alone can't see
+#   this: a PR's commits can reach main via a DIFFERENT PR while the
+#   original stays open, and force-deleting that branch auto-closes it,
+#   destroying review state) are never touched.
 # STEP D: delete non-worker branches whose tracked upstream is gone, via
 #   `-d` (refuses anything unmerged -- an extra safety net on top of D's
 #   own scope, which never matches branches with no upstream at all).
+# STEP E: warn (never delete) about tracked ai/findings/*.md files whose
+#   `Bead:` header is closed or absent from LIVE bd state -- the drift
+#   backstop for check-findings-closed-bead-refs.sh's CI-side check, which
+#   can only see the git-tracked bd export and so misses a bead closed
+#   since the export's last commit, or pruned after closing.
 #
 # Exit codes: 0 = clean tick, nothing found. Non-zero = an anomaly for the
 # mayor to look at -- currently only STEP A's kill-verify failure (a process
 # that survives its kill signal may be zombied/reparented and needs manual
 # investigation, not an automatic retry); STEP B-D failures surface via this
 # script's own `set -e` (a `git fetch`/`branch` failure aborts the run with
-# git's exit code, which is itself already non-zero).
+# git's exit code, which is itself already non-zero). STEP E never
+# contributes to the exit code -- it only reports, it never mutates.
 #
 # DRY_RUN=1 turns every destructive command (pkill, git branch -D/-d) into a
 # logged no-op via run_cmd() -- same idiom the sibling merge/dashboard
@@ -200,11 +210,46 @@ is_unmerged_by_patch_id() {
   [ -n "$(git -C "$REPO_ROOT" cherry origin/main "$branch" 2>/dev/null)" ]
 }
 
+# True (exit 0) iff `branch` appears in the given newline-separated list of
+# open PRs' head branch names. Observed 2026-08-28: PR #1433's commits
+# reached main via a different PR (#1435) while #1433 itself was still
+# open -- is_unmerged_by_patch_id alone would call #1433's branch "safe to
+# delete" since its patch-id is already in origin/main, but deleting a
+# branch with an open PR makes GitHub auto-close that PR, destroying its
+# review state and any unresolved threads. patch-id cannot see this; only
+# a PR-state check can.
+has_open_pr() {
+  local branch="$1" open_pr_branches="$2"
+  printf '%s\n' "$open_pr_branches" | grep -qxF "$branch"
+}
+
+# True (exit 0) iff `branch` is `worker/agent-<id>` and a live worktree
+# directory ai/worktrees/agent-<id> exists, regardless of which branch that
+# worktree currently has checked out. Observed 2026-08-28: a worker
+# switched its worktree to a scratch branch mid-dispatch to build a
+# throwaway PR, leaving worker/agent-<id> checked out nowhere -- the
+# in-flight guard (is_checked_out) alone is blind to this, since it only
+# protects a branch that's CURRENTLY checked out somewhere. The worktree
+# directory name encodes the agent id directly, so this is a plain
+# name-to-directory lookup rather than a snapshot of what's checked out
+# right now.
+has_live_worktree_dir() {
+  local branch="$1" repo_root="$2"
+  local agent_id="${branch#worker/agent-}"
+  [ "$agent_id" != "$branch" ] && [ -d "$repo_root/ai/worktrees/agent-$agent_id" ]
+}
+
 step_c_stale_worker_branches() {
   run_cmd git -C "$REPO_ROOT" fetch origin main
-  local porcelain checked_out branch
+  local porcelain checked_out branch open_pr_branches
   porcelain=$(git -C "$REPO_ROOT" worktree list --porcelain)
   checked_out=$(checked_out_branches "$porcelain")
+  # Fetched once up front (not per-branch) to keep this to a single `gh`
+  # call regardless of how many worker/agent-* branches exist. A `gh`
+  # failure here aborts the whole tick via this script's own `set -e`
+  # (see file header) rather than silently deleting branches without the
+  # PR check that motivated this guard in the first place.
+  open_pr_branches=$(gh pr list -R litehop/u7s --state open --json headRefName --jq '.[].headRefName')
   while IFS= read -r branch; do
     [ -n "$branch" ] || continue
     case "$branch" in
@@ -213,6 +258,8 @@ step_c_stale_worker_branches() {
     esac
     is_checked_out "$branch" "$checked_out" && continue
     is_unmerged_by_patch_id "$branch" && continue
+    has_open_pr "$branch" "$open_pr_branches" && continue
+    has_live_worktree_dir "$branch" "$REPO_ROOT" && continue
     run_cmd git -C "$REPO_ROOT" branch -D "$branch"
   done < <(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/heads/)
 }
@@ -238,12 +285,74 @@ step_d_gone_upstream_branches() {
   done < <(gone_upstream_branches "$refs")
 }
 
+# ---------------------------------------------------------------------------
+# STEP E -- findings-enforcement drift backstop.
+#
+# CI's check-findings-closed-bead-refs.sh reads .beads/issues.jsonl, the
+# git-tracked bd export, which only refreshes at session-wrap commits and
+# loses a bead entirely once it closes AND is later `bd prune`-d -- two
+# documented holes on that check's own bead. This step reads LIVE bd
+# state instead (bd IS available in the mayor's own environment, unlike
+# CI's), closing both: a bead closed since the export was last committed,
+# and a bead pruned after closing, which the export-based check can only
+# treat as "no signal" since it can't tell "pruned" apart from "not
+# exported yet". Live bd has no such staleness excuse, so this step
+# treats "no live record at all" as ALSO stale, unlike the CI check.
+#
+# WARN-ONLY, not auto-delete: unlike STEP A-D (process kills, worktree
+# metadata pruning, branch deletion -- none of which touch the tracked
+# tree or need a commit), deleting a findings/*.md file requires
+# committing that deletion. An unattended cron sweep committing tree
+# changes on its own is a materially bigger action than anything else in
+# this loop, so this step reports loudly and leaves the delete-and-commit
+# to a human or a follow-up workflow.
+# ---------------------------------------------------------------------------
+
+# Bead ID from a findings file's `Bead: <id>` header (first 5 lines), or
+# empty if absent. Mirrors check-findings-closed-bead-refs.sh's own
+# extraction exactly so this step flags the same files that gate would.
+bead_id_from_finding() {
+  local f="$1" bead_line
+  bead_line=$(head -n 5 "$f" | grep -m1 -E '^Bead: ' || true)
+  printf '%s' "$bead_line" | sed -E 's/^Bead: *//' | tr -d '[:space:]'
+}
+
+# True (exit 0) iff a bead in the given live-bd status is stale enough to
+# warn about: closed, or an empty status (bd has no live record at all --
+# pruned after closing, or a bad reference; either way there's nothing left
+# to cross-reference).
+is_stale_bead_status() {
+  local status="$1"
+  [ "$status" = "closed" ] || [ -z "$status" ]
+}
+
+step_e_stale_findings() {
+  local findings f bead_id status
+  findings=$(git -C "$REPO_ROOT" ls-files 'ai/findings/*.md' | grep -v '^ai/findings/legacy/') || true
+  [ -n "$findings" ] || return 0
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    bead_id=$(bead_id_from_finding "$REPO_ROOT/$f")
+    [ -n "$bead_id" ] || continue
+    status=$(bd -C "$REPO_ROOT" show "$bead_id" --json 2>/dev/null | jq -r '.[0]?.status // empty') || true
+    if is_stale_bead_status "$status"; then
+      if [ -z "$status" ]; then
+        echo "[hygiene] stale-finding: $f references $bead_id, which bd has no live record of (pruned, or a bad reference) -- delete it, git history is the archive"
+      else
+        echo "[hygiene] stale-finding: $f references $bead_id, which is closed -- delete it, git history is the archive"
+      fi
+    fi
+  done <<< "$findings"
+}
+
 main() {
   local rc=0
   step_a_orphaned_processes || rc=1
   step_b_prune_worktrees
   step_c_stale_worker_branches
   step_d_gone_upstream_branches
+  step_e_stale_findings
   exit "$rc"
 }
 

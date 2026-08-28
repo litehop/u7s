@@ -29,12 +29,16 @@ set -euo pipefail
 PASS=0
 FAIL=0
 LEFTOVER_PIDS=()
+FIFO_DIR=""
 
 cleanup() {
   local p
   for p in "${LEFTOVER_PIDS[@]:-}"; do
     [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
   done
+  exec 3<&- 2>/dev/null || true
+  exec 4<&- 2>/dev/null || true
+  [ -n "$FIFO_DIR" ] && rm -rf "$FIFO_DIR"
 }
 trap cleanup EXIT
 
@@ -92,15 +96,28 @@ find_free_port() {
 # ---------------------------------------------------------------------------
 # Get lsof -ti tcp:$PORT to genuinely return 2 distinct real PIDs for ONE
 # port: a listener and a client connected to it, both with stdin held open
-# via process substitution (a plain nc otherwise sees stdin EOF immediately
-# in this non-interactive context and exits before the test can observe it).
+# (a plain nc otherwise sees stdin EOF immediately in this non-interactive
+# context and exits before the test can observe it).
+#
+# Each nc's stdin is a FIFO this shell holds open read+write via `exec N<>`
+# (opening a FIFO O_RDWR never blocks and never signals EOF to a reader, per
+# POSIX) rather than the earlier `< <(sleep 300)` process substitution: that
+# spawned sleep as an untracked grandchild whose PID this test never
+# captured, so killing only $LISTENER_PID/$CLIENT_PID on cleanup left it
+# running as a 300s orphan. The exec+FIFO form needs no extra process at
+# all, so there is nothing left to leak.
 # ---------------------------------------------------------------------------
 PORT="$(find_free_port)"
-nc -l "$PORT" < <(sleep 300) &
+FIFO_DIR="$(mktemp -d)"
+mkfifo "$FIFO_DIR/listener" "$FIFO_DIR/client"
+
+exec 3<> "$FIFO_DIR/listener"
+nc -l "$PORT" <&3 &
 LISTENER_PID=$!
 LEFTOVER_PIDS+=("$LISTENER_PID")
 sleep 0.5
-nc 127.0.0.1 "$PORT" < <(sleep 300) &
+exec 4<> "$FIFO_DIR/client"
+nc 127.0.0.1 "$PORT" <&4 &
 CLIENT_PID=$!
 LEFTOVER_PIDS+=("$CLIENT_PID")
 sleep 0.5

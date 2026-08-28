@@ -184,6 +184,51 @@ assert "a squash-merged branch (same patch, different SHA) still produces cherry
   "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 3b. STEP C -- open-PR guard. Observed 2026-08-28: PR #1433's
+#    commits reached main via a DIFFERENT PR (#1435) while #1433 itself was
+#    still open -- patch-id alone would call #1433's branch safe to delete,
+#    but deleting it would auto-close the still-open PR and destroy its
+#    review state. This must be judged on PR state, not patch-id.
+# ---------------------------------------------------------------------------
+OPEN_PRS='worker/agent-has-open-pr
+worker/agent-other-open-pr'
+
+RC=0
+call has_open_pr 'worker/agent-has-open-pr' "$OPEN_PRS" || RC=$?
+assert "a branch with an open PR is guarded, even though its commits might already be merged elsewhere by patch-id" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call has_open_pr 'worker/agent-no-pr' "$OPEN_PRS" || RC=$?
+assert "a branch with no open PR is not guarded by the open-PR check" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 3c. STEP C -- live-worktree-directory guard. Observed
+#    2026-08-28: a worker switched its worktree to a scratch branch
+#    mid-dispatch, leaving worker/agent-<id> checked out nowhere --
+#    is_checked_out alone is blind to this since it only sees what's
+#    checked out RIGHT NOW, not which worktree directories still exist.
+# ---------------------------------------------------------------------------
+LIVE_AGENT_DIR="$SANDBOX_ROOT/live-agent-worktrees/ai/worktrees/agent-live123"
+mkdir -p "$LIVE_AGENT_DIR"
+
+RC=0
+call has_live_worktree_dir 'worker/agent-live123' "$SANDBOX_ROOT/live-agent-worktrees" || RC=$?
+assert "a worker/agent-<id> branch with a live worktree directory is guarded, regardless of what that worktree currently has checked out" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call has_live_worktree_dir 'worker/agent-gone456' "$SANDBOX_ROOT/live-agent-worktrees" || RC=$?
+assert "a worker/agent-<id> branch with no matching worktree directory is not guarded by this check" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call has_live_worktree_dir 'main' "$SANDBOX_ROOT/live-agent-worktrees" || RC=$?
+assert "a non-worker/agent-* branch name (e.g. main) never matches this check, even if a coincidentally-named directory existed" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 4. STEP D -- gone-upstream match.
 # ---------------------------------------------------------------------------
 
@@ -218,6 +263,53 @@ assert "...and the gated command genuinely did not execute" \
 call run_cmd touch "$MARKER" >/dev/null
 assert "without DRY_RUN, run_cmd executes the real command" \
   "$([ -e "$MARKER" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 6. STEP E -- findings-enforcement drift backstop. Only the two pure
+#    functions are covered here (bead-id extraction and staleness
+#    classification, which together fully capture the branching logic);
+#    step_e_stale_findings() itself isn't, since it calls live `bd show`
+#    against this repo's real, mutable bead state -- referencing a real
+#    bead ID here would make the test's outcome depend on that bead's
+#    status at whatever moment CI happens to run, silently flipping
+#    PASS/FAIL as unrelated bead lifecycle events occur elsewhere. This was
+#    instead verified manually against real live bd state during
+#    development (a scratch ai/findings/*.md staged against a genuinely
+#    closed bead, a genuinely open bead, and a nonexistent bead ID all
+#    produced the expected warn/silent split) -- the same "exercise the
+#    real thing, not a synthetic stand-in" principle this suite follows
+#    elsewhere, just not automatable here without a disposable bd database.
+# ---------------------------------------------------------------------------
+
+FINDING_CLOSED="$SANDBOX_ROOT/finding-closed.md"
+printf 'Bead: fixture-closed-1\n\nBody text.\n' > "$FINDING_CLOSED"
+assert "bead_id_from_finding extracts the bead id from a well-formed header" \
+  "$([ "$(call bead_id_from_finding "$FINDING_CLOSED")" = "fixture-closed-1" ] && echo 1 || echo 0)"
+
+FINDING_NO_HEADER="$SANDBOX_ROOT/finding-no-header.md"
+printf 'Just prose, no bead reference.\n' > "$FINDING_NO_HEADER"
+assert "bead_id_from_finding returns empty for a file with no Bead: header (must not be treated as a match for any bead)" \
+  "$([ -z "$(call bead_id_from_finding "$FINDING_NO_HEADER")" ] && echo 1 || echo 0)"
+
+RC=0
+call is_stale_bead_status "closed" || RC=$?
+assert "is_stale_bead_status flags a closed bead as stale (the case check-findings-closed-bead-refs.sh already catches via the export)" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call is_stale_bead_status "" || RC=$?
+assert "is_stale_bead_status flags an empty (no live bd record) status as stale -- the pruned-bead hole the export-based CI check cannot see" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call is_stale_bead_status "open" || RC=$?
+assert "is_stale_bead_status does NOT flag an open bead -- must not warn on every routine in-flight finding" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call is_stale_bead_status "in_progress" || RC=$?
+assert "is_stale_bead_status does NOT flag an in_progress bead" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

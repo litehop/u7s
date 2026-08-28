@@ -22,6 +22,10 @@
 #      same stubbed backend (which never validates the JWT's issuer) happily
 #      returns a token anyway -- exactly the silent-empty-token bug that
 #      would make GH_TOKEN="" fall back to the operator's own gh credentials.
+#   4b. The same non-zero/empty-stdout guarantee holds against realistic
+#      malformed mint-response bodies too (missing .token, null, empty
+#      string), not just a bad local precondition -- proven against the
+#      curl stub's overridable response body, not assumed.
 #   5. stdout is exactly one line, the token -- the caller does
 #      GH_TOKEN=$(scripts/gh-app-token.sh), so any stray diagnostic line on
 #      stdout poisons the token.
@@ -62,25 +66,43 @@ openssl rsa -in "$KEY" -pubout -out "$PUB" >/dev/null 2>&1
 # validates the JWT it receives -- that asymmetry is what the assertion-4
 # mutation self-check below relies on to prove the ${VAR:?} guards, not this
 # stub, are what stop a silently-empty issuer from still yielding a token.
-STUB_TOKEN="test-stub-token-not-a-real-credential"
+#
+# The real script sends Authorization via a stdin-fed `-K -` config file
+# (never as a `-H` argv, so it never shows up in `ps`), so this stub reads
+# the header out of its own stdin rather than out of "$@" -- AUTH_CAPTURE
+# and STUB_TOKEN are exported (not heredoc-interpolated) so the stub, a
+# separate process, can read them at runtime without fighting heredoc
+# quoting rules to embed a literal '"' in the generated script text.
+# STUB_TOKEN_BODY lets a caller override the POST response body (default
+# unset -> the normal {"token":...} shape) to exercise malformed-response
+# handling.
+export STUB_TOKEN="test-stub-token-not-a-real-credential"
 STUBDIR="$WORK/stubbin"
 mkdir -p "$STUBDIR"
-AUTH_CAPTURE="$WORK/last-auth-header"
-cat > "$STUBDIR/curl" <<STUBEOF
+export AUTH_CAPTURE="$WORK/last-auth-header"
+cat > "$STUBDIR/curl" <<'STUBEOF'
 #!/usr/bin/env bash
 method="GET"
 prev=""
-for arg in "\$@"; do
-  if [ "\$prev" = "-X" ]; then method="\$arg"; fi
-  if [ "\$prev" = "-H" ]; then
-    case "\$arg" in
-      Authorization:*) printf '%s' "\$arg" > "$AUTH_CAPTURE" ;;
-    esac
-  fi
-  prev="\$arg"
+for arg in "$@"; do
+  if [ "$prev" = "-X" ]; then method="$arg"; fi
+  prev="$arg"
 done
-if [ "\$method" = "POST" ]; then
-  printf '{"token":"%s"}\n' "$STUB_TOKEN"
+while IFS= read -r line; do
+  case "$line" in
+    'header = "Authorization: '*)
+      hdr="${line#header = \"}"
+      hdr="${hdr%\"}"
+      printf '%s' "$hdr" > "$AUTH_CAPTURE"
+      ;;
+  esac
+done
+if [ "$method" = "POST" ]; then
+  if [ -n "${STUB_TOKEN_BODY:-}" ]; then
+    printf '%s\n' "$STUB_TOKEN_BODY"
+  else
+    printf '{"token":"%s"}\n' "$STUB_TOKEN"
+  fi
 else
   printf '{"id":999123}\n'
 fi
@@ -189,6 +211,24 @@ assert "...with stderr output naming the problem" \
   "$([ -n "$RUN_ERR" ] && echo 1 || echo 0)"
 assert "...and, critically, EMPTY stdout" \
   "$([ -z "$RUN_OUT" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 4b. Realistic malformed mint-response shapes. Assertion 4 above only
+#    proves the ${VAR:?} guards fire on a bad LOCAL precondition; it never
+#    exercises what happens if GitHub's own access-token endpoint returns a
+#    200 whose body carries no usable token -- a missing key, an explicit
+#    null, or an empty string, all shapes a real API edge case could
+#    plausibly produce. Each must still exit non-zero with empty stdout,
+#    same as assertion 4, or GH_TOKEN="$(...)" silently falls back to the
+#    operator's own gh credentials with no visible error.
+# ---------------------------------------------------------------------------
+for MALFORMED_BODY in '{}' '{"token":null}' '{"token":""}'; do
+  STUB_TOKEN_BODY="$MALFORMED_BODY" run_script "424242" "$KEY"
+  assert "a mint response body of $MALFORMED_BODY exits non-zero instead of yielding an unusable token" \
+    "$([ "$RUN_RC" -ne 0 ] && echo 1 || echo 0)"
+  assert "...and, critically, EMPTY stdout for body $MALFORMED_BODY" \
+    "$([ -z "$RUN_OUT" ] && echo 1 || echo 0)"
+done
 
 # ---------------------------------------------------------------------------
 # Mutation self-check (CLAUDE.md rule 14): prove the two assertions above
