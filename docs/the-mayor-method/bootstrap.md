@@ -55,12 +55,14 @@ consume in 30 seconds, so:
 Full rewrites with the `Write` tool are expected and cheaper than a warped log; do
 not fear replacing the whole file when it has drifted.
 
-**Findings vs extended-context.** `ai/findings/` is gitignored exploratory work
-(audits, drafts, alternatives); always write the finding doc BEFORE filing the
-beads it would spawn. `ai/extended-context/` is committed durable context for
-the next fresh mayor (initiative state, recent strategic decisions, why a
-non-obvious convention exists). When unsure: would a fresh mayor next week need
-this? Yes → extended-context. No → findings.
+**Findings vs extended-context.** `ai/findings/` is git-tracked exploratory
+work (audits, drafts, alternatives) scoped to one bead's lifetime — committed
+with the bead's work, deleted in its close commit (see README's "Findings
+lifecycle"); always write the finding doc BEFORE filing the beads it would
+spawn. `ai/extended-context/` is committed durable context for the next fresh
+mayor (initiative state, recent strategic decisions, why a non-obvious
+convention exists) meant to persist indefinitely. When unsure: would a fresh
+mayor next week need this? Yes → extended-context. No → findings.
 
 **Dispatch discipline.** For each worker: dedicated worktree; one bounded task;
 explicit write scope; project stance injected into the preamble; enumerate
