@@ -142,7 +142,14 @@ chmod +x "$STUBDIR/kubectl"
 # through to the real limactl found below, so this stub can sit on PATH for
 # the whole test file without changing any test's existing behavior.
 # ---------------------------------------------------------------------------
-REAL_LIMACTL="$(command -v limactl)"
+# CI runners (script-tests' ubuntu-latest job) have no lima installed at all,
+# so `command -v limactl` finding nothing is the expected case there, not an
+# error -- `|| true` keeps that from tripping this file's own `set -e` and
+# killing it before a single PASS/FAIL line prints. An empty REAL_LIMACTL
+# still behaves correctly below: `exec ""` fails with the same "not found"
+# exit status a genuinely absent limactl binary would have produced anyway,
+# which every real caller (sample_vm_rss/sample_vm_free) already tolerates.
+REAL_LIMACTL="$(command -v limactl || true)"
 LIMACTL_STUB_STATE="$TMPDIR_TEST/limactl-state"
 export LIMACTL_STUB_STATE
 cat > "$STUBDIR/limactl" <<STUB
@@ -171,7 +178,17 @@ echo "down" > "$LIMACTL_STUB_STATE"
 # 1. Start/reap happy path — real listener stands in for the apiserver.
 # ===========================================================================
 PORT1="$(find_free_port)"
-nc -l "$PORT1" < <(sleep 300) &
+# A plain `< <(sleep 300)` process substitution here would leak that sleep as
+# an untracked, unkillable-via-$! orphan: killing nc's own PID does not
+# touch the separate subshell feeding its stdin, so it would keep running
+# for its own full 300s after this file has already exited (GH Actions'
+# post-job "Terminate orphan process" cleanup is what actually reaps it, not
+# this script). A named FIFO gives sleep a real, trackable PID instead.
+NC_STDIN_FIFO="$TMPDIR_TEST/nc-stdin-fifo"
+mkfifo "$NC_STDIN_FIFO"
+sleep 300 > "$NC_STDIN_FIFO" &
+LEFTOVER_PIDS+=("$!")
+nc -l "$PORT1" < "$NC_STDIN_FIFO" &
 STANDIN_PID=$!
 LEFTOVER_PIDS+=("$STANDIN_PID")
 sleep 0.3
@@ -360,6 +377,42 @@ if [ -f "$WORKDIR6/kcm-metrics-02-second.prom" ]; then
 else
   echo "PASS: an unreachable KCM leaves no kcm-metrics file behind, same non-fatal contract as the apiserver scrape"
   PASS=$(( PASS + 1 ))
+fi
+
+# ===========================================================================
+# 5. This whole file must run to completion on a PATH with no limactl
+#    anywhere on it -- the actual shape of script-tests' CI runner, which has
+#    no lima installed. Before the fix, resolving REAL_LIMACTL above failed
+#    under this file's own set -e and killed it before a single PASS/FAIL
+#    line printed, which silently tripped the outer script-tests harness's
+#    fail=1 even though zero real assertions had failed: a green suite must
+#    exit 0, or CI reports failure on passing tests and blocks every merge.
+#    NO_LIMACTL_CHILD guards the nested re-invocation from recursing into
+#    this same section again.
+# ===========================================================================
+# Redirected to a real FILE, deliberately not captured via "$(...)": a
+# command substitution blocks until every process holding its pipe's write
+# end has closed it, so any future background job in this file that forgets
+# to redirect away from stdout/stderr would silently turn this check into a
+# multi-minute stall instead of the few seconds it actually takes. A file
+# has no such "wait for every writer to close" requirement, so this reads
+# the exact same way script-tests' own `bash "$t" || fail=1` runs it: the
+# parent only waits on the direct child.
+if [ -z "${NO_LIMACTL_CHILD:-}" ]; then
+  NO_LIMACTL_LOG="$TMPDIR_TEST/no-limactl-run.log"
+  set +e
+  NO_LIMACTL_CHILD=1 PATH="/usr/bin:/bin:/usr/sbin:/sbin" bash "${BASH_SOURCE[0]}" > "$NO_LIMACTL_LOG" 2>&1
+  NO_LIMACTL_STATUS=$?
+  set -e
+  assert_true "the whole suite exits 0 with no limactl anywhere on PATH" "$NO_LIMACTL_STATUS"
+  if grep -q "^Results: [0-9]* passed, 0 failed$" "$NO_LIMACTL_LOG"; then
+    echo "PASS: the no-limactl run actually reached its own summary line (ran every assertion, not just exiting 0 for an unrelated early reason)"
+    PASS=$(( PASS + 1 ))
+  else
+    echo "FAIL: no-limactl run never reached its own summary line — got:"
+    cat "$NO_LIMACTL_LOG"
+    FAIL=$(( FAIL + 1 ))
+  fi
 fi
 
 # ---------------------------------------------------------------------------
