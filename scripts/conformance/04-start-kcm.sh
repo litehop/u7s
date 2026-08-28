@@ -77,7 +77,10 @@ export TZ=UTC
 # inherit it as ordinary child processes. GOMEMLIMIT is a soft cap: GC works
 # harder as it's approached, it never OOM-kills, so this is safe to trial and
 # fully reversible.
-export GOMEMLIMIT=200MiB
+# Round-2: 200MiB->128MiB. Two tuned full-conformance samples measured
+# KCM peak at 109.2MB/112.8MB (transient 115.48MB) -- 128MiB still clears
+# that by 19-25MB while giving GC less headroom to coast on.
+export GOMEMLIMIT=128MiB
 export GOGC=50
 export GOMAXPROCS=2
 # Verbosity flag: when run-all.sh is invoked with --verbose it passes --kcm-v <N>,
@@ -138,18 +141,27 @@ fi
 echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
 SUPERVISOR_LOG="/tmp/kcm-supervisor.log"
 chmod +x /tmp/kcm-supervisor.sh
+# -clusterrole-aggregation-controller / -device-taint-eviction-controller:
+# see scripts/install.sh's u7s-kcm.service for why -- mirrored here so the
+# conformance run exercises what ships.
+# --authorization-always-allow-paths below adds /metrics to the default
+# /healthz,/readyz,/livez allow-list. Without it, sample-run-metrics.sh's
+# unauthenticated curl to :10257/metrics gets a 403 -- confirmed: archived
+# kcm-metrics-*.prom snapshots hold a JSON Forbidden body, not Prometheus
+# text, so it's not just missing go_memstats, it's zero series of any kind.
 setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --kubeconfig="\$KUBECONFIG_FILE" \\
   --cluster-signing-cert-file="\$CA_CERT" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
   --service-account-private-key-file="\$WORKDIR/sa.key" \\
   --root-ca-file="\$CA_CERT" \\
-  --controllers='*,-cloud-node-lifecycle-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \\
+  --controllers='*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \\
   --concurrent-gc-syncs=5 \\
   --use-service-account-credentials=false \\
   --leader-elect=false \\
   --bind-address=127.0.0.1 \\
   --kube-api-content-type=application/json \\
+  --authorization-always-allow-paths=/healthz,/readyz,/livez,/metrics \\
   \$KCM_V_FLAG \\
   > "\$SUPERVISOR_LOG" 2>&1 &
 

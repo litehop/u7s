@@ -932,10 +932,23 @@ ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE
 # fix below, measured independently for KCM rather than assumed to
 # transfer. GOMEMLIMIT is a soft cap (GC works harder as it's approached,
 # never OOM-kills), so this is safe to trial and fully reversible.
-Environment=GOMEMLIMIT=200MiB
+# Round-2: 200MiB->128MiB. Two tuned full-conformance samples measured
+# KCM peak at 109.2MB/112.8MB (transient 115.48MB) -- 128MiB still clears
+# that by 19-25MB while giving GC less headroom to coast on.
+Environment=GOMEMLIMIT=128MiB
 Environment=GOGC=50
 Environment=GOMAXPROCS=2
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,-cloud-node-lifecycle-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+# -clusterrole-aggregation-controller: u7s never sets ClusterRole.aggregationRule
+# (no shipped ClusterRole uses it, no code reads it) so this controller has no
+# object to ever act on; the informer it shares (ClusterRoles) is already kept
+# warm by RBAC authorization itself.
+# -device-taint-eviction-controller: DRA is GA (DynamicResourceAllocation) and
+# u7s fully serves resource.k8s.io/v1 (DeviceClass/ResourceClaim/
+# ResourceClaimTemplate/ResourceSlice), but the DeviceTaintRule type this
+# controller acts on lives at resource.k8s.io/v1beta2, a version u7s does not
+# serve at all -- no DeviceTaintRule can ever exist, so device-taint-based
+# eviction is structurally unreachable regardless of this flag.
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 
