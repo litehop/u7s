@@ -189,20 +189,26 @@ The `## critical-reviewer findings` header is a load-bearing marker: the merge-P
 Then post it yourself, per deliverable type:
 
 - **`deliverable_type: pr`** (ref is a PR URL, extract `<N>`): post ONE
-  Pull Request Review — not a plain issue comment — via `gh api
-  repos/litehop/u7s/pulls/<N>/reviews -X POST --input -`. Always use
-  `"event": "COMMENT"`, unconditionally, for every verdict including
-  `needs-changes`/`needs-discussion`. Do NOT use `event: "REQUEST_CHANGES"`
-  or `"APPROVE"`, and do NOT call `gh pr review --request-changes`: every PR
-  in this repo (worker and operator alike) is authored under the same
-  GitHub account the reviewer authenticates as, and GitHub hard-blocks both
-  on your own PR — confirmed empirically against this exact
-  `pulls/<N>/reviews` endpoint: `event=REQUEST_CHANGES` errors "Can not
-  request changes on your own pull request", `event=APPROVE` errors "Can
-  not approve your own pull request". The review body's `**Verdict**:
-  needs-changes` text is what the merge gate keys off — a GitHub-native
-  review-state mechanism would need a second bot identity, which is out of
-  scope here.
+  Pull Request Review — not a plain issue comment — under the
+  `litehop-reviewer[bot]` App identity by piping the payload into
+  `scripts/gh-app-review.sh <N>` (never the operator's own `gh api
+  ... --input -`, and never `gh pr review` directly: the wrapper mints the
+  App's installation token and POSTs in one process, which is also the only
+  shape the sandbox's first-token command allowlist accepts). Map the
+  findings block's own `**Verdict**` to the review `event`: `LGTM` and
+  `LGTM-with-suggestions` → `APPROVE`; `needs-changes` and
+  `needs-discussion` → `REQUEST_CHANGES`. The bot is not the PR's author, so
+  GitHub's self-review block does not apply — that only becomes a problem
+  again if a PR is ever authored by the bot itself, which is not a live case
+  today (workers push under the operator identity).
+
+  **Mint-failure fallback:** if `scripts/gh-app-review.sh <N>` exits
+  non-zero, retry ONCE — post the same body as `"event": "COMMENT"` via `gh
+  api repos/litehop/u7s/pulls/<N>/reviews -X POST --input -` under the
+  operator's own token — and say so explicitly in your returned
+  confirmation: the App mint failed and the review posted as a fallback
+  comment. Without this, a key hiccup means no review posts at all and the
+  merge gate holds the PR with no visible cause.
 
   Partition your findings before building the JSON payload:
   - Each **Confirmed findings** / **Suspicions** bullet whose Evidence cites
@@ -250,11 +256,14 @@ Then post it yourself, per deliverable type:
      (e.g. `scripts/conformance/write-build-provenance.sh`'s
      `VM_SPECS_JSON="[$(vm_spec_json "$VM"), ...]"`). Each piece is already
      safely escaped, so string-splicing compact `jq -c` output is safe.
-  4. Build the final payload and pipe it straight into `gh api` in one
-     pipeline — never store it in an intermediate string the shell might
-     re-interpret: `jq -n --arg body "$BODY" --arg event COMMENT --argjson
-     comments "$COMMENTS" '{body:$body, event:$event, comments:$comments}' |
-     gh api repos/litehop/u7s/pulls/<N>/reviews -X POST --input -`.
+  4. Build the final payload and pipe it straight into the posting command
+     in one pipeline — never store it in an intermediate string the shell
+     might re-interpret: `jq -n --arg body "$BODY" --arg event "$EVENT"
+     --argjson comments "$COMMENTS" '{body:$body, event:$event,
+     comments:$comments}' | scripts/gh-app-review.sh <N>`. On a non-zero
+     exit, retry once per the mint-failure fallback above, substituting
+     `--arg event COMMENT` and `gh api repos/litehop/u7s/pulls/<N>/reviews
+     -X POST --input -` for the `scripts/gh-app-review.sh` call.
 - **`deliverable_type: findings`** (ref is a file path under `ai/findings/`):
   there is no PR to comment on. Identify the originating bead ID — findings
   docs consistently name it in their own title/intro (grep the doc for the
