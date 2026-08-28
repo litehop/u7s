@@ -160,6 +160,49 @@ assert "missing .beads/issues.jsonl is a hard failure, not a silent pass" \
   "$([ "$RC6" -ne 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 7. .beads/issues.jsonl exists but is empty (0 bytes, no records) and a
+#    finding cites a bead that IS actually closed -> hard failure, not a
+#    silent pass. This is the vacuous-pass hole that scenario 4 (absent
+#    bead ID = no signal) opened a back door to: an empty export produces
+#    the exact same jq "no match" result as a bead merely not being in a
+#    populated export, so without a record-count check, this scenario
+#    would false-pass a genuinely closed bead's finding -- the very bug
+#    this whole check exists to catch.
+# ---------------------------------------------------------------------------
+S7="$SANDBOX_ROOT/7-empty-export"
+new_sandbox "$S7"
+mkdir -p "$S7/.beads" "$S7/ai/findings"
+: > "$S7/.beads/issues.jsonl"
+printf 'Bead: fixture-closed-3\n\nSome finding body.\n' > "$S7/ai/findings/2026-08-27-fixture-empty-export-test.md"
+git -C "$S7" add ai/findings/2026-08-27-fixture-empty-export-test.md .beads/issues.jsonl
+RC7=$(run_gate "$S7")
+assert "empty .beads/issues.jsonl is a hard failure, even though it would otherwise pass a closed bead's finding" \
+  "$([ "$RC7" -ne 0 ] && echo 1 || echo 0)"
+assert "empty-export failure names the unusable export, not just a generic error" \
+  "$(grep -qF 'no bead records' "$S7/.gate-out" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 8. .beads/issues.jsonl exists and is non-empty but is not valid JSON ->
+#    hard failure (set -e/pipefail already forces this) with THIS script's
+#    own clear message identifying the export as malformed, not a bare jq
+#    parse-error dump. An operator hitting a raw jq error in CI would have
+#    to go read this script to work out what happened; a clear ERROR line
+#    is the same posture already used for the missing-file and missing-jq
+#    cases above.
+# ---------------------------------------------------------------------------
+S8="$SANDBOX_ROOT/8-malformed-export"
+new_sandbox "$S8"
+mkdir -p "$S8/.beads" "$S8/ai/findings"
+printf '{"id": "fixture-open-1", "status": }\n' > "$S8/.beads/issues.jsonl"
+printf 'Bead: fixture-open-1\n\nSome finding body.\n' > "$S8/ai/findings/2026-08-27-fixture-malformed-export-test.md"
+git -C "$S8" add ai/findings/2026-08-27-fixture-malformed-export-test.md .beads/issues.jsonl
+RC8=$(run_gate "$S8")
+assert "malformed .beads/issues.jsonl is a hard failure" \
+  "$([ "$RC8" -ne 0 ] && echo 1 || echo 0)"
+assert "malformed-export failure states the export is invalid, not a bare jq error" \
+  "$(grep -qF 'not valid JSONL' "$S8/.gate-out" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

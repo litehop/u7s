@@ -31,6 +31,14 @@
 # eventual (the next commit that updates the export after a close) rather
 # than immediate -- an accepted tradeoff for never depending on a tool CI
 # cannot run, against never enforcing this at all.
+#
+# Absent-bead-means-no-signal only holds if the export itself is usable.
+# An empty, record-free, or syntactically invalid .beads/issues.jsonl would
+# otherwise produce the exact same "no match" result as a genuinely absent
+# bead ID -- silently passing every finding, including ones citing beads
+# that really are closed. So file existence alone is not enough: the
+# record-count and parse-validity checks below establish the export is
+# usable BEFORE any per-bead absence is allowed to mean "no signal".
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -42,6 +50,17 @@ fi
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "ERROR: jq not found -- cannot read $ISSUES_FILE, refusing to pass" >&2
+  exit 1
+fi
+
+if ! record_count=$(jq -s 'length' "$ISSUES_FILE" 2>&1); then
+  echo "ERROR: $ISSUES_FILE is not valid JSONL -- cannot determine bead state, refusing to pass" >&2
+  echo "$record_count" >&2
+  exit 1
+fi
+
+if [ "$record_count" -eq 0 ]; then
+  echo "ERROR: $ISSUES_FILE contains no bead records -- cannot determine bead state, refusing to pass" >&2
   exit 1
 fi
 
