@@ -158,7 +158,7 @@ code behind them, `scripts/*.sh`, non-`src/` test dirs (e.g. `tests/`,
 `scripts/test-*.sh` fixtures) — with **no changes to code or any public-API surface**
 (handler signatures, protobuf/JSON encoders, CRD schemas, RBAC rules, any
 `src/**/*.rs` logic) qualifies for the low-effort tier: dispatch
-critical-reviewer with `model="haiku", effort="low"`. Every other PR — larger
+critical-reviewer with `model="haiku"`. Every other PR — larger
 diff, or any diff touching code or a public-API surface, regardless of size —
 stays on critical-reviewer.md's Sonnet default. A one-line `src/` fix does
 NOT qualify just because it's small; the surface criterion is independent of
@@ -170,22 +170,17 @@ Concrete invocation for a low-risk case (a 12-line `docs/decisions/` typo fix):
 Agent(
     subagent_type="critical-reviewer",
     model="haiku",
-    effort="low",
     prompt="Review PR https://github.com/litehop/u7s/pull/<N> ...",
 )
 ```
 
-For everything else, omit `model`/`effort` and let critical-reviewer.md's own
+For everything else, omit `model` and let critical-reviewer.md's own
 frontmatter (`model: sonnet`) apply.
 
-**UNVERIFIED (mayor-p6sj7):** `effort="low"` as a per-call `Agent()` override
-has no prior precedent anywhere in this repo, and worker agents cannot
-smoke-test it themselves (`Agent` is in every worker's `disallowedTools`).
-Only the mayor can run the actual smoke test. Until that's confirmed, don't
-assume this tier fires as documented — if the harness rejects or silently
-ignores `effort`, fall back to omitting it (still dispatch `model="haiku"`
-for the size/surface win, just without the effort override) and file that
-finding back to mayor-p6sj7.
+This tier ships `model="haiku"` only. An `effort="low"` override was
+considered but is non-functional: the Agent tool's JSONSchema declares
+`additionalProperties: false` with property set `{description, isolation,
+model, prompt, subagent_type}` — no `effort` (verified mayor-p6sj7).
 
 ## Common preamble (every dispatch)
 

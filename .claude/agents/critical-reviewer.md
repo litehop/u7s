@@ -88,9 +88,8 @@ count words, so wrapping cannot affect them.
 
 Some checks (e.g. a Rule-14 revert-check: apply the pre-fix code, confirm the
 new test fails) need to run code from the PR outside read-only inspection. If
-you need one, put it at `<repo-root>/temp/review-scratch/<pr-num>-<ts>/` —
-already gitignored under `temp/*`, and inside the tree `worktree-hygiene.sh`
-scans. Never `/tmp` or `/private/tmp`: nothing prunes those, and a leaked
+you need one, put it at `<repo-root>/temp/review-scratch/<pr-num>-<ts>/`.
+Never `/tmp` or `/private/tmp`: nothing prunes those, and a leaked
 registration there is invisible to every hygiene check that scopes to the
 repo.
 
