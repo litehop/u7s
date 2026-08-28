@@ -851,6 +851,23 @@ async fn watch_generic_impl<S: Store>(
 
     let label_selector = label_selector.unwrap_or_default();
     let field_selector = field_selector.unwrap_or_default();
+    // Quantifies how much of deletion_log's per-tombstone full-body fidelity (kept so a
+    // selector-scoped watch reconnecting after compaction can still evaluate its selector
+    // against a deleted object) is ever actually consumed vs. paid for on every deletion — see
+    // WATCH_OPENS_TOTAL's own doc.
+    // Quantifies how much of deletion_log's per-tombstone full-body fidelity (kept so a
+    // selector-scoped watch reconnecting after compaction can still evaluate its selector
+    // against a deleted object) is ever actually consumed vs. paid for on every deletion — see
+    // WATCH_OPENS_TOTAL's own doc.
+    crate::metrics::WATCH_OPENS_TOTAL
+        .with_label_values(
+            &[if label_selector.is_empty() && field_selector.is_empty() {
+                "false"
+            } else {
+                "true"
+            }],
+        )
+        .inc();
     let chunk_stream = async_stream::stream! {
         use futures_core::Stream;
         use std::pin::pin;
@@ -2133,6 +2150,113 @@ mod tests {
             after > before,
             "a successful watch open must record a duration sample for its {{group,resource}}; \
              before={before} after={after}"
+        );
+    }
+
+    /// A watch open must record itself into `u7s_apiserver_watch_opens_total` under
+    /// `has_selector="true"` when it carries a `labelSelector`, and `has_selector="false"` when
+    /// it carries neither selector — this counter quantifies how much of
+    /// deletion_log's per-tombstone full-body fidelity ever actually gets read by a
+    /// selector-scoped reconnect vs. paid for as write-and-never-read insurance on every
+    /// deletion. Fails on revert if the `.inc()` call in `watch_generic_impl` were deleted, or
+    /// mislabeled a selector-bearing open as `"false"` (or vice versa): a real watch open would
+    /// leave the wrong series unchanged instead of gaining a sample.
+    #[tokio::test]
+    async fn watch_generic_open_records_selector_presence_under_the_correct_label() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let true_before = crate::metrics::WATCH_OPENS_TOTAL
+            .with_label_values(&["true"])
+            .get();
+        let false_before = crate::metrics::WATCH_OPENS_TOTAL
+            .with_label_values(&["false"])
+            .get();
+
+        // A ?labelSelector= watch open must count under has_selector="true", not "false".
+        let with_selector = watch_generic(
+            state.clone(),
+            WatchConfig {
+                prefix: "/registry/watch-selector-metric-test-a/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: Some("app=frontend".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "watch-selector-metric-test-a".into(),
+                timeout_seconds: None,
+            },
+        )
+        .await;
+        assert!(
+            with_selector.is_ok(),
+            "watch open with a selector must succeed"
+        );
+
+        // A watch open with neither selector must count under has_selector="false", not "true".
+        let without_selector = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/watch-selector-metric-test-b/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "watch-selector-metric-test-b".into(),
+                timeout_seconds: None,
+            },
+        )
+        .await;
+        assert!(
+            without_selector.is_ok(),
+            "watch open with no selector must succeed"
+        );
+
+        let true_after = crate::metrics::WATCH_OPENS_TOTAL
+            .with_label_values(&["true"])
+            .get();
+        let false_after = crate::metrics::WATCH_OPENS_TOTAL
+            .with_label_values(&["false"])
+            .get();
+
+        // `>=`, not `==`: `has_selector` only ever takes two values, so this counter is shared
+        // by every other watch-opening test in this file running concurrently in the same test
+        // binary — an exact-delta assertion is flaky by construction (confirmed empirically: a
+        // full-module run intermittently saw `false` jump by 3 during this test's own window).
+        // `>=` stays correct under that noise because our own call always contributes exactly
+        // one and concurrent activity can only add more, never fewer — so it still fails
+        // deterministically when run in isolation (no concurrent noise) against reverted code,
+        // where `after` would equal `before` exactly.
+        assert!(
+            true_after > true_before,
+            "a labelSelector-bearing watch open must increment has_selector=\"true\" by at \
+             least one; before={true_before} after={true_after}"
+        );
+        assert!(
+            false_after > false_before,
+            "a no-selector watch open must increment has_selector=\"false\" by at least one; \
+             before={false_before} after={false_after}"
         );
     }
 

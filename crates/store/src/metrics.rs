@@ -175,6 +175,42 @@ pub static DELETION_LOG_LEN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+/// 64B..2MiB exponential (factor 2, 16 buckets). A two-tier deletion_log design under
+/// consideration for this store picks its tier-cap boundaries from an *estimated* 1-6KB
+/// tombstone body size; this metric exists to replace that estimate with a measured one.
+/// Buckets are densest through the 512B-8KiB range the estimate landed in, with headroom out
+/// to 2MiB for outsized objects (etcd's own default value-size cap is 1.5MiB) so a tail of
+/// large tombstones is visible rather than silently overflowing the last bucket.
+fn deletion_log_body_size_bytes_buckets() -> Vec<f64> {
+    prometheus::exponential_buckets(64.0, 2.0, 16).expect("static bucket definition is valid")
+}
+
+/// Size in bytes of each tombstone's retained object body (`InternalEvent::deleted_body`),
+/// by shard. Observed once per deletion, at the same insert site that maintains
+/// `u7s_deletion_log_len` — insert time, not eviction time, so this captures every tombstone's
+/// size (including ones later evicted by the `DELETION_LOG_CAP` policy) rather than only the
+/// subset that happens to be evicted while a scrape is watching.
+///
+/// This is the missing measurement `u7s_deletion_log_len`'s own doc alludes to: length alone
+/// says how many tombstones a shard holds, not how many bytes each one actually costs to keep
+/// — the quantity a tier-cap policy sized in bytes (rather than in object count) would need.
+pub static DELETION_LOG_BODY_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "u7s_deletion_log_body_size_bytes",
+            "Size in bytes of each deletion-tombstone's retained object body, by shard, \
+             observed once per deletion at insert time.",
+        )
+        .buckets(deletion_log_body_size_bytes_buckets()),
+        &["shard"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(histogram.clone()))
+        .expect("u7s_deletion_log_body_size_bytes is registered exactly once per process");
+    histogram
+});
+
 /// Total watch ring shards torn down by idle-GC after `RING_SHARD_IDLE_GRACE` — the direct
 /// measure of the eviction pressure this lifecycle (create-on-first-watch, reclaim once every
 /// watcher disconnects) actually produces. A near-zero rate on a long-running process with many
@@ -420,6 +456,39 @@ mod tests {
             7.0,
             "gathered value must match the last .set() call — a mismatch here means the \
              registered Collector is not the same instance push_event_locked is setting"
+        );
+    }
+
+    /// Same reasoning as the gauge tests above, for the tombstone body-size histogram: a
+    /// `HistogramVec` only shows a `shard` series once observed, so this fails on revert if
+    /// `push_into_shard`'s `.observe()` call at tombstone-insert time were deleted — the exact
+    /// scenario this measurement needs to detect, since a silently missing histogram looks
+    /// identical to "no deletions have ever happened."
+    #[test]
+    fn deletion_log_body_size_bytes_records_an_observation_for_its_shard_label() {
+        let shard = "/registry/metrics-test-body-size/";
+        DELETION_LOG_BODY_SIZE_BYTES
+            .with_label_values(&[shard])
+            .observe(4096.0);
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "u7s_deletion_log_body_size_bytes")
+            .expect(
+                "u7s_deletion_log_body_size_bytes must appear in gathered metric families once \
+                 observed",
+            );
+        let has_shard_label = family
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label())
+            .any(|l| l.name() == "shard" && l.value() == shard);
+        assert!(
+            has_shard_label,
+            "gathered output must carry a series labeled shard={shard:?} after observing it — \
+             without this, a tombstone's body size on that resource type would be invisible to \
+             a scraper even though it was recorded"
         );
     }
 
