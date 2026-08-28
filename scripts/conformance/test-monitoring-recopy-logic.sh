@@ -66,6 +66,7 @@ recopy_monitoring() {
   [ -f "$workdir/vm-free.csv" ]  && cp "$workdir/vm-free.csv" "$monitoring_dir/vm-free.csv"
   [ -f "$workdir/ring-age.csv" ] && cp "$workdir/ring-age.csv" "$monitoring_dir/ring-age.csv"
   cp "$workdir"/metrics-*.prom "$monitoring_dir/" 2>/dev/null || true
+  cp "$workdir"/kcm-metrics-*.prom "$monitoring_dir/" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -77,6 +78,7 @@ WORKDIR_T="$TMPDIR_TEST/workdir"
 RUN_DIR_T="$TMPDIR_TEST/e2e/0814-slug"
 mkdir -p "$WORKDIR_T" "$RUN_DIR_T"
 echo "pre-teardown-metrics" > "$WORKDIR_T/metrics-03-pre-teardown.prom"
+echo "pre-teardown-kcm-metrics" > "$WORKDIR_T/kcm-metrics-03-pre-teardown.prom"
 
 # ---------------------------------------------------------------------------
 # 1. A PLAIN (non --profile) run: the fixed gate must still fire, so the
@@ -88,6 +90,8 @@ if [ "$(should_recopy_monitoring "$RUN_DIR_T")" = "1" ]; then
 fi
 assert "a plain conformance run's pre-teardown metrics snapshot reaches the permanent RUN_DIR/monitoring/ directory" \
   "$([ -f "$RUN_DIR_T/monitoring/metrics-03-pre-teardown.prom" ] && echo 1 || echo 0)"
+assert "the KCM pre-teardown snapshot reaches RUN_DIR/monitoring/ too -- without this, KCM's memory numbers stay inferred from RSS rather than measured" \
+  "$([ -f "$RUN_DIR_T/monitoring/kcm-metrics-03-pre-teardown.prom" ] && echo 1 || echo 0)"
 
 # Regression guard: prove the OLD buggy (--profile-gated) version genuinely
 # drops the snapshot for this same plain-run fixture -- the actual bug this

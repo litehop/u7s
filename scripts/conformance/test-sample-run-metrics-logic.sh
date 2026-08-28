@@ -131,8 +131,41 @@ u7s_watch_ring_span_seconds_count{shard="/registry/configmaps/"} 1
 EOF
 STUB
 chmod +x "$STUBDIR/kubectl"
+
+# ---------------------------------------------------------------------------
+# Stub limactl: only intercepts the exact `shell <vm> -- curl ... 10257/metrics`
+# invocation take_kcm_snapshot makes, controlled by $LIMACTL_STUB_STATE ("up"
+# serves a fixed metrics body, anything else simulates KCM being unreachable).
+# Every other invocation (sample_vm_rss/sample_vm_free's real `limactl shell
+# no-such-vm-N -- ps/free` calls elsewhere in this test, which rely on the
+# REAL binary's fast-fail against a nonexistent instance) execs straight
+# through to the real limactl found below, so this stub can sit on PATH for
+# the whole test file without changing any test's existing behavior.
+# ---------------------------------------------------------------------------
+REAL_LIMACTL="$(command -v limactl)"
+LIMACTL_STUB_STATE="$TMPDIR_TEST/limactl-state"
+export LIMACTL_STUB_STATE
+cat > "$STUBDIR/limactl" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "shell" ] && [[ "\$*" == *"curl"*"10257/metrics"* ]]; then
+  if [ -f "\$LIMACTL_STUB_STATE" ] && [ "\$(cat "\$LIMACTL_STUB_STATE")" = "up" ]; then
+    cat <<'EOF'
+# HELP go_goroutines stub
+# TYPE go_goroutines gauge
+go_goroutines 42
+EOF
+    exit 0
+  fi
+  echo "stub limactl: connection refused (simulated kcm down)" >&2
+  exit 1
+fi
+exec "$REAL_LIMACTL" "\$@"
+STUB
+chmod +x "$STUBDIR/limactl"
+
 export PATH="$STUBDIR:$PATH"
 echo "up" > "$KUBECTL_STUB_STATE"
+echo "down" > "$LIMACTL_STUB_STATE"
 
 # ===========================================================================
 # 1. Start/reap happy path — real listener stands in for the apiserver.
@@ -296,6 +329,38 @@ else
   PASS=$(( PASS + 1 ))
 fi
 echo "  (output: $SNAP_OUT)"
+
+# ===========================================================================
+# 4. KCM /metrics snapshot — reachable KCM produces a
+#    kcm-metrics-NN-<label>.prom sibling of the apiserver's own snapshot;
+#    unreachable KCM degrades gracefully like every other scrape in this
+#    script (no partial file, no failed exit code for the caller).
+# ===========================================================================
+echo "up" > "$KUBECTL_STUB_STATE"
+echo "up" > "$LIMACTL_STUB_STATE"
+WORKDIR6="$TMPDIR_TEST/work6"
+mkdir -p "$WORKDIR6"
+bash "$SCRIPT" snapshot --workdir "$WORKDIR6" --label startup --vm fake-vm
+
+KCM_FILE="$WORKDIR6/kcm-metrics-01-startup.prom"
+if grep -q "^go_goroutines 42$" "$KCM_FILE" 2>/dev/null; then
+  echo "PASS: a reachable KCM produces its own kcm-metrics-NN-<label>.prom snapshot alongside the apiserver's — KCM's memory numbers were previously inferred from RSS growth, never measured"
+  PASS=$(( PASS + 1 ))
+else
+  echo "FAIL: expected $KCM_FILE to contain the stub KCM metrics body — got:"
+  cat "$KCM_FILE" 2>/dev/null || echo "  (no file)"
+  FAIL=$(( FAIL + 1 ))
+fi
+
+echo "down" > "$LIMACTL_STUB_STATE"
+bash "$SCRIPT" snapshot --workdir "$WORKDIR6" --label second --vm fake-vm
+if [ -f "$WORKDIR6/kcm-metrics-02-second.prom" ]; then
+  echo "FAIL: a snapshot taken while KCM is unreachable must not leave a (misleadingly present but empty) file behind"
+  FAIL=$(( FAIL + 1 ))
+else
+  echo "PASS: an unreachable KCM leaves no kcm-metrics file behind, same non-fatal contract as the apiserver scrape"
+  PASS=$(( PASS + 1 ))
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

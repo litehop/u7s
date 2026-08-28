@@ -79,6 +79,20 @@
 # separating "the tail came from the startup burst" from "this is steady
 # state" for u7s_watch_replay_depth.
 #
+# Each apiserver snapshot has a sibling kube-controller-manager snapshot
+# (kcm-metrics-<seq>-<label>.prom), scraped straight from KCM's own
+# --bind-address=127.0.0.1:10257/metrics inside the VM (KCM has no apiserver
+# proxy route to piggyback on the way the apiserver's own /metrics does via
+# kubectl --raw). Deliberately a `kcm-` PREFIX, not a same-named file or a
+# suffix, so it never matches aggregate-run-metrics.sh's `metrics-*.prom`
+# glob — that glob picks first/last by sort order to diff apiserver-specific
+# counters (apiserver_request_total, ...), and a KCM file sorting in as
+# either endpoint would silently corrupt that delta with the wrong process's
+# metrics. This closes the gap the KCM memory-evaluation doc named as "the
+# single cheapest thing that would firm up every number" — until now, no
+# KCM /metrics snapshot existed anywhere, so its memory decomposition was
+# inferred from the RSS growth curve, not measured.
+#
 # This is a SEPARATE script from run-all.sh (not an inline background job)
 # so it reaps cleanly (SIGTERM + poll, mirroring reset.sh's own hostagent
 # reap pattern) and so it can be run standalone against an already-up stack
@@ -308,6 +322,25 @@ sample_ring_gauges() {
   rm -f "$occ_tmp" "$span_tmp"
 }
 
+# KCM's secure port (default 10257, unchanged by 04-start-kcm.sh's
+# --bind-address=127.0.0.1) is loopback-only inside the VM, so it needs a
+# `limactl shell` hop rather than a direct curl from the host. `-k` skips
+# verification of KCM's self-signed serving cert (same trust model as every
+# other in-VM scrape this script already does). Failure (KCM down, or a
+# future auth requirement) is non-fatal — same "warn and skip" contract as
+# take_snapshot's own apiserver scrape below, since a monitoring gap must
+# never abort the run it's trying to observe.
+take_kcm_snapshot() {
+  local label="$1" seq="$2" out
+  out="$WORKDIR/kcm-metrics-$(printf '%02d' "$seq")-${label}.prom"
+  if limactl shell "$VM" -- curl -sk --max-time 5 https://127.0.0.1:10257/metrics > "$out" 2>/dev/null && [ -s "$out" ]; then
+    echo "kcm metrics snapshot (${label}): $out"
+  else
+    echo "warning: failed to capture KCM /metrics snapshot (label=${label}) — kube-controller-manager may be down" >&2
+    rm -f "$out"
+  fi
+}
+
 take_snapshot() {
   local label="$1" seq=0
   [ -f "$SEQFILE" ] && seq="$(cat "$SEQFILE" 2>/dev/null || echo 0)"
@@ -321,6 +354,7 @@ take_snapshot() {
     echo "warning: failed to capture /metrics snapshot (label=${label}) — apiserver may be down" >&2
     rm -f "$out"
   fi
+  take_kcm_snapshot "$label" "$seq"
 }
 
 sample_tick() {

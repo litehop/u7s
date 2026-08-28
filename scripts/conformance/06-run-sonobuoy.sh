@@ -514,13 +514,14 @@ echo "Host logs: $HOST_LOGS_DIR"
 # of the RSS/ring-gauge CSVs as they stand right now (they keep growing after
 # this copy since the sampler is still running; a --profile run re-copies the
 # final state once it reaps the sampler for real).
-bash scripts/conformance/sample-run-metrics.sh snapshot --workdir "$WORKDIR" --label post-run
+bash scripts/conformance/sample-run-metrics.sh snapshot --workdir "$WORKDIR" --label post-run --vm "$VM_NAME"
 MONITORING_DIR="$RUN_DIR/monitoring"
 mkdir -p "$MONITORING_DIR"
 [ -f "$WORKDIR/rss.csv" ]      && cp "$WORKDIR/rss.csv" "$MONITORING_DIR/rss.csv"
 [ -f "$WORKDIR/vm-free.csv" ]  && cp "$WORKDIR/vm-free.csv" "$MONITORING_DIR/vm-free.csv"
 [ -f "$WORKDIR/ring-age.csv" ] && cp "$WORKDIR/ring-age.csv" "$MONITORING_DIR/ring-age.csv"
 cp "$WORKDIR"/metrics-*.prom "$MONITORING_DIR/" 2>/dev/null || true
+cp "$WORKDIR"/kcm-metrics-*.prom "$MONITORING_DIR/" 2>/dev/null || true
 echo "Monitoring artifacts: $MONITORING_DIR"
 
 if [ "$UNPACK" -eq 1 ]; then

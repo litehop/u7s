@@ -129,6 +129,20 @@ apiserver_watch_open_duration_seconds_sum{resource="pods"} 2.0
 apiserver_watch_open_duration_seconds_count{resource="pods"} 100
 PROM
 
+# KCM's own /metrics snapshot sorts alphabetically BEFORE
+# metrics-01-startup.prom ('-' < '.' in "kcm-metrics-01-startup.prom" vs
+# "metrics-01-startup.prom"). If it used the `metrics-` prefix instead of
+# `kcm-metrics-`, it would match this section's `find -name 'metrics-*.prom'`
+# glob and get picked as the delta's start_file in place of the real
+# apiserver snapshot -- these wildly different counter values exist so that
+# regression would blow up the 5xx/watch-events assertions below instead of
+# passing silently.
+cat > "$MON/kcm-metrics-01-startup.prom" <<'PROM'
+# TYPE apiserver_request_total counter
+apiserver_request_total{code="200",resource="pods"} 999999
+apiserver_request_total{code="500",resource="pods"} 999999
+PROM
+
 # ===========================================================================
 # 1. Peak RSS section -- tracked categories, "not observed" for absent ones,
 #    and the uncategorized "weirdproc" landing in the other-processes table.
