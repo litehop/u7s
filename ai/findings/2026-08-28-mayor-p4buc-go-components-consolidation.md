@@ -20,7 +20,7 @@ clear the Gate-4 budget and would forfeit the conformance-oracle guarantee.
 **kube-proxy** is the smallest and least-analyzed of the three — the input
 doc is purely descriptive (no rewrite argument) and is the one component of
 the three that has *not* received the tuning pass the other two already got.
-**kube-controller-manager** (52 controllers, u7s runs ~47) sits between the
+**kube-controller-manager** (52 controllers, u7s runs 45) sits between the
 two: its ~91 MiB idle footprint is ~85% fixed cost per the input doc's own
 growth-curve reasoning, but that reasoning is undercut by a fact the input
 doc didn't check — the same GOMEMLIMIT/GOGC/GOMAXPROCS tuning it proposes as
@@ -206,7 +206,8 @@ shape has not been measured, so the payoff size is a guess, not a number.
 ### What the input doc claims
 
 One process, 52 registered controller descriptors (3 off by default), u7s
-enables ~47 (production keeps node-ipam, conformance disables it — flagged
+enables 45 (52 - 3 default-disabled - 4 explicit disables at
+`scripts/install.sh:921`; production keeps node-ipam, conformance disables it — flagged
 as a drift the doc itself catches). Measured baseline: 90.9 MB idle → 109.2
 MB peak, stable across four runs, with ~85% attributed to fixed cost (text,
 runtime, GC headroom, reflector goroutines) based on only ~17 MB of growth
@@ -277,17 +278,17 @@ run's KCM figures were cross-checked against `mayor-lulpm` (exact match).
    GOMEMLIMIT/GOGC/GOMAXPROCS + `--concurrent-gc-syncs=5` tuning is the
    current state; 90.9 MB idle is the honest number to plan against, not a
    pre-tuning figure.
-2. **Further upstream tuning** (name a *new* lever: prune more of the ~47
+2. **Further upstream tuning** (name a *new* lever: prune more of the 45
    enabled controllers if any are unused in practice, or push
    `--concurrent-*-syncs` further, or try a tighter GOMEMLIMIT). Effort:
    low, reversible. Payoff: unknown until measured — the doc's own "measure
    S0 before crediting S1/S2" caution applies doubly now that the easy lever
    is already spent.
-3. **S1 — standalone Rust rewrite, parity with ~47 controllers.** 12–45 MB
+3. **S1 — standalone Rust rewrite, parity with 45 controllers.** 12–45 MB
    estimated vs 90.9 MB today. Effort: covers GC's ownerReference graph, PV
    binding/dynamic provisioning, HPA's scaling algorithm, disruption-budget
    math, taint-eviction rate limiting — each independently conformance-visible.
-   Risk: high surface area for subtle behavioral drift; ~47 controllers is a
+   Risk: high surface area for subtle behavioral drift; 45 controllers is a
    large parity target even before rewrite quality is considered.
 4. **S2 — fold into apiserver+scheduler binary.** Best-case combined number
    (45 MB for all three) but, per the doc's own honest accounting, does not
