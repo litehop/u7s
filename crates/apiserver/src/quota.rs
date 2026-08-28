@@ -903,6 +903,12 @@ pub async fn check_resource_quota<S: Store>(
                 // Only applies when creating pods.
                 if resource == "pods" && group.is_empty() {
                     if let Some((field, resource_key)) = quota_to_pod_resource(quota_resource) {
+                        // A hard limit that fails to parse is unenforced for this resource
+                        // (falls through to the next quota entry), not a request error. Since
+                        // parse_quantity_milli now accepts fractional quantities, a fractional
+                        // `spec.hard` value (e.g. "1.5") that previously landed here as None
+                        // (silently unenforced) now parses and is actively enforced instead —
+                        // an intentional behavior change, not a regression.
                         let hard_milli = match parse_quantity_milli(limit_str) {
                             Some(m) => m,
                             None => continue,
