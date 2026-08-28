@@ -145,6 +145,32 @@ pub static WATCH_OPEN_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|
     histogram
 });
 
+/// Counter of watch opens, split by whether the request carried a `labelSelector` or
+/// `fieldSelector` (either counts as `has_selector="true"`). The store's deletion_log keeps a
+/// full object body per tombstone specifically so a selector-scoped watch reconnecting after
+/// ring compaction can still evaluate its selector against the deleted object — this metric
+/// quantifies how often that fidelity is ever actually exercised versus paid for as
+/// write-and-never-read insurance on every deletion.
+///
+/// Incremented once per watch open in `handlers::watch::watch_generic_impl`, after
+/// `label_selector`/`field_selector` are defaulted to empty strings, so both selector kinds
+/// are checked in one place regardless of which (or both) the request supplied.
+pub static WATCH_OPENS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "u7s_apiserver_watch_opens_total",
+            "Total number of watch streams opened, by whether the request carried a \
+             labelSelector or fieldSelector.",
+        ),
+        &["has_selector"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_apiserver_watch_opens_total is registered exactly once per process");
+    counter
+});
+
 /// Counter of SA JWT authentications accepted past their `kubernetes.io.warnafter` claim —
 /// i.e. tokens that are only still valid because of the pod-bound-token expiration-extension
 /// safety net (see `handlers::tokens::POD_BOUND_TOKEN_EXTENSION_SECS`), well past the window

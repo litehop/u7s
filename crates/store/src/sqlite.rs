@@ -563,6 +563,13 @@ fn push_into_shard(
             // Deletion: insert tombstone (indexed by revision too) then cap the map.
             guard.by_key.insert(event.key.clone(), Arc::clone(event));
             guard.by_revision.insert(event.revision, event.key.clone());
+            // Insert-time, not eviction-time: captures every tombstone's body size, including
+            // ones this cap later evicts, instead of only the (arbitrary, cap-dependent) subset
+            // that happens to get evicted. Feeds data-driven deletion_log tier-cap sizing — see
+            // the metric's own doc.
+            crate::metrics::DELETION_LOG_BODY_SIZE_BYTES
+                .with_label_values(&[shard_key_label])
+                .observe(event.deleted_body.as_ref().map_or(0, Bytes::len) as f64);
             const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
             if guard.by_key.len() > DELETION_LOG_CAP {
                 // Evict the entry with the smallest revision. `by_revision` keeps
@@ -2981,6 +2988,86 @@ mod tests {
                  for the live object, making controllers stop reconciling the re-created resource"
             );
         }
+    }
+
+    /// A deletion must record the tombstone's exact body size into
+    /// `u7s_deletion_log_body_size_bytes`, by shard — the measurement a data-driven two-tier
+    /// deletion_log tier-cap design needs to replace the estimated 1-6KB tombstone-size
+    /// assumption it would otherwise be sized against with a real one. Fails on revert if
+    /// `push_into_shard`'s `.observe()` call in the deletion branch were removed: the histogram
+    /// would gain neither a sample nor any bytes for this delete, leaving `after` equal to
+    /// `before` on both counts.
+    #[tokio::test]
+    async fn deletion_log_body_size_metric_observes_deleted_body_length() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        // A resource-type prefix unique to this test (not shared with any other test in this
+        // file) — DELETION_LOG_BODY_SIZE_BYTES is a process-global Prometheus registry, so a
+        // shared shard label would let another test's concurrent delete land an extra
+        // observation between this test's before/after reads and make the exact-delta
+        // assertion flaky under `cargo test`'s default parallel execution.
+        let key = "/registry/deletion-log-body-size-metric-test/obj-1";
+        let val = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-body-size"}}"#,
+        );
+
+        // A shard exists only once something watches this resource type (see
+        // push_event_locked's doc) — held for the whole test so it isn't idle-GC'd.
+        let _watch = store
+            .watch("/registry/deletion-log-body-size-metric-test/", 0)
+            .await
+            .expect("watch must succeed");
+
+        let shard_label = "/registry/deletion-log-body-size-metric-test/";
+        let before_count = crate::metrics::DELETION_LOG_BODY_SIZE_BYTES
+            .with_label_values(&[shard_label])
+            .get_sample_count();
+        let before_sum = crate::metrics::DELETION_LOG_BODY_SIZE_BYTES
+            .with_label_values(&[shard_label])
+            .get_sample_sum();
+
+        store
+            .put(key, val.clone(), None)
+            .await
+            .expect("put must succeed");
+        store.delete(key, None).await.expect("delete must succeed");
+
+        // The store round-trips the body through its own serialization before persisting (e.g.
+        // stamping metadata.resourceVersion), so the tombstone's actual retained size can differ
+        // from `val`'s literal length — read the real stored tombstone back instead of assuming
+        // the input's byte count survives unchanged.
+        let expected_len = {
+            let shard = store.shard_for_test(key, None);
+            let guard = shard.deletion_log.read().expect("deletion_log poisoned");
+            guard
+                .by_key
+                .get(key)
+                .expect("tombstone must exist for the just-deleted key")
+                .deleted_body
+                .as_ref()
+                .expect("a real deletion must carry a deleted_body")
+                .len() as f64
+        };
+
+        let after_count = crate::metrics::DELETION_LOG_BODY_SIZE_BYTES
+            .with_label_values(&[shard_label])
+            .get_sample_count();
+        let after_sum = crate::metrics::DELETION_LOG_BODY_SIZE_BYTES
+            .with_label_values(&[shard_label])
+            .get_sample_sum();
+
+        assert_eq!(
+            after_count,
+            before_count + 1,
+            "deleting a key must record exactly one body-size observation for its shard; \
+             before={before_count} after={after_count}"
+        );
+        assert_eq!(
+            after_sum - before_sum,
+            expected_len,
+            "the recorded observation must equal the deleted object's exact byte length \
+             ({expected_len}); a mismatch means the histogram is observing the wrong field \
+             (e.g. the live value instead of deleted_body) or a stale/truncated body"
+        );
     }
 
     /// deletion_log must retain tombstones for recently-deleted keys that have not been
