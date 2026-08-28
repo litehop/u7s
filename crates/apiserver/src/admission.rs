@@ -1534,6 +1534,12 @@ pub(crate) fn eval_cel_bool_expr(
         namespace_object,
         old_object,
     )?;
+    // A prefix that parses cleanly but leaves trailing tokens (e.g. a stray literal
+    // after a complete comparison) must be a hard parse error, not a silent
+    // truncation that evaluates just the valid prefix.
+    if pos != tokens.len() {
+        return None;
+    }
     val.as_bool()
 }
 
@@ -1549,7 +1555,7 @@ pub(crate) fn eval_cel_vap_value(
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
-    parse_vap_ternary(
+    let val = parse_vap_ternary(
         &tokens,
         &mut pos,
         object,
@@ -1557,7 +1563,13 @@ pub(crate) fn eval_cel_vap_value(
         request,
         namespace_object,
         old_object,
-    )
+    )?;
+    // See eval_cel_bool_expr: trailing unconsumed tokens are a parse error, not
+    // a silently-truncated success.
+    if pos != tokens.len() {
+        return None;
+    }
+    Some(val)
 }
 
 // ---------------------------------------------------------------------------
@@ -8521,6 +8533,59 @@ mod tests {
             "an absent claim must resolve to the orValue('') default, not an eval error — \
              an eval error here is silently treated as validation failure with the wrong \
              (generic) denial message instead of upstream's 'no node association' message"
+        );
+    }
+
+    /// A valid-prefix expression followed by a trailing token that isn't a recognized
+    /// infix continuation (here a stray `true` literal) must be a hard parse error, not
+    /// silently truncated to just the valid prefix's result. Every `parse_vap_*`
+    /// precedence level stops looping the moment it sees a token it doesn't recognize
+    /// as "its" operator and returns `Some(left)` — that is correct for handing control
+    /// back to the caller, but without a top-level `pos == tokens.len()` check nobody
+    /// ever notices the leftover `true` token. Without the check this expression
+    /// silently evaluates to `Some(true)` (the comparison's result) rather than erroring,
+    /// turning a clearly-broken policy expression into one that always passes.
+    #[test]
+    fn cel_bool_expr_rejects_trailing_garbage_after_valid_prefix() {
+        let object = json!({"foo": "bar"});
+        let vars = serde_json::Map::new();
+        let req = json!({});
+        let result = eval_cel_bool_expr(
+            r#"object.foo == "bar" true"#,
+            &object,
+            &vars,
+            &req,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(
+            result, None,
+            "trailing unconsumed tokens after a valid prefix must be a parse error; \
+             returning Some(true) here means the evaluator silently truncated the \
+             trailing `true` and mistook a broken policy expression for a valid one"
+        );
+    }
+
+    /// Same truncation hazard as above, but through eval_cel_vap_value (used for VAP
+    /// spec.variables and messageExpression) rather than eval_cel_bool_expr.
+    #[test]
+    fn cel_vap_value_rejects_trailing_garbage_after_valid_prefix() {
+        let object = json!({"foo": "bar"});
+        let vars = serde_json::Map::new();
+        let req = json!({});
+        let result = eval_cel_vap_value(
+            r#"object.foo "extra""#,
+            &object,
+            &vars,
+            &req,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(
+            result, None,
+            "trailing unconsumed tokens after a valid prefix must be a parse error; \
+             returning Some(\"bar\") here means a mistyped variable/messageExpression \
+             silently evaluates to the truncated prefix instead of failing loudly"
         );
     }
 
