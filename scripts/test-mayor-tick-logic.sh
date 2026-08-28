@@ -178,6 +178,43 @@ LATEST=$(call latest_reviewer_review "$REVIEWS_NON_REVIEWER_NEWEST")
 assert "a newer non-critical-reviewer comment does not displace the actual verdict review" \
   "$([ "$(call parse_verdict "$(printf '%s' "$LATEST" | jq -r '.body')")" = "LGTM" ] && echo 1 || echo 0)"
 
+# A DISMISSED needs-changes review must not hold the merge gate: once
+# needs-changes becomes a native REQUEST_CHANGES review, dismissing it is
+# the operator's way of saying "this verdict no longer applies" -- if the
+# gate still picked the dismissed review's body text, GitHub would unblock
+# the PR while the mayor's text-parse gate kept refusing it, a deadlock
+# neither side could release. The gate must fall back to the next
+# surviving review instead.
+REVIEWS_DISMISSED_BLOCKING='[
+  {"body": "## critical-reviewer findings — pr — #1\n\n**Verdict**: LGTM", "submittedAt": "2026-08-27T01:00:00Z", "state": "COMMENTED"},
+  {"body": "## critical-reviewer findings — pr — #1\n\n**Verdict**: needs-changes", "submittedAt": "2026-08-27T02:00:00Z", "state": "DISMISSED"}
+]'
+LATEST=$(call latest_reviewer_review "$REVIEWS_DISMISSED_BLOCKING")
+assert "a DISMISSED needs-changes review does not hold the gate -- it falls back to the older surviving LGTM" \
+  "$([ "$(call parse_verdict "$(printf '%s' "$LATEST" | jq -r '.body')")" = "LGTM" ] && echo 1 || echo 0)"
+
+# Inverse: a NON-dismissed needs-changes review must still hold the gate --
+# proves the fix is a state filter, not something that accidentally started
+# ignoring needs-changes verdicts altogether.
+REVIEWS_LIVE_BLOCKING='[
+  {"body": "## critical-reviewer findings — pr — #1\n\n**Verdict**: needs-changes", "submittedAt": "2026-08-27T02:00:00Z", "state": "COMMENTED"}
+]'
+LATEST=$(call latest_reviewer_review "$REVIEWS_LIVE_BLOCKING")
+assert "a non-dismissed needs-changes review still holds the gate" \
+  "$([ "$(call parse_verdict "$(printf '%s' "$LATEST" | jq -r '.body')")" = "needs-changes" ] && echo 1 || echo 0)"
+
+# A review with no "state" field at all (every review today, since the
+# critical-reviewer still posts under the operator's own identity, not yet
+# the litehop-reviewer[bot] identity that would set state) must be
+# unaffected by the new filter -- proves the filter is a no-op until the
+# App identity starts producing real DISMISSED states.
+REVIEWS_NO_STATE_FIELD='[
+  {"body": "## critical-reviewer findings — pr — #1\n\n**Verdict**: needs-changes", "submittedAt": "2026-08-27T02:00:00Z"}
+]'
+LATEST=$(call latest_reviewer_review "$REVIEWS_NO_STATE_FIELD")
+assert "a review with no state field at all (today's operator-identity reality) is unaffected by the DISMISSED filter" \
+  "$([ "$(call parse_verdict "$(printf '%s' "$LATEST" | jq -r '.body')")" = "needs-changes" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 1c. PR gate eligibility -- BEHIND PRs must be queued, not silently
 #     skipped forever (the merge queue's job is to rebase them, not the

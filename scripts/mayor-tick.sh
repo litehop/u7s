@@ -120,9 +120,16 @@ parse_verdict() {
 # what stops an older superseded LGTM from masking a newer needs-changes
 # verdict (a real incident hit this exact gap at the PR-verdict layer; see
 # git history, not a citation here that would rot once that PR closes).
+#
+# DISMISSED reviews are excluded before the latest-by-time pick: once a
+# needs-changes verdict becomes a native REQUEST_CHANGES review, dismissing
+# it clears GitHub's own merge block but the review body's text still reads
+# needs-changes -- without this filter the text-parse gate below would keep
+# refusing the PR even after the operator dismissed it, a deadlock neither
+# gate could release.
 latest_reviewer_review() {
   printf '%s' "$1" | jq -c \
-    '[.[] | select(.body | startswith("## critical-reviewer findings"))] | sort_by(.submittedAt) | last // empty'
+    '[.[] | select(.body | startswith("## critical-reviewer findings")) | select(.state != "DISMISSED")] | sort_by(.submittedAt) | last // empty'
 }
 
 # True (exit 0) iff a PR's merge-queue/check state makes it eligible for
