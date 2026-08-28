@@ -138,6 +138,8 @@ fi
 echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
 SUPERVISOR_LOG="/tmp/kcm-supervisor.log"
 chmod +x /tmp/kcm-supervisor.sh
+# -clusterrole-aggregation-controller: see scripts/install.sh's u7s-kcm.service
+# for why -- mirrored here so the conformance run exercises what ships.
 # --authorization-always-allow-paths below adds /metrics to the default
 # /healthz,/readyz,/livez allow-list. Without it, sample-run-metrics.sh's
 # unauthenticated curl to :10257/metrics gets a 403 -- confirmed: archived
@@ -149,7 +151,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
   --service-account-private-key-file="\$WORKDIR/sa.key" \\
   --root-ca-file="\$CA_CERT" \\
-  --controllers='*,-cloud-node-lifecycle-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \\
+  --controllers='*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \\
   --concurrent-gc-syncs=5 \\
   --use-service-account-credentials=false \\
   --leader-elect=false \\
