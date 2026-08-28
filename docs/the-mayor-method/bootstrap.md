@@ -119,12 +119,16 @@ The canonical loop bodies live in `dispatch-prompt-template.md` and prior
 session output; paste verbatim or adapt as needed.
 
 **Mayor tick loop body (mayor-zhwjg) — GitHub Merge Queue is active on
-this repo.** The main-branch ruleset (18156794) requires up-to-date
-branches (`strict_required_status_checks_policy: true`), and the queue
-satisfies that automatically (MERGE method, all-green grouping, min 1 /
-max 5, `allow_auto_merge=true`, verified end-to-end since PR #1347). The
-queue runs its own CI cycle against a synthetic merge commit and lands the
-PR when green.
+this repo.** The main-branch ruleset (18156794) requires 5 status checks
+(lint, test-coverage, fmt, e2e-focus 1.36.4, script-tests), enforced.
+`strict_required_status_checks_policy` is deliberately `false` — the
+project moved to a GitHub org specifically to get merge queues and escape
+the up-to-date-branch treadmill, and the queue is why that requirement is
+UNNECESSARY, not why it's satisfied: it builds a synthetic merge commit
+against the latest base and tests THAT, so also requiring the PR branch
+itself to be current would just cost a redundant CI cycle per PR (MERGE
+method, all-green grouping, min 1 / max 5, `allow_auto_merge=true`,
+verified end-to-end since PR #1347).
 
 1. Run `scripts/mayor-tick.sh`. It drains `pr`-type review-queue entries
    (removes a queue file once it confirms the deliverable's review
@@ -184,7 +188,11 @@ PR when green.
    (e.g. resolving a gate exception), stay queue-native: bare `gh pr merge
    <N>` only — `--merge`/`--delete-branch` are rejected by the queue, and
    `gh pr update-branch` on a BEHIND PR just triggers a redundant CI cycle
-   the queue's own synthetic-merge cycle will invalidate anyway.
+   the queue's own synthetic-merge cycle will invalidate anyway. BEHIND and
+   BLOCKED are different cases: a PR BLOCKED by a failing check whose fix
+   already landed on main cannot enter the queue at all — GitHub refuses to
+   admit a BLOCKED PR — so "let the queue handle it" isn't available; update
+   its branch, since it can never go green on its own.
 
 **Inline sync after every task-notification — transport-conditional (mayor-t79kb).**
 Standing cron loops fire reliably on the terminal CLI (Claude Code invoked as

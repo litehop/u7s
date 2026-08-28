@@ -84,11 +84,27 @@ count words, so wrapping cannot affect them.
 8. **ADR over 400 words.** The budget passes it only if it did not grow. Over-budget and merely unchanged still warrants a suggestion.
 9. **Citations into `ai/findings/` from a tracked file.** Grep the diff for `ai/findings/`. A findings file is deleted from the working tree in its bead's close commit, so a bare path citation resolves to nothing in any checkout taken after that point — the referenced content does not exist for anyone else. Every hit is a HIGH finding: the material must be extracted into a tracked doc or converted to a bead. Applies to `docs/`, `ai/extended-context/`, `ai/dashboard.md`, PR bodies, and bead notes alike.
 
+## Test execution posture
+
+Default: read, don't re-run. A worker's reported pass and CI's own run are
+already evidence — re-running a suite to confirm a reported pass, or
+repeating the worker's own revert-verification (stash the fix, watch the
+same tests fail, restore), adds no information. "Confirm the test actually
+tests the behaviour" is a reading task: does the assertion depend on the
+changed logic, would it still pass with the fix removed — usually answerable
+from the diff plus the surrounding test code.
+
+Execute only when reading is genuinely insufficient: the test looks
+suspicious, weird, or wrong on reading, or you've formed a hypothesis about
+an input nobody tested. When you do execute, state in the review what made
+reading insufficient, or name the hypothesis.
+
 ## Scratch worktrees
 
-Some checks (e.g. a Rule-14 revert-check: apply the pre-fix code, confirm the
-new test fails) need to run code from the PR outside read-only inspection. If
-you need one, put it at `<repo-root>/temp/review-scratch/<pr-num>-<ts>/`.
+A hypothesis-driven check (e.g. constructing an input the worker didn't
+test, or reproducing a suspected vacuous pass) sometimes needs to run code
+from the PR outside read-only inspection. If you need one, put it at
+`<repo-root>/temp/review-scratch/<pr-num>-<ts>/`.
 Never `/tmp` or `/private/tmp`: nothing prunes those, and a leaked
 registration there is invisible to every hygiene check that scopes to the
 repo.
@@ -105,6 +121,10 @@ before returning. A claimed cleanup that leaves the worktree registered is a
 finding against your own output, not just the deliverable you reviewed.
 
 ## Output & posting
+
+Do NOT hard-wrap the findings block — GFM renders a manual newline inside a
+PR review body as a hard line break, so wrapped prose can never reflow in
+the browser. Write each bullet/paragraph as one line.
 
 First, build the findings block below internally (do not just return it — this
 is an intermediate artefact, not your final action):
@@ -265,5 +285,5 @@ it has already been posted where it needs to live.
   create` for a `needs-changes`/`needs-discussion` follow-on. Never `bd
   close`, never touch status/priority/assignee/labels on the reviewed bead
   itself.
-- Do NOT re-run cargo tests, clippy, or conformance suites. The worker already ran them; your job is to review, not re-verify pipeline mechanics.
+- Do NOT re-run cargo tests, clippy, or conformance suites to confirm a reported pass or a documented revert-verification. Run one only per the "Test execution posture" carve-out, naming the hypothesis.
 - Never trust temporal claims in the deliverable without checking the log's own timestamp / commit time / `mergedAt` (see CLAUDE.md "Evidence & time discipline").
