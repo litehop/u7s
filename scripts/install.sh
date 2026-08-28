@@ -746,6 +746,33 @@ EOF
 
 write_kubelet_config_yaml
 
+# Round-2 kubelet tuning, shared by both kubelet.service blocks
+# below. --max-pods and ConfigMapAndSecretChangeDetectionStrategy are
+# deliberately NOT touched here -- operator scope narrowing keeps
+# behavior-changing knobs off the table until other levers are exhausted.
+#
+# Feature gates: kubelet-consulted Beta gates, default-on in v1.36.4's
+# pkg/features/kube_features.go, that no u7s workload or manifest exercises
+# (verified per-gate against crates/ + manifests/ for a consumer of the
+# capability's wire field). PodReadyToStartContainersCondition was
+# deliberately excluded -- apiserver's condition-ordering logic
+# (crates/apiserver/src/handlers/pods.rs) depends on kubelet emitting it, so
+# disabling it would reintroduce the reconcile-churn bug that regression test
+# guards against. Disabling drops the corresponding kubelet code paths
+# (checkpoint HTTP handler, credential-provider SA-token plumbing, CA/serving
+# -cert file watchers, pod/container-level resize bookkeeping, etc.) for zero
+# functional loss.
+#
+# cAdvisor trim: u7s scrapes neither kubelet's /metrics nor
+# /metrics/cadvisor anywhere in the monitoring pipeline, so the default 10s
+# per-container stat refresh and the 100-slot-per-container legacy
+# "application metrics" ring buffer (a cadvisor flag mistakenly registered on
+# kubelet, per its own --help output) are pure overhead.
+# --disable-metrics/--cadvisor-metrics do not exist on this kubelet version
+# (verified via `kubelet --help` on the conformance VM) -- interval and the
+# count limit are the only real cAdvisor levers kubelet exposes.
+KUBELET_ROUND2_FLAGS="--housekeeping-interval=30s --application-metrics-count-limit=0 --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,InPlacePodVerticalScalingInitContainers=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false"
+
 if [ "$WORKER_MODE" -eq 1 ]; then
   # --- Join an existing cluster via the CSR API, or upgrade an
   # already-joined worker in place (kubelet binary + kubelet.service only,
@@ -775,7 +802,7 @@ WorkingDirectory=$STATE_DIR
 Environment=GOMEMLIMIT=200MiB
 Environment=GOGC=50
 Environment=GOMAXPROCS=2
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 
@@ -985,7 +1012,7 @@ Environment=GOMAXPROCS=2
 # repeat across services.
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
 ExecStartPre=/bin/bash -c 'test -s $STATE_DIR/kubelet-serving.crt || { openssl ecparam -name prime256v1 -genkey -noout -out $STATE_DIR/kubelet-serving.key && chmod 600 $STATE_DIR/kubelet-serving.key && openssl req -new -key $STATE_DIR/kubelet-serving.key -subj "/CN=$NODE_NAME" -out $STATE_DIR/kubelet-serving.csr && openssl x509 -req -in $STATE_DIR/kubelet-serving.csr -CA $STATE_DIR/ca.pem -CAkey $STATE_DIR/ca.key -CAcreateserial -days 3650 -extfile <(printf "subjectAltName=IP:$IFACE_IP\nextendedKeyUsage=serverAuth\n") -out $STATE_DIR/kubelet-serving.crt; }'
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 
