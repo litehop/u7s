@@ -138,6 +138,11 @@ fi
 echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
 SUPERVISOR_LOG="/tmp/kcm-supervisor.log"
 chmod +x /tmp/kcm-supervisor.sh
+# --authorization-always-allow-paths below adds /metrics to the default
+# /healthz,/readyz,/livez allow-list. Without it, sample-run-metrics.sh's
+# unauthenticated curl to :10257/metrics gets a 403 -- confirmed: archived
+# kcm-metrics-*.prom snapshots hold a JSON Forbidden body, not Prometheus
+# text, so it's not just missing go_memstats, it's zero series of any kind.
 setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --kubeconfig="\$KUBECONFIG_FILE" \\
   --cluster-signing-cert-file="\$CA_CERT" \\
@@ -150,6 +155,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --leader-elect=false \\
   --bind-address=127.0.0.1 \\
   --kube-api-content-type=application/json \\
+  --authorization-always-allow-paths=/healthz,/readyz,/livez,/metrics \\
   \$KCM_V_FLAG \\
   > "\$SUPERVISOR_LOG" 2>&1 &
 
