@@ -76,10 +76,18 @@ fi
 KUBECONFIG_PATH="$WORKDIR/kubeconfig"
 
 echo "=== [add-node] Joining $VM_NAME (kubelet port $KUBELET_PORT) ==="
-echo "WARNING: this does not update the running apiserver's --node-kubelet-port mapping." >&2
-echo "kubectl logs/exec against pods on $VM_NAME will 404 until the apiserver is restarted" >&2
-echo "with --node-kubelet-port $VM_NAME=$KUBELET_PORT (or start fresh via run-all.sh" >&2
-echo "--extra-node/--extra-kubelet-port instead)." >&2
+# Skipped when run-all.sh --extra-node invokes this script internally
+# (U7S_ADD_NODE_FROM_RUN_ALL=1, set by run-all.sh right at that call site): that
+# path already wires --node-kubelet-port into 02-start-apiserver.sh before this
+# script ever runs, so the 404 described below cannot happen there. Only the
+# standalone invocation -- against an apiserver that started with no idea
+# $VM_NAME exists -- has the problem this warns about.
+if [ -z "${U7S_ADD_NODE_FROM_RUN_ALL:-}" ]; then
+  echo "WARNING: this does not update the running apiserver's --node-kubelet-port mapping." >&2
+  echo "kubectl logs/exec against pods on $VM_NAME will 404 until the apiserver is restarted" >&2
+  echo "with --node-kubelet-port $VM_NAME=$KUBELET_PORT (or start fresh via run-all.sh" >&2
+  echo "--extra-node/--extra-kubelet-port instead)." >&2
+fi
 
 # Verify the primary stack is reachable before touching the 2nd VM (mirror lima-start.sh).
 if ! kubectl --kubeconfig="$KUBECONFIG_PATH" get namespaces &>/dev/null; then

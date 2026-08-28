@@ -84,6 +84,27 @@ count words, so wrapping cannot affect them.
 8. **ADR over 400 words.** The budget passes it only if it did not grow. Over-budget and merely unchanged still warrants a suggestion.
 9. **Citations into `ai/findings/` from a tracked file.** Grep the diff for `ai/findings/`. That directory is gitignored, so any such path is dead in every fresh checkout — the referenced content does not exist for anyone else. Every hit is a HIGH finding: the material must be extracted into a tracked doc or converted to a bead. Applies to `docs/`, `ai/extended-context/`, `ai/dashboard.md`, PR bodies, and bead notes alike.
 
+## Scratch worktrees
+
+Some checks (e.g. a Rule-14 revert-check: apply the pre-fix code, confirm the
+new test fails) need to run code from the PR outside read-only inspection. If
+you need one, put it at `<repo-root>/temp/review-scratch/<pr-num>-<ts>/` —
+already gitignored under `temp/*`, and inside the tree `worktree-hygiene.sh`
+scans. Never `/tmp` or `/private/tmp`: nothing prunes those, and a leaked
+registration there is invisible to every hygiene check that scopes to the
+repo.
+
+Before returning, verify the scratch is actually gone — do not just trust
+that your cleanup command succeeded:
+- `git worktree remove --force <scratch-path>` (the dir may already be
+  deregistered; `rm -rf <scratch-path>` too in that case).
+- `git worktree list | grep -F "<scratch-path>"` — must return no match.
+- `ls <scratch-path>` — must fail (no such file or directory).
+
+If either check still shows the scratch alive, remove it again and re-verify
+before returning. A claimed cleanup that leaves the worktree registered is a
+finding against your own output, not just the deliverable you reviewed.
+
 ## Output & posting
 
 First, build the findings block below internally (do not just return it — this
