@@ -1,7 +1,7 @@
 use super::*;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -35,17 +35,65 @@ pub(crate) const RING_SHARD_IDLE_GRACE: std::time::Duration = std::time::Duratio
 #[cfg(test)]
 pub(crate) const RING_SHARD_IDLE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// One tombstone in a shard's `DeletionLog`, in one of two fidelity tiers — see
+/// `push_into_shard`'s doc for the policy that moves an entry between them.
+///
+/// - Full: complete last-known body, needed so a selector-scoped watch can correctly decide
+///   whether the deleted object still matches (see watch.rs's `WatchEvent::Deleted` handling)
+///   before emitting a synthetic DELETE. Not dead weight: a full conformance run showed 81% of
+///   watch opens carry a label/field selector (`u7s_apiserver_watch_opens_total`), so this
+///   fidelity is actually consumed by real traffic, not just a theoretical need.
+/// - Stripped: revision only, body discarded to bound memory once a tombstone has aged past
+///   the Full tier. Replay degrades to `body: None`, which watch.rs's `encode_watch_event`
+///   already handles today via `build_tombstone_object`'s "no body available, send
+///   unconditionally" fallback (`watch.rs:295-298`) — no new wire-format code needed.
+#[derive(Debug)]
+enum DeletionLogEntry {
+    Full(Arc<InternalEvent>),
+    Stripped { revision: u64 },
+}
+
+impl DeletionLogEntry {
+    /// The deletion's revision, available unconditionally in both tiers: evict-on-recreate,
+    /// eviction ordering, and replay's `last_replayed` tracking all need it regardless of
+    /// whether the body was stripped.
+    fn revision(&self) -> u64 {
+        match self {
+            DeletionLogEntry::Full(event) => event.revision,
+            DeletionLogEntry::Stripped { revision } => *revision,
+        }
+    }
+
+    /// Render this tombstone as the `WatchEvent::Deleted` a replaying watcher receives. See
+    /// this enum's own doc for why a Stripped entry's `body: None` is already a handled case,
+    /// not a gap.
+    fn to_watch_event(&self, key: &str) -> WatchEvent {
+        match self {
+            DeletionLogEntry::Full(event) => internal_to_watch(event),
+            DeletionLogEntry::Stripped { revision } => WatchEvent::Deleted {
+                key: key.to_string(),
+                revision: *revision,
+                body: None,
+            },
+        }
+    }
+}
+
 /// Deletion-log storage: `by_key` gives O(1) lookup for evict-on-recreate and the
 /// prefix-scan replay watchers use; `by_revision` mirrors it as a revision-sorted index
 /// so the lowest-revision entry can be evicted in O(log n) via `pop_first()` instead of
-/// an O(n) scan over `by_key`. The two maps are always mutated together. Revisions are
-/// unique and monotonically assigned by the single global write-connection-guarded
-/// counter (see `push_event_locked`'s doc comment), so `by_revision` never has two
-/// entries collide on the same revision key.
+/// an O(n) scan over `by_key`. `full_revisions` is a further revision-sorted subset of
+/// `by_revision`, covering only entries still in the Full tier, so the Full -> Stripped
+/// downgrade policy (see `push_into_shard`) can likewise find its victim in O(log n)
+/// instead of scanning `by_key` for the lowest-revision Full entry. All three are always
+/// mutated together. Revisions are unique and monotonically assigned by the single global
+/// write-connection-guarded counter (see `push_event_locked`'s doc comment), so neither
+/// index ever collides on the same revision key.
 #[derive(Default)]
 struct DeletionLog {
-    by_key: HashMap<String, Arc<InternalEvent>>,
+    by_key: HashMap<String, DeletionLogEntry>,
     by_revision: BTreeMap<u64, String>,
+    full_revisions: BTreeSet<u64>,
 }
 
 /// One resource type's ring buffer + deletion log, keyed by its resource-type root prefix (see
@@ -544,7 +592,7 @@ fn push_into_shard(
     // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
     // compaction can still receive DELETED events for objects deleted before compaction.
     //
-    // Eviction policy (two-pronged to bound memory without dropping needed tombstones):
+    // Eviction policy (three-pronged to bound memory without dropping needed tombstones):
     //
     // 1. Evict-on-recreate: when a PUT event arrives for a key that has a tombstone in
     //    deletion_log, remove it. The tombstone is stale — the key now exists again, so
@@ -552,43 +600,84 @@ fn push_into_shard(
     //    a DELETED tombstone for a live key would cause a watcher to emit a spurious DELETED
     //    event for the current incarnation.
     //
-    // 2. Cap at 2×RING_CAPACITY: after inserting a new tombstone, if the map exceeds the
-    //    cap, evict the entry with the lowest revision. The cap is generous enough (2×1000)
-    //    to cover any watcher within the ring window; tombstones evicted by this path are
-    //    for keys deleted more than 2000 writes ago, which any active watcher has already
-    //    processed via the broadcast channel.
+    // 2. Full -> Stripped downgrade at FULL_TIER_CAP: once a shard holds more than
+    //    RING_CAPACITY full-body tombstones, the lowest-revision one is DOWNGRADED (not
+    //    removed) to a revision-only Stripped entry — same key, same by_revision entry, no
+    //    resize. A selector-scoped watch needs the body only to decide whether a deletion it
+    //    JUST missed still matches; conformance data shows 81% of watch opens carry a
+    //    selector (`u7s_apiserver_watch_opens_total`), so this tier is real, not speculative.
+    //    Per-shard `u7s_deletion_log_body_size_bytes` from a full run: the busiest shards'
+    //    tombstones average well under RING_CAPACITY's own doc's 1-6KB estimate (e.g.
+    //    configmaps ~800B, podtemplates ~320B avg), with pods the heaviest tail observed
+    //    (~3.8KB avg, ~16KB p99) — informing FULL_TIER_CAP's sizing below.
+    //
+    // 3. Outright eviction at STRIPPED_TIER_CAP: once the WHOLE log (both tiers) exceeds
+    //    this larger cap, the lowest-revision entry is evicted via by_revision's
+    //    pop_first() — always a Stripped one in practice, since (2) keeps the Full tier
+    //    bounded to FULL_TIER_CAP. In the same conformance run, the busiest shard (events)
+    //    accumulated 4,557 tombstones — comfortably exercising this eviction path, not just
+    //    the downgrade path — while most shards never got close to either cap.
     {
         let mut guard = shard.deletion_log.write().expect("deletion_log poisoned");
         if event.value.is_none() {
-            // Deletion: insert tombstone (indexed by revision too) then cap the map.
-            guard.by_key.insert(event.key.clone(), Arc::clone(event));
+            // Deletion: insert as a Full-tier tombstone (indexed by revision, and as a
+            // Full-tier candidate for the downgrade policy below).
+            guard
+                .by_key
+                .insert(event.key.clone(), DeletionLogEntry::Full(Arc::clone(event)));
             guard.by_revision.insert(event.revision, event.key.clone());
+            guard.full_revisions.insert(event.revision);
             // Insert-time, not eviction-time: captures every tombstone's body size, including
-            // ones this cap later evicts, instead of only the (arbitrary, cap-dependent) subset
-            // that happens to get evicted. Feeds data-driven deletion_log tier-cap sizing — see
-            // the metric's own doc.
+            // ones the caps below later downgrade or evict, instead of only the (arbitrary,
+            // cap-dependent) subset that happens to survive. Feeds data-driven deletion_log
+            // tier-cap sizing — see the metric's own doc. Full-tier only: a Stripped entry
+            // never carries a body to observe (a Full->Stripped downgrade observation is a
+            // follow-on, not this metric's job).
             crate::metrics::DELETION_LOG_BODY_SIZE_BYTES
                 .with_label_values(&[shard_key_label])
                 .observe(event.deleted_body.as_ref().map_or(0, Bytes::len) as f64);
-            const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
-            if guard.by_key.len() > DELETION_LOG_CAP {
-                // Evict the entry with the smallest revision. `by_revision` keeps
-                // revision -> key sorted, so this is O(log n) via pop_first() instead
-                // of an O(n) linear scan over `by_key`.
-                if let Some((_, oldest_key)) = guard.by_revision.pop_first() {
+
+            // Tier 1: downgrade the lowest-revision Full entry once the Full tier exceeds
+            // RING_CAPACITY. `full_revisions` mirrors `by_revision` for exactly this tier's
+            // entries, giving O(log n) victim lookup via pop_first() instead of scanning
+            // `by_key` for the lowest-revision Full entry.
+            const FULL_TIER_CAP: usize = RING_CAPACITY;
+            if guard.full_revisions.len() > FULL_TIER_CAP {
+                if let Some(downgrade_revision) = guard.full_revisions.pop_first() {
+                    if let Some(downgrade_key) = guard.by_revision.get(&downgrade_revision).cloned()
+                    {
+                        guard.by_key.insert(
+                            downgrade_key,
+                            DeletionLogEntry::Stripped {
+                                revision: downgrade_revision,
+                            },
+                        );
+                    }
+                }
+            }
+
+            // Tier 2: evict outright once the whole log exceeds a larger cap. `by_revision`
+            // keeps revision -> key sorted, so this is O(log n) via pop_first() instead of
+            // an O(n) linear scan over `by_key`.
+            const STRIPPED_TIER_CAP: usize = 8 * RING_CAPACITY;
+            if guard.by_key.len() > STRIPPED_TIER_CAP {
+                if let Some((oldest_revision, oldest_key)) = guard.by_revision.pop_first() {
                     guard.by_key.remove(&oldest_key);
+                    guard.full_revisions.remove(&oldest_revision);
                     tracing::debug!(
                         evicted_key = %oldest_key,
-                        cap = DELETION_LOG_CAP,
+                        cap = STRIPPED_TIER_CAP,
                         "push_into_shard: deletion tombstone log evicted oldest entry"
                     );
                 }
             }
         } else {
-            // Creation/update: evict any stale tombstone for this key, keeping the
-            // revision index in sync too.
+            // Creation/update: evict any stale tombstone for this key, keeping both the
+            // revision index and the full-tier set in sync too.
             if let Some(old) = guard.by_key.remove(&event.key) {
-                guard.by_revision.remove(&old.revision);
+                let old_revision = old.revision();
+                guard.by_revision.remove(&old_revision);
+                guard.full_revisions.remove(&old_revision);
             }
         }
         // Unconditional (not just on eviction), same reasoning as WATCH_RING_OCCUPANCY above:
@@ -1982,23 +2071,25 @@ impl Store for SqliteStore {
             // would reconnect after a relist and never see the DELETED events, deadlocking any
             // watcher that waits for a DELETED event for an object deleted in the compaction window.
             if from_revision > 0 && from_revision < horizon {
-                let tombstones: Vec<Arc<InternalEvent>> = {
+                let tombstones: Vec<WatchEvent> = {
                     let shards_guard = shards_arc.read().expect("shards poisoned");
                     match find_shard(&shards_guard, &prefix_owned) {
                         Some(shard) => {
                             let guard = shard.deletion_log.read().expect("deletion_log poisoned");
                             guard
                                 .by_key
-                                .values()
-                                .filter(|e| e.key.starts_with(&prefix_owned) && e.revision > from_revision)
-                                .cloned()
+                                .iter()
+                                .filter(|(key, entry)| {
+                                    key.starts_with(&prefix_owned) && entry.revision() > from_revision
+                                })
+                                .map(|(key, entry)| entry.to_watch_event(key))
                                 .collect()
                         }
                         None => Vec::new(),
                     }
                 };
-                for tombstone in &tombstones {
-                    yield internal_to_watch(tombstone);
+                for tombstone in tombstones {
+                    yield tombstone;
                 }
                 tracing::debug!(
                     prefix = %prefix_owned,
@@ -2196,7 +2287,7 @@ impl Store for SqliteStore {
                             // Using from_revision ensures every deletion since the watcher
                             // started is delivered before Compacted. The client relists after
                             // Compacted anyway, so a pre-Compacted duplicate DELETED is harmless.
-                            let tombstones: Vec<Arc<InternalEvent>> = {
+                            let tombstones: Vec<(u64, WatchEvent)> = {
                                 let shards_guard = shards_arc.read().expect("shards poisoned");
                                 match find_shard(&shards_guard, &prefix_owned) {
                                     Some(shard) => {
@@ -2204,20 +2295,20 @@ impl Store for SqliteStore {
                                             shard.deletion_log.read().expect("deletion_log poisoned");
                                         guard
                                             .by_key
-                                            .values()
-                                            .filter(|e| {
-                                                e.key.starts_with(&prefix_owned)
-                                                    && e.revision > from_revision
+                                            .iter()
+                                            .filter(|(key, entry)| {
+                                                key.starts_with(&prefix_owned)
+                                                    && entry.revision() > from_revision
                                             })
-                                            .cloned()
+                                            .map(|(key, entry)| (entry.revision(), entry.to_watch_event(key)))
                                             .collect()
                                     }
                                     None => Vec::new(),
                                 }
                             };
-                            for tombstone in &tombstones {
-                                last_replayed = last_replayed.max(tombstone.revision);
-                                yield internal_to_watch(tombstone);
+                            for (revision, tombstone) in tombstones {
+                                last_replayed = last_replayed.max(revision);
+                                yield tombstone;
                             }
                             tracing::debug!(
                                 prefix = %prefix_owned,
@@ -3038,14 +3129,17 @@ mod tests {
         let expected_len = {
             let shard = store.shard_for_test(key, None);
             let guard = shard.deletion_log.read().expect("deletion_log poisoned");
-            guard
-                .by_key
-                .get(key)
-                .expect("tombstone must exist for the just-deleted key")
-                .deleted_body
-                .as_ref()
-                .expect("a real deletion must carry a deleted_body")
-                .len() as f64
+            match guard.by_key.get(key) {
+                Some(DeletionLogEntry::Full(event)) => event
+                    .deleted_body
+                    .as_ref()
+                    .expect("a real deletion must carry a deleted_body")
+                    .len() as f64,
+                other => panic!(
+                    "tombstone for the just-deleted key must exist and still be in the Full \
+                     tier (a single delete never crosses the Full-tier cap); got {other:?}"
+                ),
+            }
         };
 
         let after_count = crate::metrics::DELETION_LOG_BODY_SIZE_BYTES
@@ -3121,10 +3215,77 @@ mod tests {
         }
     }
 
-    /// Eviction over the deletion_log cap must remove the tombstone with the globally lowest
-    /// revision — not the first-inserted, last-inserted, or HashMap-iteration-order entry.
+    /// Once a shard's Full-tier tombstone count exceeds RING_CAPACITY, the lowest-revision
+    /// Full entry must be DOWNGRADED to Stripped (revision-only) — not evicted outright, and
+    /// not left as Full forever.
     ///
-    /// Why it matters: eviction is now driven by a `by_revision: BTreeMap<u64, String>`
+    /// Why it matters: this downgrade is the entire memory-saving mechanism of the two-tier
+    /// deletion_log design. If it silently stopped firing, every tombstone would stay
+    /// full-body forever — reverting to the old flat, unbounded-per-tombstone-cost behavior,
+    /// without any other test noticing (the entry would still be present in `by_key`, so
+    /// evict-on-recreate and retain-until-recreated tests would keep passing). This test
+    /// fails on that exact revert: with the downgrade step disabled,
+    /// `guard.by_key.get(&victim_key)` still matches `Some(DeletionLogEntry::Full(_))` instead
+    /// of `Stripped`, hitting the `panic!` branch below instead of the assertions.
+    #[tokio::test]
+    async fn deletion_log_downgrades_to_stripped_once_full_tier_cap_exceeded() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let victim_key = "/registry/core/namespaces/full-tier-victim".to_string();
+
+        // The victim's own tombstone, at the lowest revision in this test.
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: victim_key.clone(),
+                revision: 0,
+                value: None,
+                is_create: false,
+                deleted_body: None,
+            }),
+            None,
+        );
+
+        // Push RING_CAPACITY more tombstones (all at higher revisions, well under
+        // STRIPPED_TIER_CAP so outright eviction never fires in this test) so the Full tier
+        // exceeds its cap exactly once, on the final insert, downgrading the victim — the
+        // lowest-revision Full entry — to Stripped.
+        for i in 0..RING_CAPACITY {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/namespaces/ns-{i}"),
+                    revision: (i as u64) + 1,
+                    value: None,
+                    is_create: false,
+                    deleted_body: None,
+                }),
+                None,
+            );
+        }
+
+        let shard = store.shard_for_test(&victim_key, None);
+        let guard = shard.deletion_log.read().expect("deletion_log poisoned");
+        assert!(
+            guard.by_key.contains_key(&victim_key),
+            "downgrading to Stripped must NOT remove the key — a reconnecting watcher still \
+             needs to know this key was deleted, just without the body"
+        );
+        match guard.by_key.get(&victim_key) {
+            Some(DeletionLogEntry::Stripped { revision }) => assert_eq!(
+                *revision, 0,
+                "a downgraded entry must keep its original revision — replay's last_replayed \
+                 tracking and eviction ordering both depend on it staying accurate"
+            ),
+            other => panic!(
+                "the lowest-revision Full tombstone must be downgraded to Stripped once \
+                 RING_CAPACITY newer deletions land; got {other:?} instead of Stripped"
+            ),
+        }
+    }
+
+    /// Outright eviction at the Stripped tier's cap must remove the tombstone with the
+    /// globally lowest revision — not the first-inserted, last-inserted, or
+    /// HashMap-iteration-order entry.
+    ///
+    /// Why it matters: eviction is driven by a `by_revision: BTreeMap<u64, String>`
     /// auxiliary index (`pop_first()`) instead of an O(n) `.iter().min_by_key()` scan over
     /// `by_key`, so the O(n) scan no longer runs while every concurrent writer is blocked on
     /// the global write lock. If that index were ever built from insertion order instead of
@@ -3134,20 +3295,23 @@ mod tests {
     ///
     /// This test plants the lowest-revision tombstone in the MIDDLE of the insertion
     /// sequence (not first or last), so it only passes if eviction genuinely orders by
-    /// revision rather than by insertion order.
+    /// revision rather than by insertion order. It pushes past `STRIPPED_TIER_CAP` (not just
+    /// the smaller Full-tier cap), so by the time eviction fires every survivor has already
+    /// been downgraded to Stripped — this is the "Stripped tombstone evicted at
+    /// STRIPPED_TIER_CAP" case the two-tier design's eviction policy must still get right.
     #[tokio::test]
     async fn deletion_log_eviction_evicts_lowest_revision_not_insertion_order() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
 
-        const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
+        const STRIPPED_TIER_CAP: usize = 8 * RING_CAPACITY;
         let victim_key = "/registry/core/namespaces/victim".to_string();
 
-        // Insert DELETION_LOG_CAP + 1 tombstones so the cap is exceeded exactly once, on
+        // Insert STRIPPED_TIER_CAP + 1 tombstones so the cap is exceeded exactly once, on
         // the final insert. The victim gets the lowest revision (0) but is inserted at the
         // MIDDLE index — an insertion-order-based (or desynced) eviction would pick a
         // different key.
-        for i in 0..=DELETION_LOG_CAP {
-            let (key, revision) = if i == DELETION_LOG_CAP / 2 {
+        for i in 0..=STRIPPED_TIER_CAP {
+            let (key, revision) = if i == STRIPPED_TIER_CAP / 2 {
                 (victim_key.clone(), 0)
             } else {
                 (format!("/registry/core/namespaces/ns-{i}"), (i as u64) + 1)
@@ -3168,7 +3332,7 @@ mod tests {
         let guard = shard.deletion_log.read().expect("deletion_log poisoned");
         assert_eq!(
             guard.by_key.len(),
-            DELETION_LOG_CAP,
+            STRIPPED_TIER_CAP,
             "deletion_log must shrink back to the cap after exactly one entry is evicted"
         );
         assert!(
@@ -3179,8 +3343,8 @@ mod tests {
         );
     }
 
-    /// The evict-on-recreate path must remove a tombstone's entry from BOTH `by_key` and the
-    /// `by_revision` index — not just `by_key`.
+    /// The evict-on-recreate path must remove a tombstone's entry from `by_key`, the
+    /// `by_revision` index, AND `full_revisions` — not just `by_key`.
     ///
     /// Why it matters: eviction walks `by_revision` to find the lowest-revision victim in
     /// O(log n) (`pop_first()`). If evict-on-recreate only cleared `by_key` (forgetting
@@ -3222,13 +3386,13 @@ mod tests {
             None,
         );
 
-        // 3. Push DELETION_LOG_CAP + 1 fresh tombstones, all at revisions strictly above the
+        // 3. Push STRIPPED_TIER_CAP + 1 fresh tombstones, all at revisions strictly above the
         // stale revision=0 left behind by step 1 if the index were desynced. The lowest
         // revision among this fresh batch (revision=2, key "ns-0") is what a correctly
         // synced index must evict when the cap is exceeded on the final insert.
-        const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
+        const STRIPPED_TIER_CAP: usize = 8 * RING_CAPACITY;
         let true_victim = "/registry/core/namespaces/ns-0".to_string();
-        for i in 0..=DELETION_LOG_CAP {
+        for i in 0..=STRIPPED_TIER_CAP {
             store.push_event(
                 Arc::new(InternalEvent {
                     key: format!("/registry/core/namespaces/ns-{i}"),
@@ -3245,7 +3409,7 @@ mod tests {
         let guard = shard.deletion_log.read().expect("deletion_log poisoned");
         assert_eq!(
             guard.by_key.len(),
-            DELETION_LOG_CAP,
+            STRIPPED_TIER_CAP,
             "deletion_log must shrink back to the cap after the cap-triggering insert; a stale \
              by_revision entry left behind by evict-on-recreate would make eviction a no-op \
              (removing a key that no longer exists in by_key), leaving the log permanently over \
