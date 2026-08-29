@@ -236,6 +236,51 @@ assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cl
   grep -qF 'clientCAFile: $STATE_DIR/ca.pem' "$INSTALL"
 
 # ---------------------------------------------------------------------------
+# Regression guard: install.sh's own documented reset procedure ("stop the
+# u7s services, rm -rf $STATE_DIR, and re-run install.sh", below) is only
+# true if everything kubelet caches actually lives under $STATE_DIR. kubelet's
+# hardcoded default certDir (/var/lib/kubelet/pki) does not -- it's where
+# kubelet caches the client cert it self-renews via CSR (rotateCertificates:
+# true above) -- so that cache survived a real rm -rf $STATE_DIR untouched: a
+# reset that regenerates the CA then left kubelet presenting a rotated client
+# cert signed by the deleted CA, an infinite UnknownIssuer reconnect loop with
+# no node ever registering (reproduced live on a fresh-VM reset). This
+# extracts and actually renders the real write_kubelet_config_yaml function
+# (not a hand-copy or a grep for a literal), so a future edit that drops
+# certDir or points it back outside $STATE_DIR fails here instead of only on
+# a live VM reset.
+# ---------------------------------------------------------------------------
+write_kubelet_config_runner() {
+  local install_script="$1" runner="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'STATE_DIR="$1"'
+    echo 'mkdir -p "$STATE_DIR"'
+    awk '/^write_kubelet_config_yaml\(\) \{$/,/^}$/' "$install_script"
+    echo 'write_kubelet_config_yaml'
+  } > "$runner"
+}
+
+KUBELET_CFG_WORK="$(mktemp -d)"
+KUBELET_CFG_RUNNER="$KUBELET_CFG_WORK/write-kubelet-config.sh"
+write_kubelet_config_runner "$INSTALL" "$KUBELET_CFG_RUNNER"
+KUBELET_CFG_STATE_DIR="$KUBELET_CFG_WORK/state"
+bash "$KUBELET_CFG_RUNNER" "$KUBELET_CFG_STATE_DIR"
+# `|| true`: if certDir is ever dropped from the rendered yaml entirely, grep
+# exits 1 and (under this file's `set -euo pipefail`) would abort the whole
+# suite instead of failing this one assertion -- kubelet_cert_dir empty is
+# itself a real failure mode the prefix check below must catch.
+kubelet_cert_dir="$(grep '^certDir:' "$KUBELET_CFG_STATE_DIR/kubelet-config.yaml" | cut -d' ' -f2 || true)"
+# Prefix check via parameter expansion, not a `case` inside "$(...)": on
+# macOS's default bash 3.2, a case/esac embedded in a command substitution
+# mis-parses (the pattern's own closing paren is read as closing the
+# substitution), silently truncating the check.
+assert "the rendered kubelet-config.yaml's certDir resolves under \$STATE_DIR, so install.sh's documented single 'rm -rf \$STATE_DIR' reset actually wipes kubelet's rotated client-cert cache instead of leaving it pinned to a CA the reset just deleted" \
+  "$([ "${kubelet_cert_dir#"$KUBELET_CFG_STATE_DIR"/}" != "$kubelet_cert_dir" ] && echo 1 || echo 0)"
+rm -rf "$KUBELET_CFG_WORK"
+
+# ---------------------------------------------------------------------------
 # Tarball sourcing: --tarball (local path) / --tarball-url / the URL baked in
 # at release time. A script piped into `bash` cannot discover the URL it came
 # from, so the published copy carries it as a literal that
