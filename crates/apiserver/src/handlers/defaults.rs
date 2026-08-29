@@ -48,6 +48,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "persistentvolumes") = (group, plural) {
         default_pv(obj);
     }
+    if let ("", "secrets") = (group, plural) {
+        default_secret(obj);
+    }
     if let ("storage.k8s.io", "csidrivers") = (group, plural) {
         default_csidriver(obj);
     }
@@ -967,6 +970,50 @@ fn validate_network_policy_ports(obj: &serde_json::Value) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+/// Merges `Secret.stringData` (the write-only plaintext convenience map clients like
+/// `kubectl create secret generic --from-literal=...` send) into `Secret.data`
+/// (base64-encoded, the only field ever returned by GET) and clears `stringData` —
+/// mirroring upstream's `Convert_v1_Secret_To_core_Secret`
+/// (`pkg/apis/core/v1/conversion.go`: "StringData overwrites Data", i.e. a stringData
+/// entry wins over a data entry for the same key). Without this merge, a Secret created
+/// with only `stringData` persists with no usable `data` at all — any `secretKeyRef`
+/// volume/env mount referencing it fails with "couldn't find key", even though
+/// `kubectl get -o yaml` shows the value sitting right there under `stringData`.
+fn default_secret(obj: &mut serde_json::Value) {
+    let Some(obj_map) = obj.as_object_mut() else {
+        return;
+    };
+    let Some(string_data) = obj_map.remove("stringData") else {
+        return;
+    };
+    let Some(string_data) = string_data.as_object() else {
+        return;
+    };
+    if string_data.is_empty() {
+        return;
+    }
+    let data = obj_map
+        .entry("data")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !data.is_object() {
+        *data = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let data_map = data
+        .as_object_mut()
+        .expect("just normalized to an object above");
+    for (key, value) in string_data {
+        if let Some(s) = value.as_str() {
+            data_map.insert(
+                key.clone(),
+                serde_json::Value::String(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    s.as_bytes(),
+                )),
+            );
+        }
+    }
 }
 
 fn validate_data_keys(obj: &serde_json::Value, plural: &str) -> Result<(), String> {
