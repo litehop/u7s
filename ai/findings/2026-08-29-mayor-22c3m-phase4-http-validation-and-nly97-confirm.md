@@ -55,7 +55,10 @@ under `$STATE_DIR` and never touched the stale, now-irrelevant
 5. WordPress+nginx deploy (reused Phase 3's manifest verbatim, including its
    `X-Forwarded-Proto` readinessProbe deviation) → `2/2 Running`: **~60s**.
 6. Port-forward + curl (GET, POST install, final GET): **<1 min**.
-7. Total wall clock, reset → HTTP-validated: **~7m11s**.
+7. Other (port-forward setup, between-step `kubectl` status polling not
+   captured by any single step's timer): **~75s**.
+8. Total wall clock, reset → HTTP-validated: **~7m11s** — steps 1-6 sum to
+   ~5m56s; step 7 accounts for the remainder.
 
 ## Gaps
 
