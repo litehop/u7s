@@ -1158,11 +1158,33 @@ pub(crate) async fn do_patch<S: Store>(
                     .await
                     .map_err(|e| store_err(e, name, &meta.kind))?;
                 current.set_resource_version(rv);
+                if group == RBAC_GROUP {
+                    let rbac_key = match ns {
+                        None => rbac_cluster_key(group, version, plural, name),
+                        Some(namespace) => {
+                            rbac_namespaced_key(group, version, namespace, plural, name)
+                        }
+                    };
+                    state.rbac_index.apply_object(&rbac_key, &current.body);
+                }
                 return Ok(Json(current.body).into_response());
             }
             Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, name, &meta.kind)),
         };
         obj.set_resource_version(new_rv);
+        // SSA upsert-create: this is the same "object now exists" event create_resource's
+        // RBAC_GROUP hook handles for a plain POST — without it, a ClusterRole/ClusterRoleBinding
+        // created via `kubectl apply --server-side` (or this apiserver's own bootstrap-installer,
+        // which SSAs every manifest in the well-known manifest dir including coredns.yaml) is
+        // persisted correctly but never enters the authorizer's index, so SubjectAccessReview
+        // denies every request until the object is later touched by an ordinary PATCH/PUT.
+        if group == RBAC_GROUP {
+            let rbac_key = match ns {
+                None => rbac_cluster_key(group, version, plural, name),
+                Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
+            };
+            state.rbac_index.apply_object(&rbac_key, &obj.body);
+        }
         if let Some(fm) = field_manager {
             let api_ver = obj.body["apiVersion"].as_str().unwrap_or("").to_string();
             let now = crate::util::utc_now_rfc3339();
@@ -5296,6 +5318,113 @@ mod tests {
 
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/lima-node";
         assert!(store.get(key).await.unwrap().is_some());
+    }
+
+    /// A ClusterRoleBinding created via Server-Side-Apply (`kubectl apply --server-side`, and
+    /// this apiserver's own bootstrap-installer applying manifests/coredns.yaml) must grant its
+    /// subjects access immediately — do_patch's SSA "create when absent" branch previously
+    /// skipped the `RBAC_GROUP` -> `rbac_index.apply_object` hook that create_resource / the
+    /// PATCH-on-existing loop both have, so the binding was persisted correctly but invisible to
+    /// the authorizer until an unrelated later PATCH touched the object. CoreDNS's own
+    /// `system:coredns` ClusterRoleBinding (vendored from kubeadm, carrying the standard
+    /// `kubernetes.io/bootstrapping: rbac-defaults` label) hit exactly this gap and lost list/
+    /// watch access to every resource its "kubernetes" plugin needs, breaking cluster DNS.
+    /// The label itself must never be an authorization signal — a labeled binding and an
+    /// otherwise-identical unlabeled one must both be authorized identically.
+    #[tokio::test]
+    async fn ssa_created_clusterrolebinding_grants_access_with_or_without_bootstrapping_label() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // The ClusterRole both bindings below reference.
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/service-lister",
+            &serde_json::json!({
+                "rules": [{ "apiGroups": [""], "resources": ["services"], "verbs": ["list"] }]
+            }),
+        );
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        // (binding name, subject ServiceAccount name, carries the bootstrapping label)
+        let cases = [
+            ("coredns-style-labeled", "coredns-style-sa", true),
+            ("coredns-style-unlabeled", "coredns-style-sa-2", false),
+        ];
+
+        for (binding_name, sa_name, labeled) in cases {
+            let mut metadata = serde_json::json!({ "name": binding_name });
+            if labeled {
+                metadata["labels"] =
+                    serde_json::json!({ "kubernetes.io/bootstrapping": "rbac-defaults" });
+            }
+            let body = serde_json::json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRoleBinding",
+                "metadata": metadata,
+                "subjects": [{ "kind": "ServiceAccount", "namespace": "test", "name": sa_name }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "service-lister"
+                }
+            });
+            let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
+
+            patch_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "rbac.authorization.k8s.io".to_string(),
+                    "v1".to_string(),
+                    "clusterrolebindings".to_string(),
+                    binding_name.to_string(),
+                )),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                ssa_headers.clone(),
+                body_bytes,
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("SSA create of ClusterRoleBinding {binding_name} must succeed")
+            });
+
+            let username = format!("system:serviceaccount:test:{sa_name}");
+            let groups: Vec<String> = vec![];
+            let req = crate::rbac::AuthzRequest {
+                username: &username,
+                groups: &groups,
+                verb: "list",
+                api_group: "",
+                resource: "services",
+                subresource: "",
+                namespace: None,
+                name: None,
+                non_resource_url: None,
+            };
+            assert!(
+                state.rbac_index.is_allowed(&req),
+                "ClusterRoleBinding {binding_name} (bootstrapping label present={labeled}) \
+                 created via Server-Side-Apply must grant its subject access immediately; a \
+                 metadata label must never affect authorization, and the SSA-create path must \
+                 index the binding just like a plain POST create does — otherwise every \
+                 upstream-shaped manifest (including u7s's own bundled CoreDNS) silently loses \
+                 its granted RBAC permissions until something else happens to PATCH the object"
+            );
+        }
     }
 
     /// SSA apply-create (do_patch's is_ssa && stored_opt.is_none() upsert branch) had no
