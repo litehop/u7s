@@ -746,6 +746,40 @@ EOF
 
 write_kubelet_config_yaml
 
+# Round-2 kubelet tuning, shared by both kubelet.service blocks
+# below. --max-pods and ConfigMapAndSecretChangeDetectionStrategy are
+# deliberately NOT touched here -- operator scope narrowing keeps
+# behavior-changing knobs off the table until other levers are exhausted.
+#
+# Feature gates: kubelet-consulted Beta gates, default-on in v1.36.4's
+# pkg/features/kube_features.go, that no u7s workload or manifest exercises
+# (verified per-gate against crates/ + manifests/ for a consumer of the
+# capability's wire field). PodReadyToStartContainersCondition was left
+# enabled -- whether anything depends on kubelet emitting it is uncertain
+# (the closest regression test, crates/apiserver/src/handlers/pods.rs's
+# $setElementOrder/conditions reordering, is condition-name-agnostic, so it
+# doesn't prove this specific condition is required), and the conservative
+# default is to keep an uncertain dependency on rather than prove it's safe
+# to cut. Disabling the other 15 drops the corresponding kubelet code paths
+# (checkpoint HTTP handler, credential-provider SA-token plumbing, CA/serving
+# -cert file watchers, pod/container-level resize bookkeeping, etc.) for zero
+# functional loss.
+#
+# cAdvisor trim: --application-metrics-count-limit=0 drops the
+# 100-slot-per-container legacy "application metrics" ring buffer (a
+# cadvisor flag mistakenly registered on kubelet, per its own --help
+# output) -- u7s has no container exposing that legacy annotation-based
+# metrics source, so the buffer is never populated. --housekeeping-interval
+# was tried and reverted: pkg/kubelet/kubelet.go's evictionMonitoringPeriod
+# is a hardcoded 10s constant with an explicit upstream comment to "keep
+# this in sync with internal cadvisor housekeeping" -- raising
+# --housekeeping-interval desyncs the two, so the eviction manager can act
+# on cAdvisor stats up to (new_interval - 10s) stale under real memory
+# pressure. That is a genuine behavior change under load, not the
+# zero-impact trim it looked like, and falls under the same
+# behavior-changing-knob restriction as --max-pods.
+KUBELET_ROUND2_FLAGS="--application-metrics-count-limit=0 --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,InPlacePodVerticalScalingInitContainers=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false"
+
 if [ "$WORKER_MODE" -eq 1 ]; then
   # --- Join an existing cluster via the CSR API, or upgrade an
   # already-joined worker in place (kubelet binary + kubelet.service only,
@@ -775,7 +809,7 @@ WorkingDirectory=$STATE_DIR
 Environment=GOMEMLIMIT=200MiB
 Environment=GOGC=50
 Environment=GOMAXPROCS=2
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 
@@ -985,7 +1019,7 @@ Environment=GOMAXPROCS=2
 # repeat across services.
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
 ExecStartPre=/bin/bash -c 'test -s $STATE_DIR/kubelet-serving.crt || { openssl ecparam -name prime256v1 -genkey -noout -out $STATE_DIR/kubelet-serving.key && chmod 600 $STATE_DIR/kubelet-serving.key && openssl req -new -key $STATE_DIR/kubelet-serving.key -subj "/CN=$NODE_NAME" -out $STATE_DIR/kubelet-serving.csr && openssl x509 -req -in $STATE_DIR/kubelet-serving.csr -CA $STATE_DIR/ca.pem -CAkey $STATE_DIR/ca.key -CAcreateserial -days 3650 -extfile <(printf "subjectAltName=IP:$IFACE_IP\nextendedKeyUsage=serverAuth\n") -out $STATE_DIR/kubelet-serving.crt; }'
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 

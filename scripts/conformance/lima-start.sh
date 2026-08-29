@@ -559,7 +559,16 @@ ExecStart=/usr/bin/kubelet \\\\
   --tls-private-key-file=/etc/kubelet-tls.key \\\\
   --hostname-override=${VM_NAME} \\\\
   --node-ip=${LIMA_VM_IP},${NODE_IPV6} \\\\
-  --v=${KUBELET_V}
+  --v=${KUBELET_V} \\\\
+  --application-metrics-count-limit=0 \\\\
+  --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,InPlacePodVerticalScalingInitContainers=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false
+# Round-2 tuning: feature-gate audit + cAdvisor trim -- see the
+# matching kubelet.service comment in scripts/install.sh for the full
+# per-gate/-flag rationale (mirrored here so the conformance run exercises
+# what production ships), including why --housekeeping-interval was tried
+# and reverted (desyncs from kubelet's hardcoded eviction-monitoring
+# period). --max-pods/ChangeDetectionStrategy intentionally untouched --
+# operator scope narrowing.
 # Matches kube-proxy.service's LimitNOFILE below — sustained conformance load
 # (one FD per container log/exec/attach stream) can exceed the systemd default
 # well before kube-proxy's own limit would ever be hit.
