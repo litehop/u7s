@@ -502,21 +502,22 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
     // No leeway: reject tokens that are even 1 second past expiry.
     validation.leeway = 0;
 
-    // Signature-verify cache: skip the RSA modexp when this exact token's
-    // signature bytes were already verified valid and the cached entry hasn't reached the
-    // token's real `exp` yet (see `sa_sig_cache` module doc for the full design). A
-    // malformed token makes `signature_hash` return `None`, which naturally falls through
-    // to the full decode below and its own proper rejection.
-    let sig_key = sa_sig_cache::signature_hash(token);
-    let cache_hit =
-        sig_key.is_some_and(|k| sig_cache.get(&k, std::time::Instant::now()) == Some(true));
+    // Whole-token verify cache: skip the RSA modexp when this exact token — header, payload,
+    // AND signature together — was already verified valid and the cached entry hasn't
+    // reached the token's real `exp` yet (see `sa_sig_cache` module doc for the full
+    // design). Keying on the whole token, not just the signature segment, is what makes a
+    // cache hit trustworthy: it is only reachable by presenting byte-for-byte the same token
+    // that was verified before, so a token built from a copied signature and
+    // attacker-chosen header/payload always misses and falls through to a real RSA verify.
+    let token_key = sa_sig_cache::token_hash(token);
+    let cache_hit = sig_cache.get(&token_key, std::time::Instant::now()) == Some(true);
 
     let claims = if cache_hit {
-        // Signature already verified for this exact byte-for-byte token: RS256/PKCS#1v1.5
-        // signing is deterministic per (message, key), so an identical signature can only
-        // have been produced by an identical header+payload — every claim decoded here is
-        // exactly what a fresh `jsonwebtoken::decode` would have produced too. Skips the RSA
-        // verify, not claim decoding.
+        // Cache key is sha256(whole_token), so a hit proves this exact byte-for-byte token
+        // was already verified in full before — no cryptographic argument about signature
+        // uniqueness is needed or trusted; the claims decoded here are the ones that were
+        // already RSA-verified the first time this token was seen. Skips the RSA verify, not
+        // claim decoding.
         match jsonwebtoken::dangerous::insecure_decode::<SaClaims>(token) {
             Ok(data) => data.claims,
             Err(e) => {
@@ -533,11 +534,9 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
                 return None;
             }
         };
-        if let Some(k) = sig_key {
-            let now = std::time::Instant::now();
-            let expires_at = sa_sig_cache::capped_expiry(data.claims.exp, unix_now(), now);
-            sig_cache.insert(k, None, expires_at);
-        }
+        let now = std::time::Instant::now();
+        let expires_at = sa_sig_cache::capped_expiry(data.claims.exp, unix_now(), now);
+        sig_cache.insert(token_key, None, expires_at);
         data.claims
     };
 
@@ -2355,10 +2354,15 @@ mod tests {
         );
     }
 
-    /// A cache keyed on signature bytes must never let a tampered token piggyback on a
+    /// A cache keyed on the whole token must never let a tampered token piggyback on a
     /// different (valid) token's cached result — otherwise, once ANY valid token has warmed
     /// the cache, an attacker able to flip bits in a signature could bypass RSA verification
-    /// entirely as long as some unrelated valid entry happens to occupy the cache.
+    /// entirely as long as some unrelated valid entry happens to occupy the cache. Now that
+    /// the cache key covers the whole token, this passes because the changed signature bytes
+    /// alone already change the key; see
+    /// `tampered_header_payload_with_replayed_signature_never_gets_cache_hit_shortcut` below
+    /// for the complementary case (signature unchanged, header/payload forged) that this
+    /// test does not cover.
     #[tokio::test]
     async fn tampered_signature_never_gets_cache_hit_shortcut() {
         let (enc, dec) = test_rsa_keypair();
@@ -2411,6 +2415,88 @@ mod tests {
         assert!(
             tampered.is_none(),
             "a tampered signature must never authenticate"
+        );
+    }
+
+    /// A cache keyed on only the signature segment let an attacker copy a legitimately
+    /// verified signature onto a forged header+payload for a DIFFERENT ServiceAccount and
+    /// ride the original token's cached "verified" result straight past RSA verification —
+    /// a full authentication bypass allowing any holder of one valid SA JWT to forge tokens
+    /// for any other ServiceAccount whose UID they can discover. This is the exact
+    /// vulnerability the whole-token cache key closes.
+    #[tokio::test]
+    async fn tampered_header_payload_with_replayed_signature_never_gets_cache_hit_shortcut() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
+        let sig_cache = make_test_sig_cache();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+
+        let valid = try_verify_sa_jwt(&token, &dec, &[], &store, &sig_cache).await;
+        assert!(
+            valid.is_some(),
+            "valid token must authenticate and populate the cache"
+        );
+        assert_eq!(
+            sig_cache.verify_count(),
+            1,
+            "first verify must run the real RSA check"
+        );
+
+        // Keep the legitimate signature segment verbatim, but forge a brand-new
+        // header+payload claiming a different, more privileged ServiceAccount — this is the
+        // attack: an attacker who owns any one valid token has the signature bytes needed to
+        // "prove" whatever claims they like, if the cache trusts the signature alone.
+        let segments: Vec<&str> = token.splitn(3, '.').collect();
+        assert_eq!(
+            segments.len(),
+            3,
+            "test fixture must be a 3-segment compact JWS"
+        );
+        let real_sig = segments[2];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let forged_header = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+        let forged_payload = serde_json::json!({
+            "iss": "https://kubernetes.default.svc",
+            "sub": "system:serviceaccount:kube-system:cluster-admin-sa",
+            "aud": ["https://kubernetes.default.svc"],
+            "iat": now,
+            "exp": now + 3600,
+            "kubernetes.io": {
+                "namespace": "kube-system",
+                "serviceaccount": {"name": "cluster-admin-sa", "uid": "uid-attacker-never-signed-for"},
+            },
+        });
+        let b64 = |v: &serde_json::Value| {
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                serde_json::to_vec(v).expect("serialize forged segment"),
+            )
+        };
+        let forged_token = format!(
+            "{}.{}.{}",
+            b64(&forged_header),
+            b64(&forged_payload),
+            real_sig
+        );
+
+        let forged = try_verify_sa_jwt(&forged_token, &dec, &[], &store, &sig_cache).await;
+        assert_eq!(
+            sig_cache.verify_count(),
+            2,
+            "a token with a copied signature but attacker-chosen claims must never ride the \
+             cached result of the legitimately-signed original token — a hit here is the \
+             exact bug: any authenticated SA could forge tokens for any other SA"
+        );
+        assert!(
+            forged.is_none(),
+            "the real RSA verify must reject the forged header+payload against the replayed \
+             signature — if this ever returned Some(_), an attacker holding one valid SA JWT \
+             could authenticate as any ServiceAccount whose UID they can discover, with zero \
+             knowledge of the signing key"
         );
     }
 
