@@ -91,6 +91,12 @@ raised, or reports what "this session" did. A concise "why" is sufficient if
 something is not obvious, but otherwise text (comments, commits) should be as
 concise and factual as possible.
 
+### Rule 17 — Answer First
+Every artefact written for another agent to read cold — bead note, PR body,
+dashboard entry, findings doc, worker brief — opens with a single-sentence
+answer or decision before any evidence, mechanism, or chronology. Evidence
+supports the answer; it does not precede it.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
 

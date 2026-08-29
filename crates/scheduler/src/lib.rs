@@ -1115,7 +1115,11 @@ fn subtract_requests(total: &mut ResourceRequests, victim: &ResourceRequests) {
 /// rounded to the nearest integer since milli is this representation's finest granularity —
 /// a deliberate, explicit choice rather than the silent truncation-to-zero that `i64` parsing
 /// alone would produce. `NaN`/`inf` are rejected: `f64::from_str` accepts them, but they are
-/// not valid Kubernetes quantity values.
+/// not valid Kubernetes quantity values. The scaled (post-`mult`) value is also range-checked
+/// against `i64` before the final cast: `f64 as i64` SATURATES to `i64::MAX`/`i64::MIN` on
+/// overflow rather than signaling failure, so without this check a monster fractional
+/// quantity (e.g. "1e19") would be silently accepted as the saturated max/min instead of
+/// treated as unparseable (0).
 fn parse_number_milli(s: &str, mult: i64) -> i64 {
     if let Ok(n) = s.parse::<i64>() {
         return n.checked_mul(mult).unwrap_or(0);
@@ -1124,10 +1128,16 @@ fn parse_number_milli(s: &str, mult: i64) -> i64 {
         Ok(f) => f,
         Err(_) => return 0,
     };
-    if !f.is_finite() {
+    let scaled = f * mult as f64;
+    // `i64::MAX` (2^63 - 1) needs 63 bits and isn't exactly representable in f64's 53-bit
+    // mantissa, so `i64::MAX as f64` rounds UP to 2^63. A strict `>` would let `scaled ==
+    // 2^63.0` through the guard, then saturate to `i64::MAX` on the cast below — so the
+    // upper bound must be `>=`, not `>`. `i64::MIN` (-2^63) is a power of two and IS exact,
+    // so `<` is correct there.
+    if !scaled.is_finite() || scaled < i64::MIN as f64 || scaled >= i64::MAX as f64 {
         return 0;
     }
-    (f * mult as f64).round() as i64
+    scaled.round() as i64
 }
 
 /// Parse a Kubernetes resource quantity string into milli-units: for CPU,
@@ -8588,7 +8598,10 @@ mod tests {
     /// `NaN`/`inf` are not valid Kubernetes quantities even though `f64::from_str` happily
     /// parses them — without an explicit finite check, the f64 fallback added for fractional
     /// support would treat a malformed capacity/request string as a nonsensical numeric value
-    /// instead of the "unparseable" 0 every other invalid input maps to.
+    /// instead of the "unparseable" 0 every other invalid input maps to. This only exercises
+    /// the non-finite half of the fallback's guard — see
+    /// `parse_quantity_milli_rejects_overflowing_fractional` for the separate
+    /// finite-but-too-large-to-fit-in-i64 half.
     #[test]
     fn parse_quantity_milli_rejects_non_finite() {
         assert_eq!(
@@ -8608,6 +8621,79 @@ mod tests {
             0,
             "\"-inf\" must be treated as unparseable (0), not accepted via the fractional \
              fallback"
+        );
+    }
+
+    /// `"1e19"` is FINITE (unlike `NaN`/`inf` above) but its milli-scaled value
+    /// (1e19 * 1000 = 1e22) overflows `i64::MAX` (~9.22e18). Rust's `f64 as i64` cast
+    /// SATURATES on overflow instead of signaling failure, so before the explicit range
+    /// check this silently returned `i64::MAX` — a monster fractional cpu/memory
+    /// request/capacity would be read as the saturated max instead of unparseable (0),
+    /// letting the scheduler make a fit decision against a bogus huge value.
+    #[test]
+    fn parse_quantity_milli_rejects_overflowing_fractional() {
+        assert_eq!(
+            parse_quantity_milli("1e19"),
+            0,
+            "a fractional value whose milli-scaled magnitude exceeds i64::MAX must be \
+             treated as unparseable (0), not silently saturated to i64::MAX"
+        );
+    }
+
+    /// Mirrors the positive-overflow case above but for the negative saturation bound
+    /// (`i64::MIN`) — a naive fix that only range-checked the upper bound would still
+    /// silently accept `"-1e19"` as the saturated minimum.
+    #[test]
+    fn parse_quantity_milli_rejects_negative_overflowing_fractional() {
+        assert_eq!(
+            parse_quantity_milli("-1e19"),
+            0,
+            "a fractional value whose milli-scaled magnitude is below i64::MIN must be \
+             treated as unparseable (0), not silently saturated to i64::MIN"
+        );
+    }
+
+    /// A moderate-looking fractional value combined with a binary suffix ("1e19Gi") must
+    /// also be rejected — the overflow can come from the numeric literal alone, the binary
+    /// multiplier alone, or (as tested here) their product, so the guard must run on the
+    /// fully mult-scaled value, not just the bare parsed float.
+    #[test]
+    fn parse_quantity_milli_rejects_overflowing_fractional_binary_suffix() {
+        assert_eq!(
+            parse_quantity_milli("1e19Gi"),
+            0,
+            "a fractional binary-suffixed quantity that overflows i64 once scaled by the \
+             Gi multiplier must be treated as unparseable (0), not silently saturated"
+        );
+    }
+
+    /// `9223372036854775808` is exactly `2^63`, one past `i64::MAX` (`2^63 - 1`). `i64::MAX`
+    /// itself isn't exactly representable in f64 (63 bits needed, f64 has 53), so `i64::MAX
+    /// as f64` rounds UP to `2^63.0` — a strict `scaled > i64::MAX as f64` guard would let
+    /// `scaled == 2^63.0` through, then saturate to `i64::MAX` on the cast. The upper bound
+    /// must be `>=` to close this exact-boundary hole.
+    #[test]
+    fn parse_quantity_milli_rejects_exact_two_pow_63_boundary() {
+        assert_eq!(
+            parse_quantity_milli("9223372036854775808m"),
+            0,
+            "2^63 milli-units is one past i64::MAX and must be treated as unparseable (0) — \
+             a `>` (rather than `>=`) upper-bound check would let this saturate to i64::MAX \
+             instead"
+        );
+    }
+
+    /// Sanity check for the boundary fix above: `i64::MAX` itself (one milli-unit below
+    /// `2^63`) must still parse successfully — an overly aggressive `>=` fix applied to the
+    /// wrong operand, or an off-by-one in the other direction, would over-reject the exact
+    /// maximum valid value.
+    #[test]
+    fn parse_quantity_milli_accepts_exact_i64_max() {
+        assert_eq!(
+            parse_quantity_milli("9223372036854775807m"),
+            i64::MAX,
+            "i64::MAX itself is a valid milli-quantity and must not be rejected by the \
+             overflow guard"
         );
     }
 
