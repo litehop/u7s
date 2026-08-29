@@ -503,6 +503,7 @@ pub(crate) async fn patch_namespace<S: Store>(
                     "groups": user.groups,
                     "extra": user.extra,
                 })),
+                user: &user,
             },
         )
         .await;

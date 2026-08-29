@@ -1046,6 +1046,9 @@ pub(crate) struct PatchConfig<'a> {
     /// Authenticated user info for the request. Used by VAP CEL expressions
     /// that reference `request.userInfo.*`.
     pub user_info: Option<serde_json::Value>,
+    /// The authenticated caller, for RBAC escalation-prevention checks on the
+    /// SSA-create branch (mirrors create_resource/replace_resource's `user` param).
+    pub user: &'a UserInfo,
 }
 
 /// Shared patch logic for cluster-scoped and namespaced resources.
@@ -1072,6 +1075,7 @@ pub(crate) async fn do_patch<S: Store>(
         body,
         dry_run,
         user_info,
+        user,
     } = cfg;
     let stored_opt = state
         .store
@@ -1100,6 +1104,20 @@ pub(crate) async fn do_patch<S: Store>(
         super::defaults::apply_defaults(group, plural, &mut obj.body);
         super::defaults::validate_resource(group, plural, &obj.body)
             .map_err(Status::unprocessable_entity)?;
+        // Escalation prevention: SSA-create is a create just like create_resource /
+        // create_namespaced_resource, so it must run the same checks before persisting
+        // a ClusterRoleBinding/ClusterRole/RoleBinding — otherwise `kubectl apply
+        // --server-side` on a not-yet-existing name is a privilege-escalation bypass.
+        check_crb_escalation(plural, group, user, &obj.body, state)?;
+        check_clusterrole_escalation(plural, group, user, &obj.body, state)?;
+        check_rb_escalation(
+            plural,
+            group,
+            ns.unwrap_or_default(),
+            user,
+            &obj.body,
+            state,
+        )?;
         if dry_run {
             // Dry-run: validation passed; return the would-be created object without persisting.
             if let Some(fm) = field_manager {
@@ -1143,6 +1161,20 @@ pub(crate) async fn do_patch<S: Store>(
                 super::defaults::apply_defaults(group, plural, &mut current.body);
                 super::defaults::validate_resource(group, plural, &current.body)
                     .map_err(Status::unprocessable_entity)?;
+                // Escalation prevention: same rationale as the primary create path above —
+                // this branch is still creating the object from the caller's perspective
+                // (it lost a create/create race and fell back to a merge), so it must not
+                // skip the check just because another writer's create won the race first.
+                check_crb_escalation(plural, group, user, &current.body, state)?;
+                check_clusterrole_escalation(plural, group, user, &current.body, state)?;
+                check_rb_escalation(
+                    plural,
+                    group,
+                    ns.unwrap_or_default(),
+                    user,
+                    &current.body,
+                    state,
+                )?;
                 if let Some(fm) = field_manager {
                     let api_ver = current.body["apiVersion"]
                         .as_str()
@@ -2008,6 +2040,7 @@ pub(crate) async fn patch_resource<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
+            user: &user,
         },
     )
     .await
@@ -3349,6 +3382,7 @@ pub(crate) async fn patch_namespaced_resource<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
+            user: &user,
         },
     )
     .await
@@ -3436,6 +3470,7 @@ pub(crate) async fn patch_collection_namespaced_resource<S: Store>(
                 body: body.clone(),
                 dry_run: patch_query.is_dry_run(),
                 user_info: user_info.clone(),
+                user: &user,
             },
         )
         .await;
@@ -5352,6 +5387,20 @@ mod tests {
                 "rules": [{ "apiGroups": [""], "resources": ["services"], "verbs": ["list"] }]
             }),
         );
+        // Escalation prevention (this test's SSA-create must pass it, not be blocked by it —
+        // that's a separate concern from what this test verifies) requires the creator to
+        // already hold every rule of the role it's binding to.
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/test-admin-service-lister",
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": "admin" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "service-lister"
+                }
+            }),
+        );
 
         let mut ssa_headers = axum::http::HeaderMap::new();
         ssa_headers.insert(
@@ -5425,6 +5474,172 @@ mod tests {
                  its granted RBAC permissions until something else happens to PATCH the object"
             );
         }
+    }
+
+    /// SSA-created RBAC bindings must obey escalation-prevention; a low-priv client crafting
+    /// a self-privilege-escalating CRB via `kubectl apply --server-side` must be rejected.
+    ///
+    /// do_patch's SSA "create when absent" branch previously skipped check_crb_escalation
+    /// entirely (unlike create_resource/replace_resource), so a caller who could only `get
+    /// pods` in one namespace could SSA-create a brand-new ClusterRoleBinding granting
+    /// themselves cluster-admin — a complete bypass of Kubernetes' RBAC privilege-escalation
+    /// guard, reachable simply by using PATCH+apply-patch+yaml instead of POST.
+    #[tokio::test]
+    async fn ssa_create_clusterrolebinding_denied_for_user_lacking_role_rules() {
+        use axum::http::StatusCode;
+
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        // "eve" holds only get-pods in "default" — nowhere near cluster-admin.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/namespaces/default/roles/pod-getter"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+            }),
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/namespaces/default/rolebindings/eve-pod-getter"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "eve"}],
+                "roleRef": {"apiGroup": group, "kind": "Role", "name": "pod-getter"}
+            }),
+        );
+        // The ClusterRole eve tries to bind herself to — real cluster-admin-shaped rules.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/cluster-admin"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+            }),
+        );
+
+        let eve = Extension(crate::auth::UserInfo {
+            username: "eve".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+
+        let crb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "eve-self-admin"},
+            "subjects": [{"kind": "User", "name": "eve"}],
+            "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "cluster-admin"}
+        });
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                "v1".to_string(),
+                "clusterrolebindings".to_string(),
+                "eve-self-admin".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            eve,
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&crb_body).unwrap()),
+        )
+        .await;
+
+        const INVARIANT: &str = "SSA-created RBAC bindings must obey escalation-prevention; a \
+             low-priv client crafting a self-privilege-escalating CRB via kubectl apply \
+             --server-side must be rejected.";
+        match result {
+            Err(err) => assert_eq!(err.0, StatusCode::FORBIDDEN, "{INVARIANT}"),
+            Ok(_) => panic!("{INVARIANT}"),
+        }
+
+        // Ordering: a rejected escalation must not leave the object in storage.
+        let key =
+            crate::keys::group_object_key(group, "clusterrolebindings", None, "eve-self-admin");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "the escalation check must run before the store write — a rejected SSA-create \
+             must not persist the ClusterRoleBinding it just denied"
+        );
+    }
+
+    /// Symmetric baseline for the test above: a user who already holds every rule of the
+    /// ClusterRole they're binding to must be allowed to SSA-create that ClusterRoleBinding.
+    /// Without this, the escalation check above could be over-broad and reject legitimate
+    /// `kubectl apply --server-side` of RBAC bindings a caller is entitled to create.
+    #[tokio::test]
+    async fn ssa_create_clusterrolebinding_allowed_for_user_holding_role_rules() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/pod-getter"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+            }),
+        );
+        // "eve" already holds get-pods cluster-wide via her own ClusterRoleBinding.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/eve-pod-getter"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "eve"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "pod-getter"}
+            }),
+        );
+
+        let eve = Extension(crate::auth::UserInfo {
+            username: "eve".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+
+        // eve grants "bob" the exact same pod-getter role she already holds.
+        let crb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "bob-pod-getter"},
+            "subjects": [{"kind": "User", "name": "bob"}],
+            "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "pod-getter"}
+        });
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                "v1".to_string(),
+                "clusterrolebindings".to_string(),
+                "bob-pod-getter".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            eve,
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&crb_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "escalation-prevention must not block a user from SSA-creating a \
+                 ClusterRoleBinding to a role they already hold every rule of — this test \
+                 isolates that the check above is denying eve on privilege grounds, not by \
+                 accident rejecting every SSA-created CRB: {e:?}"
+            )
+        })
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
     }
 
     /// SSA apply-create (do_patch's is_ssa && stored_opt.is_none() upsert branch) had no
