@@ -1354,7 +1354,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "rules": [
             { "apiGroups": [""], "resources": ["nodes"],        "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": [""], "resources": ["nodes/status"], "verbs": ["get","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods"],         "verbs": ["get","list","watch"] },
+            // Kubelet must be able to delete a pod once its containers have exited and the
+            // grace period elapses, to complete pod-termination reconciliation. Without this,
+            // terminated pods stay in `Terminating` forever until force-deleted by a client
+            // with higher privileges than the node's own identity (upstream kubelet's
+            // pkg/kubelet/status/status_manager.go:1219).
+            { "apiGroups": [""], "resources": ["pods"],         "verbs": ["get","list","watch","delete"] },
             { "apiGroups": [""], "resources": ["pods/status"],  "verbs": ["get","update","patch"] },
             { "apiGroups": [""], "resources": ["pods/log"],     "verbs": ["get"] },
             { "apiGroups": [""], "resources": ["events"],       "verbs": ["create","patch","update"] },
@@ -4712,6 +4717,52 @@ mod tests {
             "system:node must be able to get VolumeAttachments so kubelet knows when a CSI \
              volume attach has completed before it attempts to mount; missing this rule blocks \
              every CSI PVC-backed pod"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_to_delete_terminated_pods() {
+        // Regression test for a live outage: once a pod's containers have exited and its
+        // grace period elapses, kubelet must be able to DELETE the pod object to complete
+        // pod-termination reconciliation. Without this rule every deleted pod (StatefulSet
+        // rolling update, manual delete, a finished Job pod, eviction, ...) stays wedged in
+        // `Terminating` forever, blocking recreation by owning controllers, until an operator
+        // force-deletes it with a higher-privileged client.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        // Find a rule granting `verb` on `resource` in `api_group`.
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule("", "pods", "delete"),
+            "system:node must be able to delete pods so kubelet can complete \
+             pod-termination reconciliation (pkg/kubelet/status/status_manager.go:1219); \
+             missing this rule leaves terminated pods stuck in Terminating forever"
         );
     }
 
