@@ -258,7 +258,7 @@ stage_binaries() {
 }
 
 # Minimal KubeletConfiguration: CRI-O's socket, cluster DNS matching
-# apiserver's default --service-cluster-ip-range (10.96.0.0/12), and four
+# apiserver's default --service-cluster-ip-range (10.96.0.0/12), and five
 # settings that are not obvious:
 #
 # resolvConf: "" -- Ubuntu's systemd-resolved points /etc/resolv.conf at the
@@ -276,6 +276,13 @@ stage_binaries() {
 #
 # rotateCertificates -- kubelet self-renews its client cert over the same CSR
 # path; the selfnodeclient RBAC grant it needs is already seeded.
+#
+# certDir -- kubelet's hardcoded default (/var/lib/kubelet/pki) lives outside
+# $STATE_DIR, so it survives the documented reset procedure's `rm -rf
+# $STATE_DIR` untouched. A reset that regenerates the CA then leaves kubelet
+# presenting a rotated client cert signed by the deleted CA, an infinite
+# UnknownIssuer reconnect loop with no node ever registering. Pointing
+# certDir under $STATE_DIR makes that single rm -rf actually complete.
 write_kubelet_config_yaml() {
   cat > "$STATE_DIR/kubelet-config.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -294,6 +301,7 @@ authentication:
   x509:
     clientCAFile: $STATE_DIR/ca.pem
 rotateCertificates: true
+certDir: $STATE_DIR/kubelet/pki
 EOF
 }
 
