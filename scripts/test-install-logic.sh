@@ -252,17 +252,40 @@ assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cl
 # install.sh's literal ExecStart line, not a rendered/executed check, so it
 # cannot prove kubelet actually reads the flag at runtime -- but it does
 # catch a reverted-to-yaml regression (the exact failure mode above) with no
-# live VM required. Both kubelet.service blocks (worker-mode join/upgrade
-# and control-plane single-node bootstrap) render this ExecStart line, so
-# the flag must appear exactly twice.
+# live VM required. Both kubelet.service blocks (worker-mode join/upgrade and
+# control-plane single-node bootstrap) render this ExecStart line, so each
+# block is extracted and checked in isolation below -- a file-wide `grep -c`
+# count would stay unchanged (and so keep passing) if the flag were deleted
+# from one block while an unrelated second copy (e.g. a comment) were added
+# anywhere else in the file, which is not the invariant this test exists to
+# guard.
 # ---------------------------------------------------------------------------
+kubelet_service_block() {
+  # Extracts the Nth (1-indexed, $2) `cat > .../kubelet.service <<EOF` ...
+  # `EOF` heredoc body from install.sh ($1). Both blocks share the identical
+  # header line, so awk's range operator alone can't tell them apart -- a
+  # counter picks out the one at index $2.
+  local install_script="$1" index="$2"
+  awk -v want="$index" '
+    /^[[:space:]]*cat > \/etc\/systemd\/system\/kubelet\.service <<EOF$/ { n++ }
+    n == want { print; if (/^EOF$/) exit }
+  ' "$install_script"
+}
+
+kubelet_worker_block="$(kubelet_service_block "$INSTALL" 1)"
+kubelet_cp_block="$(kubelet_service_block "$INSTALL" 2)"
+
 # `|| true`: grep -c exits 1 on zero matches, which under this file's
 # `set -euo pipefail` would abort the whole suite right here instead of
-# failing this one assertion -- a flag_count of 0 is itself a real failure
-# mode the -eq 2 check below must catch.
-kubelet_cert_dir_flag_count="$(grep -cF -- '--cert-dir=$STATE_DIR/kubelet/pki' "$INSTALL" || true)"
-assert "kubelet's cert-dir must be a CLI flag under \$STATE_DIR; setting it in kubelet-config.yaml is a silent no-op -- a reverted-to-yaml regression would leave the reset path broken with no CI signal" \
-  "$([ "$kubelet_cert_dir_flag_count" -eq 2 ] && echo 1 || echo 0)"
+# failing this one assertion -- a count of 0 is itself a real failure mode
+# the -eq 1 check below must catch.
+kubelet_worker_cert_dir_count="$(printf '%s\n' "$kubelet_worker_block" | grep -cF -- '--cert-dir=$STATE_DIR/kubelet/pki' || true)"
+assert "kubelet's worker-mode ExecStart must carry --cert-dir=\$STATE_DIR/kubelet/pki exactly once -- a file-wide count check doesn't catch someone deleting this from the worker-mode block while duplicating the flag elsewhere in install.sh" \
+  "$([ "$kubelet_worker_cert_dir_count" -eq 1 ] && echo 1 || echo 0)"
+
+kubelet_cp_cert_dir_count="$(printf '%s\n' "$kubelet_cp_block" | grep -cF -- '--cert-dir=$STATE_DIR/kubelet/pki' || true)"
+assert "kubelet's control-plane-mode ExecStart must carry --cert-dir=\$STATE_DIR/kubelet/pki exactly once -- a file-wide count check doesn't catch someone deleting this from the control-plane-mode block while duplicating the flag elsewhere in install.sh" \
+  "$([ "$kubelet_cp_cert_dir_count" -eq 1 ] && echo 1 || echo 0)"
 
 assert_false "kubelet-config.yaml must not set a certDir key -- kubelet has no such KubeletConfiguration field and silently ignores it, so leaving it there would misleadingly suggest the reset-path fix lives in the yaml rather than the ExecStart CLI flag" \
   grep -qF 'certDir:' "$INSTALL"
