@@ -1376,6 +1376,14 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] },
+            // Needed for kubelet to mount PVC-backed volumes: it must read the PVC and the PV
+            // it's bound to before it can attach/mount the underlying volume.
+            { "apiGroups": [""], "resources": ["persistentvolumeclaims"], "verbs": ["get"] },
+            { "apiGroups": [""], "resources": ["persistentvolumes"], "verbs": ["get"] },
+            { "apiGroups": [""], "resources": ["persistentvolumeclaims/status"], "verbs": ["get","update","patch"] },
+            // CSI: kubelet reads the VolumeAttachment to learn when volume attach has completed
+            // before it mounts.
+            { "apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments"], "verbs": ["get"] },
             // Kubelet webhook authorizer and authenticator call back to the apiserver via
             // SubjectAccessReview and TokenReview. Without these the kubelet denies all
             // proxy requests (logs, exec, attach) with "Authorization error".
@@ -4643,6 +4651,68 @@ mod tests {
         assert_eq!(subjects[0]["name"].as_str(), Some("system:nodes"));
         assert_eq!(crb["roleRef"]["name"].as_str(), Some("system:node"));
         assert_eq!(crb["roleRef"]["kind"].as_str(), Some("ClusterRole"));
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_to_mount_pvc_backed_volumes() {
+        // Regression test for a live outage: a kubelet mounting a PVC-backed volume must GET
+        // the PersistentVolumeClaim and the PersistentVolume it's bound to, PATCH the PVC's
+        // status, and (for CSI) GET the VolumeAttachment to learn when attach has completed.
+        // Without these rules every PVC-backed pod on the cluster is stuck in
+        // ContainerCreating with "... is not allowed to get persistentvolumeclaims".
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        // Find a rule granting `verb` on `resource` in `api_group`.
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule("", "persistentvolumeclaims", "get"),
+            "system:node must be able to get PVCs so kubelet can mount PVC-backed volumes; \
+             missing this rule blocks every PVC-backed pod on the cluster"
+        );
+        assert!(
+            has_rule("", "persistentvolumes", "get"),
+            "system:node must be able to get PVs so kubelet can resolve the volume backing a \
+             bound PVC before mounting it; missing this rule blocks every PVC-backed pod"
+        );
+        for verb in ["get", "update", "patch"] {
+            assert!(
+                has_rule("", "persistentvolumeclaims/status", verb),
+                "system:node must be able to {verb} PVC status so kubelet can report volume \
+                 conditions (e.g. FileSystemResizePending) back to the control plane"
+            );
+        }
+        assert!(
+            has_rule("storage.k8s.io", "volumeattachments", "get"),
+            "system:node must be able to get VolumeAttachments so kubelet knows when a CSI \
+             volume attach has completed before it attempts to mount; missing this rule blocks \
+             every CSI PVC-backed pod"
+        );
     }
 
     #[tokio::test]
