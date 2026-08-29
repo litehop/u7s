@@ -381,6 +381,49 @@ assert_true "br_netfilter is persisted via modules-load.d so it survives a reboo
   grep -qF '/etc/modules-load.d/u7s-br-netfilter.conf' "$INSTALL"
 
 # ---------------------------------------------------------------------------
+# Regression guard: kube-proxy's iptables-mode Service NAT (u7s's default,
+# manifests/kube-proxy.yaml) relies on br_netfilter's
+# net.bridge.bridge-nf-call-iptables{,6}=1 sysctls being set -- without them,
+# frames bridged purely at L2 between two pods on the same node's CNI bridge
+# never traverse netfilter, so the DNAT rule mapping a ClusterIP to its
+# backend pod is never applied and same-node Service traffic silently times
+# out (confirmed live: a kube-dns ClusterIP DNS query). This
+# extracts and actually runs the real modprobe/sysctl-file-write statements
+# (not a hand-copy or a grep for a literal), with modprobe/sysctl themselves
+# stubbed out (no root, no real kernel module needed) and the /etc paths
+# redirected into a temp dir, so a future edit that drops the module load or
+# either sysctl fails here instead of only on a live VM running a real
+# workload against a Service.
+# ---------------------------------------------------------------------------
+br_netfilter_runner() {
+  local install_script="$1" runner="$2" workdir="$3"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo "modprobe() { echo \"\$*\" >> \"$workdir/modprobe.log\"; }"
+    echo 'sysctl() { :; }'
+    awk '/^modprobe br_netfilter$/,/^sysctl --system >\/dev\/null$/' "$install_script" \
+      | sed "s#/etc/modules-load.d#$workdir/modules-load.d#; s#/etc/sysctl.d#$workdir/sysctl.d#"
+  } > "$runner"
+}
+
+BR_NETFILTER_WORK="$(mktemp -d)"
+mkdir -p "$BR_NETFILTER_WORK/modules-load.d" "$BR_NETFILTER_WORK/sysctl.d"
+BR_NETFILTER_RUNNER="$BR_NETFILTER_WORK/br-netfilter.sh"
+br_netfilter_runner "$INSTALL" "$BR_NETFILTER_RUNNER" "$BR_NETFILTER_WORK"
+bash "$BR_NETFILTER_RUNNER"
+
+assert_true "install.sh's kernel-module step actually invokes modprobe with br_netfilter (not just mentions it in a comment)" \
+  grep -qF 'br_netfilter' "$BR_NETFILTER_WORK/modprobe.log"
+
+BR_NETFILTER_SYSCTL_CONF="$BR_NETFILTER_WORK/sysctl.d/u7s-br-netfilter.conf"
+assert_true "the sysctl.d config install.sh writes sets net.bridge.bridge-nf-call-iptables=1, which kube-proxy's iptables NAT relies on to see bridged same-node pod-to-pod traffic at all -- missing this breaks Service-to-pod traffic silently, only noticed when a workload actually uses a Service" \
+  grep -qxF 'net.bridge.bridge-nf-call-iptables = 1' "$BR_NETFILTER_SYSCTL_CONF"
+assert_true "the sysctl.d config install.sh writes also sets the ip6tables counterpart, so IPv6 Service traffic gets the same bridged-netfilter treatment as IPv4" \
+  grep -qxF 'net.bridge.bridge-nf-call-ip6tables = 1' "$BR_NETFILTER_SYSCTL_CONF"
+rm -rf "$BR_NETFILTER_WORK"
+
+# ---------------------------------------------------------------------------
 # Regression guard: 'systemctl enable --now UNIT' is enable+
 # start; start on an already-active unit is a no-op, so a re-run of
 # install.sh staged new binaries into place but the running process never
