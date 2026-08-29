@@ -13216,6 +13216,158 @@ mod tests {
         );
     }
 
+    // -- Secret stringData -> data merge on write --
+
+    /// A Secret created with only `stringData` must be readable via its base64 `data` field,
+    /// with `stringData` gone from the stored/returned object.
+    ///
+    /// `stringData` is the write-only alias k8s clients like `kubectl create secret generic
+    /// --from-literal=` use so callers never hand-encode base64. If it isn't merged into
+    /// `data` on write, the Secret is persisted with no usable keys at all: any pod mounting
+    /// it via `secretKeyRef` fails with "couldn't find key", even though `kubectl get -o yaml`
+    /// shows the value sitting right there under `stringData`.
+    #[tokio::test]
+    async fn create_namespaced_resource_merges_secret_string_data_into_base64_data() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use base64::Engine;
+
+        let state = make_state();
+
+        let secret = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "from-literal", "namespace": "default" },
+            "stringData": { "foo": "bar" }
+        });
+
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&secret).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Secret POST with stringData must succeed; got: {e:?}"));
+
+        let get_resp = get_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "from-literal".into(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Secret GET must succeed; got: {e:?}"))
+        .into_response();
+
+        let body = to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let data_foo = v["data"]["foo"].as_str().unwrap_or_else(|| {
+            panic!(
+                "Secret.data.foo must be present — stringData is the write-only alias \
+                 kubectl create secret uses; not merging it into data silently drops the \
+                 secret's contents. Got object: {v}"
+            )
+        });
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data_foo)
+            .unwrap_or_else(|e| panic!("Secret.data.foo must be valid base64; got err: {e}"));
+        assert_eq!(
+            decoded, b"bar",
+            "Secret.data.foo must base64-decode to the stringData value \"bar\""
+        );
+        assert!(
+            v["stringData"].is_null(),
+            "stringData must never be output when reading a Secret back from the API \
+             (matches u7s's own OpenAPI schema doc); got: {v}"
+        );
+    }
+
+    /// When a Secret specifies the same key in both `data` and `stringData`, `stringData`
+    /// must win — matching upstream's `Convert_v1_Secret_To_core_Secret` comment
+    /// "StringData overwrites Data". Without this ordering, a manifest that sets both
+    /// (e.g. a Helm chart re-templating a Secret with a plaintext override) would silently
+    /// keep the stale base64 value instead of the value the author actually intended.
+    #[tokio::test]
+    async fn create_namespaced_resource_secret_string_data_overrides_data_for_same_key() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use base64::Engine;
+
+        let state = make_state();
+
+        let old_b64 = base64::engine::general_purpose::STANDARD.encode(b"old");
+        let secret = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "override", "namespace": "default" },
+            "data": { "foo": old_b64 },
+            "stringData": { "foo": "new" }
+        });
+
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&secret).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Secret POST with data+stringData must succeed; got: {e:?}"));
+
+        let get_resp = get_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "override".into(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Secret GET must succeed; got: {e:?}"))
+        .into_response();
+
+        let body = to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let data_foo = v["data"]["foo"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Secret.data.foo must be present; got: {v}"));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data_foo)
+            .unwrap_or_else(|e| panic!("Secret.data.foo must be valid base64; got err: {e}"));
+        assert_eq!(
+            decoded, b"new",
+            "stringData must override data for the same key — a Secret manifest that \
+             plaintext-overrides an already-base64-encoded key must end up with the \
+             plaintext value, not silently keep the stale encoded one"
+        );
+    }
+
     /// `kubectl get <resource> <name> -n <ns>` sends Accept: application/json;as=Table;...
     /// by default. Before this fix, get_namespaced_resource ignored Accept entirely and always
     /// returned the raw object, so kubectl fell back to printing only NAME/AGE for any
