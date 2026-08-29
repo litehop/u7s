@@ -8,15 +8,13 @@
 //! # What is cached
 //!
 //! ONLY the boolean outcome of the cryptographic signature check, keyed by
-//! `SHA-256(raw signature bytes)`. Nothing else — not the decoded claims, not the
+//! `SHA-256(the whole token)`. Nothing else — not the decoded claims, not the
 //! audience/issuer decision, not the bound-object liveness check (`auth::object_is_live`
-//! stays fully per-request by design). RS256/PKCS#1v1.5 signing is
-//! deterministic for a fixed (message, key) pair, so an identical signature is only
-//! producible from an identical `header.payload` — the cache key therefore uniquely
-//! (cryptographically) identifies the exact token that produced it. Keying on the
-//! signature alone (rather than the full token string or the `kid`) means a client
-//! replaying the identical token gets a cache hit while a single flipped bit anywhere in
-//! the token — header, payload, or signature — always misses.
+//! stays fully per-request by design). Hashing the whole token — header, payload, AND
+//! signature together, not just the signature segment — means a cache hit is reachable
+//! only by presenting byte-for-byte the same token that was verified before; see
+//! `token_hash`'s doc for why a prior design that hashed only the signature segment was a
+//! full authentication-bypass vulnerability.
 //!
 //! # Why a cache hit still re-checks audience
 //!
@@ -201,26 +199,24 @@ impl SigCache {
     }
 }
 
-/// SHA-256 over the raw (base64url-decoded) signature bytes — the third dot-separated
-/// segment of a compact JWS. Deliberately NOT the full token string (so a client-controlled
-/// header/payload byte flip elsewhere never accidentally collides) and NOT the `kid` alone
-/// (see `Entry::kid`'s doc for why `kid` can't identify anything on its own today). Returns
-/// `None` for a malformed token (not exactly 3 dot-separated segments, or a non-base64url
-/// signature segment) — callers fall through to full verification, which rejects the token
-/// with a proper decode error rather than silently skipping the cache.
-pub fn signature_hash(token: &str) -> Option<[u8; 32]> {
-    let mut parts = token.split('.');
-    let _header = parts.next()?;
-    let _payload = parts.next()?;
-    let sig_b64 = parts.next()?;
-    if parts.next().is_some() {
-        return None; // more than 3 segments — malformed compact JWS
-    }
-    let sig_bytes =
-        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, sig_b64).ok()?;
+/// SHA-256 over the entire wire-format token — header, payload, and signature segments,
+/// verbatim, undecoded. A cache hit is therefore proof that this exact byte-for-byte token
+/// was already verified in full; no cryptographic argument about what a matching hash
+/// *implies* about the message is needed or trusted, because there is no way to produce a
+/// matching key except by presenting the identical bytes that were verified before.
+///
+/// A prior design hashed only the signature segment, reasoning that RS256/PKCS#1v1.5 signing
+/// is deterministic so an identical signature could only be produced by an identical
+/// header+payload. That argument is fallacious: it only holds for someone who legitimately
+/// signed the message, not for an attacker who copies a valid signature onto a
+/// self-chosen header+payload. Under the signature-only key, such a forged token hashed to
+/// the same cache entry as the legitimately-signed original and rode its cached "verified"
+/// result straight past the RSA check — a full authentication bypass letting the holder of
+/// any one valid ServiceAccount JWT forge tokens for any other ServiceAccount.
+pub fn token_hash(token: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(&sig_bytes);
-    Some(hasher.finalize().into())
+    hasher.update(token.as_bytes());
+    hasher.finalize().into()
 }
 
 /// Computes the `Instant` at which a freshly-verified signature's cache entry must expire:
@@ -241,52 +237,53 @@ pub fn capped_expiry(token_exp_unix: u64, now_unix: u64, now: Instant) -> Instan
 mod tests {
     use super::*;
 
-    /// The whole cache design rests on signature bytes uniquely identifying the token that
-    /// produced them; if two different signatures ever hashed to the same key, an attacker's
-    /// forged-but-different token could ride in on a victim's cached "valid" result.
+    /// The whole cache design rests on the token bytes uniquely identifying what was
+    /// verified; if two tokens with different signature bytes ever hashed to the same key,
+    /// an attacker's forged-but-different token could ride in on a victim's cached "valid"
+    /// result.
     #[test]
-    fn signature_hash_differs_for_different_signature_bytes() {
-        // Both signature segments are valid base64url (len % 4 == 0); they must decode to
-        // *different* bytes for this test to mean anything — an invalid-base64 segment on
-        // both sides would make signature_hash return None for both and vacuously pass.
+    fn token_hash_differs_when_signature_bytes_differ() {
         let a = "aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl"; // header.payload.sig("signature")
         let b = "aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJm"; // last byte of the signature differs
         assert_ne!(
-            signature_hash(a),
-            signature_hash(b),
-            "two different signature segments must never hash to the same cache key — a \
-             collision here would let a tampered token ride a victim's cached result"
+            token_hash(a),
+            token_hash(b),
+            "two tokens with different signature bytes must never hash to the same cache \
+             key — a collision here would let a tampered token ride a victim's cached result"
+        );
+    }
+
+    /// This is the exact property the whole-token key exists to guarantee, and the one the
+    /// prior signature-only key violated: a forged token that copies a victim's signature
+    /// segment verbatim but carries attacker-chosen header/payload bytes (e.g. a different
+    /// `sub` claiming a different, more privileged ServiceAccount) must never hash to the
+    /// same cache key as the original — otherwise the forged token rides the original's
+    /// cached "verified" result and skips RSA verification entirely, authenticating as
+    /// whatever the attacker put in the payload.
+    #[test]
+    fn token_hash_differs_when_header_or_payload_differs_but_signature_is_identical() {
+        let original = "aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl";
+        let forged_payload = "aGVhZGVy.cGF5bG9hZDI.c2lnbmF0dXJl"; // payload differs, sig identical
+        assert_ne!(
+            token_hash(original),
+            token_hash(forged_payload),
+            "a forged payload riding a copied signature must produce a different cache key, \
+             or an attacker holding any one valid SA JWT could forge tokens for any other \
+             ServiceAccount by copying its signature onto new claims"
         );
     }
 
     /// The same exact token presented twice is the entire point of this cache — if
-    /// `signature_hash` weren't deterministic, every request would be a guaranteed miss and
-    /// the RSA modexp would never actually be skipped.
+    /// `token_hash` weren't deterministic, every request would be a guaranteed miss and the
+    /// RSA modexp would never actually be skipped.
     #[test]
-    fn signature_hash_is_deterministic_for_the_same_token() {
+    fn token_hash_is_deterministic_for_the_same_token() {
         let token = "aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl";
         assert_eq!(
-            signature_hash(token),
-            signature_hash(token),
+            token_hash(token),
+            token_hash(token),
             "hashing the same token twice must produce the same key, or a repeat request \
              from the same client would never hit the cache"
-        );
-    }
-
-    /// A malformed token (missing a segment) must not panic or silently produce a hashable
-    /// key — the call site relies on `None` here to know it must fall through to
-    /// `jsonwebtoken::decode`, which will reject the token with a real error.
-    #[test]
-    fn signature_hash_rejects_malformed_token_shapes() {
-        assert_eq!(
-            signature_hash("only.two"),
-            None,
-            "a 2-segment token is not a valid JWS"
-        );
-        assert_eq!(
-            signature_hash("a.b.c.d"),
-            None,
-            "a 4-segment token is not a valid compact JWS"
         );
     }
 
