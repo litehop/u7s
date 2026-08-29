@@ -238,47 +238,34 @@ assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cl
 # ---------------------------------------------------------------------------
 # Regression guard: install.sh's own documented reset procedure ("stop the
 # u7s services, rm -rf $STATE_DIR, and re-run install.sh", below) is only
-# true if everything kubelet caches actually lives under $STATE_DIR. kubelet's
-# hardcoded default certDir (/var/lib/kubelet/pki) does not -- it's where
-# kubelet caches the client cert it self-renews via CSR (rotateCertificates:
-# true above) -- so that cache survived a real rm -rf $STATE_DIR untouched: a
-# reset that regenerates the CA then left kubelet presenting a rotated client
-# cert signed by the deleted CA, an infinite UnknownIssuer reconnect loop with
-# no node ever registering (reproduced live on a fresh-VM reset). This
-# extracts and actually renders the real write_kubelet_config_yaml function
-# (not a hand-copy or a grep for a literal), so a future edit that drops
-# certDir or points it back outside $STATE_DIR fails here instead of only on
-# a live VM reset.
+# true if everything kubelet caches actually lives under $STATE_DIR. kubelet
+# has no certDir/certDirectory KubeletConfiguration yaml field (upstream:
+# staging/src/k8s.io/kubelet/config/v1beta1/types.go's TLSCertFile doc
+# comment names --cert-dir as a CLI flag, not a config key, and no such
+# field exists anywhere on the struct) -- an earlier fix set certDir in
+# kubelet-config.yaml, which kubelet silently ignored with no warning,
+# leaving it on its compiled-in default (/var/lib/kubelet/pki). That default
+# survives `rm -rf $STATE_DIR` untouched: a reset that regenerates the CA
+# then leaves kubelet presenting a rotated client cert signed by the deleted
+# CA, an infinite UnknownIssuer reconnect loop with no node ever registering
+# (reproduced live on a fresh-VM reset). This is a source grep against
+# install.sh's literal ExecStart line, not a rendered/executed check, so it
+# cannot prove kubelet actually reads the flag at runtime -- but it does
+# catch a reverted-to-yaml regression (the exact failure mode above) with no
+# live VM required. Both kubelet.service blocks (worker-mode join/upgrade
+# and control-plane single-node bootstrap) render this ExecStart line, so
+# the flag must appear exactly twice.
 # ---------------------------------------------------------------------------
-write_kubelet_config_runner() {
-  local install_script="$1" runner="$2"
-  {
-    echo '#!/usr/bin/env bash'
-    echo 'set -euo pipefail'
-    echo 'STATE_DIR="$1"'
-    echo 'mkdir -p "$STATE_DIR"'
-    awk '/^write_kubelet_config_yaml\(\) \{$/,/^}$/' "$install_script"
-    echo 'write_kubelet_config_yaml'
-  } > "$runner"
-}
+# `|| true`: grep -c exits 1 on zero matches, which under this file's
+# `set -euo pipefail` would abort the whole suite right here instead of
+# failing this one assertion -- a flag_count of 0 is itself a real failure
+# mode the -eq 2 check below must catch.
+kubelet_cert_dir_flag_count="$(grep -cF -- '--cert-dir=$STATE_DIR/kubelet/pki' "$INSTALL" || true)"
+assert "kubelet's cert-dir must be a CLI flag under \$STATE_DIR; setting it in kubelet-config.yaml is a silent no-op -- a reverted-to-yaml regression would leave the reset path broken with no CI signal" \
+  "$([ "$kubelet_cert_dir_flag_count" -eq 2 ] && echo 1 || echo 0)"
 
-KUBELET_CFG_WORK="$(mktemp -d)"
-KUBELET_CFG_RUNNER="$KUBELET_CFG_WORK/write-kubelet-config.sh"
-write_kubelet_config_runner "$INSTALL" "$KUBELET_CFG_RUNNER"
-KUBELET_CFG_STATE_DIR="$KUBELET_CFG_WORK/state"
-bash "$KUBELET_CFG_RUNNER" "$KUBELET_CFG_STATE_DIR"
-# `|| true`: if certDir is ever dropped from the rendered yaml entirely, grep
-# exits 1 and (under this file's `set -euo pipefail`) would abort the whole
-# suite instead of failing this one assertion -- kubelet_cert_dir empty is
-# itself a real failure mode the prefix check below must catch.
-kubelet_cert_dir="$(grep '^certDir:' "$KUBELET_CFG_STATE_DIR/kubelet-config.yaml" | cut -d' ' -f2 || true)"
-# Prefix check via parameter expansion, not a `case` inside "$(...)": on
-# macOS's default bash 3.2, a case/esac embedded in a command substitution
-# mis-parses (the pattern's own closing paren is read as closing the
-# substitution), silently truncating the check.
-assert "the rendered kubelet-config.yaml's certDir resolves under \$STATE_DIR, so install.sh's documented single 'rm -rf \$STATE_DIR' reset actually wipes kubelet's rotated client-cert cache instead of leaving it pinned to a CA the reset just deleted" \
-  "$([ "${kubelet_cert_dir#"$KUBELET_CFG_STATE_DIR"/}" != "$kubelet_cert_dir" ] && echo 1 || echo 0)"
-rm -rf "$KUBELET_CFG_WORK"
+assert_false "kubelet-config.yaml must not set a certDir key -- kubelet has no such KubeletConfiguration field and silently ignores it, so leaving it there would misleadingly suggest the reset-path fix lives in the yaml rather than the ExecStart CLI flag" \
+  grep -qF 'certDir:' "$INSTALL"
 
 # ---------------------------------------------------------------------------
 # Tarball sourcing: --tarball (local path) / --tarball-url / the URL baked in

@@ -258,7 +258,7 @@ stage_binaries() {
 }
 
 # Minimal KubeletConfiguration: CRI-O's socket, cluster DNS matching
-# apiserver's default --service-cluster-ip-range (10.96.0.0/12), and five
+# apiserver's default --service-cluster-ip-range (10.96.0.0/12), and four
 # settings that are not obvious:
 #
 # resolvConf: "" -- Ubuntu's systemd-resolved points /etc/resolv.conf at the
@@ -277,12 +277,10 @@ stage_binaries() {
 # rotateCertificates -- kubelet self-renews its client cert over the same CSR
 # path; the selfnodeclient RBAC grant it needs is already seeded.
 #
-# certDir -- kubelet's hardcoded default (/var/lib/kubelet/pki) lives outside
-# $STATE_DIR, so it survives the documented reset procedure's `rm -rf
-# $STATE_DIR` untouched. A reset that regenerates the CA then leaves kubelet
-# presenting a rotated client cert signed by the deleted CA, an infinite
-# UnknownIssuer reconnect loop with no node ever registering. Pointing
-# certDir under $STATE_DIR makes that single rm -rf actually complete.
+# The rotated client cert's on-disk location is NOT set here: certDir is not
+# a KubeletConfiguration field (kubelet silently ignores it), only the
+# --cert-dir CLI flag on kubelet.service's ExecStart -- see the flag there
+# for why it must live under $STATE_DIR.
 write_kubelet_config_yaml() {
   cat > "$STATE_DIR/kubelet-config.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -301,7 +299,6 @@ authentication:
   x509:
     clientCAFile: $STATE_DIR/ca.pem
 rotateCertificates: true
-certDir: $STATE_DIR/kubelet/pki
 EOF
 }
 
@@ -817,7 +814,15 @@ WorkingDirectory=$STATE_DIR
 Environment=GOMEMLIMIT=200MiB
 Environment=GOGC=50
 Environment=GOMAXPROCS=2
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP $KUBELET_ROUND2_FLAGS
+# --cert-dir: kubelet's compiled-in default (/var/lib/kubelet/pki) lives
+# outside $STATE_DIR, so it survives the documented reset procedure's `rm -rf
+# $STATE_DIR` untouched. A reset that regenerates the CA then leaves kubelet
+# presenting a rotated client cert signed by the deleted CA, an infinite
+# UnknownIssuer reconnect loop with no node ever registering. This is a
+# --cert-dir CLI flag, not a KubeletConfiguration yaml field -- kubelet has
+# no certDir/certDirectory config-file key, so setting it in
+# kubelet-config.yaml is a silent no-op.
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 
@@ -1027,7 +1032,9 @@ Environment=GOMAXPROCS=2
 # repeat across services.
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
 ExecStartPre=/bin/bash -c 'test -s $STATE_DIR/kubelet-serving.crt || { openssl ecparam -name prime256v1 -genkey -noout -out $STATE_DIR/kubelet-serving.key && chmod 600 $STATE_DIR/kubelet-serving.key && openssl req -new -key $STATE_DIR/kubelet-serving.key -subj "/CN=$NODE_NAME" -out $STATE_DIR/kubelet-serving.csr && openssl x509 -req -in $STATE_DIR/kubelet-serving.csr -CA $STATE_DIR/ca.pem -CAkey $STATE_DIR/ca.key -CAcreateserial -days 3650 -extfile <(printf "subjectAltName=IP:$IFACE_IP\nextendedKeyUsage=serverAuth\n") -out $STATE_DIR/kubelet-serving.crt; }'
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP $KUBELET_ROUND2_FLAGS
+# --cert-dir -- see the worker-mode kubelet.service block above for why this
+# must be a CLI flag under $STATE_DIR rather than a kubelet-config.yaml key.
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 
