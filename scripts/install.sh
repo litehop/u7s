@@ -754,24 +754,31 @@ write_kubelet_config_yaml
 # Feature gates: kubelet-consulted Beta gates, default-on in v1.36.4's
 # pkg/features/kube_features.go, that no u7s workload or manifest exercises
 # (verified per-gate against crates/ + manifests/ for a consumer of the
-# capability's wire field). PodReadyToStartContainersCondition was
-# deliberately excluded -- apiserver's condition-ordering logic
-# (crates/apiserver/src/handlers/pods.rs) depends on kubelet emitting it, so
-# disabling it would reintroduce the reconcile-churn bug that regression test
-# guards against. Disabling drops the corresponding kubelet code paths
+# capability's wire field). PodReadyToStartContainersCondition was left
+# enabled -- whether anything depends on kubelet emitting it is uncertain
+# (the closest regression test, crates/apiserver/src/handlers/pods.rs's
+# $setElementOrder/conditions reordering, is condition-name-agnostic, so it
+# doesn't prove this specific condition is required), and the conservative
+# default is to keep an uncertain dependency on rather than prove it's safe
+# to cut. Disabling the other 15 drops the corresponding kubelet code paths
 # (checkpoint HTTP handler, credential-provider SA-token plumbing, CA/serving
 # -cert file watchers, pod/container-level resize bookkeeping, etc.) for zero
 # functional loss.
 #
-# cAdvisor trim: u7s scrapes neither kubelet's /metrics nor
-# /metrics/cadvisor anywhere in the monitoring pipeline, so the default 10s
-# per-container stat refresh and the 100-slot-per-container legacy
-# "application metrics" ring buffer (a cadvisor flag mistakenly registered on
-# kubelet, per its own --help output) are pure overhead.
-# --disable-metrics/--cadvisor-metrics do not exist on this kubelet version
-# (verified via `kubelet --help` on the conformance VM) -- interval and the
-# count limit are the only real cAdvisor levers kubelet exposes.
-KUBELET_ROUND2_FLAGS="--housekeeping-interval=30s --application-metrics-count-limit=0 --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,InPlacePodVerticalScalingInitContainers=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false"
+# cAdvisor trim: --application-metrics-count-limit=0 drops the
+# 100-slot-per-container legacy "application metrics" ring buffer (a
+# cadvisor flag mistakenly registered on kubelet, per its own --help
+# output) -- u7s has no container exposing that legacy annotation-based
+# metrics source, so the buffer is never populated. --housekeeping-interval
+# was tried and reverted: pkg/kubelet/kubelet.go's evictionMonitoringPeriod
+# is a hardcoded 10s constant with an explicit upstream comment to "keep
+# this in sync with internal cadvisor housekeeping" -- raising
+# --housekeeping-interval desyncs the two, so the eviction manager can act
+# on cAdvisor stats up to (new_interval - 10s) stale under real memory
+# pressure. That is a genuine behavior change under load, not the
+# zero-impact trim it looked like, and falls under the same
+# behavior-changing-knob restriction as --max-pods.
+KUBELET_ROUND2_FLAGS="--application-metrics-count-limit=0 --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,InPlacePodVerticalScalingInitContainers=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false"
 
 if [ "$WORKER_MODE" -eq 1 ]; then
   # --- Join an existing cluster via the CSR API, or upgrade an
