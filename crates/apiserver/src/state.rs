@@ -7,6 +7,7 @@ use u7s_store::{ListOptions, SqliteStore, Store};
 
 use crate::admission::WebhookEntry;
 use crate::auth::UserInfo;
+use crate::node_authz::NodeGraph;
 use crate::rbac::RbacIndex;
 use crate::sa_sig_cache::SigCache;
 use crate::types::{ResourceKey, ResourceMeta};
@@ -583,6 +584,11 @@ pub struct AppState<S = SqliteStore> {
     pub store: Arc<S>,
     pub resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
     pub rbac_index: Arc<RbacIndex>,
+    /// Node-authorization-mode graph: which pods are scheduled on which node, and what
+    /// Secrets/ConfigMaps/PVCs/ServiceAccounts those pods reference. See `node_authz` module
+    /// docs for the freshness model. Populated at startup by `init_node_graph` and kept
+    /// current by hooks in `handlers::pods` and `handlers::resource`'s owner-cascade deletes.
+    pub node_graph: Arc<NodeGraph>,
     /// RSA signing key for service-account JWTs. None when SA key is unavailable.
     pub sa_key: Option<Arc<jsonwebtoken::EncodingKey>>,
     /// RSA public key for verifying inbound SA JWTs. None when SA key is unavailable.
@@ -728,6 +734,7 @@ impl<S> Clone for AppState<S> {
             store: self.store.clone(),
             resource_registry: self.resource_registry.clone(),
             rbac_index: self.rbac_index.clone(),
+            node_graph: self.node_graph.clone(),
             sa_key: self.sa_key.clone(),
             sa_decoding_key: self.sa_decoding_key.clone(),
             token_map: self.token_map.clone(),
@@ -921,6 +928,7 @@ impl<S: Store> AppState<S> {
             store: cfg.store,
             resource_registry: Arc::new(registry),
             rbac_index: Arc::new(RbacIndex::new()),
+            node_graph: Arc::new(NodeGraph::new()),
             sa_key: cfg.sa_key.map(Arc::new),
             sa_decoding_key: cfg.sa_decoding_key.map(Arc::new),
             token_map: Arc::new(cfg.token_map),
@@ -1030,6 +1038,36 @@ impl<S: Store> AppState<S> {
         }
 
         tracing::info!("rbac init: index populated from store");
+    }
+
+    /// Populate the node-authorization graph from pods already persisted in the store.
+    ///
+    /// Must be called once at startup before serving requests, mirroring `init()` for the
+    /// RBAC index — without this, every scheduled pod that existed before an apiserver
+    /// restart is invisible to the Node authorizer until it's next written, so its node's
+    /// kubelet would 403 on secrets/configmaps/tokens it legitimately needs.
+    pub async fn init_node_graph(&self) {
+        let prefix = "/registry/pods/";
+        match self.store.list(prefix, ListOptions::default()).await {
+            Err(e) => tracing::warn!("node graph init: list {prefix} failed: {e}"),
+            Ok(resp) => {
+                for obj in resp.items {
+                    // Store key: /registry/pods/<namespace>/<name>
+                    let rest = obj.key.strip_prefix(prefix).unwrap_or(&obj.key);
+                    let Some((namespace, name)) = rest.split_once('/') else {
+                        tracing::warn!("node graph init: unexpected key format: {}", obj.key);
+                        continue;
+                    };
+                    match serde_json::from_slice::<serde_json::Value>(&obj.value) {
+                        Ok(val) => self.node_graph.apply_pod(namespace, name, &val),
+                        Err(e) => {
+                            tracing::warn!("node graph init: parse error for {}: {e}", obj.key)
+                        }
+                    }
+                }
+            }
+        }
+        tracing::info!("node graph init: populated from store");
     }
 
     /// Scan `/registry/service-ips/` at startup to seed the hint past already-allocated IPs.

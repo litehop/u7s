@@ -4091,6 +4091,11 @@ async fn strip_or_delete_dependent<S: Store>(
                 Ok(_) | Err(StoreError::NotFound { .. }) => {}
                 Err(e) => tracing::warn!("cascade-delete {label}: {e}"),
             }
+            // This helper cascade-deletes pods, ReplicaSets, and Jobs alike; only pods are
+            // tracked by the node-authorization graph, so only remove when the key is one.
+            if let Some(pod_name) = key.strip_prefix(&format!("/registry/pods/{namespace}/")) {
+                state.node_graph.remove_pod(namespace, pod_name);
+            }
             return true;
         }
 
@@ -4409,6 +4414,7 @@ async fn remove_job_tracking_finalizer_from_pods<S: Store>(
             if let Err(e) = state.store.delete(&pod_key, None).await {
                 tracing::warn!("job-tracking cleanup: hard-delete pod {namespace}/{pod_name}: {e}");
             }
+            state.node_graph.remove_pod(namespace, &pod_name);
             continue;
         }
 

@@ -636,6 +636,10 @@ pub(crate) async fn create_pod<S: Store>(
 
     obj.set_resource_version(new_rv);
 
+    // Register with the node-authorization graph. A no-op unless spec.nodeName is already
+    // set (a static/pre-scheduled pod) — most pods get their nodeName later, via bind_pod.
+    state.node_graph.apply_pod(ns.as_str(), &name, &obj.body);
+
     crate::quota::update_quota_status(&state, ns.as_str()).await;
 
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
@@ -860,6 +864,7 @@ pub(crate) async fn replace_pod<S: Store>(
             .delete(&key, None)
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
+        state.node_graph.remove_pod(ns.as_str(), &name);
         super::namespaces::maybe_finalize_terminating_namespace(&state, ns.as_str()).await;
         return Ok(Json(obj.body));
     }
@@ -986,6 +991,9 @@ pub(crate) async fn delete_collection_pods<S: Store>(
             continue;
         }
         let _ = state.store.delete(&obj.key, None).await;
+        if let Some(pod_name) = obj.key.rsplit('/').next() {
+            state.node_graph.remove_pod(ns.as_str(), pod_name);
+        }
     }
 
     Ok(Json(serde_json::json!({
@@ -1088,6 +1096,7 @@ pub(crate) async fn delete_pod<S: Store>(
                 .delete(&key, None)
                 .await
                 .map_err(|e| store_err_to_status(e, &name))?;
+            state.node_graph.remove_pod(ns.as_str(), &name);
 
             crate::quota::update_quota_status(&state, ns.as_str()).await;
 
@@ -1238,6 +1247,7 @@ pub(crate) async fn patch_pod<S: Store>(
                 .delete(&key, None)
                 .await
                 .map_err(|e| store_err_to_status(e, &name))?;
+            state.node_graph.remove_pod(ns.as_str(), &name);
             // After hard-deleting a pod, check if its namespace is ready to complete deletion.
             // This handles OrderedNamespaceDeletion: once all finalizer'd pods are cleared,
             // the Terminating namespace hard-deletes.
@@ -1309,6 +1319,7 @@ pub(crate) async fn evict_pod<S: Store>(
             .delete(&key, None)
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
+        state.node_graph.remove_pod(ns.as_str(), &name);
     } else if !already_terminating {
         check_pdb_allows_eviction(&state, ns.as_str(), &obj.body).await?;
 
@@ -7716,6 +7727,11 @@ pub(crate) async fn bind_pod<S: Store>(
         .map_err(|e| store_err_to_status(e, &name))?;
 
     obj.set_resource_version(new_rv);
+
+    // Now that spec.nodeName is set, register the pod (and its reference edges) with the
+    // node-authorization graph — this is what actually grants the target node's kubelet
+    // access to this pod and whatever it references.
+    state.node_graph.apply_pod(ns.as_str(), &name, &obj.body);
 
     Ok((StatusCode::CREATED, Json(obj.body)))
 }

@@ -22,6 +22,7 @@ use u7s_store::{SqliteStore, Store};
 use crate::apf;
 use crate::keys::object_key;
 use crate::metrics::record_request_total;
+use crate::node_authz::{self, NodeGraph};
 use crate::rbac::{AuthzRequest, RbacIndex};
 use crate::sa_sig_cache::{self, SigCache};
 use crate::state::FlowControlCache;
@@ -766,7 +767,7 @@ fn get_verb(name: Option<&str>, query: Option<&str>) -> &'static str {
 /// Kubernetes clients (client-go) percent-encode `fieldSelector` values, e.g.
 /// `metadata.name%3Dfoo` for `metadata.name=foo`. Bytes that don't form a valid
 /// `%XX` escape are passed through unchanged.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -983,6 +984,7 @@ pub struct AuthLayer {
     store: Arc<SqliteStore>,
     sig_cache: Arc<SigCache>,
     flowcontrol_cache: Arc<FlowControlCache>,
+    node_graph: Arc<NodeGraph>,
 }
 
 impl AuthLayer {
@@ -993,6 +995,7 @@ impl AuthLayer {
         store: Arc<SqliteStore>,
         sig_cache: Arc<SigCache>,
         flowcontrol_cache: Arc<FlowControlCache>,
+        node_graph: Arc<NodeGraph>,
     ) -> Self {
         AuthLayer {
             rbac_index,
@@ -1001,6 +1004,7 @@ impl AuthLayer {
             store,
             sig_cache,
             flowcontrol_cache,
+            node_graph,
         }
     }
 }
@@ -1017,6 +1021,7 @@ impl<S> Layer<S> for AuthLayer {
             store: Arc::clone(&self.store),
             sig_cache: Arc::clone(&self.sig_cache),
             flowcontrol_cache: Arc::clone(&self.flowcontrol_cache),
+            node_graph: Arc::clone(&self.node_graph),
         }
     }
 }
@@ -1034,6 +1039,7 @@ pub struct AuthService<S> {
     store: Arc<SqliteStore>,
     sig_cache: Arc<SigCache>,
     flowcontrol_cache: Arc<FlowControlCache>,
+    node_graph: Arc<NodeGraph>,
 }
 
 /// Classify an already-authorized request against the cached FlowSchemas/
@@ -1107,6 +1113,7 @@ where
         // same clone-then-.await idiom InflightService uses — since Service::call can only be
         // invoked once we're past the awaited authenticate() call.
         let rbac_index = Arc::clone(&self.rbac_index);
+        let node_graph = Arc::clone(&self.node_graph);
         let token_map = Arc::clone(&self.token_map);
         let sa_decoding_key = self.sa_decoding_key.clone();
         let store = Arc::clone(&self.store);
@@ -1357,7 +1364,7 @@ where
                 "cluster"
             };
 
-            let allowed = rbac_index.is_allowed(&AuthzRequest {
+            let authz_req = AuthzRequest {
                 username: &user.username,
                 groups: &user.groups,
                 verb,
@@ -1367,7 +1374,16 @@ where
                 namespace: parsed.namespace.as_deref(),
                 name: authz_name,
                 non_resource_url,
-            });
+            };
+            // Node authorization mode: a `system:node:<name>` identity is authorized SOLELY
+            // by this check for anything related to its own node — the `system:node`
+            // ClusterRoleBinding is seeded with no subjects (matching upstream
+            // bootstrappolicy), so `rbac_index.is_allowed` below grants a kubelet identity
+            // nothing on its own. Every other identity gets `false` here unconditionally
+            // (see `node_authz::authorize`'s doc) and is decided by RBAC exactly as before.
+            let allowed =
+                node_authz::authorize(&authz_req, req.uri().query(), &node_graph, &rbac_index)
+                    || rbac_index.is_allowed(&authz_req);
 
             if !allowed {
                 record_request_total(
@@ -3479,6 +3495,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         // Request as alice, impersonating bob.
@@ -3541,6 +3558,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -3665,6 +3683,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -3728,6 +3747,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -3852,6 +3872,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -3917,6 +3938,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -3969,6 +3991,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -4186,6 +4209,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         // Exactly the request client-go's ConfigMap informer issues: a LIST (not watch)
@@ -4265,6 +4289,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -4338,6 +4363,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
         let req_allowed = Request::builder()
             .method("GET")
@@ -4385,6 +4411,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
         let req_denied = Request::builder()
             .method("GET")
@@ -4484,6 +4511,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let cases: [(&str, &str, &str); 3] = [
@@ -4600,6 +4628,7 @@ mod tests {
             Arc::new(make_test_store()),
             Arc::new(make_test_sig_cache()),
             Arc::new(FlowControlCache::new()),
+            Arc::new(NodeGraph::new()),
         )
         .layer(ChunkedWatchService);
 
@@ -4686,6 +4715,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         // (verb, uri) — LIST mirrors a tombstoned-CRD-group or expired-continue-token
@@ -4759,6 +4789,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let before_401 = REQUEST_TOTAL
@@ -4813,6 +4844,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let before_403 = REQUEST_TOTAL
@@ -4929,6 +4961,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 make_warm_flowcontrol_cache("noxu"),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -4989,6 +5022,7 @@ mod tests {
                 // Cache is warm for "noxu"'s specific FlowSchema — "someone-else" doesn't
                 // match it and must fall through to the catch-all pair.
                 make_warm_flowcontrol_cache("noxu"),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -5047,6 +5081,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()
@@ -5110,6 +5145,7 @@ mod tests {
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
             ));
 
         let req = Request::builder()

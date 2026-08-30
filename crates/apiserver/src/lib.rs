@@ -22,6 +22,7 @@ mod limit_range;
 mod metrics;
 mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
+mod node_authz;
 mod patch;
 mod proto;
 #[cfg(test)]
@@ -409,6 +410,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // 10a. Populate RBAC index from persisted objects before serving.
     state.init().await;
 
+    // 10a2. Populate the node-authorization graph from persisted pods before serving — see
+    // init_node_graph's doc for why this must happen before the listener accepts traffic.
+    state.init_node_graph().await;
+
     // 10b. Seed service IP hint from already-allocated sentinels in the store.
     state.init_service_ip_hint().await;
 
@@ -600,6 +605,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Arc::clone(&state.store),
             Arc::clone(&state.sa_sig_cache),
             Arc::clone(&state.flowcontrol_cache),
+            Arc::clone(&state.node_graph),
         ))
         .layer(InflightLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
@@ -1405,13 +1411,18 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     });
     put!(key, body, "system:node", "ClusterRole");
 
-    // ClusterRoleBinding: system:node — binds system:nodes group to the ClusterRole.
+    // ClusterRoleBinding: system:node — no subjects. Matches upstream bootstrappolicy.go
+    // (deprecated in 1.7): a kubelet is authorized by the Node authorizer
+    // (crate::node_authz), which scopes it to its own node's objects, never by a
+    // cluster-wide RBAC grant to the whole system:nodes group. The ClusterRole above is
+    // still seeded, unbound, for backward-compat/manual opt-in only — exactly as upstream
+    // keeps it.
     let key = keys::group_object_key(GROUP, "clusterrolebindings", None, "system:node");
     let body = serde_json::json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
         "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000011", "creationTimestamp": TS },
-        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:nodes" }],
+        "subjects": [],
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:node" }
     });
     put!(key, body, "system:node", "ClusterRoleBinding");
@@ -4655,9 +4666,13 @@ mod tests {
         let subjects = crb["subjects"]
             .as_array()
             .expect("subjects must be an array");
-        assert_eq!(subjects.len(), 1, "must have exactly one subject");
-        assert_eq!(subjects[0]["kind"].as_str(), Some("Group"));
-        assert_eq!(subjects[0]["name"].as_str(), Some("system:nodes"));
+        assert!(
+            subjects.is_empty(),
+            "system:node's ClusterRoleBinding must have NO subjects — matching upstream \
+             bootstrappolicy (deprecated in 1.7), a kubelet is authorized by the Node \
+             authorizer, never by a blanket cluster-wide grant to system:nodes; a non-empty \
+             subjects list here reopens the P0 this fix closes (any node reads every secret)"
+        );
         assert_eq!(crb["roleRef"]["name"].as_str(), Some("system:node"));
         assert_eq!(crb["roleRef"]["kind"].as_str(), Some("ClusterRole"));
     }
@@ -5258,12 +5273,15 @@ mod tests {
     #[tokio::test]
     async fn system_nodes_group_is_authorized_after_rbac_seed_and_init() {
         // Verifies the full chain: seed_rbac writes ClusterRole+ClusterRoleBinding,
-        // AppState::init() loads them into the RBAC index, and is_allowed returns
-        // true for a kubelet in system:nodes.
+        // AppState::init() loads them into the RBAC index, RBAC ALONE now denies every
+        // system:nodes permission (the ClusterRoleBinding has no subjects — this is the
+        // fix), and node_authz::authorize is what actually grants a kubelet identity access
+        // to its own node's objects.
         //
         // Without this test the seeded data could be structurally correct (stored under
         // the right key) but still broken at the authorization layer — e.g. if init()
-        // builds the wrong api_key or if subject_matches ignores the Group kind.
+        // builds the wrong api_key, or if the ClusterRoleBinding regressed back to a
+        // subject-full binding (reopening the P0 this fix closes).
         let store = std::sync::Arc::new(make_store());
         seed_rbac(&store).await.expect("seed must not fail");
 
@@ -5279,7 +5297,8 @@ mod tests {
 
         let groups = vec!["system:nodes".to_owned()];
 
-        // A kubelet in system:nodes must be able to GET a pod assigned to it.
+        // A kubelet in system:nodes must be able to GET a pod assigned to it — but ONLY via
+        // the Node authorizer's graph, never via RBAC (the ClusterRoleBinding is empty).
         let pod_read = rbac::AuthzRequest {
             username: "system:node:my-node",
             groups: &groups,
@@ -5288,19 +5307,30 @@ mod tests {
             resource: "pods",
             subresource: "",
             namespace: Some("default"),
-            name: None,
+            name: Some("my-pod"),
             non_resource_url: None,
         };
         assert!(
-            state.rbac_index.is_allowed(&pod_read),
-            "system:nodes must be allowed to GET pods — kubelet needs this to reconcile its pod list"
+            !state.rbac_index.is_allowed(&pod_read),
+            "RBAC alone must deny this — the system:node ClusterRoleBinding has no subjects; \
+             an allow here means the binding regressed back to granting system:nodes blanket \
+             cluster-wide pod access, the exact P0 this fix closes"
+        );
+        state.node_graph.apply_pod(
+            "default",
+            "my-pod",
+            &serde_json::json!({"spec": {"nodeName": "my-node", "serviceAccountName": "my-sa"}}),
+        );
+        assert!(
+            node_authz::authorize(&pod_read, None, &state.node_graph, &state.rbac_index),
+            "the Node authorizer must allow my-node to GET its own pod once the graph knows \
+             about it — this is the scoped replacement for the removed blanket RBAC grant"
         );
 
         // A kubelet in system:nodes must be able to LIST services -- kubelet's own service
         // informer needs this to populate Service-discovery env vars in every pod's
-        // containers. A real joined node authenticates as this exact identity,
-        // unlike a single-node install's kubelet which shares the admin/system:masters
-        // kubeconfig and never exercises this rule at all.
+        // containers. Not graph-scoped (matches upstream): granted via the Node authorizer's
+        // fallback to the (unbound) system:node ClusterRole's own rules.
         let service_list = rbac::AuthzRequest {
             username: "system:node:my-node",
             groups: &groups,
@@ -5313,13 +5343,13 @@ mod tests {
             non_resource_url: None,
         };
         assert!(
-            state.rbac_index.is_allowed(&service_list),
-            "system:nodes must be allowed to LIST services — kubelet's service informer needs \
-             this or every container on the node fails to start with CreateContainerConfigError \
-             (\"services have not yet been read at least once\")"
+            node_authz::authorize(&service_list, None, &state.node_graph, &state.rbac_index),
+            "system:nodes must still be allowed to LIST services via the Node authorizer's \
+             ClusterRole-rule fallback — kubelet's service informer needs this or every \
+             container on the node fails to start with CreateContainerConfigError"
         );
 
-        // A kubelet in system:nodes must be able to create a lease (heartbeat).
+        // A kubelet in system:nodes must be able to create its own heartbeat lease.
         let lease_create = rbac::AuthzRequest {
             username: "system:node:my-node",
             groups: &groups,
@@ -5332,53 +5362,13 @@ mod tests {
             non_resource_url: None,
         };
         assert!(
-            state.rbac_index.is_allowed(&lease_create),
-            "system:nodes must be allowed to create leases — kubelet heartbeat depends on this"
-        );
-
-        // A kubelet in system:nodes must be able to create SubjectAccessReviews so its
-        // webhook authorizer can call back to the apiserver (needed for logs/exec/attach).
-        let sar_create = rbac::AuthzRequest {
-            username: "system:node:my-node",
-            groups: &groups,
-            verb: "create",
-            api_group: "authorization.k8s.io",
-            resource: "subjectaccessreviews",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            state.rbac_index.is_allowed(&sar_create),
-            "system:nodes must be allowed to create subjectaccessreviews — \
-             kubelet webhook authorizer calls back to the apiserver for proxy requests (logs/exec/attach)"
-        );
-
-        // A kubelet in system:nodes must be able to create TokenReviews so its
-        // webhook authenticator can validate bearer tokens.
-        let tr_create = rbac::AuthzRequest {
-            username: "system:node:my-node",
-            groups: &groups,
-            verb: "create",
-            api_group: "authentication.k8s.io",
-            resource: "tokenreviews",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            state.rbac_index.is_allowed(&tr_create),
-            "system:nodes must be allowed to create tokenreviews — \
-             kubelet webhook authenticator calls back to the apiserver"
+            node_authz::authorize(&lease_create, None, &state.node_graph, &state.rbac_index),
+            "the Node authorizer must allow my-node to create its own heartbeat lease"
         );
 
         // Regression test: kubelet must be allowed to POST
-        // /api/v1/namespaces/{ns}/serviceaccounts/{name}/token (TokenRequest subresource).
-        // Without this rule the projected SA token volume never gets populated —
-        // the kubelet's POST returns 403 and containers never receive an SA token,
-        // breaking all in-cluster API calls.
+        // /api/v1/namespaces/{ns}/serviceaccounts/{name}/token (TokenRequest subresource) for
+        // the ServiceAccount its OWN pod runs as — graph-scoped, not blanket.
         let sa_token_create = rbac::AuthzRequest {
             username: "system:node:my-node",
             groups: &groups,
@@ -5387,39 +5377,24 @@ mod tests {
             resource: "serviceaccounts",
             subresource: "token",
             namespace: Some("default"),
-            name: None,
+            name: Some("my-sa"),
             non_resource_url: None,
         };
         assert!(
-            state.rbac_index.is_allowed(&sa_token_create),
-            "system:nodes must be allowed to create serviceaccounts/token — \
-             kubelet needs this to project SA tokens into pod volumes"
+            node_authz::authorize(&sa_token_create, None, &state.node_graph, &state.rbac_index),
+            "the Node authorizer must allow my-node to mint a token for my-sa, the \
+             ServiceAccount its own registered pod runs as"
         );
-
-        // A kubelet in system:nodes must be able to create a plain (no-subresource) CSR
-        // to rotate its own client certificate. Matches upstream bootstrappolicy.go's
-        // NodeRules() exactly. Without this rule, a joined node has no permission to even
-        // submit its own self-renewal CSR — the selfnodeclient ClusterRole/binding only
-        // governs KCM's SAR-based auto-approval decision, not the initial create call,
-        // so self-renewal is fully broken without both being present together.
-        let csr_create = rbac::AuthzRequest {
-            username: "system:node:my-node",
-            groups: &groups,
-            verb: "create",
-            api_group: "certificates.k8s.io",
-            resource: "certificatesigningrequests",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: None,
+        let sa_token_other = rbac::AuthzRequest {
+            name: Some("someone-elses-sa"),
+            ..sa_token_create
         };
         assert!(
-            state.rbac_index.is_allowed(&csr_create),
-            "system:nodes must be allowed to create certificatesigningrequests — \
-             a kubelet cannot submit its own certificate-rotation CSR without this rule"
+            !node_authz::authorize(&sa_token_other, None, &state.node_graph, &state.rbac_index),
+            "my-node must NOT be able to mint a token for a ServiceAccount none of its pods use"
         );
 
-        // A user NOT in system:nodes must be denied — the binding is group-specific.
+        // A user NOT in system:nodes must be denied everything above.
         let other_groups = vec!["system:authenticated".to_owned()];
         let pod_read_other = rbac::AuthzRequest {
             username: "someone-else",
@@ -5433,8 +5408,14 @@ mod tests {
             non_resource_url: None,
         };
         assert!(
-            !state.rbac_index.is_allowed(&pod_read_other),
-            "users not in system:nodes must not inherit kubelet permissions"
+            !state.rbac_index.is_allowed(&pod_read_other)
+                && !node_authz::authorize(
+                    &pod_read_other,
+                    None,
+                    &state.node_graph,
+                    &state.rbac_index
+                ),
+            "users not in system:nodes must not inherit kubelet permissions from either path"
         );
     }
 
@@ -7859,6 +7840,7 @@ mod tests {
             std::sync::Arc::clone(&state.store),
             std::sync::Arc::clone(&state.sa_sig_cache),
             std::sync::Arc::clone(&state.flowcontrol_cache),
+            std::sync::Arc::clone(&state.node_graph),
         ));
 
         for path in ["/openapi/v2", "/openapi/v3"] {
