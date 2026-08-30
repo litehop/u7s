@@ -1015,14 +1015,17 @@ pub(crate) async fn maybe_finalize_terminating_namespace<S: Store>(
     }
     // No remaining finalizer'd objects — hard-delete remaining objects and the namespace.
     for obj in objects {
-        let _ = state.store.delete(&obj.key, None).await;
-        // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a pod
-        // hard-deleted here must lose its node-authorization graph edges immediately.
-        if let Some(pod_name) = obj
-            .key
-            .strip_prefix(&format!("/registry/pods/{namespace}/"))
-        {
-            state.node_graph.remove_pod(namespace, pod_name);
+        if state.store.delete(&obj.key, None).await.is_ok() {
+            // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a
+            // pod hard-deleted here must lose its node-authorization graph edges
+            // immediately, but only once the delete actually landed — a failed delete
+            // leaves the pod (and its edges) exactly as they were.
+            if let Some(pod_name) = obj
+                .key
+                .strip_prefix(&format!("/registry/pods/{namespace}/"))
+            {
+                state.node_graph.remove_pod(namespace, pod_name);
+            }
         }
     }
     delete_namespace_scoped_crds(state, namespace).await;
@@ -3200,6 +3203,92 @@ mod tests {
              moment the namespace cascade hard-deletes pod web — otherwise the node stays \
              authorized to read a secret belonging to a pod that no longer exists until the \
              apiserver restarts"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_finalize_terminating_namespace_revokes_node_graph_edges_for_drained_pods() {
+        // Regression test for the OTHER (and more common) namespace-deletion path: a
+        // real user namespace always carries spec.finalizers=["kubernetes"] at creation, so
+        // it soft-deletes and is drained by KCM's namespace controller, which calls
+        // .../finalize once content is gone — that completion is what
+        // maybe_finalize_terminating_namespace handles. cascade_delete_namespace_resources
+        // (covered by the test above) only fires for the bootstrap/no-spec-finalizers edge
+        // case. If THIS path's pod hard-delete doesn't also deregister the node-authorization
+        // graph, every ordinary namespace deletion leaves the node authorized for the drained
+        // pod's secrets/SA-token until the apiserver restarts.
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        // Namespace already Terminating with spec.finalizers empty — the exact precondition
+        // maybe_finalize_terminating_namespace requires before it will act.
+        let ns_key = crate::keys::cluster_object_key("namespaces", "drained-ns");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "drained-ns",
+                "uid": "00000000-0000-0000-0000-0000000000bb",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": [] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("namespace write must succeed");
+
+        // A pod with no metadata.finalizers -- the "nothing left blocking drain" case
+        // maybe_finalize_terminating_namespace hard-deletes directly.
+        let pod_key = crate::keys::object_key("pods", "drained-ns", "web2");
+        let pod_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "web2", "namespace": "drained-ns" },
+            "spec": {
+                "nodeName": "worker-node-2",
+                "containers": [{
+                    "name": "c",
+                    "envFrom": [{"secretRef": {"name": "worker-secret-2"}}],
+                }],
+            }
+        });
+        state
+            .store
+            .put(&pod_key, bytes::Bytes::from(pod_body.to_string()), Some(0))
+            .await
+            .expect("pod write must succeed");
+        state.node_graph.apply_pod("drained-ns", "web2", &pod_body);
+        assert!(
+            state
+                .node_graph
+                .secret_referenced("worker-node-2", "drained-ns", "worker-secret-2"),
+            "test setup: worker-node-2 must start out authorized for worker-secret-2 via pod web2"
+        );
+
+        maybe_finalize_terminating_namespace(&state, "drained-ns").await;
+
+        assert!(
+            state
+                .store
+                .get(&pod_key)
+                .await
+                .expect("get must not error")
+                .is_none(),
+            "test precondition: pod must actually be hard-deleted by the finalize-drain path"
+        );
+        assert!(
+            !state
+                .node_graph
+                .secret_referenced("worker-node-2", "drained-ns", "worker-secret-2"),
+            "worker-node-2 must lose its node-authorization graph edge for worker-secret-2 the \
+             moment maybe_finalize_terminating_namespace hard-deletes pod web2 — this is the \
+             path an ordinary (non-bootstrap) namespace deletion actually takes via KCM's \
+             namespace controller, so a regression here would leave every real namespace \
+             deletion granting stale node access until the apiserver restarts"
         );
     }
 
