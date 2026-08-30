@@ -61,7 +61,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 kc() {
-  kubectl "${KUBECTL_ARGS[@]}" "$@"
+  # ${KUBECTL_ARGS[@]+"${KUBECTL_ARGS[@]}"} (not a bare "${KUBECTL_ARGS[@]}") is the
+  # bash-3.2-safe empty-array idiom -- macOS's stock /bin/bash is 3.2, where a plain
+  # "${arr[@]}" on an empty array trips `set -u`'s unbound-variable check. This is
+  # the script's default invocation (no --kubeconfig), so it must not crash there.
+  kubectl "${KUBECTL_ARGS[@]+"${KUBECTL_ARGS[@]}"}" "$@"
 }
 
 fail() {
