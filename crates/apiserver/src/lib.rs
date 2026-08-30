@@ -1313,6 +1313,61 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Force the `system:node` ClusterRoleBinding's `subjects` field to empty even when the
+/// binding already exists from a previous version of this apiserver that bound it to the
+/// whole `system:nodes` group.
+///
+/// Every other seeded RBAC object is create-only (see `seed_rbac`'s `put!` macro doc) so an
+/// operator's own edits survive a restart — but `subjects` on THIS binding is the actual
+/// security boundary the Node-authorization-mode fix depends on. `put!` alone only seeds an
+/// empty-subjects binding on a FRESH store; an apiserver upgraded against an EXISTING store
+/// would otherwise keep the old subject-full binding forever, silently reopening the P0 this
+/// fix closes (any node reads every secret in the cluster) on every upgraded deployment.
+/// Matches upstream bootstrappolicy's own "tightening reconciliation" comment for this exact
+/// binding. Deliberately narrow: only `subjects` is touched, and only when non-empty —
+/// `roleRef`/`metadata` and every other seeded object are left to `put!`'s normal
+/// create-only semantics.
+async fn reconcile_system_node_binding_subjects(
+    store: &SqliteStore,
+    key: &str,
+) -> anyhow::Result<()> {
+    use u7s_store::{Store, StoreError};
+    loop {
+        let Some(stored) = store.get(key).await? else {
+            // put! above either just created it (subjects already empty) or seeding failed
+            // earlier and returned before this point — nothing to reconcile either way.
+            return Ok(());
+        };
+        let mut obj: serde_json::Value = serde_json::from_slice(&stored.value)?;
+        let already_empty = obj["subjects"].as_array().is_some_and(|s| s.is_empty());
+        if already_empty {
+            return Ok(());
+        }
+        obj["subjects"] = serde_json::Value::Array(vec![]);
+        match store
+            .put(
+                key,
+                bytes::Bytes::from(obj.to_string()),
+                Some(stored.revision),
+            )
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    "reconciled system:node ClusterRoleBinding: cleared subjects (upgrade path)"
+                );
+                return Ok(());
+            }
+            Err(StoreError::RevisionMismatch { .. }) => continue,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "reconcile system:node ClusterRoleBinding subjects: {e}"
+                ))
+            }
+        }
+    }
+}
+
 async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
@@ -1426,6 +1481,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:node" }
     });
     put!(key, body, "system:node", "ClusterRoleBinding");
+    // Reconcile subjects to empty on an upgraded (pre-existing) store too — see the
+    // function's doc for why this one binding can't rely on put!'s create-only semantics.
+    reconcile_system_node_binding_subjects(store, &key).await?;
 
     // -----------------------------------------------------------------------
     // ClusterRole: cluster-admin — wildcard access to all resources.
@@ -4678,6 +4736,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_rbac_reconciles_stale_subject_full_system_node_binding_on_upgrade() {
+        // Regression test: an apiserver upgraded against an EXISTING store (one seeded by a
+        // pre-fix version that bound system:node to the whole system:nodes group) must not
+        // keep that stale binding — put!'s create-only semantics alone would silently leave
+        // it in place forever, reopening the exact P0 (any node reads every secret in the
+        // cluster) this fix closes. Pre-populate the OLD subject-full binding directly,
+        // bypassing seed_rbac, to simulate that upgraded store.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = make_store();
+        let key = keys::group_object_key(GROUP, "clusterrolebindings", None, "system:node");
+        let stale_binding = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000011", "creationTimestamp": "2024-01-01T00:00:00Z" },
+            "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:nodes" }],
+            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:node" }
+        });
+        store
+            .put(&key, bytes::Bytes::from(stale_binding.to_string()), None)
+            .await
+            .expect("pre-populate stale binding must not fail");
+
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let crb_obj = store
+            .get(&key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRoleBinding system:node must still exist");
+        let crb: serde_json::Value = serde_json::from_slice(&crb_obj.value).expect("valid json");
+        let subjects = crb["subjects"]
+            .as_array()
+            .expect("subjects must be an array");
+        assert!(
+            subjects.is_empty(),
+            "seed_rbac must reconcile a pre-existing subject-full system:node binding down to \
+             empty subjects on every boot, not just seed an empty one on a fresh store — \
+             otherwise every cluster upgraded from a pre-fix version keeps the stale \
+             cluster-wide grant forever and the P0 stays open"
+        );
+        // roleRef must be untouched by the reconciliation — only subjects is a security
+        // boundary here; clobbering roleRef would be a different, unrelated bug.
+        assert_eq!(crb["roleRef"]["name"].as_str(), Some("system:node"));
+    }
+
+    #[tokio::test]
     async fn seed_rbac_system_node_clusterrole_allows_kubelet_to_mount_pvc_backed_volumes() {
         // Regression test for a live outage: a kubelet mounting a PVC-backed volume must GET
         // the PersistentVolumeClaim and the PersistentVolume it's bound to, PATCH the PVC's
@@ -5347,6 +5451,69 @@ mod tests {
             "system:nodes must still be allowed to LIST services via the Node authorizer's \
              ClusterRole-rule fallback — kubelet's service informer needs this or every \
              container on the node fails to start with CreateContainerConfigError"
+        );
+
+        // A kubelet in system:nodes must be able to create SubjectAccessReviews so its
+        // webhook authorizer can call back to the apiserver (needed for logs/exec/attach).
+        // Not graph-scoped: same ClusterRole-rule fallback path as the services check above.
+        let sar_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "authorization.k8s.io",
+            resource: "subjectaccessreviews",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            node_authz::authorize(&sar_create, None, &state.node_graph, &state.rbac_index),
+            "system:nodes must be allowed to create subjectaccessreviews via the Node \
+             authorizer's ClusterRole-rule fallback — kubelet webhook authorizer calls back \
+             to the apiserver for proxy requests (logs/exec/attach)"
+        );
+
+        // A kubelet in system:nodes must be able to create TokenReviews so its
+        // webhook authenticator can validate bearer tokens. Same fallback path.
+        let tr_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "authentication.k8s.io",
+            resource: "tokenreviews",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            node_authz::authorize(&tr_create, None, &state.node_graph, &state.rbac_index),
+            "system:nodes must be allowed to create tokenreviews via the Node authorizer's \
+             ClusterRole-rule fallback — kubelet webhook authenticator calls back to the \
+             apiserver"
+        );
+
+        // A kubelet in system:nodes must be able to create a plain (no-subresource) CSR to
+        // rotate its own client certificate. Matches upstream bootstrappolicy.go's
+        // NodeRules() exactly — without this, a joined node has no permission to even submit
+        // its own self-renewal CSR. Same fallback path.
+        let csr_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "certificates.k8s.io",
+            resource: "certificatesigningrequests",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            node_authz::authorize(&csr_create, None, &state.node_graph, &state.rbac_index),
+            "system:nodes must be allowed to create certificatesigningrequests via the Node \
+             authorizer's ClusterRole-rule fallback — a kubelet cannot submit its own \
+             certificate-rotation CSR without this"
         );
 
         // A kubelet in system:nodes must be able to create its own heartbeat lease.
