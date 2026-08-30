@@ -484,7 +484,15 @@ fn resolve_role_rules<'a>(
     }
 }
 
-fn rules_allow(rules: &[PolicyRule], req: &AuthzRequest<'_>) -> bool {
+/// Match a plain (non-resourceName-restricted, in practice) rule list against a request.
+///
+/// `pub(crate)` so `node_authz` can reuse it for the Node authorizer's fallback path:
+/// resources the Node authorizer doesn't subdivide by node (services, events, csinodes,
+/// SAR/TokenReview creation, ...) are authorized straight from the `system:node` ClusterRole's
+/// own rules, exactly as `rbac.RulesAllow` does in upstream's node authorizer — without this,
+/// re-deriving the same rule list by hand in node_authz would drift the moment someone edits
+/// the seeded ClusterRole.
+pub(crate) fn rules_allow(rules: &[PolicyRule], req: &AuthzRequest<'_>) -> bool {
     rules.iter().any(|rule| rule_covers(rule, req))
 }
 

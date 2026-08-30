@@ -870,13 +870,21 @@ async fn cascade_delete_namespace_resources<S: Store>(
             } else {
                 any_soft_deleted = true;
             }
-        } else {
-            if let Err(e) = state.store.delete(&obj_stored.key, None).await {
-                tracing::warn!(
-                    "namespace {namespace}: hard-delete {} failed: {e}",
-                    obj_stored.key
-                );
-            }
+        } else if let Err(e) = state.store.delete(&obj_stored.key, None).await {
+            tracing::warn!(
+                "namespace {namespace}: hard-delete {} failed: {e}",
+                obj_stored.key
+            );
+        } else if let Some(pod_name) = obj_stored
+            .key
+            .strip_prefix(&format!("/registry/pods/{namespace}/"))
+        {
+            // A pod hard-deleted by the namespace cascade must lose its node-authorization
+            // graph edges immediately, exactly like every hard-delete site in handlers/pods.rs
+            // and handlers/resource.rs — otherwise the node it was scheduled on stays
+            // authorized to read the pod's secrets/mint its ServiceAccount's token until the
+            // apiserver restarts and rebuilds the graph from scratch.
+            state.node_graph.remove_pod(namespace, pod_name);
         }
     }
     any_soft_deleted
@@ -1008,6 +1016,14 @@ pub(crate) async fn maybe_finalize_terminating_namespace<S: Store>(
     // No remaining finalizer'd objects — hard-delete remaining objects and the namespace.
     for obj in objects {
         let _ = state.store.delete(&obj.key, None).await;
+        // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a pod
+        // hard-deleted here must lose its node-authorization graph edges immediately.
+        if let Some(pod_name) = obj
+            .key
+            .strip_prefix(&format!("/registry/pods/{namespace}/"))
+        {
+            state.node_graph.remove_pod(namespace, pod_name);
+        }
     }
     delete_namespace_scoped_crds(state, namespace).await;
     let _ = state.store.delete(&ns_key, None).await;
@@ -3096,6 +3112,94 @@ mod tests {
             StatusCode::CREATED,
             "POST configmap to re-created namespace must return 201 Created, not 409 — \
              false 409 occurs when namespace hard-delete leaves orphaned resources in the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_namespace_hard_delete_revokes_node_graph_edges_for_cascaded_pods() {
+        // Regression test: a namespace hard-delete cascade-deletes every pod inside it, but
+        // if that cascade doesn't also deregister those pods from the node-authorization
+        // graph, the node they were scheduled on stays authorized to read their secrets and
+        // mint their ServiceAccount's token until the apiserver restarts and rebuilds the
+        // graph from scratch — permissions must not outlive the object that granted them.
+        use axum::extract::{Path, State};
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        // Write a namespace directly to the store WITHOUT a finalizer so delete_namespace
+        // takes the hard-delete cascade path (mirrors the bootstrap-namespace shape: the
+        // finalizer lives under metadata, not spec, so seed_namespaces' namespaces take this
+        // exact path too).
+        let ns_key = crate::keys::cluster_object_key("namespaces", "revoke-ns");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "revoke-ns", "uid": "00000000-0000-0000-0000-0000000000aa" },
+            "status": { "phase": "Active" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("namespace write must succeed");
+
+        // Write a pod scheduled on "worker-node" that references "worker-secret", and
+        // register it with the node graph -- exactly what create_pod/bind_pod do on the real
+        // write path.
+        let pod_key = crate::keys::object_key("pods", "revoke-ns", "web");
+        let pod_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "web", "namespace": "revoke-ns" },
+            "spec": {
+                "nodeName": "worker-node",
+                "containers": [{
+                    "name": "c",
+                    "envFrom": [{"secretRef": {"name": "worker-secret"}}],
+                }],
+            }
+        });
+        state
+            .store
+            .put(&pod_key, bytes::Bytes::from(pod_body.to_string()), Some(0))
+            .await
+            .expect("pod write must succeed");
+        state.node_graph.apply_pod("revoke-ns", "web", &pod_body);
+        assert!(
+            state
+                .node_graph
+                .secret_referenced("worker-node", "revoke-ns", "worker-secret"),
+            "test setup: worker-node must start out authorized for worker-secret via pod web"
+        );
+
+        // Hard-delete the namespace — this cascades to the pod via
+        // cascade_delete_namespace_resources.
+        delete_namespace(
+            State(state.clone()),
+            Path("revoke-ns".to_string()),
+            test_user(),
+        )
+        .await
+        .expect("namespace delete must succeed");
+
+        assert!(
+            state
+                .store
+                .get(&pod_key)
+                .await
+                .expect("get must not error")
+                .is_none(),
+            "test precondition: pod must actually be hard-deleted by the cascade"
+        );
+        assert!(
+            !state
+                .node_graph
+                .secret_referenced("worker-node", "revoke-ns", "worker-secret"),
+            "worker-node must lose its node-authorization graph edge for worker-secret the \
+             moment the namespace cascade hard-deletes pod web — otherwise the node stays \
+             authorized to read a secret belonging to a pod that no longer exists until the \
+             apiserver restarts"
         );
     }
 
