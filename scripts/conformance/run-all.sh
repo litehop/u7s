@@ -427,10 +427,10 @@ echo "Using KUBECONFIG=$KUBECONFIG"
 # backend registered there every Resource-type HPA target is permanently stuck. Applied
 # unconditionally, every run, straight after the apiserver is reachable -- convenient for
 # manual debugging and required by non-Conformance-tagged HPA/DRA e2e coverage. See
-# crates/apiserver/manifests/metrics-server.yaml for provenance and the deviations from
+# scripts/conformance/manifests/metrics-server.yaml for provenance and the deviations from
 # upstream's stock manifest.
 banner "Applying metrics-server manifest"
-kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/crates/apiserver/manifests/metrics-server.yaml"
+kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/scripts/conformance/manifests/metrics-server.yaml"
 
 # Step 03: Start lima VM and join kubelet.
 banner "Step 3/6: Start lima VM"
