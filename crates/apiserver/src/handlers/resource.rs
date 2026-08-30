@@ -1417,7 +1417,8 @@ pub(crate) async fn do_patch<S: Store>(
         }
 
         if let Some(ref old_spec) = pvc_spec_before_patch {
-            validate_pvc_spec_immutable(old_spec, &current.body["spec"])
+            let old_status = stored_status.as_ref().unwrap_or(&serde_json::Value::Null);
+            validate_pvc_spec_immutable(old_spec, &current.body["spec"], old_status)
                 .map_err(Status::unprocessable_entity)?;
         }
 
@@ -1660,9 +1661,10 @@ async fn reject_disallowed_pvc_resize<S: Store>(
 /// Reject a PersistentVolumeClaim spec update that changes any field outside the narrow
 /// upstream-allowed set — an allowlist mirroring `ValidatePersistentVolumeClaimUpdate` in
 /// `pkg/apis/core/validation` (release-1.36). Only `spec.resources` may change once a PVC
-/// exists (plus the one-time `volumeName` transition below); `storageClassName`,
-/// `accessModes`, `dataSource`, `dataSourceRef`, `volumeMode`, `selector`, and any other
-/// spec field are frozen at creation time.
+/// exists (plus the one-time `volumeName` transition below and the bound-claim
+/// `volumeAttributesClassName` exception below that); `storageClassName`, `accessModes`,
+/// `dataSource`, `dataSourceRef`, `volumeMode`, `selector`, and any other spec field are
+/// frozen at creation time.
 ///
 /// This is the same allowlist shape `validate_pod_spec_immutable` uses (PR
 /// #1213): munge the upstream-permitted mutable fields out of a clone of `new_spec` using
@@ -1691,9 +1693,24 @@ async fn reject_disallowed_pvc_resize<S: Store>(
 /// `reject_disallowed_pvc_resize` and deliberately NOT duplicated here: this function only
 /// decides whether a *change* to `resources` (or `volumeName`) is permitted at all, not
 /// whether the particular change is a valid resize.
+///
+/// `spec.volumeAttributesClassName` is exempted from the freeze — but only once the claim is
+/// `Bound` (`old_status.phase == "Bound"`), exactly mirroring upstream's own gate (`if
+/// newPvc.Status.Phase == core.ClaimBound { newPvcClone.Spec.VolumeAttributesClassName =
+/// oldPvcClone.Spec.VolumeAttributesClassName }`): CSI's `ControllerModifyVolume` workflow
+/// (the `[Feature:VolumeAttributesClass]` volume-modify e2e suite) patches this field on an
+/// already-bound claim to request a class change, and without this exemption every such
+/// patch fell through to the generic "may not change fields other than spec.resources"
+/// rejection before the modify request ever reached the CSI driver. On an unbound claim the
+/// field stays frozen like any other — there is no bound volume for a class change to apply
+/// to. If a real change to the field survives that exemption, `status.currentVolumeAttributesClassName`
+/// being non-empty (upstream: a `ControllerModifyVolume` for some class already completed)
+/// forbids clearing the field back to nil/empty — abandoning the active class with nothing
+/// left recording which one is in effect.
 fn validate_pvc_spec_immutable(
     old_spec: &serde_json::Value,
     new_spec: &serde_json::Value,
+    old_status: &serde_json::Value,
 ) -> Result<(), String> {
     if old_spec == new_spec {
         return Ok(());
@@ -1706,6 +1723,16 @@ fn validate_pvc_spec_immutable(
             }
             _ => {
                 m.remove("resources");
+            }
+        }
+        if old_status.get("phase").and_then(|v| v.as_str()) == Some("Bound") {
+            match old_spec.get("volumeAttributesClassName") {
+                Some(v) if !v.is_null() => {
+                    m.insert("volumeAttributesClassName".to_string(), v.clone());
+                }
+                _ => {
+                    m.remove("volumeAttributesClassName");
+                }
             }
         }
     }
@@ -1733,6 +1760,36 @@ fn validate_pvc_spec_immutable(
     }
 
     if munged == old_for_compare {
+        // The generic freeze passed — but if volumeAttributesClassName is what actually
+        // changed, a class-modify already in flight/complete for this claim
+        // (status.currentVolumeAttributesClassName set) must not be abandoned by clearing
+        // the field back to nil/empty (upstream: same "forbidden when
+        // status.currentVolumeAttributesClassName is not nil" rule).
+        if old_spec.get("volumeAttributesClassName") != new_spec.get("volumeAttributesClassName") {
+            let current_vac_set = old_status
+                .get("currentVolumeAttributesClassName")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty());
+            if current_vac_set {
+                match new_spec.get("volumeAttributesClassName") {
+                    None | Some(serde_json::Value::Null) => {
+                        return Err(
+                            "spec.volumeAttributesClassName: Forbidden: update to nil is \
+                             forbidden when status.currentVolumeAttributesClassName is not nil"
+                                .into(),
+                        );
+                    }
+                    Some(v) if v.as_str() == Some("") => {
+                        return Err(
+                            "spec.volumeAttributesClassName: Forbidden: update to empty string \
+                             is forbidden when status.currentVolumeAttributesClassName is not nil"
+                                .into(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
         return Ok(());
     }
     Err(
@@ -2953,7 +3010,8 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // after apply_defaults (above) so both sides are defaulted the same way — see
     // pvc_spec_before_replace's comment for why comparing pre-default would false-positive.
     if let Some(ref old_spec) = pvc_spec_before_replace {
-        validate_pvc_spec_immutable(old_spec, &obj.body["spec"])
+        let old_status = stored_status.as_ref().unwrap_or(&serde_json::Value::Null);
+        validate_pvc_spec_immutable(old_spec, &obj.body["spec"], old_status)
             .map_err(Status::unprocessable_entity)?;
     }
 
@@ -19166,6 +19224,248 @@ mod tests {
                 "PATCH changing PersistentVolumeClaim.spec.volumeName must be rejected — \
                  accepting it lets a caller misdirect a bound claim's storage to a different \
                  PersistentVolume, a potential cross-tenant data exposure"
+            ),
+        }
+    }
+
+    /// PATCH changing a Bound PVC's `spec.volumeAttributesClassName` must succeed.
+    ///
+    /// Upstream (`ValidatePersistentVolumeClaimUpdate`, release-1.36) exempts this field
+    /// from the freeze once `status.phase == "Bound"`, because CSI's
+    /// `ControllerModifyVolume` workflow — the `[Feature:VolumeAttributesClass]`
+    /// volume-modify e2e suite — works by patching this exact field on an already-bound
+    /// claim. Before this exemption, every such patch fell through to the generic "may not
+    /// change fields other than spec.resources" rejection, so no VolumeAttributesClass e2e
+    /// test could get past the update call to ever reach the CSI driver.
+    #[tokio::test]
+    async fn patch_namespaced_resource_allows_pvc_volume_attributes_class_name_change_when_bound() {
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/persistentvolumeclaims/default/vac-pvc";
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "vac-pvc", "namespace": "default", "resourceVersion": "1" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-a",
+                "resources": { "requests": { "storage": "1Gi" } },
+                "volumeAttributesClassName": "gold-tier"
+            },
+            "status": { "phase": "Bound" }
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({ "spec": { "volumeAttributesClassName": "silver-tier" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "vac-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PATCH changing spec.volumeAttributesClassName on a Bound PVC must succeed — \
+             rejecting it as \"pvc updates may not change fields other than spec.resources\" \
+             is exactly the Forbidden error that made every csi-hostpath \
+             [Feature:VolumeAttributesClass] volume-modify e2e test fail at the update call, \
+             never reaching the CSI driver's ControllerModifyVolume; got: {:?}",
+            result.err().map(|e| e.1.message)
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["volumeAttributesClassName"], "silver-tier",
+            "the patched volumeAttributesClassName must actually persist, not just pass \
+             validation"
+        );
+    }
+
+    /// PATCH changing `spec.volumeAttributesClassName` on a claim that is NOT yet Bound must
+    /// still return 422.
+    ///
+    /// Upstream's exemption is conditioned on `status.phase == "Bound"` — there is no bound
+    /// volume for a class change to apply to otherwise. If this gate were loosened to permit
+    /// the field to change unconditionally, this test would start passing incorrectly
+    /// (`result.is_ok()`), silently diverging from upstream instead of failing loud.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_pvc_volume_attributes_class_name_change_when_not_bound(
+    ) {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "unbound-vac-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } },
+                "volumeAttributesClassName": "gold-tier"
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "volumeAttributesClassName": "silver-tier" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "unbound-vac-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing spec.volumeAttributesClassName on a claim that isn't Bound must \
+                 return 422 — the bound-claim exemption must not leak into the pre-bind state"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing volumeAttributesClassName on an unbound PVC must be rejected — \
+                 upstream only exempts this field from the freeze once status.phase == Bound"
+            ),
+        }
+    }
+
+    /// PATCH clearing `spec.volumeAttributesClassName` back to nil must return 422 once
+    /// `status.currentVolumeAttributesClassName` already records an active class.
+    ///
+    /// Mirrors upstream's own guard in `ValidatePersistentVolumeClaimUpdate`: once a
+    /// `ControllerModifyVolume` for some class has taken effect, clearing the spec field
+    /// would abandon that active class with nothing left recording which one is in effect.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_clearing_pvc_volume_attributes_class_name_once_current_is_set(
+    ) {
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/persistentvolumeclaims/default/current-vac-pvc";
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "current-vac-pvc", "namespace": "default", "resourceVersion": "1" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-a",
+                "resources": { "requests": { "storage": "1Gi" } },
+                "volumeAttributesClassName": "gold-tier"
+            },
+            "status": { "phase": "Bound", "currentVolumeAttributesClassName": "gold-tier" }
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({ "spec": { "volumeAttributesClassName": null } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "current-vac-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "clearing spec.volumeAttributesClassName while status.currentVolumeAttributesClassName \
+                 is still set must return 422 — accepting it abandons the class the CSI driver \
+                 already applied with nothing left recording which one is active"
+            ),
+            Ok(_) => panic!(
+                "clearing volumeAttributesClassName to nil must be rejected once \
+                 status.currentVolumeAttributesClassName is non-empty"
             ),
         }
     }
