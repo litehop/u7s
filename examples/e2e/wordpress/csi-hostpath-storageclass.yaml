@@ -1,0 +1,22 @@
+# csi-hostpath's own driver/StatefulSet/RBAC is NOT vendored here -- install it from
+# the pinned upstream tag before applying this directory:
+#
+#   git clone --depth 1 --branch v1.17.1 https://github.com/kubernetes-csi/csi-driver-host-path.git
+#   cd csi-driver-host-path/deploy/kubernetes-latest && ./deploy.sh
+#
+# v1.17.1 matches u7s's own sonobuoy e2e pin -- pin it explicitly here too
+# rather than floating the branch HEAD, which can drift.
+# deploy.sh also tries to apply a VolumeSnapshot snapshotclass, which hard-fails
+# with no VolumeSnapshot CRDs installed -- harmless, ignore it (a vanilla kubeadm
+# cluster lacks these CRDs too).
+#
+# This StorageClass is the one piece deploy.sh does not create -- apply this
+# directory (which includes it) after deploy.sh finishes.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-hostpath-sc
+provisioner: hostpath.csi.k8s.io
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
