@@ -11,11 +11,22 @@ use u7s_store::Store;
 
 use crate::{
     auth::UserInfo,
-    rbac::AuthzRequest,
+    node_authz::{self, NodeGraph},
+    rbac::{AuthzRequest, RbacIndex},
     state::AppState,
     status::Status,
     util::{content_type, extract_body},
 };
+
+/// Mirrors `AuthService::call`'s enforcement decision exactly (`node_authz::authorize(...) ||
+/// rbac_index.is_allowed(...)`, see auth.rs) so a SAR/SelfSubjectAccessReview result agrees
+/// with what the runtime authorizer would actually grant. Without this, a `system:node:<name>`
+/// identity's own-node-scoped grants (node_authz.rs) are invisible here even though the real
+/// request would succeed — `kubectl auth can-i --as=system:node:X` (and any controller that
+/// trusts SAR instead of just attempting the action) would report a false "no".
+fn authorized(req: &AuthzRequest<'_>, node_graph: &NodeGraph, rbac_index: &RbacIndex) -> bool {
+    node_authz::authorize(req, None, node_graph, rbac_index) || rbac_index.is_allowed(req)
+}
 
 // ---------------------------------------------------------------------------
 // SelfSubjectAccessReview
@@ -142,29 +153,37 @@ pub async fn self_subject_access_review<S: Store>(
         };
         let (resource, subresource) = split_combined_resource(&attrs.resource, &attrs.subresource);
 
-        state.rbac_index.is_allowed(&AuthzRequest {
-            username: &user.username,
-            groups: &user.groups,
-            verb: &attrs.verb,
-            api_group: &attrs.group,
-            resource,
-            subresource,
-            namespace: ns,
-            name,
-            non_resource_url: None,
-        })
+        authorized(
+            &AuthzRequest {
+                username: &user.username,
+                groups: &user.groups,
+                verb: &attrs.verb,
+                api_group: &attrs.group,
+                resource,
+                subresource,
+                namespace: ns,
+                name,
+                non_resource_url: None,
+            },
+            &state.node_graph,
+            &state.rbac_index,
+        )
     } else if let Some(attrs) = req.spec.non_resource_attributes {
-        state.rbac_index.is_allowed(&AuthzRequest {
-            username: &user.username,
-            groups: &user.groups,
-            verb: &attrs.verb,
-            api_group: "",
-            resource: "",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: Some(&attrs.path),
-        })
+        authorized(
+            &AuthzRequest {
+                username: &user.username,
+                groups: &user.groups,
+                verb: &attrs.verb,
+                api_group: "",
+                resource: "",
+                subresource: "",
+                namespace: None,
+                name: None,
+                non_resource_url: Some(&attrs.path),
+            },
+            &state.node_graph,
+            &state.rbac_index,
+        )
     } else {
         false
     };
@@ -405,17 +424,21 @@ pub async fn subject_access_review<S: Store>(
         };
         let (resource, subresource) = split_combined_resource(&attrs.resource, &attrs.subresource);
 
-        state.rbac_index.is_allowed(&AuthzRequest {
-            username: &spec.user,
-            groups: &spec.groups,
-            verb: &attrs.verb,
-            api_group: &attrs.group,
-            resource,
-            subresource,
-            namespace: ns,
-            name,
-            non_resource_url: None,
-        })
+        authorized(
+            &AuthzRequest {
+                username: &spec.user,
+                groups: &spec.groups,
+                verb: &attrs.verb,
+                api_group: &attrs.group,
+                resource,
+                subresource,
+                namespace: ns,
+                name,
+                non_resource_url: None,
+            },
+            &state.node_graph,
+            &state.rbac_index,
+        )
     } else if let Some(attrs) = spec.non_resource_attributes {
         // Real apiservers delegate authorization for their own non-resource endpoints
         // (discovery, openapi, ...) via exactly this shape instead of resourceAttributes.
@@ -423,17 +446,21 @@ pub async fn subject_access_review<S: Store>(
         // /apis/{group}/{version} discovery endpoint (system:auth-delegator's SAR call) —
         // without this branch every such check fell through to `allowed: false` below,
         // making aggregated discovery permanently 403 even for a cluster-admin caller.
-        state.rbac_index.is_allowed(&AuthzRequest {
-            username: &spec.user,
-            groups: &spec.groups,
-            verb: &attrs.verb,
-            api_group: "",
-            resource: "",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: Some(&attrs.path),
-        })
+        authorized(
+            &AuthzRequest {
+                username: &spec.user,
+                groups: &spec.groups,
+                verb: &attrs.verb,
+                api_group: "",
+                resource: "",
+                subresource: "",
+                namespace: None,
+                name: None,
+                non_resource_url: Some(&attrs.path),
+            },
+            &state.node_graph,
+            &state.rbac_index,
+        )
     } else {
         false
     };
@@ -550,17 +577,21 @@ pub async fn local_subject_access_review<S: Store>(
         };
         let (resource, subresource) = split_combined_resource(&attrs.resource, &attrs.subresource);
 
-        state.rbac_index.is_allowed(&AuthzRequest {
-            username: &spec.user,
-            groups: &spec.groups,
-            verb: &attrs.verb,
-            api_group: &attrs.group,
-            resource,
-            subresource,
-            namespace: ns,
-            name,
-            non_resource_url: None,
-        })
+        authorized(
+            &AuthzRequest {
+                username: &spec.user,
+                groups: &spec.groups,
+                verb: &attrs.verb,
+                api_group: &attrs.group,
+                resource,
+                subresource,
+                namespace: ns,
+                name,
+                non_resource_url: None,
+            },
+            &state.node_graph,
+            &state.rbac_index,
+        )
     } else {
         false
     };
@@ -1411,6 +1442,142 @@ mod handler_tests {
                  agree with the runtime authorizer, which already permits this action"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: SelfSubjectAccessReview must consult the Node authorizer, not just
+    // RBAC. `kubectl auth can-i --as=system:node:<node> ...` impersonates that identity
+    // and lands here (Extension(user) becomes the impersonated identity), so if this
+    // handler only checked rbac_index.is_allowed it would report "no" for every action
+    // the Node authorizer actually grants at the HTTP layer — the RBAC index below has NO
+    // bindings at all (mirroring the emptied system:node ClusterRoleBinding on main), so
+    // only node_authz::authorize's pod-reference graph can produce "allowed: true" here.
+    // -----------------------------------------------------------------------
+
+    /// A real kubelet on node-a can GET a Secret its own pod mounts (enforced by
+    /// AuthService::call's node_authz OR rbac_index check). SAR must agree, or any
+    /// operator/controller that trusts `kubectl auth can-i` instead of just attempting the
+    /// action gets a false "no" for something that actually works.
+    #[tokio::test]
+    async fn ssar_reports_allowed_for_secret_referenced_by_its_own_pod_matching_node_authorizer_enforcement(
+    ) {
+        let state = make_state();
+        state.node_graph.apply_pod(
+            "default",
+            "pod-a",
+            &serde_json::json!({
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"name": "c", "envFrom": [{"secretRef": {"name": "secret-a"}}]}],
+                }
+            }),
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "resourceAttributes": {
+                    "namespace": "default",
+                    "verb": "get",
+                    "group": "",
+                    "resource": "secrets",
+                    "name": "secret-a"
+                }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+            body,
+            user("system:node:node-a", &["system:nodes"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["allowed"], true,
+            "node-a must be reported as allowed to get secret-a, the secret its own pod \
+             actually mounts — before this fix the handler called rbac_index.is_allowed \
+             alone (which sees no bindings at all) and always reported false here, diverging \
+             from what AuthService::call actually grants"
+        );
+    }
+
+    /// The mirror case: node-a asking about a secret only node-b's pod references must stay
+    /// denied. Guards against a broken fix that grants any system:node identity blanket
+    /// access instead of scoping it through node_authz's own-node graph — that would silently
+    /// reopen the exact cross-node secret exfiltration the Node authorizer exists to close.
+    #[tokio::test]
+    async fn ssar_reports_denied_for_secret_referenced_only_by_another_nodes_pod() {
+        let state = make_state();
+        state.node_graph.apply_pod(
+            "default",
+            "pod-a",
+            &serde_json::json!({
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"name": "c", "envFrom": [{"secretRef": {"name": "secret-a"}}]}],
+                }
+            }),
+        );
+        state.node_graph.apply_pod(
+            "default",
+            "pod-b",
+            &serde_json::json!({
+                "spec": {
+                    "nodeName": "node-b",
+                    "containers": [{"name": "c", "envFrom": [{"secretRef": {"name": "secret-b"}}]}],
+                }
+            }),
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "resourceAttributes": {
+                    "namespace": "default",
+                    "verb": "get",
+                    "group": "",
+                    "resource": "secrets",
+                    "name": "secret-b"
+                }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+            body,
+            user("system:node:node-a", &["system:nodes"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["allowed"], false,
+            "node-a must NOT be reported as allowed to get secret-b, which only node-b's pod \
+             mounts — SAR granting this would mislead an operator into believing a compromised \
+             node-a can read cross-node secrets, which the Node authorizer exists to prevent"
+        );
     }
 
     // -----------------------------------------------------------------------
