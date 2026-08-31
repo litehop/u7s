@@ -588,7 +588,7 @@ see `roadmap.md` for the shipped decision in each case:
 
 - **Admission webhooks:** MutatingWebhookConfiguration and ValidatingWebhookConfiguration are implemented (`crates/apiserver/src/admission.rs`), not just built-in plugins.
 - **Aggregated API server / API aggregation layer:** `apiregistration.k8s.io` APIService aggregation is implemented (`crates/apiserver/src/handlers/aggregation.rs`); CRDs are no longer the only extension mechanism.
-- **Horizontal Pod Autoscaler (HPA):** A metrics-server addon manifest (`crates/apiserver/manifests/metrics-server.yaml`) is applied by the test/dev harness (not baked into the API server's own boot sequence) and the `scale` subresource is implemented (`crates/apiserver/src/handlers/scale.rs`), unblocking CPU/memory HPA targets.
+- **Horizontal Pod Autoscaler (HPA):** A metrics-server addon manifest (`scripts/conformance/manifests/metrics-server.yaml`) is applied by the test/dev harness only (not baked into the API server's own boot sequence, not shipped to users) and the `scale` subresource is implemented (`crates/apiserver/src/handlers/scale.rs`), unblocking CPU/memory HPA targets once a user installs their own metrics-server.
 
 **Pod Disruption Budgets** remain accurately scoped above: u7s has no PDB *controller*
 of its own (no reimplementation of `disruptionsAllowed` computation) — it delegates

@@ -34,6 +34,14 @@ and kube-controller-manager, and writes a systemd unit for each.
    kubectl --kubeconfig=/var/lib/u7s/kubeconfig get nodes
    ```
 
+u7s does not ship metrics-server. The `scale` subresource is implemented, so
+`HorizontalPodAutoscaler` works once you install metrics-server yourself —
+apply upstream's release manifest:
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+```
+
 ## Architecture
 
 u7s implements the Kubernetes REST API surface natively rather than

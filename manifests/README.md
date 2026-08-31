@@ -12,10 +12,11 @@ copies every `*.yaml` file here into the release tarball's own `manifests/`
 directory, and `scripts/install.sh` copies them from there into
 `--manifest-output-dir` (default `/etc/u7s/manifests`), where the apiserver
 auto-applies them at every boot. Do not add a manifest here that should NOT
-be auto-applied by default (e.g. metrics-server, which is opt-in by design --
-see `docs/decisions/upstream-component-shipping-shape.md` -- and lives at
-`crates/apiserver/manifests/metrics-server.yaml` instead, for users to apply
-themselves).
+be auto-applied by default (e.g. metrics-server, which u7s does not ship at
+all -- see `docs/decisions/upstream-component-shipping-shape.md`. The
+dev/test harness vendors its own copy at
+`scripts/conformance/manifests/metrics-server.yaml`; real users install
+metrics-server themselves from upstream).
 
 CoreDNS (`coredns.yaml`), moved off its former `include_bytes!` compile-time
 embed, joins `flannel.yaml` (`__IFACE__`,
