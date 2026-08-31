@@ -20,10 +20,8 @@ answer per component rather than resolving it ad hoc at install time.
   `apt`. Ubuntu only for now.
 - **CoreDNS** — in-cluster manifest, applied through the existing
   manifest-bootstrap path (`bootstrap_apply.rs`).
-- **metrics-server** — not shipped by u7s. The dev/test harness vendors a
-  copy at `scripts/conformance/manifests/metrics-server.yaml` for e2e
-  coverage only; users wanting HPA install upstream's own metrics-server
-  themselves.
+- **metrics-server** — not installed by default. Users wanting HPA apply the
+  manifest themselves; documented, not hidden.
 
 ## Rationale
 
