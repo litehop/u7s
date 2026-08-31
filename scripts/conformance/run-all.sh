@@ -432,6 +432,18 @@ echo "Using KUBECONFIG=$KUBECONFIG"
 banner "Applying metrics-server manifest"
 kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/scripts/conformance/manifests/metrics-server.yaml"
 
+# external-snapshotter: same opt-in shape as metrics-server above -- not part of the
+# apiserver's own boot sequence or the production release bundle (VolumeSnapshot stays
+# out of scope for that, k0s precedent), but the csi-hostpath snapshot e2e specs need the
+# snapshot.storage.k8s.io CRDs + snapshot-controller present or they fail at setup with
+# `Resource "snapshot.storage.k8s.io/v1/volumesnapshotclasses" not found`. Applied
+# unconditionally, every run, straight after metrics-server -- harmless when no
+# snapshot-tagged spec is selected. See
+# scripts/conformance/manifests/external-snapshotter.yaml for provenance and the version
+# pin rationale.
+banner "Applying external-snapshotter manifest"
+kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/scripts/conformance/manifests/external-snapshotter.yaml"
+
 # Step 03: Start lima VM and join kubelet.
 banner "Step 3/6: Start lima VM"
 # shellcheck disable=SC2086
