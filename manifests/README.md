@@ -18,6 +18,13 @@ dev/test harness vendors its own copy at
 `scripts/conformance/manifests/metrics-server.yaml`; real users install
 metrics-server themselves from upstream).
 
+The VolumeSnapshot API (`snapshot.storage.k8s.io` CRDs + the external
+`snapshot-controller`) is excluded the same way, for the same reason (k0s
+precedent: not every distro ships it). The dev/test harness vendors its own
+copy at `scripts/conformance/manifests/external-snapshotter.yaml`, applied
+opt-in so the csi-hostpath snapshot e2e suite can run; real users install it
+themselves from upstream `kubernetes-csi/external-snapshotter`.
+
 CoreDNS (`coredns.yaml`), moved off its former `include_bytes!` compile-time
 embed, joins `flannel.yaml` (`__IFACE__`,
 `__POD_CLUSTER_CIDR__`) and `kube-proxy.yaml` (`__KUBE_VERSION__`,
