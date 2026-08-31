@@ -1712,6 +1712,14 @@ fn validate_pvc_spec_immutable(
     new_spec: &serde_json::Value,
     old_status: &serde_json::Value,
 ) -> Result<(), String> {
+    // Normalize null-vs-absent first (see strip_zero_value_fields): a resources-only or
+    // finalizer-only update whose spec differs from the stored one only in whether e.g.
+    // `volumeAttributesClassName` is written as literal `null` or left out entirely must
+    // never be treated as "the spec changed" — every branch below (the resources/VAC
+    // munging and the frozen-field deep-equal) needs both sides pre-normalized or that
+    // shape difference alone re-introduces the same false positive it's meant to prevent.
+    let old_spec = &strip_zero_value_fields(old_spec);
+    let new_spec = &strip_zero_value_fields(new_spec);
     if old_spec == new_spec {
         return Ok(());
     }
@@ -1884,18 +1892,68 @@ const STATEFULSET_MUTABLE_SPEC_FIELDS: [&str; 7] = [
     "minReadySeconds",
 ];
 
+/// Recursively drops every object key whose value is a JSON "Go zero value" — `null`,
+/// `false`, `0`, `""`, `[]`, or `{}` — so a field a client wrote out explicitly and a field
+/// it omitted altogether compare equal.
+///
+/// Upstream's own immutability checks (`ValidatePersistentVolumeUpdate`,
+/// `ValidatePersistentVolumeClaimUpdate`, ...) run on typed Go structs, where a
+/// `json:"...,omitempty"` field left absent on the wire and one sent with its zero value
+/// decode to the exact same Go value — `omitempty` doesn't only apply to nil pointers, it
+/// applies to a struct field's zero value for ANY type: an absent `bool` and one sent as
+/// literal `false` are indistinguishable once decoded, same for an absent `string`/`""`, an
+/// absent `int`/`0`, and an absent slice/map/`[]`/`{}`. `serde_json::Value`'s `==` has no
+/// such equivalence — `{"readOnly": false}` and `{}` compare unequal — so any validator here
+/// that deep-compares raw `Value` trees needs this normalization first or it diverges from
+/// upstream purely on which shape a given writer happens to prefer. Live e2e proof: a
+/// dynamically-provisioned CSI PV's stored `spec.csi.readOnly` is `false` (u7s's own
+/// create-time defaulting round-trip wrote it out explicitly), while kube-controller-
+/// manager's pv-protection controller's finalizer-only `Update()` — a DeepCopy of its
+/// informer cache, itself decoded from/re-encoded through client-go's typed
+/// `CSIPersistentVolumeSource` struct, whose `ReadOnly bool` field carries `omitempty` —
+/// never sends the key at all; that difference alone tripped a spurious
+/// `spec.persistentvolumesource is immutable` 422 on every single retry for the object's
+/// entire lifetime, hotlooping the controller and, via its cascading queue growth, blocking
+/// namespace deletion cluster-wide.
+fn strip_zero_value_fields(v: &serde_json::Value) -> serde_json::Value {
+    fn is_zero_value(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Null => true,
+            serde_json::Value::Bool(b) => !b,
+            serde_json::Value::Number(n) => n.as_f64() == Some(0.0),
+            serde_json::Value::String(s) => s.is_empty(),
+            serde_json::Value::Array(a) => a.is_empty(),
+            serde_json::Value::Object(o) => o.is_empty(),
+        }
+    }
+    match v {
+        serde_json::Value::Object(m) => serde_json::Value::Object(
+            m.iter()
+                .map(|(k, val)| (k.clone(), strip_zero_value_fields(val)))
+                .filter(|(_, val)| !is_zero_value(val))
+                .collect(),
+        ),
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(strip_zero_value_fields).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 /// Returns whether `old` and `new` agree on every field except those in `mutable_fields` —
 /// the shared "whole-spec allowlist" tail used by immutability validators that reject an
 /// update touching any field outside an explicit mutable set. Stripping the excluded fields
 /// off both sides (rather than munging one side to match the other) means a field's presence,
-/// absence, or value never matters as long as it's in the allowlist.
+/// absence, or value never matters as long as it's in the allowlist. Also strips null-valued
+/// fields first (see `strip_zero_value_fields`) so an explicit-null-vs-absent difference on a
+/// mutable-set-excluded field's sibling never masquerades as a real change.
 fn spec_immutable_except(
     old: &serde_json::Value,
     new: &serde_json::Value,
     mutable_fields: &[&str],
 ) -> bool {
     let strip = |v: &serde_json::Value| {
-        let mut m = v.clone();
+        let mut m = strip_zero_value_fields(v);
         if let Some(obj) = m.as_object_mut() {
             for field in mutable_fields {
                 obj.remove(*field);
@@ -19470,6 +19528,209 @@ mod tests {
         }
     }
 
+    /// PUT that only appends `metadata.finalizers` to a Bound PVC — the exact shape
+    /// kube-controller-manager's pvc-protection controller sends via a plain informer-cache
+    /// `Update()` — must succeed.
+    ///
+    /// This is `pvc_protection_controller.go`'s `addFinalizer`/`removeFinalizer`: a DeepCopy
+    /// of the cached claim with only `ObjectMeta.Finalizers` touched, spec byte-identical.
+    /// Before this fix a live csi-hostpath e2e run saw this exact update rejected 422 "pvc
+    /// updates may not change fields other than spec.resources" on every retry — the
+    /// controller hotlooped forever, its workqueue grew unbounded, and namespaces holding
+    /// any PVC never finished deleting because the finalizer was never actually removed.
+    #[tokio::test]
+    async fn replace_namespaced_resource_allows_pvc_finalizer_only_update() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "finalizer-only-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-a",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let finalized = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "finalizer-only-pvc",
+                "namespace": "default",
+                "finalizers": ["kubernetes.io/pvc-protection"]
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-a",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "finalizer-only-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&finalized).unwrap()),
+        )
+        .await;
+
+        result.unwrap_or_else(|e| {
+            panic!(
+                "PUT adding only metadata.finalizers to a PVC must succeed — a spec that is \
+                 byte-identical to the stored one must never be treated as a forbidden spec \
+                 change: {e:?}"
+            )
+        });
+    }
+
+    /// PUT growing a Bound PVC's `spec.resources` must succeed when
+    /// `spec.volumeAttributesClassName` is stored as literal JSON `null` on both the stored
+    /// object and the incoming body — not merely absent from both.
+    ///
+    /// The VAC-exemption munge (added alongside the "allow VAC change when Bound" feature)
+    /// zeroed a null/absent incoming `volumeAttributesClassName` by `remove`-ing the key from
+    /// the munged copy, but the object it was compared against (`old_for_compare`) was a
+    /// plain clone of the stored spec and so still carried the literal `null` if that's what
+    /// was stored — `{"volumeAttributesClassName": null, ...}` and `{...}` (key entirely
+    /// missing) are unequal `serde_json::Value`s, so a claim that ever had this field
+    /// explicitly nulled (e.g. by an earlier JSON-merge-patch) could never be resized again:
+    /// every legitimate resources-only grow was rejected 422 as if the whole spec had
+    /// changed.
+    #[tokio::test]
+    async fn replace_namespaced_resource_allows_pvc_resize_when_stored_vac_is_explicit_null() {
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/persistentvolumeclaims/default/null-vac-pvc";
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let sc = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "null-vac-sc" },
+            "provisioner": "csi-hostpath",
+            "allowVolumeExpansion": true
+        });
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        // volumeMode is spelled out explicitly (rather than left for apply_defaults to
+        // supply) because this seed is written straight to the store, bypassing
+        // create_namespaced_resource's own apply_defaults pass — a real stored PVC always
+        // has it defaulted at create time, and pvc_spec_before_replace intentionally
+        // compares the PUT's post-defaults spec against this pre-defaulted stored one (see
+        // its doc comment), so the seed must already carry every field apply_defaults would
+        // have added or the comparison would trip on that, not on the VAC null/absent
+        // question this test actually targets.
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "null-vac-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "null-vac-sc",
+                "volumeName": "pv-a",
+                "volumeMode": "Filesystem",
+                "resources": { "requests": { "storage": "1Gi" } },
+                "volumeAttributesClassName": null
+            },
+            "status": { "phase": "Bound" }
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // No resourceVersion on the PUT body: the CAS precondition is orthogonal to what
+        // this test exercises, and every sibling PVC-resize test in this file (e.g.
+        // replace_namespaced_resource_rejects_pvc_expansion_without_allow_volume_expansion)
+        // omits it the same way.
+        let grown = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "null-vac-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "null-vac-sc",
+                "volumeName": "pv-a",
+                "resources": { "requests": { "storage": "2Gi" } },
+                "volumeAttributesClassName": null
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "null-vac-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&grown).unwrap()),
+        )
+        .await;
+
+        result.unwrap_or_else(|e| {
+            panic!(
+                "PUT growing spec.resources on a Bound PVC must succeed when \
+                 volumeAttributesClassName is null on both sides — null and absent must \
+                 compare equal, not trip the generic \"may not change fields other than \
+                 spec.resources\" rejection: {e:?}"
+            )
+        });
+    }
+
     /// PATCH changing `spec.storageClassName` on an existing PVC must return 422.
     ///
     /// Upstream only permits setting this field once, from empty; the pre-rewrite guard
@@ -23364,6 +23625,252 @@ mod tests {
                 "PATCH changing PersistentVolume.spec.hostPath must be rejected — accepting \
                  it silently repoints every PVC/Pod bound to this PV at a different backing \
                  store without their knowledge"
+            ),
+        }
+    }
+
+    fn csi_pv_body(name: &str, driver: &str, volume_handle: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": { "name": name },
+            "spec": {
+                "capacity": { "storage": "1Gi" },
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "storageClassName": "csi-hostpath-sc",
+                "csi": {
+                    "driver": driver,
+                    "volumeHandle": volume_handle,
+                    "controllerPublishSecretRef": null,
+                    "nodeStageSecretRef": null,
+                    "nodePublishSecretRef": null,
+                    "volumeAttributes": {
+                        "storage.kubernetes.io/csiProvisionerIdentity": "1234-hostpath.csi.k8s.io"
+                    }
+                }
+            }
+        })
+    }
+
+    /// PUT that only appends `metadata.finalizers` to a dynamically-provisioned CSI
+    /// PersistentVolume must succeed, even though `spec.csi` carries several optional
+    /// secret-ref fields as literal JSON `null`.
+    ///
+    /// This is `pv_protection_controller.go`'s `addFinalizer`/`removeFinalizer`: a DeepCopy
+    /// of the informer's cached PV (client-go's typed struct round-trip omits `omitempty`
+    /// pointer fields like these secret refs entirely rather than sending literal `null`)
+    /// with only `ObjectMeta.Finalizers` touched. Before `strip_zero_value_fields`,
+    /// `spec_immutable_except` compared the stored `{"csi": {"nodePublishSecretRef": null,
+    /// ...}}` against the controller's `{"csi": {...}}` (keys absent) and saw them as
+    /// unequal, so this update was rejected 422 "spec.persistentvolumesource is immutable"
+    /// on every retry — the confirmed root cause of pv-protection's hotloop that blocked
+    /// namespace finalization cluster-wide.
+    #[tokio::test]
+    async fn replace_resource_allows_pv_finalizer_only_update_with_null_csi_secret_refs() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let pv = csi_pv_body("csi-finalizer-pv", "hostpath.csi.k8s.io", "vol-1");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let mut finalized = csi_pv_body("csi-finalizer-pv", "hostpath.csi.k8s.io", "vol-1");
+        finalized["metadata"]["finalizers"] = serde_json::json!(["kubernetes.io/pv-protection"]);
+        // Drop the null secret refs entirely, exactly as client-go's typed Update() would —
+        // this is the shape difference the fix must tolerate.
+        finalized["spec"]["csi"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|_, v| !v.is_null());
+
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "csi-finalizer-pv".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&finalized).unwrap()),
+        )
+        .await;
+
+        result.unwrap_or_else(|e| {
+            panic!(
+                "PUT adding only metadata.finalizers to a CSI PersistentVolume must succeed — \
+                 a null-vs-absent difference on an untouched spec.csi field must never look \
+                 like a real persistentVolumeSource change: {e:?}"
+            )
+        });
+    }
+
+    /// PUT that only appends `metadata.finalizers` to a CSI PersistentVolume must succeed
+    /// even when `spec.csi.readOnly` is stored as literal `false` but the incoming body
+    /// omits the key entirely.
+    ///
+    /// This is the EXACT shape a live csi-hostpath e2e run hit: `false` is a Go zero value,
+    /// and Go's `json:"readOnly,omitempty"` tag on `CSIPersistentVolumeSource.ReadOnly bool`
+    /// omits it whenever it's `false` — not just when nil, since a plain `bool` has no nil
+    /// state. kube-controller-manager's pv-protection controller's finalizer-only `Update()`
+    /// (built from a DeepCopy of its typed informer cache) therefore never sends this key,
+    /// while u7s's own create-time handling wrote it out explicitly as `false`. That
+    /// difference alone reproduced `spec.persistentvolumesource is immutable` on every single
+    /// retry for the object's entire ~20s lifetime in a live run — never once succeeding —
+    /// confirming `strip_zero_value_fields` must treat every Go zero value (not just `null`) as
+    /// equivalent to absent, not only `null`/pointer-typed fields.
+    #[tokio::test]
+    async fn replace_resource_allows_pv_finalizer_only_update_when_csi_read_only_false_becomes_absent(
+    ) {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let pv = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": { "name": "csi-readonly-pv" },
+            "spec": {
+                "capacity": { "storage": "1Mi" },
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "storageClassName": "csi-hostpath-sc",
+                "csi": {
+                    "driver": "hostpath.csi.k8s.io",
+                    "volumeHandle": "vol-readonly-1",
+                    "readOnly": false,
+                    "volumeAttributes": {
+                        "storage.kubernetes.io/csiProvisionerIdentity": "1234-hostpath.csi.k8s.io"
+                    }
+                }
+            }
+        });
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        // Mirrors pv_protection_controller.go's addFinalizer: readOnly is entirely absent,
+        // exactly as client-go's typed Update() would send it (omitempty on a `false` bool).
+        let finalized = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {
+                "name": "csi-readonly-pv",
+                "finalizers": ["kubernetes.io/pv-protection"]
+            },
+            "spec": {
+                "capacity": { "storage": "1Mi" },
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "storageClassName": "csi-hostpath-sc",
+                "csi": {
+                    "driver": "hostpath.csi.k8s.io",
+                    "volumeHandle": "vol-readonly-1",
+                    "volumeAttributes": {
+                        "storage.kubernetes.io/csiProvisionerIdentity": "1234-hostpath.csi.k8s.io"
+                    }
+                }
+            }
+        });
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "csi-readonly-pv".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&finalized).unwrap()),
+        )
+        .await;
+
+        result.unwrap_or_else(|e| {
+            panic!(
+                "PUT adding only metadata.finalizers to a CSI PersistentVolume must succeed \
+                 when spec.csi.readOnly is stored as literal false but the update omits the \
+                 key entirely — a Go zero value and an omitted field must compare equal, not \
+                 look like a real persistentVolumeSource change: {e:?}"
+            )
+        });
+    }
+
+    /// PUT that changes the CSI `volumeHandle` (a real `persistentVolumeSource` change) must
+    /// still return 422, even when the update also drops the same null secret-ref fields the
+    /// test above proves must be tolerated.
+    ///
+    /// Guards against `strip_zero_value_fields` overcorrecting into "ignore any spec.csi diff": a
+    /// PV's `volumeHandle` is the CSI driver's only handle on which physical volume this
+    /// object represents, so silently accepting a change here would repoint every already-
+    /// bound PVC/Pod at different backing storage without their knowledge.
+    #[tokio::test]
+    async fn replace_resource_rejects_pv_csi_volume_handle_change_despite_null_secret_refs() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let pv = csi_pv_body("csi-repoint-pv", "hostpath.csi.k8s.io", "vol-1");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let mut repointed = csi_pv_body("csi-repoint-pv", "hostpath.csi.k8s.io", "vol-2");
+        repointed["spec"]["csi"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|_, v| !v.is_null());
+
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "csi-repoint-pv".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&repointed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing PersistentVolume.spec.csi.volumeHandle must return 422 — a real \
+                 backing-volume change must still be rejected after the null-vs-absent fix"
+            ),
+            Ok(_) => panic!(
+                "PUT changing PersistentVolume.spec.csi.volumeHandle must be rejected — \
+                 accepting it silently repoints every PVC/Pod bound to this PV at a different \
+                 physical volume"
             ),
         }
     }
