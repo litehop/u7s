@@ -1215,13 +1215,18 @@ fn build_router(state: AppState) -> Router {
                 .delete(handlers::resource::delete_namespaced_resource)
                 .patch(handlers::resource::patch_namespaced_resource),
         )
-        // Cluster-scoped status subresource — CR-aware handler falls through to
-        // registry resources; generic GET/PATCH still handle non-CR resources.
+        // Cluster-scoped status subresource — CR-aware handlers fall through to
+        // registry resources for GET/PUT/PATCH alike (patch_cr_status must have the same
+        // resource_registry-or-CRD fallback as put_cr_status/get_cr_status, or a
+        // cluster-scoped CRD's controller — e.g. csi-snapshotter patching
+        // VolumeSnapshotContent/status — gets a 404 on every status update, since plain
+        // `handlers::status::patch_resource_status` 404s on anything absent from
+        // resource_registry).
         .route(
             "/apis/{group}/{version}/{resource}/{name}/status",
             get(handlers::cr::get_cr_status)
                 .put(handlers::cr::put_cr_status)
-                .patch(handlers::status::patch_resource_status),
+                .patch(handlers::cr::patch_cr_status),
         )
         // Cluster-scoped scale subresource — same CRD-only reasoning as the namespaced
         // scale route above; cluster-scoped CRDs can also declare `subresources.scale`.
@@ -10692,6 +10697,163 @@ mod tests {
                 "GET {path} must return kind={expected_kind}"
             );
         }
+    }
+
+    /// PATCH /apis/{group}/{version}/{resource}/{name}/status for a cluster-scoped CRD
+    /// declaring `subresources.status: {}` must return 200 and persist `.status` — not
+    /// 404. Mirrors VolumeSnapshotContent (cluster-scoped, `subresources.status: {}`):
+    /// before this fix the cluster-scoped `/status` route wired PATCH directly to the
+    /// non-CR-aware `handlers::status::patch_resource_status`, whose `lookup()` 404s on
+    /// anything absent from the static `resource_registry` — i.e. every CRD. Every PATCH
+    /// from the csi-snapshotter sidecar setting `status.readyToUse` 404ed, so the
+    /// snapshot never became ready and snapshot-controller looped delete/recreate until
+    /// the e2e watchdog force-deleted the namespace.
+    #[tokio::test]
+    async fn crd_status_patch_returns_200_and_updates_status_not_spec() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        let admin = auth::UserInfo {
+            username: "admin".to_string(),
+            uid: String::new(),
+            groups: vec!["system:masters".to_string()],
+            extra: Default::default(),
+        };
+
+        // A cluster-scoped CRD declaring subresources.status, mirroring
+        // VolumeSnapshotContent's shape.
+        let crd_body = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "widgets.example.io" },
+            "spec": {
+                "group": "example.io",
+                "names": {
+                    "plural": "widgets",
+                    "singular": "widget",
+                    "kind": "Widget",
+                    "listKind": "WidgetList"
+                },
+                "scope": "Cluster",
+                "versions": [
+                    { "name": "v1", "served": true, "storage": true, "subresources": { "status": {} } }
+                ]
+            }
+        });
+        let mut crd_req = Request::builder()
+            .method(Method::POST)
+            .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(crd_body.to_string()))
+            .expect("CRD POST request must build");
+        crd_req.extensions_mut().insert(admin.clone());
+        let crd_resp = router
+            .call(crd_req)
+            .await
+            .expect("router must not error on CRD POST");
+        assert_eq!(
+            crd_resp.status(),
+            StatusCode::CREATED,
+            "CRD create must succeed before we can test the CR's /status route"
+        );
+        let _ = to_bytes(crd_resp.into_body(), 4096).await;
+
+        let cr_body = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "snap-content-1" },
+            "spec": { "color": "blue" }
+        });
+        let mut create_req = Request::builder()
+            .method(Method::POST)
+            .uri("/apis/example.io/v1/widgets")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(cr_body.to_string()))
+            .expect("CR POST request must build");
+        create_req.extensions_mut().insert(admin);
+        let create_resp = router
+            .call(create_req)
+            .await
+            .expect("router must not error on CR POST");
+        assert_eq!(
+            create_resp.status(),
+            StatusCode::CREATED,
+            "CR create must succeed before we can PATCH its /status"
+        );
+        let _ = to_bytes(create_resp.into_body(), 4096).await;
+
+        // The csi-snapshotter sidecar's actual write shape: merge-patch PATCH to /status.
+        let status_patch = serde_json::json!({ "status": { "readyToUse": true } });
+        let patch_req = Request::builder()
+            .method(Method::PATCH)
+            .uri("/apis/example.io/v1/widgets/snap-content-1/status")
+            .header("content-type", "application/merge-patch+json")
+            .body(axum::body::Body::from(status_patch.to_string()))
+            .expect("status PATCH request must build");
+        let patch_resp = router
+            .call(patch_req)
+            .await
+            .expect("router must not error on status PATCH");
+        let patch_status = patch_resp.status();
+        let patch_body_bytes = to_bytes(patch_resp.into_body(), 4096)
+            .await
+            .expect("status PATCH body must be readable");
+        assert_eq!(
+            patch_status,
+            StatusCode::OK,
+            "PATCH .../widgets/{{name}}/status must return 200, not 404 — a cluster-scoped \
+             CRD (like VolumeSnapshotContent) has no resource_registry entry, so wiring \
+             this route to the non-CR-aware patch_resource_status 404s on every write and \
+             the controller writing status never sees it stick; got {patch_status}, body: {}",
+            String::from_utf8_lossy(&patch_body_bytes)
+        );
+        let patched: serde_json::Value =
+            serde_json::from_slice(&patch_body_bytes).expect("status PATCH response must be JSON");
+        assert_eq!(
+            patched["status"]["readyToUse"], true,
+            "status PATCH must actually persist .status.readyToUse"
+        );
+        assert_eq!(
+            patched["spec"]["color"], "blue",
+            "a /status PATCH must never alter .spec — spec/status is a subresource split"
+        );
+
+        // A subsequent GET on the main resource must see the same split: status carries
+        // the patch, spec is untouched.
+        let get_req = Request::builder()
+            .method(Method::GET)
+            .uri("/apis/example.io/v1/widgets/snap-content-1")
+            .body(axum::body::Body::empty())
+            .expect("GET request must build");
+        let get_resp = router
+            .call(get_req)
+            .await
+            .expect("router must not error on GET");
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let get_body = to_bytes(get_resp.into_body(), 4096)
+            .await
+            .expect("GET body must be readable");
+        let obj: serde_json::Value =
+            serde_json::from_slice(&get_body).expect("GET response must be JSON");
+        assert_eq!(
+            obj["status"]["readyToUse"], true,
+            "status PATCH must be durably stored, visible on a subsequent GET"
+        );
+        assert_eq!(
+            obj["spec"]["color"], "blue",
+            "spec must be untouched by the status PATCH"
+        );
     }
 
     // -----------------------------------------------------------------------

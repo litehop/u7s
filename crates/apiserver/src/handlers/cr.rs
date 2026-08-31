@@ -4164,6 +4164,112 @@ pub async fn get_cr_status<S: Store>(
     Ok(Json(obj).into_response())
 }
 
+/// PATCH /apis/{group}/{version}/{plural}/{name}/status
+///
+/// Same registry/CR fallback as `put_cr_status`, but mirrors
+/// `handlers::status::patch_resource_status`'s multi-patch-type handling (JSON Patch,
+/// merge, strategic merge, and SSA). Before this fallback existed, the route wired PATCH
+/// directly to `patch_resource_status`, whose `lookup()` 404s on anything absent from
+/// `resource_registry` — every cluster-scoped CRD (e.g. VolumeSnapshotContent) — so a
+/// CRD-backed controller's PATCH to its own `/status` subresource never landed.
+pub async fn patch_cr_status<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    use crate::handlers::json_patch::{
+        apply_json_patch, detect_patch_type, ssa_body_to_json, PatchType,
+    };
+    use crate::{keys::group_object_key, types::ResourceKey, util::parse_resource_version};
+
+    let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
+
+    // Determine the store key: registry resources use the group-object key;
+    // CRs use the /registry/cr/... key. Same fallback as put_cr_status.
+    let registry_key = ResourceKey {
+        group: group.clone(),
+        version: version.clone(),
+        plural: plural.clone(),
+    };
+    let (key, kind) = if let Some(meta) = state.resource_registry.get(&registry_key) {
+        (
+            group_object_key(&group, &plural, None, &name),
+            meta.kind.clone(),
+        )
+    } else {
+        let ctx = find_crd(&state, &group, &version, &plural).await?;
+        if ctx.namespaced {
+            return Err(Status::not_found(&name, &ctx.kind));
+        }
+        (cr_store_key(&group, &plural, None, &name), ctx.kind)
+    };
+
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &kind))?;
+
+    let mut current: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+
+    // apply-patch+yaml bodies are genuine YAML; every other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
+
+    match patch_type {
+        PatchType::Json => {
+            crate::handlers::status::validate_status_json_patch_paths(&patch)?;
+            apply_json_patch(&mut current, &patch)?;
+        }
+        _ => {
+            // Merge and strategic merge: apply status and metadata from the patch body.
+            if let Some(status_patch) = patch.get("status") {
+                let entry = current.as_object_mut().map(|m| {
+                    m.entry("status")
+                        .or_insert(serde_json::Value::Object(Default::default()))
+                });
+                if let Some(entry) = entry {
+                    match patch_type {
+                        PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
+                        PatchType::StrategicMerge => {
+                            crate::patch::strategic_merge_patch(entry, status_patch)
+                                .map_err(|e| Status::bad_request(e.to_string()))?;
+                        }
+                        PatchType::Json => unreachable!(),
+                    }
+                }
+            }
+            crate::handlers::status::merge_incoming_metadata(&mut current, &patch, &kind);
+        }
+    }
+
+    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
+    let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
+    let new_rv = state
+        .store
+        .put(&key, Bytes::from(bytes), expected_rv)
+        .await
+        .map_err(|e| store_err_cr(e, &name, &kind))?;
+    // Same ordering as put_cr_status: `current["metadata"]["resourceVersion"]` here is
+    // still the pre-put (old) rv for the merge/strategic-merge branches (protected by
+    // merge_incoming_metadata), which is what the conversion cache is keyed on.
+    evict_cr_conversion_cache(&state, current["metadata"]["resourceVersion"].as_str());
+
+    let mut current_meta: crate::types::ObjectMeta =
+        serde_json::from_value(current["metadata"].take()).unwrap_or_default();
+    current_meta.resource_version = Some(new_rv.to_string());
+    current["metadata"] = serde_json::to_value(current_meta).unwrap_or_default();
+    Ok(Json(current))
+}
+
 // ---------------------------------------------------------------------------
 // CRD scale subresource
 //
@@ -10851,6 +10957,144 @@ mod tests {
             )
             .await,
             "get_cr_status with namespaced CRD must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+    }
+
+    // ---------------------------------------------------------------------------
+    // patch_cr_status tests
+    // ---------------------------------------------------------------------------
+
+    // patch_cr_status must update .status and leave .spec untouched for a cluster-scoped
+    // CRD declaring subresources.status. Before patch_cr_status existed, the route wired
+    // PATCH directly to the non-CR-aware patch_resource_status, which 404s on any group
+    // absent from resource_registry — every CRD, including cluster-scoped ones like
+    // VolumeSnapshotContent.
+    #[tokio::test]
+    async fn patch_cr_status_merge_patch_updates_status_not_spec() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "patch-status-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body =
+            Bytes::from(serde_json::json!({ "status": { "readyToUse": true } }).to_string());
+
+        let resp = match patch_cr_status(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+            headers,
+            patch_body,
+        )
+        .await
+        {
+            Ok(r) => r.into_response(),
+            Err(e) => panic!(
+                "patch_cr_status must return 200, not 404, for a cluster-scoped CRD's \
+                 own status subresource — else a controller like csi-snapshotter can \
+                 never publish readiness: {e:?}"
+            ),
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["status"]["readyToUse"], true,
+            "patch_cr_status must persist the status field from the patch body"
+        );
+        assert_eq!(
+            obj["spec"]["color"], "blue",
+            "patch_cr_status must not alter .spec — status is a separate subresource"
+        );
+    }
+
+    // patch_cr_status for a missing cluster-scoped CR must return 404, not silently
+    // create or no-op — a controller PATCHing a deleted object's status must see the
+    // object is gone, not a false success.
+    #[tokio::test]
+    async fn patch_cr_status_missing_cluster_scoped_returns_404() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "nonexistent".to_string(),
+                )),
+                headers,
+                Bytes::from(serde_json::json!({ "status": {} }).to_string()),
+            )
+            .await,
+            "patch_cr_status on missing object must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+    }
+
+    // patch_cr_status for a namespaced CRD via the cluster-scoped path must return 404.
+    // The cluster-scoped status endpoint must not serve namespaced CRDs — mirrors
+    // get_cr_status_with_namespaced_crd_returns_404.
+    #[tokio::test]
+    async fn patch_cr_status_with_namespaced_crd_returns_404() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    "applications".to_string(),
+                    "my-app".to_string(),
+                )),
+                headers,
+                Bytes::from(serde_json::json!({ "status": {} }).to_string()),
+            )
+            .await,
+            "patch_cr_status with namespaced CRD must return 404",
         );
 
         let json = serde_json::to_value(&err.1).unwrap();
