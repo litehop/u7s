@@ -2011,6 +2011,14 @@ fn validate_pv_spec_immutable(
     old_spec: &serde_json::Value,
     new_spec: &serde_json::Value,
 ) -> Result<(), String> {
+    // Normalize null-vs-absent (and every other Go zero-value shape) first — see
+    // strip_zero_value_fields — so the volumeMode/nodeAffinity comparisons below aren't
+    // tripped by the same omitempty-shape diff that motivated stripping before the
+    // persistentVolumeSource comparison lower down: KCM's typed round-trip through
+    // `*PersistentVolumeMode`/`VolumeNodeAffinity`'s nested `omitempty` fields (e.g.
+    // `matchFields`) omits a Go zero value that u7s may have written out explicitly.
+    let old_spec = &strip_zero_value_fields(old_spec);
+    let new_spec = &strip_zero_value_fields(new_spec);
     if old_spec["volumeMode"] != new_spec["volumeMode"] {
         return Err("volumeMode: Forbidden: field is immutable".into());
     }
@@ -23553,6 +23561,134 @@ mod tests {
         );
     }
 
+    /// PUT re-submitting a StatefulSet must succeed even when the stored
+    /// `spec.selector.matchExpressions` is an explicit empty array but the incoming body omits
+    /// that key entirely.
+    ///
+    /// `validate_statefulset_spec_immutable` shares `spec_immutable_except`/
+    /// `strip_zero_value_fields` with `validate_pv_spec_immutable`/`validate_pvc_spec_immutable`
+    /// (see those validators' fixes above), but had no regression test proving that sharing
+    /// actually works for StatefulSet: a future change to the shared helper that broke this
+    /// null-vs-absent normalization would silently reject every StatefulSet PUT/PATCH from a
+    /// typed client (`LabelSelector.MatchExpressions` carries `omitempty` on a nil slice) whose
+    /// stored selector happens to carry the field explicitly.
+    #[tokio::test]
+    async fn replace_namespaced_resource_allows_statefulset_selector_match_expressions_shape_only_noop(
+    ) {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "default";
+        let mut sts = statefulset_body("shape-sts", ns, "shape-sts", "shape-svc", 1);
+        sts["spec"]["selector"]["matchExpressions"] = serde_json::json!([]);
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "statefulsets".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+        )
+        .await
+        .expect("StatefulSet create must succeed");
+
+        // Same object, but selector.matchExpressions omitted entirely — exactly the shape a
+        // typed client's LabelSelector would send back.
+        let resubmitted = statefulset_body("shape-sts", ns, "shape-sts", "shape-svc", 1);
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "statefulsets".into(),
+                "shape-sts".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&resubmitted).unwrap()),
+        )
+        .await;
+
+        result.expect(
+            "PUT re-submitting a StatefulSet whose stored spec.selector.matchExpressions is an \
+             explicit empty array, but whose incoming body omits it, must succeed — an omitted \
+             Go zero-value field and one written out explicitly must compare equal, not look \
+             like a real selector change",
+        );
+    }
+
+    /// PUT changing StatefulSet.spec.selector.matchLabels (a real change) must still return
+    /// 422 even when the update also drops the same explicit empty matchExpressions the test
+    /// above proves must be tolerated — guards against `strip_zero_value_fields`
+    /// overcorrecting into "ignore any selector diff" for StatefulSet, the same guard the PV
+    /// `csi.volumeHandle` test provides for PersistentVolume.
+    #[tokio::test]
+    async fn replace_namespaced_resource_rejects_statefulset_selector_real_change_despite_match_expressions_shape_diff(
+    ) {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "default";
+        let mut sts = statefulset_body(
+            "shape-change-sts",
+            ns,
+            "shape-change-sts",
+            "shape-change-svc",
+            1,
+        );
+        sts["spec"]["selector"]["matchExpressions"] = serde_json::json!([]);
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "statefulsets".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+        )
+        .await
+        .expect("StatefulSet create must succeed");
+
+        // Real change (different selector matchLabels) AND the same omitted-matchExpressions
+        // shape diff — the real change must still be caught.
+        let changed = statefulset_body(
+            "shape-change-sts",
+            ns,
+            "different-selector",
+            "shape-change-svc",
+            1,
+        );
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "statefulsets".into(),
+                "shape-change-sts".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing StatefulSet.spec.selector.matchLabels must return 422 even when \
+                 the update also normalizes away an explicit empty matchExpressions"
+            ),
+            Ok(_) => panic!(
+                "PUT changing StatefulSet.spec.selector must be rejected — accepting it lets \
+                 already-created Pods silently fall outside the set the StatefulSet claims"
+            ),
+        }
+    }
+
     fn pv_body(name: &str, host_path: &str, reclaim_policy: &str) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "v1",
@@ -23925,6 +24061,35 @@ mod tests {
         }
     }
 
+    /// `validate_pv_spec_immutable` must treat an explicit zero-value `volumeMode` (`""`) and
+    /// an entirely omitted one as equivalent, not a real change.
+    ///
+    /// Same omitempty-shape-diff class `strip_zero_value_fields` was introduced to close for
+    /// `spec.csi.readOnly`/`spec.persistentvolumesource` above: before routing this comparison
+    /// through that helper, `old_spec["volumeMode"] != new_spec["volumeMode"]` compared the raw
+    /// `Value::String("")` against `Value::Null` directly and would spuriously reject the
+    /// update.
+    #[test]
+    fn validate_pv_spec_immutable_treats_empty_string_volume_mode_as_absent() {
+        let old_spec = serde_json::json!({
+            "capacity": { "storage": "1Gi" },
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": { "path": "/mnt/data" },
+            "volumeMode": ""
+        });
+        let new_spec = serde_json::json!({
+            "capacity": { "storage": "1Gi" },
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": { "path": "/mnt/data" }
+        });
+        validate_pv_spec_immutable(&old_spec, &new_spec).unwrap_or_else(|e| {
+            panic!(
+                "an explicit empty-string volumeMode and an omitted volumeMode must compare \
+                 equal, not be rejected as a change to an immutable field: {e}"
+            )
+        });
+    }
+
     /// PATCH changing only PersistentVolume.spec.persistentVolumeReclaimPolicy (a mutable
     /// field) must still succeed — a naive "reject any spec change" implementation would
     /// wrongly reject this.
@@ -24292,6 +24457,128 @@ mod tests {
              succeed — the immutability check must compare values, not merely whether the \
              field is set",
         );
+    }
+
+    /// PUT that only appends `metadata.finalizers` to a PersistentVolume must succeed even
+    /// when `spec.nodeAffinity`'s nested `matchFields` is stored as an explicit empty array
+    /// but the incoming body omits it entirely.
+    ///
+    /// Same omitempty-shape-diff class as the CSI `readOnly`/secret-ref fixes above, one level
+    /// deeper: upstream's `NodeSelectorTerm.MatchFields` (`json:"matchFields,omitempty"`) is a
+    /// nil slice on a topology-aware PV that only ever populates `matchExpressions` — the
+    /// shape a dynamically-provisioned, topology-aware CSI PV carries. Before routing this
+    /// comparison through `strip_zero_value_fields`, that shape alone tripped
+    /// `spec.nodeAffinity is immutable once set` on kube-controller-manager's pv-protection
+    /// finalizer-only `Update()`.
+    #[tokio::test]
+    async fn replace_resource_allows_pv_finalizer_only_update_with_empty_node_affinity_match_fields(
+    ) {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let mut pv = pv_body("topology-pv", "/mnt/topology-data", "Retain");
+        let mut affinity = pv_node_affinity("node1");
+        affinity["required"]["nodeSelectorTerms"][0]["matchFields"] = serde_json::json!([]);
+        pv["spec"]["nodeAffinity"] = affinity;
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let mut finalized = pv_body("topology-pv", "/mnt/topology-data", "Retain");
+        finalized["metadata"]["finalizers"] = serde_json::json!(["kubernetes.io/pv-protection"]);
+        // matchFields omitted entirely, exactly as client-go's typed NodeSelectorTerm
+        // (omitempty on a nil slice) would send it.
+        finalized["spec"]["nodeAffinity"] = pv_node_affinity("node1");
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "topology-pv".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&finalized).unwrap()),
+        )
+        .await;
+
+        result.unwrap_or_else(|e| {
+            panic!(
+                "PUT adding only metadata.finalizers to a topology-aware PersistentVolume must \
+                 succeed — a null-vs-absent difference on nodeAffinity's nested matchFields \
+                 must never look like a real nodeAffinity change: {e:?}"
+            )
+        });
+    }
+
+    /// PUT changing PersistentVolume.spec.nodeAffinity's actual node selector (a real change)
+    /// must still return 422, even when the update also drops the same empty matchFields the
+    /// test above proves must be tolerated.
+    ///
+    /// Guards against `strip_zero_value_fields` overcorrecting into "ignore any nodeAffinity
+    /// diff": nodeAffinity is the scheduler's and kubelet's only record of which nodes a bound
+    /// PV is reachable from, so silently accepting a change here would desync an
+    /// already-scheduled Pod from the constraint it was placed for.
+    #[tokio::test]
+    async fn replace_resource_rejects_pv_nodeaffinity_change_despite_empty_match_fields_shape() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let mut pv = pv_body("topology-repoint-pv", "/mnt/topology-repoint", "Retain");
+        let mut affinity = pv_node_affinity("node1");
+        affinity["required"]["nodeSelectorTerms"][0]["matchFields"] = serde_json::json!([]);
+        pv["spec"]["nodeAffinity"] = affinity;
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        // Real change (different target node) AND the same omitted-matchFields shape diff —
+        // the real change must still be caught.
+        let mut repointed = pv_body("topology-repoint-pv", "/mnt/topology-repoint", "Retain");
+        repointed["spec"]["nodeAffinity"] = pv_node_affinity("node2");
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "topology-repoint-pv".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&repointed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing PersistentVolume.spec.nodeAffinity must return 422 even when the \
+                 update also normalizes away an explicit empty matchFields"
+            ),
+            Ok(_) => panic!(
+                "PUT changing PersistentVolume.spec.nodeAffinity once set must be rejected — \
+                 accepting it silently retargets which nodes a bound PV is reachable from"
+            ),
+        }
     }
 
     fn storageclass_body(name: &str, provisioner: &str) -> serde_json::Value {
