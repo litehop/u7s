@@ -1871,6 +1871,32 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     });
     put!(key, body, "system:volume-scheduler", "ClusterRole");
 
+    // ClusterRoleBinding: system:volume-scheduler → user system:kube-scheduler.
+    // Upstream binds this role to the scheduler identity IN ADDITION TO
+    // system:kube-scheduler's own (read-only-on-PVCs) role above — without
+    // it, the scheduler's PATCH of volume.kubernetes.io/selected-node onto an
+    // unbound WaitForFirstConsumer PVC (see u7s-scheduler's
+    // stamp_selected_node_for_pvcs) 403s, external-provisioner never learns
+    // which node to provision for, and the PVC — and any pod waiting on it,
+    // including every generic-ephemeral inline volume — stays Pending
+    // forever. Live-confirmed via scheduler.log: "PATCH .../persistentvolumeclaims/...
+    // returned 403 Forbidden: ... system:kube-scheduler is not allowed to
+    // patch persistentvolumeclaims" before this fix.
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterrolebindings",
+        None,
+        "system:volume-scheduler",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:volume-scheduler", "uid": "00000000-0000-0000-0000-00000000006a", "creationTimestamp": TS },
+        "subjects": [{ "kind": "User", "apiGroup": "rbac.authorization.k8s.io", "name": "system:kube-scheduler" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:volume-scheduler" }
+    });
+    put!(key, body, "system:volume-scheduler", "ClusterRoleBinding");
+
     // -----------------------------------------------------------------------
     // ClusterRole: system:node-bootstrapper — TLS bootstrap for kubelets.
     // -----------------------------------------------------------------------
@@ -6949,6 +6975,51 @@ mod tests {
              identity were granted cluster-admin-equivalent access, the dedicated x509 \
              identity would give no least-privilege benefit over the shared admin kubeconfig \
              it replaces"
+        );
+    }
+
+    /// Regression test: system:kube-scheduler must be able to PATCH persistentvolumeclaims,
+    /// via the (separately bound) system:volume-scheduler ClusterRole — matching upstream,
+    /// which binds BOTH system:kube-scheduler (read-only on PVCs) and system:volume-scheduler
+    /// (read/write) to the same scheduler identity. Without this second binding, the
+    /// scheduler's PATCH of volume.kubernetes.io/selected-node onto an unbound
+    /// WaitForFirstConsumer PVC (stamp_selected_node_for_pvcs) 403s: external-provisioner
+    /// never learns which node to provision for, so the PVC — and any pod waiting on it,
+    /// including every generic-ephemeral inline volume — stays Pending forever. Live-confirmed
+    /// via scheduler.log's 403 before this fix (system:volume-scheduler ClusterRole existed
+    /// but had no ClusterRoleBinding).
+    #[tokio::test]
+    async fn scheduler_identity_can_patch_persistentvolumeclaims_for_selected_node_stamping() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+
+        let patch_pvc = rbac::AuthzRequest {
+            username: "system:kube-scheduler",
+            groups: &groups,
+            verb: "patch",
+            api_group: "",
+            resource: "persistentvolumeclaims",
+            subresource: "",
+            namespace: Some("default"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&patch_pvc),
+            "system:kube-scheduler must be allowed to PATCH persistentvolumeclaims — without \
+             this, stamping volume.kubernetes.io/selected-node on an unbound \
+             WaitForFirstConsumer PVC 403s and the PVC (and any pod waiting on it) never binds"
         );
     }
 
