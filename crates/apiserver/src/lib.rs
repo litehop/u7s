@@ -1419,8 +1419,10 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // grace period elapses, to complete pod-termination reconciliation. Without this,
             // terminated pods stay in `Terminating` forever until force-deleted by a client
             // with higher privileges than the node's own identity (upstream kubelet's
-            // pkg/kubelet/status/status_manager.go:1219).
-            { "apiGroups": [""], "resources": ["pods"],         "verbs": ["get","list","watch","delete"] },
+            // pkg/kubelet/status/status_manager.go:1219). `create` is needed for kubelet to
+            // register mirror pods for static pods under its own identity. Matches upstream
+            // bootstrappolicy.go's NodeRules() `create,delete` rule on pods exactly.
+            { "apiGroups": [""], "resources": ["pods"],         "verbs": ["get","list","watch","create","delete"] },
             { "apiGroups": [""], "resources": ["pods/status"],  "verbs": ["get","update","patch"] },
             { "apiGroups": [""], "resources": ["pods/log"],     "verbs": ["get"] },
             { "apiGroups": [""], "resources": ["events"],       "verbs": ["create","patch","update"] },
@@ -4886,6 +4888,56 @@ mod tests {
             "system:node must be able to delete pods so kubelet can complete \
              pod-termination reconciliation (pkg/kubelet/status/status_manager.go:1219); \
              missing this rule leaves terminated pods stuck in Terminating forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_to_create_mirror_pods() {
+        // Regression test: kubelet needs `create` on pods to register mirror pods for
+        // static pods (manifest-defined pods on the node) under its own node identity.
+        // Without this rule, static-pod mirror registration is denied. Matches upstream
+        // bootstrappolicy.go's NodeRules(), which grants `create,delete` on pods together.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        // Find a rule granting `verb` on `resource` in `api_group`.
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule("", "pods", "create"),
+            "system:node must be able to create pods so kubelet can register mirror pods \
+             for static pods under its own identity; missing this rule breaks static-pod \
+             mirror registration (upstream NodeRules() grants create+delete on pods together)"
+        );
+        assert!(
+            has_rule("", "pods", "delete"),
+            "system:node must still retain delete on pods alongside create (upstream's \
+             single create+delete rule); a regression here would re-wedge terminated pods \
+             in Terminating forever"
         );
     }
 
