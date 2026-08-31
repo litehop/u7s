@@ -902,7 +902,7 @@ fn validate_cel_rules(
         .and_then(|v| v.as_array())
     {
         for rule in rules {
-            evaluate_cel_rule(rule, obj, old_node, field_path, programs)?;
+            evaluate_cel_rule(rule, schema, obj, old_node, field_path, programs)?;
         }
     }
 
@@ -999,6 +999,145 @@ fn schema_branch_structurally_matches(branch: &serde_json::Value, obj: &serde_js
         }
     }
     true
+}
+
+/// CEL lexer reserved words (google/cel-spec langdef.md `RESERVED`) that a structural
+/// schema field name collides with most often — `namespace` above all, since it's a
+/// property on nearly every Kubernetes object. Mirrors
+/// `k8s.io/apiserver/pkg/cel.celReservedSymbols` exactly.
+const CEL_RESERVED_WORDS: &[&str] = &[
+    "true",
+    "false",
+    "null",
+    "in",
+    "as",
+    "break",
+    "const",
+    "continue",
+    "else",
+    "for",
+    "function",
+    "if",
+    "import",
+    "let",
+    "loop",
+    "package",
+    "namespace",
+    "return",
+    "var",
+    "void",
+    "while",
+];
+
+/// Escapes `ident` into a valid CEL identifier (`[a-zA-Z_][a-zA-Z0-9_]*`), matching
+/// Kubernetes' structural-schema field escaping exactly
+/// (https://kubernetes.io/docs/reference/using-api/cel/#escaping,
+/// `k8s.io/apiserver/pkg/cel.Escape`): a name that is itself a CEL reserved word (e.g.
+/// `namespace`) becomes `__namespace__`; `.`, `-`, `/`, and a literal `__` become
+/// `__dot__`, `__dash__`, `__slash__`, `__underscores__` respectively (in that priority
+/// order — a run of exactly two underscores is one `__underscores__` substitution, not
+/// two single-underscore ones). Returns `None` if `ident` cannot be represented as a CEL
+/// identifier at all (empty, leading digit, or a character outside
+/// `[a-zA-Z0-9_.\-/]`) — such a field is simply unreachable from any CEL rule, matching
+/// upstream's `common.SchemaDeclType`, which silently omits it from the generated CEL
+/// struct type rather than exposing it under some fallback name.
+fn cel_escape_ident(ident: &str) -> Option<String> {
+    if ident.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    if CEL_RESERVED_WORDS.contains(&ident) {
+        return Some(format!("__{ident}__"));
+    }
+
+    let chars: Vec<char> = ident.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(ident.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '_' && chars.get(i + 1) == Some(&'_') {
+            out.push_str("__underscores__");
+            i += 2;
+            continue;
+        }
+        match c {
+            '.' => out.push_str("__dot__"),
+            '-' => out.push_str("__dash__"),
+            '/' => out.push_str("__slash__"),
+            c if c.is_ascii_alphanumeric() || c == '_' => out.push(c),
+            _ => return None,
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Recursively renames `value`'s object keys that `schema` declares under a structural
+/// `properties` map to their CEL-escaped form (`cel_escape_ident`), so binding `value`
+/// as a CEL `self`/`oldSelf` variable lets a rule reach a reserved-word or special-char
+/// field the way its author wrote it — e.g. upstream external-snapshotter's
+/// VolumeSnapshotContent CRD ships `rule: has(self.name) && has(self.__namespace__)` on
+/// a field literally named `namespace`. Without this, `self.__namespace__` can never
+/// resolve (the bound object only ever has a `namespace` key), so `has()` is always
+/// false and the rule spuriously rejects every write, however the CR is populated.
+///
+/// A key under an `additionalProperties` map schema is left untouched: Kubernetes only
+/// escapes/unescapes property names declared in a structural schema's `properties`,
+/// never arbitrary map keys (`k8s.io/apiserver/pkg/cel/common.unstructuredMap.Find` only
+/// unescapes when `schema.Properties() != nil`) — a map key literally named `namespace`
+/// is reachable only via index syntax (`self.m['namespace']`), which needs no escaping
+/// since it's a string literal, not an identifier.
+fn cel_escape_self_keys(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        let Some(map) = value.as_object() else {
+            return value.clone();
+        };
+        let mut out = serde_json::Map::with_capacity(map.len());
+        for (key, v) in map {
+            match props.get(key) {
+                Some(sub_schema) => {
+                    if let Some(escaped) = cel_escape_ident(key) {
+                        out.insert(escaped, cel_escape_self_keys(sub_schema, v));
+                    }
+                    // else: unescapable field name — omit, matching upstream (see doc
+                    // comment above): such a field is never declared in the CEL type.
+                }
+                // Not a declared property (e.g. data kept only via
+                // x-kubernetes-preserve-unknown-fields) — untyped, so not reachable
+                // from a CEL rule either way; keep it verbatim rather than drop data.
+                None => {
+                    out.insert(key.clone(), v.clone());
+                }
+            }
+        }
+        return serde_json::Value::Object(out);
+    }
+    if let Some(items_schema) = schema.get("items") {
+        return match value.as_array() {
+            Some(arr) => serde_json::Value::Array(
+                arr.iter()
+                    .map(|item| cel_escape_self_keys(items_schema, item))
+                    .collect(),
+            ),
+            None => value.clone(),
+        };
+    }
+    if let Some(ap_schema) = schema.get("additionalProperties").filter(|v| v.is_object()) {
+        return match value.as_object() {
+            Some(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), cel_escape_self_keys(ap_schema, v)))
+                    .collect(),
+            ),
+            None => value.clone(),
+        };
+    }
+    value.clone()
 }
 
 /// Wall-clock budget for evaluating a single CEL rule or `messageExpression`. Upstream
@@ -1122,9 +1261,13 @@ fn execute_cel_with_budget(
 /// Evaluate a single `x-kubernetes-validations` entry (`{rule, message,
 /// messageExpression, reason, fieldPath, optionalOldSelf}`, per the CRD-storage
 /// round-trip in `apiextensions_gen_adapter.rs`) against `self_value`, optionally
-/// binding `oldSelf` to `old_self_value`.
+/// binding `oldSelf` to `old_self_value`. `schema` is the schema node `self_value` was
+/// validated against (i.e. `self`'s own type) — used to escape reserved-word/special-char
+/// property names (`cel_escape_self_keys`) before binding, so a rule can reach a field
+/// like `namespace` as `self.__namespace__`, matching how the CRD author wrote it.
 fn evaluate_cel_rule(
     rule: &serde_json::Value,
+    schema: &serde_json::Value,
     self_value: &serde_json::Value,
     old_self_value: Option<&serde_json::Value>,
     field_path: &str,
@@ -1140,12 +1283,15 @@ fn evaluate_cel_rule(
         ))
     })?;
 
+    let escaped_self = cel_escape_self_keys(schema, self_value);
+    let escaped_old_self = old_self_value.map(|v| cel_escape_self_keys(schema, v));
+
     let mut cel_ctx = cel::Context::default();
     register_cel_string_extensions(&mut cel_ctx);
     cel_ctx
-        .add_variable("self", self_value)
+        .add_variable("self", &escaped_self)
         .map_err(|e| Status::internal(format!("CEL: failed to bind self: {e}")))?;
-    if let Some(old) = old_self_value {
+    if let Some(old) = &escaped_old_self {
         cel_ctx
             .add_variable("oldSelf", old)
             .map_err(|e| Status::internal(format!("CEL: failed to bind oldSelf: {e}")))?;
@@ -1203,7 +1349,13 @@ fn evaluate_cel_rule(
         return Ok(());
     }
 
-    let detail = cel_rule_failure_detail(rule, rule_text, self_value, old_self_value, programs);
+    let detail = cel_rule_failure_detail(
+        rule,
+        rule_text,
+        &escaped_self,
+        escaped_old_self.as_ref(),
+        programs,
+    );
     let value_prefix = match self_value {
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => String::new(),
         other => format!("\"{}\": ", json_value_as_display_string(other)),
@@ -8458,6 +8610,89 @@ mod tests {
         assert!(
             err.1.message.contains("protocol must be HTTP or HTTPS"),
             "a protocol outside the allowed list must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // x-kubernetes-validations reserved-word / special-char field escaping
+    // (https://kubernetes.io/docs/reference/using-api/cel/#escaping)
+    //
+    // `namespace` is a CEL lexer reserved word, so a rule can only reach a field
+    // literally named `namespace` by spelling it `self.__namespace__`. Upstream
+    // external-snapshotter's VolumeSnapshotContent CRD ships exactly this
+    // (`has(self.name) && has(self.__namespace__)` on `spec.volumeSnapshotRef`) —
+    // without escaping-aware binding, `__namespace__` never resolves to the object's
+    // real `namespace` field, so the rule is always false and every VolumeSnapshotContent
+    // create is spuriously rejected regardless of whether namespace is actually set.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn cel_rule_referencing_reserved_word_field_sees_the_real_value() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "volumeSnapshotRef": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "namespace": { "type": "string" }
+                    },
+                    "x-kubernetes-validations": [{
+                        "rule": "has(self.name) && has(self.__namespace__)",
+                        "message": "both name and namespace must be set"
+                    }]
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({
+                    "volumeSnapshotRef": { "name": "snap-1", "namespace": "default" }
+                }),
+                schema.clone(),
+            )
+            .is_ok(),
+            "a reserved-word field (namespace) that IS set must not be spuriously \
+             rejected — this is the VolumeSnapshotContent bug: without escaping-aware \
+             binding this write was rejected even with namespace set"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "volumeSnapshotRef": { "name": "snap-1" } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("both name and namespace must be set"),
+            "an unset reserved-word field must still fail the rule — escaping must not \
+             make the rule vacuously true (got: {})",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn cel_rule_referencing_dash_field_sees_the_real_value() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "foo-bar": { "type": "string" }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "has(self.foo__dash__bar)",
+                "message": "foo-bar must be set"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "foo-bar": "x" }), schema.clone()).is_ok(),
+            "a dash-containing field name that IS set must not be spuriously rejected \
+             (self.foo__dash__bar must resolve to the real 'foo-bar' field)"
+        );
+        let err = check_schema(&serde_json::json!({}), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("foo-bar must be set"),
+            "an unset dash-containing field must still fail the rule (got: {})",
             err.1.message
         );
     }
