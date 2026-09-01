@@ -3,7 +3,7 @@ name: roadmap
 description: u7s roadmap — current state and priorities via a per-component decision matrix and horizontal gates. Not a phase list. Durable north star, decision framework, and guiding principles live in north-star.md; this file changes often and links back rather than restating them.
 metadata:
   type: project
-as_of: 2026-08-21
+as_of: 2026-09-01
 kind: roadmap
 ---
 
@@ -38,7 +38,8 @@ Decision legend: **KEEP** (decision made, no revisit expected) · **MEASURED**
 | **KCM (kube-controller-manager)** | UPSTREAM | Yes | MEASURED | Runs with `--controllers='*,-cloud-*'`. Confirmed the **second-largest** component in the stack by a wide margin. |
 | **Kubelet** | UPSTREAM | Yes | MEASURED | Runs on every node. Confirmed the **single largest** component by a wide margin — more than double KCM. "Gargantuan" (scope, complexity, footprint) is a real, multi-dimensional description, not a disqualifier: necessity is obvious (skipped), cost is measured, an upstream config-tuning audit is next, native rewrite is only considered after that. Packaging shape (Gate 6) may also factor in eventually. |
 | **CRI-O + crun** | UPSTREAM | Yes | KEEP | Container runtime. No plan to rewrite; measurement was for completeness only. |
-| **kube-proxy** | UPSTREAM | Yes | MEASURED | Low-level networking; native rewrite is high-effort. No presumption either way — same necessity-then-cost-then-tuning-then-rewrite evaluation as everything else, data-first. |
+| **kube-proxy** | UPSTREAM | Yes | MEASURED | East-west/`ClusterIP`/`NodePort` only now — north-south `LoadBalancer` traffic split off to the eBPF ServiceLB dataplane (next row). Native rewrite of the remaining scope is still open, data-first. |
+| **ServiceLB (eBPF dataplane)** | NATIVE | Yes | KEEP | Purpose-built per-node eBPF (tc-bpf, `aya`) LB for north-south `type=LoadBalancer` traffic: consistent-hash to a backend, Geneve-encapsulate to whichever node holds it, symmetric return. Chosen over klipper-lb-alike (lost client IP cross-node) and every off-the-shelf eBPF LB surveyed — see the ADRs for why. `docs/decisions/servicelb-ebpf-geneve-dataplane.md`, `docs/decisions/servicelb-symmetric-geneve-return.md`, `docs/decisions/ebpf-toolchain-aya.md`. |
 | **konnectivity-server** | HYBRID | Yes | KEEP-as-dev-tool, skipped in production | Bridges apiserver (host) → kubelet (VM subnet) across Lima's NAT boundary — a dev-topology artifact, not a runtime requirement. Same-network production deployments (k3s-style packaging target) dial `kubelet:10250` directly; no tunnel needed. |
 | **CoreDNS** | UPSTREAM | Yes | KEEP | In-cluster DNS. No plan to rewrite. |
 | **metrics-server** | UPSTREAM | Yes | KEEP | Standard component; no rewrite plan. |
@@ -68,6 +69,13 @@ un-defer trigger.
   overwhelmingly a multi-node concern (since fixed —
   `node_taints_tolerated`/`toleration_matches_taint` in `crates/scheduler`).
   This is exactly what Gate 5 below exists to keep catching.
+- **A second, sharper instance of the same caveat:** conformance exercises
+  none of the security surface. A red-team audit's 4 Phase-1 deep-dives
+  (AuthN, AuthZ/RBAC, admission/CEL, proxy/exec/portforward) found 1
+  CRITICAL + 7 HIGH + 4 MED + 3 LOW findings — RBAC escalation checks, an
+  AuthN empty-token bypass, admission CEL-recursion/dry-run, and portforward
+  request-splitting — none of which a green conformance run surfaces. Fix
+  wave in progress.
 - Any test regression triggers immediate correctness work (higher priority
   than perf work) — see north-star.md's correctness-first principle.
 
@@ -96,6 +104,12 @@ un-defer trigger.
   `present_any` helper pair, opportunistic adoption).
 - Observability EPIC: structured access log + `/metrics` + ring gauges,
   extended into automated run-time sampling.
+- InflightLayer bounded-wait backpressure (`crates/apiserver/src/inflight.rs`):
+  root-caused a csi-hostpath crasher to an instant-429-vs-queue gap under
+  bulk-mutating bursts (upstream APF queues; u7s instant-rejects). Fix in
+  progress (`mayor-4q3m2`): a tokio bounded-wait timeout instead of the
+  instant reject — a deliberate minimal APF subset. Scope-creep guardrail:
+  bd memory `u7s-inflight-backpressure-is-deliberate-minimal-apf-subset`.
 
 ### Gate 4 — Perf (ACTIVE since 2026-07-24)
 Method: audit → file bead → measured before/after → land. No perf PR without
@@ -182,14 +196,12 @@ found during MVP verification and fixed same-session, `mayor-h0cyv`/PR
 #1343: kubelet's serving cert now signed by the cluster CA, with the
 matching client-CA trust wired in).
 
-**Scoping decision added this session:** the install script's own logic
-(CRI-O setup, systemd units, manifest bootstrap, defaulting behavior — i.e.
-what it *does* once it has a release tarball) is deliberately decoupled from
-how that tarball gets *built and hosted* (still open, see the distribution-
-hosting item above). For this MVP, the install script takes a locally
-pre-built tarball as a path/file argument rather than fetching one from a
-URL — this lets the install logic be fully tested end-to-end without the
-hosting question blocking anything.
+**Scoping decision:** the install script's own logic (CRI-O setup, systemd
+units, manifest bootstrap, defaulting) is decoupled from how the tarball is
+*built and hosted* (still open, see distribution-hosting above). This MVP
+takes a locally pre-built tarball as a path argument rather than fetching
+one, so the install logic is fully tested end-to-end without the hosting
+question blocking anything.
 
 The remaining open items above (tarball build/shape, distribution hosting,
 multi-node CA-trust/rotation) are not yet beads — they fire when correctness + perf
@@ -253,16 +265,7 @@ Closed since last revision: `mayor-axi12` (superseded 2026-08-13 by `mayor-c6rml
 | `mayor-rvkq` | P3 | CRD CEL validation (`x-kubernetes-validations`). A CEL evaluator already exists for `ValidatingAdmissionPolicy` — this would wire it into CR schema validation, not build one from scratch. Trigger: real workload uses CEL in a CRD schema |
 | `mayor-9xsn3` | P3 | DRA v1alpha3 registration. Deferred to 1.37 upstream bump (schema growing there) |
 
-Closed since last revision: `mayor-jtlnx` (CLOSED 2026-08-14, no-fix-warranted) —
-verified against two fresh full-conformance runs that `mayor-9sd51`/PR #1134's fix
-eliminates 100% of the original fatal `deleteCollection` signature. A different,
-non-fatal error still surfaces ~once per 446-spec run via `deleteAllContent`'s
-unscoped `listCollection` sweep, but it self-heals via KCM's own retry in
-single-digit milliseconds and does not block conformance. Extending verb-scoping
-to that LIST path was investigated and explicitly rejected: it risks reintroducing
-the informer-relist-hangs-forever bug `mayor-9sd51` fixed, since there's no safe
-way to distinguish a namespace-deleter sweep LIST from an informer relist LIST at
-the handler level. No PR opened; see bead close reason for full evidence.
+Closed since last revision: `mayor-jtlnx` (CLOSED 2026-08-14, no-fix-warranted — self-heals via KCM retry, zero conformance impact; see bead close reason for full evidence).
 
 ---
 
@@ -277,21 +280,8 @@ the handler level. No PR opened; see bead close reason for full evidence.
 | CRD validation | boon crate (full openAPIV3Schema) | `docs/decisions/boon-for-crd-schema-validation.md` |
 | Networking | WebSocket-only exec/attach/portforward (no SPDY) | operator confirmed 2026-05-28; k8s 1.34+ dropped SPDY |
 | TLS | aws-lc-rs (P-256 ECDSA) — known arm64/Lima compat issue; workaround: use CI | memory: `local-lima-arm64-environment` |
+| Service LoadBalancer | Per-node eBPF (aya) + Geneve dataplane | `docs/decisions/servicelb-ebpf-geneve-dataplane.md` |
 
 (`project-context.md`'s "Design decisions" section previously duplicated
 this table; `mayor-sks59` resolved that 2026-08-13 — it now links here
 instead of restating the list.)
-
----
-
-## What this roadmap is not
-
-- Not a timeline. Timelines assume predictable engineering-effort estimates on a
-  novel codebase; we don't have those. Every gate has a fireable trigger; that's
-  what schedules the next work.
-- Not a phase list. Component decisions are per-component, not per-phase. The
-  matrix above is the primary structure; gates are horizontal cuts, not linear
-  phases.
-- Not an aspiration doc. Every row cites either a shipped decision, a filed
-  bead, or a pointer to where the current data lives. Aspiration lives in
-  north-star.md; everything below it is tracked work.
