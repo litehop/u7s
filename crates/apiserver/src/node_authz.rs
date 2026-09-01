@@ -35,9 +35,12 @@
 //! `resourceslices` individually. u7s doesn't model PV objects at that granularity; those
 //! resources fall through to the same static, un-scoped rule match every other unsubdivided
 //! `system:node` permission gets (see the `_ =>` arm of `authorize`) — identical to today's
-//! behavior, not a regression. Mirror-pod create/delete and the SelfSubjectAccessReview
-//! (`handlers/authorization.rs`) endpoint are not wired to this authorizer; see the PR
-//! description for the follow-on.
+//! behavior, not a regression. Mirror-pod create is authorized by the separate
+//! `authorize_pod_create` (it needs the request body, unavailable where `authorize()` runs);
+//! it isn't yet called from the pod-create handler, so the `system:node` ClusterRole's
+//! `create` grant on pods stays inert until that wiring lands. The SelfSubjectAccessReview/
+//! SubjectAccessReview/LocalSubjectAccessReview endpoints (`handlers/authorization.rs`) DO
+//! consult this authorizer, via the `authorized()` helper defined there.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
@@ -48,6 +51,7 @@ const NODE_USERNAME_PREFIX: &str = "system:node:";
 const NODES_GROUP: &str = "system:nodes";
 const NODE_LEASE_NAMESPACE: &str = "kube-node-lease";
 const NODE_CLUSTER_ROLE: &str = "system:node";
+const MIRROR_POD_ANNOTATION: &str = "kubernetes.io/config.mirror";
 
 /// Reference edges extracted from a single pod's (immutable, post-creation) spec.
 #[derive(Debug, Default, Clone)]
@@ -244,7 +248,7 @@ fn extract_pod_edges(body: &serde_json::Value) -> PodEdges {
 /// must actually carry the `system:nodes` group — a CN alone (without the matching
 /// Organization) is not enough, since x509 CN is client-chosen but O is what the issuing CA
 /// controls.
-fn node_identity<'a>(username: &'a str, groups: &[String]) -> Option<&'a str> {
+pub(crate) fn node_identity<'a>(username: &'a str, groups: &[String]) -> Option<&'a str> {
     let name = username.strip_prefix(NODE_USERNAME_PREFIX)?;
     if name.is_empty() || !groups.iter().any(|g| g == NODES_GROUP) {
         return None;
@@ -360,12 +364,46 @@ fn authorize_pod(
             "list" | "watch" => {
                 field_selector_selects_node(raw_query, node_name) || req.name.is_some_and(owns)
             }
+            // Deliberately denied, not an oversight: telling a mirror pod (bound to this
+            // node) apart from any other pod needs the request body (the
+            // `kubernetes.io/config.mirror` annotation and `spec.nodeName`), which isn't
+            // available here — `authorize()` runs in `AuthService::call` before the body is
+            // read (see module doc). See `authorize_pod_create`, called directly by the
+            // create handler once the body is parsed.
+            "create" => false,
             _ => false,
         },
         "status" => matches!(req.verb, "get" | "update" | "patch") && req.name.is_some_and(owns),
         "log" => req.verb == "get" && req.name.is_some_and(owns),
         _ => false,
     }
+}
+
+/// Authorizes a pod CREATE for a `system:node:<name>` identity, mirroring upstream's
+/// NodeRestriction admission-plugin semantics (`plugin/pkg/admission/noderestriction`): only
+/// a mirror pod (carries the `kubernetes.io/config.mirror` annotation) bound to the
+/// requesting node's own `spec.nodeName` may be created this way — kubelet's mechanism for
+/// registering one of its own locally-run static pods. Anything else (a non-mirror pod, or a
+/// mirror pod claiming a different node) is denied.
+///
+/// Not reachable from `authorize()`/`authorize_pod` above — see the `"create" => false` arm's
+/// comment for why the pod body can't reach that layer. Call this directly wherever the
+/// create request's body has already been parsed (e.g. the pod-create handler); not wired up
+/// yet (`handlers/pods.rs` is a separate, concurrently-owned change), hence `dead_code`
+/// outside test builds.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn authorize_pod_create(
+    username: &str,
+    groups: &[String],
+    pod_body: &serde_json::Value,
+) -> bool {
+    let Some(node_name) = node_identity(username, groups) else {
+        return false;
+    };
+    let is_mirror_pod = pod_body["metadata"]["annotations"]
+        .get(MIRROR_POD_ANNOTATION)
+        .is_some();
+    is_mirror_pod && pod_body["spec"]["nodeName"].as_str() == Some(node_name)
 }
 
 /// Node authorization entry point. Returns `true` only for a genuine `system:node:<name>`
@@ -684,6 +722,52 @@ mod tests {
             authorize(&req, None, &graph, &idx),
             "node-a must still be able to patch pod-a's own status — this is the routine \
              kubelet status-report path every running pod depends on"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // authorize_pod_create: kubelet's mirror-pod registration path. A body-blind pass here
+    // would let a compromised kubelet directly schedule arbitrary pods (bypassing the
+    // scheduler) or forge another node's static-pod mirror — these tests fail if either gap
+    // reopens.
+    // -----------------------------------------------------------------------
+
+    fn mirror_pod_body(node_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": { "annotations": { "kubernetes.io/config.mirror": "abc123" } },
+            "spec": { "nodeName": node_name },
+        })
+    }
+
+    #[test]
+    fn node_can_create_a_mirror_pod_bound_to_itself() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        assert!(
+            authorize_pod_create("system:node:node-a", &groups, &mirror_pod_body("node-a")),
+            "a kubelet registering its own static pod as a mirror pod must be allowed to \
+             create it — denying this breaks static pod support entirely"
+        );
+    }
+
+    #[test]
+    fn node_cannot_create_a_non_mirror_pod() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        let body = serde_json::json!({"spec": {"nodeName": "node-a"}});
+        assert!(
+            !authorize_pod_create("system:node:node-a", &groups, &body),
+            "a node must NOT be able to create an ordinary (non-mirror) pod — that would let \
+             a compromised kubelet directly schedule arbitrary pods onto itself, bypassing \
+             the scheduler entirely"
+        );
+    }
+
+    #[test]
+    fn node_cannot_create_a_mirror_pod_bound_to_a_different_node() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        assert!(
+            !authorize_pod_create("system:node:node-a", &groups, &mirror_pod_body("node-b")),
+            "node-a must NOT be able to register a mirror pod claiming node-b — that would \
+             let one compromised kubelet forge another node's static-pod mirror"
         );
     }
 
