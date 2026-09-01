@@ -104,12 +104,12 @@ un-defer trigger.
   `present_any` helper pair, opportunistic adoption).
 - Observability EPIC: structured access log + `/metrics` + ring gauges,
   extended into automated run-time sampling.
-- InflightLayer bounded-wait backpressure (`crates/apiserver/src/inflight.rs`,
-  `mayor-4q3m2`): root-caused a csi-hostpath crasher to an instant-429-vs-queue
-  gap under bulk-mutating bursts (upstream APF queues; u7s instant-rejected).
-  Fix: a tokio bounded-wait timeout instead of the instant reject — a
-  deliberate minimal APF subset. Scope-creep guardrail: bd memory
-  `u7s-inflight-backpressure-is-deliberate-minimal-apf-subset`.
+- InflightLayer bounded-wait backpressure (`crates/apiserver/src/inflight.rs`):
+  root-caused a csi-hostpath crasher to an instant-429-vs-queue gap under
+  bulk-mutating bursts (upstream APF queues; u7s instant-rejects). Fix in
+  progress (`mayor-4q3m2`): a tokio bounded-wait timeout instead of the
+  instant reject — a deliberate minimal APF subset. Scope-creep guardrail:
+  bd memory `u7s-inflight-backpressure-is-deliberate-minimal-apf-subset`.
 
 ### Gate 4 — Perf (ACTIVE since 2026-07-24)
 Method: audit → file bead → measured before/after → land. No perf PR without
