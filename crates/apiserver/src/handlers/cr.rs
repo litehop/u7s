@@ -2442,10 +2442,19 @@ pub async fn replace_cr<S: Store>(
     resolve_cr_metadata(&existing, &mut obj, &name, &ctx.kind)?;
 
     // When the CRD declares a status subresource, the main PUT endpoint must not
-    // update .status — clients must use PUT /status for that.
+    // update .status — clients must use PUT /status for that. Restore whatever is
+    // already stored rather than dropping it: a controller (e.g. csi-snapshotter)
+    // that PUTs a spec-only change to VolumeSnapshotContent reads .status back off
+    // the same response to extract snapshotHandle — wiping status here made that
+    // read nil on every main-resource PUT after the first /status write.
     if ctx.has_status_subresource {
-        if let Some(map) = obj.as_object_mut() {
-            map.remove("status");
+        let stored_status = existing["status"].clone();
+        if stored_status.is_null() {
+            if let Some(map) = obj.as_object_mut() {
+                map.remove("status");
+            }
+        } else {
+            obj["status"] = stored_status;
         }
     }
 
@@ -3305,10 +3314,19 @@ pub async fn replace_cr_namespaced<S: Store>(
     resolve_cr_metadata(&existing, &mut obj, &name, &ctx.kind)?;
 
     // When the CRD declares a status subresource, the main PUT endpoint must not
-    // update .status — clients must use PUT /status for that.
+    // update .status — clients must use PUT /status for that. Restore whatever is
+    // already stored rather than dropping it: a controller (e.g. csi-snapshotter)
+    // that PUTs a spec-only change to VolumeSnapshotContent reads .status back off
+    // the same response to extract snapshotHandle — wiping status here made that
+    // read nil on every main-resource PUT after the first /status write.
     if ctx.has_status_subresource {
-        if let Some(map) = obj.as_object_mut() {
-            map.remove("status");
+        let stored_status = existing["status"].clone();
+        if stored_status.is_null() {
+            if let Some(map) = obj.as_object_mut() {
+                map.remove("status");
+            }
+        } else {
+            obj["status"] = stored_status;
         }
     }
 
@@ -7466,6 +7484,123 @@ mod tests {
         );
     }
 
+    // Regression: a controller (e.g. csi-snapshotter's sidecar) that already published
+    // .status via the /status subresource must not have that status wiped by a later
+    // spec-only PUT to the main endpoint. Before this fix, replace_cr_namespaced
+    // unconditionally *removed* .status from the object on every main PUT once the CRD
+    // declared a status subresource — instead of preserving whatever was already
+    // stored — so a controller that reads .status back off its own PUT response (as
+    // upstream's CreateSnapshotResource does for VolumeSnapshotContent.status.snapshotHandle)
+    // saw nil forever after the first /status write, panicking with a nil map assertion.
+    #[tokio::test]
+    async fn namespaced_main_put_preserves_status_set_via_status_subresource() {
+        let state = make_state();
+        install_crd_with_status_subresource(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "my-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Publish .status via the /status subresource, the same way a real controller does.
+        let status_put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "destination": { "namespace": "staging" } },
+                "status": { "phase": "Synced" }
+            })
+            .to_string(),
+        );
+        assert!(
+            crate::handlers::status::put_namespaced_resource_status(
+                State(state.clone()),
+                Path((
+                    group.clone(),
+                    version.clone(),
+                    ns.clone(),
+                    plural.clone(),
+                    name.clone(),
+                )),
+                axum::http::HeaderMap::new(),
+                status_put_body,
+            )
+            .await
+            .is_ok(),
+            "PUT /status must succeed"
+        );
+
+        // A later spec-only PUT to the main endpoint must not wipe the status just set.
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "destination": { "namespace": "production" } }
+            })
+            .to_string(),
+        );
+        assert!(
+            replace_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    group.clone(),
+                    version.clone(),
+                    ns.clone(),
+                    plural.clone(),
+                    name.clone(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                update_body,
+            )
+            .await
+            .is_ok(),
+            "replace must succeed"
+        );
+
+        let resp = match get_cr_namespaced(
+            State(state.clone()),
+            Path((group, version, ns, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            obj["spec"]["destination"]["namespace"], "production",
+            "spec must still be updated by the main PUT"
+        );
+        assert_eq!(
+            obj["status"]["phase"], "Synced",
+            "status set via the /status subresource must survive a later spec-only main \
+             PUT — a controller that reads .status back off the PUT response (as \
+             CreateSnapshotResource does for snapshotHandle) must never see it wiped"
+        );
+    }
+
     // Regression: A CRD WITHOUT a status subresource must persist .status normally
     // on the main PUT endpoint. This verifies the guard fires only when declared.
     #[tokio::test]
@@ -10351,6 +10486,115 @@ mod tests {
         assert!(
             obj["status"].is_null() || obj.get("status").is_none(),
             "status must NOT be stored by main PUT when status subresource is declared"
+        );
+    }
+
+    // Regression: mirrors VolumeSnapshotContent's real lifecycle — csi-snapshotter PATCHes
+    // .status.snapshotHandle via /status, then a later spec-only Update (PUT to the main
+    // endpoint, e.g. flipping deletionPolicy to Retain) must not wipe that status. Before
+    // this fix, replace_cr dropped .status from the object entirely on every main PUT once
+    // the CRD declared a status subresource, instead of preserving what was already stored,
+    // so upstream's CreateSnapshotResource (which reads .status.snapshotHandle straight off
+    // its own Update response) panicked with `interface conversion: interface {} is nil,
+    // not map[string]interface {}`.
+    #[tokio::test]
+    async fn cluster_scoped_replace_cr_preserves_status_set_via_status_subresource() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "my-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Publish .status via the /status subresource, the same way csi-snapshotter does.
+        let status_put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name },
+                "spec": { "color": "blue" },
+                "status": { "snapshotHandle": "handle-123" }
+            })
+            .to_string(),
+        );
+        assert!(
+            put_cr_status(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                axum::http::HeaderMap::new(),
+                status_put_body,
+            )
+            .await
+            .is_ok(),
+            "PUT /status must succeed"
+        );
+
+        // A later spec-only Update (PUT to the main endpoint) must not wipe that status.
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name },
+                "spec": { "color": "green" }
+            })
+            .to_string(),
+        );
+        let replace_resp = replace_cr(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            update_body,
+        )
+        .await
+        .expect("replace must succeed")
+        .into_response();
+        let replace_body = axum::body::to_bytes(replace_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replace_obj: serde_json::Value = serde_json::from_slice(&replace_body).unwrap();
+        assert_eq!(
+            replace_obj["status"]["snapshotHandle"], "handle-123",
+            "the PUT response itself must carry the preserved status — a controller like \
+             CreateSnapshotResource reads .status straight off its own Update response, not \
+             a fresh GET"
+        );
+
+        let resp = match get_cr(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["spec"]["color"], "green",
+            "spec must still be updated by the main PUT"
+        );
+        assert_eq!(
+            obj["status"]["snapshotHandle"], "handle-123",
+            "status set via the /status subresource must survive a later spec-only main PUT"
         );
     }
 
