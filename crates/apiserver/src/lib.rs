@@ -1832,6 +1832,22 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     });
     put!(key, body, "system:monitoring", "ClusterRole");
 
+    // ClusterRoleBinding: system:monitoring → group system:monitoring. Upstream
+    // (bootstrappolicy.go's ClusterRoleBindings()) binds this role to the well-known
+    // system:monitoring group so a monitoring scraper's token can be granted that group
+    // without also granting cluster-admin. The ClusterRole above existed already but had no
+    // binding, so a caller authenticated as system:monitoring still 403'd on GET /metrics
+    // and had no way to reach it short of a system:masters credential.
+    let key = keys::group_object_key(GROUP, "clusterrolebindings", None, "system:monitoring");
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:monitoring", "uid": "00000000-0000-0000-0000-000000000213", "creationTimestamp": TS },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:monitoring" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:monitoring" }
+    });
+    put!(key, body, "system:monitoring", "ClusterRoleBinding");
+
     // -----------------------------------------------------------------------
     // ClusterRole: system:persistent-volume-provisioner — for external PV provisioners.
     // -----------------------------------------------------------------------
@@ -5454,6 +5470,43 @@ mod tests {
             non_resource_urls.contains(&"/metrics"),
             "system:monitoring must still grant /metrics — that route does exist and is the \
              ClusterRole's whole purpose"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_binds_system_monitoring_group_to_its_clusterrole() {
+        // The system:monitoring ClusterRole was seeded with no matching ClusterRoleBinding:
+        // a monitoring scraper authenticated into the system:monitoring group had nowhere to
+        // get its /metrics grant from and 403'd, same class of bug as the system:node and
+        // system:volume-scheduler binding gaps fixed earlier this initiative. Matches upstream
+        // bootstrappolicy.go's ClusterRoleBindings(), which binds this role to the
+        // well-known system:monitoring group.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let key = keys::group_object_key(GROUP, "clusterrolebindings", None, "system:monitoring");
+        let obj = store.get(&key).await.expect("get must not fail");
+        assert!(
+            obj.is_some(),
+            "ClusterRoleBinding system:monitoring must exist — without it, nothing can ever \
+             be granted the system:monitoring ClusterRole's /metrics access short of \
+             system:masters"
+        );
+        let crb: serde_json::Value =
+            serde_json::from_slice(&obj.unwrap().value).expect("valid json");
+        assert_eq!(
+            crb["roleRef"]["name"].as_str(),
+            Some("system:monitoring"),
+            "binding must reference the system:monitoring ClusterRole"
+        );
+        let subjects = crb["subjects"].as_array().expect("subjects must be array");
+        assert!(
+            subjects.iter().any(|s| s["kind"].as_str() == Some("Group")
+                && s["name"].as_str() == Some("system:monitoring")),
+            "binding must grant the system:monitoring group — that's the well-known group a \
+             monitoring scraper's token is placed in, matching upstream bootstrappolicy"
         );
     }
 
