@@ -2464,6 +2464,18 @@ pub async fn replace_cr<S: Store>(
 
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
 
+    // A PUT whose body has deletionTimestamp set and finalizers now empty is how a
+    // controller that removes its own protection finalizer via Update rather than Patch
+    // (e.g. external-snapshotter's snapshot-controller on VolumeSnapshotContent) completes
+    // a delete. patch_cr already completes the delete instead of storing the update here;
+    // replace_cr (PUT) did not, so the object sat forever with deletionTimestamp set and
+    // no finalizers — never actually removed — and callers waiting for it to disappear
+    // (e.g. the e2e client's WaitForGVRDeletion poll) timed out after 5 minutes.
+    if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
+        return Ok(Json(obj));
+    }
+
     let admission_ctx = AdmissionContext {
         group: &group,
         version: &version,
@@ -3335,6 +3347,19 @@ pub async fn replace_cr_namespaced<S: Store>(
     }
 
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
+
+    // A PUT whose body has deletionTimestamp set and finalizers now empty is how a
+    // controller that removes its own protection finalizer via Update rather than Patch
+    // (e.g. external-snapshotter's snapshot-controller on VolumeSnapshot) completes a
+    // delete. patch_cr_namespaced already completes the delete instead of storing the
+    // update here; replace_cr_namespaced (PUT) did not, so the object sat forever with
+    // deletionTimestamp set and no finalizers — never actually removed — and callers
+    // waiting for it to disappear (e.g. the e2e client's WaitForNamespacedGVRDeletion
+    // poll) timed out after 5 minutes.
+    if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
+        return Ok(Json(obj));
+    }
 
     let admission_ctx = AdmissionContext {
         group: &group,
@@ -16410,6 +16435,156 @@ mod tests {
             state.store.get(&owner_key).await.unwrap().is_none(),
             "owner CR must be hard-deleted once its last finalizer (orphan) drains — this is \
              how the deferred hard-delete of an Orphan-marked owner actually completes"
+        );
+    }
+
+    /// A PUT (replace_cr) whose body has deletionTimestamp set and finalizers now empty is
+    /// how a controller that removes its own protection finalizer via Update rather than
+    /// Patch signals drain completion — e.g. external-snapshotter's snapshot-controller
+    /// updates VolumeSnapshotContent this way. Before this fix, replace_cr had no
+    /// equivalent to patch_cr's finalizer-drain-complete check above, so the PUT just
+    /// stored the finalizer-cleared object — leaving it stuck with deletionTimestamp set
+    /// and no finalizers forever. This is exactly what caused the real e2e failure:
+    /// "volumesnapshotcontents ... is not deleted within 5m0s".
+    #[tokio::test]
+    async fn replace_cr_finalizer_drain_completion_hard_deletes_object() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        // Seed a Widget already soft-deleted with one finalizer pending, as delete_cr
+        // leaves it for the owning controller to drain.
+        let key = cr_store_key(group, plural, None, "draining-widget");
+        let widget = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "draining-widget",
+                "uid": "drain-uid-put-1",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["snapshot.storage.k8s.io/vsc-protection"]
+            },
+            "spec": { "color": "blue" }
+        });
+        state
+            .store
+            .put(
+                &key,
+                Bytes::from(serde_json::to_vec(&widget).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed draining widget CR");
+
+        // The owning controller's Update() call: same deletionTimestamp, finalizers now
+        // empty — mirrors snapshot-controller removing its own finalizer via PUT.
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "draining-widget",
+                    "deletionTimestamp": "2026-07-22T00:00:00Z",
+                    "finalizers": []
+                },
+                "spec": { "color": "blue" }
+            })
+            .to_string(),
+        );
+
+        replace_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "draining-widget".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            put_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("finalizer-drain PUT must succeed: {e:?}"));
+
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "object must be hard-deleted once its last finalizer drains via PUT — a \
+             controller that uses Update rather than Patch to remove its own finalizer must \
+             not leave the object stuck Terminating forever"
+        );
+    }
+
+    /// Namespaced equivalent of `replace_cr_finalizer_drain_completion_hard_deletes_object`
+    /// — mirrors external-snapshotter's snapshot-controller removing its protection
+    /// finalizer from a namespaced VolumeSnapshot via PUT (Update), not PATCH.
+    #[tokio::test]
+    async fn replace_cr_namespaced_finalizer_drain_completion_hard_deletes_object() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io";
+        let version = "v1alpha1";
+        let ns = "argocd";
+        let plural = "applications";
+
+        let key = cr_store_key(group, plural, Some(ns), "draining-app");
+        let app = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": {
+                "name": "draining-app",
+                "namespace": ns,
+                "uid": "drain-uid-put-2",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["snapshot.storage.k8s.io/vs-protection"]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(&key, Bytes::from(serde_json::to_vec(&app).unwrap()), None)
+            .await
+            .expect("seed draining Application CR");
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": {
+                    "name": "draining-app",
+                    "namespace": ns,
+                    "deletionTimestamp": "2026-07-22T00:00:00Z",
+                    "finalizers": []
+                },
+                "spec": {}
+            })
+            .to_string(),
+        );
+
+        replace_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                "draining-app".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            put_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("finalizer-drain PUT must succeed: {e:?}"));
+
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "namespaced object must be hard-deleted once its last finalizer drains via PUT \
+             — the same VolumeSnapshot-deletion-timeout bug applies to the namespaced route"
         );
     }
 
