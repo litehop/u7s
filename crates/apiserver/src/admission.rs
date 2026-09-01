@@ -360,16 +360,18 @@ fn namespace_selector_skip_context<'a>(
 /// exclude (verified live).
 ///
 /// A condition that fails to evaluate (parse error, or references a variable this evaluator
-/// subset doesn't support, e.g. `authorizer`) is treated as satisfied rather than as a skip —
-/// the same fail-open choice already used for ValidatingAdmissionPolicy matchConditions in this
-/// file (see `run_validating_admission_policies`). This favors availability: the webhook still
-/// runs, subject to its own failurePolicy for the actual HTTP call, instead of an expression
-/// this MVP evaluator can't parse silently disabling policy enforcement.
+/// subset doesn't support, e.g. `authorizer`) is governed by the webhook's `failurePolicy`,
+/// matching upstream (`matchconditions/matcher.go`): `failurePolicy: Ignore` skips the webhook,
+/// as if the condition had evaluated to `false`; `failurePolicy: Fail` (the default) denies the
+/// request outright instead of silently running a webhook whose gating condition could not be
+/// evaluated.
 pub(crate) fn webhook_match_conditions_pass(
     conditions: &[MatchCondition],
     object: &serde_json::Value,
     request: &serde_json::Value,
-) -> bool {
+    webhook_name: &str,
+    failure_policy: &str,
+) -> Result<bool, StatusError> {
     let vars = serde_json::Map::new();
     // Webhook matchConditions have no `namespaceObject` CEL variable in the upstream spec
     // (only ValidatingAdmissionPolicy does) — Null makes any such reference resolve rather
@@ -387,17 +389,27 @@ pub(crate) fn webhook_match_conditions_pass(
             &no_namespace_object,
             &no_old_object,
         ) {
-            Some(false) => return false,
+            Some(false) => return Ok(false),
             Some(true) => {}
             None => {
-                tracing::warn!(
-                    "admission: webhook matchCondition \"{}\" eval error, treating as pass",
-                    cond.name
-                );
+                if failure_policy == "Ignore" {
+                    tracing::warn!(
+                        "admission: webhook \"{}\" matchCondition \"{}\" eval error, \
+                         skipping (failurePolicy=Ignore)",
+                        webhook_name,
+                        cond.name
+                    );
+                    return Ok(false);
+                }
+                return Err(Status::internal(format!(
+                    "admission webhook \"{webhook_name}\" matchCondition \"{}\" failed to \
+                     evaluate (failurePolicy=Fail): {}",
+                    cond.name, cond.expression
+                )));
             }
         }
     }
-    true
+    Ok(true)
 }
 
 /// Build the `request` JSON value exposed to webhook `matchConditions` CEL expressions.
@@ -1294,10 +1306,17 @@ async fn invoke_mutating_webhook<S: Store>(
     }
 
     // matchConditions: the final, most expensive filter. Skip this webhook if any CEL
-    // expression evaluates to false — see webhook_match_conditions_pass.
+    // expression evaluates to false; deny/skip on eval error per failurePolicy — see
+    // webhook_match_conditions_pass.
     if !webhook.match_conditions.is_empty() {
         let request_val = webhook_match_condition_request(ctx);
-        if !webhook_match_conditions_pass(&webhook.match_conditions, object, &request_val) {
+        if !webhook_match_conditions_pass(
+            &webhook.match_conditions,
+            object,
+            &request_val,
+            &webhook.name,
+            &webhook.failure_policy,
+        )? {
             tracing::debug!(
                 "admission: mutating webhook \"{}\" skipped: matchCondition evaluated false",
                 webhook.name
@@ -3654,8 +3673,12 @@ async fn run_validating_admission_policies<S: Store>(
         };
 
         // Evaluate matchConditions (pre-filter): any false → skip this binding, not deny.
+        // An eval error is governed by the policy's failurePolicy (matching upstream
+        // matchconditions/matcher.go), not treated as an unconditional pass: Ignore skips
+        // this binding like a false match; Fail (the default) denies the request outright.
         let match_conditions = policy["spec"]["matchConditions"].as_array();
         if let Some(conditions) = match_conditions {
+            let policy_failure_policy = policy["spec"]["failurePolicy"].as_str().unwrap_or("Fail");
             let mut skip = false;
             for cond in conditions {
                 let expr = cond["expression"].as_str().unwrap_or("");
@@ -3681,12 +3704,26 @@ async fn run_validating_admission_policies<S: Store>(
                         skip = true;
                         break;
                     }
-                    None => {
-                        // eval error on matchCondition → treat as "do not skip" (upstream behavior)
+                    None if policy_failure_policy == "Ignore" => {
                         tracing::warn!(
-                            "admission: VAP \"{}\" matchCondition eval error, treating as pass",
+                            "admission: VAP \"{}\" matchCondition eval error, skipping \
+                             (failurePolicy=Ignore)",
                             policy_name
                         );
+                        skip = true;
+                        break;
+                    }
+                    None => {
+                        tracing::warn!(
+                            "admission: VAP \"{}\" matchCondition eval error, denying \
+                             (failurePolicy=Fail): {}",
+                            policy_name,
+                            expr
+                        );
+                        return Err(Status::internal(format!(
+                            "ValidatingAdmissionPolicy \"{policy_name}\" matchCondition \
+                             failed to evaluate (failurePolicy=Fail): {expr}"
+                        )));
                     }
                 }
             }
@@ -3928,10 +3965,17 @@ pub async fn run_validating_webhooks<S: Store>(
             }
 
             // matchConditions: the final, most expensive filter. Skip this webhook if any CEL
-            // expression evaluates to false — see webhook_match_conditions_pass.
+            // expression evaluates to false; deny/skip on eval error per failurePolicy — see
+            // webhook_match_conditions_pass.
             if !webhook.match_conditions.is_empty() {
                 let request_val = webhook_match_condition_request(ctx);
-                if !webhook_match_conditions_pass(&webhook.match_conditions, object, &request_val) {
+                if !webhook_match_conditions_pass(
+                    &webhook.match_conditions,
+                    object,
+                    &request_val,
+                    &webhook.name,
+                    &webhook.failure_policy,
+                )? {
                     tracing::debug!(
                     "admission: validating webhook \"{}\" skipped: matchCondition evaluated false",
                     webhook.name
@@ -6128,7 +6172,8 @@ mod tests {
         }];
         let object = json!({"metadata": {"name": "skip-me"}});
         assert!(
-            !webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            !webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail")
+                .expect("a false-evaluating condition is not an eval error"),
             "a matchCondition evaluating to false must skip the webhook, else it acts on \
              objects it was configured to exclude"
         );
@@ -6146,7 +6191,8 @@ mod tests {
         }];
         let object = json!({"metadata": {"name": "other"}});
         assert!(
-            webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail")
+                .expect("a true-evaluating condition is not an eval error"),
             "an object not matched by the exclusion expression must still be processed by \
              the webhook"
         );
@@ -6168,27 +6214,56 @@ mod tests {
         ];
         let object = json!({"metadata": {"name": "skip-me"}});
         assert!(
-            !webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            !webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail")
+                .expect("all-boolean conditions are not an eval error"),
             "matchConditions are combined with logical AND; one false condition must skip \
              the webhook regardless of how many other conditions passed"
         );
     }
 
-    /// A matchCondition expression this evaluator cannot parse/evaluate must NOT skip the
-    /// webhook (fail open), matching the existing ValidatingAdmissionPolicy matchConditions
-    /// behavior in this file. Silently skipping a webhook whenever it uses CEL this MVP
-    /// evaluator doesn't support would disable policy enforcement without any signal.
+    /// A matchCondition expression this evaluator cannot parse/evaluate must deny the request
+    /// under `failurePolicy: Fail` (the default) instead of silently running the webhook.
+    ///
+    /// Upstream (`matchconditions/matcher.go`) returns the eval error itself under Fail, which
+    /// fails the whole request without ever calling the webhook. Treating an eval error as an
+    /// unconditional pass — the pre-fix behavior — would let an operator's `failurePolicy: Fail`
+    /// setting be silently bypassed by any matchCondition this MVP evaluator can't parse, the
+    /// exact bypass this test guards against.
     #[test]
-    fn webhook_match_conditions_pass_treats_eval_error_as_pass() {
+    fn webhook_match_conditions_pass_denies_on_eval_error_under_fail_policy() {
         let conditions = vec![MatchCondition {
             name: "unsupported".into(),
             expression: "authorizer.group('').resource('pods').check().allowed()".into(),
         }];
         let object = json!({"metadata": {"name": "anything"}});
+        let result =
+            webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail");
         assert!(
-            webhook_match_conditions_pass(&conditions, &object, &empty_request()),
-            "a matchCondition this evaluator cannot parse must fail open (webhook still \
-             invoked) rather than silently disabling the webhook"
+            result.is_err(),
+            "failurePolicy=Fail (the default) must deny the request when a matchCondition \
+             fails to evaluate, not silently run the webhook as if the condition passed"
+        );
+    }
+
+    /// A matchCondition expression this evaluator cannot parse/evaluate must skip the webhook
+    /// (not deny the request, not run the webhook) under `failurePolicy: Ignore`.
+    ///
+    /// Upstream returns `Matches: false` on eval error under Ignore, which skips the webhook
+    /// entirely — the operator configured Ignore precisely because they want uncertainty to be
+    /// skippable, not because they want the webhook to always run regardless.
+    #[test]
+    fn webhook_match_conditions_pass_skips_on_eval_error_under_ignore_policy() {
+        let conditions = vec![MatchCondition {
+            name: "unsupported".into(),
+            expression: "authorizer.group('').resource('pods').check().allowed()".into(),
+        }];
+        let object = json!({"metadata": {"name": "anything"}});
+        let result =
+            webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Ignore");
+        assert!(
+            !result.expect("Ignore must not turn an eval error into a request-denying error"),
+            "failurePolicy=Ignore must skip the webhook (as if the condition were false) when \
+             a matchCondition fails to evaluate, not run the webhook as if it had passed"
         );
     }
 
@@ -6198,7 +6273,8 @@ mod tests {
     fn webhook_match_conditions_pass_returns_true_when_no_conditions_configured() {
         let object = json!({"metadata": {"name": "anything"}});
         assert!(
-            webhook_match_conditions_pass(&[], &object, &empty_request()),
+            webhook_match_conditions_pass(&[], &object, &empty_request(), "wh", "Fail")
+                .expect("no conditions means no eval error is possible"),
             "absent matchConditions must match everything, same as an absent selector"
         );
     }
@@ -9902,6 +9978,160 @@ mod tests {
             result.is_ok(),
             "admissionregistration.k8s.io resources must be exempt from VAP evaluation \
              to prevent bootstrap deadlocks; the deny-all VAP must not fire for its own creation"
+        );
+    }
+
+    /// A VAP matchCondition that fails to evaluate must deny the request under
+    /// `failurePolicy: Fail` (the default), not silently run the (permissive) validations as
+    /// if the condition had passed.
+    ///
+    /// Bypass this guards against: an operator sets `failurePolicy: Fail` expecting "if I
+    /// can't be sure the policy applies, refuse the request" — treating the eval error as an
+    /// unconditional pass (the pre-fix behavior) instead runs the policy's validations
+    /// (which may allow), silently downgrading Fail to something closer to Ignore.
+    #[tokio::test]
+    async fn vap_matchcondition_eval_error_denies_under_fail_policy() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // matchCondition uses `authorizer`, a variable this hand-rolled evaluator subset
+        // doesn't support — guaranteed eval error, not a real-world CEL failure mode we need
+        // to construct carefully.
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "unevaluable-matchcondition-policy"},
+            "spec": {
+                "failurePolicy": "Fail",
+                "matchConstraints": {
+                    "resourceRules": [{"apiGroups": ["*"], "apiVersions": ["*"],
+                        "resources": ["*"], "operations": ["*"]}]
+                },
+                "matchConditions": [{
+                    "name": "unsupported",
+                    "expression": "authorizer.group('').resource('pods').check().allowed()"
+                }],
+                // Would ALLOW if reached — proves denial came from the matchCondition eval
+                // error, not from this validation.
+                "validations": [{"expression": "true"}]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/unevaluable-matchcondition-policy",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()), None).await.unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "unevaluable-matchcondition-binding"},
+            "spec": {
+                "policyName": "unevaluable-matchcondition-policy",
+                "validationActions": ["Deny"]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/unevaluable-matchcondition-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()), None).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "some-pod"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "some-pod",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &pod, None, &ctx).await;
+        assert!(
+            result.is_err(),
+            "failurePolicy=Fail must deny the request when a matchCondition fails to \
+             evaluate, not silently run the (allowing) validations as if it had passed"
+        );
+    }
+
+    /// A VAP matchCondition that fails to evaluate must skip the binding (as if the
+    /// condition were false) under `failurePolicy: Ignore`, not run the binding's
+    /// (denying) validations as if the condition had passed.
+    #[tokio::test]
+    async fn vap_matchcondition_eval_error_skips_binding_under_ignore_policy() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "unevaluable-matchcondition-ignore-policy"},
+            "spec": {
+                "failurePolicy": "Ignore",
+                "matchConstraints": {
+                    "resourceRules": [{"apiGroups": ["*"], "apiVersions": ["*"],
+                        "resources": ["*"], "operations": ["*"]}]
+                },
+                "matchConditions": [{
+                    "name": "unsupported",
+                    "expression": "authorizer.group('').resource('pods').check().allowed()"
+                }],
+                // Would DENY if reached — proves the allow came from skipping the binding,
+                // not from this validation.
+                "validations": [{"expression": "false"}]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/unevaluable-matchcondition-ignore-policy",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()), None).await.unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "unevaluable-matchcondition-ignore-binding"},
+            "spec": {
+                "policyName": "unevaluable-matchcondition-ignore-policy",
+                "validationActions": ["Deny"]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/unevaluable-matchcondition-ignore-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()), None).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "some-pod"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "some-pod",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &pod, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "failurePolicy=Ignore must skip the binding when a matchCondition fails to \
+             evaluate, not run the (denying) validations as if the condition had passed"
         );
     }
 
