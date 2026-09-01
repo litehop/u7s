@@ -3328,10 +3328,9 @@ pub async fn run_cel_mutating_policies<S: Store>(
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Returns true if the resource being admitted is in the `admissionregistration.k8s.io` group.
-///
-/// All resources in `admissionregistration.k8s.io` must be exempt from the admission
-/// pipeline to prevent bootstrap deadlocks:
+/// Returns true if the resource being admitted is one of the six
+/// admission-configuration kinds that must be exempt from the admission pipeline to
+/// prevent bootstrap deadlocks:
 ///
 /// - MutatingWebhookConfiguration / ValidatingWebhookConfiguration: if creating one of
 ///   these triggered the admission webhooks, the newly-registered webhook would call itself
@@ -3340,10 +3339,21 @@ pub async fn run_cel_mutating_policies<S: Store>(
 ///   the CEL-based policy objects; exempting them prevents the same class of bootstrap
 ///   problems and matches Kubernetes upstream behavior.
 ///
-/// This matches Kubernetes upstream behavior: the entire `admissionregistration.k8s.io`
-/// group bypasses the webhook admission chain.
+/// Matches upstream `IsExemptAdmissionConfigurationResource`
+/// (`staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/predicates/rules/rules.go`),
+/// which checks the specific kind rather than the whole `admissionregistration.k8s.io`
+/// group — so a future resource added to this group is not silently exempted too.
 fn is_webhook_configuration_resource(ctx: &AdmissionContext<'_>) -> bool {
     ctx.group == "admissionregistration.k8s.io"
+        && matches!(
+            ctx.resource,
+            "mutatingwebhookconfigurations"
+                | "validatingwebhookconfigurations"
+                | "validatingadmissionpolicies"
+                | "validatingadmissionpolicybindings"
+                | "mutatingadmissionpolicies"
+                | "mutatingadmissionpolicybindings"
+        )
 }
 
 /// Run the mutating admission webhook chain.
@@ -4068,6 +4078,34 @@ mod tests {
     }
 
     // -- bootstrap deadlock prevention tests --
+
+    /// A non-exempt kind in the `admissionregistration.k8s.io` group must NOT be
+    /// bootstrap-exempted.
+    ///
+    /// The exemption exists to prevent self-referential deadlocks for the six specific
+    /// admission-configuration kinds (webhook configs, VAP/MAP + their bindings) — not for
+    /// the whole group. Matching on `ctx.group` alone (the pre-fix behavior) would silently
+    /// exempt any future resource landing in this group from every admission webhook and
+    /// ValidatingAdmissionPolicy, with no test to catch the regression.
+    #[test]
+    fn is_webhook_configuration_resource_rejects_non_exempt_kind_in_group() {
+        let ctx = AdmissionContext {
+            group: "admissionregistration.k8s.io",
+            version: "v1",
+            resource: "somefutureresource",
+            name: "x",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        assert!(
+            !is_webhook_configuration_resource(&ctx),
+            "a resource in admissionregistration.k8s.io that isn't one of the six exempt \
+             kinds must still go through admission webhooks/VAP, or a future addition to \
+             this group would be silently and unintentionally exempted"
+        );
+    }
 
     /// Creating a MutatingWebhookConfiguration must bypass the admission pipeline entirely.
     ///
