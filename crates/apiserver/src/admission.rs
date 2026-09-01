@@ -230,6 +230,11 @@ pub(crate) struct WebhookEntry {
     /// `validate_webhook_match_conditions_cel`.
     #[serde(default)]
     match_conditions: Vec<MatchCondition>,
+    /// SideEffectClass (`None`, `NoneOnDryRun`, `Some`, or `Unknown` — the conservative
+    /// default when unset). Governs whether this webhook may be invoked for a dry-run
+    /// request; see `webhook_dry_run_supported`.
+    #[serde(default = "default_side_effects")]
+    side_effects: String,
 }
 
 /// One `webhooks[*].matchConditions[*]` entry: a named CEL expression gating whether
@@ -262,6 +267,21 @@ struct LabelSelectorRequirement {
 
 fn default_failure_policy() -> String {
     "Fail".to_string()
+}
+
+fn default_side_effects() -> String {
+    "Unknown".to_string()
+}
+
+/// Returns true if `sideEffects` permits invoking the webhook for a dry-run request.
+///
+/// Only `None` and `NoneOnDryRun` are safe: the webhook has no contractual guarantee it
+/// honors `dryRun: true` in the AdmissionReview it receives, so calling one with any other
+/// declared sideEffects (including the conservative `Unknown` default) could cause real
+/// side effects — external provisioning, billing, notification — for a client that
+/// explicitly asked for none via `kubectl --dry-run=server` or SSA dry-run.
+fn webhook_dry_run_supported(side_effects: &str) -> bool {
+    matches!(side_effects, "None" | "NoneOnDryRun")
 }
 
 /// Evaluate a Kubernetes LabelSelector against a set of labels.
@@ -360,16 +380,18 @@ fn namespace_selector_skip_context<'a>(
 /// exclude (verified live).
 ///
 /// A condition that fails to evaluate (parse error, or references a variable this evaluator
-/// subset doesn't support, e.g. `authorizer`) is treated as satisfied rather than as a skip —
-/// the same fail-open choice already used for ValidatingAdmissionPolicy matchConditions in this
-/// file (see `run_validating_admission_policies`). This favors availability: the webhook still
-/// runs, subject to its own failurePolicy for the actual HTTP call, instead of an expression
-/// this MVP evaluator can't parse silently disabling policy enforcement.
+/// subset doesn't support, e.g. `authorizer`) is governed by the webhook's `failurePolicy`,
+/// matching upstream (`matchconditions/matcher.go`): `failurePolicy: Ignore` skips the webhook,
+/// as if the condition had evaluated to `false`; `failurePolicy: Fail` (the default) denies the
+/// request outright instead of silently running a webhook whose gating condition could not be
+/// evaluated.
 pub(crate) fn webhook_match_conditions_pass(
     conditions: &[MatchCondition],
     object: &serde_json::Value,
     request: &serde_json::Value,
-) -> bool {
+    webhook_name: &str,
+    failure_policy: &str,
+) -> Result<bool, StatusError> {
     let vars = serde_json::Map::new();
     // Webhook matchConditions have no `namespaceObject` CEL variable in the upstream spec
     // (only ValidatingAdmissionPolicy does) — Null makes any such reference resolve rather
@@ -387,17 +409,27 @@ pub(crate) fn webhook_match_conditions_pass(
             &no_namespace_object,
             &no_old_object,
         ) {
-            Some(false) => return false,
+            Some(false) => return Ok(false),
             Some(true) => {}
             None => {
-                tracing::warn!(
-                    "admission: webhook matchCondition \"{}\" eval error, treating as pass",
-                    cond.name
-                );
+                if failure_policy == "Ignore" {
+                    tracing::warn!(
+                        "admission: webhook \"{}\" matchCondition \"{}\" eval error, \
+                         skipping (failurePolicy=Ignore)",
+                        webhook_name,
+                        cond.name
+                    );
+                    return Ok(false);
+                }
+                return Err(Status::internal(format!(
+                    "admission webhook \"{webhook_name}\" matchCondition \"{}\" failed to \
+                     evaluate (failurePolicy=Fail): {}",
+                    cond.name, cond.expression
+                )));
             }
         }
     }
-    true
+    Ok(true)
 }
 
 /// Build the `request` JSON value exposed to webhook `matchConditions` CEL expressions.
@@ -1294,15 +1326,40 @@ async fn invoke_mutating_webhook<S: Store>(
     }
 
     // matchConditions: the final, most expensive filter. Skip this webhook if any CEL
-    // expression evaluates to false — see webhook_match_conditions_pass.
+    // expression evaluates to false; deny/skip on eval error per failurePolicy — see
+    // webhook_match_conditions_pass.
     if !webhook.match_conditions.is_empty() {
         let request_val = webhook_match_condition_request(ctx);
-        if !webhook_match_conditions_pass(&webhook.match_conditions, object, &request_val) {
+        if !webhook_match_conditions_pass(
+            &webhook.match_conditions,
+            object,
+            &request_val,
+            &webhook.name,
+            &webhook.failure_policy,
+        )? {
             tracing::debug!(
                 "admission: mutating webhook \"{}\" skipped: matchCondition evaluated false",
                 webhook.name
             );
             return Ok((object.as_ref().clone(), false));
+        }
+    }
+
+    // Dry-run: the webhook has no contractual guarantee it honors `dryRun: true` in the
+    // AdmissionReview it receives, so only invoke it if its declared sideEffects say it's
+    // safe to call anyway — see webhook_dry_run_supported.
+    if ctx.dry_run && !webhook_dry_run_supported(&webhook.side_effects) {
+        if webhook.failure_policy == "Ignore" {
+            tracing::warn!(
+                "admission: mutating webhook \"{}\" skipped (dry-run unsupported, sideEffects={}, failurePolicy=Ignore)",
+                webhook.name, webhook.side_effects
+            );
+            return Ok((object.as_ref().clone(), false));
+        } else {
+            return Err(Status::bad_request(format!(
+                "admission webhook \"{}\" does not support dry run",
+                webhook.name
+            )));
         }
     }
 
@@ -1582,6 +1639,51 @@ pub(crate) fn eval_cel_vap_value(
 // VAP CEL expression evaluator (full precedence, object + variables roots)
 // ---------------------------------------------------------------------------
 
+/// Maximum recursion depth for the hand-rolled recursive-descent CEL parsers below
+/// (`parse_vap_*` and, further down, `parse_cel_*`) — mirrors the vendored `cel` crate's own
+/// `Parser::max_recursion_depth` (default 96, `cel-0.14.3/src/parser/parser.rs`), which this
+/// evaluator has no equivalent of. Every layer of `(...)` nesting, a chained unary `-`/`!`, a
+/// chained `?:`, or a nested `{...}`/`[...]` literal recurses through this call chain again
+/// with no bound but the native call stack; a Rust stack overflow isn't catchable with
+/// `panic::catch_unwind`, so an attacker-controlled CRD/VAP/matchCondition CEL expression deep
+/// enough to exhaust the stack SIGSEGVs the whole apiserver process, not just one request.
+const CEL_MAX_RECURSION_DEPTH: u32 = 96;
+
+thread_local! {
+    /// Current live recursion depth of the parser call chain on this thread. Each top-level
+    /// `eval_cel_*` entry point starts a fresh, self-contained parse that always returns this
+    /// to 0 by the time it returns (via `CelRecursionGuard`'s `Drop`), so a wide-but-shallow
+    /// expression (e.g. a long `a + b + c + ...` chain, parsed by a `while` loop rather than
+    /// recursion) never approaches the cap — only actual call-stack *depth* does.
+    static CEL_RECURSION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard: increments [`CEL_RECURSION_DEPTH`] on construction, decrements on drop.
+/// `enter()` returns `None` instead of incrementing past [`CEL_MAX_RECURSION_DEPTH`], which
+/// every recursive parser function below propagates with `?` — turning excessive nesting into
+/// a normal parse error (the same "eval error" outcome as any other malformed expression)
+/// instead of a stack overflow.
+struct CelRecursionGuard;
+
+impl CelRecursionGuard {
+    fn enter() -> Option<Self> {
+        CEL_RECURSION_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current >= CEL_MAX_RECURSION_DEPTH {
+                return None;
+            }
+            depth.set(current + 1);
+            Some(CelRecursionGuard)
+        })
+    }
+}
+
+impl Drop for CelRecursionGuard {
+    fn drop(&mut self) {
+        CEL_RECURSION_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 /// Parse a `?:` (ternary conditional) expression — the lowest-precedence CEL operator.
 ///
 /// Both branches are always evaluated (this evaluator has no side effects, so eager
@@ -1597,6 +1699,7 @@ fn parse_vap_ternary(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let cond = parse_vap_or(
         tokens,
         pos,
@@ -1651,6 +1754,7 @@ fn parse_vap_or(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut left = parse_vap_and(
         tokens,
         pos,
@@ -1691,6 +1795,7 @@ fn parse_vap_and(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut left = parse_vap_cmp(
         tokens,
         pos,
@@ -1731,6 +1836,7 @@ fn parse_vap_cmp(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let left = parse_vap_add(
         tokens,
         pos,
@@ -1810,6 +1916,7 @@ fn parse_vap_add(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut left = parse_vap_mul(
         tokens,
         pos,
@@ -1886,6 +1993,7 @@ fn parse_vap_mul(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut left = parse_vap_unary(
         tokens,
         pos,
@@ -1949,6 +2057,7 @@ fn parse_vap_unary(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -2011,6 +2120,7 @@ fn parse_vap_primary(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -2234,6 +2344,7 @@ fn parse_vap_field_chain(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut present = true;
     loop {
         if *pos >= tokens.len() {
@@ -2364,6 +2475,7 @@ fn parse_vap_call_args(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<Vec<serde_json::Value>> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut args = Vec::new();
     while *pos < tokens.len() {
         if let CelToken::RParen = &tokens[*pos] {
@@ -2477,6 +2589,7 @@ fn parse_vap_object_body(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut map = serde_json::Map::new();
     while *pos < tokens.len() {
         if let CelToken::RBrace = &tokens[*pos] {
@@ -2774,6 +2887,7 @@ fn parse_cel_value(
     pos: &mut usize,
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -2812,6 +2926,7 @@ fn parse_cel_primary(
     pos: &mut usize,
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -2999,6 +3114,7 @@ fn parse_cel_object_body(
     pos: &mut usize,
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut map = serde_json::Map::new();
 
     while *pos < tokens.len() {
@@ -3328,10 +3444,9 @@ pub async fn run_cel_mutating_policies<S: Store>(
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Returns true if the resource being admitted is in the `admissionregistration.k8s.io` group.
-///
-/// All resources in `admissionregistration.k8s.io` must be exempt from the admission
-/// pipeline to prevent bootstrap deadlocks:
+/// Returns true if the resource being admitted is one of the six
+/// admission-configuration kinds that must be exempt from the admission pipeline to
+/// prevent bootstrap deadlocks:
 ///
 /// - MutatingWebhookConfiguration / ValidatingWebhookConfiguration: if creating one of
 ///   these triggered the admission webhooks, the newly-registered webhook would call itself
@@ -3340,10 +3455,21 @@ pub async fn run_cel_mutating_policies<S: Store>(
 ///   the CEL-based policy objects; exempting them prevents the same class of bootstrap
 ///   problems and matches Kubernetes upstream behavior.
 ///
-/// This matches Kubernetes upstream behavior: the entire `admissionregistration.k8s.io`
-/// group bypasses the webhook admission chain.
+/// Matches upstream `IsExemptAdmissionConfigurationResource`
+/// (`staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/predicates/rules/rules.go`),
+/// which checks the specific kind rather than the whole `admissionregistration.k8s.io`
+/// group — so a future resource added to this group is not silently exempted too.
 fn is_webhook_configuration_resource(ctx: &AdmissionContext<'_>) -> bool {
     ctx.group == "admissionregistration.k8s.io"
+        && matches!(
+            ctx.resource,
+            "mutatingwebhookconfigurations"
+                | "validatingwebhookconfigurations"
+                | "validatingadmissionpolicies"
+                | "validatingadmissionpolicybindings"
+                | "mutatingadmissionpolicies"
+                | "mutatingadmissionpolicybindings"
+        )
 }
 
 /// Run the mutating admission webhook chain.
@@ -3644,8 +3770,12 @@ async fn run_validating_admission_policies<S: Store>(
         };
 
         // Evaluate matchConditions (pre-filter): any false → skip this binding, not deny.
+        // An eval error is governed by the policy's failurePolicy (matching upstream
+        // matchconditions/matcher.go), not treated as an unconditional pass: Ignore skips
+        // this binding like a false match; Fail (the default) denies the request outright.
         let match_conditions = policy["spec"]["matchConditions"].as_array();
         if let Some(conditions) = match_conditions {
+            let policy_failure_policy = policy["spec"]["failurePolicy"].as_str().unwrap_or("Fail");
             let mut skip = false;
             for cond in conditions {
                 let expr = cond["expression"].as_str().unwrap_or("");
@@ -3671,12 +3801,26 @@ async fn run_validating_admission_policies<S: Store>(
                         skip = true;
                         break;
                     }
-                    None => {
-                        // eval error on matchCondition → treat as "do not skip" (upstream behavior)
+                    None if policy_failure_policy == "Ignore" => {
                         tracing::warn!(
-                            "admission: VAP \"{}\" matchCondition eval error, treating as pass",
+                            "admission: VAP \"{}\" matchCondition eval error, skipping \
+                             (failurePolicy=Ignore)",
                             policy_name
                         );
+                        skip = true;
+                        break;
+                    }
+                    None => {
+                        tracing::warn!(
+                            "admission: VAP \"{}\" matchCondition eval error, denying \
+                             (failurePolicy=Fail): {}",
+                            policy_name,
+                            expr
+                        );
+                        return Err(Status::internal(format!(
+                            "ValidatingAdmissionPolicy \"{policy_name}\" matchCondition \
+                             failed to evaluate (failurePolicy=Fail): {expr}"
+                        )));
                     }
                 }
             }
@@ -3918,15 +4062,39 @@ pub async fn run_validating_webhooks<S: Store>(
             }
 
             // matchConditions: the final, most expensive filter. Skip this webhook if any CEL
-            // expression evaluates to false — see webhook_match_conditions_pass.
+            // expression evaluates to false; deny/skip on eval error per failurePolicy — see
+            // webhook_match_conditions_pass.
             if !webhook.match_conditions.is_empty() {
                 let request_val = webhook_match_condition_request(ctx);
-                if !webhook_match_conditions_pass(&webhook.match_conditions, object, &request_val) {
+                if !webhook_match_conditions_pass(
+                    &webhook.match_conditions,
+                    object,
+                    &request_val,
+                    &webhook.name,
+                    &webhook.failure_policy,
+                )? {
                     tracing::debug!(
                     "admission: validating webhook \"{}\" skipped: matchCondition evaluated false",
                     webhook.name
                 );
                     continue;
+                }
+            }
+
+            // Dry-run: only invoke this webhook if its declared sideEffects say it's safe
+            // to call anyway — see webhook_dry_run_supported.
+            if ctx.dry_run && !webhook_dry_run_supported(&webhook.side_effects) {
+                if webhook.failure_policy == "Ignore" {
+                    tracing::warn!(
+                        "admission: validating webhook \"{}\" skipped (dry-run unsupported, sideEffects={}, failurePolicy=Ignore)",
+                        webhook.name, webhook.side_effects
+                    );
+                    continue;
+                } else {
+                    return Err(Status::bad_request(format!(
+                        "admission webhook \"{}\" does not support dry run",
+                        webhook.name
+                    )));
                 }
             }
 
@@ -4068,6 +4236,34 @@ mod tests {
     }
 
     // -- bootstrap deadlock prevention tests --
+
+    /// A non-exempt kind in the `admissionregistration.k8s.io` group must NOT be
+    /// bootstrap-exempted.
+    ///
+    /// The exemption exists to prevent self-referential deadlocks for the six specific
+    /// admission-configuration kinds (webhook configs, VAP/MAP + their bindings) — not for
+    /// the whole group. Matching on `ctx.group` alone (the pre-fix behavior) would silently
+    /// exempt any future resource landing in this group from every admission webhook and
+    /// ValidatingAdmissionPolicy, with no test to catch the regression.
+    #[test]
+    fn is_webhook_configuration_resource_rejects_non_exempt_kind_in_group() {
+        let ctx = AdmissionContext {
+            group: "admissionregistration.k8s.io",
+            version: "v1",
+            resource: "somefutureresource",
+            name: "x",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        assert!(
+            !is_webhook_configuration_resource(&ctx),
+            "a resource in admissionregistration.k8s.io that isn't one of the six exempt \
+             kinds must still go through admission webhooks/VAP, or a future addition to \
+             this group would be silently and unintentionally exempted"
+        );
+    }
 
     /// Creating a MutatingWebhookConfiguration must bypass the admission pipeline entirely.
     ///
@@ -6090,7 +6286,8 @@ mod tests {
         }];
         let object = json!({"metadata": {"name": "skip-me"}});
         assert!(
-            !webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            !webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail")
+                .expect("a false-evaluating condition is not an eval error"),
             "a matchCondition evaluating to false must skip the webhook, else it acts on \
              objects it was configured to exclude"
         );
@@ -6108,7 +6305,8 @@ mod tests {
         }];
         let object = json!({"metadata": {"name": "other"}});
         assert!(
-            webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail")
+                .expect("a true-evaluating condition is not an eval error"),
             "an object not matched by the exclusion expression must still be processed by \
              the webhook"
         );
@@ -6130,27 +6328,56 @@ mod tests {
         ];
         let object = json!({"metadata": {"name": "skip-me"}});
         assert!(
-            !webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            !webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail")
+                .expect("all-boolean conditions are not an eval error"),
             "matchConditions are combined with logical AND; one false condition must skip \
              the webhook regardless of how many other conditions passed"
         );
     }
 
-    /// A matchCondition expression this evaluator cannot parse/evaluate must NOT skip the
-    /// webhook (fail open), matching the existing ValidatingAdmissionPolicy matchConditions
-    /// behavior in this file. Silently skipping a webhook whenever it uses CEL this MVP
-    /// evaluator doesn't support would disable policy enforcement without any signal.
+    /// A matchCondition expression this evaluator cannot parse/evaluate must deny the request
+    /// under `failurePolicy: Fail` (the default) instead of silently running the webhook.
+    ///
+    /// Upstream (`matchconditions/matcher.go`) returns the eval error itself under Fail, which
+    /// fails the whole request without ever calling the webhook. Treating an eval error as an
+    /// unconditional pass — the pre-fix behavior — would let an operator's `failurePolicy: Fail`
+    /// setting be silently bypassed by any matchCondition this MVP evaluator can't parse, the
+    /// exact bypass this test guards against.
     #[test]
-    fn webhook_match_conditions_pass_treats_eval_error_as_pass() {
+    fn webhook_match_conditions_pass_denies_on_eval_error_under_fail_policy() {
         let conditions = vec![MatchCondition {
             name: "unsupported".into(),
             expression: "authorizer.group('').resource('pods').check().allowed()".into(),
         }];
         let object = json!({"metadata": {"name": "anything"}});
+        let result =
+            webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail");
         assert!(
-            webhook_match_conditions_pass(&conditions, &object, &empty_request()),
-            "a matchCondition this evaluator cannot parse must fail open (webhook still \
-             invoked) rather than silently disabling the webhook"
+            result.is_err(),
+            "failurePolicy=Fail (the default) must deny the request when a matchCondition \
+             fails to evaluate, not silently run the webhook as if the condition passed"
+        );
+    }
+
+    /// A matchCondition expression this evaluator cannot parse/evaluate must skip the webhook
+    /// (not deny the request, not run the webhook) under `failurePolicy: Ignore`.
+    ///
+    /// Upstream returns `Matches: false` on eval error under Ignore, which skips the webhook
+    /// entirely — the operator configured Ignore precisely because they want uncertainty to be
+    /// skippable, not because they want the webhook to always run regardless.
+    #[test]
+    fn webhook_match_conditions_pass_skips_on_eval_error_under_ignore_policy() {
+        let conditions = vec![MatchCondition {
+            name: "unsupported".into(),
+            expression: "authorizer.group('').resource('pods').check().allowed()".into(),
+        }];
+        let object = json!({"metadata": {"name": "anything"}});
+        let result =
+            webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Ignore");
+        assert!(
+            !result.expect("Ignore must not turn an eval error into a request-denying error"),
+            "failurePolicy=Ignore must skip the webhook (as if the condition were false) when \
+             a matchCondition fails to evaluate, not run the webhook as if it had passed"
         );
     }
 
@@ -6160,7 +6387,8 @@ mod tests {
     fn webhook_match_conditions_pass_returns_true_when_no_conditions_configured() {
         let object = json!({"metadata": {"name": "anything"}});
         assert!(
-            webhook_match_conditions_pass(&[], &object, &empty_request()),
+            webhook_match_conditions_pass(&[], &object, &empty_request(), "wh", "Fail")
+                .expect("no conditions means no eval error is possible"),
             "absent matchConditions must match everything, same as an absent selector"
         );
     }
@@ -6704,6 +6932,342 @@ mod tests {
             count, 1,
             "webhook with IfNeeded must only be called once when no patch was applied in pass 1; \
              triggering pass 2 without any_patched=true wastes latency and causes duplicate calls"
+        );
+    }
+
+    // -- dry-run sideEffects tests --
+    //
+    // A dry-run request (kubectl --dry-run=server, or SSA dry-run) must not invoke a webhook
+    // whose declared sideEffects it has no contractual guarantee are honored — the webhook
+    // could cause real external side effects (provisioning, billing, notification) for a
+    // client that explicitly asked for none. These tests use a real mock HTTP server with a
+    // call counter so a regression (dry-run gate removed) is caught by an actual invocation,
+    // not just an error-message match.
+
+    /// A dry-run request must NOT invoke a mutating webhook that declares sideEffects other
+    /// than None/NoneOnDryRun — under failurePolicy=Ignore the request must still succeed,
+    /// but the webhook's HTTP endpoint must never be called.
+    #[tokio::test]
+    async fn dry_run_skips_mutating_webhook_declaring_unsupported_side_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "uid-dry-run", "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "side-effects-some-mwc"},
+            "webhooks": [{
+                "name": "side-effects-some.webhook.example.com",
+                "clientConfig": { "url": format!("{url}/webhook") },
+                "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                "failurePolicy": "Ignore",
+                "sideEffects": "Some"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/side-effects-some-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "dry-run-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "dry-run-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: true,
+        };
+        let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "failurePolicy=Ignore must let the dry-run request through even when the \
+             webhook's sideEffects don't support dry run"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "a webhook declaring sideEffects: Some has no contractual guarantee it honors \
+             dryRun:true, so a dry-run request must never reach its HTTP endpoint — calling \
+             it anyway could cause real external side effects for a client that explicitly \
+             asked for none"
+        );
+    }
+
+    /// Complements the skip test above: a dry-run request MUST still invoke a mutating
+    /// webhook that declares sideEffects: None — dry-run-safe webhooks must not be
+    /// over-broadly skipped just because the request is a dry run.
+    #[tokio::test]
+    async fn dry_run_invokes_mutating_webhook_declaring_side_effects_none() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "uid-dry-run-safe", "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "side-effects-none-mwc"},
+            "webhooks": [{
+                "name": "side-effects-none.webhook.example.com",
+                "clientConfig": { "url": format!("{url}/webhook") },
+                "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail",
+                "sideEffects": "None"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/side-effects-none-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "dry-run-safe-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "dry-run-safe-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: true,
+        };
+        let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "a dry-run-safe webhook (sideEffects: None) must be invoked and its allow \
+             response honored"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "sideEffects: None means the webhook is safe to call on a dry-run request; \
+             over-broadly skipping every webhook on dry run (instead of gating on \
+             sideEffects) would silently disable dry-run-safe mutating webhooks too"
+        );
+    }
+
+    /// A dry-run request against a webhook with unsupported sideEffects must be denied
+    /// outright under failurePolicy=Fail (the default) — not silently allowed, and not
+    /// silently invoked.
+    #[tokio::test]
+    async fn dry_run_with_unsupported_side_effects_denies_under_fail_policy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "uid-dry-run-fail", "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "side-effects-some-fail-mwc"},
+            "webhooks": [{
+                "name": "side-effects-some-fail.webhook.example.com",
+                "clientConfig": { "url": format!("{url}/webhook") },
+                "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail",
+                "sideEffects": "Some"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/side-effects-some-fail-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "dry-run-fail-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "dry-run-fail-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: true,
+        };
+        let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
+        assert!(
+            result.is_err(),
+            "failurePolicy=Fail (the default) must deny a dry-run request outright when the \
+             matching webhook's sideEffects don't support dry run — it must not silently \
+             allow the request through as if the webhook had passed"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "the webhook's HTTP endpoint must never be called even though the request is \
+             ultimately denied"
+        );
+    }
+
+    /// Same dry-run/sideEffects gating requirement as the mutating case, for validating
+    /// webhooks.
+    #[tokio::test]
+    async fn dry_run_skips_validating_webhook_declaring_unsupported_side_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "uid-dry-run-validating", "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "side-effects-some-vwc"},
+            "webhooks": [{
+                "name": "side-effects-some.validating.webhook.example.com",
+                "clientConfig": { "url": format!("{url}/webhook") },
+                "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                "failurePolicy": "Ignore",
+                "sideEffects": "Some"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/side-effects-some-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "dry-run-validating-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "dry-run-validating-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: true,
+        };
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "failurePolicy=Ignore must let the dry-run request through even when the \
+             validating webhook's sideEffects don't support dry run"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "a validating webhook declaring sideEffects: Some must never be called for a \
+             dry-run request, same as the mutating case"
         );
     }
 
@@ -8402,6 +8966,95 @@ mod tests {
         );
     }
 
+    // -- CEL parser recursion-depth guard tests --
+    //
+    // The hand-rolled recursive-descent parsers below (parse_vap_*, parse_cel_*) have no
+    // bound but the native call stack on their own — every `(...)` nesting level, chained
+    // unary `-`, or nested array/object literal recurses through the full precedence chain
+    // again. A Rust stack overflow SIGSEGVs the whole process, not just one request, and
+    // isn't catchable, so these tests must never crash the test binary: if they did, `cargo
+    // test` would report the process aborting/segfaulting, not a clean assertion failure.
+
+    /// A deeply-nested-parens ValidatingAdmissionPolicy/matchCondition CEL expression must
+    /// be a parse error, not a stack overflow.
+    ///
+    /// Mirrors the exact attack payload shape from the audit that found this gap: `~4KB` of
+    /// nested parens is small enough to fit in any request body limit, but recurses through
+    /// this evaluator's full 8-function precedence chain per paren level with no depth bound
+    /// — comfortably enough to exhaust a typical 2-8MB thread stack and crash the whole
+    /// apiserver process (taking down every tenant, not just the request that sent it), not
+    /// just fail one request. If the recursion-depth guard is removed, running this test
+    /// crashes the test binary instead of failing an assertion.
+    #[test]
+    fn eval_cel_bool_expr_rejects_deeply_nested_parens_instead_of_crashing() {
+        let expr = format!("{}true{}", "(".repeat(2000), ")".repeat(2000));
+        let object = json!({});
+        let variables = serde_json::Map::new();
+        let request = json!({});
+        let result = eval_cel_bool_expr(
+            &expr,
+            &object,
+            &variables,
+            &request,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(
+            result, None,
+            "a CEL expression nested past the recursion-depth cap must be a parse error \
+             (None), the same outcome as any other malformed expression — an attacker-\
+             controlled VAP/matchCondition expression this deep must not be able to \
+             SIGSEGV the apiserver process"
+        );
+    }
+
+    /// A long chain of unary `-` must also be a parse error, not a stack overflow.
+    ///
+    /// `parse_vap_unary` recurses directly into itself for chained `-`/`!`, entirely
+    /// bypassing the paren-nesting path above — a depth guard placed only on the
+    /// paren/ternary re-entry points would miss this vector, since no `(` or `?` is
+    /// involved at all.
+    #[test]
+    fn eval_cel_bool_expr_rejects_deeply_chained_unary_minus_instead_of_crashing() {
+        let expr = format!("{}1", "-".repeat(2000));
+        let object = json!({});
+        let variables = serde_json::Map::new();
+        let request = json!({});
+        let result = eval_cel_vap_value(
+            &expr,
+            &object,
+            &variables,
+            &request,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(
+            result, None,
+            "a chain of unary `-` past the recursion-depth cap must be a parse error, not \
+             an unbounded self-recursion in parse_vap_unary"
+        );
+    }
+
+    /// A deeply-nested array literal in a MutatingAdmissionPolicy `applyConfiguration`
+    /// expression must be a parse error, not a stack overflow.
+    ///
+    /// `eval_cel_apply_config` uses a separate, simpler parser (`parse_cel_value`/
+    /// `parse_cel_primary`) from the VAP evaluator above — the recursion-depth guard must
+    /// cover this second parser independently, since it doesn't share a call chain with
+    /// `parse_vap_*` at all.
+    #[test]
+    fn eval_cel_apply_config_rejects_deeply_nested_array_literal_instead_of_crashing() {
+        let expr = format!("{}1{}", "[".repeat(2000), "]".repeat(2000));
+        let object = json!({});
+        let result = eval_cel_apply_config(&expr, &object);
+        assert_eq!(
+            result, None,
+            "a nested array literal past the recursion-depth cap must be a parse error \
+             (None) in the applyConfiguration evaluator too, not an unbounded \
+             parse_cel_value/parse_cel_primary self-recursion"
+        );
+    }
+
     /// apply_cel_patch must recursively merge nested objects.
     ///
     /// This ensures that a label addition does not overwrite sibling labels.
@@ -9864,6 +10517,160 @@ mod tests {
             result.is_ok(),
             "admissionregistration.k8s.io resources must be exempt from VAP evaluation \
              to prevent bootstrap deadlocks; the deny-all VAP must not fire for its own creation"
+        );
+    }
+
+    /// A VAP matchCondition that fails to evaluate must deny the request under
+    /// `failurePolicy: Fail` (the default), not silently run the (permissive) validations as
+    /// if the condition had passed.
+    ///
+    /// Bypass this guards against: an operator sets `failurePolicy: Fail` expecting "if I
+    /// can't be sure the policy applies, refuse the request" — treating the eval error as an
+    /// unconditional pass (the pre-fix behavior) instead runs the policy's validations
+    /// (which may allow), silently downgrading Fail to something closer to Ignore.
+    #[tokio::test]
+    async fn vap_matchcondition_eval_error_denies_under_fail_policy() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // matchCondition uses `authorizer`, a variable this hand-rolled evaluator subset
+        // doesn't support — guaranteed eval error, not a real-world CEL failure mode we need
+        // to construct carefully.
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "unevaluable-matchcondition-policy"},
+            "spec": {
+                "failurePolicy": "Fail",
+                "matchConstraints": {
+                    "resourceRules": [{"apiGroups": ["*"], "apiVersions": ["*"],
+                        "resources": ["*"], "operations": ["*"]}]
+                },
+                "matchConditions": [{
+                    "name": "unsupported",
+                    "expression": "authorizer.group('').resource('pods').check().allowed()"
+                }],
+                // Would ALLOW if reached — proves denial came from the matchCondition eval
+                // error, not from this validation.
+                "validations": [{"expression": "true"}]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/unevaluable-matchcondition-policy",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()), None).await.unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "unevaluable-matchcondition-binding"},
+            "spec": {
+                "policyName": "unevaluable-matchcondition-policy",
+                "validationActions": ["Deny"]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/unevaluable-matchcondition-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()), None).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "some-pod"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "some-pod",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &pod, None, &ctx).await;
+        assert!(
+            result.is_err(),
+            "failurePolicy=Fail must deny the request when a matchCondition fails to \
+             evaluate, not silently run the (allowing) validations as if it had passed"
+        );
+    }
+
+    /// A VAP matchCondition that fails to evaluate must skip the binding (as if the
+    /// condition were false) under `failurePolicy: Ignore`, not run the binding's
+    /// (denying) validations as if the condition had passed.
+    #[tokio::test]
+    async fn vap_matchcondition_eval_error_skips_binding_under_ignore_policy() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "unevaluable-matchcondition-ignore-policy"},
+            "spec": {
+                "failurePolicy": "Ignore",
+                "matchConstraints": {
+                    "resourceRules": [{"apiGroups": ["*"], "apiVersions": ["*"],
+                        "resources": ["*"], "operations": ["*"]}]
+                },
+                "matchConditions": [{
+                    "name": "unsupported",
+                    "expression": "authorizer.group('').resource('pods').check().allowed()"
+                }],
+                // Would DENY if reached — proves the allow came from skipping the binding,
+                // not from this validation.
+                "validations": [{"expression": "false"}]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/unevaluable-matchcondition-ignore-policy",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()), None).await.unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "unevaluable-matchcondition-ignore-binding"},
+            "spec": {
+                "policyName": "unevaluable-matchcondition-ignore-policy",
+                "validationActions": ["Deny"]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/unevaluable-matchcondition-ignore-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()), None).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "some-pod"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "some-pod",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &pod, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "failurePolicy=Ignore must skip the binding when a matchCondition fails to \
+             evaluate, not run the (denying) validations as if the condition had passed"
         );
     }
 
@@ -12517,6 +13324,7 @@ mod tests {
             object_selector: None,
             timeout_seconds: None,
             match_conditions: vec![],
+            side_effects: default_side_effects(),
         };
         *state.admission_cache.validating_webhooks.write().unwrap() =
             Some(std::sync::Arc::new(vec![fake_entry]));
@@ -12588,6 +13396,7 @@ mod tests {
             object_selector: None,
             timeout_seconds: None,
             match_conditions: vec![],
+            side_effects: default_side_effects(),
         };
         let cached_arc = Arc::new(vec![fake_entry]);
         *state.admission_cache.mutating_webhooks.write().unwrap() = Some(cached_arc.clone());
