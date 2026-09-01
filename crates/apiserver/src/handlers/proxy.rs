@@ -1310,8 +1310,9 @@ async fn run_exec_proxy_spliced(
 
 /// Query parameters for portforward: only `ports` is required.
 ///
-/// kubectl sends `?ports=<port>` (may repeat for multiple ports).
-/// We forward it verbatim to the kubelet.
+/// kubectl sends `?ports=<port>` (may repeat for multiple ports). Validated by
+/// `validate_ports_param` and forwarded to the kubelet — never trusted verbatim,
+/// since it is hand-interpolated into a raw HTTP/1.1 request line downstream.
 #[derive(Deserialize)]
 pub struct PortforwardQuery {
     pub ports: Option<String>,
@@ -1323,6 +1324,30 @@ pub(crate) struct PortforwardParams {
     pub kubelet_url: String,
     pub cluster_ca_der: Option<Vec<u8>>,
     pub client_identity_pem: Option<Vec<u8>>,
+}
+
+/// Enforce kubectl's own `ports` grammar: a comma-separated list of 1-65535
+/// integers, matching upstream's `NewV4Options` (`strings.Split(portString, ",")`
+/// then `strconv.ParseUint`). A positive allowlist, not a CRLF/control-byte
+/// blocklist — anything outside `[0-9,]` is rejected outright, so this can never
+/// be bypassed by a control character upstream's blocklist-style check forgot
+/// about. See `validate_portforward`'s call site for why this exists at all.
+fn validate_ports_param(ports: &str) -> Result<(), String> {
+    if ports.is_empty() {
+        return Err("ports must not be empty".to_string());
+    }
+    for part in ports.split(',') {
+        match part.parse::<u16>() {
+            Ok(0) | Err(_) => {
+                return Err(format!(
+                    "invalid ports value '{ports}': each comma-separated entry \
+                     must be an integer in 1..=65535, got '{part}'"
+                ));
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Validate portforward pre-conditions: pod exists and is scheduled.
@@ -1341,6 +1366,19 @@ pub(crate) async fn validate_portforward<S: Store>(
     pod_name: &str,
     ports: Option<&str>,
 ) -> Result<PortforwardParams, crate::status::StatusError> {
+    // `ports` is interpolated verbatim into `kubelet_url` below, which
+    // `dial_kubelet_portforward` then hand-rolls into a raw HTTP/1.1 request line
+    // written directly to kubelet's socket — unlike /exec, /attach, and the v4
+    // portforward leg, nothing downstream parses it as a real URI, so nothing else
+    // rejects control bytes. Enforce kubectl's own comma-separated-integer grammar
+    // (upstream's `NewV4Options`: `strings.Split(portString, ",")`) as a positive
+    // allowlist *before* it reaches any URL or request text: this is what closes
+    // CRLF/control-byte request-splitting into kubelet's connection for a caller
+    // that holds nothing but `create` on `pods/portforward` for this one pod.
+    if let Some(p) = ports {
+        validate_ports_param(p).map_err(Status::bad_request)?;
+    }
+
     // 1. Look up the pod.
     let pod_key = object_key("pods", ns, pod_name);
     let stored = state
@@ -1499,21 +1537,30 @@ fn is_raw_spdy_upgrade_request(req: &axum::http::Request<Body>) -> bool {
 
 /// Parse a `https://host:port/path` URL into its parts.
 ///
-/// `validate_portforward` builds `kubelet_url` from a fixed template — it is never
-/// user-supplied — so a tiny hand-rolled parser avoids pulling in a URL crate for this
-/// single, fully-controlled call site.
+/// `validate_portforward` builds `kubelet_url` from a fixed template, but its query
+/// string carries the client-supplied `ports` value — `validate_ports_param` is the
+/// primary gate against control bytes, but `dial_kubelet_portforward` hand-rolls the
+/// returned path directly into a raw HTTP/1.1 request line with no URI parser in
+/// between (unlike /exec, /attach, and the v4 leg, which all build their kubelet
+/// request via `IntoClientRequest`'s `http::Uri` parsing). So this parser re-validates
+/// `path` through `http::uri::PathAndQuery` before returning it, as a second,
+/// defense-in-depth layer that fails closed if any future field is ever added to the
+/// query string without going through `validate_ports_param`.
 fn parse_https_url(url: &str) -> anyhow::Result<(String, u16, String)> {
     let rest = url
         .strip_prefix("https://")
         .ok_or_else(|| anyhow::anyhow!("kubelet URL must use https://: {url}"))?;
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let path = format!("/{path}");
+    axum::http::uri::PathAndQuery::try_from(path.as_str())
+        .map_err(|e| anyhow::anyhow!("kubelet URL path/query is not request-line-safe: {e}"))?;
     let (host, port_str) = authority
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("kubelet URL missing port: {url}"))?;
     let port: u16 = port_str
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid kubelet port '{port_str}': {e}"))?;
-    Ok((host.to_owned(), port, format!("/{path}")))
+    Ok((host.to_owned(), port, path))
 }
 
 /// portforward proxy: kubectl (or a raw v4.channel.k8s.io websocket client) →
@@ -3830,6 +3877,154 @@ mod tests {
             "kubelet URL must use https:// scheme (a raw HTTP/1.1 upgrade, not a \
              WebSocket), InternalIP, configured port, /portForward/<ns>/<pod> path, \
              and the ports query string"
+        );
+    }
+
+    /// `validate_ports_param` rejects CRLF/control-byte and other non-grammar input.
+    ///
+    /// `dial_kubelet_portforward` hand-rolls its kubelet-facing HTTP/1.1 request line
+    /// from a `ports_qs` string built out of this value with zero further escaping —
+    /// if this check ever regressed to a CRLF blocklist (or was dropped entirely), a
+    /// caller holding nothing but `create` on `pods/portforward` for one pod could
+    /// smuggle a second, fully independent HTTP request onto the apiserver's own
+    /// trusted mTLS connection to that pod's node's kubelet, reaching any kubelet
+    /// endpoint (other pods' exec, `/stats`, `/runningpods`) as the apiserver's
+    /// identity. This must be a positive grammar allowlist, not a blocklist, so it
+    /// can't be bypassed by some other control byte a blocklist author forgot.
+    #[test]
+    fn validate_ports_param_rejects_non_grammar_input() {
+        let bad = [
+            "1\r\nHost: x\r\nContent-Length: 0\r\n\r\nGET /runningpods/ HTTP/1.1\r\nHost: x\r\n\r\n",
+            "1\r\n",
+            "\r\n",
+            "",
+            "8080,",
+            ",8080",
+            "8080 8081",
+            "8080;rm -rf",
+            "0",
+            "65536",
+            "abc",
+        ];
+        for value in bad {
+            assert!(
+                validate_ports_param(value).is_err(),
+                "ports value {value:?} does not match the comma-separated 1-65535 \
+                 integer grammar and must be rejected before it ever reaches a URL \
+                 or the kubelet request line — got Ok"
+            );
+        }
+
+        for value in ["8080", "8080,9090", "1,65535"] {
+            assert!(
+                validate_ports_param(value).is_ok(),
+                "legitimate kubectl ports value {value:?} must still be accepted"
+            );
+        }
+    }
+
+    /// `validate_portforward` rejects a CRLF-smuggling `ports` value before it ever
+    /// builds a kubelet URL, for a pod the caller is otherwise fully entitled to
+    /// port-forward to.
+    ///
+    /// This is the end-to-end regression for the request-splitting vulnerability:
+    /// without the `validate_ports_param` gate, this exact payload would have been
+    /// interpolated into `kubelet_url` and then into the raw HTTP/1.1 request
+    /// `dial_kubelet_portforward` writes to kubelet's socket, smuggling a second
+    /// request onto the apiserver's trusted connection. Asserting `Err` here proves
+    /// the malicious value never reaches that dial — the pod/node lookups above
+    /// prove this isn't merely a coincidental 404 for a pod that doesn't exist.
+    #[tokio::test]
+    async fn portforward_validation_rejects_crlf_injection_in_ports() {
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "node-1", "containers": [{"name": "app", "image": "nginx"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let payload =
+            "1\r\nHost: x\r\nContent-Length: 0\r\n\r\nGET /runningpods/ HTTP/1.1\r\nHost: x\r\n\r\n";
+        let result = validate_portforward(&state, "default", "mypod", Some(payload)).await;
+
+        match result {
+            Ok(p) => panic!(
+                "a CRLF-smuggling ports value must never produce a kubelet URL — a \
+                 portforward-only grant could otherwise splice a second HTTP request \
+                 onto the apiserver's trusted kubelet connection; got kubelet_url {:?}",
+                p.kubelet_url
+            ),
+            Err(e) => assert_eq!(
+                e.0.as_u16(),
+                400,
+                "CRLF-smuggling ports value must be rejected as a 400 Bad Request, \
+                 not silently swallowed or reported as a different error"
+            ),
+        }
+    }
+
+    /// `parse_https_url` rejects a CRLF byte in the path/query it hands back.
+    ///
+    /// This is the second, defense-in-depth gate `dial_kubelet_portforward` relies
+    /// on: `validate_ports_param` is the primary check, but if some future field is
+    /// ever added to `kubelet_url`'s query string without going through it, this
+    /// `http::uri::PathAndQuery` re-parse — the same class of real URI parser the
+    /// /exec, /attach, and v4 legs get for free from `IntoClientRequest` — must still
+    /// stop a CRLF byte from reaching the hand-rolled `POST {path} HTTP/1.1\r\n...`
+    /// request line written straight to kubelet's socket.
+    #[test]
+    fn parse_https_url_rejects_crlf_in_query() {
+        let malicious = "https://10.0.0.1:10250/portForward/default/mypod?ports=1\r\nHost: evil";
+        assert!(
+            parse_https_url(malicious).is_err(),
+            "a CRLF byte in the kubelet URL's path/query must fail parse_https_url, \
+             not flow into the raw HTTP/1.1 request line dial_kubelet_portforward \
+             writes to kubelet's socket"
         );
     }
 
