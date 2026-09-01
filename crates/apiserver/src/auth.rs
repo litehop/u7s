@@ -961,6 +961,28 @@ fn forbidden_response(user: &str, verb: &str, resource: &str) -> Response<Body> 
         .unwrap()
 }
 
+/// Malformed impersonation request — e.g. `Impersonate-Group`/`-Uid`/`-Extra-*` without
+/// `Impersonate-User`. Mirrors upstream's `buildImpersonationRequests`, which rejects that
+/// shape with 400 rather than silently ignoring the extra headers.
+fn bad_request_response(message: String) -> Response<Body> {
+    let status = Status {
+        kind: "Status",
+        api_version: "v1",
+        status: "Failure",
+        message,
+        reason: "BadRequest",
+        code: 400,
+        metadata: None,
+        details: None,
+    };
+    let body = serde_json::to_vec(&status).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 /// Splits a `system:serviceaccount:<namespace>:<name>` username into its namespace and
 /// name components. Reuses apf.rs's `service_account_matches_namespace` prefix constant and
 /// stripping approach, but (unlike that function, which only tests membership in an already-
@@ -1163,6 +1185,25 @@ where
             // We must verify that the authenticated user has the `impersonate` verb on the
             // target resources before substituting the impersonated identity.
             //
+            // Impersonate-Group/-Uid/-Extra-* without Impersonate-User is a malformed request:
+            // upstream's buildImpersonationRequests rejects this shape with 400 rather than
+            // silently dropping the headers, which would otherwise mask a client bug (e.g. a
+            // caller whose intended Impersonate-User header was stripped by a proxy).
+            if req.headers().get("Impersonate-User").is_none()
+                && (req.headers().get("Impersonate-Group").is_some()
+                    || req.headers().get("Impersonate-Uid").is_some()
+                    || req
+                        .headers()
+                        .iter()
+                        .any(|(name, _)| name.as_str().starts_with("impersonate-extra-")))
+            {
+                return Ok(bad_request_response(
+                    "requested Impersonate-Group/Impersonate-Uid/Impersonate-Extra-* without \
+                     impersonating a user (Impersonate-User)"
+                        .to_owned(),
+                ));
+            }
+
             // The impersonated groups replace the authenticated user's groups entirely; real
             // Kubernetes always adds system:authenticated to any impersonated non-system user,
             // but if the caller explicitly supplies groups we use those verbatim (just like the
@@ -3644,6 +3685,59 @@ mod tests {
             axum::http::StatusCode::FORBIDDEN,
             "caller without impersonate verb must get 403 — \
              failing this would allow any authenticated user to escalate to cluster-admin"
+        );
+    }
+
+    /// `Impersonate-Group`/`Impersonate-Uid`/`Impersonate-Extra-*` present WITHOUT
+    /// `Impersonate-User` must be rejected with 400, matching upstream's
+    /// `buildImpersonationRequests` ("requested %v without impersonating a user"). Before
+    /// this fix these headers were silently dropped and the request proceeded as the
+    /// authenticated caller — masking what upstream treats as a malformed client request
+    /// (e.g. a caller whose intended Impersonate-User header was stripped by a proxy).
+    #[tokio::test]
+    async fn impersonate_group_without_impersonate_user_is_bad_request() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        // alice has full impersonate RBAC — the 400 must fire purely because
+        // Impersonate-User is missing, before any authorization check runs.
+        let idx = make_rbac_with_impersonator_and_target();
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-Group", "some-group")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "Impersonate-Group without Impersonate-User must 400, not silently proceed as alice"
         );
     }
 
