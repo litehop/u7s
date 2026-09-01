@@ -2315,8 +2315,11 @@ async fn pod_proxy_via_connect_tunnel(
 
     let status = hyper_resp.status().as_u16();
     let headers = hyper_resp.headers().clone();
-    let collected = hyper_resp
-        .into_body()
+    // Every konnectivity-proxied response is collected here, HTML or not — unlike the
+    // direct-dial leg it has no separate streaming path — so this is the only cap on this
+    // leg (see buffer_capped's doc comment for why an uncapped read is a memory-exhaustion
+    // vector).
+    let collected = http_body_util::Limited::new(hyper_resp.into_body(), crate::MAX_BODY_BYTES)
         .collect()
         .await
         .map_err(|e| format!("read pod response body: {e}"))?;
@@ -2418,6 +2421,33 @@ fn rewrite_html_body(body: bytes::Bytes, proxy_base: &str) -> bytes::Bytes {
         Ok(html) => bytes::Bytes::from(rewrite_relative_links(html, proxy_base)),
         Err(_) => body,
     }
+}
+
+/// Buffer a chunked response body up to `limit` bytes total, erroring instead of growing
+/// without bound once the cap is exceeded.
+///
+/// The html-rewrite path (below) must fully materialize a proxied response before
+/// `rewrite_html_body` can scan it for relative links to rewrite, so it cannot stream the
+/// body straight to the client the way the non-HTML path does. Without this cap, a
+/// pod/Service proxy backend returning an unbounded `text/html` body — or one an attacker
+/// redirected there via the podIP/EndpointSlice-address SSRF this file also guards against
+/// — would force the apiserver to allocate memory proportional to the response size, per
+/// in-flight proxy request. The inbound `DefaultBodyLimit` (lib.rs) caps request bodies
+/// only and never applies to a response read back from a proxied backend.
+async fn buffer_capped<E: std::fmt::Display>(
+    mut stream: impl futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    limit: usize,
+) -> Result<bytes::Bytes, String> {
+    use futures_util::StreamExt as _;
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if buf.len() + chunk.len() > limit {
+            return Err(format!("response body exceeds {limit}-byte proxy cap"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
 }
 
 /// Proxy a request to the pod's IP and containerPort.
@@ -2530,21 +2560,23 @@ async fn pod_proxy_dispatch<S: Store>(
     let pod_status = pod_resp.status();
     let mut upstream_headers = pod_resp.headers().clone();
     let body = if is_html_content_type(&upstream_headers) {
-        let raw = pod_resp.bytes().await.map_err(|e| {
-            crate::status::StatusError(
-                axum::http::StatusCode::BAD_GATEWAY,
-                crate::status::Status {
-                    kind: "Status",
-                    api_version: "v1",
-                    status: "Failure",
-                    message: format!("pod unreachable: {e}"),
-                    reason: "BadGateway",
-                    code: 502,
-                    metadata: None,
-                    details: None,
-                },
-            )
-        })?;
+        let raw = buffer_capped(pod_resp.bytes_stream(), crate::MAX_BODY_BYTES)
+            .await
+            .map_err(|e| {
+                crate::status::StatusError(
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    crate::status::Status {
+                        kind: "Status",
+                        api_version: "v1",
+                        status: "Failure",
+                        message: format!("pod proxy response body: {e}"),
+                        reason: "BadGateway",
+                        code: 502,
+                        metadata: None,
+                        details: None,
+                    },
+                )
+            })?;
         upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
         Body::from(rewrite_html_body(raw, &proxy_base))
     } else {
@@ -2851,21 +2883,23 @@ async fn service_proxy_dispatch<S: Store>(
     let ep_status = ep_resp.status();
     let mut upstream_headers = ep_resp.headers().clone();
     let body = if is_html_content_type(&upstream_headers) {
-        let raw = ep_resp.bytes().await.map_err(|e| {
-            crate::status::StatusError(
-                axum::http::StatusCode::BAD_GATEWAY,
-                crate::status::Status {
-                    kind: "Status",
-                    api_version: "v1",
-                    status: "Failure",
-                    message: format!("service endpoint unreachable: {e}"),
-                    reason: "BadGateway",
-                    code: 502,
-                    metadata: None,
-                    details: None,
-                },
-            )
-        })?;
+        let raw = buffer_capped(ep_resp.bytes_stream(), crate::MAX_BODY_BYTES)
+            .await
+            .map_err(|e| {
+                crate::status::StatusError(
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    crate::status::Status {
+                        kind: "Status",
+                        api_version: "v1",
+                        status: "Failure",
+                        message: format!("service proxy response body: {e}"),
+                        reason: "BadGateway",
+                        code: 502,
+                        metadata: None,
+                        details: None,
+                    },
+                )
+            })?;
         upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
         Body::from(rewrite_html_body(raw, &proxy_base))
     } else {
@@ -2988,6 +3022,77 @@ mod tests {
                     .delete(service_proxy),
             )
             .with_state(state)
+    }
+
+    // -----------------------------------------------------------------------
+    // buffer_capped: response-body size cap for the html-rewrite proxy path
+    // -----------------------------------------------------------------------
+
+    /// buffer_capped must reject a chunked body once the running total exceeds `limit`,
+    /// rather than buffering it in full — this is the fix for the html-rewrite proxy path,
+    /// which (unlike the non-HTML path) must fully materialize the response before it can
+    /// scan for links to rewrite. Without this cap a malicious/compromised proxy backend
+    /// returning an oversized text/html body forces the apiserver to allocate memory
+    /// proportional to the response size, per in-flight request (memory-exhaustion DoS).
+    #[tokio::test]
+    async fn buffer_capped_rejects_body_over_limit() {
+        let chunks: Vec<Result<bytes::Bytes, String>> = vec![
+            Ok(bytes::Bytes::from(vec![0u8; 3])),
+            Ok(bytes::Bytes::from(vec![0u8; 3])),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+
+        let result = buffer_capped(stream, 4).await;
+
+        assert!(
+            result.is_err(),
+            "a body whose chunks sum past the limit must be rejected — silently accepting \
+             it defeats the whole point of the cap and reintroduces the unbounded-memory \
+             DoS this function exists to close"
+        );
+    }
+
+    /// buffer_capped must return the full, reassembled body when the total stays within
+    /// `limit` — the cap must not reject or truncate ordinary, legitimately-sized proxied
+    /// responses (the vast majority of real HTML proxy traffic).
+    #[tokio::test]
+    async fn buffer_capped_accepts_body_under_limit() {
+        let chunks: Vec<Result<bytes::Bytes, String>> = vec![
+            Ok(bytes::Bytes::from_static(b"hello ")),
+            Ok(bytes::Bytes::from_static(b"world")),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+
+        let result = buffer_capped(stream, 4 * 1024 * 1024)
+            .await
+            .expect("a body under the limit must not be rejected");
+
+        assert_eq!(
+            result,
+            bytes::Bytes::from_static(b"hello world"),
+            "buffer_capped must reassemble every chunk in order — dropping or reordering \
+             chunks would corrupt the proxied response body"
+        );
+    }
+
+    /// A stream error (e.g. the backend connection dropping mid-response) must propagate
+    /// as an error rather than being silently swallowed into a truncated, seemingly-valid
+    /// body — a caller that got Ok(partial_body) here would rewrite and serve a corrupted
+    /// page instead of surfacing the failure as a 502.
+    #[tokio::test]
+    async fn buffer_capped_propagates_stream_error() {
+        let chunks: Vec<Result<bytes::Bytes, String>> = vec![
+            Ok(bytes::Bytes::from_static(b"partial")),
+            Err("connection reset".to_owned()),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+
+        let result = buffer_capped(stream, 4 * 1024 * 1024).await;
+
+        assert!(
+            result.is_err(),
+            "a mid-stream read error must surface as an error, not a truncated Ok(body)"
+        );
     }
 
     // -----------------------------------------------------------------------
