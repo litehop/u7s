@@ -219,6 +219,29 @@ pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::St
     }
 }
 
+/// Bounded retry budget for generateName collisions on create, matching upstream's
+/// `maxNameGenerationCreateAttempts` (`k8s.io/apiserver/pkg/registry/generic/registry/store.go`).
+pub(crate) const MAX_GENERATE_NAME_CREATE_ATTEMPTS: u32 = 8;
+
+/// Returns the `generateName` prefix when a create request relies on the server picking
+/// the name (no explicit `metadata.name`), so the caller can retry with a fresh suffix
+/// when the store reports a name collision instead of surfacing a spurious 409 to the
+/// client — mirrors upstream's `needsNameGeneration`, which gates
+/// `createWithGenerateNameRetry`. An explicit `metadata.name` always wins, even if
+/// `generateName` is also set (same precedence as `resolve_name`), so those requests are
+/// never retried: a real name collision on an explicit name is a genuine 409.
+///
+/// Must be called BEFORE `resolve_name`, which mutates `metadata.name` in place.
+pub(crate) fn wants_generate_name(obj: &Object) -> Option<String> {
+    if obj.name().filter(|n| !n.is_empty()).is_some() {
+        return None;
+    }
+    obj.body["metadata"]["generateName"]
+        .as_str()
+        .filter(|g| !g.is_empty())
+        .map(str::to_string)
+}
+
 pub(crate) fn lookup<'a, S: Store>(
     state: &'a AppState<S>,
     group: &str,
@@ -1282,6 +1305,44 @@ mod tests {
         .unwrap();
         let err = resolve_name(&mut obj).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    // -- wants_generate_name --
+
+    #[test]
+    fn wants_generate_name_returns_prefix_when_only_generate_name_set() {
+        // A generateName-only create must be eligible for the collision-retry loop —
+        // without this, a random suffix collision surfaces as a spurious 409 to a client
+        // that never chose a name (e.g. a bulk PVC-creation loop).
+        let obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({ "metadata": { "generateName": "pvc-" } }).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(wants_generate_name(&obj), Some("pvc-".to_string()));
+    }
+
+    #[test]
+    fn wants_generate_name_returns_none_when_explicit_name_set() {
+        // An explicit name must never be silently retried under a different generated
+        // name on conflict — a collision on a client-chosen name is a genuine 409.
+        let obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
+                "metadata": { "name": "my-pvc", "generateName": "pvc-" }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        assert_eq!(wants_generate_name(&obj), None);
+    }
+
+    #[test]
+    fn wants_generate_name_returns_none_when_neither_set() {
+        // No retry semantics apply when there is nothing to regenerate.
+        let obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({ "metadata": {} }).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(wants_generate_name(&obj), None);
     }
 
     // -- parse_field_selector --

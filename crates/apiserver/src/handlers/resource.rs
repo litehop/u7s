@@ -21,9 +21,10 @@ use crate::{
 
 use super::generic::{
     apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
-    check_crb_escalation, check_rb_escalation, decode_continue, lookup, parse_field_selector,
-    parse_label_selector, resolve_name, stamp_metadata, store_err, validate_name,
-    validate_name_for_group, CollectionQuery, RBAC_GROUP,
+    check_crb_escalation, check_rb_escalation, decode_continue, generate_suffix, lookup,
+    parse_field_selector, parse_label_selector, resolve_name, stamp_metadata, store_err,
+    validate_name, validate_name_for_group, wants_generate_name, CollectionQuery,
+    MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
@@ -320,7 +321,10 @@ pub(crate) async fn create_resource<S: Store>(
     // this role, the caller must hold all the rules they are about to define.
     check_clusterrole_escalation(&plural, &group, &user, &obj.body, &state)?;
 
-    let name = resolve_name(&mut obj)?;
+    // Captured before resolve_name mutates metadata.name, so a store collision below
+    // knows whether it's allowed to retry under a freshly generated name.
+    let generate_name_prefix = wants_generate_name(&obj);
+    let mut name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
     if meta.kind == "VolumeAttributesClass" {
         add_vac_protection_finalizer(&mut obj);
@@ -358,38 +362,62 @@ pub(crate) async fn create_resource<S: Store>(
         return Ok(resp);
     }
 
-    let key = group_object_key(&group, &plural, None, &name);
-    let put_start = std::time::Instant::now();
-    let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
-    tracing::debug!(
-        key = %key,
-        elapsed_ms = put_start.elapsed().as_millis() as u64,
-        ok = result.is_ok(),
-        "create_resource: store.put call completed"
-    );
-    let new_rv = match result {
-        Ok(rv) => rv,
-        Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
-            // createOrUpdate: replace existing object unconditionally.
-            state
-                .store
-                .put(&key, obj.to_bytes(), None)
-                .await
-                .map_err(|e| store_err(e, &name, &meta.kind))?
+    let mut attempt = 0u32;
+    let new_rv = loop {
+        let key = group_object_key(&group, &plural, None, &name);
+        let put_start = std::time::Instant::now();
+        let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
+        tracing::debug!(
+            key = %key,
+            elapsed_ms = put_start.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            "create_resource: store.put call completed"
+        );
+        match result {
+            Ok(rv) => break rv,
+            Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
+                // createOrUpdate: replace existing object unconditionally.
+                break state
+                    .store
+                    .put(&key, obj.to_bytes(), None)
+                    .await
+                    .map_err(|e| store_err(e, &name, &meta.kind))?;
+            }
+            // The client never chose this name (it came from generateName) — a collision
+            // is the server's random suffix landing on an existing object, not a real
+            // conflict the client should see. Retry with a fresh suffix, matching
+            // upstream's createWithGenerateNameRetry, instead of surfacing a spurious 409
+            // on what the client experiences as a plain create.
+            Err(StoreError::AlreadyExists { .. })
+                if generate_name_prefix.is_some()
+                    && attempt < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
+            {
+                attempt += 1;
+                name = format!(
+                    "{}{}",
+                    generate_name_prefix.as_deref().unwrap_or_default(),
+                    generate_suffix()
+                );
+                obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+            }
+            Err(StoreError::AlreadyExists { .. }) => {
+                let stored = state
+                    .store
+                    .get(&key)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+                let existing: serde_json::Value = serde_json::from_slice(&stored.value)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                return Ok((StatusCode::CONFLICT, Json(existing)).into_response());
+            }
+            Err(e) => return Err(store_err(e, &name, &meta.kind)),
         }
-        Err(StoreError::AlreadyExists { .. }) => {
-            let stored = state
-                .store
-                .get(&key)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-            let existing: serde_json::Value = serde_json::from_slice(&stored.value)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            return Ok((StatusCode::CONFLICT, Json(existing)).into_response());
-        }
-        Err(e) => return Err(store_err(e, &name, &meta.kind)),
     };
+    // Recomputed rather than threaded out of the loop above: cheap string formatting, and
+    // always matches the name the successful put() used (whether the first attempt or a
+    // generateName retry).
+    let key = group_object_key(&group, &plural, None, &name);
 
     obj.set_resource_version(new_rv);
     if group == RBAC_GROUP {
@@ -2444,7 +2472,10 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     // caller already holds all rules of the referenced Role or ClusterRole in this namespace.
     check_rb_escalation(&plural, &group, &ns, &user, &obj.body, &state)?;
 
-    let name = resolve_name(&mut obj)?;
+    // Captured before resolve_name mutates metadata.name, so a store collision below
+    // knows whether it's allowed to retry under a freshly generated name.
+    let generate_name_prefix = wants_generate_name(&obj);
+    let mut name = resolve_name(&mut obj)?;
 
     // Capture RS revision propagation info BEFORE ns_meta processing drops ownerReferences.
     // ObjectMeta serde drops unknown fields (including ownerReferences), so we must extract
@@ -2522,53 +2553,74 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         return Ok(resp);
     }
 
-    let key = group_object_key(&group, &plural, Some(&ns), &name);
     let ns_key = cluster_object_key("namespaces", &ns);
-    let put_start = std::time::Instant::now();
-    // Namespace-Terminating check and the create are one atomic store transaction — matches
-    // kube-apiserver behaviour: 403 Forbidden "unable to create new content in namespace <ns>
-    // because it is being terminated" — closing the check-then-act window a separate earlier
-    // check + this write used to leave open (a create could observe Active, then a concurrent
-    // delete_namespace flips the phase, and this write would blindly succeed regardless).
-    let result = state
-        .store
-        .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
-        .await;
-    tracing::debug!(
-        key = %key,
-        elapsed_ms = put_start.elapsed().as_millis() as u64,
-        ok = result.is_ok(),
-        "create_namespaced_resource: store.put call completed"
-    );
-    let new_rv = match result {
-        Ok(rv) => rv,
-        Err(CreateNamespacedError::NamespaceTerminating) => {
-            return Err(Status::forbidden(format!(
-                "unable to create new content in namespace {ns} because it is being terminated"
-            )));
+    let mut attempt = 0u32;
+    let new_rv = loop {
+        let key = group_object_key(&group, &plural, Some(&ns), &name);
+        let put_start = std::time::Instant::now();
+        // Namespace-Terminating check and the create are one atomic store transaction —
+        // matches kube-apiserver behaviour: 403 Forbidden "unable to create new content in
+        // namespace <ns> because it is being terminated" — closing the check-then-act window
+        // a separate earlier check + this write used to leave open (a create could observe
+        // Active, then a concurrent delete_namespace flips the phase, and this write would
+        // blindly succeed regardless).
+        let result = state
+            .store
+            .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
+            .await;
+        tracing::debug!(
+            key = %key,
+            elapsed_ms = put_start.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            "create_namespaced_resource: store.put call completed"
+        );
+        match result {
+            Ok(rv) => break rv,
+            Err(CreateNamespacedError::NamespaceTerminating) => {
+                return Err(Status::forbidden(format!(
+                    "unable to create new content in namespace {ns} because it is being terminated"
+                )));
+            }
+            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
+                if meta.create_or_update =>
+            {
+                // createOrUpdate: replace existing object unconditionally.
+                break state
+                    .store
+                    .put(&key, obj.to_bytes(), None)
+                    .await
+                    .map_err(|e| store_err(e, &name, &meta.kind))?;
+            }
+            // The client never chose this name (it came from generateName) — a collision is
+            // the server's random suffix landing on an existing object, not a real conflict
+            // the client should see. Retry with a fresh suffix, matching upstream's
+            // createWithGenerateNameRetry, instead of surfacing a spurious 409 on what the
+            // client experiences as a plain create (e.g. a bulk PVC-creation loop).
+            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
+                if generate_name_prefix.is_some()
+                    && attempt < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
+            {
+                attempt += 1;
+                name = format!(
+                    "{}{}",
+                    generate_name_prefix.as_deref().unwrap_or_default(),
+                    generate_suffix()
+                );
+                obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+            }
+            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
+                let stored = state
+                    .store
+                    .get(&key)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+                let existing: serde_json::Value = serde_json::from_slice(&stored.value)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                return Ok((StatusCode::CONFLICT, Json(existing)).into_response());
+            }
+            Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, &name, &meta.kind)),
         }
-        Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
-            if meta.create_or_update =>
-        {
-            // createOrUpdate: replace existing object unconditionally.
-            state
-                .store
-                .put(&key, obj.to_bytes(), None)
-                .await
-                .map_err(|e| store_err(e, &name, &meta.kind))?
-        }
-        Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
-            let stored = state
-                .store
-                .get(&key)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-            let existing: serde_json::Value = serde_json::from_slice(&stored.value)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            return Ok((StatusCode::CONFLICT, Json(existing)).into_response());
-        }
-        Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, &name, &meta.kind)),
     };
 
     obj.set_resource_version(new_rv);
@@ -21720,6 +21772,188 @@ mod tests {
              that clobbers stale LIST-time data instead of retrying against the freshly \
              re-read object would silently discard a status update the writer believes \
              succeeded, with no error surfaced to either side"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // MockStore whose first put() always fails with AlreadyExists, regardless of key —
+    // simulating a generateName suffix landing on some unrelated existing object.
+    //
+    // Used by create_namespaced_resource's generateName-collision-retry regression test.
+    // ---------------------------------------------------------------------------
+
+    struct FirstPutAlreadyExistsStore {
+        inner: std::sync::Arc<u7s_store::SqliteStore>,
+        fire_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl FirstPutAlreadyExistsStore {
+        fn new() -> Self {
+            Self {
+                inner: std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").unwrap()),
+                fire_once: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl u7s_store::Store for FirstPutAlreadyExistsStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .fire_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move {
+                if inject {
+                    Err(u7s_store::StoreError::AlreadyExists { key })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// upstream's pvc-deletion-performance spec (`test/e2e/storage/testsuites/pvcdeletionperf.go`)
+    /// creates hundreds of PVCs in a tight loop using bare `metadata.generateName` — the client
+    /// never chose a name and has no way to retry a collision itself. Before this fix,
+    /// `create_namespaced_resource` generated exactly one candidate name and surfaced ANY
+    /// store-level `AlreadyExists` straight to the client as a 409 on what looks like a plain
+    /// create, even though the client-side symptom is indistinguishable from a random suffix
+    /// landing on an unrelated object — a case upstream's own generic registry retries up to 8
+    /// times with a fresh suffix (`createWithGenerateNameRetry`) rather than ever surfacing to
+    /// the caller. This test fails on revert: it forces the very first put() to report
+    /// AlreadyExists regardless of key, and asserts the create still succeeds.
+    #[tokio::test]
+    async fn create_namespaced_resource_retries_generate_name_collision_instead_of_409ing() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+
+        let store = Arc::new(FirstPutAlreadyExistsStore::new());
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "generateName": "pvc-", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap());
+
+        let response = create_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "a generateName create must retry past a spurious collision, not hard-error: {e:?}"
+            )
+        })
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::CREATED,
+            "a generateName-based create must retry with a fresh suffix on AlreadyExists and \
+             succeed, not surface a 409 the client never asked for and cannot retry itself"
         );
     }
 
