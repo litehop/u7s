@@ -21,10 +21,10 @@ use crate::{
 
 use super::generic::{
     apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
-    check_crb_escalation, check_rb_escalation, decode_continue, generate_suffix, lookup,
-    parse_field_selector, parse_label_selector, resolve_name, stamp_metadata, store_err,
-    validate_name, validate_name_for_group, wants_generate_name, CollectionQuery,
-    MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
+    check_crb_escalation, check_rb_escalation, check_role_escalation, decode_continue,
+    generate_suffix, lookup, parse_field_selector, parse_label_selector, resolve_name,
+    stamp_metadata, store_err, validate_name, validate_name_for_group, wants_generate_name,
+    CollectionQuery, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
@@ -1169,6 +1169,14 @@ pub(crate) async fn do_patch<S: Store>(
             &obj.body,
             state,
         )?;
+        check_role_escalation(
+            plural,
+            group,
+            ns.unwrap_or_default(),
+            user,
+            &obj.body,
+            state,
+        )?;
         if dry_run {
             // Dry-run: validation passed; return the would-be created object without persisting.
             if let Some(fm) = field_manager {
@@ -1219,6 +1227,14 @@ pub(crate) async fn do_patch<S: Store>(
                 check_crb_escalation(plural, group, user, &current.body, state)?;
                 check_clusterrole_escalation(plural, group, user, &current.body, state)?;
                 check_rb_escalation(
+                    plural,
+                    group,
+                    ns.unwrap_or_default(),
+                    user,
+                    &current.body,
+                    state,
+                )?;
+                check_role_escalation(
                     plural,
                     group,
                     ns.unwrap_or_default(),
@@ -2494,6 +2510,10 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     // Escalation prevention: before persisting a namespaced RoleBinding, verify the
     // caller already holds all rules of the referenced Role or ClusterRole in this namespace.
     check_rb_escalation(&plural, &group, &ns, &user, &obj.body, &state)?;
+    // Escalation prevention for Role creates: if any RoleBinding in this namespace
+    // already references this role, the caller must hold all the rules they are about
+    // to define — the namespaced mirror of check_clusterrole_escalation.
+    check_role_escalation(&plural, &group, &ns, &user, &obj.body, &state)?;
 
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
@@ -2913,6 +2933,10 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // Escalation prevention: before updating a namespaced RoleBinding, verify the
     // caller already holds all rules of the referenced Role or ClusterRole in this namespace.
     check_rb_escalation(&plural, &group, &ns, &user, &obj.body, &state)?;
+    // Escalation prevention for Role updates: if any RoleBinding in this namespace
+    // already references this role, the caller must hold all the rules they are about
+    // to define — the namespaced mirror of check_clusterrole_escalation.
+    check_role_escalation(&plural, &group, &ns, &user, &obj.body, &state)?;
 
     // Stamp namespace from the URL into the body. If the client omits metadata.namespace
     // in the PUT body, the stored object would have no namespace. A cluster-wide Watch

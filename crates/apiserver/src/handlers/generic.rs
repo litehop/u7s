@@ -848,6 +848,59 @@ pub(crate) fn check_clusterrole_escalation<S: Store>(
     Ok(())
 }
 
+/// Escalation prevention for namespaced Role writes.
+///
+/// When a Role is created or updated with non-empty rules, and any RoleBinding
+/// in the same namespace already references that role, the caller must already
+/// hold every rule in the new role spec, scoped to that namespace.  Mirrors
+/// check_clusterrole_escalation's race prevention for namespaced Roles: without
+/// this check a user can do: (1) create RoleBinding → references non-existent
+/// Role → RB check skipped; (2) create Role with wildcard rules → instant
+/// namespace-admin.
+///
+/// The check is skipped when the role has no rules (nothing to escalate)
+/// or when no RoleBinding in the namespace references it yet (role-first
+/// ordering).  system:masters members bypass via the RBAC cluster-admin binding.
+///
+/// Returns `Ok(())` if the check passes, or `Err(403 Forbidden)`.
+pub(crate) fn check_role_escalation<S: Store>(
+    plural: &str,
+    group: &str,
+    namespace: &str,
+    user: &UserInfo,
+    body: &serde_json::Value,
+    state: &AppState<S>,
+) -> Result<(), crate::status::StatusError> {
+    if group != RBAC_GROUP || plural != ROLES {
+        return Ok(());
+    }
+    let role_rules = serde_json::from_value::<crate::rbac::RbacRole>(body.clone())
+        .map(|r| r.rules)
+        .unwrap_or_default();
+    if role_rules.is_empty() {
+        return Ok(());
+    }
+    let role_name = body["metadata"]["name"].as_str().unwrap_or("");
+    if !state
+        .rbac_index
+        .namespace_binding_references_role(namespace, role_name)
+    {
+        return Ok(());
+    }
+    if !user_holds_all_rules_in_namespace(
+        &user.username,
+        &user.groups,
+        &role_rules,
+        namespace,
+        &state.rbac_index,
+    ) {
+        return Err(Status::forbidden(
+            "cannot escalate privileges: Role is already bound and user does not hold all its rules in this namespace".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Escalation prevention for namespaced RoleBinding writes.
 ///
 /// A user may only create or update a RoleBinding if they already hold every
@@ -3602,6 +3655,167 @@ mod escalation_tests {
             result.is_ok(),
             "creating a ClusterRole with no existing CRB must always be allowed; \
              the role grants nothing until a binding references it, so there is no escalation risk"
+        );
+    }
+
+    // -- namespaced Role create-time escalation (two-step loophole) --
+
+    /// The same two-step loophole check_clusterrole_escalation closes for ClusterRoles,
+    /// mirrored for namespaced Roles: (1) create a RoleBinding referencing a non-existent
+    /// Role → RB check skips (role has no rules); (2) create the Role with wildcard rules
+    /// → binding immediately grants namespace-admin. Before check_role_escalation existed,
+    /// a user with only plain `create`/`update` on `roles`+`rolebindings` in one namespace —
+    /// narrower than any built-in ClusterRole — could self-escalate to full control of that
+    /// namespace via exactly this race.
+    #[test]
+    fn role_create_with_existing_rolebinding_denied_for_unprivileged_user() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "ns-a";
+
+        // Step 1: "alice" creates a RoleBinding in ns-a referencing a not-yet-existing
+        // "evil-role". The RB check allows this (role has no rules yet). Seed the
+        // RoleBinding in the rbac_index as if it was persisted.
+        let evil_rb = serde_json::json!({
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": "evil-role"
+            }
+        });
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/evil-rb"),
+            &evil_rb,
+        );
+
+        // Step 2: "alice" tries to create "evil-role" in ns-a with wildcard rules. The
+        // check must deny this because a RoleBinding referencing "evil-role" already
+        // exists in this namespace and alice does not hold all those rules — without
+        // this, alice gets instant admin over ns-a.
+        let evil_role_body = serde_json::json!({
+            "metadata": {"name": "evil-role", "namespace": ns},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        let alice_user = crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let result =
+            super::check_role_escalation("roles", group, ns, &alice_user, &evil_role_body, &state);
+        assert!(
+            result.is_err(),
+            "creating a namespaced Role with wildcard rules when a RoleBinding already \
+             references it must be denied for a user who does not hold those rules; \
+             missing this check reopens the two-step escalation loophole for Roles"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::FORBIDDEN,
+            "denial must return 403 Forbidden"
+        );
+    }
+
+    /// An admin who holds all the rules they are defining in a Role must be allowed even
+    /// when a RoleBinding already references that role — legitimate namespace RBAC
+    /// management must not be blocked by this check.
+    #[test]
+    fn role_create_with_existing_rolebinding_allowed_for_admin() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "ns-a";
+
+        // Seed cluster-admin role and system:masters binding so admin holds all rules.
+        let admin_role = serde_json::json!({
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin",
+            &admin_role,
+        );
+        let masters_crb = serde_json::json!({
+            "subjects": [{"kind": "Group", "name": "system:masters"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system-masters-cluster-admin",
+            &masters_crb,
+        );
+
+        // A RoleBinding in ns-a references "my-role", which an admin is about to create.
+        let my_rb = serde_json::json!({
+            "subjects": [{"kind": "User", "name": "bob"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": "my-role"
+            }
+        });
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/my-rb"),
+            &my_rb,
+        );
+
+        let my_role_body = serde_json::json!({
+            "metadata": {"name": "my-role", "namespace": ns},
+            "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+        });
+        let admin_user = crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+            extra: Default::default(),
+        };
+        let result =
+            super::check_role_escalation("roles", group, ns, &admin_user, &my_role_body, &state);
+        assert!(
+            result.is_ok(),
+            "an admin who already holds all rules must be allowed to create a Role even \
+             when a RoleBinding already references it — blocking this would prevent \
+             legitimate admin RBAC management"
+        );
+    }
+
+    /// Creating a namespaced Role with no RoleBinding referencing it must always be
+    /// allowed, regardless of the caller's permissions — the role grants nothing until
+    /// bound (role-first ordering, matching upstream and check_clusterrole_escalation).
+    #[test]
+    fn role_create_without_existing_rolebinding_always_allowed() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "ns-a";
+
+        // No RoleBinding references "orphan-role".
+        let orphan_role_body = serde_json::json!({
+            "metadata": {"name": "orphan-role", "namespace": ns},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        let plain_user = crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let result = super::check_role_escalation(
+            "roles",
+            group,
+            ns,
+            &plain_user,
+            &orphan_role_body,
+            &state,
+        );
+        assert!(
+            result.is_ok(),
+            "creating a namespaced Role with no existing RoleBinding must always be \
+             allowed; the role grants nothing until a binding references it, so there is \
+             no escalation risk"
         );
     }
 
