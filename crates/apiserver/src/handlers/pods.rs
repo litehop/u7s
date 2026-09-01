@@ -956,6 +956,15 @@ fn shorten_grace_period_secs(
             period = 1;
         }
     }
+    // The clamp above only ever raises the candidate, never lowers it — if the pod is already
+    // overdue (now_secs already past stored_deletion_timestamp_secs, e.g. stuck on a slow
+    // finalizer, which is exactly this function's target scenario), raising to "now" can land
+    // AFTER the stored timestamp. That is not a shortening: a shorter grace period can only
+    // move deletion earlier than what's already recorded, never later. Treat it as a no-op
+    // instead of silently pushing the deadline out.
+    if new_deletion_timestamp_secs >= stored_deletion_timestamp_secs {
+        return None;
+    }
     Some((new_deletion_timestamp_secs, period))
 }
 
@@ -1012,28 +1021,48 @@ mod shorten_grace_period_secs_tests {
         );
     }
 
-    /// If shortening would move deletionTimestamp into the past, it must clamp to "now" instead
-    /// — kube-apiserver never lets DELETE stamp a deletionTimestamp that has already elapsed,
-    /// since that would make an object briefly "overdue" for a hard delete no actor has
-    /// authorized yet.
+    /// An already-overdue pod (now already past the stored deletionTimestamp — exactly this
+    /// function's target scenario: a pod stuck on a slow finalizer past its deletion time) has
+    /// nothing left to shorten. Naively clamping the computed timestamp up to "now" would land
+    /// AFTER the already-recorded deletionTimestamp, which is not a shortening at all — it
+    /// would silently push the deadline out. This must be a no-op instead: leave the stored
+    /// deletionTimestamp untouched, no generation bump.
+    ///
+    /// Fails on revert: without the `>= stored_deletion_timestamp_secs` guard, this returns
+    /// `Some((5_000, 1))` — 5_000 is later than the stored 2_000, violating the "never later
+    /// than stored" invariant this function exists to enforce.
     #[test]
-    fn shortening_into_the_past_clamps_to_now_and_floors_grace_to_one_second() {
-        // now = 5_000; naive shortened timestamp (1_910) is already in the past.
+    fn shortening_an_already_overdue_pod_is_a_no_op() {
+        // now = 5_000, already past the stored deletionTimestamp (2_000).
         assert_eq!(
             shorten_grace_period_secs(5_000, 2_000, Some(120), Some(30)),
-            Some((5_000, 1))
+            None
         );
     }
 
-    /// An explicit `--grace-period=0` shortening into the past must clamp the timestamp to
-    /// "now" but keep the grace period at exactly 0 — this is the `--force` path, which must
-    /// still land at grace 0 so a finalizer-free pod can hard-delete on its very next
-    /// evaluation instead of being floored to a spurious extra second.
+    /// Same as above but via the `--grace-period=0` (`--force`) path: even a forced shortening
+    /// cannot move an already-overdue pod's deletionTimestamp later than what's stored.
     #[test]
-    fn shortening_to_zero_into_the_past_keeps_grace_at_zero() {
+    fn shortening_to_zero_on_an_already_overdue_pod_is_a_no_op() {
         assert_eq!(
             shorten_grace_period_secs(5_000, 2_000, Some(120), Some(0)),
-            Some((5_000, 0))
+            None
+        );
+    }
+
+    /// A pod that is NOT yet overdue (stored deletionTimestamp still in the future) but whose
+    /// naive shortened timestamp lands before "now" must still clamp to "now" and floor grace
+    /// to 1s — the overdue no-op above must not swallow this legitimate case. The clamped
+    /// result (1_000) stays strictly before the stored deletionTimestamp (1_010), so it's a
+    /// real shortening, not a no-op.
+    #[test]
+    fn shortening_into_the_recent_past_still_before_stored_clamps_to_now_and_floors_grace() {
+        // now = 1_000; stored deletionTimestamp = 1_010 (10s still remaining, not overdue).
+        // naive = 1_010 - 120 + 5 = 895, before "now" -> clamps to now=1_000, which is still
+        // before the stored 1_010.
+        assert_eq!(
+            shorten_grace_period_secs(1_000, 1_010, Some(120), Some(5)),
+            Some((1_000, 1))
         );
     }
 }
