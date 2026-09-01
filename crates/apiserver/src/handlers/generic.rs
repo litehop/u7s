@@ -219,8 +219,11 @@ pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::St
     }
 }
 
-/// Bounded retry budget for generateName collisions on create, matching upstream's
-/// `maxNameGenerationCreateAttempts` (`k8s.io/apiserver/pkg/registry/generic/registry/store.go`).
+/// Bounded retry budget for generateName collisions on create: the maximum number of
+/// TOTAL `store.put` attempts (the first attempt plus any retries), matching upstream's
+/// `maxNameGenerationCreateAttempts` (`k8s.io/apiserver/pkg/registry/generic/registry/store.go`),
+/// which is likewise a total-iteration count (`for i := 0; i < maxNameGenerationCreateAttempts;
+/// i++`), not a retry count on top of an initial attempt.
 pub(crate) const MAX_GENERATE_NAME_CREATE_ATTEMPTS: u32 = 8;
 
 /// Returns the `generateName` prefix when a create request relies on the server picking

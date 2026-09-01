@@ -362,7 +362,11 @@ pub(crate) async fn create_resource<S: Store>(
         return Ok(resp);
     }
 
-    let mut attempt = 0u32;
+    // Counts store.put attempts made so far (the loop's first iteration is attempt 1).
+    // Bounded at MAX_GENERATE_NAME_CREATE_ATTEMPTS TOTAL attempts, matching upstream's
+    // maxNameGenerationCreateAttempts (8 total calls to create(), not 8 retries after
+    // the first — see the guard below).
+    let mut attempts_made = 1u32;
     let new_rv = loop {
         let key = group_object_key(&group, &plural, None, &name);
         let put_start = std::time::Instant::now();
@@ -390,15 +394,34 @@ pub(crate) async fn create_resource<S: Store>(
             // on what the client experiences as a plain create.
             Err(StoreError::AlreadyExists { .. })
                 if generate_name_prefix.is_some()
-                    && attempt < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
+                    && attempts_made < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
             {
-                attempt += 1;
+                attempts_made += 1;
                 name = format!(
                     "{}{}",
                     generate_name_prefix.as_deref().unwrap_or_default(),
                     generate_suffix()
                 );
                 obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+                // Re-validate the regenerated name — mirrors upstream's
+                // createWithGenerateNameRetry, which invokes createValidation (validating
+                // admission) once per attempt, not just for the first candidate name.
+                let retry_ctx = AdmissionContext {
+                    group: &group,
+                    version: &version,
+                    resource: &plural,
+                    name: &name,
+                    namespace: None,
+                    operation: "CREATE",
+                    user_info: Some(serde_json::json!({
+                        "username": user.username,
+                        "uid": user.uid,
+                        "groups": user.groups,
+                        "extra": user.extra,
+                    })),
+                    dry_run: false,
+                };
+                run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
             Err(StoreError::AlreadyExists { .. }) => {
                 let stored = state
@@ -2554,7 +2577,11 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     }
 
     let ns_key = cluster_object_key("namespaces", &ns);
-    let mut attempt = 0u32;
+    // Counts store.put attempts made so far (the loop's first iteration is attempt 1).
+    // Bounded at MAX_GENERATE_NAME_CREATE_ATTEMPTS TOTAL attempts, matching upstream's
+    // maxNameGenerationCreateAttempts (8 total calls to create(), not 8 retries after
+    // the first — see the guard below).
+    let mut attempts_made = 1u32;
     let new_rv = loop {
         let key = group_object_key(&group, &plural, Some(&ns), &name);
         let put_start = std::time::Instant::now();
@@ -2598,15 +2625,34 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             // client experiences as a plain create (e.g. a bulk PVC-creation loop).
             Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
                 if generate_name_prefix.is_some()
-                    && attempt < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
+                    && attempts_made < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
             {
-                attempt += 1;
+                attempts_made += 1;
                 name = format!(
                     "{}{}",
                     generate_name_prefix.as_deref().unwrap_or_default(),
                     generate_suffix()
                 );
                 obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+                // Re-validate the regenerated name — mirrors upstream's
+                // createWithGenerateNameRetry, which invokes createValidation (validating
+                // admission) once per attempt, not just for the first candidate name.
+                let retry_ctx = AdmissionContext {
+                    group: &group,
+                    version: &version,
+                    resource: &plural,
+                    name: &name,
+                    namespace: Some(&ns),
+                    operation: "CREATE",
+                    user_info: Some(serde_json::json!({
+                        "username": user.username,
+                        "uid": user.uid,
+                        "groups": user.groups,
+                        "extra": user.extra,
+                    })),
+                    dry_run: false,
+                };
+                run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
             Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
                 let stored = state
@@ -21893,6 +21939,151 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // MockStore whose EVERY put() fails with AlreadyExists, counting attempts —
+    // simulating exhausted generateName retries (every candidate name collides).
+    //
+    // Used by the retry-bound off-by-one regression test.
+    // ---------------------------------------------------------------------------
+
+    struct AlwaysAlreadyExistsStore {
+        put_attempts: std::sync::atomic::AtomicU32,
+    }
+
+    impl AlwaysAlreadyExistsStore {
+        fn new() -> Self {
+            Self {
+                put_attempts: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        fn put_attempts(&self) -> u32 {
+            self.put_attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl u7s_store::Store for AlwaysAlreadyExistsStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            // A real "already exists" collision means a GET must find something at that
+            // key — otherwise create_namespaced_resource's post-exhaustion 409 fallback
+            // (which reads back "the" existing object to return in the response body)
+            // sees a NotFound and turns it into a spurious 404 instead of the intended
+            // 409. Content doesn't matter to the test, only that it round-trips as JSON.
+            let value = bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "metadata": { "name": "always-exists" }
+                }))
+                .unwrap(),
+            );
+            std::future::ready(Ok(Some(u7s_store::StoreObject {
+                key: key.to_string(),
+                value,
+                revision: 1,
+            })))
+        }
+
+        fn list(
+            &self,
+            _prefix: &str,
+            _opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            std::future::ready(Ok(u7s_store::ListResponse {
+                items: Vec::new(),
+                revision: 0,
+                continue_key: None,
+                remaining_count: None,
+            }))
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            _value: bytes::Bytes,
+            _expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            self.put_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let key = key.to_string();
+            async move { Err(u7s_store::StoreError::AlreadyExists { key }) }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            _expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let key = key.to_string();
+            async move { Err(u7s_store::StoreError::NotFound { key }) }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            _namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            std::future::ready(Ok(Vec::new()))
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            _namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            std::future::ready(Ok(Vec::new()))
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            0
+        }
+
+        fn current_revision(&self) -> u64 {
+            0
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            0
+        }
+    }
+
+    /// Start an axum router on a random local TCP port and return its base URL.
+    ///
+    /// Local to this module rather than shared with `admission.rs`'s identical test-only
+    /// helper: each test module already owns its mock `Store` types the same way (see
+    /// `FirstPutAlreadyExistsStore` above vs `admission.rs`'s equivalents) — one file's
+    /// `#[cfg(test)] mod tests` isn't visible from another.
+    async fn start_mock_admission_webhook_server(
+        router: axum::Router,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock webhook server must not fail");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     /// upstream's pvc-deletion-performance spec (`test/e2e/storage/testsuites/pvcdeletionperf.go`)
     /// creates hundreds of PVCs in a tight loop using bare `metadata.generateName` — the client
     /// never chose a name and has no way to retry a collision itself. Before this fix,
@@ -21954,6 +22145,245 @@ mod tests {
             axum::http::StatusCode::CREATED,
             "a generateName-based create must retry with a fresh suffix on AlreadyExists and \
              succeed, not surface a 409 the client never asked for and cannot retry itself"
+        );
+    }
+
+    /// The cluster-scoped sibling of `create_namespaced_resource_retries_generate_name_
+    /// collision_instead_of_409ing` above: `create_resource` has the identical
+    /// generateName-collision-retry loop, so it must retry past a spurious store-level
+    /// AlreadyExists the same way. This test fails on revert: it forces the very first
+    /// put() to report AlreadyExists regardless of key, and asserts the create still
+    /// succeeds instead of surfacing a 409.
+    #[tokio::test]
+    async fn create_resource_retries_generate_name_collision_instead_of_409ing() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+
+        let store = Arc::new(FirstPutAlreadyExistsStore::new());
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Node is cluster-scoped, matching create_resource's scope; a bare generateName
+        // (no explicit name) puts it through the same retry path a namespaced resource uses.
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "generateName": "node-" }
+        });
+        let admin = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+            extra: Default::default(),
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&node).unwrap());
+
+        let response = create_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            axum::extract::Query(CreateQuery::default()),
+            admin,
+            json_headers(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "a generateName create must retry past a spurious collision, not hard-error: {e:?}"
+            )
+        })
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::CREATED,
+            "a generateName-based create on the cluster-scoped handler must retry with a \
+             fresh suffix on AlreadyExists and succeed, not surface a 409 the client never \
+             asked for and cannot retry itself"
+        );
+    }
+
+    /// If every candidate name collides (pathological, but the retry budget must still be
+    /// bounded), the loop must give up after exactly `MAX_GENERATE_NAME_CREATE_ATTEMPTS`
+    /// TOTAL `put()` calls — matching upstream's `maxNameGenerationCreateAttempts`, which
+    /// counts the first attempt plus retries, not retries alone. An off-by-one here either
+    /// makes one fewer real attempt than upstream (spurious 409 one collision earlier than
+    /// necessary) or one extra (an unbounded-looking retry burst under sustained collisions).
+    /// This test fails on revert of the attempt-counting fix: it forces AlreadyExists on
+    /// EVERY put() and asserts the exact call count.
+    #[tokio::test]
+    async fn create_namespaced_resource_generate_name_retry_gives_up_after_exactly_max_attempts() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+
+        let store = Arc::new(AlwaysAlreadyExistsStore::new());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "generateName": "pvc-", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap());
+
+        let response = create_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("an exhausted generateName retry must 409, not hard-error: {e:?}")
+        })
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::CONFLICT,
+            "once every retry attempt has also collided, the client must finally see a \
+             409 rather than the server retrying forever"
+        );
+        assert_eq!(
+            store.put_attempts(),
+            MAX_GENERATE_NAME_CREATE_ATTEMPTS,
+            "must stop at exactly MAX_GENERATE_NAME_CREATE_ATTEMPTS total put() calls \
+             (upstream's maxNameGenerationCreateAttempts counts the first attempt plus \
+             retries) — one more or one fewer is an off-by-one in the retry bound"
+        );
+    }
+
+    /// The retry loop must re-validate a REGENERATED generateName candidate against
+    /// validating admission, not just the discarded first candidate — mirrors upstream's
+    /// `createWithGenerateNameRetry`, which invokes `createValidation` once per attempt.
+    /// Without this, a validating policy that inspects `metadata.name` (e.g. a
+    /// naming-convention check) would validate a name that never gets persisted and never
+    /// see the name that actually lands in the store after a collision retry.
+    ///
+    /// Regression test: forces exactly one store-level AlreadyExists (one retry) and
+    /// asserts the mock webhook was invoked twice. If validating admission moves back
+    /// outside the retry loop, the webhook is only ever called once and this test fails.
+    #[tokio::test]
+    async fn create_namespaced_resource_revalidates_regenerated_name_on_generate_name_retry() {
+        use axum::extract::{Path, State};
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counter = call_count.clone();
+        let router = Router::new().route(
+            "/validate",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": { "uid": "uid-retry-validate", "allowed": true }
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = start_mock_admission_webhook_server(router).await;
+
+        let store = Arc::new(FirstPutAlreadyExistsStore::new());
+
+        // Seed straight into the wrapped SqliteStore, NOT through `store.put()` — the
+        // wrapper's fire-once AlreadyExists injection must be reserved for the PVC create
+        // below, not consumed by this unrelated setup write.
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "pvc-retry-revalidate-vwc"},
+            "webhooks": [{
+                "name": "pvc.count-calls.example.com",
+                "clientConfig": { "url": format!("{base_url}/validate") },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .inner
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/pvc-retry-revalidate-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "generateName": "pvc-", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap());
+
+        let response = create_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("an always-allow webhook must never block the create: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::CREATED,
+            "an always-allow webhook must never block the create"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "the generateName collision retry must re-run validating admission against the \
+             regenerated name — a count of 1 means the retried name bypassed admission \
+             entirely (validation only ever ran for the first, discarded candidate)"
         );
     }
 
