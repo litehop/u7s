@@ -35,9 +35,10 @@
 //! `resourceslices` individually. u7s doesn't model PV objects at that granularity; those
 //! resources fall through to the same static, un-scoped rule match every other unsubdivided
 //! `system:node` permission gets (see the `_ =>` arm of `authorize`) — identical to today's
-//! behavior, not a regression. Mirror-pod create/delete and the SelfSubjectAccessReview
-//! (`handlers/authorization.rs`) endpoint are not wired to this authorizer; see the PR
-//! description for the follow-on.
+//! behavior, not a regression. Mirror-pod create/delete is not wired to this authorizer (see
+//! the follow-on fix). The SelfSubjectAccessReview/SubjectAccessReview/LocalSubjectAccessReview
+//! endpoints (`handlers/authorization.rs`) DO consult this authorizer, via the `authorized()`
+//! helper defined there.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
@@ -244,7 +245,7 @@ fn extract_pod_edges(body: &serde_json::Value) -> PodEdges {
 /// must actually carry the `system:nodes` group — a CN alone (without the matching
 /// Organization) is not enough, since x509 CN is client-chosen but O is what the issuing CA
 /// controls.
-fn node_identity<'a>(username: &'a str, groups: &[String]) -> Option<&'a str> {
+pub(crate) fn node_identity<'a>(username: &'a str, groups: &[String]) -> Option<&'a str> {
     let name = username.strip_prefix(NODE_USERNAME_PREFIX)?;
     if name.is_empty() || !groups.iter().any(|g| g == NODES_GROUP) {
         return None;

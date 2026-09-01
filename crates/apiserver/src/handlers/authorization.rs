@@ -299,13 +299,22 @@ pub async fn self_subject_rules_review<S: Store>(
         }
     }
 
+    // `enumerate_rules` only walks RBAC RoleBindings/ClusterRoleBindings — it never
+    // consults node_authz, whose `system:node:<name>` grants are per-object (which secret a
+    // node's own pod references, which node/lease name matches its own identity) and cannot
+    // be expressed as a static ResourceRule (no `resourceNames` field, no notion of "this
+    // node's own pods" as a rule). For a node identity, `authorize()` grants access this
+    // response can never list, so `incomplete` must say so; for every other identity
+    // node_authz contributes nothing (see `node_identity`), so RBAC's enumeration is complete.
+    let incomplete = node_authz::node_identity(&user.username, &user.groups).is_some();
+
     let resp = SelfSubjectRulesReviewResponse {
         api_version: "authorization.k8s.io/v1",
         kind: "SelfSubjectRulesReview",
         status: RulesReviewStatus {
             resource_rules,
             non_resource_rules,
-            incomplete: false,
+            incomplete,
         },
     };
 
@@ -1663,6 +1672,43 @@ mod handler_tests {
         assert_eq!(
             val["status"]["incomplete"], false,
             "incomplete must be false when enumeration completed normally"
+        );
+    }
+
+    /// A `system:node:<name>` caller's real access includes node_authz's per-object grants
+    /// (its own pods' secrets, its own Node/Lease), none of which `enumerate_rules` (RBAC
+    /// only) can express as a static rule. Reporting `incomplete: false` here would be a
+    /// lie: `kubectl auth can-i --list` (or any tool trusting this response) would tell an
+    /// operator the node has no access to a secret it can, in fact, read via node_authz.
+    #[tokio::test]
+    async fn ssrr_reports_incomplete_for_a_node_identity() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+                post(self_subject_rules_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "namespace": "default" } });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+            body,
+            user("system:node:node-a", &["system:nodes"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["incomplete"], true,
+            "a system:node:* caller's node_authz-granted rules are per-object and cannot be \
+             enumerated by RBAC's rule resolver, so incomplete must be true — false would \
+             under-report this node's real access"
         );
     }
 
