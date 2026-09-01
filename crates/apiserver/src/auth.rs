@@ -243,54 +243,62 @@ pub(crate) async fn authenticate<S: Store>(
     store: &S,
     sig_cache: &SigCache,
 ) -> AuthnResult {
-    match auth_header {
-        None => {
-            // No Authorization header — try x509 client cert before anonymous fallback.
-            if let Some(cert) = peer_cert {
-                // chain already verified by rustls WebPkiClientVerifier
-                if let Some(user) = extract_client_cert_identity(&cert.0) {
-                    return AuthnResult::Identified(user);
-                }
+    // RFC 7235 auth-scheme tokens are case-insensitive, and upstream's bearertoken
+    // authenticator (bearertoken.go) compares the scheme lowercased. A header that is
+    // missing entirely, or present with a non-"Bearer" scheme (e.g. "Basic ..."), must
+    // both "decline" the same way — falling through to x509 client-cert auth, then
+    // anonymous — rather than hard-failing 401. A hard 401 here would reject a client
+    // whose verified cert alone would have identified it under real kube-apiserver,
+    // since the union authenticator lets a still-available cert authenticate when the
+    // bearer-token authenticator declines instead of erroring.
+    const BEARER_PREFIX: &str = "Bearer ";
+    let bearer_token = auth_header.and_then(|value| {
+        let scheme = value.get(..BEARER_PREFIX.len())?;
+        scheme
+            .eq_ignore_ascii_case(BEARER_PREFIX)
+            .then(|| &value[BEARER_PREFIX.len()..])
+    });
+
+    let Some(token) = bearer_token else {
+        // No usable bearer token — try x509 client cert before anonymous fallback.
+        if let Some(cert) = peer_cert {
+            // chain already verified by rustls WebPkiClientVerifier
+            if let Some(user) = extract_client_cert_identity(&cert.0) {
+                return AuthnResult::Identified(user);
             }
-            // No credential at all → anonymous.
-            AuthnResult::Identified(UserInfo {
-                username: "system:anonymous".to_owned(),
-                uid: String::new(),
-                groups: vec!["system:unauthenticated".to_owned()],
-                extra: HashMap::new(),
-            })
         }
-        Some(value) => {
-            if let Some(token) = value.strip_prefix("Bearer ") {
-                // 1. Check static token map first using constant-time comparison.
-                // HashMap.get() can leak timing information about token prefixes
-                // (SipHash is non-cryptographic). Instead, compare all tokens in
-                // constant time so an attacker cannot distinguish valid prefixes
-                // from invalid ones.
-                if let Some(info) = ct_token_lookup(token_map, token) {
-                    let mut user = info.clone();
-                    // Real Kubernetes always adds system:authenticated to every
-                    // successfully identified user so that ClusterRoleBindings on
-                    // that group (e.g. system:basic-user) apply universally.
-                    if !user.groups.contains(&"system:authenticated".to_owned()) {
-                        user.groups.push("system:authenticated".to_owned());
-                    }
-                    return AuthnResult::Identified(user);
-                }
-                // 2. If a SA decoding key is available, attempt JWT verification.
-                if let Some(key) = sa_decoding_key {
-                    if let Some(user) = try_verify_sa_jwt(token, key, &[], store, sig_cache).await {
-                        return AuthnResult::Identified(user);
-                    }
-                }
-                // 3. Token not recognized — reject.
-                AuthnResult::BadToken
-            } else {
-                // Malformed Authorization header → treat as bad token.
-                AuthnResult::BadToken
-            }
+        // No credential at all → anonymous.
+        return AuthnResult::Identified(UserInfo {
+            username: "system:anonymous".to_owned(),
+            uid: String::new(),
+            groups: vec!["system:unauthenticated".to_owned()],
+            extra: HashMap::new(),
+        });
+    };
+
+    // 1. Check static token map first using constant-time comparison.
+    // HashMap.get() can leak timing information about token prefixes
+    // (SipHash is non-cryptographic). Instead, compare all tokens in
+    // constant time so an attacker cannot distinguish valid prefixes
+    // from invalid ones.
+    if let Some(info) = ct_token_lookup(token_map, token) {
+        let mut user = info.clone();
+        // Real Kubernetes always adds system:authenticated to every
+        // successfully identified user so that ClusterRoleBindings on
+        // that group (e.g. system:basic-user) apply universally.
+        if !user.groups.contains(&"system:authenticated".to_owned()) {
+            user.groups.push("system:authenticated".to_owned());
+        }
+        return AuthnResult::Identified(user);
+    }
+    // 2. If a SA decoding key is available, attempt JWT verification.
+    if let Some(key) = sa_decoding_key {
+        if let Some(user) = try_verify_sa_jwt(token, key, &[], store, sig_cache).await {
+            return AuthnResult::Identified(user);
         }
     }
+    // 3. Token not recognized — reject.
+    AuthnResult::BadToken
 }
 
 /// Parse a DER-encoded X.509 client certificate and extract subject CN and O
@@ -3196,6 +3204,67 @@ mod tests {
         {
             AuthnResult::Identified(u) => assert_eq!(u.username, "bob"),
             AuthnResult::BadToken => panic!("static token must resolve"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authn_non_bearer_scheme_declines_to_cert_auth() {
+        // A non-"Bearer" Authorization scheme (e.g. "Basic ...") must not hard-fail
+        // 401 — upstream's bearertoken authenticator treats a scheme mismatch as
+        // "declined", which lets a still-verified client cert authenticate the
+        // request instead. A hard 401 here would reject a client that real
+        // kube-apiserver would still identify via its cert, just because it (or an
+        // intermediary) also sent an unrelated Basic-auth header.
+        let der = make_cert_der("alice", &["system:masters"]);
+        let cert = PeerCertificate(der);
+        let map = HashMap::new();
+        let req = make_req(Method::GET, "/api/v1/pods", Some("Basic dXNlcjpwYXNz"));
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            Some(&cert),
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await
+        {
+            AuthnResult::Identified(u) => assert_eq!(u.username, "alice"),
+            AuthnResult::BadToken => {
+                panic!("non-bearer scheme must decline to cert auth, not hard-fail 401")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authn_bearer_scheme_is_case_insensitive() {
+        // RFC 7235 auth-scheme tokens are case-insensitive; a client (or proxy)
+        // sending "bearer" instead of "Bearer" must still authenticate via the
+        // token map — matching upstream's bearertoken.go, which lowercases the
+        // scheme before comparing.
+        let mut map = HashMap::new();
+        map.insert(
+            "secret-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+        );
+        let req = make_req(Method::GET, "/api/v1/pods", Some("bearer secret-token"));
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            None,
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await
+        {
+            AuthnResult::Identified(u) => assert_eq!(u.username, "alice"),
+            AuthnResult::BadToken => panic!("lowercase 'bearer' scheme must still authenticate"),
         }
     }
 
