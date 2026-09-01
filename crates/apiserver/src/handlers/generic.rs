@@ -665,8 +665,21 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
     };
 
     if has_finalizers {
-        // Soft delete: stamp deletionTimestamp.
-        obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+        // Soft delete: stamp deletionTimestamp, but only if it isn't already set. Real
+        // kube-apiserver's BeforeDelete does the same — a repeat DELETE on an
+        // already-terminating finalizer'd object is a no-op, not a fresh timestamp. Without
+        // this check, every redundant DELETE (harmless retries are routine — e.g. the
+        // snapshot common-controller re-issuing Delete() on a VolumeSnapshotContent each time
+        // its bound VolumeSnapshot resyncs) would advance deletionTimestamp and defeat the
+        // store's byte-equality no-op check, bumping resourceVersion and firing a watch event
+        // on every call. That resurrects the object in every controller's queue forever,
+        // starving the finalizer-owning controller's own update of a stable resourceVersion
+        // window and livelocking the delete (observed as csi-hostpath's snapshottable_stress
+        // conformance spec timing out waiting for a VolumeSnapshotContent to be deleted).
+        if obj.body["metadata"]["deletionTimestamp"].is_null() {
+            obj.body["metadata"]["deletionTimestamp"] =
+                serde_json::Value::String(utc_now_rfc3339());
+        }
         // The upstream KCM namespace controller watches for status.phase == "Terminating"
         // to trigger finalizer removal.
         if is_namespace {
@@ -1883,6 +1896,42 @@ mod tests {
         assert!(
             result.is_none(),
             "apply_delete_policy must return None (hard-delete) when no finalizers are present"
+        );
+    }
+
+    /// A second DELETE on an already-terminating finalizer'd object must preserve the original
+    /// deletionTimestamp instead of stamping a fresh one. If it re-stamps, the resulting body is
+    /// never byte-identical to what's already stored, so the store's no-op-write check (which
+    /// compares bytes to suppress redundant writes) never fires: every redundant DELETE bumps
+    /// resourceVersion and fires a watch event, which is exactly the livelock that made
+    /// csi-hostpath's snapshottable_stress conformance spec time out waiting 5 minutes for a
+    /// VolumeSnapshotContent to be deleted (its bound VolumeSnapshot's controller re-issues a
+    /// no-op Delete() on every resync).
+    #[test]
+    fn apply_delete_policy_is_idempotent_when_already_terminating() {
+        // Pre-set an already-in-the-past deletionTimestamp, as if this object were re-read from
+        // the store after a prior DELETE already soft-deleted it. A fixed, distinguishable value
+        // (rather than comparing two `now()` stamps, which can collide within the same second)
+        // is what makes this test actually fail if apply_delete_policy re-stamps unconditionally.
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
+                "metadata": {
+                    "name": "my-obj",
+                    "finalizers": ["my.io/cleanup"],
+                    "deletionTimestamp": "2020-01-01T00:00:00Z"
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+        let result = apply_delete_policy(&mut obj).expect("still has finalizers: must soft-delete");
+
+        assert_eq!(
+            result["metadata"]["deletionTimestamp"], "2020-01-01T00:00:00Z",
+            "a repeat DELETE on an already-terminating object must not advance \
+             deletionTimestamp — doing so defeats the store's no-op-write detection and \
+             livelocks finalizer removal under concurrent controller retries"
         );
     }
 
