@@ -779,14 +779,16 @@ pub(crate) fn check_crb_escalation<S: Store>(
         );
         return Ok(());
     }
-    // Kubernetes upstream: a user who holds the `escalate` verb on clusterroles in
-    // rbac.authorization.k8s.io may create a CRB to any ClusterRole without personally
-    // holding all of its rules.  The name-scoped check mirrors upstream: escalate may be
-    // granted cluster-wide (no resourceNames) or scoped to a specific ClusterRole.
-    let escalate_req = AuthzRequest {
+    // Kubernetes upstream (BindingAuthorized): a user who holds the `bind` verb on
+    // clusterroles in rbac.authorization.k8s.io may create a CRB to any ClusterRole
+    // without personally holding all of its rules.  `bind` is distinct from `escalate`
+    // (which only bypasses the check on Role/ClusterRole *authoring*, not on binding
+    // creation) — the name-scoped check mirrors upstream: bind may be granted
+    // cluster-wide (no resourceNames) or scoped to a specific ClusterRole.
+    let bind_req = AuthzRequest {
         username: &user.username,
         groups: &user.groups,
-        verb: "escalate",
+        verb: "bind",
         api_group: RBAC_GROUP,
         resource: CLUSTER_ROLES,
         subresource: "",
@@ -794,7 +796,7 @@ pub(crate) fn check_crb_escalation<S: Store>(
         name: Some(&role_ref_name),
         non_resource_url: None,
     };
-    if state.rbac_index.is_allowed(&escalate_req) {
+    if state.rbac_index.is_allowed(&bind_req) {
         return Ok(());
     }
     if !user_holds_all_rules(&user.username, &user.groups, &role_rules, &state.rbac_index) {
@@ -846,6 +848,59 @@ pub(crate) fn check_clusterrole_escalation<S: Store>(
     Ok(())
 }
 
+/// Escalation prevention for namespaced Role writes.
+///
+/// When a Role is created or updated with non-empty rules, and any RoleBinding
+/// in the same namespace already references that role, the caller must already
+/// hold every rule in the new role spec, scoped to that namespace.  Mirrors
+/// check_clusterrole_escalation's race prevention for namespaced Roles: without
+/// this check a user can do: (1) create RoleBinding → references non-existent
+/// Role → RB check skipped; (2) create Role with wildcard rules → instant
+/// namespace-admin.
+///
+/// The check is skipped when the role has no rules (nothing to escalate)
+/// or when no RoleBinding in the namespace references it yet (role-first
+/// ordering).  system:masters members bypass via the RBAC cluster-admin binding.
+///
+/// Returns `Ok(())` if the check passes, or `Err(403 Forbidden)`.
+pub(crate) fn check_role_escalation<S: Store>(
+    plural: &str,
+    group: &str,
+    namespace: &str,
+    user: &UserInfo,
+    body: &serde_json::Value,
+    state: &AppState<S>,
+) -> Result<(), crate::status::StatusError> {
+    if group != RBAC_GROUP || plural != ROLES {
+        return Ok(());
+    }
+    let role_rules = serde_json::from_value::<crate::rbac::RbacRole>(body.clone())
+        .map(|r| r.rules)
+        .unwrap_or_default();
+    if role_rules.is_empty() {
+        return Ok(());
+    }
+    let role_name = body["metadata"]["name"].as_str().unwrap_or("");
+    if !state
+        .rbac_index
+        .namespace_binding_references_role(namespace, role_name)
+    {
+        return Ok(());
+    }
+    if !user_holds_all_rules_in_namespace(
+        &user.username,
+        &user.groups,
+        &role_rules,
+        namespace,
+        &state.rbac_index,
+    ) {
+        return Err(Status::forbidden(
+            "cannot escalate privileges: Role is already bound and user does not hold all its rules in this namespace".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Escalation prevention for namespaced RoleBinding writes.
 ///
 /// A user may only create or update a RoleBinding if they already hold every
@@ -887,28 +942,30 @@ pub(crate) fn check_rb_escalation<S: Store>(
     if role_rules.is_empty() {
         return Ok(());
     }
-    // Kubernetes upstream: a user who holds the `escalate` verb on the role resource
-    // in rbac.authorization.k8s.io may create a RoleBinding without personally holding
-    // all of the role's rules.  The resource and namespace for the escalate check follow
-    // the roleRef kind:
-    //   - Role → resource "roles", namespace = binding's namespace (namespaced grant)
-    //   - ClusterRole → resource "clusterroles", no namespace (cluster-scoped grant)
-    let (escalate_resource, escalate_namespace) = match role_ref.kind.as_str() {
-        "Role" => (ROLES, Some(namespace)),
-        _ => (CLUSTER_ROLES, None),
+    // Kubernetes upstream (BindingAuthorized): a user who holds the `bind` verb on the
+    // role resource in rbac.authorization.k8s.io may create a RoleBinding without
+    // personally holding all of the role's rules.  `bind` is checked against the
+    // binding's own namespace REGARDLESS of roleRef.Kind — this is what lets an operator
+    // delegate "bind ClusterRole X, but only via RoleBindings in namespace N" without
+    // granting cluster-wide bind. The resource follows the roleRef kind:
+    //   - Role        → resource "roles"
+    //   - ClusterRole → resource "clusterroles"
+    let bind_resource = match role_ref.kind.as_str() {
+        "Role" => ROLES,
+        _ => CLUSTER_ROLES,
     };
-    let escalate_req = AuthzRequest {
+    let bind_req = AuthzRequest {
         username: &user.username,
         groups: &user.groups,
-        verb: "escalate",
+        verb: "bind",
         api_group: RBAC_GROUP,
-        resource: escalate_resource,
+        resource: bind_resource,
         subresource: "",
-        namespace: escalate_namespace,
+        namespace: Some(namespace),
         name: Some(&role_ref.name),
         non_resource_url: None,
     };
-    if state.rbac_index.is_allowed(&escalate_req) {
+    if state.rbac_index.is_allowed(&bind_req) {
         return Ok(());
     }
     if !user_holds_all_rules_in_namespace(
@@ -2817,18 +2874,19 @@ mod escalation_tests {
         );
     }
 
-    // -- escalate-verb bypass (Kubernetes RBAC semantics) --
+    // -- bind-verb bypass (Kubernetes RBAC semantics) --
 
-    /// A user who holds the `escalate` verb on clusterroles in rbac.authorization.k8s.io
+    /// A user who holds the `bind` verb on clusterroles in rbac.authorization.k8s.io
     /// may create a ClusterRoleBinding to any ClusterRole, even without personally holding
-    /// all of its rules.
+    /// all of its rules. Upstream (`BindingAuthorized`) uses `bind` for this, distinct from
+    /// `escalate` (which only bypasses Role/ClusterRole *authoring*, not binding creation).
     ///
     /// WHY THIS MATTERS: sonobuoy's service account has verbs:['*'] on clusterroles
-    /// (which includes 'escalate') but does not hold every rule of every ClusterRole it
+    /// (which includes 'bind') but does not hold every rule of every ClusterRole it
     /// binds subjects to.  Without this bypass the binding is wrongly denied 403, breaking
     /// RBAC conformance and OIDC discovery setup.  Matches Kubernetes upstream semantics.
     #[test]
-    fn crb_escalate_verb_holder_allowed_without_holding_role_rules() {
+    fn crb_bind_verb_holder_allowed_without_holding_role_rules() {
         let state = make_state();
         let group = "rbac.authorization.k8s.io";
 
@@ -2845,29 +2903,29 @@ mod escalation_tests {
             &target_role,
         );
 
-        // Grant "bob" only the `escalate` verb on clusterroles — NOT secrets get/list.
-        let escalate_role = serde_json::json!({
+        // Grant "bob" only the `bind` verb on clusterroles — NOT secrets get/list.
+        let bind_role = serde_json::json!({
             "rules": [{
                 "apiGroups": ["rbac.authorization.k8s.io"],
                 "resources": ["clusterroles"],
-                "verbs": ["escalate"]
+                "verbs": ["bind"]
             }]
         });
-        let escalate_crb = serde_json::json!({
+        let bind_crb = serde_json::json!({
             "subjects": [{"kind": "User", "name": "bob"}],
             "roleRef": {
                 "apiGroup": "rbac.authorization.k8s.io",
                 "kind": "ClusterRole",
-                "name": "escalate-clusterroles"
+                "name": "bind-clusterroles"
             }
         });
         state.rbac_index.apply_object(
-            "/apis/rbac.authorization.k8s.io/v1/clusterroles/escalate-clusterroles",
-            &escalate_role,
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/bind-clusterroles",
+            &bind_role,
         );
         state.rbac_index.apply_object(
-            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/bob-escalate",
-            &escalate_crb,
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/bob-bind",
+            &bind_crb,
         );
 
         let bob = crate::auth::UserInfo {
@@ -2891,90 +2949,39 @@ mod escalation_tests {
             super::check_crb_escalation("clusterrolebindings", group, &bob, &crb_body, &state);
         assert!(
             result.is_ok(),
-            "user with 'escalate' verb on clusterroles may bind any ClusterRole without \
+            "user with 'bind' verb on clusterroles may bind any ClusterRole without \
              personally holding its rules — matches Kubernetes upstream RBAC semantics; \
              without this bypass sonobuoy's RBAC conformance tests and OIDC discovery fail"
         );
     }
 
-    /// A user who does NOT hold the `escalate` verb AND does NOT hold the role's rules
-    /// must still be denied — the privilege-escalation guard must not be weakened.
-    ///
-    /// WHY THIS MATTERS: the escalate bypass must be additive, not a blanket weakening.
-    /// A user with only `create` on clusterrolebindings (but no escalate and no rules)
-    /// must still receive 403 when trying to bind a role they don't hold.
+    /// A user who holds ONLY `escalate` (not `bind`) on clusterroles must still be DENIED
+    /// creating a ClusterRoleBinding to a role they don't hold. Upstream separates these
+    /// two verbs deliberately: `escalate` bypasses the check on Role/ClusterRole
+    /// *authoring*, `bind` bypasses it on binding *creation*. Conflating them (as u7s did
+    /// before this fix, checking `escalate` for both) would let an `escalate`-only holder
+    /// transitively gain `bind` power — e.g. bind cluster-admin to any subject — without
+    /// ever being granted `bind`.
     #[test]
-    fn crb_without_escalate_and_without_rules_still_denied() {
+    fn crb_escalate_alone_does_not_grant_bind_privilege() {
         let state = make_state();
         let group = "rbac.authorization.k8s.io";
 
-        // Seed a ClusterRole with rules.
+        // Seed a powerful ClusterRole that "bob" does NOT hold.
         let target_role = serde_json::json!({
             "rules": [{
-                "apiGroups": [""],
-                "resources": ["secrets"],
-                "verbs": ["get"]
+                "apiGroups": ["*"],
+                "resources": ["*"],
+                "verbs": ["*"]
             }]
         });
         state.rbac_index.apply_object(
-            "/apis/rbac.authorization.k8s.io/v1/clusterroles/secret-reader",
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin",
             &target_role,
         );
 
-        // "eve" has NO escalate and NO secrets/get — cannot bind secret-reader.
-        let eve = crate::auth::UserInfo {
-            username: "eve".into(),
-            uid: String::new(),
-            groups: vec![],
-            extra: Default::default(),
-        };
-        let crb_body = serde_json::json!({
-            "apiVersion": "rbac.authorization.k8s.io/v1",
-            "kind": "ClusterRoleBinding",
-            "metadata": {"name": "eve-secret-reader"},
-            "subjects": [{"kind": "User", "name": "eve"}],
-            "roleRef": {
-                "apiGroup": "rbac.authorization.k8s.io",
-                "kind": "ClusterRole",
-                "name": "secret-reader"
-            }
-        });
-        let result =
-            super::check_crb_escalation("clusterrolebindings", group, &eve, &crb_body, &state);
-        assert!(
-            result.is_err(),
-            "user without 'escalate' verb and without the role's rules must be denied — \
-             privilege-escalation guard must remain intact; \
-             if this passes, unprivileged users can grant themselves arbitrary permissions"
-        );
-    }
-
-    /// A user with `escalate` on clusterroles may bind a ClusterRole via a RoleBinding
-    /// without holding the ClusterRole's rules.
-    ///
-    /// WHY THIS MATTERS: RoleBindings can reference ClusterRoles.  The escalate bypass
-    /// must also cover this path, or a user with global escalate-on-clusterroles is
-    /// still blocked when creating a namespace-scoped RoleBinding.
-    #[test]
-    fn rb_referencing_clusterrole_with_escalate_verb_allowed() {
-        let state = make_state();
-        let group = "rbac.authorization.k8s.io";
-        let ns = "test-ns";
-
-        // Seed a ClusterRole with rules that "bob" does NOT hold.
-        let target_role = serde_json::json!({
-            "rules": [{
-                "apiGroups": [""],
-                "resources": ["configmaps"],
-                "verbs": ["get"]
-            }]
-        });
-        state.rbac_index.apply_object(
-            "/apis/rbac.authorization.k8s.io/v1/clusterroles/configmap-reader",
-            &target_role,
-        );
-
-        // Grant "bob" escalate on clusterroles.
+        // Grant "bob" only `escalate` on clusterroles — NOT `bind`, and none of
+        // cluster-admin's rules.
         let escalate_role = serde_json::json!({
             "rules": [{
                 "apiGroups": ["rbac.authorization.k8s.io"],
@@ -3005,6 +3012,210 @@ mod escalation_tests {
             groups: vec![],
             extra: Default::default(),
         };
+        let crb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "bob-cluster-admin"},
+            "subjects": [{"kind": "User", "name": "bob"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        let result =
+            super::check_crb_escalation("clusterrolebindings", group, &bob, &crb_body, &state);
+        assert!(
+            result.is_err(),
+            "'escalate' on clusterroles must NOT bypass the bind check — an escalate-only \
+             holder must not be able to bind themselves to cluster-admin; if this passes, \
+             escalate-only grants transitively confer bind power upstream never grants them"
+        );
+    }
+
+    /// A user granted `bind` scoped to a specific ClusterRole name (via resourceNames),
+    /// but no `escalate` and none of the role's own rules, may still create a
+    /// ClusterRoleBinding to exactly that named role — upstream's delegation pattern for
+    /// letting an operator hand out narrow binding power without full escalate.
+    #[test]
+    fn crb_bind_scoped_by_resource_name_allows_only_that_role() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        let target_role = serde_json::json!({
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["get", "list"]
+            }]
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/secret-reader",
+            &target_role,
+        );
+
+        // Grant "bob" `bind` scoped ONLY to the "secret-reader" ClusterRole by name.
+        let bind_role = serde_json::json!({
+            "rules": [{
+                "apiGroups": ["rbac.authorization.k8s.io"],
+                "resources": ["clusterroles"],
+                "resourceNames": ["secret-reader"],
+                "verbs": ["bind"]
+            }]
+        });
+        let bind_crb = serde_json::json!({
+            "subjects": [{"kind": "User", "name": "bob"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "bind-secret-reader-only"
+            }
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/bind-secret-reader-only",
+            &bind_role,
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/bob-bind-scoped",
+            &bind_crb,
+        );
+
+        let bob = crate::auth::UserInfo {
+            username: "bob".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let crb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "bob-secret-reader"},
+            "subjects": [{"kind": "User", "name": "carol"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "secret-reader"
+            }
+        });
+        let result =
+            super::check_crb_escalation("clusterrolebindings", group, &bob, &crb_body, &state);
+        assert!(
+            result.is_ok(),
+            "'bind' scoped to a specific ClusterRole name via resourceNames must allow \
+             binding exactly that role without holding its rules or holding escalate — \
+             this is upstream's narrow binding-delegation pattern"
+        );
+    }
+
+    /// A user who does NOT hold the `bind` verb AND does NOT hold the role's rules
+    /// must still be denied — the privilege-escalation guard must not be weakened.
+    ///
+    /// WHY THIS MATTERS: the bind bypass must be additive, not a blanket weakening.
+    /// A user with only `create` on clusterrolebindings (but no bind and no rules)
+    /// must still receive 403 when trying to bind a role they don't hold.
+    #[test]
+    fn crb_without_bind_and_without_rules_still_denied() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        // Seed a ClusterRole with rules.
+        let target_role = serde_json::json!({
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["get"]
+            }]
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/secret-reader",
+            &target_role,
+        );
+
+        // "eve" has NO bind and NO secrets/get — cannot bind secret-reader.
+        let eve = crate::auth::UserInfo {
+            username: "eve".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let crb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "eve-secret-reader"},
+            "subjects": [{"kind": "User", "name": "eve"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "secret-reader"
+            }
+        });
+        let result =
+            super::check_crb_escalation("clusterrolebindings", group, &eve, &crb_body, &state);
+        assert!(
+            result.is_err(),
+            "user without 'bind' verb and without the role's rules must be denied — \
+             privilege-escalation guard must remain intact; \
+             if this passes, unprivileged users can grant themselves arbitrary permissions"
+        );
+    }
+
+    /// A user with `bind` on clusterroles may bind a ClusterRole via a RoleBinding
+    /// without holding the ClusterRole's rules.
+    ///
+    /// WHY THIS MATTERS: RoleBindings can reference ClusterRoles.  The bind bypass
+    /// must also cover this path, or a user with global bind-on-clusterroles is
+    /// still blocked when creating a namespace-scoped RoleBinding.
+    #[test]
+    fn rb_referencing_clusterrole_with_bind_verb_allowed() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "test-ns";
+
+        // Seed a ClusterRole with rules that "bob" does NOT hold.
+        let target_role = serde_json::json!({
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["configmaps"],
+                "verbs": ["get"]
+            }]
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/configmap-reader",
+            &target_role,
+        );
+
+        // Grant "bob" bind on clusterroles, cluster-wide (via a ClusterRoleBinding), so
+        // it applies regardless of which namespace the RoleBinding is created in.
+        let bind_role = serde_json::json!({
+            "rules": [{
+                "apiGroups": ["rbac.authorization.k8s.io"],
+                "resources": ["clusterroles"],
+                "verbs": ["bind"]
+            }]
+        });
+        let bind_crb = serde_json::json!({
+            "subjects": [{"kind": "User", "name": "bob"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "bind-clusterroles"
+            }
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/bind-clusterroles",
+            &bind_role,
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/bob-bind",
+            &bind_crb,
+        );
+
+        let bob = crate::auth::UserInfo {
+            username: "bob".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
         let rb_body = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "RoleBinding",
@@ -3019,20 +3230,20 @@ mod escalation_tests {
         let result = super::check_rb_escalation("rolebindings", group, ns, &bob, &rb_body, &state);
         assert!(
             result.is_ok(),
-            "user with 'escalate' on clusterroles may create a RoleBinding referencing \
+            "user with 'bind' on clusterroles may create a RoleBinding referencing \
              a ClusterRole without holding the ClusterRole's rules — matches Kubernetes \
              upstream RBAC semantics for RoleBindings referencing ClusterRoles"
         );
     }
 
-    /// A user without `escalate` and without the role's rules must be denied a RoleBinding
+    /// A user without `bind` and without the role's rules must be denied a RoleBinding
     /// to a ClusterRole — the namespace-scoped escalation guard must remain intact.
     ///
     /// WHY THIS MATTERS: RoleBindings are the primary way namespaced RBAC is granted.
     /// An unprivileged user must not be able to bind a ClusterRole they don't hold to
     /// grant themselves or others arbitrary permissions within a namespace.
     #[test]
-    fn rb_referencing_clusterrole_without_escalate_still_denied() {
+    fn rb_referencing_clusterrole_without_bind_still_denied() {
         let state = make_state();
         let group = "rbac.authorization.k8s.io";
         let ns = "test-ns";
@@ -3050,7 +3261,7 @@ mod escalation_tests {
             &target_role,
         );
 
-        // "eve" has neither escalate nor configmaps/get.
+        // "eve" has neither bind nor configmaps/get.
         let eve = crate::auth::UserInfo {
             username: "eve".into(),
             uid: String::new(),
@@ -3071,9 +3282,99 @@ mod escalation_tests {
         let result = super::check_rb_escalation("rolebindings", group, ns, &eve, &rb_body, &state);
         assert!(
             result.is_err(),
-            "user without 'escalate' and without the role's rules must be denied a RoleBinding — \
+            "user without 'bind' and without the role's rules must be denied a RoleBinding — \
              privilege-escalation guard must remain intact for namespace-scoped bindings; \
              if this passes, unprivileged users can grant themselves arbitrary namespace permissions"
+        );
+    }
+
+    /// A namespace-scoped `bind` grant (via a namespaced Role bound in that namespace) must
+    /// authorize a RoleBinding→ClusterRole reference ONLY in the namespace where it was
+    /// granted, matching upstream's `bindingNamespace` scoping (which applies regardless of
+    /// roleRef.Kind). Before this fix the check always passed `namespace: None` for a
+    /// ClusterRole roleRef, which — since `is_allowed` only consults namespace-scoped
+    /// bindings when the request carries a namespace — meant a namespaced Role could NEVER
+    /// grant this bypass at all, silently dropping upstream's namespace-delegation pattern.
+    #[test]
+    fn rb_bind_via_namespaced_role_is_scoped_to_that_namespace() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "test-ns";
+        let other_ns = "other-ns";
+
+        let target_role = serde_json::json!({
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["configmaps"],
+                "verbs": ["get"]
+            }]
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/configmap-reader",
+            &target_role,
+        );
+
+        // Grant "dave" `bind` on clusterroles (scoped to "configmap-reader" by name) via a
+        // namespaced Role bound only in `ns` — NOT a ClusterRole/ClusterRoleBinding.
+        let bind_role = serde_json::json!({
+            "rules": [{
+                "apiGroups": ["rbac.authorization.k8s.io"],
+                "resources": ["clusterroles"],
+                "resourceNames": ["configmap-reader"],
+                "verbs": ["bind"]
+            }]
+        });
+        state.rbac_index.apply_object(
+            &format!(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/roles/bind-configmap-reader"
+            ),
+            &bind_role,
+        );
+        let bind_rb = serde_json::json!({
+            "subjects": [{"kind": "User", "name": "dave"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": "bind-configmap-reader"
+            }
+        });
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/dave-bind"),
+            &bind_rb,
+        );
+
+        let dave = crate::auth::UserInfo {
+            username: "dave".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let rb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": "dave-rb"},
+            "subjects": [{"kind": "User", "name": "carol"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "configmap-reader"
+            }
+        });
+        let allowed =
+            super::check_rb_escalation("rolebindings", group, ns, &dave, &rb_body, &state);
+        assert!(
+            allowed.is_ok(),
+            "the namespace-scoped 'bind' grant must authorize the RoleBinding in the \
+             namespace it was granted in, even though the roleRef targets a ClusterRole"
+        );
+
+        let denied =
+            super::check_rb_escalation("rolebindings", group, other_ns, &dave, &rb_body, &state);
+        assert!(
+            denied.is_err(),
+            "the namespace-scoped 'bind' grant must NOT authorize the same RoleBinding in a \
+             different namespace — upstream scopes 'bind' to bindingNamespace regardless of \
+             roleRef.Kind, so delegation must not leak cluster-wide"
         );
     }
 
@@ -3354,6 +3655,167 @@ mod escalation_tests {
             result.is_ok(),
             "creating a ClusterRole with no existing CRB must always be allowed; \
              the role grants nothing until a binding references it, so there is no escalation risk"
+        );
+    }
+
+    // -- namespaced Role create-time escalation (two-step loophole) --
+
+    /// The same two-step loophole check_clusterrole_escalation closes for ClusterRoles,
+    /// mirrored for namespaced Roles: (1) create a RoleBinding referencing a non-existent
+    /// Role → RB check skips (role has no rules); (2) create the Role with wildcard rules
+    /// → binding immediately grants namespace-admin. Before check_role_escalation existed,
+    /// a user with only plain `create`/`update` on `roles`+`rolebindings` in one namespace —
+    /// narrower than any built-in ClusterRole — could self-escalate to full control of that
+    /// namespace via exactly this race.
+    #[test]
+    fn role_create_with_existing_rolebinding_denied_for_unprivileged_user() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "ns-a";
+
+        // Step 1: "alice" creates a RoleBinding in ns-a referencing a not-yet-existing
+        // "evil-role". The RB check allows this (role has no rules yet). Seed the
+        // RoleBinding in the rbac_index as if it was persisted.
+        let evil_rb = serde_json::json!({
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": "evil-role"
+            }
+        });
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/evil-rb"),
+            &evil_rb,
+        );
+
+        // Step 2: "alice" tries to create "evil-role" in ns-a with wildcard rules. The
+        // check must deny this because a RoleBinding referencing "evil-role" already
+        // exists in this namespace and alice does not hold all those rules — without
+        // this, alice gets instant admin over ns-a.
+        let evil_role_body = serde_json::json!({
+            "metadata": {"name": "evil-role", "namespace": ns},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        let alice_user = crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let result =
+            super::check_role_escalation("roles", group, ns, &alice_user, &evil_role_body, &state);
+        assert!(
+            result.is_err(),
+            "creating a namespaced Role with wildcard rules when a RoleBinding already \
+             references it must be denied for a user who does not hold those rules; \
+             missing this check reopens the two-step escalation loophole for Roles"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::FORBIDDEN,
+            "denial must return 403 Forbidden"
+        );
+    }
+
+    /// An admin who holds all the rules they are defining in a Role must be allowed even
+    /// when a RoleBinding already references that role — legitimate namespace RBAC
+    /// management must not be blocked by this check.
+    #[test]
+    fn role_create_with_existing_rolebinding_allowed_for_admin() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "ns-a";
+
+        // Seed cluster-admin role and system:masters binding so admin holds all rules.
+        let admin_role = serde_json::json!({
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin",
+            &admin_role,
+        );
+        let masters_crb = serde_json::json!({
+            "subjects": [{"kind": "Group", "name": "system:masters"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system-masters-cluster-admin",
+            &masters_crb,
+        );
+
+        // A RoleBinding in ns-a references "my-role", which an admin is about to create.
+        let my_rb = serde_json::json!({
+            "subjects": [{"kind": "User", "name": "bob"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": "my-role"
+            }
+        });
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/my-rb"),
+            &my_rb,
+        );
+
+        let my_role_body = serde_json::json!({
+            "metadata": {"name": "my-role", "namespace": ns},
+            "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+        });
+        let admin_user = crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+            extra: Default::default(),
+        };
+        let result =
+            super::check_role_escalation("roles", group, ns, &admin_user, &my_role_body, &state);
+        assert!(
+            result.is_ok(),
+            "an admin who already holds all rules must be allowed to create a Role even \
+             when a RoleBinding already references it — blocking this would prevent \
+             legitimate admin RBAC management"
+        );
+    }
+
+    /// Creating a namespaced Role with no RoleBinding referencing it must always be
+    /// allowed, regardless of the caller's permissions — the role grants nothing until
+    /// bound (role-first ordering, matching upstream and check_clusterrole_escalation).
+    #[test]
+    fn role_create_without_existing_rolebinding_always_allowed() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "ns-a";
+
+        // No RoleBinding references "orphan-role".
+        let orphan_role_body = serde_json::json!({
+            "metadata": {"name": "orphan-role", "namespace": ns},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        let plain_user = crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let result = super::check_role_escalation(
+            "roles",
+            group,
+            ns,
+            &plain_user,
+            &orphan_role_body,
+            &state,
+        );
+        assert!(
+            result.is_ok(),
+            "creating a namespaced Role with no existing RoleBinding must always be \
+             allowed; the role grants nothing until a binding references it, so there is \
+             no escalation risk"
         );
     }
 

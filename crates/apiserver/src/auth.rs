@@ -3794,8 +3794,13 @@ mod tests {
     }
 
     /// ClusterRole granting `impersonate` on `users`/`groups` (core group) AND
-    /// `uids`/`userextras` (authentication.k8s.io), bound to alice — the superset needed
-    /// to exercise full Impersonate-Uid / Impersonate-Extra-* substitution.
+    /// `uids`/`userextras/known-languages` (authentication.k8s.io), bound to alice — the
+    /// superset needed to exercise full Impersonate-Uid / Impersonate-Extra-* substitution.
+    /// The extra-key grant names the exact key (`known-languages`) rather than a
+    /// `userextras/*` wildcard: upstream's RBAC has no `resource/*` special case, so
+    /// authorizing "any extra key" requires either enumerating each key or the real
+    /// `*/known-languages` cross-resource wildcard — this fixture uses the former, which is
+    /// the pattern a real operator would write to scope impersonation to one extra key.
     fn make_rbac_with_full_impersonation() -> Arc<RbacIndex> {
         let idx = Arc::new(RbacIndex::new());
 
@@ -3803,7 +3808,7 @@ mod tests {
         let role_val = serde_json::json!({
             "rules": [
                 { "apiGroups": [""], "resources": ["users", "groups"], "verbs": ["impersonate"] },
-                { "apiGroups": ["authentication.k8s.io"], "resources": ["uids", "userextras/*"], "verbs": ["impersonate"] }
+                { "apiGroups": ["authentication.k8s.io"], "resources": ["uids", "userextras/known-languages"], "verbs": ["impersonate"] }
             ]
         });
         idx.apply_object(role_key, &role_val);

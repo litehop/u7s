@@ -1751,11 +1751,13 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:bootstrap-installer", "uid": "00000000-0000-0000-0000-000000000079", "creationTimestamp": TS },
         "rules": [
-            // "escalate" lets this identity SSA-apply a ClusterRoleBinding to a
+            // "bind" lets this identity SSA-apply a ClusterRoleBinding to a
             // ClusterRole (e.g. CoreDNS's system:coredns) whose rules it doesn't hold
             // itself — without it, RBAC escalation-prevention on the SSA-create path
-            // makes every real cluster boot fail to install CoreDNS's RBAC.
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update","escalate"] },
+            // makes every real cluster boot fail to install CoreDNS's RBAC. This is
+            // distinct from "escalate", which only bypasses the check when authoring a
+            // Role/ClusterRole's own rules, not when creating a binding to one.
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update","bind"] },
             { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services","namespaces"], "verbs": ["get","create","patch","update"] },
             { "apiGroups": ["apps"], "resources": ["deployments","daemonsets"], "verbs": ["get","create","patch","update"] }
         ]

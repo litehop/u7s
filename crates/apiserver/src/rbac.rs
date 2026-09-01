@@ -214,6 +214,24 @@ impl RbacIndex {
         })
     }
 
+    /// Return true if any RoleBinding in `namespace` references the named (namespaced)
+    /// Role.
+    ///
+    /// Used by escalation prevention: when a Role is created or updated with rules, we
+    /// must check whether any RoleBinding in the same namespace already points to it so
+    /// that the role-creator also holds those rules — the namespaced mirror of
+    /// `clusterrole_has_bindings`.
+    pub fn namespace_binding_references_role(&self, namespace: &str, role_name: &str) -> bool {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.namespace_bindings.iter().any(|(_, b)| {
+            let binding_ns = b.namespace.as_deref().unwrap_or("");
+            binding_ns == namespace
+                && b.role_ref.kind == "Role"
+                && b.role_ref.api_group == "rbac.authorization.k8s.io"
+                && b.role_ref.name == role_name
+        })
+    }
+
     pub fn is_allowed(&self, req: &AuthzRequest<'_>) -> bool {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
 
@@ -567,27 +585,33 @@ fn rule_covers(rule: &PolicyRule, req: &AuthzRequest<'_>) -> bool {
     true
 }
 
-/// Match rule resource strings against a (resource, subresource) pair.
+/// Match rule resource strings against a (resource, subresource) pair, mirroring upstream
+/// `ResourceMatches` (`pkg/apis/rbac/v1/evaluation_helpers.go`) exactly.
 ///
 /// - `"*"` matches any resource+subresource combination.
-/// - `"pods"` matches resource=pods, subresource="" only.
-/// - `"pods/log"` matches resource=pods, subresource=log.
-/// - `"pods/*"` matches resource=pods with any non-empty subresource.
+/// - `"pods"` matches resource=pods, subresource="" only (exact combined-string match).
+/// - `"pods/log"` matches resource=pods, subresource=log only (exact combined-string match).
+/// - `"pods/*"` is NOT a wildcard: it only matches the literal combined string "pods/*",
+///   which no real request ever has — upstream has no `resource/*` special case, so a rule
+///   author scoping a grant to `pods/*` grants nothing rather than "any pods subresource".
+/// - `"*/log"` matches ANY resource with subresource=log (e.g. pods/log, deployments/log) —
+///   this is upstream's real cross-resource subresource wildcard.
 fn resource_matches(rule_resources: &[String], resource: &str, subresource: &str) -> bool {
     rule_resources.iter().any(|r| {
         if r == "*" {
             return true;
         }
-        if let Some((res, sub)) = r.split_once('/') {
-            // e.g. "pods/log" or "pods/*"
-            if res != resource {
-                return false;
-            }
-            sub == "*" || sub == subresource
-        } else {
-            // Plain resource, no subresource separator.
-            r == resource && subresource.is_empty()
+        // Exact match on the combined "resource" or "resource/subresource" string.
+        let exact = match r.split_once('/') {
+            Some((res, sub)) => res == resource && sub == subresource,
+            None => subresource.is_empty() && r == resource,
+        };
+        if exact {
+            return true;
         }
+        // Cross-resource wildcard: "*/subresource" matches any resource with that exact
+        // subresource, regardless of the resource name.
+        !subresource.is_empty() && r.strip_prefix("*/").is_some_and(|sub| sub == subresource)
     })
 }
 
@@ -733,14 +757,14 @@ mod tests {
 
     #[test]
     fn test_cluster_role_binding() {
-        // A ClusterRoleBinding grants get/list on pods/* in any namespace.
+        // A ClusterRoleBinding grants get/list on pods in any namespace.
         let idx = RbacIndex::new();
 
         let (role_key, role_val) = make_cluster_role(
             "pod-reader",
             json!([{
                 "apiGroups": [""],
-                "resources": ["pods/*"],
+                "resources": ["pods"],
                 "verbs": ["get", "list"]
             }]),
         );
@@ -906,6 +930,99 @@ mod tests {
         assert!(
             !idx.is_allowed(&r_pods),
             "plain pods must be denied when rule only covers pods/log"
+        );
+    }
+
+    /// A `resources: ["pods/*"]` rule must NOT grant the bare `pods` resource. Upstream's
+    /// `ResourceMatches` has no `resource/*` special case — only exact combined-string
+    /// equality or the dedicated `*/subresource` wildcard apply — so a rule author who
+    /// writes `pods/*` intending "any pods subresource" must not silently also get base
+    /// pod get/list/watch/delete, which would be a real privilege escalation vs. upstream.
+    #[test]
+    fn resource_slash_star_does_not_match_bare_resource() {
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-subresource-only",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods/*"],
+                "verbs": ["get"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "dave-pod-subresource-only",
+            "pod-subresource-only",
+            json!([{ "kind": "User", "name": "dave" }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+        let r_bare = req("dave", &groups, "get", "pods", "", Some("default"), None);
+        assert!(
+            !idx.is_allowed(&r_bare),
+            "a 'pods/*' rule must not leak access to the bare 'pods' resource — that would \
+             let a subresource-scoped grant (e.g. pods/log) also read/delete whole pods"
+        );
+    }
+
+    /// A `resources: ["*/log"]` rule must match the `log` subresource across ANY resource
+    /// (e.g. both pods/log and deployments/log) — upstream's real cross-resource
+    /// subresource wildcard. Without this, delegation patterns like "let this role read
+    /// the log subresource everywhere" silently grant nothing, diverging from upstream.
+    #[test]
+    fn star_slash_subresource_matches_across_resources() {
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "any-log-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["*/log"],
+                "verbs": ["get"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "erin-any-log-reader",
+            "any-log-reader",
+            json!([{ "kind": "User", "name": "erin" }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+        let r_pod_log = req("erin", &groups, "get", "pods", "log", Some("default"), None);
+        assert!(
+            idx.is_allowed(&r_pod_log),
+            "'*/log' must match pods/log — upstream's cross-resource subresource wildcard"
+        );
+        let r_deploy_log = req(
+            "erin",
+            &groups,
+            "get",
+            "deployments",
+            "log",
+            Some("default"),
+            None,
+        );
+        assert!(
+            idx.is_allowed(&r_deploy_log),
+            "'*/log' must match deployments/log too — the wildcard is resource-agnostic"
+        );
+        let r_pod_status = req(
+            "erin",
+            &groups,
+            "get",
+            "pods",
+            "status",
+            Some("default"),
+            None,
+        );
+        assert!(
+            !idx.is_allowed(&r_pod_status),
+            "'*/log' must not match a different subresource (status) — the wildcard is \
+             scoped to the exact subresource string, not all subresources"
         );
     }
 
