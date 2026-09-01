@@ -2315,7 +2315,10 @@ pub async fn create_cr<S: Store>(
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let mut wrapped = crate::types::Object { body: obj };
-    let name = crate::handlers::generic::resolve_name(&mut wrapped)?;
+    // Captured before resolve_name mutates metadata.name, so a store collision below
+    // knows whether it's allowed to retry under a freshly generated name.
+    let generate_name_prefix = crate::handlers::generic::wants_generate_name(&wrapped);
+    let mut name = crate::handlers::generic::resolve_name(&mut wrapped)?;
     let mut obj = wrapped.body;
     validate_cr_name(&name)?;
 
@@ -2353,13 +2356,57 @@ pub async fn create_cr<S: Store>(
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
-    let key = cr_store_key(&group, &plural, None, &name);
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
-    let rv = state
-        .store
-        .put(&key, Bytes::from(bytes), Some(0))
-        .await
-        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+    // Counts store.put attempts made so far (the loop's first iteration is attempt 1).
+    // Bounded at MAX_GENERATE_NAME_CREATE_ATTEMPTS TOTAL attempts, mirroring
+    // create_resource/create_namespaced_resource's generateName-collision retry (see
+    // resource.rs) — a controller mass-creating CRs via bare `metadata.generateName` must
+    // not see a spurious 409 just because the server's random suffix landed on an existing
+    // name.
+    let mut attempts_made = 1u32;
+    let rv = loop {
+        let key = cr_store_key(&group, &plural, None, &name);
+        let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+        match state.store.put(&key, Bytes::from(bytes), Some(0)).await {
+            Ok(rv) => break rv,
+            // The client never chose this name (it came from generateName) — a collision is
+            // the server's random suffix landing on an existing object, not a real conflict
+            // the client should see. Retry with a fresh suffix instead of surfacing a
+            // spurious 409 on what the client experiences as a plain create.
+            Err(u7s_store::StoreError::AlreadyExists { .. })
+                if generate_name_prefix.is_some()
+                    && attempts_made
+                        < crate::handlers::generic::MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
+            {
+                attempts_made += 1;
+                name = format!(
+                    "{}{}",
+                    generate_name_prefix.as_deref().unwrap_or_default(),
+                    crate::handlers::generic::generate_suffix()
+                );
+                obj["metadata"]["name"] = serde_json::Value::String(name.clone());
+                // Re-validate the regenerated name — mirrors create_resource's retry, which
+                // re-runs validating admission once per attempt, not just for the first
+                // candidate name.
+                let retry_ctx = AdmissionContext {
+                    group: &group,
+                    version: &version,
+                    resource: &plural,
+                    name: &name,
+                    namespace: None,
+                    operation: "CREATE",
+                    user_info: Some(serde_json::json!({
+                        "username": user.username,
+                        "uid": user.uid,
+                        "groups": user.groups,
+                        "extra": user.extra,
+                    })),
+                    dry_run: false,
+                };
+                run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
+            }
+            Err(e) => return Err(store_err_cr(e, &name, &ctx.kind)),
+        }
+    };
 
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
@@ -3177,7 +3224,10 @@ pub async fn create_cr_namespaced<S: Store>(
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let mut wrapped = crate::types::Object { body: obj };
-    let name = crate::handlers::generic::resolve_name(&mut wrapped)?;
+    // Captured before resolve_name mutates metadata.name, so a store collision below
+    // knows whether it's allowed to retry under a freshly generated name.
+    let generate_name_prefix = crate::handlers::generic::wants_generate_name(&wrapped);
+    let mut name = crate::handlers::generic::resolve_name(&mut wrapped)?;
     let mut obj = wrapped.body;
     validate_cr_name(&name)?;
 
@@ -3225,25 +3275,71 @@ pub async fn create_cr_namespaced<S: Store>(
     let _quota_lock = state.quota_admission_locks.lock(&ns).await;
     crate::quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj)).await?;
 
-    let key = cr_store_key(&group, &plural, Some(&ns), &name);
     let ns_key = cluster_object_key("namespaces", &ns);
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     // Namespace-Terminating check and the create are one atomic store transaction — matches
     // kube-apiserver behaviour: 403 Forbidden "unable to create new content in namespace <ns>
     // because it is being terminated".
-    let rv = match state
-        .store
-        .create_if_namespace_active(Some(&ns_key), &key, Bytes::from(bytes))
-        .await
-    {
-        Ok(rv) => rv,
-        Err(u7s_store::CreateNamespacedError::NamespaceTerminating) => {
-            return Err(Status::forbidden(format!(
-                "unable to create new content in namespace {ns} because it is being terminated"
-            )));
-        }
-        Err(u7s_store::CreateNamespacedError::Store(e)) => {
-            return Err(store_err_cr(e, &name, &ctx.kind))
+    //
+    // Counts store.create_if_namespace_active attempts made so far (the loop's first
+    // iteration is attempt 1). Bounded at MAX_GENERATE_NAME_CREATE_ATTEMPTS TOTAL attempts,
+    // mirroring create_resource/create_namespaced_resource's generateName-collision retry
+    // (see resource.rs) — a controller mass-creating CRs via bare `metadata.generateName`
+    // must not see a spurious 409 just because the server's random suffix landed on an
+    // existing name.
+    let mut attempts_made = 1u32;
+    let rv = loop {
+        let key = cr_store_key(&group, &plural, Some(&ns), &name);
+        let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+        match state
+            .store
+            .create_if_namespace_active(Some(&ns_key), &key, Bytes::from(bytes))
+            .await
+        {
+            Ok(rv) => break rv,
+            Err(u7s_store::CreateNamespacedError::NamespaceTerminating) => {
+                return Err(Status::forbidden(format!(
+                    "unable to create new content in namespace {ns} because it is being terminated"
+                )));
+            }
+            // The client never chose this name (it came from generateName) — a collision is
+            // the server's random suffix landing on an existing object, not a real conflict
+            // the client should see. Retry with a fresh suffix instead of surfacing a
+            // spurious 409 on what the client experiences as a plain create.
+            Err(u7s_store::CreateNamespacedError::Store(
+                u7s_store::StoreError::AlreadyExists { .. },
+            )) if generate_name_prefix.is_some()
+                && attempts_made < crate::handlers::generic::MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
+            {
+                attempts_made += 1;
+                name = format!(
+                    "{}{}",
+                    generate_name_prefix.as_deref().unwrap_or_default(),
+                    crate::handlers::generic::generate_suffix()
+                );
+                obj["metadata"]["name"] = serde_json::Value::String(name.clone());
+                // Re-validate the regenerated name — mirrors create_resource's retry, which
+                // re-runs validating admission once per attempt, not just for the first
+                // candidate name.
+                let retry_ctx = AdmissionContext {
+                    group: &group,
+                    version: &version,
+                    resource: &plural,
+                    name: &name,
+                    namespace: Some(&ns),
+                    operation: "CREATE",
+                    user_info: Some(serde_json::json!({
+                        "username": user.username,
+                        "uid": user.uid,
+                        "groups": user.groups,
+                        "extra": user.extra,
+                    })),
+                    dry_run: false,
+                };
+                run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
+            }
+            Err(u7s_store::CreateNamespacedError::Store(e)) => {
+                return Err(store_err_cr(e, &name, &ctx.kind))
+            }
         }
     };
 
@@ -5250,6 +5346,286 @@ mod tests {
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 409, "duplicate create must return 409");
         assert_eq!(json["reason"], "AlreadyExists");
+    }
+
+    /// A store wrapper whose first `put()` call always fails with AlreadyExists,
+    /// regardless of key — simulating a generateName suffix landing on some unrelated
+    /// existing object. Delegates every other call to the inner SqliteStore.
+    ///
+    /// Used by create_cr/create_cr_namespaced's generateName-collision-retry regression
+    /// tests. `create_if_namespace_active`'s default trait implementation calls `put()`
+    /// internally, so this transparently exercises create_cr_namespaced's actual write
+    /// path too.
+    struct FirstPutAlreadyExistsStore {
+        inner: Arc<SqliteStore>,
+        fire_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl FirstPutAlreadyExistsStore {
+        fn new(inner: Arc<SqliteStore>) -> Self {
+            Self {
+                inner,
+                fire_once: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl u7s_store::Store for FirstPutAlreadyExistsStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .fire_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move {
+                if inject {
+                    Err(u7s_store::StoreError::AlreadyExists { key })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// A controller mass-creating cluster-scoped CRs via bare `metadata.generateName`
+    /// must not see a spurious 409 just because the server's random name suffix happened
+    /// to collide with an unrelated object. This forces that collision on the very first
+    /// `put()` and asserts create_cr retries with a fresh suffix and succeeds, rather than
+    /// surfacing the collision as AlreadyExists to the client.
+    ///
+    /// Fails on revert: without the retry, create_cr's single `store.put` call returns
+    /// AlreadyExists and the handler maps it straight to 409.
+    #[tokio::test]
+    async fn create_cr_retries_generate_name_collision_instead_of_409ing() {
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        inner
+            .put(
+                &format!("{CRD_LIST_PREFIX}widgets.example.io"),
+                cluster_crd_bytes(),
+                None,
+            )
+            .await
+            .expect("seed CRD");
+        let collision_store = Arc::new(FirstPutAlreadyExistsStore::new(Arc::clone(&inner)));
+        let state = AppState::new(
+            Arc::clone(&collision_store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "generateName": "widget-" },
+                "spec": { "color": "blue" }
+            })
+            .to_string(),
+        );
+
+        let resp = match create_cr(
+            State(state),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        {
+            Ok(r) => r.into_response(),
+            Err(e) => {
+                let json = serde_json::to_value(&e.1).unwrap();
+                panic!(
+                    "a generateName-based CR create must retry past a spurious store \
+                     collision, not hard-error: {json}"
+                );
+            }
+        };
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a generateName-based CR create must retry past a spurious store collision, \
+             not hard-error with 409 — a controller mass-creating CRs via generateName \
+             would otherwise see spurious create failures"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            created["metadata"]["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("widget-")),
+            "created CR must still carry the generateName prefix after the retry"
+        );
+    }
+
+    /// Namespaced sibling of `create_cr_retries_generate_name_collision_instead_of_409ing`:
+    /// create_cr_namespaced writes via `create_if_namespace_active` (not a bare `put`), a
+    /// separate code path that needs its own generateName-collision-retry loop, so it must
+    /// retry past a spurious store collision instead of surfacing a 409 to a controller
+    /// mass-creating namespaced CRs via generateName.
+    ///
+    /// Fails on revert: without the retry, create_cr_namespaced's single
+    /// `create_if_namespace_active` call returns AlreadyExists and the handler maps it
+    /// straight to 409.
+    #[tokio::test]
+    async fn create_cr_namespaced_retries_generate_name_collision_instead_of_409ing() {
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        inner
+            .put(
+                &format!("{CRD_LIST_PREFIX}applications.argoproj.io"),
+                namespaced_crd_bytes(),
+                None,
+            )
+            .await
+            .expect("seed CRD");
+        let collision_store = Arc::new(FirstPutAlreadyExistsStore::new(Arc::clone(&inner)));
+        let state = AppState::new(
+            Arc::clone(&collision_store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "generateName": "app-", "namespace": "argocd" },
+                "spec": { "destination": { "namespace": "default" } }
+            })
+            .to_string(),
+        );
+
+        let resp = match create_cr_namespaced(
+            State(state),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        {
+            Ok(r) => r.into_response(),
+            Err(e) => {
+                let json = serde_json::to_value(&e.1).unwrap();
+                panic!(
+                    "a generateName-based namespaced CR create must retry past a spurious \
+                     store collision, not hard-error: {json}"
+                );
+            }
+        };
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a generateName-based namespaced CR create must retry past a spurious store \
+             collision, not hard-error with 409 — a controller mass-creating CRs via \
+             generateName would otherwise see spurious create failures"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            created["metadata"]["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("app-")),
+            "created CR must still carry the generateName prefix after the retry"
+        );
     }
 
     // Getting a missing CR must return 404.

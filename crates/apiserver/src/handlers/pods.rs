@@ -473,7 +473,10 @@ pub(crate) async fn create_pod<S: Store>(
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let name = crate::handlers::generic::resolve_name(&mut obj)?;
+    // Captured before resolve_name mutates metadata.name, so a store collision below
+    // knows whether it's allowed to retry under a freshly generated name.
+    let generate_name_prefix = crate::handlers::generic::wants_generate_name(&obj);
+    let mut name = crate::handlers::generic::resolve_name(&mut obj)?;
 
     // Ensure namespace is set in the stored object
     obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.as_str().to_owned());
@@ -613,7 +616,6 @@ pub(crate) async fn create_pod<S: Store>(
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
-    let key = object_key("pods", ns.as_str(), &name);
     let ns_key = cluster_object_key("namespaces", ns.as_str());
     // Reject pod creation in a Terminating namespace — matches kube-apiserver behaviour and
     // the same gate create_namespaced_resource enforces for every other resource type,
@@ -622,18 +624,65 @@ pub(crate) async fn create_pod<S: Store>(
     // controller can keep recreating pods in a namespace mid-deletion, forcing the real KCM
     // namespace-controller's own DeleteCollection retries to repeatedly race new pods instead
     // of converging quickly.
-    let new_rv = match state
-        .store
-        .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
-        .await
-    {
-        Ok(rv) => rv,
-        Err(CreateNamespacedError::NamespaceTerminating) => {
-            return Err(Status::forbidden(format!(
-                "unable to create new content in namespace {ns} because it is being terminated"
-            )));
+    //
+    // Counts store.create_if_namespace_active attempts made so far (the loop's first
+    // iteration is attempt 1). Bounded at MAX_GENERATE_NAME_CREATE_ATTEMPTS TOTAL attempts,
+    // mirroring create_resource/create_namespaced_resource's generateName-collision retry
+    // (see resource.rs) — a controller mass-creating pods via bare `metadata.generateName`
+    // must not see a spurious 409 just because the server's random suffix landed on an
+    // existing name.
+    let mut attempts_made = 1u32;
+    let new_rv = loop {
+        let key = object_key("pods", ns.as_str(), &name);
+        match state
+            .store
+            .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
+            .await
+        {
+            Ok(rv) => break rv,
+            Err(CreateNamespacedError::NamespaceTerminating) => {
+                return Err(Status::forbidden(format!(
+                    "unable to create new content in namespace {ns} because it is being terminated"
+                )));
+            }
+            // The client never chose this name (it came from generateName) — a collision is
+            // the server's random suffix landing on an existing object, not a real conflict
+            // the client should see. Retry with a fresh suffix instead of surfacing a
+            // spurious 409 on what the client experiences as a plain create.
+            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
+                if generate_name_prefix.is_some()
+                    && attempts_made
+                        < crate::handlers::generic::MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
+            {
+                attempts_made += 1;
+                name = format!(
+                    "{}{}",
+                    generate_name_prefix.as_deref().unwrap_or_default(),
+                    crate::handlers::generic::generate_suffix()
+                );
+                obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+                // Re-validate the regenerated name — mirrors create_resource's retry, which
+                // re-runs validating admission once per attempt, not just for the first
+                // candidate name.
+                let retry_ctx = AdmissionContext {
+                    group: "",
+                    version: "v1",
+                    resource: "pods",
+                    name: &name,
+                    namespace: Some(ns.as_str()),
+                    operation: "CREATE",
+                    user_info: Some(serde_json::json!({
+                        "username": user.username,
+                        "uid": user.uid,
+                        "groups": user.groups,
+                        "extra": user.extra,
+                    })),
+                    dry_run: false,
+                };
+                run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
+            }
+            Err(CreateNamespacedError::Store(e)) => return Err(store_err_to_status(e, &name)),
         }
-        Err(CreateNamespacedError::Store(e)) => return Err(store_err_to_status(e, &name)),
     };
 
     obj.set_resource_version(new_rv);
@@ -9695,6 +9744,186 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// A store wrapper whose first `put()` call always fails with AlreadyExists,
+    /// regardless of key — simulating a generateName suffix landing on some unrelated
+    /// existing object. Delegates every other call to the inner SqliteStore.
+    ///
+    /// Used by create_pod's generateName-collision-retry regression test.
+    /// `create_if_namespace_active`'s default trait implementation calls `put()`
+    /// internally, so this transparently exercises create_pod's actual write path.
+    struct FirstPutAlreadyExistsStore {
+        inner: Arc<SqliteStore>,
+        fire_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl FirstPutAlreadyExistsStore {
+        fn new(inner: Arc<SqliteStore>) -> Self {
+            Self {
+                inner,
+                fire_once: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl u7s_store::Store for FirstPutAlreadyExistsStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .fire_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move {
+                if inject {
+                    Err(u7s_store::StoreError::AlreadyExists { key })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// A controller mass-creating pods via bare `metadata.generateName` (e.g. a
+    /// ReplicaSet backfilling replicas) must not see a spurious 409 just because the
+    /// server's random name suffix happened to collide with an unrelated object. This
+    /// forces that collision on the very first attempt and asserts create_pod retries
+    /// with a fresh suffix and succeeds, rather than surfacing the collision as
+    /// AlreadyExists to the client.
+    ///
+    /// Fails on revert: without the retry, create_pod's single create_if_namespace_active
+    /// call returns AlreadyExists and the handler maps it straight to 409.
+    #[tokio::test]
+    async fn create_pod_retries_generate_name_collision_instead_of_409ing() {
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        seed_namespace(&inner, "default").await;
+        let collision_store = Arc::new(FirstPutAlreadyExistsStore::new(Arc::clone(&inner)));
+
+        let state = AppState::new(
+            Arc::clone(&collision_store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"generateName": "web-", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a generateName-based pod create must retry past a spurious store collision, \
+             not hard-error with 409 — a controller mass-creating pods via generateName \
+             would otherwise see spurious create failures"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            created["metadata"]["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("web-")),
+            "created pod must still carry the generateName prefix after the retry"
+        );
     }
 
     /// POST a pod into a Terminating namespace must return 403, matching
