@@ -1317,18 +1317,24 @@ where
                 // separate header instance per value). Each key's subresource on "userextras"
                 // is authorized per value, mirroring upstream. Header names from the http crate
                 // are always lowercase, so the prefix match below is case-insensitive for free.
+                //
+                // HTTP header names cannot contain a raw '/', so client-go's
+                // transport.headerKeyEscape percent-encodes any illegal byte in an extra key
+                // before setting the header (e.g. u7s's own SA-JWT extra key
+                // "authentication.kubernetes.io/credential-id" is sent as
+                // "Impersonate-Extra-authentication.kubernetes.io%2fcredential-id"). Decode the
+                // key here — mirroring upstream's unescapeExtraKey — so it matches both the
+                // RBAC "userextras" subresource check below and the final extra map key.
                 let mut impersonate_extra: HashMap<String, Vec<String>> = HashMap::new();
                 for (name, value) in req.headers().iter() {
-                    let Some(key) = name.as_str().strip_prefix("impersonate-extra-") else {
+                    let Some(raw_key) = name.as_str().strip_prefix("impersonate-extra-") else {
                         continue;
                     };
                     let Ok(v) = value.to_str() else {
                         continue;
                     };
-                    impersonate_extra
-                        .entry(key.to_owned())
-                        .or_default()
-                        .push(v.to_owned());
+                    let key = percent_decode(raw_key);
+                    impersonate_extra.entry(key).or_default().push(v.to_owned());
                 }
                 for (key, values) in &impersonate_extra {
                     for value in values {
@@ -3738,6 +3744,117 @@ mod tests {
             resp.status(),
             axum::http::StatusCode::BAD_REQUEST,
             "Impersonate-Group without Impersonate-User must 400, not silently proceed as alice"
+        );
+    }
+
+    /// A percent-encoded `Impersonate-Extra-<key>` header name (as client-go's
+    /// `transport.headerKeyEscape` produces for any key containing an illegal HTTP header
+    /// byte — e.g. u7s's own SA-JWT extra key `authentication.kubernetes.io/credential-id`)
+    /// must be percent-decoded before both the RBAC "userextras" subresource check and the
+    /// final `UserInfo.extra` key. Before this fix the raw encoded string was used for
+    /// both, so a caller authorized on the human-readable decoded key never matched.
+    #[tokio::test]
+    async fn impersonate_extra_key_is_percent_decoded_before_rbac_and_extra_map() {
+        use axum::{body::Body, http::Request, routing::get, Extension, Router};
+        use tower::ServiceExt;
+
+        let idx = Arc::new(RbacIndex::new());
+        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/extra-impersonator";
+        let role_val = serde_json::json!({
+            "rules": [
+                { "apiGroups": [""], "resources": ["users"], "verbs": ["impersonate"] },
+                {
+                    "apiGroups": ["authentication.k8s.io"],
+                    "resources": ["userextras/authentication.kubernetes.io/credential-id"],
+                    "verbs": ["impersonate"]
+                }
+            ]
+        });
+        idx.apply_object(role_key, &role_val);
+        let bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/alice-extra-impersonator";
+        let bind_val = serde_json::json!({
+            "subjects": [{ "kind": "User", "name": "alice" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "extra-impersonator"
+            }
+        });
+        idx.apply_object(bind_key, &bind_val);
+        let target_role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/pod-lister-extra";
+        let target_role_val = serde_json::json!({
+            "rules": [{ "apiGroups": [""], "resources": ["pods"], "verbs": ["list"] }]
+        });
+        idx.apply_object(target_role_key, &target_role_val);
+        let target_bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/bob-pod-lister-extra";
+        let target_bind_val = serde_json::json!({
+            "subjects": [{ "kind": "User", "name": "bob" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "pod-lister-extra"
+            }
+        });
+        idx.apply_object(target_bind_key, &target_bind_val);
+
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        async fn whoami(Extension(user): Extension<UserInfo>) -> String {
+            serde_json::to_string(&user.extra).unwrap()
+        }
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(whoami))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-User", "bob")
+            .header(
+                "Impersonate-Extra-authentication.kubernetes.io%2fcredential-id",
+                "v1",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "caller is authorized on the DECODED subresource key \
+             'authentication.kubernetes.io/credential-id' — before this fix the RBAC check \
+             used the raw percent-encoded header name and never matched, so this would 403"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let extra: HashMap<String, Vec<String>> = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            extra.get("authentication.kubernetes.io/credential-id"),
+            Some(&vec!["v1".to_owned()]),
+            "the final UserInfo.extra key must be the decoded key, not the raw \
+             percent-encoded header name"
         );
     }
 
