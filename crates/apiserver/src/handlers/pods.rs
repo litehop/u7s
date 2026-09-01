@@ -19,7 +19,9 @@ use crate::{
     state::AppState,
     status::Status,
     types::{Binding, DeleteOptions, Namespace, Object, ObjectMeta, PodSpec},
-    util::{content_type, extract_body, parse_resource_version, secs_to_rfc3339},
+    util::{
+        content_type, extract_body, parse_resource_version, rfc3339_to_unix_secs, secs_to_rfc3339,
+    },
 };
 
 #[derive(Deserialize)]
@@ -900,16 +902,140 @@ fn effective_grace_period_seconds(requested: Option<i64>, pod: &serde_json::Valu
         .unwrap_or(30)
 }
 
+fn unix_now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 /// Compute the RFC3339 timestamp `grace_period_seconds` in the future from now, for stamping
 /// `metadata.deletionTimestamp`. Kubelet/controllers use this value (not "now") to know how
 /// long they have before the apiserver expects a hard delete.
 fn deletion_timestamp_after_grace(grace_period_seconds: i64) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    secs_to_rfc3339(now_secs + grace_period_seconds)
+    secs_to_rfc3339(unix_now_secs() + grace_period_seconds)
+}
+
+/// When a pod is already Terminating (`deletionTimestamp` set) and finalizers still block hard
+/// delete, real kube-apiserver's `BeforeDelete`
+/// (staging/src/k8s.io/apiserver/pkg/registry/rest/delete.go) only lets a repeat DELETE move
+/// `deletionTimestamp` earlier — never later, never on a bare re-DELETE with no explicit
+/// `gracePeriodSeconds`. Anything else must leave metadata untouched: writing it anyway defeats
+/// the store's byte-equality no-op-write check, bumping resourceVersion and firing a watch event
+/// on every redundant DELETE. That livelocks finalizer drain under a controller that re-issues
+/// Delete() on resync — e.g. the Job controller against a pod holding
+/// `batch.kubernetes.io/job-tracking`. Generation is deliberately not touched here either:
+/// upstream only bumps it on the initial not-yet-terminating -> Terminating transition.
+///
+/// Returns `Some((new_deletion_timestamp_secs, new_grace_period_seconds))` when the grace period
+/// is legitimately shortened, `None` when the request is a no-op.
+fn shorten_grace_period_secs(
+    now_secs: i64,
+    stored_deletion_timestamp_secs: i64,
+    stored_grace_period_seconds: Option<i64>,
+    requested_grace_period_seconds: Option<i64>,
+) -> Option<(i64, i64)> {
+    let stored_grace_period_seconds = stored_grace_period_seconds?;
+    if stored_grace_period_seconds <= 0 {
+        return None;
+    }
+    let requested = requested_grace_period_seconds?;
+    if requested >= stored_grace_period_seconds {
+        return None;
+    }
+    // Move the existing deletionTimestamp back by the stored grace period, then forward by the
+    // newly requested one — same base reference, shorter duration — rather than recomputing from
+    // "now", matching upstream exactly.
+    let mut new_deletion_timestamp_secs =
+        stored_deletion_timestamp_secs - stored_grace_period_seconds + requested;
+    let mut period = requested;
+    if new_deletion_timestamp_secs < now_secs {
+        new_deletion_timestamp_secs = now_secs;
+        if period != 0 {
+            period = 1;
+        }
+    }
+    Some((new_deletion_timestamp_secs, period))
+}
+
+#[cfg(test)]
+mod shorten_grace_period_secs_tests {
+    use super::shorten_grace_period_secs;
+
+    /// No explicit gracePeriodSeconds in the re-DELETE request must never touch the object —
+    /// this is the plain "redundant retry" case a resyncing controller sends constantly.
+    #[test]
+    fn no_requested_grace_is_a_no_op() {
+        assert_eq!(
+            shorten_grace_period_secs(1_000, 2_000, Some(30), None),
+            None
+        );
+    }
+
+    /// A requested grace period equal to or longer than what's already stored must not extend
+    /// (or gratuitously restamp) deletionTimestamp — kube-apiserver only ever shortens.
+    #[test]
+    fn requested_grace_greater_or_equal_to_stored_is_a_no_op() {
+        assert_eq!(
+            shorten_grace_period_secs(1_000, 2_000, Some(30), Some(30)),
+            None
+        );
+        assert_eq!(
+            shorten_grace_period_secs(1_000, 2_000, Some(30), Some(60)),
+            None
+        );
+    }
+
+    /// A stored grace period of 0 (or absent) means the object is already at "delete now" —
+    /// there is nothing left to shorten.
+    #[test]
+    fn stored_grace_period_zero_or_absent_is_a_no_op() {
+        assert_eq!(
+            shorten_grace_period_secs(1_000, 2_000, Some(0), Some(0)),
+            None
+        );
+        assert_eq!(shorten_grace_period_secs(1_000, 2_000, None, Some(0)), None);
+    }
+
+    /// A genuinely shorter explicit grace period moves deletionTimestamp back by the stored
+    /// grace period and forward by the new one, preserving the original base reference instead
+    /// of recomputing from "now" — this is what lets `kubectl delete pod --grace-period=<n>`
+    /// speed up an already in-flight graceful termination without losing precision.
+    #[test]
+    fn shorter_requested_grace_moves_deletion_timestamp_earlier() {
+        // stored deletionTimestamp = 2_000, stored grace = 120 -> object entered Terminating
+        // at 2_000 - 120 = 1_880. Shortening to 30s should land at 1_880 + 30 = 1_910.
+        assert_eq!(
+            shorten_grace_period_secs(1_000, 2_000, Some(120), Some(30)),
+            Some((1_910, 30))
+        );
+    }
+
+    /// If shortening would move deletionTimestamp into the past, it must clamp to "now" instead
+    /// — kube-apiserver never lets DELETE stamp a deletionTimestamp that has already elapsed,
+    /// since that would make an object briefly "overdue" for a hard delete no actor has
+    /// authorized yet.
+    #[test]
+    fn shortening_into_the_past_clamps_to_now_and_floors_grace_to_one_second() {
+        // now = 5_000; naive shortened timestamp (1_910) is already in the past.
+        assert_eq!(
+            shorten_grace_period_secs(5_000, 2_000, Some(120), Some(30)),
+            Some((5_000, 1))
+        );
+    }
+
+    /// An explicit `--grace-period=0` shortening into the past must clamp the timestamp to
+    /// "now" but keep the grace period at exactly 0 — this is the `--force` path, which must
+    /// still land at grace 0 so a finalizer-free pod can hard-delete on its very next
+    /// evaluation instead of being floored to a spurious extra second.
+    #[test]
+    fn shortening_to_zero_into_the_past_keeps_grace_at_zero() {
+        assert_eq!(
+            shorten_grace_period_secs(5_000, 2_000, Some(120), Some(0)),
+            Some((5_000, 0))
+        );
+    }
 }
 
 /// DELETE /api/v1/namespaces/{ns}/pods — collection delete with optional labelSelector.
@@ -973,17 +1099,46 @@ pub(crate) async fn delete_collection_pods<S: Store>(
             let force_requested = requested_grace == Some(0);
             let hard_delete_now = !has_finalizers && (already_terminating || force_requested);
             if !hard_delete_now {
-                let mut updated = parsed;
-                let grace = effective_grace_period_seconds(requested_grace, &updated);
-                updated["metadata"]["deletionTimestamp"] =
-                    serde_json::Value::String(deletion_timestamp_after_grace(grace));
-                updated["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
-                let current_gen = updated["metadata"]["generation"].as_i64().unwrap_or(1);
-                updated["metadata"]["generation"] = serde_json::json!(current_gen + 1);
-                let _ = state
-                    .store
-                    .put(&obj.key, bytes::Bytes::from(updated.to_string()), None)
-                    .await;
+                if already_terminating {
+                    // Redundant re-DELETE of an already-Terminating, finalizer-carrying pod
+                    // (e.g. a Job controller re-issuing Delete() on resync): only a legitimate
+                    // grace-period shortening writes; anything else is a no-op so it doesn't
+                    // churn resourceVersion. See shorten_grace_period_secs for why.
+                    let stored_ts_secs = meta
+                        .deletion_timestamp
+                        .as_deref()
+                        .and_then(rfc3339_to_unix_secs);
+                    if let Some((new_ts_secs, new_grace)) = stored_ts_secs.and_then(|ts| {
+                        shorten_grace_period_secs(
+                            unix_now_secs(),
+                            ts,
+                            meta.deletion_grace_period_seconds,
+                            requested_grace,
+                        )
+                    }) {
+                        let mut updated = parsed;
+                        updated["metadata"]["deletionTimestamp"] =
+                            serde_json::Value::String(secs_to_rfc3339(new_ts_secs));
+                        updated["metadata"]["deletionGracePeriodSeconds"] =
+                            serde_json::json!(new_grace);
+                        let _ = state
+                            .store
+                            .put(&obj.key, bytes::Bytes::from(updated.to_string()), None)
+                            .await;
+                    }
+                } else {
+                    let mut updated = parsed;
+                    let grace = effective_grace_period_seconds(requested_grace, &updated);
+                    updated["metadata"]["deletionTimestamp"] =
+                        serde_json::Value::String(deletion_timestamp_after_grace(grace));
+                    updated["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
+                    let current_gen = updated["metadata"]["generation"].as_i64().unwrap_or(1);
+                    updated["metadata"]["generation"] = serde_json::json!(current_gen + 1);
+                    let _ = state
+                        .store
+                        .put(&obj.key, bytes::Bytes::from(updated.to_string()), None)
+                        .await;
+                }
                 soft_deleted = true;
             }
         }
@@ -1108,18 +1263,49 @@ pub(crate) async fn delete_pod<S: Store>(
             })));
         }
 
-        // Soft-delete: stamp deletionTimestamp so the kubelet knows to gracefully terminate
-        // the container. Applies regardless of whether the pod has finalizers.
-        //
-        // Setting deletionTimestamp is always a real mutation — Kubernetes increments
-        // metadata.generation on every graceful delete so that controllers can detect
-        // the transition via observedGeneration (pods.go:573 conformance test).
-        let grace = effective_grace_period_seconds(requested_grace, &obj.body);
-        obj.body["metadata"]["deletionTimestamp"] =
-            serde_json::Value::String(deletion_timestamp_after_grace(grace));
-        obj.body["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
-        let current_gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
-        obj.body["metadata"]["generation"] = serde_json::json!(current_gen + 1);
+        if already_terminating {
+            // Redundant re-DELETE of an already-Terminating, finalizer-carrying pod (this
+            // handler only reaches here with has_finalizers — see the hard-delete branch
+            // above). Real kube-apiserver's BeforeDelete only lets this move deletionTimestamp
+            // earlier (an explicit, shorter gracePeriodSeconds); otherwise it must be a no-op.
+            // Restamping on every retry defeats the store's byte-equality no-op-write check,
+            // bumping resourceVersion and firing a watch event on every redundant DELETE — the
+            // livelock that stalls Job pod-GC when the Job controller re-issues Delete() on
+            // resync against a pod holding batch.kubernetes.io/job-tracking.
+            let stored_ts_secs = meta
+                .deletion_timestamp
+                .as_deref()
+                .and_then(rfc3339_to_unix_secs);
+            match stored_ts_secs.and_then(|ts| {
+                shorten_grace_period_secs(
+                    unix_now_secs(),
+                    ts,
+                    meta.deletion_grace_period_seconds,
+                    requested_grace,
+                )
+            }) {
+                Some((new_ts_secs, new_grace)) => {
+                    obj.body["metadata"]["deletionTimestamp"] =
+                        serde_json::Value::String(secs_to_rfc3339(new_ts_secs));
+                    obj.body["metadata"]["deletionGracePeriodSeconds"] =
+                        serde_json::json!(new_grace);
+                }
+                None => return Ok(Json(obj.body)),
+            }
+        } else {
+            // Soft-delete: stamp deletionTimestamp so the kubelet knows to gracefully terminate
+            // the container. Applies regardless of whether the pod has finalizers.
+            //
+            // Setting deletionTimestamp is always a real mutation — Kubernetes increments
+            // metadata.generation on every graceful delete so that controllers can detect
+            // the transition via observedGeneration (pods.go:573 conformance test).
+            let grace = effective_grace_period_seconds(requested_grace, &obj.body);
+            obj.body["metadata"]["deletionTimestamp"] =
+                serde_json::Value::String(deletion_timestamp_after_grace(grace));
+            obj.body["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
+            let current_gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
+            obj.body["metadata"]["generation"] = serde_json::json!(current_gen + 1);
+        }
         let expected_rv = parse_resource_version(obj.resource_version())?;
         match state.store.put(&key, obj.to_bytes(), expected_rv).await {
             Ok(new_rv) => {
@@ -11097,6 +11283,162 @@ mod handler_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A repeat DELETE on a pod that is already Terminating (deletionTimestamp set) with a
+    /// finalizer still held, and no explicit gracePeriodSeconds in the request, must be a
+    /// complete no-op: same deletionTimestamp, deletionGracePeriodSeconds, generation and
+    /// resourceVersion. This is exactly the redundant DELETE a controller re-issues on every
+    /// resync (e.g. the Job controller against a pod holding batch.kubernetes.io/job-tracking)
+    /// — if this re-stamps, the store's byte-equality no-op-write check never fires,
+    /// resourceVersion climbs on every retry, and the resulting watch events livelock finalizer
+    /// drain.
+    ///
+    /// Fails on revert: without the already_terminating branch this test targets, delete_pod
+    /// always re-stamps deletionTimestamp to a fresh `now() + grace`, which will not equal the
+    /// original value and will bump resourceVersion.
+    #[tokio::test]
+    async fn delete_pod_redundant_delete_of_already_terminating_pod_is_idempotent() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/already-terminating";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "already-terminating",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "generation": 2,
+                "finalizers": ["batch.kubernetes.io/job-tracking"],
+                "deletionTimestamp": "2099-01-01T00:00:00Z",
+                "deletionGracePeriodSeconds": 30
+            },
+            "spec": {},
+            "status": {}
+        });
+        let seeded_rv = store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/already-terminating")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "redundant delete must still return 200"
+        );
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("pod must still exist — finalizer still held");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["resourceVersion"],
+            seeded_rv.to_string(),
+            "a redundant DELETE with unchanged grace must not write — otherwise \
+             resourceVersion churns on every controller retry, and the watch events it fires \
+             livelock finalizer drain"
+        );
+        assert_eq!(
+            v["metadata"]["generation"], 2,
+            "generation must not bump on a no-op re-delete"
+        );
+        assert_eq!(
+            v["metadata"]["deletionTimestamp"], "2099-01-01T00:00:00Z",
+            "deletionTimestamp must not be re-stamped on a no-op re-delete"
+        );
+    }
+
+    /// A repeat DELETE with an explicit, shorter gracePeriodSeconds than what's already stored
+    /// must still move deletionTimestamp earlier — mirroring real kube-apiserver's
+    /// BeforeDelete, which lets a caller (e.g. `kubectl delete pod --grace-period=<n>`) speed
+    /// up an in-flight graceful termination. Without this, the idempotency fix verified above
+    /// would over-apply and freeze deletionTimestamp even when the caller legitimately wants it
+    /// moved sooner.
+    ///
+    /// Fails on revert: if the idempotency guard collapses to a bare "skip whenever
+    /// already_terminating", this legitimate shortening request also becomes a no-op and
+    /// deletionTimestamp stays at its original (later) value.
+    #[tokio::test]
+    async fn delete_pod_explicit_shorter_grace_period_moves_deletion_timestamp_earlier() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/shortening-grace";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "shortening-grace",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "generation": 2,
+                "finalizers": ["batch.kubernetes.io/job-tracking"],
+                "deletionTimestamp": "2099-01-01T00:00:00Z",
+                "deletionGracePeriodSeconds": 120
+            },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "gracePeriodSeconds": 30
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/shortening-grace")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("finalizer still held, pod must survive");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["deletionGracePeriodSeconds"], 30,
+            "explicit shorter gracePeriodSeconds must be persisted"
+        );
+        assert_eq!(
+            v["metadata"]["deletionTimestamp"], "2098-12-31T23:58:30Z",
+            "shortening grace from 120s to 30s must move deletionTimestamp 90s earlier, \
+             matching real kube-apiserver's BeforeDelete (moves the timestamp back by the \
+             stored grace period, then forward by the new one)"
+        );
+        assert_eq!(
+            v["metadata"]["generation"], 2,
+            "generation must not bump when only shortening an already-in-flight graceful \
+             delete — upstream only bumps it on the initial not-yet-terminating transition"
+        );
+    }
+
     /// DELETE on the pods collection endpoint must respect each pod's own soft/hard-delete
     /// state exactly like a single-pod DELETE does, not hard-delete everything
     /// unconditionally. The real KCM namespace-controller drains pods via exactly this
@@ -11229,6 +11571,159 @@ mod handler_tests {
             stored_terminating.is_none(),
             "a pod already Terminating with no finalizers must be hard-deleted by \
              DeleteCollection — otherwise it lingers forever since nothing else removes it"
+        );
+    }
+
+    /// A redundant DeleteCollection sweep (e.g. a Job controller's namespace-wide resync) over
+    /// an already-Terminating, finalizer-carrying pod, with no explicit gracePeriodSeconds, must
+    /// be a no-op: same deletionTimestamp/deletionGracePeriodSeconds/resourceVersion. Real
+    /// clients call DeleteCollection repeatedly (it's how KCM's namespace controller drains a
+    /// namespace during OrderedNamespaceDeletion); re-stamping every pass would churn
+    /// resourceVersion and livelock finalizer drain exactly like the single-pod DELETE path.
+    ///
+    /// Fails on revert: without the already_terminating branch this test targets,
+    /// delete_collection_pods always re-stamps deletionTimestamp to a fresh `now() + grace` on
+    /// every call, which will not equal the original value and will bump resourceVersion.
+    #[tokio::test]
+    async fn delete_collection_pods_redundant_delete_of_already_terminating_pod_is_idempotent() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/already-terminating";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "already-terminating",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "generation": 2,
+                "finalizers": ["batch.kubernetes.io/job-tracking"],
+                "deletionTimestamp": "2099-01-01T00:00:00Z",
+                "deletionGracePeriodSeconds": 30
+            },
+            "spec": {},
+            "status": {}
+        });
+        let seeded_rv = store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods",
+                delete(delete_collection_pods),
+            )
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("pod must still exist — finalizer still held");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["resourceVersion"],
+            seeded_rv.to_string(),
+            "a redundant DeleteCollection sweep with unchanged grace must not write — \
+             otherwise resourceVersion churns on every controller resync and livelocks \
+             finalizer drain"
+        );
+        assert_eq!(
+            v["metadata"]["generation"], 2,
+            "generation must not bump on a no-op re-delete"
+        );
+        assert_eq!(
+            v["metadata"]["deletionTimestamp"], "2099-01-01T00:00:00Z",
+            "deletionTimestamp must not be re-stamped on a no-op re-delete"
+        );
+    }
+
+    /// A DeleteCollection call with an explicit, shorter gracePeriodSeconds than what's already
+    /// stored must still move a Terminating, finalizer'd pod's deletionTimestamp earlier —
+    /// `kubectl delete pods --all --grace-period=<n>` must be able to speed up an in-flight
+    /// graceful termination, not just be swallowed by the idempotency guard above.
+    ///
+    /// Fails on revert: if the idempotency guard collapses to a bare "skip whenever
+    /// already_terminating", this legitimate shortening request also becomes a no-op.
+    #[tokio::test]
+    async fn delete_collection_pods_explicit_shorter_grace_period_moves_deletion_timestamp_earlier()
+    {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/shortening-grace";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "shortening-grace",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "generation": 2,
+                "finalizers": ["batch.kubernetes.io/job-tracking"],
+                "deletionTimestamp": "2099-01-01T00:00:00Z",
+                "deletionGracePeriodSeconds": 120
+            },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods",
+                delete(delete_collection_pods),
+            )
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "gracePeriodSeconds": 30
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("finalizer still held, pod must survive");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["deletionGracePeriodSeconds"], 30,
+            "explicit shorter gracePeriodSeconds must be persisted"
+        );
+        assert_eq!(
+            v["metadata"]["deletionTimestamp"], "2098-12-31T23:58:30Z",
+            "shortening grace from 120s to 30s must move deletionTimestamp 90s earlier, \
+             matching real kube-apiserver's BeforeDelete"
+        );
+        assert_eq!(
+            v["metadata"]["generation"], 2,
+            "generation must not bump when only shortening an already-in-flight graceful \
+             delete"
         );
     }
 
