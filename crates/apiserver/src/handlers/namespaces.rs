@@ -1179,12 +1179,13 @@ pub(crate) async fn delete_namespace<S: Store>(
     };
     run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
-    if let Some(mut soft) = apply_delete_policy(&mut obj) {
-        soft["status"] = serde_json::to_value(NamespaceStatus {
-            phase: Some(NamespacePhase::Terminating),
-            rest: serde_json::Value::Object(Default::default()),
-        })
-        .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
+    if let Some(soft) = apply_delete_policy(&mut obj) {
+        // apply_delete_policy already stamped status.phase=Terminating in place
+        // (obj.body["status"]["phase"] = ...), preserving every other status field. Rebuilding
+        // `soft["status"]` wholesale from a fresh NamespaceStatus here — as this used to do —
+        // wiped status.conditions (e.g. NamespaceDeletionContentFailure) on every repeat DELETE
+        // of an already-terminating namespace, discarding the real KCM namespace-controller's
+        // drain-progress signal that a client polls for.
         obj.body = soft;
 
         // spec.finalizers (including "kubernetes") is left untouched. deletionTimestamp +
@@ -2899,6 +2900,116 @@ mod tests {
             vec![Some("kubernetes")],
             "delete_namespace must not self-clear the kubernetes finalizer, regardless of \
              whether it was auto-stamped or explicitly set at creation time"
+        );
+    }
+
+    // A repeat DELETE on an already-terminating namespace re-enters the soft-delete branch
+    // (spec.finalizers is still non-empty) and must NOT clobber status.conditions the real
+    // KCM namespace-controller wrote via PUT /status in between. A client (or GC) polling
+    // status.conditions for NamespaceDeletionContentFailure to decide whether drain is stuck
+    // would silently lose that signal if a redundant DELETE retry wiped it.
+    #[tokio::test]
+    async fn delete_namespace_repeat_delete_preserves_controller_set_conditions() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body_with_finalizers("repeat-delete-ns", &["kubernetes"]),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // First DELETE: soft-delete, stamps deletionTimestamp + status.phase=Terminating.
+        assert!(
+            delete_namespace(
+                State(state.clone()),
+                Path("repeat-delete-ns".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
+            "first delete must not error"
+        );
+
+        // Simulate the KCM namespace controller reporting drain progress via PUT /status,
+        // the same call path put_namespace_status_updates_conditions exercises.
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "repeat-delete-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let rv = before["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("1");
+
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "repeat-delete-ns", "resourceVersion": rv },
+                "status": {
+                    "phase": "Terminating",
+                    "conditions": [{
+                        "type": "NamespaceDeletionContentFailure",
+                        "status": "True",
+                        "reason": "ContentDeletionFailed",
+                        "message": "test-pod has a finalizer"
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        assert!(
+            put_namespace_status(
+                State(state.clone()),
+                Path("repeat-delete-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                status_body,
+            )
+            .await
+            .is_ok(),
+            "put_namespace_status must succeed"
+        );
+
+        // Repeat DELETE: spec.finalizers is unchanged (still ["kubernetes"]), so this re-enters
+        // the same soft-delete branch as the first call — the one that used to rebuild
+        // status.conditions is untouched.
+        assert!(
+            delete_namespace(
+                State(state.clone()),
+                Path("repeat-delete-ns".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
+            "repeat delete must not error"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "repeat-delete-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            body["status"]["conditions"][0]["type"], "NamespaceDeletionContentFailure",
+            "a repeat DELETE must not clobber status.conditions set by the real namespace \
+             controller between DELETE calls — a client watching namespace-deletion progress \
+             would lose the failure signal if this regresses"
         );
     }
 
