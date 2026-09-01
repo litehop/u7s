@@ -2442,10 +2442,19 @@ pub async fn replace_cr<S: Store>(
     resolve_cr_metadata(&existing, &mut obj, &name, &ctx.kind)?;
 
     // When the CRD declares a status subresource, the main PUT endpoint must not
-    // update .status — clients must use PUT /status for that.
+    // update .status — clients must use PUT /status for that. Restore whatever is
+    // already stored rather than dropping it: a controller (e.g. csi-snapshotter)
+    // that PUTs a spec-only change to VolumeSnapshotContent reads .status back off
+    // the same response to extract snapshotHandle — wiping status here made that
+    // read nil on every main-resource PUT after the first /status write.
     if ctx.has_status_subresource {
-        if let Some(map) = obj.as_object_mut() {
-            map.remove("status");
+        let stored_status = existing["status"].clone();
+        if stored_status.is_null() {
+            if let Some(map) = obj.as_object_mut() {
+                map.remove("status");
+            }
+        } else {
+            obj["status"] = stored_status;
         }
     }
 
@@ -2454,6 +2463,18 @@ pub async fn replace_cr<S: Store>(
     }
 
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
+
+    // A PUT whose body has deletionTimestamp set and finalizers now empty is how a
+    // controller that removes its own protection finalizer via Update rather than Patch
+    // (e.g. external-snapshotter's snapshot-controller on VolumeSnapshotContent) completes
+    // a delete. patch_cr already completes the delete instead of storing the update here;
+    // replace_cr (PUT) did not, so the object sat forever with deletionTimestamp set and
+    // no finalizers — never actually removed — and callers waiting for it to disappear
+    // (e.g. the e2e client's WaitForGVRDeletion poll) timed out after 5 minutes.
+    if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
+        return Ok(Json(obj));
+    }
 
     let admission_ctx = AdmissionContext {
         group: &group,
@@ -3305,10 +3326,19 @@ pub async fn replace_cr_namespaced<S: Store>(
     resolve_cr_metadata(&existing, &mut obj, &name, &ctx.kind)?;
 
     // When the CRD declares a status subresource, the main PUT endpoint must not
-    // update .status — clients must use PUT /status for that.
+    // update .status — clients must use PUT /status for that. Restore whatever is
+    // already stored rather than dropping it: a controller (e.g. csi-snapshotter)
+    // that PUTs a spec-only change to VolumeSnapshotContent reads .status back off
+    // the same response to extract snapshotHandle — wiping status here made that
+    // read nil on every main-resource PUT after the first /status write.
     if ctx.has_status_subresource {
-        if let Some(map) = obj.as_object_mut() {
-            map.remove("status");
+        let stored_status = existing["status"].clone();
+        if stored_status.is_null() {
+            if let Some(map) = obj.as_object_mut() {
+                map.remove("status");
+            }
+        } else {
+            obj["status"] = stored_status;
         }
     }
 
@@ -3317,6 +3347,19 @@ pub async fn replace_cr_namespaced<S: Store>(
     }
 
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
+
+    // A PUT whose body has deletionTimestamp set and finalizers now empty is how a
+    // controller that removes its own protection finalizer via Update rather than Patch
+    // (e.g. external-snapshotter's snapshot-controller on VolumeSnapshot) completes a
+    // delete. patch_cr_namespaced already completes the delete instead of storing the
+    // update here; replace_cr_namespaced (PUT) did not, so the object sat forever with
+    // deletionTimestamp set and no finalizers — never actually removed — and callers
+    // waiting for it to disappear (e.g. the e2e client's WaitForNamespacedGVRDeletion
+    // poll) timed out after 5 minutes.
+    if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
+        return Ok(Json(obj));
+    }
 
     let admission_ctx = AdmissionContext {
         group: &group,
@@ -7466,6 +7509,123 @@ mod tests {
         );
     }
 
+    // Regression: a controller (e.g. csi-snapshotter's sidecar) that already published
+    // .status via the /status subresource must not have that status wiped by a later
+    // spec-only PUT to the main endpoint. Before this fix, replace_cr_namespaced
+    // unconditionally *removed* .status from the object on every main PUT once the CRD
+    // declared a status subresource — instead of preserving whatever was already
+    // stored — so a controller that reads .status back off its own PUT response (as
+    // upstream's CreateSnapshotResource does for VolumeSnapshotContent.status.snapshotHandle)
+    // saw nil forever after the first /status write, panicking with a nil map assertion.
+    #[tokio::test]
+    async fn namespaced_main_put_preserves_status_set_via_status_subresource() {
+        let state = make_state();
+        install_crd_with_status_subresource(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "my-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Publish .status via the /status subresource, the same way a real controller does.
+        let status_put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "destination": { "namespace": "staging" } },
+                "status": { "phase": "Synced" }
+            })
+            .to_string(),
+        );
+        assert!(
+            crate::handlers::status::put_namespaced_resource_status(
+                State(state.clone()),
+                Path((
+                    group.clone(),
+                    version.clone(),
+                    ns.clone(),
+                    plural.clone(),
+                    name.clone(),
+                )),
+                axum::http::HeaderMap::new(),
+                status_put_body,
+            )
+            .await
+            .is_ok(),
+            "PUT /status must succeed"
+        );
+
+        // A later spec-only PUT to the main endpoint must not wipe the status just set.
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "destination": { "namespace": "production" } }
+            })
+            .to_string(),
+        );
+        assert!(
+            replace_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    group.clone(),
+                    version.clone(),
+                    ns.clone(),
+                    plural.clone(),
+                    name.clone(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                update_body,
+            )
+            .await
+            .is_ok(),
+            "replace must succeed"
+        );
+
+        let resp = match get_cr_namespaced(
+            State(state.clone()),
+            Path((group, version, ns, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            obj["spec"]["destination"]["namespace"], "production",
+            "spec must still be updated by the main PUT"
+        );
+        assert_eq!(
+            obj["status"]["phase"], "Synced",
+            "status set via the /status subresource must survive a later spec-only main \
+             PUT — a controller that reads .status back off the PUT response (as \
+             CreateSnapshotResource does for snapshotHandle) must never see it wiped"
+        );
+    }
+
     // Regression: A CRD WITHOUT a status subresource must persist .status normally
     // on the main PUT endpoint. This verifies the guard fires only when declared.
     #[tokio::test]
@@ -10351,6 +10511,115 @@ mod tests {
         assert!(
             obj["status"].is_null() || obj.get("status").is_none(),
             "status must NOT be stored by main PUT when status subresource is declared"
+        );
+    }
+
+    // Regression: mirrors VolumeSnapshotContent's real lifecycle — csi-snapshotter PATCHes
+    // .status.snapshotHandle via /status, then a later spec-only Update (PUT to the main
+    // endpoint, e.g. flipping deletionPolicy to Retain) must not wipe that status. Before
+    // this fix, replace_cr dropped .status from the object entirely on every main PUT once
+    // the CRD declared a status subresource, instead of preserving what was already stored,
+    // so upstream's CreateSnapshotResource (which reads .status.snapshotHandle straight off
+    // its own Update response) panicked with `interface conversion: interface {} is nil,
+    // not map[string]interface {}`.
+    #[tokio::test]
+    async fn cluster_scoped_replace_cr_preserves_status_set_via_status_subresource() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "my-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Publish .status via the /status subresource, the same way csi-snapshotter does.
+        let status_put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name },
+                "spec": { "color": "blue" },
+                "status": { "snapshotHandle": "handle-123" }
+            })
+            .to_string(),
+        );
+        assert!(
+            put_cr_status(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                axum::http::HeaderMap::new(),
+                status_put_body,
+            )
+            .await
+            .is_ok(),
+            "PUT /status must succeed"
+        );
+
+        // A later spec-only Update (PUT to the main endpoint) must not wipe that status.
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name },
+                "spec": { "color": "green" }
+            })
+            .to_string(),
+        );
+        let replace_resp = replace_cr(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            update_body,
+        )
+        .await
+        .expect("replace must succeed")
+        .into_response();
+        let replace_body = axum::body::to_bytes(replace_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replace_obj: serde_json::Value = serde_json::from_slice(&replace_body).unwrap();
+        assert_eq!(
+            replace_obj["status"]["snapshotHandle"], "handle-123",
+            "the PUT response itself must carry the preserved status — a controller like \
+             CreateSnapshotResource reads .status straight off its own Update response, not \
+             a fresh GET"
+        );
+
+        let resp = match get_cr(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["spec"]["color"], "green",
+            "spec must still be updated by the main PUT"
+        );
+        assert_eq!(
+            obj["status"]["snapshotHandle"], "handle-123",
+            "status set via the /status subresource must survive a later spec-only main PUT"
         );
     }
 
@@ -16166,6 +16435,156 @@ mod tests {
             state.store.get(&owner_key).await.unwrap().is_none(),
             "owner CR must be hard-deleted once its last finalizer (orphan) drains — this is \
              how the deferred hard-delete of an Orphan-marked owner actually completes"
+        );
+    }
+
+    /// A PUT (replace_cr) whose body has deletionTimestamp set and finalizers now empty is
+    /// how a controller that removes its own protection finalizer via Update rather than
+    /// Patch signals drain completion — e.g. external-snapshotter's snapshot-controller
+    /// updates VolumeSnapshotContent this way. Before this fix, replace_cr had no
+    /// equivalent to patch_cr's finalizer-drain-complete check above, so the PUT just
+    /// stored the finalizer-cleared object — leaving it stuck with deletionTimestamp set
+    /// and no finalizers forever. This is exactly what caused the real e2e failure:
+    /// "volumesnapshotcontents ... is not deleted within 5m0s".
+    #[tokio::test]
+    async fn replace_cr_finalizer_drain_completion_hard_deletes_object() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        // Seed a Widget already soft-deleted with one finalizer pending, as delete_cr
+        // leaves it for the owning controller to drain.
+        let key = cr_store_key(group, plural, None, "draining-widget");
+        let widget = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "draining-widget",
+                "uid": "drain-uid-put-1",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["snapshot.storage.k8s.io/vsc-protection"]
+            },
+            "spec": { "color": "blue" }
+        });
+        state
+            .store
+            .put(
+                &key,
+                Bytes::from(serde_json::to_vec(&widget).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed draining widget CR");
+
+        // The owning controller's Update() call: same deletionTimestamp, finalizers now
+        // empty — mirrors snapshot-controller removing its own finalizer via PUT.
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "draining-widget",
+                    "deletionTimestamp": "2026-07-22T00:00:00Z",
+                    "finalizers": []
+                },
+                "spec": { "color": "blue" }
+            })
+            .to_string(),
+        );
+
+        replace_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "draining-widget".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            put_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("finalizer-drain PUT must succeed: {e:?}"));
+
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "object must be hard-deleted once its last finalizer drains via PUT — a \
+             controller that uses Update rather than Patch to remove its own finalizer must \
+             not leave the object stuck Terminating forever"
+        );
+    }
+
+    /// Namespaced equivalent of `replace_cr_finalizer_drain_completion_hard_deletes_object`
+    /// — mirrors external-snapshotter's snapshot-controller removing its protection
+    /// finalizer from a namespaced VolumeSnapshot via PUT (Update), not PATCH.
+    #[tokio::test]
+    async fn replace_cr_namespaced_finalizer_drain_completion_hard_deletes_object() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io";
+        let version = "v1alpha1";
+        let ns = "argocd";
+        let plural = "applications";
+
+        let key = cr_store_key(group, plural, Some(ns), "draining-app");
+        let app = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": {
+                "name": "draining-app",
+                "namespace": ns,
+                "uid": "drain-uid-put-2",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["snapshot.storage.k8s.io/vs-protection"]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(&key, Bytes::from(serde_json::to_vec(&app).unwrap()), None)
+            .await
+            .expect("seed draining Application CR");
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": {
+                    "name": "draining-app",
+                    "namespace": ns,
+                    "deletionTimestamp": "2026-07-22T00:00:00Z",
+                    "finalizers": []
+                },
+                "spec": {}
+            })
+            .to_string(),
+        );
+
+        replace_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                "draining-app".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            put_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("finalizer-drain PUT must succeed: {e:?}"));
+
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "namespaced object must be hard-deleted once its last finalizer drains via PUT \
+             — the same VolumeSnapshot-deletion-timeout bug applies to the namespaced route"
         );
     }
 
