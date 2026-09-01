@@ -1639,6 +1639,51 @@ pub(crate) fn eval_cel_vap_value(
 // VAP CEL expression evaluator (full precedence, object + variables roots)
 // ---------------------------------------------------------------------------
 
+/// Maximum recursion depth for the hand-rolled recursive-descent CEL parsers below
+/// (`parse_vap_*` and, further down, `parse_cel_*`) — mirrors the vendored `cel` crate's own
+/// `Parser::max_recursion_depth` (default 96, `cel-0.14.3/src/parser/parser.rs`), which this
+/// evaluator has no equivalent of. Every layer of `(...)` nesting, a chained unary `-`/`!`, a
+/// chained `?:`, or a nested `{...}`/`[...]` literal recurses through this call chain again
+/// with no bound but the native call stack; a Rust stack overflow isn't catchable with
+/// `panic::catch_unwind`, so an attacker-controlled CRD/VAP/matchCondition CEL expression deep
+/// enough to exhaust the stack SIGSEGVs the whole apiserver process, not just one request.
+const CEL_MAX_RECURSION_DEPTH: u32 = 96;
+
+thread_local! {
+    /// Current live recursion depth of the parser call chain on this thread. Each top-level
+    /// `eval_cel_*` entry point starts a fresh, self-contained parse that always returns this
+    /// to 0 by the time it returns (via `CelRecursionGuard`'s `Drop`), so a wide-but-shallow
+    /// expression (e.g. a long `a + b + c + ...` chain, parsed by a `while` loop rather than
+    /// recursion) never approaches the cap — only actual call-stack *depth* does.
+    static CEL_RECURSION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard: increments [`CEL_RECURSION_DEPTH`] on construction, decrements on drop.
+/// `enter()` returns `None` instead of incrementing past [`CEL_MAX_RECURSION_DEPTH`], which
+/// every recursive parser function below propagates with `?` — turning excessive nesting into
+/// a normal parse error (the same "eval error" outcome as any other malformed expression)
+/// instead of a stack overflow.
+struct CelRecursionGuard;
+
+impl CelRecursionGuard {
+    fn enter() -> Option<Self> {
+        CEL_RECURSION_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current >= CEL_MAX_RECURSION_DEPTH {
+                return None;
+            }
+            depth.set(current + 1);
+            Some(CelRecursionGuard)
+        })
+    }
+}
+
+impl Drop for CelRecursionGuard {
+    fn drop(&mut self) {
+        CEL_RECURSION_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 /// Parse a `?:` (ternary conditional) expression — the lowest-precedence CEL operator.
 ///
 /// Both branches are always evaluated (this evaluator has no side effects, so eager
@@ -1654,6 +1699,7 @@ fn parse_vap_ternary(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let cond = parse_vap_or(
         tokens,
         pos,
@@ -1708,6 +1754,7 @@ fn parse_vap_or(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut left = parse_vap_and(
         tokens,
         pos,
@@ -1748,6 +1795,7 @@ fn parse_vap_and(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut left = parse_vap_cmp(
         tokens,
         pos,
@@ -1788,6 +1836,7 @@ fn parse_vap_cmp(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let left = parse_vap_add(
         tokens,
         pos,
@@ -1867,6 +1916,7 @@ fn parse_vap_add(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut left = parse_vap_mul(
         tokens,
         pos,
@@ -1943,6 +1993,7 @@ fn parse_vap_mul(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut left = parse_vap_unary(
         tokens,
         pos,
@@ -2006,6 +2057,7 @@ fn parse_vap_unary(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -2068,6 +2120,7 @@ fn parse_vap_primary(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -2291,6 +2344,7 @@ fn parse_vap_field_chain(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut present = true;
     loop {
         if *pos >= tokens.len() {
@@ -2421,6 +2475,7 @@ fn parse_vap_call_args(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<Vec<serde_json::Value>> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut args = Vec::new();
     while *pos < tokens.len() {
         if let CelToken::RParen = &tokens[*pos] {
@@ -2534,6 +2589,7 @@ fn parse_vap_object_body(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut map = serde_json::Map::new();
     while *pos < tokens.len() {
         if let CelToken::RBrace = &tokens[*pos] {
@@ -2831,6 +2887,7 @@ fn parse_cel_value(
     pos: &mut usize,
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -2869,6 +2926,7 @@ fn parse_cel_primary(
     pos: &mut usize,
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -3056,6 +3114,7 @@ fn parse_cel_object_body(
     pos: &mut usize,
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _depth_guard = CelRecursionGuard::enter()?;
     let mut map = serde_json::Map::new();
 
     while *pos < tokens.len() {
@@ -8904,6 +8963,95 @@ mod tests {
              returning Some(\"bar\") here means the evaluator silently truncated the \
              garbled `== \"bar\" true` remainder and mistook a broken apply-config \
              expression for a valid one"
+        );
+    }
+
+    // -- CEL parser recursion-depth guard tests --
+    //
+    // The hand-rolled recursive-descent parsers below (parse_vap_*, parse_cel_*) have no
+    // bound but the native call stack on their own — every `(...)` nesting level, chained
+    // unary `-`, or nested array/object literal recurses through the full precedence chain
+    // again. A Rust stack overflow SIGSEGVs the whole process, not just one request, and
+    // isn't catchable, so these tests must never crash the test binary: if they did, `cargo
+    // test` would report the process aborting/segfaulting, not a clean assertion failure.
+
+    /// A deeply-nested-parens ValidatingAdmissionPolicy/matchCondition CEL expression must
+    /// be a parse error, not a stack overflow.
+    ///
+    /// Mirrors the exact attack payload shape from the audit that found this gap: `~4KB` of
+    /// nested parens is small enough to fit in any request body limit, but recurses through
+    /// this evaluator's full 8-function precedence chain per paren level with no depth bound
+    /// — comfortably enough to exhaust a typical 2-8MB thread stack and crash the whole
+    /// apiserver process (taking down every tenant, not just the request that sent it), not
+    /// just fail one request. If the recursion-depth guard is removed, running this test
+    /// crashes the test binary instead of failing an assertion.
+    #[test]
+    fn eval_cel_bool_expr_rejects_deeply_nested_parens_instead_of_crashing() {
+        let expr = format!("{}true{}", "(".repeat(2000), ")".repeat(2000));
+        let object = json!({});
+        let variables = serde_json::Map::new();
+        let request = json!({});
+        let result = eval_cel_bool_expr(
+            &expr,
+            &object,
+            &variables,
+            &request,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(
+            result, None,
+            "a CEL expression nested past the recursion-depth cap must be a parse error \
+             (None), the same outcome as any other malformed expression — an attacker-\
+             controlled VAP/matchCondition expression this deep must not be able to \
+             SIGSEGV the apiserver process"
+        );
+    }
+
+    /// A long chain of unary `-` must also be a parse error, not a stack overflow.
+    ///
+    /// `parse_vap_unary` recurses directly into itself for chained `-`/`!`, entirely
+    /// bypassing the paren-nesting path above — a depth guard placed only on the
+    /// paren/ternary re-entry points would miss this vector, since no `(` or `?` is
+    /// involved at all.
+    #[test]
+    fn eval_cel_bool_expr_rejects_deeply_chained_unary_minus_instead_of_crashing() {
+        let expr = format!("{}1", "-".repeat(2000));
+        let object = json!({});
+        let variables = serde_json::Map::new();
+        let request = json!({});
+        let result = eval_cel_vap_value(
+            &expr,
+            &object,
+            &variables,
+            &request,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(
+            result, None,
+            "a chain of unary `-` past the recursion-depth cap must be a parse error, not \
+             an unbounded self-recursion in parse_vap_unary"
+        );
+    }
+
+    /// A deeply-nested array literal in a MutatingAdmissionPolicy `applyConfiguration`
+    /// expression must be a parse error, not a stack overflow.
+    ///
+    /// `eval_cel_apply_config` uses a separate, simpler parser (`parse_cel_value`/
+    /// `parse_cel_primary`) from the VAP evaluator above — the recursion-depth guard must
+    /// cover this second parser independently, since it doesn't share a call chain with
+    /// `parse_vap_*` at all.
+    #[test]
+    fn eval_cel_apply_config_rejects_deeply_nested_array_literal_instead_of_crashing() {
+        let expr = format!("{}1{}", "[".repeat(2000), "]".repeat(2000));
+        let object = json!({});
+        let result = eval_cel_apply_config(&expr, &object);
+        assert_eq!(
+            result, None,
+            "a nested array literal past the recursion-depth cap must be a parse error \
+             (None) in the applyConfiguration evaluator too, not an unbounded \
+             parse_cel_value/parse_cel_primary self-recursion"
         );
     }
 
