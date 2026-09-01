@@ -1099,7 +1099,14 @@ async fn stamp_terminating_and_recheck_completion<S: Store>(
     mut obj: Object,
 ) -> Result<Object, crate::status::StatusError> {
     if needs_terminating_stamp(&obj.body) {
-        obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+        // deletionTimestamp is semantically immutable once set — the partial-state case
+        // (deletionTimestamp already set, phase not yet Terminating) must only advance phase,
+        // never move the timestamp forward. Mirrors apply_delete_policy's (generic.rs) same
+        // unset-only guard.
+        if obj.body["metadata"]["deletionTimestamp"].is_null() {
+            obj.body["metadata"]["deletionTimestamp"] =
+                serde_json::Value::String(utc_now_rfc3339());
+        }
         obj.body["status"] = serde_json::to_value(NamespaceStatus {
             phase: Some(NamespacePhase::Terminating),
             rest: serde_json::Value::Object(Default::default()),
@@ -6064,6 +6071,102 @@ mod tests {
         assert_eq!(
             after_body["metadata"]["deletionTimestamp"], "2099-01-01T00:00:00Z",
             "deletionTimestamp must not be re-stamped on a no-op recheck"
+        );
+    }
+
+    /// Regression: the partial-state case — deletionTimestamp already set, but status.phase
+    /// not yet Terminating — must advance phase without moving the existing deletionTimestamp.
+    ///
+    /// This is the exact case `needs_terminating_stamp` checking two fields (not just
+    /// deletionTimestamp) exists to reach: a namespace can land here if some other write path
+    /// set deletionTimestamp without also setting phase. deletionTimestamp is semantically
+    /// immutable once set — a client (or controller) that read it once must never see it move.
+    ///
+    /// Fails on revert: without the unset-only guard around the deletionTimestamp assignment,
+    /// this function stamps a fresh `now()` over the pre-existing timestamp whenever
+    /// needs_terminating_stamp is true, which it is here (phase isn't Terminating yet) — the
+    /// deletionTimestamp assertion below would fail.
+    #[tokio::test]
+    async fn stamp_terminating_and_recheck_completion_preserves_deletion_timestamp_when_only_phase_is_stale(
+    ) {
+        let state = make_state();
+        let ns_key = crate::keys::cluster_object_key("namespaces", "partial-state-ns");
+        state
+            .store
+            .put(
+                &ns_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": {
+                            "name": "partial-state-ns",
+                            "deletionTimestamp": "2099-01-01T00:00:00Z"
+                        },
+                        "spec": {},
+                        "status": {}
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("namespace seed must succeed");
+
+        // A namespaced pod with a real finalizer still held, so the completion recheck below
+        // does not hard-delete the namespace out from under the assertions.
+        let pod_key = crate::keys::object_key("pods", "partial-state-ns", "blocking-pod");
+        state
+            .store
+            .put(
+                &pod_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "blocking-pod",
+                            "namespace": "partial-state-ns",
+                            "finalizers": ["test.io/cleanup"]
+                        },
+                        "spec": { "containers": [] }
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("pod seed must succeed");
+
+        let stored = state
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not error")
+            .expect("namespace must be present");
+        let obj = Object::from_bytes(&stored.value).expect("stored namespace must parse");
+
+        stamp_terminating_and_recheck_completion(&state, &ns_key, "partial-state-ns", obj)
+            .await
+            .expect("stamp+recheck must succeed");
+
+        let after = state
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not error")
+            .expect("namespace must still be present — it still has a real finalizer blocking it");
+        let after_body: serde_json::Value = serde_json::from_slice(&after.value).unwrap();
+        assert_eq!(
+            after_body["metadata"]["deletionTimestamp"], "2099-01-01T00:00:00Z",
+            "deletionTimestamp is semantically immutable once set — advancing phase must never \
+             move it forward, or a client that already observed the original value would see \
+             the namespace's deletion deadline silently shift"
+        );
+        assert_eq!(
+            after_body["status"]["phase"], "Terminating",
+            "phase must still advance to Terminating even though deletionTimestamp itself is \
+             left untouched — this is the legitimate write the partial-state case needs"
         );
     }
 }
