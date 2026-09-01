@@ -154,6 +154,16 @@ pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> 
             continue;
         }
         let token = parts[0].to_owned();
+        if token.is_empty() {
+            // Upstream's tokenfile.go rejects `record[0] == ""` for the same reason: an
+            // empty token field (stray leading comma, template placeholder, truncated
+            // paste) would insert "" -> this line's UserInfo, and ct_token_lookup would
+            // then match ANY request sending `Authorization: Bearer ` (a literal empty
+            // token, no secret required) against it — authenticating an unauthenticated
+            // network client as that line's identity, up to system:masters.
+            tracing::warn!("token-auth-file line {}: empty token, skipping", lineno + 1);
+            continue;
+        }
         let username = parts[1].to_owned();
         let uid = parts[2].to_owned();
         let groups: Vec<String> = if parts.len() >= 4 {
@@ -2034,6 +2044,94 @@ mod tests {
         let bob = map.get("tok2").expect("tok2 must be present");
         assert_eq!(bob.username, "bob");
         assert!(bob.groups.is_empty());
+    }
+
+    /// A blank/malformed token-auth-file line (stray leading comma, template placeholder,
+    /// truncated paste) must never insert a ""-keyed map entry. Before this fix,
+    /// `ct_token_lookup`'s constant-time scan would match ANY request sending
+    /// `Authorization: Bearer ` (a literal empty token, no secret required) against that
+    /// entry, authenticating an unauthenticated network client as the blank line's identity
+    /// — up to system:masters here.
+    #[test]
+    fn test_load_token_file_skips_blank_token_line() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("u7s_test_tokens_blank.csv");
+        std::fs::write(
+            // lgtm[rust/path-injection]
+            &path,
+            ",admin,1,system:masters\ntok2,bob,uid2\n",
+        )
+        .unwrap();
+
+        let map = load_token_file(path.to_str().unwrap()).unwrap();
+        assert!(
+            !map.contains_key(""),
+            "an empty token field must never become a map key — it would let any client \
+             sending an empty bearer token authenticate as this line's identity"
+        );
+        assert!(
+            ct_token_lookup(&map, "").is_none(),
+            "constant-time lookup of an empty candidate token must never resolve to an \
+             identity, since no valid token is ever the empty string"
+        );
+        assert_eq!(map.len(), 1, "only the well-formed tok2 line should load");
+    }
+
+    /// End-to-end version of the check above: even with a blank-token line loaded through
+    /// the real `load_token_file` → `AuthLayer` path, a request literally sending
+    /// `Authorization: Bearer ` (empty token) must be rejected — not authenticated as the
+    /// blank line's identity.
+    #[tokio::test]
+    async fn empty_bearer_token_never_authenticates_even_with_blank_token_file_line() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("u7s_test_tokens_blank_integration.csv");
+        std::fs::write(
+            // lgtm[rust/path-injection]
+            &path,
+            ",admin,1,system:masters\n",
+        )
+        .unwrap();
+        let token_map = load_token_file(path.to_str().unwrap()).unwrap();
+        assert!(
+            token_map.is_empty(),
+            "the blank-token line must not load any entry"
+        );
+
+        let idx = Arc::new(RbacIndex::new());
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+            ));
+
+        // POST (not GET): the 401 short-circuit records to apiserver_request_total under a
+        // verb-keyed label before parse_path ever runs (see AuthService::call), so using a
+        // distinct verb here avoids racing auth_layer_records_request_total_on_401_and_403's
+        // own before/after read of the "get"+401 counter when tests run in parallel.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer ")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an empty bearer token must never authenticate as anyone — before this fix, a \
+             blank token-auth-file line would let this literal 'Authorization: Bearer ' \
+             request authenticate as system:masters"
+        );
     }
 
     // --- SA JWT authentication ---
