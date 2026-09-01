@@ -154,6 +154,16 @@ pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> 
             continue;
         }
         let token = parts[0].to_owned();
+        if token.is_empty() {
+            // Upstream's tokenfile.go rejects `record[0] == ""` for the same reason: an
+            // empty token field (stray leading comma, template placeholder, truncated
+            // paste) would insert "" -> this line's UserInfo, and ct_token_lookup would
+            // then match ANY request sending `Authorization: Bearer ` (a literal empty
+            // token, no secret required) against it — authenticating an unauthenticated
+            // network client as that line's identity, up to system:masters.
+            tracing::warn!("token-auth-file line {}: empty token, skipping", lineno + 1);
+            continue;
+        }
         let username = parts[1].to_owned();
         let uid = parts[2].to_owned();
         let groups: Vec<String> = if parts.len() >= 4 {
@@ -243,54 +253,62 @@ pub(crate) async fn authenticate<S: Store>(
     store: &S,
     sig_cache: &SigCache,
 ) -> AuthnResult {
-    match auth_header {
-        None => {
-            // No Authorization header — try x509 client cert before anonymous fallback.
-            if let Some(cert) = peer_cert {
-                // chain already verified by rustls WebPkiClientVerifier
-                if let Some(user) = extract_client_cert_identity(&cert.0) {
-                    return AuthnResult::Identified(user);
-                }
+    // RFC 7235 auth-scheme tokens are case-insensitive, and upstream's bearertoken
+    // authenticator (bearertoken.go) compares the scheme lowercased. A header that is
+    // missing entirely, or present with a non-"Bearer" scheme (e.g. "Basic ..."), must
+    // both "decline" the same way — falling through to x509 client-cert auth, then
+    // anonymous — rather than hard-failing 401. A hard 401 here would reject a client
+    // whose verified cert alone would have identified it under real kube-apiserver,
+    // since the union authenticator lets a still-available cert authenticate when the
+    // bearer-token authenticator declines instead of erroring.
+    const BEARER_PREFIX: &str = "Bearer ";
+    let bearer_token = auth_header.and_then(|value| {
+        let scheme = value.get(..BEARER_PREFIX.len())?;
+        scheme
+            .eq_ignore_ascii_case(BEARER_PREFIX)
+            .then(|| &value[BEARER_PREFIX.len()..])
+    });
+
+    let Some(token) = bearer_token else {
+        // No usable bearer token — try x509 client cert before anonymous fallback.
+        if let Some(cert) = peer_cert {
+            // chain already verified by rustls WebPkiClientVerifier
+            if let Some(user) = extract_client_cert_identity(&cert.0) {
+                return AuthnResult::Identified(user);
             }
-            // No credential at all → anonymous.
-            AuthnResult::Identified(UserInfo {
-                username: "system:anonymous".to_owned(),
-                uid: String::new(),
-                groups: vec!["system:unauthenticated".to_owned()],
-                extra: HashMap::new(),
-            })
         }
-        Some(value) => {
-            if let Some(token) = value.strip_prefix("Bearer ") {
-                // 1. Check static token map first using constant-time comparison.
-                // HashMap.get() can leak timing information about token prefixes
-                // (SipHash is non-cryptographic). Instead, compare all tokens in
-                // constant time so an attacker cannot distinguish valid prefixes
-                // from invalid ones.
-                if let Some(info) = ct_token_lookup(token_map, token) {
-                    let mut user = info.clone();
-                    // Real Kubernetes always adds system:authenticated to every
-                    // successfully identified user so that ClusterRoleBindings on
-                    // that group (e.g. system:basic-user) apply universally.
-                    if !user.groups.contains(&"system:authenticated".to_owned()) {
-                        user.groups.push("system:authenticated".to_owned());
-                    }
-                    return AuthnResult::Identified(user);
-                }
-                // 2. If a SA decoding key is available, attempt JWT verification.
-                if let Some(key) = sa_decoding_key {
-                    if let Some(user) = try_verify_sa_jwt(token, key, &[], store, sig_cache).await {
-                        return AuthnResult::Identified(user);
-                    }
-                }
-                // 3. Token not recognized — reject.
-                AuthnResult::BadToken
-            } else {
-                // Malformed Authorization header → treat as bad token.
-                AuthnResult::BadToken
-            }
+        // No credential at all → anonymous.
+        return AuthnResult::Identified(UserInfo {
+            username: "system:anonymous".to_owned(),
+            uid: String::new(),
+            groups: vec!["system:unauthenticated".to_owned()],
+            extra: HashMap::new(),
+        });
+    };
+
+    // 1. Check static token map first using constant-time comparison.
+    // HashMap.get() can leak timing information about token prefixes
+    // (SipHash is non-cryptographic). Instead, compare all tokens in
+    // constant time so an attacker cannot distinguish valid prefixes
+    // from invalid ones.
+    if let Some(info) = ct_token_lookup(token_map, token) {
+        let mut user = info.clone();
+        // Real Kubernetes always adds system:authenticated to every
+        // successfully identified user so that ClusterRoleBindings on
+        // that group (e.g. system:basic-user) apply universally.
+        if !user.groups.contains(&"system:authenticated".to_owned()) {
+            user.groups.push("system:authenticated".to_owned());
+        }
+        return AuthnResult::Identified(user);
+    }
+    // 2. If a SA decoding key is available, attempt JWT verification.
+    if let Some(key) = sa_decoding_key {
+        if let Some(user) = try_verify_sa_jwt(token, key, &[], store, sig_cache).await {
+            return AuthnResult::Identified(user);
         }
     }
+    // 3. Token not recognized — reject.
+    AuthnResult::BadToken
 }
 
 /// Parse a DER-encoded X.509 client certificate and extract subject CN and O
@@ -953,6 +971,28 @@ fn forbidden_response(user: &str, verb: &str, resource: &str) -> Response<Body> 
         .unwrap()
 }
 
+/// Malformed impersonation request — e.g. `Impersonate-Group`/`-Uid`/`-Extra-*` without
+/// `Impersonate-User`. Mirrors upstream's `buildImpersonationRequests`, which rejects that
+/// shape with 400 rather than silently ignoring the extra headers.
+fn bad_request_response(message: String) -> Response<Body> {
+    let status = Status {
+        kind: "Status",
+        api_version: "v1",
+        status: "Failure",
+        message,
+        reason: "BadRequest",
+        code: 400,
+        metadata: None,
+        details: None,
+    };
+    let body = serde_json::to_vec(&status).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 /// Splits a `system:serviceaccount:<namespace>:<name>` username into its namespace and
 /// name components. Reuses apf.rs's `service_account_matches_namespace` prefix constant and
 /// stripping approach, but (unlike that function, which only tests membership in an already-
@@ -1155,10 +1195,31 @@ where
             // We must verify that the authenticated user has the `impersonate` verb on the
             // target resources before substituting the impersonated identity.
             //
-            // The impersonated groups replace the authenticated user's groups entirely; real
-            // Kubernetes always adds system:authenticated to any impersonated non-system user,
-            // but if the caller explicitly supplies groups we use those verbatim (just like the
-            // real apiserver does when Impersonate-Group headers are provided).
+            // Impersonate-Group/-Uid/-Extra-* without Impersonate-User is a malformed request:
+            // upstream's buildImpersonationRequests rejects this shape with 400 rather than
+            // silently dropping the headers, which would otherwise mask a client bug (e.g. a
+            // caller whose intended Impersonate-User header was stripped by a proxy).
+            if req.headers().get("Impersonate-User").is_none()
+                && (req.headers().get("Impersonate-Group").is_some()
+                    || req.headers().get("Impersonate-Uid").is_some()
+                    || req
+                        .headers()
+                        .iter()
+                        .any(|(name, _)| name.as_str().starts_with("impersonate-extra-")))
+            {
+                return Ok(bad_request_response(
+                    "requested Impersonate-Group/Impersonate-Uid/Impersonate-Extra-* without \
+                     impersonating a user (Impersonate-User)"
+                        .to_owned(),
+                ));
+            }
+
+            // The impersonated groups replace the authenticated user's groups entirely. If the
+            // caller explicitly supplies groups we use those verbatim; if not and the target is
+            // SA-shaped, we default to the system:serviceaccounts[:ns] groups a real SA JWT
+            // carries. Either way, system:authenticated is appended unless already present (or
+            // system:unauthenticated was impersonated) — see the groups computation below for
+            // why this must run after (not just "on empty").
             let user = if let Some(impersonate_user) = req
                 .headers()
                 .get("Impersonate-User")
@@ -1268,18 +1329,24 @@ where
                 // separate header instance per value). Each key's subresource on "userextras"
                 // is authorized per value, mirroring upstream. Header names from the http crate
                 // are always lowercase, so the prefix match below is case-insensitive for free.
+                //
+                // HTTP header names cannot contain a raw '/', so client-go's
+                // transport.headerKeyEscape percent-encodes any illegal byte in an extra key
+                // before setting the header (e.g. u7s's own SA-JWT extra key
+                // "authentication.kubernetes.io/credential-id" is sent as
+                // "Impersonate-Extra-authentication.kubernetes.io%2fcredential-id"). Decode the
+                // key here — mirroring upstream's unescapeExtraKey — so it matches both the
+                // RBAC "userextras" subresource check below and the final extra map key.
                 let mut impersonate_extra: HashMap<String, Vec<String>> = HashMap::new();
                 for (name, value) in req.headers().iter() {
-                    let Some(key) = name.as_str().strip_prefix("impersonate-extra-") else {
+                    let Some(raw_key) = name.as_str().strip_prefix("impersonate-extra-") else {
                         continue;
                     };
                     let Ok(v) = value.to_str() else {
                         continue;
                     };
-                    impersonate_extra
-                        .entry(key.to_owned())
-                        .or_default()
-                        .push(v.to_owned());
+                    let key = percent_decode(raw_key);
+                    impersonate_extra.entry(key).or_default().push(v.to_owned());
                 }
                 for (key, values) in &impersonate_extra {
                     for value in values {
@@ -1304,13 +1371,29 @@ where
                 }
 
                 // All impersonation checks passed — substitute impersonated identity.
-                // If the caller supplied explicit groups, use them verbatim.
-                // If no groups were provided, add system:authenticated as Kubernetes does.
-                let groups = if impersonate_groups.is_empty() {
-                    vec!["system:authenticated".to_owned()]
-                } else {
+                // If the caller supplied explicit groups, use them verbatim. If none were
+                // provided and the target is SA-shaped, seed with the same
+                // system:serviceaccounts[:ns] groups a real SA JWT carries (try_verify_sa_jwt)
+                // — upstream's serviceaccount.MakeGroupNames adds these unconditionally.
+                let mut groups = if !impersonate_groups.is_empty() {
                     impersonate_groups
+                } else if let Some((namespace, _name)) = sa_parts {
+                    vec![
+                        "system:serviceaccounts".to_owned(),
+                        format!("system:serviceaccounts:{namespace}"),
+                    ]
+                } else {
+                    vec![]
                 };
+                // Real Kubernetes always appends system:authenticated to an impersonated
+                // identity's groups unless the caller already listed it (or explicitly
+                // impersonated system:unauthenticated) — matches upstream's WithImpersonation
+                // filter so RBAC bound to system:authenticated still applies.
+                if !groups.contains(&"system:authenticated".to_owned())
+                    && !groups.contains(&"system:unauthenticated".to_owned())
+                {
+                    groups.push("system:authenticated".to_owned());
+                }
 
                 UserInfo {
                     username: impersonate_user,
@@ -1961,6 +2044,94 @@ mod tests {
         let bob = map.get("tok2").expect("tok2 must be present");
         assert_eq!(bob.username, "bob");
         assert!(bob.groups.is_empty());
+    }
+
+    /// A blank/malformed token-auth-file line (stray leading comma, template placeholder,
+    /// truncated paste) must never insert a ""-keyed map entry. Before this fix,
+    /// `ct_token_lookup`'s constant-time scan would match ANY request sending
+    /// `Authorization: Bearer ` (a literal empty token, no secret required) against that
+    /// entry, authenticating an unauthenticated network client as the blank line's identity
+    /// — up to system:masters here.
+    #[test]
+    fn test_load_token_file_skips_blank_token_line() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("u7s_test_tokens_blank.csv");
+        std::fs::write(
+            // lgtm[rust/path-injection]
+            &path,
+            ",admin,1,system:masters\ntok2,bob,uid2\n",
+        )
+        .unwrap();
+
+        let map = load_token_file(path.to_str().unwrap()).unwrap();
+        assert!(
+            !map.contains_key(""),
+            "an empty token field must never become a map key — it would let any client \
+             sending an empty bearer token authenticate as this line's identity"
+        );
+        assert!(
+            ct_token_lookup(&map, "").is_none(),
+            "constant-time lookup of an empty candidate token must never resolve to an \
+             identity, since no valid token is ever the empty string"
+        );
+        assert_eq!(map.len(), 1, "only the well-formed tok2 line should load");
+    }
+
+    /// End-to-end version of the check above: even with a blank-token line loaded through
+    /// the real `load_token_file` → `AuthLayer` path, a request literally sending
+    /// `Authorization: Bearer ` (empty token) must be rejected — not authenticated as the
+    /// blank line's identity.
+    #[tokio::test]
+    async fn empty_bearer_token_never_authenticates_even_with_blank_token_file_line() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("u7s_test_tokens_blank_integration.csv");
+        std::fs::write(
+            // lgtm[rust/path-injection]
+            &path,
+            ",admin,1,system:masters\n",
+        )
+        .unwrap();
+        let token_map = load_token_file(path.to_str().unwrap()).unwrap();
+        assert!(
+            token_map.is_empty(),
+            "the blank-token line must not load any entry"
+        );
+
+        let idx = Arc::new(RbacIndex::new());
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+            ));
+
+        // POST (not GET): the 401 short-circuit records to apiserver_request_total under a
+        // verb-keyed label before parse_path ever runs (see AuthService::call), so using a
+        // distinct verb here avoids racing auth_layer_records_request_total_on_401_and_403's
+        // own before/after read of the "get"+401 counter when tests run in parallel.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer ")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an empty bearer token must never authenticate as anyone — before this fix, a \
+             blank token-auth-file line would let this literal 'Authorization: Bearer ' \
+             request authenticate as system:masters"
+        );
     }
 
     // --- SA JWT authentication ---
@@ -3199,6 +3370,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn authn_non_bearer_scheme_declines_to_cert_auth() {
+        // A non-"Bearer" Authorization scheme (e.g. "Basic ...") must not hard-fail
+        // 401 — upstream's bearertoken authenticator treats a scheme mismatch as
+        // "declined", which lets a still-verified client cert authenticate the
+        // request instead. A hard 401 here would reject a client that real
+        // kube-apiserver would still identify via its cert, just because it (or an
+        // intermediary) also sent an unrelated Basic-auth header.
+        let der = make_cert_der("alice", &["system:masters"]);
+        let cert = PeerCertificate(der);
+        let map = HashMap::new();
+        let req = make_req(Method::GET, "/api/v1/pods", Some("Basic dXNlcjpwYXNz"));
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            Some(&cert),
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await
+        {
+            AuthnResult::Identified(u) => assert_eq!(u.username, "alice"),
+            AuthnResult::BadToken => {
+                panic!("non-bearer scheme must decline to cert auth, not hard-fail 401")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authn_bearer_scheme_is_case_insensitive() {
+        // RFC 7235 auth-scheme tokens are case-insensitive; a client (or proxy)
+        // sending "bearer" instead of "Bearer" must still authenticate via the
+        // token map — matching upstream's bearertoken.go, which lowercases the
+        // scheme before comparing.
+        let mut map = HashMap::new();
+        map.insert(
+            "secret-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+        );
+        let req = make_req(Method::GET, "/api/v1/pods", Some("bearer secret-token"));
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            None,
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await
+        {
+            AuthnResult::Identified(u) => assert_eq!(u.username, "alice"),
+            AuthnResult::BadToken => panic!("lowercase 'bearer' scheme must still authenticate"),
+        }
+    }
+
     // --- system:authenticated group presence ---
     // Argo CD and other tools bind ClusterRoles to the system:authenticated group
     // (e.g. system:basic-user grants SelfSubjectAccessReview).  Without this group
@@ -3578,6 +3810,235 @@ mod tests {
         );
     }
 
+    /// `Impersonate-Group`/`Impersonate-Uid`/`Impersonate-Extra-*` present WITHOUT
+    /// `Impersonate-User` must be rejected with 400, matching upstream's
+    /// `buildImpersonationRequests` ("requested %v without impersonating a user"). Before
+    /// this fix these headers were silently dropped and the request proceeded as the
+    /// authenticated caller — masking what upstream treats as a malformed client request
+    /// (e.g. a caller whose intended Impersonate-User header was stripped by a proxy).
+    #[tokio::test]
+    async fn impersonate_group_without_impersonate_user_is_bad_request() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        // alice has full impersonate RBAC — the 400 must fire purely because
+        // Impersonate-User is missing, before any authorization check runs.
+        let idx = make_rbac_with_impersonator_and_target();
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-Group", "some-group")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "Impersonate-Group without Impersonate-User must 400, not silently proceed as alice"
+        );
+    }
+
+    /// A percent-encoded `Impersonate-Extra-<key>` header name (as client-go's
+    /// `transport.headerKeyEscape` produces for any key containing an illegal HTTP header
+    /// byte — e.g. u7s's own SA-JWT extra key `authentication.kubernetes.io/credential-id`)
+    /// must be percent-decoded before both the RBAC "userextras" subresource check and the
+    /// final `UserInfo.extra` key. Before this fix the raw encoded string was used for
+    /// both, so a caller authorized on the human-readable decoded key never matched.
+    #[tokio::test]
+    async fn impersonate_extra_key_is_percent_decoded_before_rbac_and_extra_map() {
+        use axum::{body::Body, http::Request, routing::get, Extension, Router};
+        use tower::ServiceExt;
+
+        let idx = Arc::new(RbacIndex::new());
+        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/extra-impersonator";
+        let role_val = serde_json::json!({
+            "rules": [
+                { "apiGroups": [""], "resources": ["users"], "verbs": ["impersonate"] },
+                {
+                    "apiGroups": ["authentication.k8s.io"],
+                    "resources": ["userextras/authentication.kubernetes.io/credential-id"],
+                    "verbs": ["impersonate"]
+                }
+            ]
+        });
+        idx.apply_object(role_key, &role_val);
+        let bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/alice-extra-impersonator";
+        let bind_val = serde_json::json!({
+            "subjects": [{ "kind": "User", "name": "alice" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "extra-impersonator"
+            }
+        });
+        idx.apply_object(bind_key, &bind_val);
+        let target_role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/pod-lister-extra";
+        let target_role_val = serde_json::json!({
+            "rules": [{ "apiGroups": [""], "resources": ["pods"], "verbs": ["list"] }]
+        });
+        idx.apply_object(target_role_key, &target_role_val);
+        let target_bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/bob-pod-lister-extra";
+        let target_bind_val = serde_json::json!({
+            "subjects": [{ "kind": "User", "name": "bob" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "pod-lister-extra"
+            }
+        });
+        idx.apply_object(target_bind_key, &target_bind_val);
+
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        async fn whoami(Extension(user): Extension<UserInfo>) -> String {
+            serde_json::to_string(&user.extra).unwrap()
+        }
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(whoami))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-User", "bob")
+            .header(
+                "Impersonate-Extra-authentication.kubernetes.io%2fcredential-id",
+                "v1",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "caller is authorized on the DECODED subresource key \
+             'authentication.kubernetes.io/credential-id' — before this fix the RBAC check \
+             used the raw percent-encoded header name and never matched, so this would 403"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let extra: HashMap<String, Vec<String>> = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            extra.get("authentication.kubernetes.io/credential-id"),
+            Some(&vec!["v1".to_owned()]),
+            "the final UserInfo.extra key must be the decoded key, not the raw \
+             percent-encoded header name"
+        );
+    }
+
+    /// Real kube-apiserver always appends `system:authenticated` to an impersonated
+    /// identity's groups unless the caller's explicit `Impersonate-Group` list already
+    /// contains it (or `system:unauthenticated`) — before this fix explicit groups were used
+    /// verbatim with no backstop, so ClusterRoleBindings on `system:authenticated` (e.g.
+    /// `system:basic-user`) silently stopped applying to any impersonated identity that
+    /// supplied its own group list.
+    #[tokio::test]
+    async fn impersonate_group_header_still_gets_system_authenticated_backstop() {
+        use axum::{body::Body, http::Request, routing::get, Extension, Router};
+        use tower::ServiceExt;
+
+        let idx = make_rbac_with_impersonator_and_target();
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        async fn whoami(Extension(user): Extension<UserInfo>) -> String {
+            serde_json::to_string(&user.groups).unwrap()
+        }
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(whoami))
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-User", "bob")
+            .header("Impersonate-Group", "custom-group")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let groups: Vec<String> = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            groups.contains(&"system:authenticated".to_owned()),
+            "an explicit Impersonate-Group list without system:authenticated must still get \
+             the backstop appended — got {groups:?}"
+        );
+        assert!(
+            groups.contains(&"custom-group".to_owned()),
+            "the caller's explicit group must still be present alongside the backstop"
+        );
+    }
+
     // --- SA-shaped Impersonate-User must check resource=serviceaccounts, not users ---
     //
     // Real kube-apiserver's impersonation filter branches on the impersonated username: a
@@ -3653,6 +4114,12 @@ mod tests {
     /// grant real kube-apiserver requires for SA-shaped impersonation. This is the gap
     /// deliberately left inert by seed_rbac's `serviceaccounts` impersonate rule until this
     /// fix landed.
+    ///
+    /// Also asserts the auto-added `system:serviceaccounts`/`system:serviceaccounts:ns-a`
+    /// groups: with no explicit `Impersonate-Group` header, an SA-shaped impersonated
+    /// identity must carry the same groups a real SA JWT does (`try_verify_sa_jwt`) — without
+    /// them, RBAC rules and `kubectl auth can-i --as=` bound to those groups would falsely
+    /// deny an impersonated ServiceAccount that a real one would pass.
     #[tokio::test]
     async fn impersonation_of_sa_shaped_identity_checks_serviceaccounts_resource() {
         use axum::{body::Body, http::Request, routing::get, Extension, Router};
@@ -3671,7 +4138,11 @@ mod tests {
         );
 
         async fn whoami(Extension(user): Extension<UserInfo>) -> String {
-            user.username
+            serde_json::to_string(&serde_json::json!({
+                "username": user.username,
+                "groups": user.groups,
+            }))
+            .unwrap()
         }
 
         let app = Router::new()
@@ -3706,10 +4177,21 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(
-            std::str::from_utf8(&body_bytes).unwrap(),
-            "system:serviceaccount:ns-a:target",
+            val["username"], "system:serviceaccount:ns-a:target",
             "effective identity must be the impersonated ServiceAccount, not the caller"
+        );
+        let groups: Vec<String> = serde_json::from_value(val["groups"].clone()).unwrap();
+        assert!(
+            groups.contains(&"system:serviceaccounts".to_owned())
+                && groups.contains(&"system:serviceaccounts:ns-a".to_owned())
+                && groups.contains(&"system:authenticated".to_owned()),
+            "impersonating an SA-shaped identity with no explicit Impersonate-Group header \
+             must auto-add system:serviceaccounts/system:serviceaccounts:ns-a (plus the usual \
+             system:authenticated backstop) — omitting them breaks RBAC rules (and `kubectl \
+             auth can-i --as=`) that bind to those groups, matching what a real SA JWT \
+             carries via try_verify_sa_jwt. Got: {groups:?}"
         );
     }
 
