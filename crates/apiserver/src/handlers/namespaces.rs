@@ -1098,23 +1098,40 @@ async fn stamp_terminating_and_recheck_completion<S: Store>(
     name: &str,
     mut obj: Object,
 ) -> Result<Object, crate::status::StatusError> {
-    obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-    obj.body["status"] = serde_json::to_value(NamespaceStatus {
-        phase: Some(NamespacePhase::Terminating),
-        rest: serde_json::Value::Object(Default::default()),
-    })
-    .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
-    let expected_rv = parse_resource_version(obj.resource_version())?;
-    let new_rv = state
-        .store
-        .put(key, obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err_to_status(e, name))?;
-    obj.set_resource_version(new_rv);
+    if needs_terminating_stamp(&obj.body) {
+        obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+        obj.body["status"] = serde_json::to_value(NamespaceStatus {
+            phase: Some(NamespacePhase::Terminating),
+            rest: serde_json::Value::Object(Default::default()),
+        })
+        .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
+        let expected_rv = parse_resource_version(obj.resource_version())?;
+        let new_rv = state
+            .store
+            .put(key, obj.to_bytes(), expected_rv)
+            .await
+            .map_err(|e| store_err_to_status(e, name))?;
+        obj.set_resource_version(new_rv);
+    }
 
     maybe_finalize_terminating_namespace(state, name).await;
 
     Ok(obj)
+}
+
+/// Whether a namespace still needs its deletionTimestamp/status.phase stamped Terminating, or
+/// already carries both from a prior call.
+///
+/// `stamp_terminating_and_recheck_completion` is re-driven on every repeat DELETE while a
+/// contained object's owning controller is slow to clear its finalizer — the same class of
+/// redundant retry `apply_delete_policy` (generic.rs) and `delete_pod` (pods.rs) already guard
+/// against. Re-stamping deletionTimestamp with a fresh "now" on every retry defeats the store's
+/// byte-equality no-op-write check, bumping resourceVersion and firing a watch event each time;
+/// a namespace stuck behind a slow finalizer would never converge, livelocking in Terminating
+/// forever instead of completing once the finalizer actually clears.
+fn needs_terminating_stamp(obj_body: &serde_json::Value) -> bool {
+    obj_body["metadata"]["deletionTimestamp"].is_null()
+        || obj_body["status"]["phase"].as_str() != Some("Terminating")
 }
 
 pub(crate) async fn delete_namespace<S: Store>(
@@ -5926,6 +5943,127 @@ mod tests {
              a concurrent completion-trigger call that fired too early to see the namespace's \
              own deletionTimestamp — without re-checking here the namespace orphans in \
              Terminating forever with nothing left to ever re-drive it"
+        );
+    }
+
+    /// needs_terminating_stamp must say "nothing to do" once a namespace already carries both
+    /// deletionTimestamp and status.phase=Terminating — the case a redundant DELETE retry hits
+    /// on every resync while a contained object's finalizer is slow to clear.
+    #[test]
+    fn needs_terminating_stamp_is_false_once_already_terminating() {
+        let already_terminating = serde_json::json!({
+            "metadata": { "deletionTimestamp": "2099-01-01T00:00:00Z" },
+            "status": { "phase": "Terminating" }
+        });
+        assert!(
+            !needs_terminating_stamp(&already_terminating),
+            "a namespace that already has deletionTimestamp and phase=Terminating must not be \
+             re-stamped — re-stamping on every redundant DELETE retry bumps resourceVersion \
+             and fires a watch event on every call, livelocking the namespace in Terminating \
+             forever instead of letting it complete once its blocking finalizer clears"
+        );
+    }
+
+    /// needs_terminating_stamp must still say "stamp it" for a namespace that has neither field
+    /// set yet — the very first FinalizerPending call this function exists to handle.
+    #[test]
+    fn needs_terminating_stamp_is_true_for_a_fresh_namespace() {
+        let fresh = serde_json::json!({ "metadata": {}, "status": {} });
+        assert!(
+            needs_terminating_stamp(&fresh),
+            "a namespace with no deletionTimestamp yet must still be stamped, or it would \
+             never transition into Terminating at all"
+        );
+    }
+
+    /// Regression: a repeat call to stamp_terminating_and_recheck_completion against a
+    /// namespace that is already Terminating must not write to the store at all.
+    ///
+    /// Fails on revert: without the `needs_terminating_stamp` guard, this function
+    /// unconditionally re-stamps deletionTimestamp to a fresh `now()` and re-persists on every
+    /// call, which changes resourceVersion — this test's final assertion would fail.
+    #[tokio::test]
+    async fn stamp_terminating_and_recheck_completion_is_a_no_op_when_already_terminating() {
+        let state = make_state();
+        let ns_key = crate::keys::cluster_object_key("namespaces", "already-terminating-ns");
+        let seeded_rv = state
+            .store
+            .put(
+                &ns_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": {
+                            "name": "already-terminating-ns",
+                            "deletionTimestamp": "2099-01-01T00:00:00Z"
+                        },
+                        "spec": {},
+                        "status": { "phase": "Terminating" }
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("namespace seed must succeed");
+
+        // A namespaced pod with a real finalizer still held — without this, the recheck call
+        // below would find zero remaining finalizer'd objects and hard-delete the namespace,
+        // which would make the resourceVersion assertion below meaningless.
+        let pod_key = crate::keys::object_key("pods", "already-terminating-ns", "blocking-pod");
+        state
+            .store
+            .put(
+                &pod_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "blocking-pod",
+                            "namespace": "already-terminating-ns",
+                            "finalizers": ["test.io/cleanup"]
+                        },
+                        "spec": { "containers": [] }
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("pod seed must succeed");
+
+        let stored = state
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not error")
+            .expect("namespace must be present");
+        let obj = Object::from_bytes(&stored.value).expect("stored namespace must parse");
+
+        stamp_terminating_and_recheck_completion(&state, &ns_key, "already-terminating-ns", obj)
+            .await
+            .expect("stamp+recheck must succeed");
+
+        let after = state
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not error")
+            .expect("namespace must still be present — it still has a real finalizer blocking it");
+        let after_body: serde_json::Value = serde_json::from_slice(&after.value).unwrap();
+        assert_eq!(
+            after_body["metadata"]["resourceVersion"],
+            seeded_rv.to_string(),
+            "a repeat call on an already-terminating namespace must not write — otherwise \
+             resourceVersion churns and the watch events it fires livelock finalizer drain, \
+             the same class of bug already fixed for pods (delete_pod) and generic soft-delete \
+             (apply_delete_policy)"
+        );
+        assert_eq!(
+            after_body["metadata"]["deletionTimestamp"], "2099-01-01T00:00:00Z",
+            "deletionTimestamp must not be re-stamped on a no-op recheck"
         );
     }
 }
