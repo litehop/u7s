@@ -690,7 +690,7 @@ echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnecti
 # script loud with a journalctl dump — this fallback can't produce a silently
 # broken kube-proxy.
 KUBELET_VERSION=$(limactl shell "$VM_NAME" kubelet --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-KUBELET_VERSION="${KUBELET_VERSION:-1.36.4}"
+KUBELET_VERSION="${KUBELET_VERSION:-1.37.0}"
 
 # Create kube-proxy ServiceAccount and RBAC (needed for the kubeconfig token).
 kubectl --kubeconfig="$KUBECONFIG_PATH" create serviceaccount kube-proxy -n kube-system \

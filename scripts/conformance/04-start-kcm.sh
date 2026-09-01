@@ -90,8 +90,8 @@ KCM_V_FLAG="$([ -n "$KCM_V" ] && echo "--v=$KCM_V" || echo "")"
 CACHE_DIR="\${KCM_CACHE_DIR:-\${HOME}/.cache/u7s/kcm}"
 KCM_LOG="$KCM_LOG"
 
-# Determine k8s version from kubectl inside the VM; fallback to 1.36.4.
-DEFAULT_VERSION="1.36.4"
+# Determine k8s version from kubectl inside the VM; fallback to 1.37.0.
+DEFAULT_VERSION="1.37.0"
 if command -v kubectl &>/dev/null; then
   DETECTED=\$(kubectl version --client -o json 2>/dev/null \
     | jq -r '.clientVersion.gitVersion' 2>/dev/null \

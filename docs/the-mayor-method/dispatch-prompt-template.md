@@ -409,11 +409,11 @@ this repo. When you need it:
   ask the mayor to copy it into your worktree — do not reach into the mayor
   checkout or fetch a divergent copy elsewhere.
 - **Fetch with `gh api` or `curl`, never `WebFetch`** (blocked for workers).
-  E.g. `gh api -H "Accept: application/vnd.github.raw" "/repos/kubernetes/kubernetes/contents/test/e2e/node/pods.go?ref=release-1.36"`.
+  E.g. `gh api -H "Accept: application/vnd.github.raw" "/repos/kubernetes/kubernetes/contents/test/e2e/node/pods.go?ref=release-1.37"`.
   Fetch each file ONCE, save it into `temp/research/<filename>`, then grep/read
   the cached copy locally for any further lookups — don't re-fetch per symbol.
-- **Pin to the latest Kubernetes version: `1.36.4`** (as of 2026-08) — branch
-  `release-1.36` for raw GitHub fetches, and reference 1.36.4 API/test
+- **Pin to the latest Kubernetes version: `1.37.0`** (as of 2026-09) — branch
+  `release-1.37` for raw GitHub fetches, and reference 1.37.0 API/test
   semantics, not an older minor. Deviate only if a run's `serverversion.json`
   explicitly shows a different client version for that run.
 
