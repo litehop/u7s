@@ -3437,6 +3437,15 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
 
     quota::update_quota_status(&state, &ns).await;
 
+    // This object's finalizers were already empty at DELETE time (no complete_finalizer_drain
+    // call happens for a plain DELETE — that path only fires from a PATCH/PUT that itself
+    // clears the last finalizer). If it was the last blocking finalizer'd object in a
+    // Terminating namespace, the namespace's own completion re-check must still fire here, or
+    // a namespace stuck on this one child never notices the child is gone and stays
+    // Terminating forever. Mirrors complete_finalizer_drain's ordering (quota refresh, then
+    // the namespace completion check).
+    super::namespaces::maybe_finalize_terminating_namespace(&state, &ns).await;
+
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
@@ -6717,6 +6726,103 @@ mod tests {
         let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(val["kind"], "Status");
         assert_eq!(val["status"], "Success");
+    }
+
+    /// A namespace stuck Terminating on exactly one blocking child must complete once that
+    /// child is removed via a plain DELETE — even though its finalizer was cleared by a
+    /// separate write, not by this DELETE itself.
+    ///
+    /// maybe_finalize_terminating_namespace (the OrderedNamespaceDeletion completion trigger)
+    /// is the only thing that ever re-checks a Terminating namespace for completion, and it
+    /// only fires from specific call sites (complete_finalizer_drain for a PATCH/PUT that
+    /// itself clears the last finalizer). Before this fix, delete_namespaced_resource's plain
+    /// DELETE hard-delete branch was not one of those call sites: a child whose finalizer had
+    /// already been cleared by an earlier, separate write and was then removed via ordinary
+    /// DELETE left the namespace with zero remaining finalizer'd content but nothing to ever
+    /// notice — it stayed Terminating forever. Fails on revert: the namespace record would
+    /// still exist after the DELETE below.
+    #[tokio::test]
+    async fn delete_namespaced_resource_rechecks_namespace_completion_after_plain_delete() {
+        use u7s_store::Store;
+        let state = make_state();
+
+        let ns_key = crate::keys::cluster_object_key("namespaces", "stuck-on-child-ns");
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "stuck-on-child-ns",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": [] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns.to_string()), None)
+            .await
+            .expect("namespace seed must succeed");
+
+        // The one real blocking child. Its finalizer is already cleared here, simulating a
+        // separate PATCH/PUT that completed the drain on the object itself but (being a
+        // no-op PATCH updating only the finalizer, not one that also has deletionTimestamp
+        // set at that moment) did not go through complete_finalizer_drain's hard-delete path.
+        let cm_key = group_object_key("", "configmaps", Some("stuck-on-child-ns"), "last-child");
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "last-child",
+                "namespace": "stuck-on-child-ns",
+                "finalizers": []
+            }
+        });
+        state
+            .store
+            .put(&cm_key, bytes::Bytes::from(cm.to_string()), None)
+            .await
+            .expect("configmap seed must succeed");
+
+        let result = delete_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "stuck-on-child-ns".into(),
+                "configmaps".into(),
+                "last-child".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "plain DELETE of the finalizer-free child must succeed"
+        );
+
+        assert!(
+            state
+                .store
+                .get(&cm_key)
+                .await
+                .expect("store get must not error")
+                .is_none(),
+            "the child itself must be hard-deleted by a plain DELETE"
+        );
+        assert!(
+            state
+                .store
+                .get(&ns_key)
+                .await
+                .expect("store get must not error")
+                .is_none(),
+            "the namespace must complete its own deletion once its last blocking child is \
+             gone, even though that child was removed via a plain DELETE rather than a \
+             finalizer-clearing PATCH/PUT completing the drain in one shot — without the \
+             completion re-check here, the namespace stays Terminating forever"
+        );
     }
 
     /// delete_namespaced_resource must return 404 when the object does not exist.
