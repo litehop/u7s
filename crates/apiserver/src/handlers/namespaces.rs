@@ -442,16 +442,6 @@ pub(crate) async fn replace_namespace<S: Store>(
         .map(|f| f.is_empty())
         .unwrap_or(true);
 
-    if deletion_ts_set && finalizers_empty {
-        state
-            .store
-            .delete(&key, None)
-            .await
-            .map_err(|e| store_err_to_status(e, &name))?;
-        state.quota_admission_locks.evict(&name);
-        return Ok(Json(obj.body).into_response());
-    }
-
     let new_rv = state
         .store
         .put(&key, obj.to_bytes(), expected_revision)
@@ -459,6 +449,17 @@ pub(crate) async fn replace_namespace<S: Store>(
         .map_err(|e| store_err_to_status(e, &name))?;
 
     obj.set_resource_version(new_rv);
+
+    // Persist first, then let maybe_finalize_terminating_namespace decide whether the
+    // namespace can actually hard-delete now. Hard-deleting unconditionally here (the old
+    // behavior) is asymmetric with the OrderedNamespaceDeletion completion trigger, which
+    // scans contained objects for a real, still-present metadata.finalizers entry before
+    // hard-deleting — without that same check, a namespace whose OWN finalizers just went
+    // empty could vanish while a ConfigMap/etc. inside it still has a blocking finalizer,
+    // orphaning that object forever (nothing left to ever re-drive it).
+    if deletion_ts_set && finalizers_empty {
+        maybe_finalize_terminating_namespace(&state, &name).await;
+    }
 
     Ok(Json(obj.body).into_response())
 }
@@ -555,16 +556,6 @@ pub(crate) async fn patch_namespace<S: Store>(
         .map(|f| f.is_empty())
         .unwrap_or(true);
 
-    if deletion_ts_set && finalizers_empty {
-        state
-            .store
-            .delete(&key, None)
-            .await
-            .map_err(|e| store_err_to_status(e, &name))?;
-        state.quota_admission_locks.evict(&name);
-        return Ok(Json(current.body).into_response());
-    }
-
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
         .store
@@ -573,6 +564,14 @@ pub(crate) async fn patch_namespace<S: Store>(
         .map_err(|e| store_err_to_status(e, &name))?;
 
     current.set_resource_version(new_rv);
+
+    // Persist first, then let maybe_finalize_terminating_namespace decide whether the
+    // namespace can actually hard-delete now — see replace_namespace for why this must not
+    // hard-delete unconditionally (it would orphan namespace content still holding a real
+    // finalizer).
+    if deletion_ts_set && finalizers_empty {
+        maybe_finalize_terminating_namespace(&state, &name).await;
+    }
 
     Ok(Json(current.body).into_response())
 }
@@ -642,17 +641,7 @@ pub(crate) async fn finalize_namespace<S: Store>(
         .map(|f| f.is_empty())
         .unwrap_or(true);
 
-    if deletion_ts_set && finalizers_empty {
-        state
-            .store
-            .delete(&key, None)
-            .await
-            .map_err(|e| store_err_to_status(e, &name))?;
-        state.quota_admission_locks.evict(&name);
-        return Ok(Json(current.body).into_response());
-    }
-
-    // Finalizers remain — persist the updated object and return it.
+    // Persist the updated object first.
     // CAS on the INCOMING request's resourceVersion, not the stored object's: /finalize is
     // a replace subresource, so a client holding a stale snapshot must get 409 and retry
     // rather than clobber a concurrent write. Absent rv stays unconditional (returns None).
@@ -666,6 +655,13 @@ pub(crate) async fn finalize_namespace<S: Store>(
         .map_err(|e| store_err_to_status(e, &name))?;
 
     current.set_resource_version(new_rv);
+
+    // Then let maybe_finalize_terminating_namespace decide whether the namespace can
+    // actually hard-delete now — see replace_namespace for why this must not hard-delete
+    // unconditionally (it would orphan namespace content still holding a real finalizer).
+    if deletion_ts_set && finalizers_empty {
+        maybe_finalize_terminating_namespace(&state, &name).await;
+    }
 
     Ok(Json(current.body).into_response())
 }
@@ -3356,6 +3352,130 @@ mod tests {
             stored.is_none(),
             "namespace must be hard-deleted when all finalizers are removed while \
              deletionTimestamp is set — without this the namespace stays Terminating forever"
+        );
+    }
+
+    /// patch_namespace must NOT hard-delete the namespace record while a namespace-scoped
+    /// object still carries a real (non-empty) metadata.finalizers entry, even though the
+    /// namespace's OWN spec.finalizers just went empty.
+    ///
+    /// Live repro this covers (kubectl): create a namespace, put a ConfigMap in it with a
+    /// real finalizer, `kubectl delete ns --wait=false` (namespace goes Terminating, the
+    /// ConfigMap is soft-deleted but keeps its finalizer), then
+    /// `kubectl patch ns --type merge -p '{"spec":{"finalizers":[]}}'` (mirrors a
+    /// force-cleanup client clearing the namespace's own finalizer). Before this fix,
+    /// patch_namespace hard-deleted the namespace unconditionally the instant its OWN
+    /// spec.finalizers went empty, with no check on contained content — the ConfigMap was
+    /// left behind, invisible to `kubectl get configmap -n <ns>`'s owning namespace listing
+    /// but never garbage collected, because nothing is left to ever re-drive it once the
+    /// namespace record is gone. maybe_finalize_terminating_namespace (the real
+    /// OrderedNamespaceDeletion completion trigger) already scans contained objects for this
+    /// exact condition — this test fails on revert because the namespace would vanish here
+    /// while protected-cm still has its finalizer.
+    #[tokio::test]
+    async fn patch_namespace_does_not_hard_delete_while_contained_object_has_finalizer() {
+        use crate::keys::object_key;
+        use u7s_store::Store;
+        let state = make_state();
+
+        let ns_key = crate::keys::cluster_object_key("namespaces", "content-blocked-ns");
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "content-blocked-ns",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["other-controller"] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns.to_string()), None)
+            .await
+            .expect("namespace seed must succeed");
+
+        // A ConfigMap holding a real, non-"kubernetes" finalizer, soft-deleted but not yet
+        // hard-deleted — exactly the state left behind by `kubectl delete ns --wait=false`
+        // for content the real controller hasn't finished draining.
+        let cm_key = object_key("configmaps", "content-blocked-ns", "protected-cm");
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "protected-cm",
+                "namespace": "content-blocked-ns",
+                "deletionTimestamp": "2024-01-01T00:00:00Z",
+                "finalizers": ["repro.example.com/blocker"]
+            }
+        });
+        state
+            .store
+            .put(&cm_key, bytes::Bytes::from(cm.to_string()), None)
+            .await
+            .expect("configmap seed must succeed");
+
+        // Force-clear the namespace's own finalizer, e.g. a client mirroring the
+        // "patches spec.finalizers to []" cleanup step.
+        let patch_body =
+            Bytes::from(serde_json::json!({ "spec": { "finalizers": [] } }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_namespace(
+                State(state.clone()),
+                Path("content-blocked-ns".to_string()),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "patch to clear the namespace's own finalizer must succeed"
+        );
+
+        assert!(
+            state
+                .store
+                .get(&ns_key)
+                .await
+                .expect("store get must not error")
+                .is_some(),
+            "namespace must NOT be hard-deleted while protected-cm still carries a real \
+             finalizer — doing so orphans the ConfigMap forever (invisible to `kubectl get ns`, \
+             but nothing is left to ever re-drive its deletion)"
+        );
+        assert!(
+            state
+                .store
+                .get(&cm_key)
+                .await
+                .expect("store get must not error")
+                .is_some(),
+            "the blocking ConfigMap itself must be untouched by the namespace patch"
+        );
+
+        // Once the blocking content is actually gone, the namespace must complete —
+        // demonstrating this is a real Terminating hold, not a stuck state.
+        state
+            .store
+            .delete(&cm_key, None)
+            .await
+            .expect("configmap hard-delete must succeed");
+        maybe_finalize_terminating_namespace(&state, "content-blocked-ns").await;
+        assert!(
+            state
+                .store
+                .get(&ns_key)
+                .await
+                .expect("store get must not error")
+                .is_none(),
+            "namespace must hard-delete once the last blocking finalizer'd object is gone"
         );
     }
 
