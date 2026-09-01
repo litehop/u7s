@@ -8963,6 +8963,144 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cel_rule_referencing_dot_field_sees_the_real_value() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "foo.bar": { "type": "string" }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "has(self.foo__dot__bar)",
+                "message": "foo.bar must be set"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "foo.bar": "x" }), schema.clone()).is_ok(),
+            "a dot-containing field name that IS set must not be spuriously rejected \
+             (self.foo__dot__bar must resolve to the real 'foo.bar' field)"
+        );
+        let err = check_schema(&serde_json::json!({}), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("foo.bar must be set"),
+            "an unset dot-containing field must still fail the rule (got: {})",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn cel_rule_referencing_slash_field_sees_the_real_value() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "foo/bar": { "type": "string" }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "has(self.foo__slash__bar)",
+                "message": "foo/bar must be set"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "foo/bar": "x" }), schema.clone()).is_ok(),
+            "a slash-containing field name that IS set must not be spuriously rejected \
+             (self.foo__slash__bar must resolve to the real 'foo/bar' field)"
+        );
+        let err = check_schema(&serde_json::json!({}), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("foo/bar must be set"),
+            "an unset slash-containing field must still fail the rule (got: {})",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn cel_rule_referencing_double_underscore_field_sees_the_real_value() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "foo__bar": { "type": "string" }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "has(self.foo__underscores__bar)",
+                "message": "foo__bar must be set"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "foo__bar": "x" }), schema.clone()).is_ok(),
+            "a field literally named with a double underscore that IS set must not be \
+             spuriously rejected (self.foo__underscores__bar must resolve to the real \
+             'foo__bar' field) — without this substitution 'foo__bar' would pass through \
+             unescaped, so a rule copied from upstream (which always escapes '__') would \
+             reference a field that doesn't exist and never match"
+        );
+        let err = check_schema(&serde_json::json!({}), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("foo__bar must be set"),
+            "an unset double-underscore field must still fail the rule (got: {})",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn cel_escape_priority_double_underscore_before_dot_dash_slash() {
+        // "a__.b" mixes a literal '__' immediately followed by '.'. The '__' must be
+        // consumed as one __underscores__ substitution *before* the scan reaches the
+        // '.', giving "a__underscores____dot__b". If '__' detection instead ran after
+        // (or lost priority to) plain single-underscore pass-through, both underscores
+        // would be emitted as themselves and the escaped name would come out as
+        // "a____dot__b" — a different, wrong identifier that no CRD-authored rule using
+        // the real (correct) escaped name would ever match.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a__.b": { "type": "string" }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "has(self.a__underscores____dot__b)",
+                "message": "a__.b must be set"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "a__.b": "x" }), schema.clone()).is_ok(),
+            "self.a__underscores____dot__b must resolve to the real 'a__.b' field — this \
+             only holds if '__' is escaped with priority over the following '.', matching \
+             upstream's escaping order"
+        );
+        let err = check_schema(&serde_json::json!({}), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("a__.b must be set"),
+            "an unset field must still fail the rule (got: {})",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn cel_rule_omits_unescapable_field_name_instead_of_exposing_it_verbatim() {
+        // "1bad" starts with a digit, so it can never be a valid CEL identifier under
+        // any escaping scheme — upstream's SchemaDeclType simply never declares such a
+        // field on the generated CEL struct type. If u7s instead leaked it into `self`
+        // under its raw name (rather than dropping it), a rule could observe data that
+        // upstream's compiled CEL type says doesn't exist, diverging from upstream
+        // evaluation semantics.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "keep": { "type": "string" },
+                "1bad": { "type": "string" }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "has(self.keep) && !('1bad' in self)",
+                "message": "unescapable field must not be exposed to self"
+            }]
+        });
+        let err = check_schema(&serde_json::json!({ "keep": "x", "1bad": "y" }), schema);
+        assert!(
+            err.is_ok(),
+            "an unescapable field name (leading digit) must be dropped from the CEL-bound \
+             self object, not exposed under its raw name — got: {err:?}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // CEL string-extension overloads (split/lowerAscii/upperAscii/replace/join)
     //
