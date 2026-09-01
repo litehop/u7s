@@ -25,16 +25,16 @@ use bytes::Bytes;
 use x509_cert::der::DecodePem as _;
 use x509_cert::request::CertReq;
 
-use u7s_store::{ListOptions, Store};
+use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     handlers::{
         generic::{
-            apply_label_selector, build_list_response, decode_continue, lookup,
+            apply_label_selector, build_list_response, decode_continue, generate_suffix, lookup,
             parse_field_selector, parse_label_selector, resolve_name, stamp_metadata,
-            validate_name, CollectionQuery,
+            validate_name, wants_generate_name, CollectionQuery, MAX_GENERATE_NAME_CREATE_ATTEMPTS,
         },
         watch::{fetch_initial_events, watch_generic, WatchConfig},
     },
@@ -274,7 +274,10 @@ pub async fn create_csr<S: Store>(
 
     validate_csr_spec(&obj.body)?;
 
-    let name = resolve_name(&mut obj)?;
+    // Captured before resolve_name mutates metadata.name, so a store collision below
+    // knows whether it's allowed to retry under a freshly generated name.
+    let generate_name_prefix = wants_generate_name(&obj);
+    let mut name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
 
     let admission_ctx = AdmissionContext {
@@ -303,12 +306,54 @@ pub async fn create_csr<S: Store>(
         map.remove("status");
     }
 
-    let key = group_object_key(GROUP, PLURAL, None, &name);
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), Some(0))
-        .await
-        .map_err(|e| crate::handlers::generic::store_err(e, &name, KIND))?;
+    // Counts store.put attempts made so far (the loop's first iteration is attempt 1).
+    // Bounded at MAX_GENERATE_NAME_CREATE_ATTEMPTS TOTAL attempts, mirroring
+    // create_resource/create_cr's generateName-collision retry (see resource.rs/cr.rs) —
+    // a controller mass-creating CSRs via bare `metadata.generateName` must not see a
+    // spurious 409 just because the server's random suffix landed on an existing name.
+    let mut attempts_made = 1u32;
+    let new_rv = loop {
+        let key = group_object_key(GROUP, PLURAL, None, &name);
+        match state.store.put(&key, obj.to_bytes(), Some(0)).await {
+            Ok(rv) => break rv,
+            // The client never chose this name (it came from generateName) — a collision
+            // is the server's random suffix landing on an existing object, not a real
+            // conflict the client should see. Retry with a fresh suffix instead of
+            // surfacing a spurious 409 on what the client experiences as a plain create.
+            Err(StoreError::AlreadyExists { .. })
+                if generate_name_prefix.is_some()
+                    && attempts_made < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
+            {
+                attempts_made += 1;
+                name = format!(
+                    "{}{}",
+                    generate_name_prefix.as_deref().unwrap_or_default(),
+                    generate_suffix()
+                );
+                obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+                // Re-validate the regenerated name — mirrors create_resource's retry, which
+                // re-runs validating admission once per attempt, not just for the first
+                // candidate name.
+                let retry_ctx = AdmissionContext {
+                    group: GROUP,
+                    version: VERSION,
+                    resource: PLURAL,
+                    name: &name,
+                    namespace: None,
+                    operation: "CREATE",
+                    user_info: Some(serde_json::json!({
+                        "username": user.username.clone(),
+                        "uid": user.uid.clone(),
+                        "groups": user.groups.clone(),
+                        "extra": user.extra.clone(),
+                    })),
+                    dry_run: false,
+                };
+                run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
+            }
+            Err(e) => return Err(crate::handlers::generic::store_err(e, &name, KIND)),
+        }
+    };
 
     obj.set_resource_version(new_rv);
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
@@ -1329,6 +1374,206 @@ mod tests {
             serde_json::json!(["real-group"]),
             "a mutating webhook's patch to spec.groups (here: forging system:masters) must \
              not survive into the stored object"
+        );
+    }
+
+    /// A store wrapper whose first `put()` call always fails with AlreadyExists,
+    /// regardless of key — simulating a generateName suffix landing on some unrelated
+    /// existing object. Delegates every other call to the inner SqliteStore.
+    ///
+    /// Mirrors create_cr's identical test double in cr.rs (see its doc comment) — used
+    /// here by create_csr's generateName-collision-retry regression test.
+    struct FirstPutAlreadyExistsStore {
+        inner: std::sync::Arc<u7s_store::SqliteStore>,
+        fire_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl FirstPutAlreadyExistsStore {
+        fn new(inner: std::sync::Arc<u7s_store::SqliteStore>) -> Self {
+            Self {
+                inner,
+                fire_once: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl u7s_store::Store for FirstPutAlreadyExistsStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .fire_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move {
+                if inject {
+                    Err(u7s_store::StoreError::AlreadyExists { key })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// A controller mass-creating CSRs via bare `metadata.generateName` must not see a
+    /// spurious 409 just because the server's random name suffix happened to collide with
+    /// an unrelated object. This forces that collision on the very first `put()` and
+    /// asserts create_csr retries with a fresh suffix and succeeds, rather than surfacing
+    /// the collision as AlreadyExists to the client.
+    ///
+    /// Fails on revert: without the retry, create_csr's single `store.put` call returns
+    /// AlreadyExists and the handler maps it straight to 409 — reverting the fix and
+    /// re-running this test reproduces exactly that 409.
+    #[tokio::test]
+    async fn create_csr_retries_generate_name_collision_instead_of_409ing() {
+        use axum::response::IntoResponse;
+        use u7s_store::SqliteStore;
+
+        let inner = std::sync::Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let collision_store = std::sync::Arc::new(FirstPutAlreadyExistsStore::new(inner));
+        let state = AppState::new(
+            collision_store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let b64 = valid_csr_b64();
+        let csr_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"generateName": "repro-csr-"},
+            "spec": {
+                "request": b64,
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let result = create_csr(
+            axum::extract::State(state),
+            axum::Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            }),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+        )
+        .await
+        .map(IntoResponse::into_response);
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(e) => panic!(
+                "a generateName-based CSR create must retry past a spurious store \
+                 collision, not hard-error: status={}",
+                e.0
+            ),
+        };
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "a generateName-based CSR create must retry past a spurious store collision, \
+             not hard-error with 409 — a controller mass-creating CSRs via generateName \
+             would otherwise see spurious create failures"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            created["metadata"]["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("repro-csr-")),
+            "created CSR must still carry the generateName prefix after the retry"
         );
     }
 }
