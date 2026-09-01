@@ -230,6 +230,11 @@ pub(crate) struct WebhookEntry {
     /// `validate_webhook_match_conditions_cel`.
     #[serde(default)]
     match_conditions: Vec<MatchCondition>,
+    /// SideEffectClass (`None`, `NoneOnDryRun`, `Some`, or `Unknown` — the conservative
+    /// default when unset). Governs whether this webhook may be invoked for a dry-run
+    /// request; see `webhook_dry_run_supported`.
+    #[serde(default = "default_side_effects")]
+    side_effects: String,
 }
 
 /// One `webhooks[*].matchConditions[*]` entry: a named CEL expression gating whether
@@ -262,6 +267,21 @@ struct LabelSelectorRequirement {
 
 fn default_failure_policy() -> String {
     "Fail".to_string()
+}
+
+fn default_side_effects() -> String {
+    "Unknown".to_string()
+}
+
+/// Returns true if `sideEffects` permits invoking the webhook for a dry-run request.
+///
+/// Only `None` and `NoneOnDryRun` are safe: the webhook has no contractual guarantee it
+/// honors `dryRun: true` in the AdmissionReview it receives, so calling one with any other
+/// declared sideEffects (including the conservative `Unknown` default) could cause real
+/// side effects — external provisioning, billing, notification — for a client that
+/// explicitly asked for none via `kubectl --dry-run=server` or SSA dry-run.
+fn webhook_dry_run_supported(side_effects: &str) -> bool {
+    matches!(side_effects, "None" | "NoneOnDryRun")
 }
 
 /// Evaluate a Kubernetes LabelSelector against a set of labels.
@@ -1322,6 +1342,24 @@ async fn invoke_mutating_webhook<S: Store>(
                 webhook.name
             );
             return Ok((object.as_ref().clone(), false));
+        }
+    }
+
+    // Dry-run: the webhook has no contractual guarantee it honors `dryRun: true` in the
+    // AdmissionReview it receives, so only invoke it if its declared sideEffects say it's
+    // safe to call anyway — see webhook_dry_run_supported.
+    if ctx.dry_run && !webhook_dry_run_supported(&webhook.side_effects) {
+        if webhook.failure_policy == "Ignore" {
+            tracing::warn!(
+                "admission: mutating webhook \"{}\" skipped (dry-run unsupported, sideEffects={}, failurePolicy=Ignore)",
+                webhook.name, webhook.side_effects
+            );
+            return Ok((object.as_ref().clone(), false));
+        } else {
+            return Err(Status::bad_request(format!(
+                "admission webhook \"{}\" does not support dry run",
+                webhook.name
+            )));
         }
     }
 
@@ -3981,6 +4019,23 @@ pub async fn run_validating_webhooks<S: Store>(
                     webhook.name
                 );
                     continue;
+                }
+            }
+
+            // Dry-run: only invoke this webhook if its declared sideEffects say it's safe
+            // to call anyway — see webhook_dry_run_supported.
+            if ctx.dry_run && !webhook_dry_run_supported(&webhook.side_effects) {
+                if webhook.failure_policy == "Ignore" {
+                    tracing::warn!(
+                        "admission: validating webhook \"{}\" skipped (dry-run unsupported, sideEffects={}, failurePolicy=Ignore)",
+                        webhook.name, webhook.side_effects
+                    );
+                    continue;
+                } else {
+                    return Err(Status::bad_request(format!(
+                        "admission webhook \"{}\" does not support dry run",
+                        webhook.name
+                    )));
                 }
             }
 
@@ -6818,6 +6873,342 @@ mod tests {
             count, 1,
             "webhook with IfNeeded must only be called once when no patch was applied in pass 1; \
              triggering pass 2 without any_patched=true wastes latency and causes duplicate calls"
+        );
+    }
+
+    // -- dry-run sideEffects tests --
+    //
+    // A dry-run request (kubectl --dry-run=server, or SSA dry-run) must not invoke a webhook
+    // whose declared sideEffects it has no contractual guarantee are honored — the webhook
+    // could cause real external side effects (provisioning, billing, notification) for a
+    // client that explicitly asked for none. These tests use a real mock HTTP server with a
+    // call counter so a regression (dry-run gate removed) is caught by an actual invocation,
+    // not just an error-message match.
+
+    /// A dry-run request must NOT invoke a mutating webhook that declares sideEffects other
+    /// than None/NoneOnDryRun — under failurePolicy=Ignore the request must still succeed,
+    /// but the webhook's HTTP endpoint must never be called.
+    #[tokio::test]
+    async fn dry_run_skips_mutating_webhook_declaring_unsupported_side_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "uid-dry-run", "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "side-effects-some-mwc"},
+            "webhooks": [{
+                "name": "side-effects-some.webhook.example.com",
+                "clientConfig": { "url": format!("{url}/webhook") },
+                "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                "failurePolicy": "Ignore",
+                "sideEffects": "Some"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/side-effects-some-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "dry-run-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "dry-run-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: true,
+        };
+        let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "failurePolicy=Ignore must let the dry-run request through even when the \
+             webhook's sideEffects don't support dry run"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "a webhook declaring sideEffects: Some has no contractual guarantee it honors \
+             dryRun:true, so a dry-run request must never reach its HTTP endpoint — calling \
+             it anyway could cause real external side effects for a client that explicitly \
+             asked for none"
+        );
+    }
+
+    /// Complements the skip test above: a dry-run request MUST still invoke a mutating
+    /// webhook that declares sideEffects: None — dry-run-safe webhooks must not be
+    /// over-broadly skipped just because the request is a dry run.
+    #[tokio::test]
+    async fn dry_run_invokes_mutating_webhook_declaring_side_effects_none() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "uid-dry-run-safe", "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "side-effects-none-mwc"},
+            "webhooks": [{
+                "name": "side-effects-none.webhook.example.com",
+                "clientConfig": { "url": format!("{url}/webhook") },
+                "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail",
+                "sideEffects": "None"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/side-effects-none-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "dry-run-safe-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "dry-run-safe-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: true,
+        };
+        let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "a dry-run-safe webhook (sideEffects: None) must be invoked and its allow \
+             response honored"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "sideEffects: None means the webhook is safe to call on a dry-run request; \
+             over-broadly skipping every webhook on dry run (instead of gating on \
+             sideEffects) would silently disable dry-run-safe mutating webhooks too"
+        );
+    }
+
+    /// A dry-run request against a webhook with unsupported sideEffects must be denied
+    /// outright under failurePolicy=Fail (the default) — not silently allowed, and not
+    /// silently invoked.
+    #[tokio::test]
+    async fn dry_run_with_unsupported_side_effects_denies_under_fail_policy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "uid-dry-run-fail", "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "side-effects-some-fail-mwc"},
+            "webhooks": [{
+                "name": "side-effects-some-fail.webhook.example.com",
+                "clientConfig": { "url": format!("{url}/webhook") },
+                "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail",
+                "sideEffects": "Some"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/side-effects-some-fail-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "dry-run-fail-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "dry-run-fail-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: true,
+        };
+        let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
+        assert!(
+            result.is_err(),
+            "failurePolicy=Fail (the default) must deny a dry-run request outright when the \
+             matching webhook's sideEffects don't support dry run — it must not silently \
+             allow the request through as if the webhook had passed"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "the webhook's HTTP endpoint must never be called even though the request is \
+             ultimately denied"
+        );
+    }
+
+    /// Same dry-run/sideEffects gating requirement as the mutating case, for validating
+    /// webhooks.
+    #[tokio::test]
+    async fn dry_run_skips_validating_webhook_declaring_unsupported_side_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "uid-dry-run-validating", "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "side-effects-some-vwc"},
+            "webhooks": [{
+                "name": "side-effects-some.validating.webhook.example.com",
+                "clientConfig": { "url": format!("{url}/webhook") },
+                "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                "failurePolicy": "Ignore",
+                "sideEffects": "Some"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/side-effects-some-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "dry-run-validating-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "dry-run-validating-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: true,
+        };
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "failurePolicy=Ignore must let the dry-run request through even when the \
+             validating webhook's sideEffects don't support dry run"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "a validating webhook declaring sideEffects: Some must never be called for a \
+             dry-run request, same as the mutating case"
         );
     }
 
@@ -12785,6 +13176,7 @@ mod tests {
             object_selector: None,
             timeout_seconds: None,
             match_conditions: vec![],
+            side_effects: default_side_effects(),
         };
         *state.admission_cache.validating_webhooks.write().unwrap() =
             Some(std::sync::Arc::new(vec![fake_entry]));
@@ -12856,6 +13248,7 @@ mod tests {
             object_selector: None,
             timeout_seconds: None,
             match_conditions: vec![],
+            side_effects: default_side_effects(),
         };
         let cached_arc = Arc::new(vec![fake_entry]);
         *state.admission_cache.mutating_webhooks.write().unwrap() = Some(cached_arc.clone());
