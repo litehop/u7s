@@ -18,6 +18,8 @@ Each file should be structured like an AI Skill: front matter describing scope, 
 | [memory-management-state.md](memory-management-state.md) | Snapshot of memory-management state: allocation hotspots, known issues, low-hanging fruit, highest-leverage changes, diagnostic playbook. AS-OF dated; audited weekly by mayor-rr177's cron (audit-only — files drift beads, never edits the doc's content) — actual refreshes are manual or by a dispatched worker |
 | [project-priority-hierarchy.md](project-priority-hierarchy.md) | Operator's bucket-ordered priority framework for bead triage and dispatch order (testing-blockers > conformance > other correctness > memory-usage > new features > o11y/perf polish) |
 | [e2e-focus-conformance-image-pull-postmortem-2026-08-25.md](e2e-focus-conformance-image-pull-postmortem-2026-08-25.md) | Postmortem: `e2e-focus.yaml` CI timeouts caused by CDN edge-cache misses on infrequently-pulled conformance-image tags, not a code regression |
+| [cni-svclb-landscape.md](cni-svclb-landscape.md) | CNI + ServiceLB landscape digest: candidate comparison, target-hardware constraints, loxilb/klipper-lb disqualifications — reference for `docs/decisions/servicelb-ebpf-geneve-dataplane.md` and related ADRs |
+| [ebpf-lb-dataplane.md](ebpf-lb-dataplane.md) | ServiceLB eBPF Geneve dataplane mechanism: hooks, packet flow, conntrack/map sizing, prototype gates, open questions — the "how", not the "why" (see the three `servicelb-*`/`ebpf-toolchain-aya` ADRs for that) |
 
 ## Frontmatter convention
 
