@@ -1204,10 +1204,12 @@ where
                 ));
             }
 
-            // The impersonated groups replace the authenticated user's groups entirely; real
-            // Kubernetes always adds system:authenticated to any impersonated non-system user,
-            // but if the caller explicitly supplies groups we use those verbatim (just like the
-            // real apiserver does when Impersonate-Group headers are provided).
+            // The impersonated groups replace the authenticated user's groups entirely. If the
+            // caller explicitly supplies groups we use those verbatim; if not and the target is
+            // SA-shaped, we default to the system:serviceaccounts[:ns] groups a real SA JWT
+            // carries. Either way, system:authenticated is appended unless already present (or
+            // system:unauthenticated was impersonated) — see the groups computation below for
+            // why this must run after (not just "on empty").
             let user = if let Some(impersonate_user) = req
                 .headers()
                 .get("Impersonate-User")
@@ -1359,13 +1361,29 @@ where
                 }
 
                 // All impersonation checks passed — substitute impersonated identity.
-                // If the caller supplied explicit groups, use them verbatim.
-                // If no groups were provided, add system:authenticated as Kubernetes does.
-                let groups = if impersonate_groups.is_empty() {
-                    vec!["system:authenticated".to_owned()]
-                } else {
+                // If the caller supplied explicit groups, use them verbatim. If none were
+                // provided and the target is SA-shaped, seed with the same
+                // system:serviceaccounts[:ns] groups a real SA JWT carries (try_verify_sa_jwt)
+                // — upstream's serviceaccount.MakeGroupNames adds these unconditionally.
+                let mut groups = if !impersonate_groups.is_empty() {
                     impersonate_groups
+                } else if let Some((namespace, _name)) = sa_parts {
+                    vec![
+                        "system:serviceaccounts".to_owned(),
+                        format!("system:serviceaccounts:{namespace}"),
+                    ]
+                } else {
+                    vec![]
                 };
+                // Real Kubernetes always appends system:authenticated to an impersonated
+                // identity's groups unless the caller already listed it (or explicitly
+                // impersonated system:unauthenticated) — matches upstream's WithImpersonation
+                // filter so RBAC bound to system:authenticated still applies.
+                if !groups.contains(&"system:authenticated".to_owned())
+                    && !groups.contains(&"system:unauthenticated".to_owned())
+                {
+                    groups.push("system:authenticated".to_owned());
+                }
 
                 UserInfo {
                     username: impersonate_user,
@@ -3858,6 +3876,71 @@ mod tests {
         );
     }
 
+    /// Real kube-apiserver always appends `system:authenticated` to an impersonated
+    /// identity's groups unless the caller's explicit `Impersonate-Group` list already
+    /// contains it (or `system:unauthenticated`) — before this fix explicit groups were used
+    /// verbatim with no backstop, so ClusterRoleBindings on `system:authenticated` (e.g.
+    /// `system:basic-user`) silently stopped applying to any impersonated identity that
+    /// supplied its own group list.
+    #[tokio::test]
+    async fn impersonate_group_header_still_gets_system_authenticated_backstop() {
+        use axum::{body::Body, http::Request, routing::get, Extension, Router};
+        use tower::ServiceExt;
+
+        let idx = make_rbac_with_impersonator_and_target();
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        async fn whoami(Extension(user): Extension<UserInfo>) -> String {
+            serde_json::to_string(&user.groups).unwrap()
+        }
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(whoami))
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-User", "bob")
+            .header("Impersonate-Group", "custom-group")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let groups: Vec<String> = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            groups.contains(&"system:authenticated".to_owned()),
+            "an explicit Impersonate-Group list without system:authenticated must still get \
+             the backstop appended — got {groups:?}"
+        );
+        assert!(
+            groups.contains(&"custom-group".to_owned()),
+            "the caller's explicit group must still be present alongside the backstop"
+        );
+    }
+
     // --- SA-shaped Impersonate-User must check resource=serviceaccounts, not users ---
     //
     // Real kube-apiserver's impersonation filter branches on the impersonated username: a
@@ -3933,6 +4016,12 @@ mod tests {
     /// grant real kube-apiserver requires for SA-shaped impersonation. This is the gap
     /// deliberately left inert by seed_rbac's `serviceaccounts` impersonate rule until this
     /// fix landed.
+    ///
+    /// Also asserts the auto-added `system:serviceaccounts`/`system:serviceaccounts:ns-a`
+    /// groups: with no explicit `Impersonate-Group` header, an SA-shaped impersonated
+    /// identity must carry the same groups a real SA JWT does (`try_verify_sa_jwt`) — without
+    /// them, RBAC rules and `kubectl auth can-i --as=` bound to those groups would falsely
+    /// deny an impersonated ServiceAccount that a real one would pass.
     #[tokio::test]
     async fn impersonation_of_sa_shaped_identity_checks_serviceaccounts_resource() {
         use axum::{body::Body, http::Request, routing::get, Extension, Router};
@@ -3951,7 +4040,11 @@ mod tests {
         );
 
         async fn whoami(Extension(user): Extension<UserInfo>) -> String {
-            user.username
+            serde_json::to_string(&serde_json::json!({
+                "username": user.username,
+                "groups": user.groups,
+            }))
+            .unwrap()
         }
 
         let app = Router::new()
@@ -3986,10 +4079,21 @@ mod tests {
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(
-            std::str::from_utf8(&body_bytes).unwrap(),
-            "system:serviceaccount:ns-a:target",
+            val["username"], "system:serviceaccount:ns-a:target",
             "effective identity must be the impersonated ServiceAccount, not the caller"
+        );
+        let groups: Vec<String> = serde_json::from_value(val["groups"].clone()).unwrap();
+        assert!(
+            groups.contains(&"system:serviceaccounts".to_owned())
+                && groups.contains(&"system:serviceaccounts:ns-a".to_owned())
+                && groups.contains(&"system:authenticated".to_owned()),
+            "impersonating an SA-shaped identity with no explicit Impersonate-Group header \
+             must auto-add system:serviceaccounts/system:serviceaccounts:ns-a (plus the usual \
+             system:authenticated backstop) — omitting them breaks RBAC rules (and `kubectl \
+             auth can-i --as=`) that bind to those groups, matching what a real SA JWT \
+             carries via try_verify_sa_jwt. Got: {groups:?}"
         );
     }
 
