@@ -1437,6 +1437,10 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["pods"],         "verbs": ["get","list","watch","create","delete"] },
             { "apiGroups": [""], "resources": ["pods/status"],  "verbs": ["get","update","patch"] },
             { "apiGroups": [""], "resources": ["pods/log"],     "verbs": ["get"] },
+            // Kubelet's node-pressure eviction path POSTs to the Eviction subresource (which
+            // respects PDBs) to evict its own bound pods under resource pressure. Without this,
+            // every such eviction 403s. Matches upstream bootstrappolicy.go's NodeRules() exactly.
+            { "apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"] },
             { "apiGroups": [""], "resources": ["events"],       "verbs": ["create","patch","update"] },
             // Kubelet's own service informer populates Service-discovery env vars
             // (SERVICE_HOST/SERVICE_PORT) injected into every pod's containers. Without this
@@ -4994,6 +4998,49 @@ mod tests {
             "system:node must still retain delete on pods alongside create (upstream's \
              single create+delete rule); a regression here would re-wedge terminated pods \
              in Terminating forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_to_create_pod_eviction() {
+        // Regression test: kubelet's node-pressure eviction path POSTs to the Eviction
+        // subresource (which respects PDBs) to evict its own bound pods under resource
+        // pressure. Without this rule every such eviction 403s -- same class of outage as the
+        // mirror-pods/terminated-pods rules above.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule("", "pods/eviction", "create"),
+            "system:node must be able to create pods/eviction so kubelet's node-pressure \
+             eviction workflow can evict its own bound pods; missing this rule 403s every \
+             such eviction"
         );
     }
 
