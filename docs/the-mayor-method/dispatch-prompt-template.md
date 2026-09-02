@@ -160,9 +160,10 @@ unguarded — and each missed cell becomes its own multi-hour re-review round.
 **Motivating case (mayor-j1oq9):** a status-subresource typed-validation
 guard (merge-PATCH bypassing it to persist an arbitrary scalar) went 4
 rounds — round 1 fixed the merge-PATCH handlers; round 2's re-review found
-the PUT path still unguarded; round 3's re-review found the JSON-Patch
-content-type branch was STILL unguarded, prompting round 4's own brief to
-note "per-path/per-branch guarding has missed THREE times now." Rounds 3+4
+the PUT path still unguarded (bd notes record the round-3 dispatch guidance
+as "stop the per-handler whack-a-mole (missed handlers TWICE now)"); round
+3's re-review then found the JSON-Patch content-type branch was STILL
+unguarded, a third missed dimension before round 4 closed it. Rounds 3+4
 alone totaled tens of millions of total-tokens-processed (cache_read +
 cache_creation + input, summed across every turn) for a bug class a single
 round-1 2D matrix (5 handlers × 3 patch content-types = 15 sites) could
