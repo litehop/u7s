@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::handlers::json_patch::{
-    apply_json_patch, detect_patch_type, ssa_body_to_json, PatchType,
+    apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
 };
 use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
@@ -509,6 +509,7 @@ async fn build_new_crd<S: Store>(
     user: &UserInfo,
     name: &str,
     mut crd: CustomResourceDefinition,
+    headers: &HeaderMap,
 ) -> Result<CustomResourceDefinition, crate::status::StatusError> {
     if name.is_empty() {
         return Err(Status::unprocessable_entity(
@@ -543,7 +544,7 @@ async fn build_new_crd<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
-            dry_run: false,
+            dry_run: is_dry_run_header(headers),
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mutated = run_mutating_webhooks(state, obj_val, None, &admission_ctx).await?;
@@ -587,7 +588,7 @@ pub async fn create_crd<S: Store>(
     let body = extract_body(&body, ct);
     let crd = parse_crd(&body)?;
     let name = crd.metadata.name.clone();
-    let mut crd = build_new_crd(&state, &user, &name, crd).await?;
+    let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
 
     let key = store_key(&name);
     let rv = state
@@ -714,7 +715,7 @@ pub async fn replace_crd<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
-            dry_run: false,
+            dry_run: is_dry_run_header(&headers),
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mutated = run_mutating_webhooks(&state, obj_val, None, &admission_ctx).await?;
@@ -923,7 +924,7 @@ pub async fn patch_crd<S: Store>(
         let crd: CustomResourceDefinition = serde_json::from_value(body_json).map_err(|e| {
             Status::unprocessable_entity(format!("invalid CustomResourceDefinition: {e}"))
         })?;
-        let mut crd = build_new_crd(&state, &user, &name, crd).await?;
+        let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
 
         let rv = state
             .store
@@ -1012,7 +1013,7 @@ pub async fn patch_crd<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
-            dry_run: false,
+            dry_run: is_dry_run_header(&headers),
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mutated = run_mutating_webhooks(&state, obj_val, None, &admission_ctx).await?;

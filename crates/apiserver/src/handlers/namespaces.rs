@@ -13,7 +13,8 @@ use crate::{
     handlers::{
         generic::{apply_delete_policy, parse_field_selector},
         json_patch::{
-            apply_json_patch, detect_patch_type, ssa_body_to_json, PatchQuery, PatchType,
+            apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchQuery,
+            PatchType,
         },
         resource::{do_patch, PatchConfig},
     },
@@ -282,7 +283,7 @@ pub(crate) async fn create_namespace<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: is_dry_run_header(&headers),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
