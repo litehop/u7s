@@ -2780,7 +2780,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    current_obj.body["status"] = incoming["status"].clone();
+    crate::handlers::status::replace_status_field(&mut current_obj.body, &incoming["status"])?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, "Pod");
 
@@ -15888,6 +15888,107 @@ mod handler_tests {
             "deletionTimestamp must survive PUT /pods/status"
         );
         assert_eq!(v["status"]["phase"], "Succeeded", "status must be updated");
+    }
+
+    /// PUT /pods/:name/status with a scalar or array `status` body must be rejected with
+    /// 422, not persisted. `status` is a message/object type for Pod like every resource;
+    /// a PUT that wholesale-replaces it with a scalar corrupts the pod's own schema and
+    /// panics `apply_resize_patch`'s and `apply_delete_policy`'s in-place
+    /// `status["field"] = ...` stamps on the next resize/delete, crashing the apiserver
+    /// for every other request in flight.
+    #[tokio::test]
+    async fn replace_pod_status_rejects_non_object_status() {
+        for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
+            let (state, store) = make_state();
+            seed_namespace(&store, "default").await;
+            seed_pod(
+                &store,
+                "default",
+                "put-scalar-pod",
+                serde_json::json!({"status": {"phase": "Running"}}),
+            )
+            .await;
+
+            let app = Router::new()
+                .route(
+                    "/api/v1/namespaces/{ns}/pods/{name}/status",
+                    put(replace_pod_status),
+                )
+                .with_state(state);
+
+            let body = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "put-scalar-pod", "namespace": "default"},
+                "status": bad_status
+            });
+            let req = Request::builder()
+                .method("PUT")
+                .uri("/api/v1/namespaces/default/pods/put-scalar-pod/status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(json_body(&body))
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a non-object status ({bad_status}) via PUT must be rejected with 422 — \
+                 it would corrupt the pod's schema and later crash apply_resize_patch/\
+                 apply_delete_policy's in-place status stamps"
+            );
+
+            let key = "/registry/pods/default/put-scalar-pod";
+            let stored = store.get(key).await.unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            assert_eq!(
+                v["status"]["phase"], "Running",
+                "the rejected PUT must not have been persisted for input {bad_status}"
+            );
+        }
+    }
+
+    /// PUT /pods/:name/status with an explicit `status: null` body must still succeed — the
+    /// 422 guard above must reject only a present scalar/array, not the legitimate
+    /// field-clearing convention.
+    #[tokio::test]
+    async fn replace_pod_status_accepts_null_status() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "put-null-pod",
+            serde_json::json!({"status": {"phase": "Running"}}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "put-null-pod", "namespace": "default"},
+            "status": null
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/put-null-pod/status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a null status PUT is legitimate field-clearing, not a 422"
+        );
     }
 
     // -----------------------------------------------------------------------

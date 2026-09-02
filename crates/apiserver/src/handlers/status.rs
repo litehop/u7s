@@ -129,14 +129,7 @@ pub async fn put_resource_status<S: Store>(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     // Replace status and merge metadata; leave spec and identity fields untouched.
-    match &incoming.body["status"] {
-        serde_json::Value::Null => {
-            current.body.as_object_mut().map(|m| m.remove("status"));
-        }
-        v => {
-            current.body["status"] = v.clone();
-        }
-    }
+    replace_status_field(&mut current.body, &incoming.body["status"])?;
     merge_incoming_metadata(&mut current.body, &incoming.body, &meta.kind);
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
@@ -290,14 +283,7 @@ pub async fn put_namespaced_resource_status<S: Store>(
         .map(|e| e.kind)
         .unwrap_or(kind_fallback);
 
-    match &incoming.body["status"] {
-        serde_json::Value::Null => {
-            current.body.as_object_mut().map(|m| m.remove("status"));
-        }
-        v => {
-            current.body["status"] = v.clone();
-        }
-    }
+    replace_status_field(&mut current.body, &incoming.body["status"])?;
     merge_incoming_metadata(&mut current.body, &incoming.body, &kind);
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
@@ -422,6 +408,32 @@ pub(crate) fn reject_non_object_status(
     Err(Status::unprocessable_entity(format!(
         "status must be an object, got {status}"
     )))
+}
+
+/// Shared PUT-/status body: replace `current`'s `status` field with `incoming_status`
+/// (null removes the field — a PUT's own field-clearing convention), or reject with 422
+/// if `incoming_status` is a present-but-non-object scalar/array. Every PUT /status
+/// handler in this codebase (`put_resource_status`, `put_namespaced_resource_status`,
+/// `put_cr_status`, `put_crd_status`, `replace_pod_status`) round-trips through here
+/// instead of assigning `current["status"] = incoming_status.clone()` inline, so the
+/// object-type invariant `reject_non_object_status` enforces for merge-patch status
+/// writes cannot be missed for a PUT handler the way it was in two prior review rounds.
+pub(crate) fn replace_status_field(
+    current: &mut serde_json::Value,
+    incoming_status: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    reject_non_object_status(incoming_status)?;
+    match incoming_status {
+        serde_json::Value::Null => {
+            if let Some(m) = current.as_object_mut() {
+                m.remove("status");
+            }
+        }
+        v => {
+            current["status"] = v.clone();
+        }
+    }
+    Ok(())
 }
 
 /// Validate that every op in a JSON Patch sent to a /status subresource targets
@@ -630,6 +642,83 @@ mod tests {
             v.get("status").is_none(),
             "null status in PUT body must remove the status field from the stored object"
         );
+    }
+
+    /// put_resource_status with a scalar or array `status` body must be rejected with 422,
+    /// not persisted. `status` is a message/object type for every resource; a PUT that
+    /// wholesale-replaces it with a scalar corrupts the object's own schema and panics any
+    /// later in-place status stamper (e.g. `apply_delete_policy`) that indexes
+    /// `["status"]["field"]` on it, crashing the apiserver for every other request in flight.
+    #[tokio::test]
+    async fn put_resource_status_rejects_non_object_status() {
+        for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
+            let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+            let csinode = serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "CSINode",
+                "metadata": { "name": "put-scalar-node" },
+                "spec": { "drivers": [] },
+                "status": { "ready": true }
+            });
+            let key = "/registry/storage.k8s.io/csinodes/put-scalar-node";
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let state = crate::state::AppState::new(
+                store.clone(),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            );
+
+            let bad_body = serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "CSINode",
+                "metadata": { "name": "put-scalar-node" },
+                "status": bad_status
+            });
+            let result = put_resource_status(
+                axum::extract::State(state),
+                axum::extract::Path((
+                    "storage.k8s.io".into(),
+                    "v1".into(),
+                    "csinodes".into(),
+                    "put-scalar-node".into(),
+                )),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&bad_body).unwrap()),
+            )
+            .await;
+
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "a non-object status ({bad_status}) via PUT must be rejected, not \
+                     persisted — it would corrupt the object's schema and later crash any \
+                     in-place status stamper"
+                ),
+            };
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "a non-object status must be rejected with 422, matching upstream schema \
+                 validation: got {bad_status}"
+            );
+
+            let stored = store.get(key).await.unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            assert_eq!(
+                v["status"]["ready"], true,
+                "the rejected PUT must not have been persisted — status must remain the \
+                 original object for input {bad_status}"
+            );
+        }
     }
 
     /// patch_resource_status returns 404 when cluster-scoped object does not exist.
@@ -868,6 +957,78 @@ mod tests {
             v.get("status").is_none(),
             "null status in PUT body must remove the status field"
         );
+    }
+
+    /// put_namespaced_resource_status with a scalar or array `status` body must be rejected
+    /// with 422, not persisted — same protection as the cluster-scoped handler above, on the
+    /// namespaced route most real resources (Deployments, Leases, ...) actually use.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_rejects_non_object_status() {
+        for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
+            let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+            let lease = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": "put-scalar-lease", "namespace": "kube-node-lease" },
+                "spec": { "holderIdentity": "put-scalar-lease" },
+                "status": { "phase": "Active" }
+            });
+            let key = "/registry/coordination.k8s.io/leases/kube-node-lease/put-scalar-lease";
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let state = crate::state::AppState::new(
+                store.clone(),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            );
+
+            let bad_body = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": "put-scalar-lease", "namespace": "kube-node-lease" },
+                "status": bad_status
+            });
+            let result = put_namespaced_resource_status(
+                axum::extract::State(state),
+                axum::extract::Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "kube-node-lease".into(),
+                    "leases".into(),
+                    "put-scalar-lease".into(),
+                )),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&bad_body).unwrap()),
+            )
+            .await;
+
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "a non-object status ({bad_status}) via PUT must be rejected, not persisted"
+                ),
+            };
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "a non-object status must be rejected with 422: got {bad_status}"
+            );
+
+            let stored = store.get(key).await.unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            assert_eq!(
+                v["status"]["phase"], "Active",
+                "the rejected PUT must not have been persisted for input {bad_status}"
+            );
+        }
     }
 
     /// patch_namespaced_resource_status with merge-patch updates the status field.
@@ -4193,5 +4354,131 @@ mod tests {
             patch_json["apiVersion"], "apps/v1",
             "PATCH /status response must include apiVersion even when the request and stored body omit it"
         );
+    }
+
+    /// Every PUT status-subresource handler must reject a non-object (scalar/array) status
+    /// before persisting it, or a corrupted status crashes the apiserver the next time any
+    /// in-place status stamper (`apply_delete_policy`, `merge_approval_conditions`, ...)
+    /// indexes it. Two prior review rounds each missed a subset of these handlers by
+    /// checking only the ones a reviewer happened to look at — round 1 fixed the
+    /// merge-patch handlers, round 2 fixed two more PATCH sites plus DiD sweep guards, and
+    /// still missed the entire PUT path. Rather than trust a human to re-enumerate every
+    /// handler by hand a fourth time, this test greps every `.rs` file under
+    /// `src/handlers/` for the naming convention every PUT status handler in this codebase
+    /// follows (`fn put_..._status` / `fn replace_..._status`) and fails the moment a new
+    /// one is added without calling the shared guard.
+    #[test]
+    fn every_status_put_handler_guards_against_non_object_status() {
+        // put_namespace_status is the one handler exempt from calling the guard directly: it
+        // round-trips the incoming status through the typed `NamespaceStatus` struct
+        // (`serde_json::from_value::<NamespaceStatus>` then `serde_json::to_value`) before
+        // ever assigning it back, so a scalar/array status is structurally impossible to
+        // produce there — `to_value` on a struct always yields a JSON object.
+        const TYPED_SAFE: &[&str] = &["put_namespace_status"];
+
+        let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
+        let mut checked = Vec::new();
+        let mut unguarded = Vec::new();
+
+        for entry in std::fs::read_dir(&handlers_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", handlers_dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for (name, body) in status_put_handler_bodies(&source) {
+                checked.push(name.clone());
+                if TYPED_SAFE.contains(&name.as_str()) {
+                    continue;
+                }
+                if !body.contains("reject_non_object_status(")
+                    && !body.contains("replace_status_field(")
+                {
+                    unguarded.push(format!("{name} in {}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            checked.len() >= 6,
+            "sanity check: expected at least 6 status-subresource PUT handlers \
+             (put_resource_status, put_namespaced_resource_status, put_cr_status, \
+             put_crd_status, replace_pod_status, put_namespace_status), found {} — did the \
+             put_/replace_ + \"status\" naming convention change (this test would otherwise \
+             pass vacuously)?",
+            checked.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "status-subresource PUT handler(s) persist a raw status value without \
+             rejecting a non-object (scalar/array) status first: {unguarded:?} — a scalar \
+             status corrupts the object's schema and panics the next in-place status \
+             stamper, crashing the apiserver for every other request in flight. Call \
+             replace_status_field (or reject_non_object_status) before persisting, or add \
+             the handler to TYPED_SAFE with a comment proving it structurally cannot store \
+             a non-object status."
+        );
+    }
+
+    /// Extracts `(function_name, body)` for every top-level `pub`/`pub(crate)` function in
+    /// `source` whose name starts with `put_` or `replace_` and contains `status` — the
+    /// naming convention every status-subresource PUT handler in this codebase follows.
+    /// Deliberately requires the signature to start at column 0 (`line.starts_with("pub")`)
+    /// so indented `#[tokio::test] async fn put_..._status_...()` test functions inside
+    /// `mod tests` are never mistaken for a production handler.
+    fn status_put_handler_bodies(source: &str) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+        let lines: Vec<&str> = source.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if let Some(name) = line
+                .starts_with("pub")
+                .then(|| line.find("fn "))
+                .flatten()
+                .map(|fn_idx| {
+                    let after = &line[fn_idx + 3..];
+                    let end = after
+                        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(after.len());
+                    after[..end].to_string()
+                })
+            {
+                if (name.starts_with("put_") || name.starts_with("replace_"))
+                    && name.contains("status")
+                {
+                    let mut depth = 0i32;
+                    let mut started = false;
+                    let mut body = String::new();
+                    let mut j = i;
+                    while j < lines.len() {
+                        let l = lines[j];
+                        for ch in l.chars() {
+                            if ch == '{' {
+                                depth += 1;
+                                started = true;
+                            } else if ch == '}' {
+                                depth -= 1;
+                            }
+                        }
+                        body.push_str(l);
+                        body.push('\n');
+                        j += 1;
+                        if started && depth <= 0 {
+                            break;
+                        }
+                    }
+                    results.push((name, body));
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        results
     }
 }

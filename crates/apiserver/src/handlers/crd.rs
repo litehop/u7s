@@ -1078,14 +1078,7 @@ pub async fn put_crd_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    match &incoming.body["status"] {
-        serde_json::Value::Null => {
-            current.body.as_object_mut().map(|m| m.remove("status"));
-        }
-        v => {
-            current.body["status"] = v.clone();
-        }
-    }
+    crate::handlers::status::replace_status_field(&mut current.body, &incoming.body["status"])?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
 
@@ -2554,6 +2547,85 @@ mod tests {
             .unwrap();
         let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
         assert_eq!(v2["status"]["conditions"][0]["type"], "Established");
+    }
+
+    /// PUT .../{name}/status with a scalar or array `status` body must be rejected with
+    /// 422, not persisted. `status` is a message/object type for every resource including a
+    /// CustomResourceDefinition's own status; a PUT that wholesale-replaces it with a scalar
+    /// corrupts the stored object's schema and later panics `apply_delete_policy`'s in-place
+    /// `status["field"] = ...` stamp on the next DELETE, crashing the apiserver for every
+    /// other request in flight.
+    #[tokio::test]
+    async fn put_crd_status_rejects_non_object_status() {
+        for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
+            let state = make_state();
+            let name = "putscalarstatuses.example.io";
+            let body = minimal_crd_bytes_with_group(name, "example.io", "putscalarstatuses");
+            create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+                .await
+                .expect("create must succeed");
+
+            let put_body = Bytes::from(
+                serde_json::json!({
+                    "metadata": { "name": name },
+                    "status": bad_status
+                })
+                .to_string(),
+            );
+            let result = put_crd_status(
+                State(state.clone()),
+                Path(name.to_string()),
+                HeaderMap::new(),
+                put_body,
+            )
+            .await;
+
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "a non-object status ({bad_status}) via PUT must be rejected, not \
+                     persisted — it would corrupt the CRD's schema and later crash \
+                     apply_delete_policy on DELETE"
+                ),
+            };
+            assert_eq!(
+                err.0,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a non-object status must be rejected with 422: got {bad_status}"
+            );
+        }
+    }
+
+    /// PUT .../{name}/status with an explicit `status: null` body must still succeed and
+    /// clear the field — the 422 guard above must reject only a present scalar/array.
+    #[tokio::test]
+    async fn put_crd_status_accepts_null_status() {
+        let state = make_state();
+        let name = "putnullstatuses.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "putnullstatuses");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "metadata": { "name": name },
+                "status": null
+            })
+            .to_string(),
+        );
+        let result = put_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            HeaderMap::new(),
+            put_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a null status PUT is legitimate field-clearing, not a 422: {:?}",
+            result.err()
+        );
     }
 
     /// PATCH .../{name}/status with a merge-patch must update only the status field —
