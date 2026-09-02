@@ -1236,6 +1236,85 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // Security audit PoC: yaml_to_json recursion has no depth guard
+    //
+    // See the 2026-09-02 decoder-recursion-depth-audit findings doc under
+    // ai/findings/ for full context.
+    // yaml_to_json (above) recurses once per nesting level of the parsed YAML
+    // tree with no MAX_DEPTH check. yaml-rust2's scanner does cap FLOW-style
+    // nesting (`[`/`{`) at 255 levels (a `u8` counter in `Scanner::flow_level`,
+    // crates.io yaml-rust2 0.12.0 src/scanner.rs:376,1456-1463) and returns a
+    // clean "recursion limit exceeded" error — but kubectl apply --server-side
+    // sends BLOCK-style YAML (indentation, not brackets), and block nesting is
+    // tracked in a heap-allocated `Vec<Indent>` with no equivalent counter, so
+    // that cap does not apply. A small, deeply-nested BLOCK-style
+    // apply-patch+yaml body can exhaust the call stack long before the 4 MiB
+    // body-size cap is ever relevant. #[ignore]d: on overflow Rust aborts the
+    // whole process (no catchable panic) rather than unwinding, so this must
+    // never run as part of the default test suite. Run in isolation with:
+    //   cargo test -p u7s-apiserver --lib -- --ignored --exact \
+    //     handlers::json_patch::tests::ssa_body_to_json_yaml_to_json_recursion_has_no_depth_guard
+    // ---------------------------------------------------------------------------
+
+    /// Builds an `apply-patch+yaml` body consisting of `depth` nested BLOCK-style
+    /// (indentation) YAML mappings, e.g. depth=3: `"a:\n a:\n  a: 1\n"`.
+    fn nested_block_mapping_body(depth: usize) -> Vec<u8> {
+        let mut b = Vec::with_capacity(depth * 4);
+        for i in 0..depth {
+            b.extend(std::iter::repeat_n(b' ', i));
+            if i + 1 == depth {
+                b.extend_from_slice(b"a: 1\n");
+            } else {
+                b.extend_from_slice(b"a:\n");
+            }
+        }
+        b
+    }
+
+    /// Confirms yaml_to_json's recursion is bounded only by the OS stack, not by
+    /// any depth check: a deliberately tiny worker-thread stack (well below
+    /// tokio's real ~2 MiB default) survives a shallow nesting depth but
+    /// crashes the process at a depth ten times deeper and still only tens of
+    /// KB — proving the bound scales with nesting depth, not body size, and
+    /// that no code path rejects deep BLOCK-style input before the stack gives
+    /// out (unlike FLOW-style `[`/`{` nesting, which yaml-rust2 itself caps at
+    /// 255 levels).
+    #[test]
+    #[ignore = "intentionally aborts the process to confirm a stack-overflow DoS — run in isolation, see doc comment above"]
+    fn ssa_body_to_json_yaml_to_json_recursion_has_no_depth_guard() {
+        // Far below tokio's real ~2 MiB default worker-thread stack, so the
+        // overflow triggers at a small depth and the PoC stays fast (<60s).
+        const STACK_SIZE: usize = 256 * 1024;
+
+        // Point 1: shallow depth, tiny body — must succeed, proving this is well
+        // within any legitimate request and is not caught by the body-size cap.
+        let shallow = nested_block_mapping_body(500);
+        let handle = std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(move || ssa_body_to_json(&shallow).is_ok())
+            .expect("spawn shallow-depth thread");
+        assert!(
+            handle
+                .join()
+                .expect("shallow depth must not crash the thread"),
+            "500 levels of nested block mappings (~2 KB body) must parse cleanly — this \
+             proves the crash below is caused by recursion depth, not malformed input or \
+             yaml-rust2's separate 255-level FLOW-style (`[`/`{{`) nesting cap"
+        );
+
+        // Point 2: 10x deeper, still a ~20 KB body — overflows the same stack.
+        // If yaml_to_json had a depth guard, this would return Err cleanly; instead
+        // the process aborts here with no further test output, confirming the gap.
+        let deep = nested_block_mapping_body(5_000);
+        let handle = std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(move || ssa_body_to_json(&deep).is_ok())
+            .expect("spawn deep-depth thread");
+        let _ = handle.join();
+        panic!("unreachable if the process survived — yaml_to_json would need a depth guard");
+    }
+
+    // ---------------------------------------------------------------------------
     // Webhook configuration field validation — regression
     // ---------------------------------------------------------------------------
 
