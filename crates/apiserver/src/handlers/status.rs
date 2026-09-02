@@ -409,10 +409,14 @@ pub async fn patch_namespaced_resource_status<S: Store>(
 /// schema and, worse, panics any code that later stamps status fields in place via
 /// `obj.body["status"]["field"] = ...` (e.g. `apply_delete_policy`), crashing the apiserver.
 /// Reject before it's ever written to the store.
+///
+/// `null` is explicitly ALLOWED (not rejected): `{"status": null}` is RFC 7396's own
+/// field-deletion syntax, not an invalid scalar — a merge-patch that clears status
+/// entirely is legitimate and must not 422.
 pub(crate) fn reject_non_object_status(
     status: &serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
-    if status.is_object() {
+    if status.is_object() || status.is_null() {
         return Ok(());
     }
     Err(Status::unprocessable_entity(format!(
@@ -1367,6 +1371,59 @@ mod tests {
             v["status"]["phase"], "Ready",
             "the rejected patch must not have been persisted — status must remain the \
              original object"
+        );
+    }
+
+    /// patch_resource_status with a merge-patch body `{"status": null}` must be ACCEPTED,
+    /// not 422'd. `null` is RFC 7396's own field-deletion syntax, not an invalid scalar —
+    /// a controller clearing status entirely via /status is legitimate traffic that must
+    /// not be confused with the scalar-status attack the 422 check above exists to reject.
+    #[tokio::test]
+    async fn patch_resource_status_accepts_null_status_as_field_deletion() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "null-status-node", "resourceVersion": "1" },
+            "spec": { "drivers": [] },
+            "status": { "phase": "Ready" }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/null-status-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!({"status": null});
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "null-status-node".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a null status merge-patch is RFC 7396 field deletion, not a 422: {:?}",
+            result.err()
         );
     }
 
