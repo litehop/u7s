@@ -453,6 +453,14 @@ pub(crate) async fn replace_namespace<S: Store>(
         .map(|f| f.is_empty())
         .unwrap_or(true);
 
+    // Dry-run: return the would-be replaced object without persisting — mirrors
+    // create_namespace's dry-run early-return (is_dry_run_header is the router-wide
+    // ?dryRun=All signal for handlers, like this one, with no Query<...> extractor of
+    // their own).
+    if is_dry_run_header(&headers) {
+        return Ok(Json(obj.body).into_response());
+    }
+
     let new_rv = state
         .store
         .put(&key, obj.to_bytes(), expected_revision)
@@ -581,6 +589,13 @@ pub(crate) async fn patch_namespace<S: Store>(
         .as_deref()
         .map(|f| f.is_empty())
         .unwrap_or(true);
+
+    // Dry-run: return the would-be patched object without persisting — mirrors do_patch's
+    // dry-run early-return, which the SSA branch above already gets for free but this
+    // merge/strategic-merge branch has its own store.put and needed its own guard.
+    if patch_query.is_dry_run() {
+        return Ok(Json(current.body).into_response());
+    }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -1933,6 +1948,92 @@ mod tests {
         );
     }
 
+    /// `kubectl replace --dry-run=server` on a Namespace must NOT persist the replacement —
+    /// a dry-run that writes anyway silently mutates cluster state against the client's
+    /// explicit intent. This test fails on revert with the stored labels changed to
+    /// `{"env": "prod"}`.
+    #[tokio::test]
+    async fn replace_namespace_dry_run_does_not_mutate_store() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("dry-run-replace-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let stored_entry = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "dry-run-replace-ns",
+            ))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&stored_entry.value).expect("parse stored");
+        let rv = stored["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("1")
+            .to_string();
+        let uid = stored["metadata"]["uid"].as_str().unwrap_or("").to_string();
+
+        let replace_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "dry-run-replace-ns",
+                    "uid": uid,
+                    "resourceVersion": rv,
+                    "labels": { "env": "prod" }
+                }
+            })
+            .to_string(),
+        );
+
+        let mut dry_run_headers = axum::http::HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        assert!(
+            replace_namespace(
+                State(state.clone()),
+                Path("dry-run-replace-ns".to_string()),
+                dry_run_headers,
+                replace_body,
+            )
+            .await
+            .is_ok(),
+            "dry-run replace must still return a success response"
+        );
+
+        let after = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "dry-run-replace-ns",
+            ))
+            .await
+            .expect("store get must not error")
+            .expect("must still exist");
+        let body: serde_json::Value = serde_json::from_slice(&after.value).expect("parse after");
+        assert!(
+            body["metadata"]["labels"]["env"].is_null(),
+            "dryRun=All must NOT persist the replacement — if this fails, replace_namespace's \
+             dry-run guard was removed and labels.env was actually written to the store"
+        );
+    }
+
     // A plain PUT to the main /namespaces endpoint must never let the client body's
     // `.status` clobber the server's stored status: status is owned by the dedicated
     // `/status` subresource (see put_namespace_status), and any client holding a locally
@@ -2165,6 +2266,73 @@ mod tests {
         assert_eq!(
             body["metadata"]["labels"]["patched"], "yes",
             "patch must apply the merge patch to the stored namespace"
+        );
+    }
+
+    /// `kubectl patch namespace --dry-run=server` (merge-patch branch) must NOT persist the
+    /// patch — a dry-run that writes anyway silently mutates cluster state against the
+    /// client's explicit intent. This test fails on revert with the stored labels changed
+    /// to `{"patched": "yes"}`.
+    #[tokio::test]
+    async fn patch_namespace_merge_dry_run_does_not_mutate_store() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("dry-run-patch-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!({ "metadata": { "labels": { "patched": "yes" } } }).to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let dry_run_query = PatchQuery {
+            field_manager: None,
+            _field_validation: None,
+            dry_run: Some("All".to_string()),
+        };
+
+        assert!(
+            patch_namespace(
+                State(state.clone()),
+                Path("dry-run-patch-ns".to_string()),
+                axum::extract::Query(dry_run_query),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "dry-run patch must still return a success response"
+        );
+
+        let after = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "dry-run-patch-ns",
+            ))
+            .await
+            .expect("store get")
+            .expect("must still exist");
+        let body: serde_json::Value =
+            serde_json::from_slice(&after.value).expect("parse after patch");
+        assert!(
+            body["metadata"]["labels"]["patched"].is_null(),
+            "dryRun=All must NOT persist the patch — if this fails, patch_namespace's \
+             merge-branch dry-run guard was removed and labels.patched was actually written \
+             to the store"
         );
     }
 
