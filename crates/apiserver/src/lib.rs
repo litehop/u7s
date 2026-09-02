@@ -1466,8 +1466,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // for image-pull auth (KubeletServiceAccountTokenForCredentialProviders, default-true
             // upstream since 1.34).
             { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["get"] },
-            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch","delete"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] },
             // Needed for kubelet to mount PVC-backed volumes: it must read the PVC and the PV
             // it's bound to before it can attach/mount the underlying volume.
@@ -5249,6 +5249,54 @@ mod tests {
             has_rule("", "serviceaccounts", "get"),
             "system:node must be able to get serviceaccounts so kubelet credential providers \
              can request SA tokens for image-pull auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_to_delete_stale_leases_and_csinodes()
+    {
+        // Regression test: kubelet needs delete on its own coordination.k8s.io/leases (stale
+        // NodeLease cleanup on graceful shutdown) and storage.k8s.io/csinodes (stale CSINode
+        // removal on CSI driver/node deregistration). Cleanup-only verbs -- core heartbeat and
+        // CSI registration paths use get/create/update/patch and are unaffected.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule("coordination.k8s.io", "leases", "delete"),
+            "system:node must be able to delete its own Lease so kubelet can clean up a stale \
+             NodeLease on graceful shutdown"
+        );
+        assert!(
+            has_rule("storage.k8s.io", "csinodes", "delete"),
+            "system:node must be able to delete CSINode objects so kubelet can remove a stale \
+             CSINode on CSI driver/node deregistration"
         );
     }
 
