@@ -5860,6 +5860,175 @@ mod tests {
         }
     }
 
+    /// The test above only exercises do_patch's primary SSA-create success path (the two
+    /// bindings it creates never collide on a name). A second writer racing for the *same*
+    /// not-yet-existing name instead falls into the CreateNamespacedError::AlreadyExists
+    /// branch, which merges into the winner's object and has its own separate
+    /// `rbac_index.apply_object` call — a revert of only that fallback-branch hook would
+    /// leave the race's loser request indexed-but-invisible to the authorizer, and the
+    /// sequential test above can never observe that because it never forces a real race.
+    ///
+    /// This test forces two SSA-create requests for the same ClusterRoleBinding name — each
+    /// naming a *different* subject — to race (both see the name absent, since do_patch's
+    /// very first await is the existence check, so `tokio::join!` guarantees both dispatch
+    /// it before either can proceed to the create). `subjects` is a replace-only (last-
+    /// write-wins) field under strategic-merge-patch, so whichever request loses the create
+    /// race and falls into the merge branch is also the one whose subject ends up in the
+    /// final stored object — reading that back (instead of hardcoding which request "wins")
+    /// pins the assertion to whichever request the race-fallback branch actually processed.
+    #[tokio::test]
+    async fn ssa_created_clusterrolebinding_race_fallback_also_indexes_rbac() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Same escalation-satisfying setup as the sequential test above: "admin" (the
+        // creator, via test_user()) must already hold every rule of the role it binds to.
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/service-lister",
+            &serde_json::json!({
+                "rules": [{ "apiGroups": [""], "resources": ["services"], "verbs": ["list"] }]
+            }),
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/test-admin-service-lister",
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": "admin" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "service-lister"
+                }
+            }),
+        );
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        // Both requests target the same not-yet-existing name but name different subjects,
+        // so whichever one actually lands via the merge branch is identifiable afterward.
+        let body_for = |sa_name: &str| {
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "ClusterRoleBinding",
+                    "metadata": { "name": "race-created-crb" },
+                    "subjects": [{ "kind": "ServiceAccount", "namespace": "test", "name": sa_name }],
+                    "roleRef": {
+                        "apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "ClusterRole",
+                        "name": "service-lister"
+                    }
+                }))
+                .unwrap(),
+            )
+        };
+
+        let first = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "rbac.authorization.k8s.io".to_string(),
+                "v1".to_string(),
+                "clusterrolebindings".to_string(),
+                "race-created-crb".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers.clone(),
+            body_for("race-sa-first"),
+        );
+        let second = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "rbac.authorization.k8s.io".to_string(),
+                "v1".to_string(),
+                "clusterrolebindings".to_string(),
+                "race-created-crb".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            body_for("race-sa-second"),
+        );
+        let (first_result, second_result) = tokio::join!(first, second);
+
+        let mut statuses: Vec<axum::http::StatusCode> = [first_result, second_result]
+            .into_iter()
+            .map(|r| {
+                r.unwrap_or_else(|e| {
+                    panic!(
+                        "both racing SSA-create requests for the same name must succeed — \
+                         one via do_patch's primary create path, the other via the \
+                         AlreadyExists race-fallback merge — got error: {e:?}"
+                    )
+                })
+                .into_response()
+                .status()
+            })
+            .collect();
+        statuses.sort_by_key(|s| s.as_u16());
+        assert_eq!(
+            statuses,
+            vec![axum::http::StatusCode::OK, axum::http::StatusCode::CREATED],
+            "exactly one of the two racing SSA-create requests must win the primary create \
+             (201) while the other loses and lands in the race-fallback merge branch (200); \
+             if this doesn't hold, the two requests never actually raced and this test isn't \
+             exercising the fallback branch it exists to cover"
+        );
+
+        // "subjects" is last-write-wins under strategic-merge-patch, so the stored object's
+        // subject identifies exactly which request the race-fallback branch merged in.
+        let key = crate::keys::group_object_key(
+            "rbac.authorization.k8s.io",
+            "clusterrolebindings",
+            None,
+            "race-created-crb",
+        );
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("the racing pair must leave exactly one ClusterRoleBinding persisted");
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let final_sa = stored_body["subjects"][0]["name"]
+            .as_str()
+            .expect("stored ClusterRoleBinding must carry a subject name");
+
+        let username = format!("system:serviceaccount:test:{final_sa}");
+        let groups: Vec<String> = vec![];
+        let req = crate::rbac::AuthzRequest {
+            username: &username,
+            groups: &groups,
+            verb: "list",
+            api_group: "",
+            resource: "services",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&req),
+            "the ClusterRoleBinding's actual persisted subject ({final_sa}) must be \
+             authorized — this subject is whichever request lost the create race and was \
+             merged in by the race-fallback branch, so if that branch's own \
+             rbac_index.apply_object call regresses, the authorizer's index is left holding \
+             only the create-race winner's now-stale subject and this fails"
+        );
+    }
+
     /// SSA-created RBAC bindings must obey escalation-prevention; a low-priv client crafting
     /// a self-privilege-escalating CRB via `kubectl apply --server-side` must be rejected.
     ///
@@ -6019,6 +6188,362 @@ mod tests {
                  ClusterRoleBinding to a role they already hold every rule of — this test \
                  isolates that the check above is denying eve on privilege grounds, not by \
                  accident rejecting every SSA-created CRB: {e:?}"
+            )
+        })
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+    }
+
+    /// SSA-created ClusterRoles must obey escalation-prevention just like the CRB pair above;
+    /// a low-priv client crafting a self-privilege-escalating ClusterRole via `kubectl apply
+    /// --server-side` must be rejected.
+    ///
+    /// do_patch's SSA "create when absent" branch also calls check_clusterrole_escalation —
+    /// this is its dedicated SSA-path regression test (the pre-existing coverage for that
+    /// check only exercised the PATCH-on-an-already-existing-role path).
+    #[tokio::test]
+    async fn ssa_create_clusterrole_denied_for_user_lacking_role_rules() {
+        use axum::http::StatusCode;
+
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        // "mallory" holds only get-pods cluster-wide — nowhere near the wildcard rule she's
+        // about to try to grant herself.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/pod-getter"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+            }),
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/mallory-pod-getter"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "mallory"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "pod-getter"}
+            }),
+        );
+        // A ClusterRoleBinding already references "escalate-target" before the role itself
+        // exists — check_clusterrole_escalation treats a referenced-but-not-yet-created role
+        // as already bound (role-first ordering), so mallory's SSA-create is not exempt just
+        // because the store has never seen this name.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/escalate-target-binding"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "someone-else"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "escalate-target"}
+            }),
+        );
+
+        let mallory = Extension(crate::auth::UserInfo {
+            username: "mallory".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+
+        let cr_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "escalate-target"},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                "v1".to_string(),
+                "clusterroles".to_string(),
+                "escalate-target".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            mallory,
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&cr_body).unwrap()),
+        )
+        .await;
+
+        const INVARIANT: &str = "SSA-created ClusterRoles must obey escalation-prevention; a \
+             low-priv client crafting a self-privilege-escalating ClusterRole via kubectl \
+             apply --server-side must be rejected.";
+        match result {
+            Err(err) => assert_eq!(err.0, StatusCode::FORBIDDEN, "{INVARIANT}"),
+            Ok(_) => panic!("{INVARIANT}"),
+        }
+
+        // Ordering: a rejected escalation must not leave the object in storage.
+        let key = crate::keys::group_object_key(group, "clusterroles", None, "escalate-target");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "the escalation check must run before the store write — a rejected SSA-create \
+             must not persist the ClusterRole it just denied"
+        );
+    }
+
+    /// Symmetric baseline for the test above: a user who already holds every rule of an
+    /// already-bound ClusterRole must be allowed to SSA-create it. Without this, the
+    /// escalation check above could be over-broad and reject legitimate `kubectl apply
+    /// --server-side` of ClusterRoles a caller is entitled to create.
+    #[tokio::test]
+    async fn ssa_create_clusterrole_allowed_for_user_holding_role_rules() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        // "eve" already holds get-pods cluster-wide via her own ClusterRoleBinding.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/pod-getter"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+            }),
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/eve-pod-getter"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "eve"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "pod-getter"}
+            }),
+        );
+        // A ClusterRoleBinding already references the not-yet-created "escalate-target"
+        // role — required for check_clusterrole_escalation to apply at all (an unbound role
+        // has nothing to escalate).
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/escalate-target-binding"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "bob"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "escalate-target"}
+            }),
+        );
+
+        let eve = Extension(crate::auth::UserInfo {
+            username: "eve".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+
+        // eve SSA-creates "escalate-target" with the exact same rule she already holds.
+        let cr_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "escalate-target"},
+            "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+        });
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                "v1".to_string(),
+                "clusterroles".to_string(),
+                "escalate-target".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            eve,
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&cr_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "escalation-prevention must not block a user from SSA-creating an \
+                 already-bound ClusterRole whose every rule they already hold — this test \
+                 isolates that the check above is denying mallory on privilege grounds, not \
+                 by accident rejecting every SSA-created ClusterRole: {e:?}"
+            )
+        })
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+    }
+
+    /// SSA-created RoleBindings must obey escalation-prevention just like the CRB pair
+    /// above; a low-priv client crafting a self-privilege-escalating RoleBinding via
+    /// `kubectl apply --server-side` must be rejected.
+    ///
+    /// do_patch's SSA "create when absent" branch also calls check_rb_escalation — this is
+    /// its dedicated SSA-path regression test (the pre-existing coverage for that check
+    /// only exercised the POST-create path via create_namespaced_resource).
+    #[tokio::test]
+    async fn ssa_create_rolebinding_denied_for_user_lacking_role_rules() {
+        use axum::http::StatusCode;
+
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "default";
+
+        // Seed a Role in "default" with secret-read rules that "alice" does NOT hold.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/namespaces/{ns}/roles/secret-reader"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get", "list"]}]
+            }),
+        );
+
+        // "alice" can only create rolebindings — she does NOT have get/list secrets.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/alice-rb-creator"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": [group], "resources": ["rolebindings"], "verbs": ["create"]}]
+            }),
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/alice-rb-creator-bind"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "alice"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "alice-rb-creator"}
+            }),
+        );
+
+        let alice = Extension(crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+
+        // alice tries to bind herself to "secret-reader" in "default".
+        let rb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": "alice-secret-reader", "namespace": ns},
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {"apiGroup": group, "kind": "Role", "name": "secret-reader"}
+        });
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "rolebindings".to_string(),
+                "alice-secret-reader".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            alice,
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&rb_body).unwrap()),
+        )
+        .await;
+
+        const INVARIANT: &str = "SSA-created RoleBindings must obey escalation-prevention; a \
+             low-priv client crafting a self-privilege-escalating RoleBinding via kubectl \
+             apply --server-side must be rejected.";
+        match result {
+            Err(err) => assert_eq!(err.0, StatusCode::FORBIDDEN, "{INVARIANT}"),
+            Ok(_) => panic!("{INVARIANT}"),
+        }
+
+        // Ordering: a rejected escalation must not leave the object in storage.
+        let key =
+            crate::keys::group_object_key(group, "rolebindings", Some(ns), "alice-secret-reader");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "the escalation check must run before the store write — a rejected SSA-create \
+             must not persist the RoleBinding it just denied"
+        );
+    }
+
+    /// Symmetric baseline for the test above: a user who already holds every rule of a Role
+    /// must be allowed to SSA-create a RoleBinding to it. Without this, the escalation check
+    /// above could be over-broad and reject legitimate `kubectl apply --server-side` of
+    /// RoleBindings a caller is entitled to create.
+    #[tokio::test]
+    async fn ssa_create_rolebinding_allowed_for_user_holding_role_rules() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let ns = "default";
+
+        // Seed a Role in "default" with pod-read rules.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/namespaces/{ns}/roles/pod-reader"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]}]
+            }),
+        );
+
+        // Seed cluster-admin and system:masters binding so "admin" passes escalation.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/cluster-admin"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+            }),
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/system-masters-cluster-admin"),
+            &serde_json::json!({
+                "subjects": [{"kind": "Group", "name": "system:masters"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "cluster-admin"}
+            }),
+        );
+
+        let admin = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+            extra: Default::default(),
+        });
+
+        // "admin" (system:masters) SSA-creates a RoleBinding granting pod-reader to "bob".
+        let rb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": "bob-pod-reader", "namespace": ns},
+            "subjects": [{"kind": "User", "name": "bob"}],
+            "roleRef": {"apiGroup": group, "kind": "Role", "name": "pod-reader"}
+        });
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "rolebindings".to_string(),
+                "bob-pod-reader".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            admin,
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&rb_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "escalation-prevention must not block a system:masters admin from \
+                 SSA-creating a RoleBinding to a Role they already hold every rule of — this \
+                 test isolates that the check above is denying alice on privilege grounds, \
+                 not by accident rejecting every SSA-created RoleBinding: {e:?}"
             )
         })
         .into_response();
