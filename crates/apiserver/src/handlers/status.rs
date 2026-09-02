@@ -4866,12 +4866,12 @@ mod tests {
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
             for (name, body) in main_resource_handler_bodies(&source) {
-                // A handler whose own body never calls `.put(` doesn't persist anything
-                // itself — it's a thin wrapper delegating to an already-checked handler
-                // (patch_resource/patch_namespaced_resource -> do_patch, the core.rs/
-                // certificates.rs wrappers -> resource.rs, the scale PATCH handlers ->
-                // their shared *_impl). Nothing new to check.
-                if !body.contains(".put(") {
+                // A handler whose own body never calls a Store write entry point doesn't
+                // persist anything itself — it's a thin wrapper delegating to an
+                // already-checked handler (patch_resource/patch_namespaced_resource ->
+                // do_patch, the core.rs/certificates.rs wrappers -> resource.rs, the scale
+                // PATCH handlers -> their shared *_impl). Nothing new to check.
+                if !calls_store_write_entry_point(&body) {
                     continue;
                 }
                 checked.push(name.clone());
@@ -4984,5 +4984,45 @@ mod tests {
         handler_bodies_matching(source, |name| {
             (name.starts_with("patch_") || name.starts_with("replace_")) && !name.contains("status")
         })
+    }
+
+    /// Every `Store` method that actually persists new object bytes, as called from
+    /// handler source text. `create_if_namespace_active` wraps `put` internally (see
+    /// `Store::create_if_namespace_active`'s default impl in store/src/lib.rs) — listed
+    /// separately here because a handler persisting solely through it has no literal
+    /// `.put(` substring in its own body and would otherwise be silently skipped by
+    /// `every_main_resource_write_handler_preserves_stored_status`.
+    fn calls_store_write_entry_point(body: &str) -> bool {
+        const STORE_WRITE_ENTRY_POINTS: &[&str] = &[".put(", ".create_if_namespace_active("];
+        STORE_WRITE_ENTRY_POINTS
+            .iter()
+            .any(|entry_point| body.contains(entry_point))
+    }
+
+    /// `every_main_resource_write_handler_preserves_stored_status` only inspects handlers
+    /// whose body trips this detector — a future handler that persists solely through
+    /// `create_if_namespace_active` (skipping `put` entirely) must not be silently exempted
+    /// from the stored_status check just because that method's name doesn't contain the
+    /// literal substring `.put(`. Fails on revert: narrowing `calls_store_write_entry_point`
+    /// back to only `.put(` makes the `create_if_namespace_active`-only case below return
+    /// false.
+    #[test]
+    fn calls_store_write_entry_point_catches_create_if_namespace_active_only_handlers() {
+        assert!(
+            calls_store_write_entry_point("state.store.put(&key, bytes, None).await"),
+            "a handler calling .put( directly must be detected"
+        );
+        assert!(
+            calls_store_write_entry_point(
+                "state.store.create_if_namespace_active(Some(&ns_key), &key, bytes).await"
+            ),
+            "a handler persisting solely via create_if_namespace_active (which wraps put \
+             internally) must still be detected, not silently skipped by the completeness \
+             scan just because its body lacks the literal substring \".put(\""
+        );
+        assert!(
+            !calls_store_write_entry_point("state.store.get(&key).await"),
+            "a handler that only reads from the store must not be flagged as a write handler"
+        );
     }
 }
