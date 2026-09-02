@@ -1437,7 +1437,14 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["pods"],         "verbs": ["get","list","watch","create","delete"] },
             { "apiGroups": [""], "resources": ["pods/status"],  "verbs": ["get","update","patch"] },
             { "apiGroups": [""], "resources": ["pods/log"],     "verbs": ["get"] },
-            { "apiGroups": [""], "resources": ["events"],       "verbs": ["create","patch","update"] },
+            // Kubelet's node-pressure eviction path POSTs to the Eviction subresource (which
+            // respects PDBs) to evict its own bound pods under resource pressure. Without this,
+            // every such eviction 403s. Matches upstream bootstrappolicy.go's NodeRules() exactly.
+            { "apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"] },
+            // events.k8s.io is the modern Event API kubelet's default event recorder posts to;
+            // "" is the legacy group. Upstream NodeRules() grants create/update/patch on events
+            // under both groups in the same rule.
+            { "apiGroups": ["", "events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] },
             // Kubelet's own service informer populates Service-discovery env vars
             // (SERVICE_HOST/SERVICE_PORT) injected into every pod's containers. Without this
             // rule the informer's List/Watch is denied, the informer never completes its first
@@ -1449,12 +1456,18 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["services"],     "verbs": ["get","list","watch"] },
             { "apiGroups": [""], "resources": ["configmaps"],          "verbs": ["get","list","watch"] },
             { "apiGroups": [""], "resources": ["secrets"],             "verbs": ["get","list","watch"] },
+            // Needed for the (legacy) glusterfs in-tree volume plugin, per upstream's own comment.
+            { "apiGroups": [""], "resources": ["endpoints"], "verbs": ["get"] },
             // Kubelet calls TokenRequest to project SA tokens into pods (projected volumes).
             // Without this rule the kubelet's POST to serviceaccounts/{name}/token returns 403
             // and containers never get an SA token, breaking in-cluster API calls.
             { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
-            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch"] },
+            // Only activates when a kubelet credentialProviders config entry requests SA tokens
+            // for image-pull auth (KubeletServiceAccountTokenForCredentialProviders, default-true
+            // upstream since 1.34).
+            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["get"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch","delete"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] },
             // Needed for kubelet to mount PVC-backed volumes: it must read the PVC and the PV
             // it's bound to before it can attach/mount the underlying volume.
@@ -1464,10 +1477,19 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // CSI: kubelet reads the VolumeAttachment to learn when volume attach has completed
             // before it mounts.
             { "apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments"], "verbs": ["get"] },
+            // Unconditional upstream rule (not feature-gated). Any pod with spec.runtimeClassName
+            // set has its kubelet RuntimeClass lookup denied without this.
+            { "apiGroups": ["node.k8s.io"], "resources": ["runtimeclasses"], "verbs": ["get","list","watch"] },
+            // DRA (Dynamic Resource Allocation), GA and default-true upstream since 1.34: kubelet's
+            // DRA plugin manager resolves ResourceClaims for pods using accelerator/device
+            // scheduling, and cleans up stale ResourceSlices it published.
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": ["get"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceslices"], "verbs": ["deletecollection"] },
             // Kubelet webhook authorizer and authenticator call back to the apiserver via
             // SubjectAccessReview and TokenReview. Without these the kubelet denies all
             // proxy requests (logs, exec, attach) with "Authorization error".
             { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["localsubjectaccessreviews"], "verbs": ["create"] },
             { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
             // Used to create a certificatesigningrequest for a node-specific client certificate,
             // and watch for it to be signed. This allows the kubelet to rotate its own
@@ -5003,6 +5025,287 @@ mod tests {
             "system:node must still retain delete on pods alongside create (upstream's \
              single create+delete rule); a regression here would re-wedge terminated pods \
              in Terminating forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_to_create_pod_eviction() {
+        // Regression test: kubelet's node-pressure eviction path POSTs to the Eviction
+        // subresource (which respects PDBs) to evict its own bound pods under resource
+        // pressure. Without this rule every such eviction 403s -- same class of outage as the
+        // mirror-pods/terminated-pods rules above.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule("", "pods/eviction", "create"),
+            "system:node must be able to create pods/eviction so kubelet's node-pressure \
+             eviction workflow can evict its own bound pods; missing this rule 403s every \
+             such eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_to_read_runtimeclasses() {
+        // Regression test: any pod with spec.runtimeClassName set requires kubelet's
+        // RuntimeClass lookup to succeed before the pod can start. Upstream NodeRules()
+        // grants this unconditionally (not feature-gated).
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        for verb in ["get", "list", "watch"] {
+            assert!(
+                has_rule("node.k8s.io", "runtimeclasses", verb),
+                "system:node must be able to {verb} RuntimeClasses so kubelet can resolve \
+                 spec.runtimeClassName; missing this rule fails pod start on that node"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_dra_resource_access() {
+        // Regression test: DRA (Dynamic Resource Allocation) is GA and default-true upstream
+        // since 1.34. Kubelet's DRA plugin manager needs to resolve ResourceClaims for pods
+        // using accelerator/device scheduling, and clean up stale ResourceSlices it published.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule("resource.k8s.io", "resourceclaims", "get"),
+            "system:node must be able to get ResourceClaims so kubelet's DRA plugin manager \
+             can resolve device allocations for pods using dynamic resource allocation"
+        );
+        assert!(
+            has_rule("resource.k8s.io", "resourceslices", "deletecollection"),
+            "system:node must be able to deletecollection ResourceSlices so kubelet can clean \
+             up stale slices it published on that node"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_events_via_events_k8s_io() {
+        // Regression test: kubelet's default event recorder posts via the modern
+        // events.k8s.io/v1 API. Missing this apiGroup grant 403s all such postings, degrading
+        // observability (kubectl describe pod loses kubelet-sourced events like image-pull
+        // failures) even though it doesn't block scheduling.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        for verb in ["create", "patch", "update"] {
+            assert!(
+                has_rule("events.k8s.io", "events", verb),
+                "system:node must be able to {verb} events under events.k8s.io (not just the \
+                 legacy \"\" group) so kubelet's default event recorder can post via the \
+                 modern Events API"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_sar_and_endpoints_and_sa_reads() {
+        // Regression test for the three P2 NodeRules parity gaps: localsubjectaccessreviews
+        // (paired with subjectaccessreviews upstream), endpoints get (glusterfs volumes per
+        // upstream's own comment), and plain serviceaccounts get (kubelet credential providers
+        // requesting SA tokens for image-pull auth).
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule(
+                "authorization.k8s.io",
+                "localsubjectaccessreviews",
+                "create"
+            ),
+            "system:node must be able to create localsubjectaccessreviews, matching upstream's \
+             pairing with the cluster-scoped subjectaccessreviews rule"
+        );
+        assert!(
+            has_rule("", "endpoints", "get"),
+            "system:node must be able to get endpoints for the (legacy) glusterfs in-tree \
+             volume plugin, per upstream NodeRules()"
+        );
+        assert!(
+            has_rule("", "serviceaccounts", "get"),
+            "system:node must be able to get serviceaccounts so kubelet credential providers \
+             can request SA tokens for image-pull auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_to_delete_stale_leases_and_csinodes()
+    {
+        // Regression test: kubelet needs delete on its own coordination.k8s.io/leases (stale
+        // NodeLease cleanup on graceful shutdown) and storage.k8s.io/csinodes (stale CSINode
+        // removal on CSI driver/node deregistration). Cleanup-only verbs -- core heartbeat and
+        // CSI registration paths use get/create/update/patch and are unaffected.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule("coordination.k8s.io", "leases", "delete"),
+            "system:node must be able to delete its own Lease so kubelet can clean up a stale \
+             NodeLease on graceful shutdown"
+        );
+        assert!(
+            has_rule("storage.k8s.io", "csinodes", "delete"),
+            "system:node must be able to delete CSINode objects so kubelet can remove a stale \
+             CSINode on CSI driver/node deregistration"
         );
     }
 

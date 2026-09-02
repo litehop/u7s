@@ -375,6 +375,12 @@ fn authorize_pod(
         },
         "status" => matches!(req.verb, "get" | "update" | "patch") && req.name.is_some_and(owns),
         "log" => req.verb == "get" && req.name.is_some_and(owns),
+        // Upstream's authorizePod allows `create` on eviction unconditionally at this
+        // layer, relying on the NodeRestriction admission plugin (which u7s does not
+        // implement) to limit a node to evicting pods bound to itself. Scope to owned
+        // pods here instead, matching this function's existing compensating pattern for
+        // get/delete/status/log above.
+        "eviction" => req.verb == "create" && req.name.is_some_and(owns),
         _ => false,
     }
 }
@@ -895,6 +901,57 @@ mod tests {
             authorize(&req, None, &graph, &idx),
             "node-a must still be able to patch pod-a's own status — this is the routine \
              kubelet status-report path every running pod depends on"
+        );
+    }
+
+    #[test]
+    fn node_cannot_create_eviction_for_a_pod_scheduled_on_another_node() {
+        // Regression test: u7s has no NodeRestriction admission plugin, so this authorizer is
+        // the only thing stopping a compromised kubelet from evicting arbitrary pods cluster-
+        // wide (upstream defers that restriction to admission and allows eviction
+        // unconditionally at this layer — u7s must not copy that unconditional allow verbatim).
+        let graph = seeded_graph();
+        let idx = RbacIndex::new();
+        let groups = vec![NODES_GROUP.to_owned()];
+        let req = node_req(
+            "system:node:node-a",
+            &groups,
+            "create",
+            "",
+            "pods",
+            "eviction",
+            Some("default"),
+            Some("pod-b"),
+        );
+        assert!(
+            !authorize(&req, None, &graph, &idx),
+            "node-a must NOT be able to evict pod-b — pod-b runs on node-b; allowing this lets \
+             one compromised kubelet evict any pod on any node cluster-wide"
+        );
+    }
+
+    #[test]
+    fn node_can_create_eviction_for_its_own_pod() {
+        // Regression test: kubelet's node-pressure eviction path must actually
+        // work end-to-end, not just have a matching ClusterRole rule that this authorizer's
+        // `_ => false` fallback silently swallows for the "eviction" subresource.
+        let graph = seeded_graph();
+        let idx = RbacIndex::new();
+        let groups = vec![NODES_GROUP.to_owned()];
+        let req = node_req(
+            "system:node:node-a",
+            &groups,
+            "create",
+            "",
+            "pods",
+            "eviction",
+            Some("default"),
+            Some("pod-a"),
+        );
+        assert!(
+            authorize(&req, None, &graph, &idx),
+            "node-a must be able to evict pod-a, its own pod — otherwise kubelet's \
+             node-pressure eviction workflow 403s for every pod it manages"
         );
     }
 
