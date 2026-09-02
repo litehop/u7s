@@ -2,21 +2,8 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
-    # Swatinem/rust-cache's key includes the job name (build-and-publish),
-    # which no other workflow uses -- so tag-triggered runs never find a
-    # warm cache unless a push-to-main run (this branch filter) primed one
-    # first. Path-filtered so unrelated main pushes (docs, other workflows)
-    # don't pay for a ~9-minute cold-cache-priming build.
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      - 'scripts/build-release-tarball.sh'
-      - '.github/workflows/release-tarball.yaml'
   workflow_dispatch:
     inputs:
       version:
@@ -48,13 +35,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             V="${{ inputs.version }}"
-          elif [ "${{ github.ref_type }}" = "tag" ]; then
-            V="${GITHUB_REF_NAME}"
           else
-            # Plain push to main: not a release, just here to build and
-            # warm the rust-cache entry that tag-triggered runs restore
-            # from (see the paths-filtered push trigger above).
-            V="v0.0.0-cache-warm"
+            V="${GITHUB_REF_NAME}"
           fi
           case "$V" in
             v*-*) PRERELEASE=true
@@ -119,11 +101,6 @@ jobs:
           echo "baked: $url"
 
       - name: Publish GitHub Release
-        # Cache-warming runs (plain push to main, no tag) build and stage
-        # a tarball but must never cut a release from it. workflow_dispatch
-        # always publishes -- it's the manual-release path regardless of
-        # which ref it's run against.
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.v }}
