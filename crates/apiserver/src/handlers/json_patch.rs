@@ -95,6 +95,16 @@ pub(crate) async fn inject_dry_run_header(
     mut req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // DRY_RUN_HEADER is an internal signal only this layer may set. Strip any
+    // client-supplied copy FIRST, unconditionally — otherwise a caller could forge
+    // `x-u7s-dry-run: true` on a genuine (non-dryRun) write to fool the sideEffects gate
+    // (admission.rs) into skipping a `sideEffects: Some, failurePolicy: Ignore` webhook it
+    // should have invoked, reintroducing the exact bypass this layer exists to close.
+    req.headers_mut().remove(DRY_RUN_HEADER);
+
+    // A repeated `dryRun` query key must not let a non-"All" duplicate flip a genuine
+    // `dryRun=All` into a real write — treat the presence of ANY exact `dryRun=All`
+    // segment as authoritative, regardless of what other `dryRun=` values also appear.
     let is_dry_run = req
         .uri()
         .query()
@@ -1842,5 +1852,94 @@ mod tests {
                  on the nil error it gets instead of the expected 422"
             ),
         }
+    }
+
+    // -- inject_dry_run_header (integration, via a real Router) --------------------------
+    //
+    // DRY_RUN_HEADER is an internal signal that gates admission's sideEffects dry-run check
+    // (see AdmissionContext.dry_run). If a client could set it directly, they could forge
+    // `x-u7s-dry-run: true` on a genuine write to make a `sideEffects: Some,
+    // failurePolicy: Ignore` webhook get silently skipped — the exact bypass this layer
+    // exists to close, reintroduced through the header instead of the query string. These
+    // tests exercise the middleware through a real Router (oneshot), not by calling it
+    // directly, since `Next` can only be constructed by axum's own dispatch machinery.
+
+    async fn echo_dry_run_header(headers: axum::http::HeaderMap) -> String {
+        is_dry_run_header(&headers).to_string()
+    }
+
+    fn dry_run_header_test_router() -> axum::Router {
+        axum::Router::new()
+            .route("/", axum::routing::get(echo_dry_run_header))
+            .layer(axum::middleware::from_fn(inject_dry_run_header))
+    }
+
+    /// A client-forged `x-u7s-dry-run: true` header on a request with NO `dryRun=All` query
+    /// must be stripped and ignored — treating it as real would let a caller silently
+    /// disable a `sideEffects: Some, failurePolicy: Ignore` webhook on what is actually a
+    /// genuine write. Fails on revert: dropping the `remove()` call in
+    /// `inject_dry_run_header` makes the handler see the forged header and this test fails.
+    #[tokio::test]
+    async fn inject_dry_run_header_strips_client_forged_header_without_real_dry_run_query() {
+        use tower::ServiceExt as _;
+
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .header(DRY_RUN_HEADER, "true")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = dry_run_header_test_router().oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"false",
+            "a forged x-u7s-dry-run header on a non-dryRun request must be stripped — the \
+             handler must see it as a real write, not a dry run"
+        );
+    }
+
+    /// Baseline: a genuine `?dryRun=All` request (no forged header involved) must still be
+    /// recognized as dry-run — the strip step above must not also break the legitimate path.
+    #[tokio::test]
+    async fn inject_dry_run_header_sets_header_for_real_dry_run_query() {
+        use tower::ServiceExt as _;
+
+        let req = axum::http::Request::builder()
+            .uri("/?dryRun=All")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = dry_run_header_test_router().oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"true",
+            "a genuine ?dryRun=All request must still be recognized as dry-run"
+        );
+    }
+
+    /// A repeated `dryRun` query key must not let a non-"All" duplicate suppress a genuine
+    /// `dryRun=All` — the presence of any exact `dryRun=All` segment must be authoritative.
+    #[tokio::test]
+    async fn inject_dry_run_header_duplicate_key_does_not_suppress_real_dry_run() {
+        use tower::ServiceExt as _;
+
+        let req = axum::http::Request::builder()
+            .uri("/?dryRun=None&dryRun=All")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = dry_run_header_test_router().oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"true",
+            "a duplicate dryRun key must not flip a genuine dryRun=All request into a real \
+             write"
+        );
     }
 }
