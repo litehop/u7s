@@ -1108,11 +1108,14 @@ async fn stamp_terminating_and_recheck_completion<S: Store>(
             obj.body["metadata"]["deletionTimestamp"] =
                 serde_json::Value::String(utc_now_rfc3339());
         }
-        obj.body["status"] = serde_json::to_value(NamespaceStatus {
-            phase: Some(NamespacePhase::Terminating),
-            rest: serde_json::Value::Object(Default::default()),
-        })
-        .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
+        // In-place update, not a wholesale status rebuild: the real KCM namespace-controller
+        // may already have written status.conditions (e.g. NamespaceDeletionContentFailure)
+        // via PUT .../status before this fires. Rebuilding status from a fresh NamespaceStatus
+        // here — as this used to do — wiped those conditions, the same bug already fixed in
+        // delete_namespace's soft-delete branch (apply_delete_policy, above) by stamping phase
+        // in place instead.
+        obj.body["status"]["phase"] = serde_json::to_value(NamespacePhase::Terminating)
+            .expect("NamespacePhase is always serializable");
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
             .store
@@ -6279,6 +6282,100 @@ mod tests {
             after_body["status"]["phase"], "Terminating",
             "phase must still advance to Terminating even though deletionTimestamp itself is \
              left untouched — this is the legitimate write the partial-state case needs"
+        );
+    }
+
+    /// Regression: stamp_terminating_and_recheck_completion must not wipe status.conditions
+    /// the real KCM namespace-controller already wrote (e.g. NamespaceDeletionContentFailure
+    /// via PUT .../status) when it stamps status.phase=Terminating.
+    ///
+    /// Fails on revert: reverting to the wholesale `obj.body["status"] = NamespaceStatus { .. }`
+    /// rebuild (with `rest` defaulted to an empty object) drops every pre-existing status field
+    /// other than phase — the conditions assertion below would fail.
+    #[tokio::test]
+    async fn stamp_terminating_and_recheck_completion_preserves_existing_status_conditions() {
+        let state = make_state();
+        let ns_key = crate::keys::cluster_object_key("namespaces", "conditions-ns");
+        state
+            .store
+            .put(
+                &ns_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": { "name": "conditions-ns" },
+                        "spec": {},
+                        "status": {
+                            "conditions": [{
+                                "type": "NamespaceDeletionContentFailure",
+                                "status": "True",
+                                "reason": "ContentDeletionFailed",
+                                "message": "some resources are remaining"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("namespace seed must succeed");
+
+        // A namespaced pod with a real finalizer still held, so the completion recheck below
+        // does not hard-delete the namespace out from under the assertions.
+        let pod_key = crate::keys::object_key("pods", "conditions-ns", "blocking-pod");
+        state
+            .store
+            .put(
+                &pod_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "blocking-pod",
+                            "namespace": "conditions-ns",
+                            "finalizers": ["test.io/cleanup"]
+                        },
+                        "spec": { "containers": [] }
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("pod seed must succeed");
+
+        let stored = state
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not error")
+            .expect("namespace must be present");
+        let obj = Object::from_bytes(&stored.value).expect("stored namespace must parse");
+
+        stamp_terminating_and_recheck_completion(&state, &ns_key, "conditions-ns", obj)
+            .await
+            .expect("stamp+recheck must succeed");
+
+        let after = state
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not error")
+            .expect("namespace must still be present — it still has a real finalizer blocking it");
+        let after_body: serde_json::Value = serde_json::from_slice(&after.value).unwrap();
+        assert_eq!(
+            after_body["status"]["phase"], "Terminating",
+            "phase must advance to Terminating so KCM's namespace-controller drain sequence \
+             actually triggers"
+        );
+        assert_eq!(
+            after_body["status"]["conditions"][0]["type"], "NamespaceDeletionContentFailure",
+            "a controller-set status.conditions entry (the real KCM namespace-controller's \
+             drain-progress signal a client polls for) must survive the phase stamp — wiping \
+             it here would silently erase content-deletion-failure diagnostics mid-termination"
         );
     }
 }
