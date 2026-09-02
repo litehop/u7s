@@ -22593,6 +22593,256 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // MockStore that, on the first put(), writes an INDEPENDENT winner object
+    // (simulating a second writer's create beating this request to the same
+    // not-yet-existing name) instead of the caller's own value, then reports
+    // AlreadyExists — forcing do_patch's SSA-create-race fallback branch
+    // deterministically instead of relying on tokio::join! timing.
+    //
+    // Used by the SSA-create-race status-restore regression test.
+    // ---------------------------------------------------------------------------
+
+    struct RaceWinnerAlreadyExistsStore {
+        inner: std::sync::Arc<u7s_store::SqliteStore>,
+        winner_body: bytes::Bytes,
+        fire_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl RaceWinnerAlreadyExistsStore {
+        fn new(inner: std::sync::Arc<u7s_store::SqliteStore>, winner_body: bytes::Bytes) -> Self {
+            Self {
+                inner,
+                winner_body,
+                fire_once: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl u7s_store::Store for RaceWinnerAlreadyExistsStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .fire_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            let winner_body = self.winner_body.clone();
+            async move {
+                if inject {
+                    // A different writer's create lands here first, independent of
+                    // `value` (the caller's own not-yet-persisted attempt).
+                    inner
+                        .put(&key, winner_body, None)
+                        .await
+                        .expect("seed race winner");
+                    Err(u7s_store::StoreError::AlreadyExists { key })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// do_patch's SSA-create-race fallback (`is_ssa && stored_opt.is_none()`, then
+    /// `CreateNamespacedError::Store(StoreError::AlreadyExists)`) restores the race
+    /// winner's pre-merge stored status before persisting — the same status-subresource
+    /// guard the main patch loop above already has (see `stored_status`), applied here to
+    /// this separate merge-and-write. Without it, a request that loses the create race
+    /// still gets its own SSA body's `status` field merged onto the winner's already-
+    /// persisted object, bypassing the fact that `patch statefulsets` and `patch
+    /// statefulsets/status` are separate RBAC grants.
+    ///
+    /// This test forces the race deterministically — a mock store injects the winner's
+    /// object on the very first `put()`, simulating a second writer that beat this
+    /// request to the create — instead of relying on `tokio::join!` timing, and the
+    /// losing request's body carries a bare scalar for `status` (not an object), so a
+    /// pass here proves the restore is an unconditional overwrite, not merely two objects
+    /// happening to merge cleanly. Fails on revert: without the restore line, the scalar
+    /// this request's own body carried ends up persisted in place of the winner's status.
+    #[tokio::test]
+    async fn ssa_create_race_fallback_restores_stored_status_over_scalar_body_status() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/apps/statefulsets/default/web";
+
+        let winner = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
+                }
+            },
+            "status": { "replicas": 3, "readyReplicas": 3 }
+        });
+        let winner_body = bytes::Bytes::from(serde_json::to_vec(&winner).unwrap());
+
+        let store = Arc::new(RaceWinnerAlreadyExistsStore::new(
+            inner.clone(),
+            winner_body,
+        ));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // This request loses the create race (the mock injects the winner first) and
+        // lands in the AlreadyExists merge branch. Its "status" is a bare scalar: if the
+        // restore below the merge didn't run, strategic_merge_patch would overwrite
+        // current.body["status"] with it verbatim.
+        let ssa_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
+                }
+            },
+            "status": "forged-scalar-status"
+        });
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "statefulsets".to_string(),
+                "web".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&ssa_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("race-fallback SSA merge must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::OK,
+            "the race-losing request must land in the AlreadyExists merge branch (200), not \
+             the primary create path (201) — if this doesn't hold, the mock never forced \
+             the race and this test isn't exercising the branch it exists to cover"
+        );
+
+        let stored = inner
+            .get(key)
+            .await
+            .unwrap()
+            .expect("the winner's StatefulSet must be persisted");
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["status"],
+            serde_json::json!({ "replicas": 3, "readyReplicas": 3 }),
+            "the SSA-create-race fallback must restore the pre-merge stored status, not \
+             persist whatever the losing request's own body carried in `status` — if this \
+             fails, a client without the status subresource grant can forge status just by \
+             racing a create instead of PATCHing an already-existing object"
+        );
+    }
+
     /// `strip_or_delete_dependent` must re-read the dependent fresh and retry on conflict
     /// rather than blindly overwriting whatever the caller's LIST-time snapshot contained.
     ///
