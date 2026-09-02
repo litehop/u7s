@@ -196,12 +196,17 @@ pub async fn patch_resource_status<S: Store>(
                         }
                         PatchType::Json => unreachable!(),
                     }
-                    reject_non_object_status(entry)?;
                 }
             }
             merge_incoming_metadata(&mut current.body, &patch, &meta.kind);
         }
     }
+    // Convergence point for every patch content-type above (JSON Patch, merge, strategic
+    // merge): guard once here, right before the store write, instead of per-branch. A
+    // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
+    // `validate_status_json_patch_paths` permits a whole-`/status` replace and
+    // `apply_json_patch` happily turns that into a scalar.
+    reject_non_object_status(&current.body["status"])?;
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
@@ -369,12 +374,17 @@ pub async fn patch_namespaced_resource_status<S: Store>(
                         }
                         PatchType::Json => unreachable!(),
                     }
-                    reject_non_object_status(entry)?;
                 }
             }
             merge_incoming_metadata(&mut current.body, &patch, &kind);
         }
     }
+    // Convergence point for every patch content-type above (JSON Patch, merge, strategic
+    // merge): guard once here, right before the store write, instead of per-branch. A
+    // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
+    // `validate_status_json_patch_paths` permits a whole-`/status` replace and
+    // `apply_json_patch` happily turns that into a scalar.
+    reject_non_object_status(&current.body["status"])?;
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
@@ -1535,6 +1545,82 @@ mod tests {
         );
     }
 
+    /// `validate_status_json_patch_paths` explicitly permits a JSON Patch op whose path is
+    /// exactly `/status` (a whole-status replace, not a sub-field), so a
+    /// `[{"op":"replace","path":"/status","value":"x"}]` body must be rejected the same way
+    /// the merge-patch equivalent above is — same corrupted-schema-then-apiserver-panic
+    /// outcome, just reached via a different content-type. This is the gap two prior review
+    /// rounds each closed for the merge/strategic-merge branch but left open here.
+    #[tokio::test]
+    async fn patch_resource_status_rejects_scalar_status_json_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "scalar-status-jp-node", "resourceVersion": "1" },
+            "spec": { "drivers": [] },
+            "status": { "phase": "Ready" }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/scalar-status-jp-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut jp_headers = axum::http::HeaderMap::new();
+        jp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+        let patch = serde_json::json!([{"op": "replace", "path": "/status", "value": "x"}]);
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "scalar-status-jp-node".into(),
+            )),
+            jp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a JSON Patch replacing /status with a scalar must be rejected, not \
+                 accepted — it would corrupt the object's schema and later crash \
+                 apply_delete_policy on DELETE"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching the merge-patch behavior"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Ready",
+            "the rejected patch must not have been persisted — status must remain the \
+             original object"
+        );
+    }
+
     /// patch_resource_status with a merge-patch body `{"status": null}` must be ACCEPTED,
     /// not 422'd. `null` is RFC 7396's own field-deletion syntax, not an invalid scalar —
     /// a controller clearing status entirely via /status is legitimate traffic that must
@@ -1643,6 +1729,79 @@ mod tests {
             err.0,
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Active",
+            "the rejected patch must not have been persisted — status must remain the \
+             original object"
+        );
+    }
+
+    /// patch_namespaced_resource_status with a JSON Patch body
+    /// `[{"op":"replace","path":"/status","value":"x"}]` must be rejected too — same
+    /// `validate_status_json_patch_paths` whole-`/status`-replace gap as the cluster-scoped
+    /// handler, exercised on the namespaced route.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_rejects_scalar_status_json_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "scalar-status-jp-lease", "namespace": "kube-node-lease", "resourceVersion": "1" },
+            "spec": { "holderIdentity": "scalar-status-jp-lease" },
+            "status": { "phase": "Active" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/scalar-status-jp-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut jp_headers = axum::http::HeaderMap::new();
+        jp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+        let patch = serde_json::json!([{"op": "replace", "path": "/status", "value": "x"}]);
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "scalar-status-jp-lease".into(),
+            )),
+            jp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a JSON Patch replacing /status with a scalar must be rejected, not accepted"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching the merge-patch behavior"
         );
 
         let stored = store.get(key).await.unwrap().unwrap();
@@ -4424,13 +4583,88 @@ mod tests {
         );
     }
 
+    /// A guard call *inside* only one patch-content-type branch is not enough: round 3
+    /// added `reject_non_object_status` inside the merge/strategic-merge arm and the
+    /// `PatchType::Json` arm right next to it stayed unguarded, because
+    /// `validate_status_json_patch_paths` explicitly permits a whole-`/status` replace and
+    /// nothing re-checked the result afterward. Every PATCH status-subresource handler must
+    /// instead call the guard as an unconditional statement placed directly in the
+    /// function body — reached no matter which `match patch_type` arm ran — rather than
+    /// nested inside one specific arm. rustfmt indents a function's own top-level
+    /// statements at exactly 4 spaces, so a guard call that only ever shows up deeper than
+    /// that proves it is per-branch rather than a shared convergence point that runs before
+    /// every store write.
+    #[test]
+    fn every_status_patch_handler_guards_non_object_status_outside_any_branch() {
+        let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
+        let mut checked = Vec::new();
+        let mut unguarded = Vec::new();
+
+        for entry in std::fs::read_dir(&handlers_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", handlers_dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for (name, body) in patch_status_handler_bodies(&source) {
+                // Only handlers that dispatch on PatchType::Json are exposed to this bug
+                // class — e.g. patch_pod_status rejects every content-type but
+                // merge/strategic-merge with 415, so it never reaches a JSON Patch arm.
+                if !body.contains("PatchType::Json") {
+                    continue;
+                }
+                checked.push(name.clone());
+
+                let min_guard_indent = body
+                    .lines()
+                    .filter(|l| {
+                        l.contains("reject_non_object_status(")
+                            || l.contains("replace_status_field(")
+                    })
+                    .map(|l| l.len() - l.trim_start().len())
+                    .min();
+
+                if min_guard_indent != Some(4) {
+                    unguarded.push(format!("{name} in {}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            checked.len() >= 4,
+            "sanity check: expected at least 4 JSON-Patch-capable PATCH status-subresource \
+             handlers (patch_resource_status, patch_namespaced_resource_status, \
+             patch_cr_status, patch_crd_status), found {} — did the patch_ + \"status\" \
+             naming convention or the PatchType::Json dispatch change (this test would \
+             otherwise pass vacuously)?",
+            checked.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "PATCH status-subresource handler(s) guard a non-object status only inside one \
+             patch-content-type branch (or not at all), not at a shared convergence point \
+             reached by every branch: {unguarded:?} — a per-branch guard has been missed for \
+             a different content-type in three review rounds running. Call \
+             reject_non_object_status (or replace_status_field) as its own top-level \
+             statement right after the `match patch_type` block, before the store write, so \
+             JSON Patch, merge, and strategic-merge patches are all covered by the same \
+             check."
+        );
+    }
+
     /// Extracts `(function_name, body)` for every top-level `pub`/`pub(crate)` function in
-    /// `source` whose name starts with `put_` or `replace_` and contains `status` — the
-    /// naming convention every status-subresource PUT handler in this codebase follows.
-    /// Deliberately requires the signature to start at column 0 (`line.starts_with("pub")`)
-    /// so indented `#[tokio::test] async fn put_..._status_...()` test functions inside
-    /// `mod tests` are never mistaken for a production handler.
-    fn status_put_handler_bodies(source: &str) -> Vec<(String, String)> {
+    /// `source` whose name satisfies `matches_name`. Deliberately requires the signature to
+    /// start at column 0 (`line.starts_with("pub")`) so indented `#[tokio::test] async fn
+    /// ..._status_...()` test functions inside `mod tests` are never mistaken for a
+    /// production handler.
+    fn handler_bodies_matching(
+        source: &str,
+        matches_name: impl Fn(&str) -> bool,
+    ) -> Vec<(String, String)> {
         let mut results = Vec::new();
         let lines: Vec<&str> = source.lines().collect();
         let mut i = 0;
@@ -4448,9 +4682,7 @@ mod tests {
                     after[..end].to_string()
                 })
             {
-                if (name.starts_with("put_") || name.starts_with("replace_"))
-                    && name.contains("status")
-                {
+                if matches_name(&name) {
                     let mut depth = 0i32;
                     let mut started = false;
                     let mut body = String::new();
@@ -4480,5 +4712,19 @@ mod tests {
             i += 1;
         }
         results
+    }
+
+    /// Naming convention every status-subresource PUT handler in this codebase follows.
+    fn status_put_handler_bodies(source: &str) -> Vec<(String, String)> {
+        handler_bodies_matching(source, |name| {
+            (name.starts_with("put_") || name.starts_with("replace_")) && name.contains("status")
+        })
+    }
+
+    /// Naming convention every status-subresource PATCH handler in this codebase follows.
+    fn patch_status_handler_bodies(source: &str) -> Vec<(String, String)> {
+        handler_bodies_matching(source, |name| {
+            name.starts_with("patch_") && name.contains("status")
+        })
     }
 }

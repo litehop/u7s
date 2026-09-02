@@ -1149,12 +1149,17 @@ pub async fn patch_crd_status<S: Store>(
                         }
                         PatchType::Json => unreachable!(),
                     }
-                    crate::handlers::status::reject_non_object_status(entry)?;
                 }
             }
             crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch, KIND);
         }
     }
+    // Convergence point for every patch content-type above (JSON Patch, merge, strategic
+    // merge): guard once here, right before the store write, instead of per-branch. A
+    // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
+    // `validate_status_json_patch_paths` permits a whole-`/status` replace and
+    // `apply_json_patch` happily turns that into a scalar.
+    crate::handlers::status::reject_non_object_status(&current.body["status"])?;
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -2704,6 +2709,60 @@ mod tests {
             err.0,
             StatusCode::UNPROCESSABLE_ENTITY,
             "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let resp = get_crd_status(State(state), Path(name.to_string()))
+            .await
+            .expect("get_crd_status must still succeed")
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v.get("status").is_none() || v["status"].is_object(),
+            "the rejected patch must not have been persisted — status must remain absent \
+             or an object, never the scalar \"x\""
+        );
+    }
+
+    /// PATCH .../{name}/status with a JSON Patch body
+    /// `[{"op":"replace","path":"/status","value":"x"}]` must be rejected too —
+    /// `validate_status_json_patch_paths` explicitly permits a whole-`/status` replace path,
+    /// which `apply_json_patch` turns into a scalar with no further check.
+    #[tokio::test]
+    async fn patch_crd_status_rejects_scalar_status_json_patch() {
+        let state = make_state();
+        let name = "scalarstatusesjp.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "scalarstatusesjp");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let patch = serde_json::json!([{"op": "replace", "path": "/status", "value": "x"}]);
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+
+        let err = patch_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .err()
+        .expect(
+            "a JSON Patch replacing /status with a scalar must be rejected, not accepted — \
+             it would corrupt the object's schema and later crash apply_delete_policy on DELETE",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching the merge-patch behavior"
         );
 
         let resp = get_crd_status(State(state), Path(name.to_string()))

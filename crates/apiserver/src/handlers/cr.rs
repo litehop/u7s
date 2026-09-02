@@ -4376,12 +4376,17 @@ pub async fn patch_cr_status<S: Store>(
                         }
                         PatchType::Json => unreachable!(),
                     }
-                    crate::handlers::status::reject_non_object_status(entry)?;
                 }
             }
             crate::handlers::status::merge_incoming_metadata(&mut current, &patch, &kind);
         }
     }
+    // Convergence point for every patch content-type above (JSON Patch, merge, strategic
+    // merge): guard once here, right before the store write, instead of per-branch. A
+    // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
+    // `validate_status_json_patch_paths` permits a whole-`/status` replace and
+    // `apply_json_patch` happily turns that into a scalar.
+    crate::handlers::status::reject_non_object_status(&current["status"])?;
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
@@ -11861,6 +11866,78 @@ mod tests {
             err.0,
             StatusCode::UNPROCESSABLE_ENTITY,
             "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let resp = get_cr_status(State(state.clone()), Path((group, version, plural, name)))
+            .await
+            .expect("get_cr_status must still succeed")
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            obj.get("status").is_none() || obj["status"].is_object(),
+            "the rejected patch must not have been persisted — status must remain absent \
+             or an object, never the scalar \"x\""
+        );
+    }
+
+    /// patch_cr_status with a JSON Patch body `[{"op":"replace","path":"/status","value":"x"}]`
+    /// must be rejected with 422 too — `validate_status_json_patch_paths` explicitly permits
+    /// a whole-`/status` replace path, so this is the exact route a real CertificateSigningRequest
+    /// falls through (PATCH .../certificatesigningrequests/{name}/status routes here) and, before
+    /// this guard, would corrupt status into a scalar that later panics
+    /// `merge_approval_conditions`'s in-place `status["conditions"] = ...` stamp on the next
+    /// `kubectl certificate approve`.
+    #[tokio::test]
+    async fn patch_cr_status_rejects_scalar_status_json_patch() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "scalar-status-jp-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!([{"op": "replace", "path": "/status", "value": "x"}]).to_string(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                headers,
+                patch_body,
+            )
+            .await,
+            "a JSON Patch replacing /status with a scalar must be rejected, not accepted — \
+             it would corrupt the object's schema and later crash merge_approval_conditions \
+             on a CSR approve",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching the merge-patch behavior"
         );
 
         let resp = get_cr_status(State(state.clone()), Path((group, version, plural, name)))
