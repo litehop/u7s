@@ -709,6 +709,13 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
         // The upstream KCM namespace controller watches for status.phase == "Terminating"
         // to trigger finalizer removal.
         if is_namespace {
+            // A prior status-subresource write could (bug notwithstanding) have left `status`
+            // as a non-object scalar/array; indexing that with ["phase"] below would panic
+            // and crash the apiserver on every delete of that object. Coerce back to an
+            // empty object first so this stamp is panic-safe regardless of what's stored.
+            if !obj.body["status"].is_object() && !obj.body["status"].is_null() {
+                obj.body["status"] = serde_json::json!({});
+            }
             obj.body["status"]["phase"] = serde_json::to_value(NamespacePhase::Terminating)
                 .expect("NamespacePhase is always serializable");
         }
@@ -4037,6 +4044,35 @@ mod apply_delete_policy_tests {
         assert!(
             body["metadata"]["deletionTimestamp"].as_str().is_some(),
             "deletionTimestamp must still be stamped for non-Namespace soft-delete"
+        );
+    }
+
+    /// A Namespace whose stored `status` is a scalar (possible if a status-subresource
+    /// merge-patch bypassed schema validation) must not crash `apply_delete_policy` when it
+    /// indexes `status["phase"]`. Without the guard, indexing a JSON string/number with a str
+    /// key panics inside `serde_json::Value`'s `IndexMut`, crashing the apiserver for every
+    /// caller mid-DELETE — a total denial of service, not just a failed request for the one
+    /// object with the corrupt status.
+    #[test]
+    fn namespace_with_scalar_status_does_not_panic_and_still_gets_terminating_phase() {
+        let mut obj = Object {
+            body: serde_json::json!({
+                "kind": "Namespace",
+                "apiVersion": "v1",
+                "metadata": { "name": "test" },
+                "spec": { "finalizers": ["kubernetes"] },
+                "status": "corrupted-scalar-status"
+            }),
+        };
+
+        let body =
+            apply_delete_policy(&mut obj).expect("Namespace with finalizers must be soft-deleted");
+
+        assert_eq!(
+            body["status"]["phase"].as_str(),
+            Some("Terminating"),
+            "a scalar status must be coerced back to an object so the Terminating phase can \
+             still be stamped and the KCM drain cycle can still start"
         );
     }
 }

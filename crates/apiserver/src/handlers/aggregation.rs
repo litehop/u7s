@@ -788,6 +788,15 @@ fn upsert_available_condition(
         );
     }
 
+    // A prior status-subresource write could (bug notwithstanding) have left `status` as a
+    // non-object scalar/array; indexing that with ["conditions"] below would panic and
+    // crash the apiserver on every availability sweep, not just for this one APIService —
+    // this runs on a fixed interval for every registered APIService (and per-request via
+    // ensure_availability_checked). Coerce back to an empty object first so the sweep is
+    // panic-safe regardless of what's stored.
+    if !apiservice["status"].is_object() {
+        apiservice["status"] = serde_json::json!({});
+    }
     apiservice["status"]["conditions"] =
         serde_json::to_value(&conditions).expect("Condition has no non-serializable fields");
     true
@@ -1614,6 +1623,28 @@ mod tests {
             conditions[0]["message"], "all checks passed",
             "message must be exactly this string -- aggregator.go asserts on it verbatim"
         );
+    }
+
+    /// upsert_available_condition must not panic when the stored APIService's `status` is
+    /// a scalar (possible if a status-subresource merge-patch bypassed schema validation).
+    /// Indexing `apiservice["status"]["conditions"]` on a non-object status panics —
+    /// crashing the apiserver's fixed-interval availability sweep on every cycle for every
+    /// registered APIService, not just this one.
+    #[test]
+    fn upsert_available_condition_does_not_panic_on_scalar_status() {
+        let mut apiservice = serde_json::json!({ "status": "corrupted-scalar-status" });
+        let changed = upsert_available_condition(
+            &mut apiservice,
+            "True",
+            "Passed",
+            "all checks passed",
+            "2024-01-01T00:00:00Z",
+        );
+        assert!(changed);
+        let conditions = apiservice["status"]["conditions"]
+            .as_array()
+            .expect("scalar status must be coerced to an object so conditions can be set");
+        assert_eq!(conditions[0]["type"], "Available");
     }
 
     /// Re-running the reconcile sweep with the same outcome must report "unchanged" so the

@@ -4212,16 +4212,7 @@ pub async fn put_cr_status<S: Store>(
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
     // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
-    match &incoming["status"] {
-        serde_json::Value::Null => {
-            if let Some(map) = current.as_object_mut() {
-                map.remove("status");
-            }
-        }
-        v => {
-            current["status"] = v.clone();
-        }
-    }
+    crate::handlers::status::replace_status_field(&mut current, &incoming["status"])?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current, &incoming, &kind);
 
@@ -4390,6 +4381,12 @@ pub async fn patch_cr_status<S: Store>(
             crate::handlers::status::merge_incoming_metadata(&mut current, &patch, &kind);
         }
     }
+    // Convergence point for every patch content-type above (JSON Patch, merge, strategic
+    // merge): guard once here, right before the store write, instead of per-branch. A
+    // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
+    // `validate_status_json_patch_paths` permits a whole-`/status` replace and
+    // `apply_json_patch` happily turns that into a scalar.
+    crate::handlers::status::reject_non_object_status(&current["status"])?;
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
@@ -11817,6 +11814,147 @@ mod tests {
         );
     }
 
+    /// patch_cr_status with a merge-patch body `{"status":"x"}` must be rejected with 422,
+    /// not persisted. This is the cluster-scoped catch-all status route (covers every
+    /// non-core-group cluster-scoped built-in resource, e.g. CSINode, plus cluster-scoped
+    /// CRDs) — `status` is a message/object type for every resource, so a scalar `status`
+    /// corrupts the object's schema and later panics `apply_delete_policy`'s in-place
+    /// `status["field"] = ...` stamp on the next DELETE, crashing the apiserver for every
+    /// other request in flight.
+    #[tokio::test]
+    async fn patch_cr_status_rejects_scalar_status_merge_patch() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "scalar-status-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(serde_json::json!({ "status": "x" }).to_string());
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                headers,
+                patch_body,
+            )
+            .await,
+            "a scalar status merge-patch must be rejected, not accepted — it would corrupt \
+             the object's schema and later crash apply_delete_policy on DELETE",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let resp = get_cr_status(State(state.clone()), Path((group, version, plural, name)))
+            .await
+            .expect("get_cr_status must still succeed")
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            obj.get("status").is_none() || obj["status"].is_object(),
+            "the rejected patch must not have been persisted — status must remain absent \
+             or an object, never the scalar \"x\""
+        );
+    }
+
+    /// patch_cr_status with a JSON Patch body `[{"op":"replace","path":"/status","value":"x"}]`
+    /// must be rejected with 422 too — `validate_status_json_patch_paths` explicitly permits
+    /// a whole-`/status` replace path, so this is the exact route a real CertificateSigningRequest
+    /// falls through (PATCH .../certificatesigningrequests/{name}/status routes here) and, before
+    /// this guard, would corrupt status into a scalar that later panics
+    /// `merge_approval_conditions`'s in-place `status["conditions"] = ...` stamp on the next
+    /// `kubectl certificate approve`.
+    #[tokio::test]
+    async fn patch_cr_status_rejects_scalar_status_json_patch() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "scalar-status-jp-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!([{"op": "replace", "path": "/status", "value": "x"}]).to_string(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                headers,
+                patch_body,
+            )
+            .await,
+            "a JSON Patch replacing /status with a scalar must be rejected, not accepted — \
+             it would corrupt the object's schema and later crash merge_approval_conditions \
+             on a CSR approve",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching the merge-patch behavior"
+        );
+
+        let resp = get_cr_status(State(state.clone()), Path((group, version, plural, name)))
+            .await
+            .expect("get_cr_status must still succeed")
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            obj.get("status").is_none() || obj["status"].is_object(),
+            "the rejected patch must not have been persisted — status must remain absent \
+             or an object, never the scalar \"x\""
+        );
+    }
+
     // patch_cr_status for a missing cluster-scoped CR must return 404, not silently
     // create or no-op — a controller PATCHing a deleted object's status must see the
     // object is gone, not a false success.
@@ -17821,6 +17959,225 @@ mod tests {
             result.is_ok(),
             "absent resourceVersion in PUT /cr/status body must succeed (unconditional write) — \
              single-writer clients that omit rv must not be broken by the stale-RV CAS fix"
+        );
+    }
+
+    /// put_cr_status with a scalar or array `status` body must be rejected with 422, not
+    /// persisted. `status` is a message/object type for every resource (built-in or CRD);
+    /// a PUT that wholesale-replaces it with a scalar corrupts the CR's own schema and
+    /// panics any later in-place status stamper (e.g. `apply_delete_policy`,
+    /// `merge_approval_conditions` for the CertificateSigningRequest built-in that also
+    /// routes through this handler) that indexes `["status"]["field"]` on it.
+    #[tokio::test]
+    async fn put_cr_status_rejects_non_object_status() {
+        for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
+            let state = make_state();
+            install_cluster_crd_with_status_subresource(&state).await;
+
+            let create_body = Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "metadata": { "name": "put-scalar-widget" },
+                    "spec": { "color": "blue" }
+                })
+                .to_string(),
+            );
+            create_cr(
+                State(state.clone()),
+                Path(("example.io".into(), "v1".into(), "widgets".into())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                create_body,
+            )
+            .await
+            .expect("create must succeed");
+
+            let put_body = Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "metadata": { "name": "put-scalar-widget" },
+                    "status": bad_status
+                })
+                .to_string(),
+            );
+            let result = put_cr_status(
+                State(state.clone()),
+                Path((
+                    "example.io".into(),
+                    "v1".into(),
+                    "widgets".into(),
+                    "put-scalar-widget".into(),
+                )),
+                axum::http::HeaderMap::new(),
+                put_body,
+            )
+            .await;
+
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "a non-object status ({bad_status}) via PUT must be rejected, not \
+                     persisted — it would corrupt the CR's schema and later crash any \
+                     in-place status stamper"
+                ),
+            };
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "a non-object status must be rejected with 422: got {bad_status}"
+            );
+
+            let key = "/registry/cr/example.io/widgets/put-scalar-widget";
+            let stored = state.store.get(key).await.unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            assert!(
+                v.get("status").is_none() || v["status"].is_object(),
+                "the rejected PUT must not have persisted a non-object status for input \
+                 {bad_status}, got {:?}",
+                v.get("status")
+            );
+        }
+    }
+
+    /// put_cr_status with an explicit `status: null` body must still succeed and clear the
+    /// field. The 422 guard above must reject only a present scalar/array — `null` is a
+    /// PUT's own field-clearing convention and legitimate controller traffic.
+    #[tokio::test]
+    async fn put_cr_status_accepts_null_status() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "put-null-widget" },
+                "spec": { "color": "blue" },
+                "status": { "ready": true }
+            })
+            .to_string(),
+        );
+        create_cr(
+            State(state.clone()),
+            Path(("example.io".into(), "v1".into(), "widgets".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            create_body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "put-null-widget" },
+                "status": null
+            })
+            .to_string(),
+        );
+        let result = put_cr_status(
+            State(state.clone()),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "widgets".into(),
+                "put-null-widget".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            put_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a null status PUT is legitimate field-clearing, not a 422: {:?}",
+            result.err()
+        );
+
+        let key = "/registry/cr/example.io/widgets/put-null-widget";
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v.get("status").is_none(),
+            "null status in PUT body must remove the status field"
+        );
+    }
+
+    /// A scalar `status` PUT to a CertificateSigningRequest's `/status` subresource — the
+    /// route real `PUT .../certificatesigningrequests/{name}/status` traffic falls into,
+    /// since CSR is a resource_registry built-in and `put_cr_status` serves the generic
+    /// cluster-scoped `/apis/{group}/{version}/{resource}/{name}/status` route — must be
+    /// rejected with 422, not persisted. Before this fix, a corrupted scalar status here
+    /// would panic `merge_approval_conditions`'s in-place `status["conditions"]` stamp
+    /// (approval.rs) the next time the CSR was approved, crashing the apiserver for every
+    /// other request in flight.
+    #[tokio::test]
+    async fn put_cr_status_rejects_scalar_status_on_csr_closing_the_approval_panic_chain() {
+        let state = make_state();
+        let csr = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": { "name": "scalar-status-csr" },
+            "spec": { "request": "ZmFrZQ==", "signerName": "kubernetes.io/kube-apiserver-client", "usages": ["client auth"] },
+            "status": { "conditions": [] }
+        });
+        state
+            .store
+            .put(
+                "/registry/certificates.k8s.io/certificatesigningrequests/scalar-status-csr",
+                Bytes::from(serde_json::to_vec(&csr).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "certificates.k8s.io/v1",
+                "kind": "CertificateSigningRequest",
+                "metadata": { "name": "scalar-status-csr" },
+                "status": "attacker-controlled-scalar"
+            })
+            .to_string(),
+        );
+        let result = put_cr_status(
+            State(state.clone()),
+            Path((
+                "certificates.k8s.io".into(),
+                "v1".into(),
+                "certificatesigningrequests".into(),
+                "scalar-status-csr".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            put_body,
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a scalar status PUT to a CSR's /status must be rejected — otherwise \
+                 merge_approval_conditions panics indexing the scalar on the next approval"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "scalar status on CSR /status must be rejected with 422"
+        );
+
+        // The CSR's status must still be the original object — proving the approval-path
+        // in-place stamp (`obj.body["status"]["conditions"] = ...`) stays panic-safe.
+        let key = "/registry/certificates.k8s.io/certificatesigningrequests/scalar-status-csr";
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let mut current = crate::types::Object::from_bytes(&stored.value).unwrap();
+        let incoming = crate::types::Object::from_bytes(&stored.value).unwrap();
+        crate::handlers::approval::merge_approval_conditions(&mut current, &incoming);
+        assert!(
+            current.body["status"]["conditions"].is_array(),
+            "merge_approval_conditions must still work on this CSR after the rejected PUT — \
+             the approval-path panic is only closed if the corrupted status never persists"
         );
     }
 
