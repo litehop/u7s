@@ -126,9 +126,21 @@ fn is_mutating(method: &Method) -> bool {
 struct WaiterGuard(Arc<AtomicUsize>);
 
 impl WaiterGuard {
-    fn new(waiters: Arc<AtomicUsize>) -> Self {
-        waiters.fetch_add(1, Ordering::SeqCst);
-        WaiterGuard(waiters)
+    /// Atomically reserve a waiter slot and enforce MAX_MUTATING_QUEUE_DEPTH
+    /// as a hard cap. `fetch_add` returns the count as of BEFORE this
+    /// reservation, so checking that returned value (instead of a separate
+    /// `load` followed by its own `fetch_add`) closes the race where two
+    /// concurrent callers both observe the count one below the cap and both
+    /// proceed to increment, transiently pushing it past the cap. If the
+    /// reservation overshoots, roll it back with `fetch_sub` before
+    /// rejecting so the failed attempt itself doesn't count as a waiter.
+    fn try_new(waiters: Arc<AtomicUsize>) -> Option<Self> {
+        let prior = waiters.fetch_add(1, Ordering::SeqCst);
+        if prior >= MAX_MUTATING_QUEUE_DEPTH {
+            waiters.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(WaiterGuard(waiters))
     }
 }
 
@@ -154,11 +166,13 @@ async fn acquire_mutating_permit(
     // Queue-depth guard: tokio's Semaphore waiter list is unbounded FIFO,
     // so admission into the wait itself must be bounded rather than
     // trusting the timeout alone to cap memory (see MAX_MUTATING_QUEUE_DEPTH
-    // doc comment).
-    if waiters.load(Ordering::SeqCst) >= MAX_MUTATING_QUEUE_DEPTH {
-        return Err(());
-    }
-    let _waiter_guard = WaiterGuard::new(Arc::clone(&waiters));
+    // doc comment). WaiterGuard::try_new reserves the slot atomically — see
+    // its doc comment for why a separate load-then-increment can transiently
+    // exceed the cap under concurrent callers.
+    let _waiter_guard = match WaiterGuard::try_new(Arc::clone(&waiters)) {
+        Some(guard) => guard,
+        None => return Err(()),
+    };
 
     match tokio::time::timeout(MUTATING_WAIT_TIMEOUT, semaphore.acquire_owned()).await {
         Ok(Ok(permit)) => Ok(permit),
@@ -473,6 +487,142 @@ mod tests {
             "the queue-depth guard must reject instantly, not wait out the \
              deadline — this is the memory-DoS guard: waiting here is exactly \
              the unbounded growth it exists to prevent"
+        );
+    }
+
+    #[test]
+    fn test_waiter_guard_cap_never_exceeded_under_contention() {
+        // Regression for a check-then-increment TOCTOU: the old guard did
+        // `if waiters.load() >= MAX { reject }` followed by a separate
+        // `waiters.fetch_add(1)` as two ops, so two racers could both load
+        // a value one below the cap, both pass the check, and both
+        // increment — transiently exceeding the cap. That overshoot defeats
+        // the memory bound the guard exists to enforce (see
+        // MAX_MUTATING_QUEUE_DEPTH's doc comment). WaiterGuard::try_new is
+        // plain sync code (no .await between its load and its increment),
+        // so the only way this races is genuine OS-thread parallelism —
+        // real std::thread::spawn racers hammering the same atomic, holding
+        // every granted guard until every racer has finished, is what
+        // actually exercises that hardware race (a tokio task flood with a
+        // cooperative yield point never reliably reproduced it: the
+        // scheduling overhead between spawned tasks dwarfs the nanosecond
+        // window of the two racing atomic ops). This asserts the total
+        // number of guards ever granted across all racers never exceeds the
+        // cap, no matter how many threads race for the last slots. A single
+        // race is a probabilistic hardware race (not every run hits the
+        // exact nanosecond-scale interleaving), so this repeats the race
+        // many times — any single round overshooting the cap is a failure.
+        const RACERS: usize = 32;
+        const ATTEMPTS_PER_RACER: usize = 64; // RACERS * ATTEMPTS_PER_RACER >> cap
+        const ROUNDS: usize = 40;
+
+        for round in 0..ROUNDS {
+            let waiters = Arc::new(AtomicUsize::new(0));
+            let handles: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let waiters = Arc::clone(&waiters);
+                    std::thread::spawn(move || {
+                        // Hold every granted guard (don't drop) until the
+                        // whole race is over, so releases never relieve the
+                        // pressure other racers put on the boundary while
+                        // it's crossed. Returning the Vec itself (not just
+                        // its length) is what keeps the guards alive past
+                        // this thread finishing its own attempts — a racer
+                        // that returns early must not free slots while
+                        // slower racers are still contending.
+                        let mut granted = Vec::new();
+                        for _ in 0..ATTEMPTS_PER_RACER {
+                            if let Some(guard) = WaiterGuard::try_new(Arc::clone(&waiters)) {
+                                granted.push(guard);
+                            }
+                        }
+                        granted
+                    })
+                })
+                .collect();
+
+            let all_granted: Vec<Vec<WaiterGuard>> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let total_granted: usize = all_granted.iter().map(Vec::len).sum();
+
+            assert!(
+                total_granted <= MAX_MUTATING_QUEUE_DEPTH,
+                "round {round}: granted {total_granted} waiter guards total, \
+                 exceeding MAX_MUTATING_QUEUE_DEPTH ({MAX_MUTATING_QUEUE_DEPTH}) \
+                 — a transient overshoot here means the guard failed to \
+                 enforce the hard memory bound it exists for"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_waiter_guard_no_spurious_rejection_under_cap() {
+        // The atomic reservation must not reject when there is actually
+        // headroom under the cap — a fix that closes the overshoot race by
+        // over-rejecting would trade one bug (transient overshoot) for
+        // another (legitimate requests 429ing early). Half the cap's worth
+        // of concurrent acquires, none of which should ever be rejected.
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..(MAX_MUTATING_QUEUE_DEPTH / 2) {
+            let waiters = Arc::clone(&waiters);
+            let rejected = Arc::clone(&rejected);
+            tasks.spawn(async move {
+                match WaiterGuard::try_new(waiters) {
+                    Some(guard) => {
+                        tokio::task::yield_now().await;
+                        drop(guard);
+                    }
+                    None => {
+                        rejected.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(
+            rejected.load(Ordering::SeqCst),
+            0,
+            "acquiring at half the queue-depth cap concurrently must never \
+             be rejected — rejecting here would 429 requests that had real \
+             headroom under MAX_MUTATING_QUEUE_DEPTH"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_waiter_guard_count_returns_to_zero_after_drop() {
+        // The Drop impl on WaiterGuard is what prevents the ratchet the
+        // module comment warns about: every acquired guard, once dropped,
+        // must give its slot back. If a leak crept back in (e.g. a bare
+        // fetch_add/fetch_sub without RAII), the waiter count would drift
+        // upward across requests until MAX_MUTATING_QUEUE_DEPTH permanently
+        // rejects everything even with zero real waiters outstanding.
+        let waiters = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..(MAX_MUTATING_QUEUE_DEPTH * 2) {
+            let waiters = Arc::clone(&waiters);
+            tasks.spawn(async move {
+                if let Some(guard) = WaiterGuard::try_new(waiters) {
+                    tokio::task::yield_now().await;
+                    drop(guard);
+                }
+                // Attempts that were rejected must also leave no trace —
+                // try_new rolls back its own reservation on rejection.
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(
+            waiters.load(Ordering::SeqCst),
+            0,
+            "waiter count must return to exactly 0 once every guard — \
+             granted or rejected — has been dropped/rolled back; a nonzero \
+             residual here is the permanent-rejection ratchet the Drop \
+             impl exists to prevent"
         );
     }
 
