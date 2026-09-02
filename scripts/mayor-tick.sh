@@ -51,6 +51,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QUEUE_DIR="${MAYOR_TICK_QUEUE_DIR:-$REPO_ROOT/.claude/review-queue}"
 STATE_FILE="${MAYOR_TICK_STATE_FILE:-$REPO_ROOT/.claude/mayor-tick-state.json}"
 DASHBOARD_FILE="${MAYOR_TICK_DASHBOARD_FILE:-$REPO_ROOT/ai/dashboard.md}"
+# Computed once per invocation (not per-call-site) so the state file's
+# .timestamp and the dashboard's repo-state "As of" stamp are always the
+# SAME instant -- two independent `date -u` calls a few pipeline steps
+# apart could otherwise disagree by the seconds it takes refresh_dashboard
+# to run, undermining the "authoritative freshness indicator" this exists
+# to provide.
+TICK_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # ---------------------------------------------------------------------------
 # Side-effect gate. Every destructive/external-state-changing command in
@@ -340,7 +347,7 @@ write_state() {
     gate_exceptions_json="$7" pending_non_pr_json="${8:-[]}" \
     queue_warnings_json="${9:-[]}"
   jq -n \
-    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg ts "$TICK_TIMESTAMP" \
     --argjson exit_code "$exit_code" \
     --argjson queue_files "$queue_files_json" \
     --argjson pending_reviews "$pending_reviews_json" \
@@ -480,7 +487,7 @@ dashboard_repo_state() {
   else
     sync="${ahead:-0} ahead / ${behind:-0} behind origin/main"
   fi
-  printf 'Branch `%s` @ `%s`, %s, %s.' "$branch" "$sha" "$dirty" "$sync"
+  printf 'As of %s (last tick) — Branch `%s` @ `%s`, %s, %s.' "$TICK_TIMESTAMP" "$branch" "$sha" "$dirty" "$sync"
 }
 
 dashboard_review_queue() {
