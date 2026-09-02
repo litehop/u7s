@@ -2092,6 +2092,57 @@ pub fn resolve_pod_container_port(
     }
 }
 
+/// Returns `Err(reason)` when `addr` is not a plain IPv4/IPv6 address literal, or names a
+/// link-local/multicast/cloud-metadata address, or an IPv6 loopback/unspecified address —
+/// ranges no legitimate pod IP or Service-backing endpoint address should ever occupy.
+///
+/// `status.podIP` and EndpointSlice `addresses[]` are both attacker-influenced: a
+/// compromised node can PATCH its own pod's `status.podIP` to any string (the Node
+/// authorizer bounds *which* pods, not what the value is), and Service-owning controllers
+/// copy EndpointSlice addresses verbatim too. Every dial site in this file (the direct-dial
+/// URL, and the raw `CONNECT {addr}:{port} HTTP/1.1\r\n...` request line built for the
+/// konnectivity leg) uses this same string, so validating it once here — before it is ever
+/// spliced into either — closes two vectors at once: dialing an attacker-chosen internal
+/// target from the apiserver's own network position (SSRF), and splicing a second request
+/// into konnectivity-server's stream via an embedded CRLF (request splitting), since a
+/// string containing "\r\n" can never parse as `std::net::IpAddr` either.
+///
+/// Bare dotted-decimal IPv4 loopback (127.0.0.0/8) is intentionally NOT rejected — matches
+/// `validate_webhook_url`'s identical, already-reviewed exemption in admission.rs, and this
+/// file's own test suite dials an in-process TCP listener at 127.0.0.1 to stand in for a
+/// pod/Service backend throughout. Every *other* encoding of loopback (IPv6 `::1`, or an
+/// IPv4 loopback embedded in an IPv6-mapped literal) has no such legitimate use and is still
+/// rejected below, along with every other reserved range.
+fn validate_proxy_target_ip(addr: &str) -> Result<(), String> {
+    let ip: std::net::IpAddr = addr
+        .parse()
+        .map_err(|_| "not a valid IP address literal".to_owned())?;
+
+    let reserved = match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_multicast() || v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 — IPv6 link-local, analogous to IPv4's 169.254.0.0/16.
+                || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80)
+                // ::ffff:a.b.c.d (RFC 4291 §2.5.5.2) carries an IPv4 address in the low 32
+                // bits that the checks above never inspect — an attacker could otherwise
+                // bypass every IPv4 range check just by writing the mapped IPv6 form.
+                || v6.to_ipv4_mapped().is_some_and(|v4| {
+                    v4.is_loopback()
+                        || v4.is_link_local()
+                        || v4.is_multicast()
+                        || v4.is_unspecified()
+                })
+        }
+    };
+    if reserved {
+        return Err("loopback/link-local/multicast/cloud-metadata address rejected".to_owned());
+    }
+    Ok(())
+}
+
 /// Resolve pod IP and container port for the pod proxy subresource.
 ///
 /// Returns (pod_ip, port, konnectivity_proxy_addr, is_https) for the caller to build the
@@ -2126,6 +2177,22 @@ pub async fn resolve_pod_proxy_target<S: Store>(
             ))
         })?
         .to_owned();
+
+    validate_proxy_target_ip(&pod_ip).map_err(|reason| {
+        crate::status::StatusError(
+            axum::http::StatusCode::BAD_GATEWAY,
+            crate::status::Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message: format!("pod \"{pod_name}\" status.podIP \"{pod_ip}\" rejected: {reason}"),
+                reason: "BadGateway",
+                code: 502,
+                metadata: None,
+                details: None,
+            },
+        )
+    })?;
 
     let port = resolve_pod_container_port(&pod["spec"]["containers"], port_spec).unwrap_or(80);
 
@@ -2748,7 +2815,18 @@ pub async fn resolve_service_proxy_target<S: Store>(
                 if !ready {
                     continue;
                 }
-                if let Some(addr) = ep["addresses"][0].as_str().filter(|s| !s.is_empty()) {
+                // Skip (rather than dial) an endpoint whose address fails
+                // validate_proxy_target_ip — see its doc comment for why an unvalidated
+                // EndpointSlice address is an SSRF/request-splitting vector identical to
+                // the podIP one. Falling through to try the next ready endpoint means one
+                // forged address doesn't take down the whole Service if any endpoint has a
+                // legitimate one; if none do, the loop's existing "no ready endpoints" 503
+                // below still fires.
+                if let Some(addr) = ep["addresses"][0]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .filter(|s| validate_proxy_target_ip(s).is_ok())
+                {
                     return Ok((
                         addr.to_owned(),
                         port,
@@ -3092,6 +3170,125 @@ mod tests {
         assert!(
             result.is_err(),
             "a mid-stream read error must surface as an error, not a truncated Ok(body)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_proxy_target_ip: reject SSRF/request-splitting podIP and
+    // EndpointSlice addresses before they are ever dialed
+    // -----------------------------------------------------------------------
+
+    /// A pod/EndpointSlice address of the cloud-metadata/link-local range must be
+    /// rejected — this is the exact address a compromised node would set on its own
+    /// pod's status.podIP to redirect the apiserver's outbound proxy dial to an
+    /// internal target (e.g. AWS/GCP/Azure IMDS) reachable from the apiserver's own
+    /// network position but not from the compromised node itself.
+    #[test]
+    fn validate_proxy_target_ip_rejects_cloud_metadata_address() {
+        let result = validate_proxy_target_ip("169.254.169.254");
+        assert!(
+            result.is_err(),
+            "169.254.169.254 (cloud IMDS) must be rejected — accepting it lets a \
+             compromised node's forged podIP redirect the apiserver's own outbound \
+             request to the cloud metadata service"
+        );
+    }
+
+    /// A podIP string containing CRLF must be rejected by the same check — this string is
+    /// also spliced unescaped into a raw `CONNECT {addr}:{port} HTTP/1.1\r\n...` request
+    /// line for the konnectivity leg, so an embedded CRLF would let a compromised node
+    /// inject a second request into konnectivity-server's stream (request splitting).
+    #[test]
+    fn validate_proxy_target_ip_rejects_crlf_injection_payload() {
+        let result = validate_proxy_target_ip("10.0.0.1\r\nGET /admin HTTP/1.1\r\n");
+        assert!(
+            result.is_err(),
+            "a podIP containing CRLF must be rejected before it is spliced into the raw \
+             CONNECT request line — accepting it lets a compromised node smuggle a second \
+             request into konnectivity-server's stream"
+        );
+    }
+
+    /// IPv6 loopback (::1) must be rejected — a forged podIP pointing at loopback would
+    /// redirect the proxy dial to a service on the apiserver's own host (e.g. an
+    /// unauthenticated debug/pprof endpoint) rather than the pod.
+    #[test]
+    fn validate_proxy_target_ip_rejects_ipv6_loopback() {
+        assert!(validate_proxy_target_ip("::1").is_err());
+    }
+
+    /// Bare dotted-decimal IPv4 loopback (127.0.0.1) is intentionally NOT rejected — matches
+    /// `validate_webhook_url`'s identical, already-reviewed exemption for in-process test
+    /// servers (admission.rs), which this file's own proxy test suite depends on throughout
+    /// (dialing a real TCP listener at 127.0.0.1 as a stand-in for a pod/Service backend).
+    /// Rejecting it here would break that entire test harness for no security gain, since
+    /// the IPv6-mapped/loopback forms below are still blocked for any real bypass attempt.
+    #[test]
+    fn validate_proxy_target_ip_accepts_ipv4_loopback() {
+        assert!(validate_proxy_target_ip("127.0.0.1").is_ok());
+    }
+
+    /// The IPv6-mapped form of a blocked IPv4 address (::ffff:169.254.169.254) must also be
+    /// rejected — checking only the plain-IPv4 and native-IPv6 ranges would leave this
+    /// encoding as a bypass for the exact cloud-metadata block above.
+    #[test]
+    fn validate_proxy_target_ip_rejects_ipv4_mapped_cloud_metadata() {
+        let result = validate_proxy_target_ip("::ffff:169.254.169.254");
+        assert!(
+            result.is_err(),
+            "::ffff:169.254.169.254 must be rejected — it carries the same blocked IPv4 \
+             payload as 169.254.169.254 and must not bypass the check via IPv6-mapped form"
+        );
+    }
+
+    /// An ordinary pod IP in a private/cluster CIDR (10.x, typical of pod networks) must be
+    /// accepted — this guards against over-eager validation breaking every real pod proxy,
+    /// since pod and cluster IPs legitimately live in RFC1918 space unlike the SSRF-target
+    /// ranges (loopback/link-local/multicast) this check actually blocks.
+    #[test]
+    fn validate_proxy_target_ip_accepts_ordinary_pod_ip() {
+        assert!(
+            validate_proxy_target_ip("10.244.1.5").is_ok(),
+            "a routine pod IP in a private CIDR must be accepted — rejecting it would \
+             break every real pod-proxy request, since pod IPs are ordinarily private \
+             (RFC1918) addresses, not public ones"
+        );
+    }
+
+    /// resolve_pod_proxy_target must reject a pod whose status.podIP a compromised node
+    /// set to the cloud-metadata address, returning an error before ever building the
+    /// proxy dial URL — this is the end-to-end regression guard for the SSRF finding: a
+    /// unit test on validate_proxy_target_ip alone wouldn't catch a caller that forgot to
+    /// invoke it.
+    #[tokio::test]
+    async fn pod_proxy_rejects_cloud_metadata_pod_ip() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "ssrf-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"podIP": "169.254.169.254"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "ssrf-pod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let result = resolve_pod_proxy_target(&state, "default", "ssrf-pod").await;
+
+        assert!(
+            result.is_err(),
+            "a pod with status.podIP == 169.254.169.254 (cloud IMDS) must be rejected \
+             before dial — a compromised node scheduled to this pod could otherwise \
+             redirect any legitimate user's pods/proxy request to the cloud metadata \
+             service from the apiserver's own network position"
         );
     }
 
