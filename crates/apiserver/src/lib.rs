@@ -2017,7 +2017,14 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     );
 
     // ClusterRoleBinding: nodeclient ClusterRole → system:bootstrappers group.
-    // Matches upstream's `kubeadm:node-autoapprove-bootstrap` ClusterRoleBinding.
+    // This is a deliberate simplification, not a literal match to kubeadm's
+    // `kubeadm:node-autoapprove-bootstrap` binding (created by `kubeadm init`,
+    // not kube-apiserver's own RBAC bootstrap policy): that binding's subject
+    // is the narrower "system:bootstrappers:kubeadm:default-node-token"
+    // subgroup, which u7s's bootstrap-token auth doesn't implement (every
+    // bootstrap-token identity lands in the flat "system:bootstrappers"
+    // group — see csr.rs). Any system:bootstrappers-group token can
+    // self-approve a node CSR here, not just kubeadm-issued ones.
     let key = keys::group_object_key(
         GROUP,
         "clusterrolebindings",
