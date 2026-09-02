@@ -622,6 +622,50 @@ assert "...with every one of the 8 guarded array fields empty, matching the genu
   "$([ "$(jq -c '[.queue_files,.pending_reviews,.merged_prs,.bd_ready_ids,.worktree_anomalies,.gate_exceptions,.pending_non_pr_reviews,.queue_warnings] | map(length) | add' "$TICK_STATE" 2>/dev/null)" = "0" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 9b. dashboard_repo_state's "As of" stamp. The dashboard's hand-written
+#     header timestamp used to drift silently (targeted line-edits never
+#     bumped it) -- dashboard_repo_state now prepends the tick's own
+#     TICK_TIMESTAMP so the AUTO repo-state line is an always-<=15m-fresh
+#     freshness indicator. It must be the SAME instant as the state file's
+#     .timestamp (both come from one TICK_TIMESTAMP computed once per
+#     process), not two independent `date -u` calls a few pipeline steps
+#     apart that could disagree -- undermining the "authoritative" claim.
+# ---------------------------------------------------------------------------
+
+ISO_RE='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+DASH_REPO_STATE=$(call dashboard_repo_state)
+assert "dashboard_repo_state's output embeds an ISO-8601 UTC timestamp" \
+  "$(printf '%s' "$DASH_REPO_STATE" | grep -qE "$ISO_RE" && echo 1 || echo 0)"
+assert "...stamped as 'As of <ts> (last tick) — Branch ...', not replacing the branch/sha/dirty/sync fields" \
+  "$(printf '%s' "$DASH_REPO_STATE" | grep -qE "^As of $ISO_RE \(last tick\) — Branch \`" && echo 1 || echo 0)"
+
+build_scratch_repo
+DASH_E2E="$(dirname "$SCRATCH_REPO")/dashboard.md"
+cat > "$DASH_E2E" <<'EOF'
+# Dashboard
+
+## Repo state
+placeholder
+EOF
+STATE_E2E="$(dirname "$SCRATCH_REPO")/state-repo-state-ts.json"
+# MAYOR_TICK_DRY_RUN=0 here (not the usual 1): the dashboard splice's actual
+# file write is itself a run_cmd-gated side effect, so a dry run would leave
+# $DASH_E2E untouched and this test would only ever be checking the
+# "placeholder" fixture text. Safe against this isolated scratch repo (no
+# queue files, gh/bd stubbed to fail) the same way the dispatch-marker
+# lifecycle test above uses dry_run=0 to observe a real on-disk effect.
+PATH="$STUB_EMPTY_BIN:$PATH" \
+  MAYOR_TICK_QUEUE_DIR="$SCRATCH_REPO/.claude/review-queue" \
+  MAYOR_TICK_STATE_FILE="$STATE_E2E" \
+  MAYOR_TICK_DASHBOARD_FILE="$DASH_E2E" \
+  MAYOR_TICK_DRY_RUN=0 \
+  bash "$SCRATCH_REPO/scripts/mayor-tick.sh" __call main >/dev/null 2>&1 || true
+DASH_TS=$(grep -oE "$ISO_RE" "$DASH_E2E" | head -1 || true)
+STATE_TS=$(jq -r '.timestamp' "$STATE_E2E" 2>/dev/null || true)
+assert "dashboard's spliced repo-state timestamp matches the state file's .timestamp from the SAME tick run (single source of truth, not independently-drifting clocks)" \
+  "$([ -n "$DASH_TS" ] && [ "$DASH_TS" = "$STATE_TS" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 10. process_review_queue dtype routing, end-to-end through the REAL
 #     main() pipeline -- one fixture file per dtype plus one
 #     with no frontmatter at all, proving the routing in section 7 actually
