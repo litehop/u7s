@@ -1114,6 +1114,18 @@ async fn stamp_terminating_and_recheck_completion<S: Store>(
         // here — as this used to do — wiped those conditions, the same bug already fixed in
         // delete_namespace's soft-delete branch (apply_delete_policy, above) by stamping phase
         // in place instead.
+        //
+        // A merge-patch status-subresource PATCH can bypass NamespaceStatus's typed validation
+        // and persist a non-object scalar status (crate::patch::merge_patch does a raw JSON
+        // merge). serde_json's IndexMut panics indexing a non-object, non-null Value with a str
+        // key, so `obj.body["status"]["phase"] = ...` below would crash the apiserver on a
+        // subsequent DELETE. Reset an already-invalid scalar/array status to an empty object
+        // first — `is_object` is false for Null too, but indexing Null is not a panic
+        // (serde_json auto-vivifies it into an object), so this only ever fires for the
+        // genuinely-invalid case.
+        if !obj.body["status"].is_object() && !obj.body["status"].is_null() {
+            obj.body["status"] = serde_json::json!({});
+        }
         obj.body["status"]["phase"] = serde_json::to_value(NamespacePhase::Terminating)
             .expect("NamespacePhase is always serializable");
         let expected_rv = parse_resource_version(obj.resource_version())?;
@@ -6376,6 +6388,102 @@ mod tests {
             "a controller-set status.conditions entry (the real KCM namespace-controller's \
              drain-progress signal a client polls for) must survive the phase stamp — wiping \
              it here would silently erase content-deletion-failure diagnostics mid-termination"
+        );
+    }
+
+    /// Regression: stamp_terminating_and_recheck_completion must not panic when `status` is a
+    /// non-object scalar.
+    ///
+    /// A status-subresource PATCH with Content-Type: application/merge-patch+json and body
+    /// `{"status":"x"}` routes through `crate::patch::merge_patch`, which does a raw JSON merge
+    /// that bypasses `NamespaceStatus`'s typed validation — persisting a scalar `status` to the
+    /// store. serde_json's `IndexMut` panics indexing a non-object, non-null `Value` with a str
+    /// key, so a subsequent DELETE reaching this function's in-place phase stamp
+    /// (`obj.body["status"]["phase"] = ...`) would crash the apiserver — an authenticated user
+    /// with ordinary status-patch rights could take down the whole process, not just their own
+    /// request.
+    ///
+    /// Fails on revert: without the `is_object` guard resetting an invalid scalar `status` to
+    /// `{}` first, this test panics instead of reaching its assertions.
+    #[tokio::test]
+    async fn stamp_terminating_and_recheck_completion_does_not_panic_on_scalar_status() {
+        let state = make_state();
+        let ns_key = crate::keys::cluster_object_key("namespaces", "scalar-status-ns");
+        state
+            .store
+            .put(
+                &ns_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": { "name": "scalar-status-ns" },
+                        "spec": {},
+                        "status": "x"
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("namespace seed must succeed");
+
+        // A namespaced pod with a real finalizer still held, so the completion recheck below
+        // does not hard-delete the namespace out from under the assertions.
+        let pod_key = crate::keys::object_key("pods", "scalar-status-ns", "blocking-pod");
+        state
+            .store
+            .put(
+                &pod_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "blocking-pod",
+                            "namespace": "scalar-status-ns",
+                            "finalizers": ["test.io/cleanup"]
+                        },
+                        "spec": { "containers": [] }
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("pod seed must succeed");
+
+        let stored = state
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not error")
+            .expect("namespace must be present");
+        let obj = Object::from_bytes(&stored.value).expect("stored namespace must parse");
+
+        stamp_terminating_and_recheck_completion(&state, &ns_key, "scalar-status-ns", obj)
+            .await
+            .expect(
+                "stamp+recheck must succeed, not panic, even with a pre-existing invalid \
+                      scalar status",
+            );
+
+        let after = state
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not error")
+            .expect("namespace must still be present — it still has a real finalizer blocking it");
+        let after_body: serde_json::Value = serde_json::from_slice(&after.value).unwrap();
+        assert!(
+            after_body["status"].is_object(),
+            "an invalid scalar status must be reset to an object, not left as a scalar that \
+             every other in-place status stamper would also panic indexing into"
+        );
+        assert_eq!(
+            after_body["status"]["phase"], "Terminating",
+            "the phase stamp must still take effect once status has been coerced back to an \
+             object — recovering from the invalid state, not just avoiding the panic"
         );
     }
 }
