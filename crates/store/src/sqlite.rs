@@ -1015,8 +1015,12 @@ fn put_sync(
     expected_revision: Option<u64>,
     last_written: &AtomicU64,
 ) -> Result<(u64, Bytes, bool, bool, Option<String>)> {
-    // 1. Begin exclusive write transaction.
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // 1. Begin exclusive write transaction. Transaction guard: any `?` early-return below
+    // (named or not) rolls back automatically on drop (see list_sync), so a transient error
+    // from any of the fallible calls that follow can't leave this shared write connection
+    // wedged mid-transaction — which would otherwise block every future write on the process.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let conn: &Connection = &tx;
 
     // 2. Read current stored revision AND value: the no-op check below (step 3.5) needs the
     // value to compare against, and the optimistic concurrency check needs the revision.
@@ -1047,13 +1051,11 @@ fn put_sync(
         (_, None) => {}       // unconditional
         (None, Some(0)) => {} // create-only, absent: OK
         (Some(_), Some(0)) => {
-            conn.execute_batch("ROLLBACK")?;
             return Err(StoreError::AlreadyExists {
                 key: key.to_string(),
             });
         }
         (None, Some(exp)) => {
-            conn.execute_batch("ROLLBACK")?;
             return Err(StoreError::RevisionMismatch {
                 expected: exp,
                 current: 0,
@@ -1061,7 +1063,6 @@ fn put_sync(
         }
         (Some(stored_rv), Some(exp)) if stored_rv == exp => {} // match: OK
         (Some(stored_rv), Some(exp)) => {
-            conn.execute_batch("ROLLBACK")?;
             return Err(StoreError::RevisionMismatch {
                 expected: exp,
                 current: stored_rv,
@@ -1078,7 +1079,8 @@ fn put_sync(
     // (every 10s per pod) without flooding every watcher in the cluster.
     if let Some((existing_revision, existing_value)) = &stored {
         if semantically_equal_ignoring_resource_version(&value, existing_value) {
-            conn.execute_batch("ROLLBACK")?;
+            // No write happened: let `tx` drop below without committing, which rolls back
+            // the (empty) transaction instead of leaving it open.
             tracing::debug!(key, existing_revision, "put_sync: no-op write suppressed");
             return Ok((
                 *existing_revision,
@@ -1121,7 +1123,7 @@ fn put_sync(
         ],
     )?;
 
-    conn.execute_batch("COMMIT")?;
+    tx.commit()?;
     // Update last_written_revision immediately after COMMIT on this blocking thread.
     // Doing this here (rather than in the async caller) eliminates the scheduling window
     // where a concurrent list on the read connection could see the new WAL data but
@@ -1140,7 +1142,10 @@ fn delete_sync(
     expected_revision: Option<u64>,
     last_written: &AtomicU64,
 ) -> Result<(u64, Bytes, Option<String>)> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // Transaction guard (see put_sync): any `?` early-return below rolls back automatically
+    // on drop, so a transient error mid-transaction can't wedge the shared write connection.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let conn: &Connection = &tx;
 
     let stored: Option<(u64, Vec<u8>, Option<String>)> = conn
         .query_row(
@@ -1159,7 +1164,6 @@ fn delete_sync(
     // Optimistic concurrency check (same logic as put).
     match stored.as_ref().map(|(rv, _, _)| *rv) {
         None => {
-            conn.execute_batch("ROLLBACK")?;
             return Err(StoreError::NotFound {
                 key: key.to_string(),
             });
@@ -1169,7 +1173,6 @@ fn delete_sync(
         Some(stored_rv) => {
             if let Some(exp) = expected_revision {
                 if stored_rv != exp {
-                    conn.execute_batch("ROLLBACK")?;
                     return Err(StoreError::RevisionMismatch {
                         expected: exp,
                         current: stored_rv,
@@ -1193,7 +1196,7 @@ fn delete_sync(
     )?;
 
     conn.execute("DELETE FROM objects WHERE key = ?1", params![key])?;
-    conn.execute_batch("COMMIT")?;
+    tx.commit()?;
     // Same rationale as put_sync: update last_written_revision on the blocking thread
     // immediately after COMMIT so the list guard sees it before any reader can observe
     // the new WAL state from a concurrent read connection.
@@ -1217,7 +1220,10 @@ fn create_if_namespace_active_sync(
     value: Bytes,
     last_written: &AtomicU64,
 ) -> std::result::Result<(u64, Bytes, Option<String>), CreateNamespacedError> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // Transaction guard (see put_sync): any `?` early-return below rolls back automatically
+    // on drop, so a transient error mid-transaction can't wedge the shared write connection.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let conn: &Connection = &tx;
 
     if let Some(ns_key) = ns_key {
         let ns_value: Option<Vec<u8>> = conn
@@ -1230,7 +1236,6 @@ fn create_if_namespace_active_sync(
         if let Some(ns_bytes) = ns_value {
             if let Ok(ns_json) = serde_json::from_slice::<serde_json::Value>(&ns_bytes) {
                 if ns_json["status"]["phase"].as_str() == Some("Terminating") {
-                    conn.execute_batch("ROLLBACK")?;
                     return Err(CreateNamespacedError::NamespaceTerminating);
                 }
             }
@@ -1244,7 +1249,6 @@ fn create_if_namespace_active_sync(
         .optional()?
         .unwrap_or(false);
     if exists {
-        conn.execute_batch("ROLLBACK")?;
         return Err(CreateNamespacedError::Store(StoreError::AlreadyExists {
             key: key.to_string(),
         }));
@@ -1272,7 +1276,7 @@ fn create_if_namespace_active_sync(
         ],
     )?;
 
-    conn.execute_batch("COMMIT")?;
+    tx.commit()?;
     last_written.fetch_max(new_revision, Ordering::Release);
     Ok((new_revision, stamped_value, ns))
 }
@@ -1291,7 +1295,10 @@ fn delete_namespace_sync(
     namespace: &str,
     last_written: &AtomicU64,
 ) -> Result<Vec<(String, Bytes, u64)>> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // Transaction guard (see put_sync): any `?` early-return below rolls back automatically
+    // on drop, so a transient error mid-transaction can't wedge the shared write connection.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let conn: &Connection = &tx;
 
     // Collect all keys and their current bodies in the namespace.
     let mut stmt = conn.prepare_cached("SELECT key, value FROM objects WHERE ns = ?1")?;
@@ -1302,9 +1309,12 @@ fn delete_namespace_sync(
         .filter_map(|r| r.ok())
         .map(|(k, v)| (k, Bytes::from(v)))
         .collect();
+    // Drop the cached statement's borrow of `conn` (i.e. of `tx`) now: `tx.commit()` below
+    // needs to move `tx` by value, which the borrow checker won't allow while `stmt` is live.
+    drop(stmt);
 
     if pairs.is_empty() {
-        conn.execute_batch("ROLLBACK")?;
+        // Nothing to delete: let `tx` drop below without committing (no-op rollback).
         return Ok(vec![]);
     }
 
@@ -1325,7 +1335,7 @@ fn delete_namespace_sync(
         result.push((key, body, rev));
     }
 
-    conn.execute_batch("COMMIT")?;
+    tx.commit()?;
     // Same rationale as put_sync: update immediately after COMMIT on the blocking thread.
     let max_rev = result.last().map_or(0, |(_, _, r)| *r);
     last_written.fetch_max(max_rev, Ordering::Release);
@@ -4217,6 +4227,183 @@ mod tests {
              no matching ROLLBACK/COMMIT); a caller reusing this connection without \
              Store::get()'s stale-revision retry would be stuck reading a frozen snapshot from \
              the abandoned transaction"
+        );
+    }
+
+    /// `put_sync` only issues an explicit ROLLBACK on named business-logic branches
+    /// (AlreadyExists/RevisionMismatch/no-op); the revision-increment step is a bare
+    /// `?`-propagated query with no matching ROLLBACK. Before the RAII transaction guard, a
+    /// single transient failure there (disk I/O, SQLITE_BUSY/FULL) would leave the *shared*
+    /// `write_conn` connection wedged mid-transaction for the life of the process — every
+    /// subsequent put/delete/create/delete-namespace on the whole apiserver would then fail
+    /// with "cannot start a transaction within a transaction" until restart.
+    #[test]
+    fn put_sync_error_path_rolls_back_transaction() {
+        let conn = Connection::open_in_memory().expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, \
+             revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID; \
+             CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .expect("schema");
+        // No 'revision' row in meta: put_sync's revision-increment query_row fails with
+        // QueryReturnedNoRows after the create-path checks have already passed.
+        let last_written = AtomicU64::new(0);
+        let err = put_sync(
+            &conn,
+            "/registry/pods/default/foo",
+            Bytes::from(r#"{"metadata":{"name":"foo","namespace":"default"}}"#),
+            None,
+            &last_written,
+        )
+        .expect_err("a missing meta.revision row must surface as an error, not succeed");
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected put_sync's early return to be a sqlite error from the missing meta row, \
+             got {err:?}"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "put_sync's error path left the shared write connection mid-transaction — every \
+             future write on the process would fail with 'cannot start a transaction within a \
+             transaction' until restart; a single transient store error must not wedge the \
+             whole apiserver's write path"
+        );
+
+        // Prove the connection actually recovered, not just that the flag looks right.
+        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('revision', '0')")
+            .expect("seed revision");
+        put_sync(
+            &conn,
+            "/registry/pods/default/bar",
+            Bytes::from(r#"{"metadata":{"name":"bar","namespace":"default"}}"#),
+            None,
+            &last_written,
+        )
+        .expect("a subsequent write must succeed once the connection is no longer wedged");
+    }
+
+    /// Same wedge as `put_sync_error_path_rolls_back_transaction`, for `delete_sync`: the
+    /// object lookup and concurrency check pass (the object exists), then the bare
+    /// `?`-propagated revision-increment query fails with no matching ROLLBACK.
+    #[test]
+    fn delete_sync_error_path_rolls_back_transaction() {
+        let conn = Connection::open_in_memory().expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, \
+             revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID; \
+             CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL); \
+             INSERT INTO objects (key, value, revision, ns, obj_name) VALUES \
+             ('/registry/pods/default/foo', x'7b7d', 1, 'default', 'foo');",
+        )
+        .expect("schema");
+        let last_written = AtomicU64::new(0);
+        let err = delete_sync(&conn, "/registry/pods/default/foo", None, &last_written)
+            .expect_err("a missing meta.revision row must surface as an error, not succeed");
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected delete_sync's early return to be a sqlite error from the missing meta \
+             row, got {err:?}"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "delete_sync's error path left the shared write connection mid-transaction — every \
+             future write on the process would fail with 'cannot start a transaction within a \
+             transaction' until restart; a single transient store error must not wedge the \
+             whole apiserver's write path"
+        );
+
+        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('revision', '1')")
+            .expect("seed revision");
+        delete_sync(&conn, "/registry/pods/default/foo", None, &last_written)
+            .expect("a subsequent write must succeed once the connection is no longer wedged");
+    }
+
+    /// Same wedge as above, for `create_if_namespace_active_sync`: the namespace-terminating
+    /// check (skipped here via `ns_key: None`) and the already-exists check both pass, then
+    /// the bare `?`-propagated revision-increment query fails with no matching ROLLBACK.
+    #[test]
+    fn create_if_namespace_active_sync_error_path_rolls_back_transaction() {
+        let conn = Connection::open_in_memory().expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, \
+             revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID; \
+             CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .expect("schema");
+        let last_written = AtomicU64::new(0);
+        let err = create_if_namespace_active_sync(
+            &conn,
+            None,
+            "/registry/core/configmaps/default/cm",
+            Bytes::from(r#"{"metadata":{"name":"cm","namespace":"default"}}"#),
+            &last_written,
+        )
+        .expect_err("a missing meta.revision row must surface as an error, not succeed");
+        assert!(
+            matches!(err, CreateNamespacedError::Store(StoreError::Sqlite(_))),
+            "expected create_if_namespace_active_sync's early return to be a sqlite error from \
+             the missing meta row, got {err:?}"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "create_if_namespace_active_sync's error path left the shared write connection \
+             mid-transaction — every future write on the process would fail with 'cannot start \
+             a transaction within a transaction' until restart; a single transient store error \
+             must not wedge the whole apiserver's write path"
+        );
+
+        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('revision', '0')")
+            .expect("seed revision");
+        create_if_namespace_active_sync(
+            &conn,
+            None,
+            "/registry/core/configmaps/default/cm",
+            Bytes::from(r#"{"metadata":{"name":"cm","namespace":"default"}}"#),
+            &last_written,
+        )
+        .expect("a subsequent write must succeed once the connection is no longer wedged");
+    }
+
+    /// Same wedge as above, for `delete_namespace_sync`: the namespace scan finds one object
+    /// (so the empty-namespace no-op rollback doesn't fire), then the bare `?`-propagated
+    /// per-object revision-increment query inside the delete loop fails with no matching
+    /// ROLLBACK.
+    #[test]
+    fn delete_namespace_sync_error_path_rolls_back_transaction() {
+        let conn = Connection::open_in_memory().expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, \
+             revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID; \
+             CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL); \
+             INSERT INTO objects (key, value, revision, ns, obj_name) VALUES \
+             ('/registry/pods/dying-ns/foo', x'7b7d', 1, 'dying-ns', 'foo');",
+        )
+        .expect("schema");
+        let last_written = AtomicU64::new(0);
+        let err = delete_namespace_sync(&conn, "dying-ns", &last_written)
+            .expect_err("a missing meta.revision row must surface as an error, not succeed");
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected delete_namespace_sync's early return to be a sqlite error from the \
+             missing meta row, got {err:?}"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "delete_namespace_sync's error path left the shared write connection \
+             mid-transaction — every future write on the process would fail with 'cannot start \
+             a transaction within a transaction' until restart; a single transient store error \
+             must not wedge the whole apiserver's write path"
+        );
+
+        conn.execute_batch("INSERT INTO meta (key, value) VALUES ('revision', '1')")
+            .expect("seed revision");
+        let deleted = delete_namespace_sync(&conn, "dying-ns", &last_written)
+            .expect("a subsequent write must succeed once the connection is no longer wedged");
+        assert_eq!(
+            deleted.len(),
+            1,
+            "the namespace's one object must still be deletable once the connection recovers"
         );
     }
 
