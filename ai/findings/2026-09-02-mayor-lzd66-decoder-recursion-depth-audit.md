@@ -190,8 +190,8 @@ ignored` and `cargo clippy -p u7s-apiserver --tests -D warnings` is clean.
 
 ## Follow-on beads
 
-- Fix bead for `yaml_to_json`'s unbounded recursion (HIGH): filed as
-  **(appended after `bd create`)**. Fix sketch: thread an explicit `depth:
+- Fix bead for `yaml_to_json`'s unbounded recursion (HIGH): **mayor-71owd**
+  (P1). Fix sketch: thread an explicit `depth:
   usize` parameter through `yaml_to_json`, incrementing on each `Array`/`Hash`
   recursion, and return `None` (→ 400 Bad Request via the existing
   `ok_or_else` in `ssa_body_to_json`) once a cap is exceeded. Pick the cap
