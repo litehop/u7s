@@ -2150,6 +2150,124 @@ fn validate_proxy_target_ip(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns true iff `ip` is a well-formed IPv4 address contained in the well-formed IPv4
+/// CIDR `cidr`. Any parse failure (malformed CIDR, non-IPv4 `ip`, prefix > 32) returns
+/// false — fail closed, since this only gates the podIP-in-podCIDR SSRF allowlist below.
+fn ipv4_in_cidr(ip: &str, cidr: &str) -> bool {
+    let Some((net_str, prefix_str)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(net) = net_str.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix_str.parse::<u32>() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(addr) & mask) == (u32::from(net) & mask)
+}
+
+/// CIDR-membership allowlist for a pod's `status.podIP`, composed on top of
+/// `validate_proxy_target_ip`'s existing loopback/link-local/multicast/metadata blocklist.
+///
+/// A blocklist alone leaves every OTHER routable address — arbitrary external hosts,
+/// internal services the compromised node itself cannot reach — usable as a pod's forged
+/// podIP, letting a pods/proxy request dial them from the apiserver's own control-plane
+/// network position (and, on the https-scheme path, present the apiserver's kubelet-client
+/// TLS identity to whatever is listening there). The allowlist closes that whole class by
+/// requiring the podIP to actually live inside cluster-internal address space:
+///
+/// - non-hostNetwork pod: `podIP` must fall within its node's `spec.podCIDR`, IF the node
+///   has one assigned. This is only trustworthy because NodeRestriction-equivalent
+///   admission now stops a node from self-writing its own `spec.podCIDR` (only the
+///   controller that owns IPAM may set it, once, empty -> valid) — before that, a
+///   compromised node could set both its own podCIDR and its pod's podIP to the same
+///   attacker-chosen range and defeat this check. A node with no podCIDR falls back to
+///   the blocklist floor alone (see the empty-podCIDR match arm below for why).
+/// - hostNetwork pod: `podIP` must equal the pod's own `status.hostIP` (the invariant
+///   `apply_status_patch` already enforces when the kubelet's status patch goes through
+///   that path; this re-checks it at dial time as defense in depth against any write path
+///   that bypasses it).
+///
+/// `status.hostIP` is itself still node-writable (`nodes/status` is legitimately
+/// node-writable even post-NodeRestriction), so the hostNetwork branch cannot treat a
+/// podIP/hostIP match alone as proof of a real node identity — it only proves the two
+/// node-controlled fields agree with each other. A compromised node could set both to
+/// 127.0.0.1 to redirect the proxy dial to a service on the apiserver's own host. Bare
+/// IPv4 loopback (which `validate_proxy_target_ip` intentionally allows elsewhere, for
+/// this file's own real-in-process-listener test fixtures) is therefore rejected
+/// unconditionally in this branch, regardless of what hostIP claims.
+async fn validate_pod_ip_against_node<S: Store>(
+    state: &AppState<S>,
+    pod: &serde_json::Value,
+    pod_ip: &str,
+) -> Result<(), String> {
+    // Malformed/non-IP podIP (including one carrying an embedded CRLF, the request-
+    // splitting vector against konnectivity's raw CONNECT line built later from this
+    // same string) is rejected here before either branch below ever runs.
+    validate_proxy_target_ip(pod_ip)?;
+
+    let host_network = pod["spec"]["hostNetwork"].as_bool().unwrap_or(false);
+    if host_network {
+        if pod_ip
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|v4| v4.is_loopback())
+        {
+            return Err(
+                "hostNetwork pod's podIP is IPv4 loopback — rejected regardless of hostIP"
+                    .to_owned(),
+            );
+        }
+        return match pod["status"]["hostIP"].as_str().filter(|s| !s.is_empty()) {
+            Some(host_ip) if host_ip == pod_ip => Ok(()),
+            Some(host_ip) => Err(format!(
+                "hostNetwork pod's podIP does not match its own status.hostIP {host_ip}"
+            )),
+            None => Err("hostNetwork pod has no status.hostIP to validate podIP against".into()),
+        };
+    }
+
+    let node_name = pod["spec"]["nodeName"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "pod is not yet scheduled (spec.nodeName is empty)".to_owned())?;
+    let node_key = cluster_object_key("nodes", node_name);
+    let node_stored = state
+        .store
+        .get(&node_key)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("node \"{node_name}\" not found"))?;
+    let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
+        .map_err(|e| format!("corrupt stored node: {e}"))?;
+
+    // A node with no spec.podCIDR falls back to the blocklist floor already checked
+    // above, rather than hard-rejecting every non-hostNetwork pod-proxy request: this
+    // codebase's own conformance stack runs kube-controller-manager with
+    // node-ipam-controller explicitly disabled (04-start-kcm.sh's --controllers list),
+    // so podCIDR is never populated there today, and CRI-O's default bridge CNI hands
+    // out pod IPs independently of it. The CIDR-membership allowlist activates
+    // automatically the moment a real per-node podCIDR is assigned; until then this
+    // check is a no-op rather than an outage for every real pod's proxy subresource.
+    match node["spec"]["podCIDR"].as_str().filter(|s| !s.is_empty()) {
+        Some(pod_cidr) if ipv4_in_cidr(pod_ip, pod_cidr) => Ok(()),
+        Some(pod_cidr) => Err(format!(
+            "pod IP is not within node \"{node_name}\"'s podCIDR {pod_cidr}"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Resolve pod IP and container port for the pod proxy subresource.
 ///
 /// Returns (pod_ip, port, konnectivity_proxy_addr, is_https) for the caller to build the
@@ -2185,21 +2303,25 @@ pub async fn resolve_pod_proxy_target<S: Store>(
         })?
         .to_owned();
 
-    validate_proxy_target_ip(&pod_ip).map_err(|reason| {
-        crate::status::StatusError(
-            axum::http::StatusCode::BAD_GATEWAY,
-            crate::status::Status {
-                kind: "Status",
-                api_version: "v1",
-                status: "Failure",
-                message: format!("pod \"{pod_name}\" status.podIP \"{pod_ip}\" rejected: {reason}"),
-                reason: "BadGateway",
-                code: 502,
-                metadata: None,
-                details: None,
-            },
-        )
-    })?;
+    validate_pod_ip_against_node(state, &pod, &pod_ip)
+        .await
+        .map_err(|reason| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!(
+                        "pod \"{pod_name}\" status.podIP \"{pod_ip}\" rejected: {reason}"
+                    ),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                    details: None,
+                },
+            )
+        })?;
 
     let port = resolve_pod_container_port(&pod["spec"]["containers"], port_spec).unwrap_or(80);
 
@@ -3109,6 +3231,26 @@ mod tests {
             .with_state(state)
     }
 
+    /// Seed a Node with the given `spec.podCIDR`, for tests exercising the non-hostNetwork
+    /// branch of `validate_pod_ip_against_node` (the pod must carry a matching `spec.nodeName`).
+    async fn seed_node_with_pod_cidr(state: &AppState, node_name: &str, pod_cidr: &str) {
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": node_name, "resourceVersion": "1"},
+            "spec": {"podCIDR": pod_cidr}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", node_name),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+    }
+
     // -----------------------------------------------------------------------
     // buffer_capped: response-body size cap for the html-rewrite proxy path
     // -----------------------------------------------------------------------
@@ -3312,6 +3454,266 @@ mod tests {
              before dial — a compromised node scheduled to this pod could otherwise \
              redirect any legitimate user's pods/proxy request to the cloud metadata \
              service from the apiserver's own network position"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_pod_ip_against_node: podIP-in-podCIDR / hostNetwork allowlist,
+    // composed with the blocklist above -- the arbitrary-external-podIP SSRF fix
+    // -----------------------------------------------------------------------
+
+    /// A non-hostNetwork pod's podIP outside its own node's podCIDR must be rejected.
+    ///
+    /// Before this check, a blocklist alone let a compromised node set its pod's podIP to
+    /// ANY routable address outside the reserved ranges (not just cloud-metadata/loopback)
+    /// — e.g. an internal service the apiserver can reach but the node itself cannot,
+    /// turning pods/proxy into a control-plane SSRF pivot. The podCIDR is trustworthy only
+    /// because NodeRestriction-equivalent admission stops a node from self-assigning it.
+    #[tokio::test]
+    async fn pod_proxy_rejects_pod_ip_outside_node_pod_cidr() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "escapee", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "node-a", "containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"podIP": "10.99.0.5"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "escapee"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+        seed_node_with_pod_cidr(&state, "node-a", "10.244.0.0/24").await;
+
+        let result = resolve_pod_proxy_target(&state, "default", "escapee").await;
+
+        assert!(
+            result.is_err(),
+            "a podIP (10.99.0.5) outside its node's podCIDR (10.244.0.0/24) must be \
+             rejected — accepting it lets a compromised node redirect the apiserver's \
+             pods/proxy dial to any address of its choosing, not just its own pod network"
+        );
+    }
+
+    /// A non-hostNetwork pod's podIP inside its own node's podCIDR must be allowed.
+    ///
+    /// This is the ordinary, overwhelmingly common case: a real pod networked by the CNI
+    /// plugin gets an address from its node's assigned range. Rejecting it would break
+    /// every legitimate pods/proxy request in the cluster.
+    #[tokio::test]
+    async fn pod_proxy_allows_pod_ip_inside_node_pod_cidr() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "normal", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "node-b", "containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"podIP": "10.244.0.5"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "normal"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+        seed_node_with_pod_cidr(&state, "node-b", "10.244.0.0/24").await;
+
+        let (ip, ..) = resolve_pod_proxy_target(&state, "default", "normal")
+            .await
+            .expect(
+                "a podIP inside its node's podCIDR must be allowed — otherwise no real \
+                 pod's proxy subresource would ever work",
+            );
+        assert_eq!(ip, "10.244.0.5");
+    }
+
+    /// A non-hostNetwork pod whose node has no spec.podCIDR assigned must still be
+    /// allowed (falling back to the blocklist floor alone), not hard-rejected.
+    ///
+    /// This codebase's own conformance stack runs kube-controller-manager with
+    /// node-ipam-controller explicitly disabled (04-start-kcm.sh), so spec.podCIDR is
+    /// never populated there today — live-confirmed via `kubectl get node -o json`
+    /// showing an empty spec on a real, Ready, CNI-networked node. Hard-rejecting here
+    /// would 502 every ordinary pod's proxy subresource in that (currently common)
+    /// configuration; the CIDR-membership allowlist activates automatically once a real
+    /// per-node podCIDR is assigned.
+    #[tokio::test]
+    async fn pod_proxy_allows_pod_ip_when_node_has_no_pod_cidr_assigned() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "no-ipam", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "node-e", "containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"podIP": "10.85.3.40"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "no-ipam"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-e", "resourceVersion": "1"},
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-e"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let (ip, ..) = resolve_pod_proxy_target(&state, "default", "no-ipam")
+            .await
+            .expect(
+                "a podIP must be allowed when its node has no spec.podCIDR assigned — \
+                 otherwise pods/proxy would be broken cluster-wide until \
+                 node-ipam-controller is enabled",
+            );
+        assert_eq!(ip, "10.85.3.40");
+    }
+
+    /// A hostNetwork pod's podIP matching its own status.hostIP (a real routable node
+    /// address) must be allowed.
+    ///
+    /// hostNetwork pods share the node's network namespace, so their podIP is legitimately
+    /// the node's own IP rather than a pod-CIDR address; the podCIDR-membership check above
+    /// would incorrectly reject every hostNetwork pod (e.g. kube-proxy, CNI daemons) if
+    /// applied here instead of this hostIP-equality branch.
+    #[tokio::test]
+    async fn pod_proxy_allows_host_network_pod_ip_matching_host_ip() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "kube-proxy", "namespace": "kube-system", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-c",
+                "hostNetwork": true,
+                "containers": [{"name": "kube-proxy", "image": "kube-proxy"}]
+            },
+            "status": {"podIP": "192.168.1.10", "hostIP": "192.168.1.10"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "kube-system", "kube-proxy"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let (ip, ..) = resolve_pod_proxy_target(&state, "kube-system", "kube-proxy")
+            .await
+            .expect(
+                "a hostNetwork pod's podIP matching its own status.hostIP must be allowed \
+                 — otherwise proxying to any real hostNetwork pod (kube-proxy, CNI \
+                 daemons) would be broken",
+            );
+        assert_eq!(ip, "192.168.1.10");
+    }
+
+    /// A hostNetwork pod's podIP of 127.0.0.1 must be rejected even when status.hostIP
+    /// also claims 127.0.0.1 — the operator edge case this allowlist is composed against.
+    ///
+    /// status.hostIP is node-writable even after NodeRestriction-equivalent admission
+    /// (nodes/status stays legitimately node-writable), so a podIP/hostIP match alone is
+    /// not proof of a real node identity — it only proves the two node-controlled fields
+    /// agree with each other. Without this floor, a compromised node could set both to
+    /// 127.0.0.1 and redirect the proxy dial to an unauthenticated service on the
+    /// apiserver's own host (e.g. pprof/debug), defeating the hostNetwork branch entirely.
+    #[tokio::test]
+    async fn pod_proxy_rejects_host_network_loopback_pod_ip_even_if_host_ip_matches() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "evil-hostnet", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-d",
+                "hostNetwork": true,
+                "containers": [{"name": "app", "image": "nginx"}]
+            },
+            "status": {"podIP": "127.0.0.1", "hostIP": "127.0.0.1"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "evil-hostnet"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let result = resolve_pod_proxy_target(&state, "default", "evil-hostnet").await;
+
+        assert!(
+            result.is_err(),
+            "a hostNetwork pod's podIP/hostIP of 127.0.0.1 must be rejected regardless of \
+             the claimed match — a compromised node forging both fields as loopback must \
+             not be able to redirect the apiserver's own proxy dial to itself"
+        );
+    }
+
+    /// A podIP containing an embedded CRLF must be rejected via the same allowlist path,
+    /// not just the standalone `validate_proxy_target_ip` unit check above.
+    ///
+    /// This string is spliced unescaped into the raw `CONNECT {addr}:{port} HTTP/1.1\r\n...`
+    /// request line built for the konnectivity leg; accepting it here would let a
+    /// compromised node smuggle a second request into konnectivity-server's stream
+    /// (request splitting) even after the CIDR/hostIP allowlist above is composed in.
+    #[tokio::test]
+    async fn pod_proxy_rejects_crlf_pod_ip_before_dial() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "splitter", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"podIP": "10.0.0.1\r\nGET /admin HTTP/1.1\r\n"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "splitter"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let result = resolve_pod_proxy_target(&state, "default", "splitter").await;
+
+        assert!(
+            result.is_err(),
+            "a podIP containing CRLF must be rejected before dial — accepting it lets a \
+             compromised node inject a second request into konnectivity-server's stream \
+             via the raw CONNECT line built from this same podIP string"
         );
     }
 
@@ -5690,9 +6092,10 @@ mod tests {
             "kind": "Pod",
             "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
             "spec": {
-                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 8080}]}]
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 8080}]}],
+                "hostNetwork": true
             },
-            "status": {"podIP": "10.1.2.3"}
+            "status": {"podIP": "10.1.2.3", "hostIP": "10.1.2.3"}
         });
         state
             .store
@@ -5732,9 +6135,10 @@ mod tests {
             "kind": "Pod",
             "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
             "spec": {
-                "containers": [{"name": "app", "image": "nginx"}]
+                "containers": [{"name": "app", "image": "nginx"}],
+                "hostNetwork": true
             },
-            "status": {"podIP": "10.1.2.3"}
+            "status": {"podIP": "10.1.2.3", "hostIP": "10.1.2.3"}
         });
         state
             .store
@@ -5787,8 +6191,8 @@ mod tests {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
-            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
-            "status": {"podIP": "10.1.2.3"}
+            "spec": {"containers": [{"name": "app", "image": "nginx"}], "hostNetwork": true},
+            "status": {"podIP": "10.1.2.3", "hostIP": "10.1.2.3"}
         });
         state
             .store
@@ -5828,9 +6232,10 @@ mod tests {
             "kind": "Pod",
             "metadata": {"name": "proxy-test", "namespace": "default", "resourceVersion": "1"},
             "spec": {
-                "containers": [{"name": "agnhost", "image": "agnhost", "ports": [{"containerPort": 9376}]}]
+                "containers": [{"name": "agnhost", "image": "agnhost", "ports": [{"containerPort": 9376}]}],
+                "hostNetwork": true
             },
-            "status": {"podIP": "10.5.6.7"}
+            "status": {"podIP": "10.5.6.7", "hostIP": "10.5.6.7"}
         });
         state
             .store
@@ -5875,9 +6280,10 @@ mod tests {
             "kind": "Pod",
             "metadata": {"name": "proxy-test", "namespace": "default", "resourceVersion": "1"},
             "spec": {
-                "containers": [{"name": "agnhost", "image": "agnhost", "ports": [{"containerPort": 9376}]}]
+                "containers": [{"name": "agnhost", "image": "agnhost", "ports": [{"containerPort": 9376}]}],
+                "hostNetwork": true
             },
-            "status": {"podIP": "10.5.6.7"}
+            "status": {"podIP": "10.5.6.7", "hostIP": "10.5.6.7"}
         });
         state
             .store
@@ -5921,8 +6327,8 @@ mod tests {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": "tls-pod", "namespace": "default", "resourceVersion": "1"},
-            "spec": {"containers": [{"name": "app", "image": "agnhost"}]},
-            "status": {"podIP": "10.5.6.7"}
+            "spec": {"containers": [{"name": "app", "image": "agnhost"}], "hostNetwork": true},
+            "status": {"podIP": "10.5.6.7", "hostIP": "10.5.6.7"}
         });
         state
             .store
@@ -8089,6 +8495,7 @@ mod tests {
             "kind": "Pod",
             "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
             "spec": {
+                "nodeName": "node-1",
                 "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
             },
             "status": {"podIP": "127.0.0.1"}
@@ -8102,6 +8509,11 @@ mod tests {
             )
             .await
             .expect("seed pod");
+        // podCIDR covers loopback only because this test needs a real, connectable
+        // in-process listener as the pod backend — not a realistic node assignment; see
+        // validate_proxy_target_ip_accepts_ipv4_loopback for why this file's test harness
+        // relies on dialing an actual 127.0.0.1 listener throughout.
+        seed_node_with_pod_cidr(&state, "node-1", "127.0.0.0/8").await;
 
         let mut router = make_router(state);
         let req = axum::http::Request::builder()
@@ -8195,8 +8607,11 @@ mod tests {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
-            "spec": {"containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 80}]}]},
-            "status": {"podIP": "10.0.0.1"}
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 80}]}],
+                "hostNetwork": true
+            },
+            "status": {"podIP": "10.0.0.1", "hostIP": "10.0.0.1"}
         });
         store
             .put(
@@ -8516,6 +8931,7 @@ mod tests {
             "kind": "Pod",
             "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
             "spec": {
+                "nodeName": "node-1",
                 "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
             },
             "status": {"podIP": "127.0.0.1"}
@@ -8529,6 +8945,7 @@ mod tests {
             )
             .await
             .expect("seed pod");
+        seed_node_with_pod_cidr(&state, "node-1", "127.0.0.0/8").await;
 
         let mut router = make_router(state);
         let req = axum::http::Request::builder()
@@ -8626,6 +9043,7 @@ mod tests {
             "kind": "Pod",
             "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
             "spec": {
+                "nodeName": "node-1",
                 "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
             },
             "status": {"podIP": "127.0.0.1"}
@@ -8639,6 +9057,7 @@ mod tests {
             )
             .await
             .expect("seed pod");
+        seed_node_with_pod_cidr(&state, "node-1", "127.0.0.0/8").await;
 
         let mut router = make_router(state);
         let req = axum::http::Request::builder()
@@ -8723,8 +9142,11 @@ mod tests {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
-            "spec": {"containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 80}]}]},
-            "status": {"podIP": "10.0.0.1"}
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 80}]}],
+                "hostNetwork": true
+            },
+            "status": {"podIP": "10.0.0.1", "hostIP": "10.0.0.1"}
         });
         store
             .put(
