@@ -1242,8 +1242,27 @@ pub(crate) async fn do_patch<S: Store>(
                     .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
                 let mut patch: serde_json::Value = ssa_body_to_json(&body)?;
                 strip_managed_fields(&mut patch);
+                // The winner of the create race already persisted this object, so from here
+                // this is an update, not a create — same has_status_subresource restore as
+                // the main patch loop below (see its stored_status), needed here too since
+                // this is a separate merge application on the same current.body.
+                let stored_status = if meta.has_status_subresource {
+                    Some(current.body["status"].clone())
+                } else {
+                    None
+                };
                 crate::patch::strategic_merge_patch(&mut current.body, &patch)
                     .map_err(|e| Status::bad_request(e.to_string()))?;
+                if meta.has_status_subresource {
+                    match stored_status {
+                        Some(ref s) if !s.is_null() => {
+                            current.body["status"] = s.clone();
+                        }
+                        _ => {
+                            current.body.as_object_mut().map(|m| m.remove("status"));
+                        }
+                    }
+                }
                 super::defaults::apply_defaults(group, plural, &mut current.body);
                 super::defaults::validate_resource(group, plural, &current.body)
                     .map_err(Status::unprocessable_entity)?;

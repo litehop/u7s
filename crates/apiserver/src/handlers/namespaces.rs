@@ -541,9 +541,24 @@ pub(crate) async fn patch_namespace<S: Store>(
     // ownerReference and corrupt owner_ref_is_live's cascade-GC decision.
     let stored_uid = current.body["metadata"]["uid"].clone();
 
+    // Snapshot .status before applying the patch: Namespace has a dedicated /status
+    // subresource, so a patch on this main endpoint (merge or strategic-merge — both content
+    // types share this branch, see the ct check above) must never change it — restored below,
+    // mirroring do_patch's (resource.rs) identical stored_status handling. Without this, a
+    // caller holding only ordinary namespace `patch` rights (not `namespaces/status`) could
+    // persist a scalar status via `{"status":"x"}`, corrupting the object and later panicking
+    // any in-place status stamper (e.g. stamp_terminating) that indexes it with a str key.
+    let stored_status = current.body["status"].clone();
+
     crate::patch::merge_patch(&mut current.body, &patch);
 
     current.body["metadata"]["uid"] = stored_uid;
+
+    if stored_status.is_null() {
+        current.body.as_object_mut().map(|m| m.remove("status"));
+    } else {
+        current.body["status"] = stored_status;
+    }
 
     // Post-patch: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let current_meta: ObjectMeta =
@@ -801,6 +816,11 @@ pub(crate) async fn patch_namespace_status<S: Store>(
             );
         }
     }
+    // Convergence point for every patch content-type above (JSON Patch, merge, strategic
+    // merge): guard once here, right before the store write, instead of per-branch — this
+    // handler previously guarded neither branch, so a merge-patch or JSON Patch `/status`
+    // replace could persist a scalar status and later panic the in-place terminating-stamp.
+    crate::handlers::status::reject_non_object_status(&current.body["status"])?;
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -2176,6 +2196,185 @@ mod tests {
         assert_eq!(
             after_val["metadata"]["uid"], real_uid,
             "a merge-patch carrying metadata.uid must not change the stored uid"
+        );
+    }
+
+    /// Round 5 of the non-object-status bug class: patch_namespace (the MAIN `/api/v1/namespaces/{name}` PATCH
+    /// endpoint, NOT `/status`) applied a merge-patch to the whole stored object body and
+    /// restored only metadata.uid — a body `{"status":"x"}` persisted a scalar status using
+    /// only ordinary namespace `patch` rights (no `namespaces/status` rights needed).
+    ///
+    /// Fails on revert: without restoring stored_status after the merge-patch, the stored
+    /// object's status becomes the raw string "x" instead of staying an object, and any
+    /// later in-place status stamper (e.g. stamp_terminating) that indexes it with a str key
+    /// panics — crashing the apiserver for every other request in flight.
+    #[tokio::test]
+    async fn patch_namespace_rejects_scalar_status_merge_patch() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("scalar-status-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(serde_json::json!({ "status": "x" }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_namespace(
+                State(state.clone()),
+                Path("scalar-status-ns".to_string()),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "the main-endpoint patch itself must still succeed (status is silently ignored, \
+             not rejected — the main endpoint doesn't own status at all)"
+        );
+
+        let after = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "scalar-status-ns",
+            ))
+            .await
+            .expect("store get")
+            .expect("must still exist");
+        let after_val: serde_json::Value =
+            serde_json::from_slice(&after.value).expect("parse after patch");
+        assert!(
+            !after_val["status"].is_string(),
+            "a merge-patch body's scalar status must never be persisted as-is — got {:?}; a \
+             string status corrupts the object's schema and panics the next in-place status \
+             stamper",
+            after_val["status"]
+        );
+    }
+
+    /// Companion to the scalar-status regression above: a legitimate status the real
+    /// namespace controller wrote via `/status` (e.g. mid-drain Terminating) must survive a
+    /// main-endpoint patch exactly like it survives a main-endpoint PUT
+    /// (`replace_namespace_ignores_body_status_uses_stored_status`) — otherwise any ordinary
+    /// `kubectl patch namespace` metadata edit would silently resurrect a draining namespace
+    /// as whatever stale status the client's patch body happened to carry.
+    #[tokio::test]
+    async fn patch_namespace_ignores_body_status_uses_stored_status() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("patch-status-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "patch-status-ns",
+            ))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("parse stored");
+        let rv = stored_val["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("1")
+            .to_string();
+
+        // Set status.phase=Terminating via the /status subresource, as the real namespace
+        // controller does mid-drain.
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "patch-status-ns", "resourceVersion": rv },
+                "status": { "phase": "Terminating" }
+            })
+            .to_string(),
+        );
+        assert!(
+            put_namespace_status(
+                State(state.clone()),
+                Path("patch-status-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                status_body,
+            )
+            .await
+            .is_ok(),
+            "put_namespace_status must succeed"
+        );
+
+        // A client patches the main endpoint carrying a stale/bogus status (Active) in the
+        // body, plus a real metadata update.
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "metadata": { "labels": { "env": "prod" } },
+                "status": { "phase": "Active" }
+            })
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_namespace(
+                State(state.clone()),
+                Path("patch-status-ns".to_string()),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "patch must succeed"
+        );
+
+        let after = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "patch-status-ns",
+            ))
+            .await
+            .expect("store get")
+            .expect("must still exist");
+        let after_val: serde_json::Value =
+            serde_json::from_slice(&after.value).expect("parse final");
+        assert_eq!(
+            after_val["status"]["phase"], "Terminating",
+            "patch body status (Active) must be ignored; stored status (Terminating) set \
+             via the /status subresource must be preserved"
+        );
+        assert_eq!(
+            after_val["metadata"]["labels"]["env"], "prod",
+            "the patch's actual metadata update (labels) must still apply"
         );
     }
 
@@ -4484,6 +4683,127 @@ mod tests {
         assert_eq!(
             body["metadata"]["name"], "status-patch-ns",
             "metadata must be unchanged after PATCH /status"
+        );
+    }
+
+    /// patch_namespace_status with a merge-patch body `{"status":"x"}` must be rejected with
+    /// 422, not persisted. Unlike the generic status-subresource handlers, this handler had
+    /// NO guard on either patch-content-type branch — a scalar status corrupts the object's
+    /// schema and later panics the in-place namespace terminating-stamp on DELETE.
+    #[tokio::test]
+    async fn patch_namespace_status_rejects_scalar_status_merge_patch() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("scalar-status-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(serde_json::json!({ "status": "x" }).to_string());
+
+        let result = patch_namespace_status(
+            State(state.clone()),
+            Path("scalar-status-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a scalar status merge-patch must be rejected, not accepted — it would \
+                 corrupt the object's schema and later crash the terminating-stamp on DELETE"
+            ),
+        };
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "scalar-status-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            body.get("status").is_none() || body["status"].is_object(),
+            "the rejected patch must not have been persisted — status must remain absent \
+             or an object, never the scalar \"x\""
+        );
+    }
+
+    /// patch_namespace_status with a JSON Patch body
+    /// `[{"op":"replace","path":"/status","value":"x"}]` must be rejected too —
+    /// `validate_status_json_patch_paths` explicitly permits a whole-`/status` replace path.
+    #[tokio::test]
+    async fn patch_namespace_status_rejects_scalar_status_json_patch() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("scalar-status-jp-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!([{"op": "replace", "path": "/status", "value": "x"}]).to_string(),
+        );
+
+        let result = patch_namespace_status(
+            State(state.clone()),
+            Path("scalar-status-jp-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a JSON Patch replacing /status with a scalar must be rejected, not \
+                 accepted — same corruption as the merge-patch case, different content-type"
+            ),
+        };
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "scalar-status-jp-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            body.get("status").is_none() || body["status"].is_object(),
+            "the rejected patch must not have been persisted — status must remain absent \
+             or an object, never the scalar \"x\""
         );
     }
 

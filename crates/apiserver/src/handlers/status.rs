@@ -129,14 +129,7 @@ pub async fn put_resource_status<S: Store>(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     // Replace status and merge metadata; leave spec and identity fields untouched.
-    match &incoming.body["status"] {
-        serde_json::Value::Null => {
-            current.body.as_object_mut().map(|m| m.remove("status"));
-        }
-        v => {
-            current.body["status"] = v.clone();
-        }
-    }
+    replace_status_field(&mut current.body, &incoming.body["status"])?;
     merge_incoming_metadata(&mut current.body, &incoming.body, &meta.kind);
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
@@ -208,6 +201,12 @@ pub async fn patch_resource_status<S: Store>(
             merge_incoming_metadata(&mut current.body, &patch, &meta.kind);
         }
     }
+    // Convergence point for every patch content-type above (JSON Patch, merge, strategic
+    // merge): guard once here, right before the store write, instead of per-branch. A
+    // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
+    // `validate_status_json_patch_paths` permits a whole-`/status` replace and
+    // `apply_json_patch` happily turns that into a scalar.
+    reject_non_object_status(&current.body["status"])?;
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
@@ -289,14 +288,7 @@ pub async fn put_namespaced_resource_status<S: Store>(
         .map(|e| e.kind)
         .unwrap_or(kind_fallback);
 
-    match &incoming.body["status"] {
-        serde_json::Value::Null => {
-            current.body.as_object_mut().map(|m| m.remove("status"));
-        }
-        v => {
-            current.body["status"] = v.clone();
-        }
-    }
+    replace_status_field(&mut current.body, &incoming.body["status"])?;
     merge_incoming_metadata(&mut current.body, &incoming.body, &kind);
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
@@ -387,6 +379,12 @@ pub async fn patch_namespaced_resource_status<S: Store>(
             merge_incoming_metadata(&mut current.body, &patch, &kind);
         }
     }
+    // Convergence point for every patch content-type above (JSON Patch, merge, strategic
+    // merge): guard once here, right before the store write, instead of per-branch. A
+    // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
+    // `validate_status_json_patch_paths` permits a whole-`/status` replace and
+    // `apply_json_patch` happily turns that into a scalar.
+    reject_non_object_status(&current.body["status"])?;
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
@@ -398,6 +396,54 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     current.set_resource_version(new_rv);
     inject_type_meta(&mut current.body, &group, &version, &kind);
     Ok(Json(current.body))
+}
+
+/// A resource's `status` is always a message/object type in the Kubernetes API — never a
+/// scalar or array. `merge_patch` (RFC 7396) legitimately replaces `target` wholesale
+/// whenever `patch` is not itself an object, so a merge-patch body like `{"status":"x"}`
+/// would otherwise silently persist a scalar `status`. That corrupts the object's own
+/// schema and, worse, panics any code that later stamps status fields in place via
+/// `obj.body["status"]["field"] = ...` (e.g. `apply_delete_policy`), crashing the apiserver.
+/// Reject before it's ever written to the store.
+///
+/// `null` is explicitly ALLOWED (not rejected): `{"status": null}` is RFC 7396's own
+/// field-deletion syntax, not an invalid scalar — a merge-patch that clears status
+/// entirely is legitimate and must not 422.
+pub(crate) fn reject_non_object_status(
+    status: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    if status.is_object() || status.is_null() {
+        return Ok(());
+    }
+    Err(Status::unprocessable_entity(format!(
+        "status must be an object, got {status}"
+    )))
+}
+
+/// Shared PUT-/status body: replace `current`'s `status` field with `incoming_status`
+/// (null removes the field — a PUT's own field-clearing convention), or reject with 422
+/// if `incoming_status` is a present-but-non-object scalar/array. Every PUT /status
+/// handler in this codebase (`put_resource_status`, `put_namespaced_resource_status`,
+/// `put_cr_status`, `put_crd_status`, `replace_pod_status`) round-trips through here
+/// instead of assigning `current["status"] = incoming_status.clone()` inline, so the
+/// object-type invariant `reject_non_object_status` enforces for merge-patch status
+/// writes cannot be missed for a PUT handler the way it was in two prior review rounds.
+pub(crate) fn replace_status_field(
+    current: &mut serde_json::Value,
+    incoming_status: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    reject_non_object_status(incoming_status)?;
+    match incoming_status {
+        serde_json::Value::Null => {
+            if let Some(m) = current.as_object_mut() {
+                m.remove("status");
+            }
+        }
+        v => {
+            current["status"] = v.clone();
+        }
+    }
+    Ok(())
 }
 
 /// Validate that every op in a JSON Patch sent to a /status subresource targets
@@ -606,6 +652,83 @@ mod tests {
             v.get("status").is_none(),
             "null status in PUT body must remove the status field from the stored object"
         );
+    }
+
+    /// put_resource_status with a scalar or array `status` body must be rejected with 422,
+    /// not persisted. `status` is a message/object type for every resource; a PUT that
+    /// wholesale-replaces it with a scalar corrupts the object's own schema and panics any
+    /// later in-place status stamper (e.g. `apply_delete_policy`) that indexes
+    /// `["status"]["field"]` on it, crashing the apiserver for every other request in flight.
+    #[tokio::test]
+    async fn put_resource_status_rejects_non_object_status() {
+        for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
+            let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+            let csinode = serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "CSINode",
+                "metadata": { "name": "put-scalar-node" },
+                "spec": { "drivers": [] },
+                "status": { "ready": true }
+            });
+            let key = "/registry/storage.k8s.io/csinodes/put-scalar-node";
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let state = crate::state::AppState::new(
+                store.clone(),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            );
+
+            let bad_body = serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "CSINode",
+                "metadata": { "name": "put-scalar-node" },
+                "status": bad_status
+            });
+            let result = put_resource_status(
+                axum::extract::State(state),
+                axum::extract::Path((
+                    "storage.k8s.io".into(),
+                    "v1".into(),
+                    "csinodes".into(),
+                    "put-scalar-node".into(),
+                )),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&bad_body).unwrap()),
+            )
+            .await;
+
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "a non-object status ({bad_status}) via PUT must be rejected, not \
+                     persisted — it would corrupt the object's schema and later crash any \
+                     in-place status stamper"
+                ),
+            };
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "a non-object status must be rejected with 422, matching upstream schema \
+                 validation: got {bad_status}"
+            );
+
+            let stored = store.get(key).await.unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            assert_eq!(
+                v["status"]["ready"], true,
+                "the rejected PUT must not have been persisted — status must remain the \
+                 original object for input {bad_status}"
+            );
+        }
     }
 
     /// patch_resource_status returns 404 when cluster-scoped object does not exist.
@@ -844,6 +967,78 @@ mod tests {
             v.get("status").is_none(),
             "null status in PUT body must remove the status field"
         );
+    }
+
+    /// put_namespaced_resource_status with a scalar or array `status` body must be rejected
+    /// with 422, not persisted — same protection as the cluster-scoped handler above, on the
+    /// namespaced route most real resources (Deployments, Leases, ...) actually use.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_rejects_non_object_status() {
+        for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
+            let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+            let lease = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": "put-scalar-lease", "namespace": "kube-node-lease" },
+                "spec": { "holderIdentity": "put-scalar-lease" },
+                "status": { "phase": "Active" }
+            });
+            let key = "/registry/coordination.k8s.io/leases/kube-node-lease/put-scalar-lease";
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let state = crate::state::AppState::new(
+                store.clone(),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            );
+
+            let bad_body = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": "put-scalar-lease", "namespace": "kube-node-lease" },
+                "status": bad_status
+            });
+            let result = put_namespaced_resource_status(
+                axum::extract::State(state),
+                axum::extract::Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "kube-node-lease".into(),
+                    "leases".into(),
+                    "put-scalar-lease".into(),
+                )),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&bad_body).unwrap()),
+            )
+            .await;
+
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "a non-object status ({bad_status}) via PUT must be rejected, not persisted"
+                ),
+            };
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "a non-object status must be rejected with 422: got {bad_status}"
+            );
+
+            let stored = store.get(key).await.unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            assert_eq!(
+                v["status"]["phase"], "Active",
+                "the rejected PUT must not have been persisted for input {bad_status}"
+            );
+        }
     }
 
     /// patch_namespaced_resource_status with merge-patch updates the status field.
@@ -1274,6 +1469,348 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(v["status"]["phase"], "Ready");
         assert_eq!(v["spec"]["drivers"][0]["name"], "csi.io");
+    }
+
+    /// patch_resource_status with a merge-patch body `{"status":"x"}` must be rejected with
+    /// 422, not persisted.
+    ///
+    /// WHY this matters: `status` is a message/object type for every Kubernetes resource.
+    /// `merge_patch` (RFC 7396) legitimately replaces the whole target with the patch value
+    /// whenever the patch is not itself an object, so without this check a scalar `status`
+    /// would silently overwrite the object's status field. That corrupts the stored object's
+    /// own schema AND panics `apply_delete_policy`'s in-place `status["phase"] = ...` stamp on
+    /// the next DELETE of this object — crashing the apiserver for every other request in
+    /// flight, not just failing this one write.
+    #[tokio::test]
+    async fn patch_resource_status_rejects_scalar_status_merge_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "scalar-status-node", "resourceVersion": "1" },
+            "spec": { "drivers": [] },
+            "status": { "phase": "Ready" }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/scalar-status-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!({"status": "x"});
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "scalar-status-node".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a scalar status merge-patch must be rejected, not accepted — it would \
+                 corrupt the object's schema and later crash apply_delete_policy on DELETE"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Ready",
+            "the rejected patch must not have been persisted — status must remain the \
+             original object"
+        );
+    }
+
+    /// `validate_status_json_patch_paths` explicitly permits a JSON Patch op whose path is
+    /// exactly `/status` (a whole-status replace, not a sub-field), so a
+    /// `[{"op":"replace","path":"/status","value":"x"}]` body must be rejected the same way
+    /// the merge-patch equivalent above is — same corrupted-schema-then-apiserver-panic
+    /// outcome, just reached via a different content-type. This is the gap two prior review
+    /// rounds each closed for the merge/strategic-merge branch but left open here.
+    #[tokio::test]
+    async fn patch_resource_status_rejects_scalar_status_json_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "scalar-status-jp-node", "resourceVersion": "1" },
+            "spec": { "drivers": [] },
+            "status": { "phase": "Ready" }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/scalar-status-jp-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut jp_headers = axum::http::HeaderMap::new();
+        jp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+        let patch = serde_json::json!([{"op": "replace", "path": "/status", "value": "x"}]);
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "scalar-status-jp-node".into(),
+            )),
+            jp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a JSON Patch replacing /status with a scalar must be rejected, not \
+                 accepted — it would corrupt the object's schema and later crash \
+                 apply_delete_policy on DELETE"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching the merge-patch behavior"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Ready",
+            "the rejected patch must not have been persisted — status must remain the \
+             original object"
+        );
+    }
+
+    /// patch_resource_status with a merge-patch body `{"status": null}` must be ACCEPTED,
+    /// not 422'd. `null` is RFC 7396's own field-deletion syntax, not an invalid scalar —
+    /// a controller clearing status entirely via /status is legitimate traffic that must
+    /// not be confused with the scalar-status attack the 422 check above exists to reject.
+    #[tokio::test]
+    async fn patch_resource_status_accepts_null_status_as_field_deletion() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "null-status-node", "resourceVersion": "1" },
+            "spec": { "drivers": [] },
+            "status": { "phase": "Ready" }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/null-status-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!({"status": null});
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "null-status-node".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a null status merge-patch is RFC 7396 field deletion, not a 422: {:?}",
+            result.err()
+        );
+    }
+
+    /// patch_namespaced_resource_status with a merge-patch body `{"status":"x"}` must be
+    /// rejected with 422, not persisted — same protection as the cluster-scoped handler above,
+    /// exercised on the namespaced route since most real resources (Deployments, Leases, etc.)
+    /// are namespaced.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_rejects_scalar_status_merge_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "scalar-status-lease", "namespace": "kube-node-lease", "resourceVersion": "1" },
+            "spec": { "holderIdentity": "scalar-status-lease" },
+            "status": { "phase": "Active" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/scalar-status-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!({"status": "x"});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "scalar-status-lease".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a scalar status merge-patch must be rejected, not accepted"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Active",
+            "the rejected patch must not have been persisted — status must remain the \
+             original object"
+        );
+    }
+
+    /// patch_namespaced_resource_status with a JSON Patch body
+    /// `[{"op":"replace","path":"/status","value":"x"}]` must be rejected too — same
+    /// `validate_status_json_patch_paths` whole-`/status`-replace gap as the cluster-scoped
+    /// handler, exercised on the namespaced route.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_rejects_scalar_status_json_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "scalar-status-jp-lease", "namespace": "kube-node-lease", "resourceVersion": "1" },
+            "spec": { "holderIdentity": "scalar-status-jp-lease" },
+            "status": { "phase": "Active" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/scalar-status-jp-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut jp_headers = axum::http::HeaderMap::new();
+        jp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+        let patch = serde_json::json!([{"op": "replace", "path": "/status", "value": "x"}]);
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "scalar-status-jp-lease".into(),
+            )),
+            jp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a JSON Patch replacing /status with a scalar must be rejected, not accepted"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching the merge-patch behavior"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Active",
+            "the rejected patch must not have been persisted — status must remain the \
+             original object"
+        );
     }
 
     /// patch_resource_status with JSON Patch (`application/json-patch+json`) applies operations
@@ -3976,5 +4513,314 @@ mod tests {
             patch_json["apiVersion"], "apps/v1",
             "PATCH /status response must include apiVersion even when the request and stored body omit it"
         );
+    }
+
+    /// Every PUT status-subresource handler must reject a non-object (scalar/array) status
+    /// before persisting it, or a corrupted status crashes the apiserver the next time any
+    /// in-place status stamper (`apply_delete_policy`, `merge_approval_conditions`, ...)
+    /// indexes it. Two prior review rounds each missed a subset of these handlers by
+    /// checking only the ones a reviewer happened to look at — round 1 fixed the
+    /// merge-patch handlers, round 2 fixed two more PATCH sites plus DiD sweep guards, and
+    /// still missed the entire PUT path. Rather than trust a human to re-enumerate every
+    /// handler by hand a fourth time, this test greps every `.rs` file under
+    /// `src/handlers/` for the naming convention every PUT status handler in this codebase
+    /// follows (`fn put_..._status` / `fn replace_..._status`) and fails the moment a new
+    /// one is added without calling the shared guard.
+    #[test]
+    fn every_status_put_handler_guards_against_non_object_status() {
+        // put_namespace_status is the one handler exempt from calling the guard directly: it
+        // round-trips the incoming status through the typed `NamespaceStatus` struct
+        // (`serde_json::from_value::<NamespaceStatus>` then `serde_json::to_value`) before
+        // ever assigning it back, so a scalar/array status is structurally impossible to
+        // produce there — `to_value` on a struct always yields a JSON object.
+        const TYPED_SAFE: &[&str] = &["put_namespace_status"];
+
+        let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
+        let mut checked = Vec::new();
+        let mut unguarded = Vec::new();
+
+        for entry in std::fs::read_dir(&handlers_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", handlers_dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for (name, body) in status_put_handler_bodies(&source) {
+                checked.push(name.clone());
+                if TYPED_SAFE.contains(&name.as_str()) {
+                    continue;
+                }
+                if !body.contains("reject_non_object_status(")
+                    && !body.contains("replace_status_field(")
+                {
+                    unguarded.push(format!("{name} in {}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            checked.len() >= 6,
+            "sanity check: expected at least 6 status-subresource PUT handlers \
+             (put_resource_status, put_namespaced_resource_status, put_cr_status, \
+             put_crd_status, replace_pod_status, put_namespace_status), found {} — did the \
+             put_/replace_ + \"status\" naming convention change (this test would otherwise \
+             pass vacuously)?",
+            checked.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "status-subresource PUT handler(s) persist a raw status value without \
+             rejecting a non-object (scalar/array) status first: {unguarded:?} — a scalar \
+             status corrupts the object's schema and panics the next in-place status \
+             stamper, crashing the apiserver for every other request in flight. Call \
+             replace_status_field (or reject_non_object_status) before persisting, or add \
+             the handler to TYPED_SAFE with a comment proving it structurally cannot store \
+             a non-object status."
+        );
+    }
+
+    /// A guard call *inside* only one patch-content-type branch is not enough: round 3
+    /// added `reject_non_object_status` inside the merge/strategic-merge arm and the
+    /// `PatchType::Json` arm right next to it stayed unguarded, because
+    /// `validate_status_json_patch_paths` explicitly permits a whole-`/status` replace and
+    /// nothing re-checked the result afterward. Every PATCH status-subresource handler must
+    /// instead call the guard as an unconditional statement placed directly in the
+    /// function body — reached no matter which `match patch_type` arm ran — rather than
+    /// nested inside one specific arm. rustfmt indents a function's own top-level
+    /// statements at exactly 4 spaces, so a guard call that only ever shows up deeper than
+    /// that proves it is per-branch rather than a shared convergence point that runs before
+    /// every store write.
+    #[test]
+    fn every_status_patch_handler_guards_non_object_status_outside_any_branch() {
+        let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
+        let mut checked = Vec::new();
+        let mut unguarded = Vec::new();
+
+        for entry in std::fs::read_dir(&handlers_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", handlers_dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for (name, body) in patch_status_handler_bodies(&source) {
+                // Only handlers that dispatch on PatchType::Json are exposed to this bug
+                // class — e.g. patch_pod_status rejects every content-type but
+                // merge/strategic-merge with 415, so it never reaches a JSON Patch arm.
+                if !body.contains("PatchType::Json") {
+                    continue;
+                }
+                checked.push(name.clone());
+
+                let min_guard_indent = body
+                    .lines()
+                    .filter(|l| {
+                        l.contains("reject_non_object_status(")
+                            || l.contains("replace_status_field(")
+                    })
+                    .map(|l| l.len() - l.trim_start().len())
+                    .min();
+
+                if min_guard_indent != Some(4) {
+                    unguarded.push(format!("{name} in {}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            checked.len() >= 4,
+            "sanity check: expected at least 4 JSON-Patch-capable PATCH status-subresource \
+             handlers (patch_resource_status, patch_namespaced_resource_status, \
+             patch_cr_status, patch_crd_status), found {} — did the patch_ + \"status\" \
+             naming convention or the PatchType::Json dispatch change (this test would \
+             otherwise pass vacuously)?",
+            checked.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "PATCH status-subresource handler(s) guard a non-object status only inside one \
+             patch-content-type branch (or not at all), not at a shared convergence point \
+             reached by every branch: {unguarded:?} — a per-branch guard has been missed for \
+             a different content-type in three review rounds running. Call \
+             reject_non_object_status (or replace_status_field) as its own top-level \
+             statement right after the `match patch_type` block, before the store write, so \
+             JSON Patch, merge, and strategic-merge patches are all covered by the same \
+             check."
+        );
+    }
+
+    /// Rounds 1-4 closed every `/status` subresource hole this bug class hid in — round 5's
+    /// independent re-enumeration then found it hiding on the OTHER axis: `patch_namespace`,
+    /// the MAIN `/api/v1/namespaces/{name}` PATCH handler (not `/status`), applied a
+    /// merge-patch to the whole stored object body and restored only `metadata.uid`. A body
+    /// `{"status":"x"}` therefore persisted a scalar status using only ordinary `namespaces`
+    /// `patch` rights — no `namespaces/status` rights needed — corrupting the object exactly
+    /// like the four `/status` holes did, just reached through a different endpoint.
+    ///
+    /// This test covers that other axis: every MAIN-resource (non-status) handler that
+    /// itself persists a write (calls `.put(`, as opposed to a thin wrapper delegating to an
+    /// already-covered handler like `do_patch`) must restore whatever status is already
+    /// stored rather than trust the request body — following the `stored_status` naming
+    /// convention `do_patch` (resource.rs) established, which every fixed site in this repo
+    /// (including this round's `patch_namespace`/`replace_crd`/`patch_crd` fixes) already
+    /// uses. A handler that never touches `status` at all is listed in SAFE with a comment
+    /// proving it structurally cannot.
+    #[test]
+    fn every_main_resource_write_handler_preserves_stored_status() {
+        // Verified by reading each one: `patch_ephemeral_containers` only ever writes
+        // `spec.ephemeralContainers` and never reads `incoming["status"]`; `patch_approval`
+        // only ever writes `status.conditions` from a typed `CertificateSigningRequestStatus`
+        // round-trip (a scalar body value fails to deserialize and is silently ignored via
+        // `.ok()`), and unconditionally restores `spec`/`status.certificate` regardless of
+        // patch type; `patch_pod_resize`'s `apply_resize_patch` never reads
+        // `incoming["status"]` either, only stamping the fixed leaf `status.resize` behind
+        // its own is-object-or-null guard (not the `stored_status` convention, but not a
+        // whole-body clobber this test is about).
+        const SAFE: &[&str] = &[
+            "patch_ephemeral_containers",
+            "patch_approval",
+            "patch_pod_resize",
+        ];
+
+        let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
+        let mut checked = Vec::new();
+        let mut unguarded = Vec::new();
+
+        for entry in std::fs::read_dir(&handlers_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", handlers_dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for (name, body) in main_resource_handler_bodies(&source) {
+                // A handler whose own body never calls `.put(` doesn't persist anything
+                // itself — it's a thin wrapper delegating to an already-checked handler
+                // (patch_resource/patch_namespaced_resource -> do_patch, the core.rs/
+                // certificates.rs wrappers -> resource.rs, the scale PATCH handlers ->
+                // their shared *_impl). Nothing new to check.
+                if !body.contains(".put(") {
+                    continue;
+                }
+                checked.push(name.clone());
+                if SAFE.contains(&name.as_str()) {
+                    continue;
+                }
+                if !body.contains("stored_status") {
+                    unguarded.push(format!("{name} in {}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            checked.len() >= 10,
+            "sanity check: expected at least 10 main-resource write handlers (replace_namespace, \
+             patch_namespace, replace_resource, replace_namespaced_resource, replace_cr, \
+             replace_cr_namespaced, patch_cr, patch_cr_namespaced, replace_crd, patch_crd, \
+             replace_pod, patch_pod, ...), found {} — did the replace_/patch_ naming \
+             convention change (this test would otherwise pass vacuously)?",
+            checked.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "main-resource (non-status) write handler(s) can persist the request body's \
+             `status` field without restoring the stored value first: {unguarded:?} — a \
+             caller holding only ordinary (non-status-subresource) write rights could \
+             persist a scalar status and later panic the next in-place status stamper, \
+             crashing the apiserver for every other request in flight. Capture \
+             `stored_status` before applying the patch/replace and restore it after (see \
+             do_patch in resource.rs), or add the handler to SAFE with a comment proving it \
+             structurally cannot touch status."
+        );
+    }
+
+    /// Extracts `(function_name, body)` for every top-level `pub`/`pub(crate)` function in
+    /// `source` whose name satisfies `matches_name`. Deliberately requires the signature to
+    /// start at column 0 (`line.starts_with("pub")`) so indented `#[tokio::test] async fn
+    /// ..._status_...()` test functions inside `mod tests` are never mistaken for a
+    /// production handler.
+    fn handler_bodies_matching(
+        source: &str,
+        matches_name: impl Fn(&str) -> bool,
+    ) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+        let lines: Vec<&str> = source.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if let Some(name) = line
+                .starts_with("pub")
+                .then(|| line.find("fn "))
+                .flatten()
+                .map(|fn_idx| {
+                    let after = &line[fn_idx + 3..];
+                    let end = after
+                        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(after.len());
+                    after[..end].to_string()
+                })
+            {
+                if matches_name(&name) {
+                    let mut depth = 0i32;
+                    let mut started = false;
+                    let mut body = String::new();
+                    let mut j = i;
+                    while j < lines.len() {
+                        let l = lines[j];
+                        for ch in l.chars() {
+                            if ch == '{' {
+                                depth += 1;
+                                started = true;
+                            } else if ch == '}' {
+                                depth -= 1;
+                            }
+                        }
+                        body.push_str(l);
+                        body.push('\n');
+                        j += 1;
+                        if started && depth <= 0 {
+                            break;
+                        }
+                    }
+                    results.push((name, body));
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        results
+    }
+
+    /// Naming convention every status-subresource PUT handler in this codebase follows.
+    fn status_put_handler_bodies(source: &str) -> Vec<(String, String)> {
+        handler_bodies_matching(source, |name| {
+            (name.starts_with("put_") || name.starts_with("replace_")) && name.contains("status")
+        })
+    }
+
+    /// Naming convention every status-subresource PATCH handler in this codebase follows.
+    fn patch_status_handler_bodies(source: &str) -> Vec<(String, String)> {
+        handler_bodies_matching(source, |name| {
+            name.starts_with("patch_") && name.contains("status")
+        })
+    }
+
+    /// Naming convention every MAIN-resource (non-status) mutating handler in this codebase
+    /// follows: a full-object PUT is always named `replace_*`, a PATCH is always `patch_*`.
+    fn main_resource_handler_bodies(source: &str) -> Vec<(String, String)> {
+        handler_bodies_matching(source, |name| {
+            (name.starts_with("patch_") || name.starts_with("replace_")) && !name.contains("status")
+        })
     }
 }
