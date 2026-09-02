@@ -2357,6 +2357,16 @@ pub async fn create_cr<S: Store>(
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
+    // Dry-run: validation and admission passed; return the would-be created object without
+    // persisting — mirrors create_resource's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
+        if let Some(hv) = warn_header {
+            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        }
+        return Ok(resp);
+    }
+
     // Counts store.put attempts made so far (the loop's first iteration is attempt 1).
     // Bounded at MAX_GENERATE_NAME_CREATE_ATTEMPTS TOTAL attempts, mirroring
     // create_resource/create_namespaced_resource's generateName-collision retry (see
@@ -2547,6 +2557,12 @@ pub async fn replace_cr<S: Store>(
     );
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+
+    // Dry-run: validation and admission passed; return the would-be replaced object without
+    // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(obj));
+    }
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
@@ -3276,6 +3292,16 @@ pub async fn create_cr_namespaced<S: Store>(
     let _quota_lock = state.quota_admission_locks.lock(&ns).await;
     crate::quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj)).await?;
 
+    // Dry-run: validation and admission passed; return the would-be created object without
+    // persisting — mirrors create_namespaced_resource's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
+        if let Some(hv) = warn_header {
+            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        }
+        return Ok(resp);
+    }
+
     let ns_key = cluster_object_key("namespaces", &ns);
     // Namespace-Terminating check and the create are one atomic store transaction — matches
     // kube-apiserver behaviour: 403 Forbidden "unable to create new content in namespace <ns>
@@ -3481,6 +3507,12 @@ pub async fn replace_cr_namespaced<S: Store>(
     );
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+
+    // Dry-run: validation and admission passed; return the would-be replaced object without
+    // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(obj));
+    }
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
@@ -3792,6 +3824,17 @@ pub async fn patch_cr<S: Store>(
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+
+        // Dry-run: validation and admission passed; return the would-be created object
+        // without persisting — mirrors create_cr's dry-run early-return.
+        if is_dry_run_header(&headers) {
+            let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
+            if let Some(hv) = warn_header {
+                resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            }
+            return Ok(resp);
+        }
+
         let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
         let rv = state
             .store
@@ -3909,6 +3952,17 @@ pub async fn patch_cr<S: Store>(
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
+    // Dry-run: validation and admission passed; return the would-be patched object without
+    // persisting — mirrors do_patch's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+        let mut resp = Json(obj).into_response();
+        if let Some(hv) = warn_header {
+            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        }
+        return Ok(resp);
+    }
+
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
@@ -3999,6 +4053,17 @@ pub async fn patch_cr_namespaced<S: Store>(
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+
+        // Dry-run: validation and admission passed; return the would-be created object
+        // without persisting — mirrors create_cr_namespaced's dry-run early-return.
+        if is_dry_run_header(&headers) {
+            let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
+            if let Some(hv) = warn_header {
+                resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            }
+            return Ok(resp);
+        }
+
         let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
         let ns_key = cluster_object_key("namespaces", &ns);
         // Reject object creation in a Terminating namespace, atomically with the create —
@@ -4130,6 +4195,17 @@ pub async fn patch_cr_namespaced<S: Store>(
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+
+    // Dry-run: validation and admission passed; return the would-be patched object without
+    // persisting — mirrors do_patch's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+        let mut resp = Json(obj).into_response();
+        if let Some(hv) = warn_header {
+            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        }
+        return Ok(resp);
+    }
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
@@ -16081,6 +16157,246 @@ mod tests {
             "AdmissionContext.dry_run must reflect the real dry-run flag on the CR path; if \
              this fails, create_cr_namespaced went back to hardcoding dry_run: false and the \
              sideEffects:Some webhook's HTTP endpoint was wrongly invoked on a dry-run request"
+        );
+    }
+
+    fn dry_run_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        h
+    }
+
+    /// `kubectl create -f my-cr.yaml --dry-run=server` must NOT persist the object — a
+    /// dry-run that actually creates the CR silently mutates cluster state against the
+    /// client's explicit intent. Before this fix, create_cr_namespaced had no dry-run
+    /// persistence-skip at all: it always ran the store.put, so this test fails on revert
+    /// with the object present in the store.
+    #[tokio::test]
+    async fn create_cr_namespaced_dry_run_does_not_persist_object() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "dry-run-create-app".to_string();
+
+        let result = create_cr_namespaced(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+            test_user(),
+            dry_run_headers(),
+            app_body(&name, &ns),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run create must still return a success response with the would-be object"
+        );
+
+        let key = cr_store_key(&group, &plural, Some(&ns), &name);
+        let stored = state.store.get(&key).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "dryRun=All must NOT persist the CR — if this fails, create_cr_namespaced's \
+             dry-run guard was removed and the object was actually written to the store"
+        );
+    }
+
+    /// `kubectl apply --server-side --dry-run=server -f my-cr.yaml` against a CR name that
+    /// does not exist yet takes patch_cr_namespaced's SSA create-on-missing branch. A
+    /// dry-run there must NOT persist the object either — this is a separate code path
+    /// from create_cr_namespaced with its own store.put, so it needed its own guard. This
+    /// test fails on revert with the object present in the store.
+    #[tokio::test]
+    async fn patch_cr_namespaced_ssa_create_dry_run_does_not_persist_object() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "dry-run-ssa-create-app".to_string();
+
+        let mut headers = dry_run_headers();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+        let yaml_body = Bytes::from(format!(
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec:\n  destination:\n    namespace: default\n"
+        ));
+
+        let result = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+            test_user(),
+            headers,
+            yaml_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run SSA create-on-missing must still return a success response"
+        );
+
+        let key = cr_store_key(&group, &plural, Some(&ns), &name);
+        let stored = state.store.get(&key).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "dryRun=All must NOT persist the CR via the SSA create-on-missing branch — if \
+             this fails, patch_cr_namespaced's SSA-create dry-run guard was removed and the \
+             object was actually written to the store"
+        );
+    }
+
+    /// `kubectl patch --dry-run=server` against an EXISTING CR must NOT mutate the stored
+    /// object — this exercises patch_cr_namespaced's merge-into-existing branch, a distinct
+    /// code path from the SSA create-on-missing branch above with its own store.put. This
+    /// test fails on revert with the stored spec.color changed to "red".
+    #[tokio::test]
+    async fn patch_cr_namespaced_merge_dry_run_does_not_mutate_store() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "dry-run-patch-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = dry_run_headers();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(serde_json::json!({ "spec": { "color": "red" } }).to_string());
+
+        let result = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run patch must still return a success response"
+        );
+
+        let key = cr_store_key(&group, &plural, Some(&ns), &name);
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("CR must still exist");
+        let stored_json: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_ne!(
+            stored_json["spec"]["destination"],
+            serde_json::Value::Null,
+            "sanity: stored object must still be the original CR body"
+        );
+        assert!(
+            stored_json["spec"]["color"].is_null(),
+            "dryRun=All must NOT mutate the stored CR — if this fails, \
+             patch_cr_namespaced's merge-branch dry-run guard was removed and spec.color \
+             was actually persisted as \"red\""
+        );
+    }
+
+    /// `kubectl replace --dry-run=server -f my-cr.yaml` must NOT persist the replacement —
+    /// this test fails on revert with the stored object's spec.color changed to "green".
+    #[tokio::test]
+    async fn replace_cr_namespaced_dry_run_does_not_mutate_store() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "dry-run-replace-app".to_string();
+
+        let created = create_cr_namespaced(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body(&name, &ns),
+        )
+        .await
+        .expect("create must succeed")
+        .into_response();
+        let created_body = axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut created_json: serde_json::Value = serde_json::from_slice(&created_body).unwrap();
+        created_json["spec"]["color"] = serde_json::Value::String("green".to_string());
+
+        let result = replace_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+            test_user(),
+            dry_run_headers(),
+            Bytes::from(created_json.to_string()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run replace must still return a success response"
+        );
+
+        let key = cr_store_key(&group, &plural, Some(&ns), &name);
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("CR must still exist");
+        let stored_json: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            stored_json["spec"]["color"].is_null(),
+            "dryRun=All must NOT mutate the stored CR — if this fails, \
+             replace_cr_namespaced's dry-run guard was removed and spec.color was actually \
+             persisted as \"green\""
         );
     }
 

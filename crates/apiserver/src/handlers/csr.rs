@@ -307,6 +307,12 @@ pub async fn create_csr<S: Store>(
         map.remove("status");
     }
 
+    // Dry-run: validation and admission passed; return the would-be created object without
+    // persisting — mirrors create_resource's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
+    }
+
     // Counts store.put attempts made so far (the loop's first iteration is attempt 1).
     // Bounded at MAX_GENERATE_NAME_CREATE_ATTEMPTS TOTAL attempts, mirroring
     // create_resource/create_cr's generateName-collision retry (see resource.rs/cr.rs) —

@@ -288,6 +288,13 @@ pub(crate) async fn create_namespace<S: Store>(
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
+    // Dry-run: validation and admission passed; return the would-be created namespace
+    // without persisting — mirrors create_resource's dry-run early-return in resource.rs.
+    // Also skips the kube-root-ca.crt seed below, which is itself a store write.
+    if is_dry_run_header(&headers) {
+        return Ok((StatusCode::CREATED, Json(obj.body)));
+    }
+
     let key = cluster_object_key("namespaces", &name);
     let new_rv = state
         .store

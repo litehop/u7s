@@ -590,6 +590,12 @@ pub async fn create_crd<S: Store>(
     let name = crd.metadata.name.clone();
     let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
 
+    // Dry-run: validation and admission passed; return the would-be created CRD without
+    // persisting — mirrors create_resource's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        return Ok((StatusCode::CREATED, Json(crd)));
+    }
+
     let key = store_key(&name);
     let rv = state
         .store
@@ -737,6 +743,12 @@ pub async fn replace_crd<S: Store>(
         run_validating_webhooks(&state, &mutated, None, &admission_ctx).await?;
         crd = serde_json::from_value(mutated)
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+    }
+
+    // Dry-run: validation and admission passed; return the would-be replaced CRD without
+    // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(crd));
     }
 
     let rv = state
@@ -941,6 +953,12 @@ pub async fn patch_crd<S: Store>(
         })?;
         let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
 
+        // Dry-run: validation and admission passed; return the would-be created CRD without
+        // persisting — mirrors create_crd's dry-run early-return.
+        if is_dry_run_header(&headers) {
+            return Ok((StatusCode::CREATED, Json(crd)).into_response());
+        }
+
         let rv = state
             .store
             .put(&key, to_bytes(&crd)?, Some(0))
@@ -1049,6 +1067,12 @@ pub async fn patch_crd<S: Store>(
         run_validating_webhooks(&state, &mutated, None, &admission_ctx).await?;
         crd = serde_json::from_value(mutated)
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+    }
+
+    // Dry-run: validation and admission passed; return the would-be patched CRD without
+    // persisting — mirrors do_patch's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(crd).into_response());
     }
 
     let rv = state
@@ -1554,6 +1578,139 @@ mod tests {
                 .await
                 .is_ok(),
             "correct name widgets.example.io must be accepted"
+        );
+    }
+
+    fn dry_run_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        h
+    }
+
+    /// `kubectl create -f my-crd.yaml --dry-run=server` must NOT persist the CRD — a
+    /// dry-run that actually creates it silently mutates cluster state (and the discovery
+    /// cache) against the client's explicit intent. This test fails on revert with the CRD
+    /// present in the store.
+    #[tokio::test]
+    async fn create_crd_dry_run_does_not_persist() {
+        let state = make_state();
+        let name = "applications.argoproj.io";
+
+        let result = create_crd(
+            State(state.clone()),
+            test_user(),
+            dry_run_headers(),
+            minimal_crd_bytes(name),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run create must still return a success response with the would-be CRD"
+        );
+
+        let stored = state.store.get(&store_key(name)).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "dryRun=All must NOT persist the CRD — if this fails, create_crd's dry-run \
+             guard was removed and the CRD was actually written to the store"
+        );
+    }
+
+    /// `kubectl apply --server-side --dry-run=server -f my-crd.yaml` against a CRD name
+    /// that does not exist yet takes patch_crd's SSA create-on-missing branch — a separate
+    /// code path from create_crd with its own store.put. This test fails on revert with the
+    /// CRD present in the store.
+    #[tokio::test]
+    async fn patch_crd_ssa_create_dry_run_does_not_persist() {
+        let state = make_state();
+        let name = "applications.argoproj.io";
+
+        let mut headers = dry_run_headers();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+        let yaml_body = Bytes::from_static(
+            b"apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: applications.argoproj.io\nspec:\n  group: argoproj.io\n  names:\n    plural: applications\n    singular: application\n    kind: Application\n    listKind: ApplicationList\n  scope: Namespaced\n  versions:\n  - name: v1alpha1\n    served: true\n    storage: true\n",
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            yaml_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run SSA create-on-missing must still return a success response"
+        );
+
+        let stored = state.store.get(&store_key(name)).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "dryRun=All must NOT persist the CRD via the SSA create-on-missing branch — if \
+             this fails, patch_crd's SSA-create dry-run guard was removed and the CRD was \
+             actually written to the store"
+        );
+    }
+
+    /// `kubectl patch --dry-run=server` against an EXISTING CRD must NOT mutate the stored
+    /// object — this exercises patch_crd's merge-into-existing branch, a distinct code path
+    /// from the SSA create-on-missing branch above with its own store.put. This test fails
+    /// on revert with the stored metadata.labels actually updated.
+    #[tokio::test]
+    async fn patch_crd_merge_dry_run_does_not_mutate_store() {
+        let state = make_state();
+        let name = "applications.argoproj.io";
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes(name),
+        )
+        .await
+        .expect("create must succeed");
+
+        let mut headers = dry_run_headers();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!({ "metadata": { "labels": { "team": "dry-run" } } }).to_string(),
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run patch must still return a success response"
+        );
+
+        let stored = state
+            .store
+            .get(&store_key(name))
+            .await
+            .unwrap()
+            .expect("CRD must still exist");
+        let stored_json: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            stored_json["metadata"]["labels"].is_null(),
+            "dryRun=All must NOT mutate the stored CRD — if this fails, patch_crd's \
+             merge-branch dry-run guard was removed and metadata.labels.team was actually \
+             persisted as \"dry-run\""
         );
     }
 
