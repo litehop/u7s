@@ -148,6 +148,39 @@ source; critical-reviewer.md's default posture is to read first and
 execute only when reading is insufficient, naming the hypothesis when it
 does. No wording change is needed in briefs.
 
+## Guard-invariant-everywhere beads — require full-surface enumeration in round 1
+
+A "guard an invariant everywhere" bug class (e.g. "handler X must reject a
+DELETE while `<condition>`" across every request-handling path) is sized by
+its SURFACE, not its bug: if the invariant must hold across N handlers × M
+content-type/code-path branches, a round-1 brief that scopes to just one
+dimension (one handler, or one path) leaves the other cells of that matrix
+unguarded — and each missed cell becomes its own multi-hour re-review round.
+
+**Motivating case (mayor-j1oq9):** a status-subresource typed-validation
+guard (merge-PATCH bypassing it to persist an arbitrary scalar) went 4
+rounds — round 1 fixed the merge-PATCH handlers; round 2's re-review found
+the PUT path still unguarded; round 3's re-review found the JSON-Patch
+content-type branch was STILL unguarded, prompting round 4's own brief to
+note "per-path/per-branch guarding has missed THREE times now." Rounds 3+4
+alone totaled tens of millions of total-tokens-processed (cache_read +
+cache_creation + input, summed across every turn) for a bug class a single
+round-1 2D matrix (5 handlers × 3 patch content-types = 15 sites) could
+plausibly have closed outright.
+
+**Fix, mandatory when scoping this bug class:**
+- The round-1 brief must state the full matrix explicitly — every handler
+  (or entry path) × every content-type/code-path branch the invariant must
+  hold across — not just the branch where the bug was first observed.
+- The brief must require the fix to land at the SHARED convergence point
+  (the one function/module all branches funnel through) wherever one
+  exists, rather than N separate per-branch guards that can drift out of
+  sync — a per-branch fix is the failure mode that produced the 4 rounds
+  above.
+- The worker's return must confirm coverage against the stated matrix (e.g.
+  a small table, or an explicit "sites: 15/15 guarded" line), not just
+  "fixed the reported case."
+
 ## Common preamble (every dispatch)
 
 worker.md (loaded automatically by the harness as every worker's system
