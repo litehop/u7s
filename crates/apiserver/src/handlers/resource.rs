@@ -5860,6 +5860,175 @@ mod tests {
         }
     }
 
+    /// The test above only exercises do_patch's primary SSA-create success path (the two
+    /// bindings it creates never collide on a name). A second writer racing for the *same*
+    /// not-yet-existing name instead falls into the CreateNamespacedError::AlreadyExists
+    /// branch, which merges into the winner's object and has its own separate
+    /// `rbac_index.apply_object` call — a revert of only that fallback-branch hook would
+    /// leave the race's loser request indexed-but-invisible to the authorizer, and the
+    /// sequential test above can never observe that because it never forces a real race.
+    ///
+    /// This test forces two SSA-create requests for the same ClusterRoleBinding name — each
+    /// naming a *different* subject — to race (both see the name absent, since do_patch's
+    /// very first await is the existence check, so `tokio::join!` guarantees both dispatch
+    /// it before either can proceed to the create). `subjects` is a replace-only (last-
+    /// write-wins) field under strategic-merge-patch, so whichever request loses the create
+    /// race and falls into the merge branch is also the one whose subject ends up in the
+    /// final stored object — reading that back (instead of hardcoding which request "wins")
+    /// pins the assertion to whichever request the race-fallback branch actually processed.
+    #[tokio::test]
+    async fn ssa_created_clusterrolebinding_race_fallback_also_indexes_rbac() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Same escalation-satisfying setup as the sequential test above: "admin" (the
+        // creator, via test_user()) must already hold every rule of the role it binds to.
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/service-lister",
+            &serde_json::json!({
+                "rules": [{ "apiGroups": [""], "resources": ["services"], "verbs": ["list"] }]
+            }),
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/test-admin-service-lister",
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": "admin" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "service-lister"
+                }
+            }),
+        );
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        // Both requests target the same not-yet-existing name but name different subjects,
+        // so whichever one actually lands via the merge branch is identifiable afterward.
+        let body_for = |sa_name: &str| {
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "ClusterRoleBinding",
+                    "metadata": { "name": "race-created-crb" },
+                    "subjects": [{ "kind": "ServiceAccount", "namespace": "test", "name": sa_name }],
+                    "roleRef": {
+                        "apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "ClusterRole",
+                        "name": "service-lister"
+                    }
+                }))
+                .unwrap(),
+            )
+        };
+
+        let first = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "rbac.authorization.k8s.io".to_string(),
+                "v1".to_string(),
+                "clusterrolebindings".to_string(),
+                "race-created-crb".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers.clone(),
+            body_for("race-sa-first"),
+        );
+        let second = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "rbac.authorization.k8s.io".to_string(),
+                "v1".to_string(),
+                "clusterrolebindings".to_string(),
+                "race-created-crb".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            body_for("race-sa-second"),
+        );
+        let (first_result, second_result) = tokio::join!(first, second);
+
+        let mut statuses: Vec<axum::http::StatusCode> = [first_result, second_result]
+            .into_iter()
+            .map(|r| {
+                r.unwrap_or_else(|e| {
+                    panic!(
+                        "both racing SSA-create requests for the same name must succeed — \
+                         one via do_patch's primary create path, the other via the \
+                         AlreadyExists race-fallback merge — got error: {e:?}"
+                    )
+                })
+                .into_response()
+                .status()
+            })
+            .collect();
+        statuses.sort_by_key(|s| s.as_u16());
+        assert_eq!(
+            statuses,
+            vec![axum::http::StatusCode::OK, axum::http::StatusCode::CREATED],
+            "exactly one of the two racing SSA-create requests must win the primary create \
+             (201) while the other loses and lands in the race-fallback merge branch (200); \
+             if this doesn't hold, the two requests never actually raced and this test isn't \
+             exercising the fallback branch it exists to cover"
+        );
+
+        // "subjects" is last-write-wins under strategic-merge-patch, so the stored object's
+        // subject identifies exactly which request the race-fallback branch merged in.
+        let key = crate::keys::group_object_key(
+            "rbac.authorization.k8s.io",
+            "clusterrolebindings",
+            None,
+            "race-created-crb",
+        );
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("the racing pair must leave exactly one ClusterRoleBinding persisted");
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let final_sa = stored_body["subjects"][0]["name"]
+            .as_str()
+            .expect("stored ClusterRoleBinding must carry a subject name");
+
+        let username = format!("system:serviceaccount:test:{final_sa}");
+        let groups: Vec<String> = vec![];
+        let req = crate::rbac::AuthzRequest {
+            username: &username,
+            groups: &groups,
+            verb: "list",
+            api_group: "",
+            resource: "services",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&req),
+            "the ClusterRoleBinding's actual persisted subject ({final_sa}) must be \
+             authorized — this subject is whichever request lost the create race and was \
+             merged in by the race-fallback branch, so if that branch's own \
+             rbac_index.apply_object call regresses, the authorizer's index is left holding \
+             only the create-race winner's now-stale subject and this fails"
+        );
+    }
+
     /// SSA-created RBAC bindings must obey escalation-prevention; a low-priv client crafting
     /// a self-privilege-escalating CRB via `kubectl apply --server-side` must be rejected.
     ///
