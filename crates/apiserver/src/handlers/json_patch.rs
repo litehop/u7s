@@ -687,13 +687,37 @@ pub(crate) fn ssa_body_to_json(
         .ok_or_else(|| Status::bad_request("SSA body contains unparseable value".into()))
 }
 
+/// Recursion depth cap for `yaml_to_json`, matching serde_json's own
+/// `remaining_depth` limit (de.rs) so YAML and JSON apply-patch bodies behave
+/// consistently. yaml-rust2 caps FLOW-style (`[`/`{`) nesting at 255 in its
+/// scanner, but BLOCK-style (indentation) nesting — what kubectl apply
+/// --server-side actually sends — has no such cap, so this tree-walk needs
+/// its own guard. Confirmed safe against the apiserver's real worker-thread
+/// stack (512 KiB, see main.rs's `.thread_stack_size`): a release build
+/// survives raw recursion to depth ~500-1000 before overflowing that stack
+/// with nothing else on it, and even an unoptimized debug build survives to
+/// ~150-200 — this cap leaves a wide margin below both for the handler-chain
+/// frames sitting above `ssa_body_to_json` in a real request.
+const MAX_YAML_DEPTH: usize = 128;
+
 /// Recursively convert a `yaml_rust2::Yaml` node to a `serde_json::Value`.
 ///
 /// Returns `None` for `BadValue` (malformed YAML node) so the caller can
 /// surface a 400 instead of silently storing garbage.
 fn yaml_to_json(y: &yaml_rust2::Yaml) -> Option<serde_json::Value> {
+    yaml_to_json_depth(y, 0)
+}
+
+fn yaml_to_json_depth(y: &yaml_rust2::Yaml, depth: usize) -> Option<serde_json::Value> {
     use serde_json::{Number, Value};
     use yaml_rust2::Yaml;
+    // BLOCK-style (indentation) YAML nesting has no cap in yaml-rust2's scanner,
+    // unlike FLOW-style (`[`/`{`) nesting — without this check a small, deeply
+    // nested apply-patch+yaml body overflows the stack and aborts the whole
+    // process (every in-flight connection), not just this request.
+    if depth > MAX_YAML_DEPTH {
+        return None;
+    }
     Some(match y {
         Yaml::String(s) => Value::String(s.clone()),
         Yaml::Integer(i) => Value::Number(Number::from(*i)),
@@ -708,7 +732,11 @@ fn yaml_to_json(y: &yaml_rust2::Yaml) -> Option<serde_json::Value> {
             }
         }
         Yaml::Boolean(b) => Value::Bool(*b),
-        Yaml::Array(a) => Value::Array(a.iter().map(yaml_to_json).collect::<Option<Vec<_>>>()?),
+        Yaml::Array(a) => Value::Array(
+            a.iter()
+                .map(|v| yaml_to_json_depth(v, depth + 1))
+                .collect::<Option<Vec<_>>>()?,
+        ),
         Yaml::Hash(m) => {
             let mut map = serde_json::Map::new();
             for (k, v) in m {
@@ -724,7 +752,7 @@ fn yaml_to_json(y: &yaml_rust2::Yaml) -> Option<serde_json::Value> {
                     // be coerced to a string key — skip the entry.
                     _ => continue,
                 };
-                map.insert(key, yaml_to_json(v)?);
+                map.insert(key, yaml_to_json_depth(v, depth + 1)?);
             }
             Value::Object(map)
         }
@@ -1215,6 +1243,63 @@ mod tests {
         assert!(
             result.is_err(),
             "non-finite float (.inf) in YAML must return Err (400) — JSON has no Infinity"
+        );
+    }
+
+    /// Builds an `apply-patch+yaml` body consisting of `depth` nested BLOCK-style
+    /// (indentation) YAML mappings, e.g. depth=3: `"a:\n a:\n  a: 1\n"`. This is the
+    /// nesting style kubectl apply --server-side actually sends (not `[`/`{` FLOW
+    /// style), and yaml-rust2's scanner has no depth cap for it.
+    fn nested_block_mapping_body(depth: usize) -> Vec<u8> {
+        let mut b = Vec::with_capacity(depth * 4);
+        for i in 0..depth {
+            b.extend(std::iter::repeat_n(b' ', i));
+            if i + 1 == depth {
+                b.extend_from_slice(b"a: 1\n");
+            } else {
+                b.extend_from_slice(b"a:\n");
+            }
+        }
+        b
+    }
+
+    /// A BLOCK-style YAML apply-patch body nested far past MAX_YAML_DEPTH must be
+    /// rejected with a clean 400, not crash the process. Before the depth guard,
+    /// yaml_to_json's recursion was bounded only by the OS stack: a single small
+    /// (~20 KB) authenticated PATCH with 5,000 levels of nesting could overflow a
+    /// tokio worker thread's stack and SIGABRT the whole apiserver, dropping every
+    /// in-flight connection — not just the attacker's own request.
+    #[test]
+    fn ssa_body_to_json_rejects_block_style_yaml_past_max_depth() {
+        let body = nested_block_mapping_body(MAX_YAML_DEPTH * 4);
+        let result = ssa_body_to_json(&body);
+        assert!(
+            result.is_err(),
+            "YAML nested far past MAX_YAML_DEPTH must return Err (400) instead of \
+             recursing until the process overflows its stack and aborts"
+        );
+    }
+
+    /// A legitimately deep (but well under the cap) YAML body must still parse
+    /// successfully — the depth guard exists to stop a stack-overflow DoS, not
+    /// to reject real nested specs (e.g. deeply structured CRD schemas) that
+    /// never approach anywhere near attacker-crafted nesting.
+    #[test]
+    fn ssa_body_to_json_accepts_block_style_yaml_under_max_depth() {
+        let depth = MAX_YAML_DEPTH / 2;
+        let body = nested_block_mapping_body(depth);
+        let val = ssa_body_to_json(&body)
+            .expect("YAML nested well under MAX_YAML_DEPTH must still parse cleanly");
+        // Walk to the innermost "a" to confirm the whole depth actually survived
+        // conversion (not just that *something* parsed).
+        let mut cur = &val;
+        for _ in 0..depth - 1 {
+            cur = &cur["a"];
+        }
+        assert_eq!(
+            cur["a"].as_i64(),
+            Some(1),
+            "every nesting level under the cap must survive YAML → JSON conversion intact"
         );
     }
 
