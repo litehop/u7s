@@ -150,6 +150,21 @@ does. No wording change is needed in briefs.
 
 ## Common preamble (every dispatch)
 
+worker.md (loaded automatically by the harness as every worker's system
+prompt) is now the complete home for the stable, always-applicable rules
+below: command shaping, native-tool preferences, LSP-first navigation, code
+style, evidence & time discipline, and the git-hooks/cargo-verification
+order. **Do not re-paste those subsections into a dispatch brief** — every
+worker already has them regardless of bead type. They are kept below,
+marked, only as background reference (e.g. measurement provenance for the
+cargo-timing numbers) — worker.md is the version to update if the rule
+itself changes. A brief needs only: task-specifics (bead ID, context,
+concrete steps, quality-gate commands), a VM/port assignment if the bead
+needs one (Lima VM protocol block, below), and the two worktree paths
+(Worktree boundary block, above — the checklist itself is now in worker.md
+too). The subsections NOT marked "moved to worker.md" below are genuinely
+conditional — inject them verbatim only for the bead types they name.
+
 ```
 You are implementing bead **<BEAD_ID>** in <project description>.
 
@@ -158,6 +173,9 @@ You are implementing bead **<BEAD_ID>** in <project description>.
 ## Tooling rules (mandatory)
 
 ### Command shaping — PERMISSION-CRITICAL (read first)
+
+**Moved to worker.md Rule 7 — do not paste this subsection into a dispatch
+brief; every worker already has it.** Kept below as reference only.
 
 The Bash permission allowlist matches on the command's **first token** and the
 **whole compound string**. Violating the shape below makes EVERY such call prompt
@@ -190,6 +208,9 @@ reshape it into single allowlisted commands; do not abandon the task.
 
 ### Other tooling
 
+**Moved to worker.md Rules 6, 8, 9 — do not paste this subsection into a
+dispatch brief.** Kept below as reference only.
+
 - Use `jq` for JSON parsing in shell — never `python3 -c`.
 - Use the `Read` tool for file reads — never `cat`, `head`, or `tail` via Bash.
 - Use the `Edit` tool for targeted edits — never `sed` or `awk` via Bash.
@@ -221,6 +242,12 @@ reshape it into single allowlisted commands; do not abandon the task.
   stall the session. Use the right tool the first time.
 
 ### Git hooks & cargo verification (mandatory — know warm vs. cold cost per pass)
+
+**The actionable order-of-operations is now in worker.md's Workflow
+section (steps 5-7) — do not paste this subsection into a dispatch brief.**
+Kept below as reference for the underlying measurement provenance and the
+full warm/cold breakdown, since worker.md's condensed version keeps only
+the actionable total.
 
 The repo has both a pre-commit and a pre-push hook. Knowing what each runs saves
 minutes per iteration:
@@ -372,6 +399,9 @@ this repo. When you need it:
 
 ## Evidence & time discipline (mandatory)
 
+**Moved to worker.md Rule 11 — do not paste this section into a dispatch
+brief.** Kept below as reference only.
+
 - Before asserting WHEN something happened or what a time gap MEANS, confirm it
   against an actual timestamp — never infer ordering from memory or vibes.
   Sources of truth: the log line's own timestamp, the run-directory name
@@ -387,6 +417,9 @@ this repo. When you need it:
   did not verify it, say so explicitly rather than stating it as fact (Rule 12).
 
 ## Code style rules (mandatory)
+
+**Moved to worker.md Rule 10 — do not paste this section into a dispatch
+brief.** Kept below as reference only.
 
 - Do NOT hard-wrap text destined for the GitHub UI — PR bodies, PR/issue
   comments, critical-reviewer review bodies. GFM renders a manual newline
@@ -879,15 +912,15 @@ When a worker returns from a VM/sonobuoy-touching bead:
   Inject the Lima VM protocol block and enforce VM evidence at return-review time.
 - **Workers use Python or shell tools instead of permitted built-ins.**
   `python3 -c` for JSON, `cat`/`head` for file reads, `sed`/`awk` for edits
-  — all trigger permission prompts and slow the session. Always inject the
-  common preamble verbatim.
+  — all trigger permission prompts and slow the session. worker.md's Rule 6
+  already covers this for every worker — no brief injection needed.
 - **Workers grep `~/.cargo` vendored crate files to understand a dependency's
   API instead of using the LSP.** The `mcpls` Rust LSP is live and warm here
   (verified 2026-07-13). `get_hover` on an external symbol returns its signature
   + resolved generics + doc + docs.rs link without reading a file; `get_definition`
   jumps to the exact vendored file+line. Grepping the registry by hand is slower,
   misses resolved types, and triggers permission prompts. Two drivers, both fixed
-  in the preamble: (1) the vendored-crate navigation case wasn't spelled out; (2)
+  in worker.md Rule 9: (1) the vendored-crate navigation case wasn't spelled out; (2)
   the `workspace_symbol_search`-returns-empty caveat got over-generalized into
   "LSP is unreliable here" — it is specific to name-search; hover/definition/
   references at a position work fine. See bd memory `mcpls-rust-lsp-works-dont-grep-cargo`.
@@ -899,8 +932,8 @@ When a worker returns from a VM/sonobuoy-touching bead:
   after / previous / stale" claim, verify against the log timestamp, run-dir name,
   `gh pr view --json mergedAt`, or commit time — and normalize timezones (apiserver
   UTC vs ginkgo/run-dir local). At review time, distrust any temporal claim in a
-  worker's return that isn't backed by a quoted timestamp. See the "Evidence & time
-  discipline" block — inject it via the common preamble.
+  worker's return that isn't backed by a quoted timestamp. See worker.md Rule 11
+  ("Evidence & time discipline") — every worker already has it, no injection needed.
 - **Workers burn 10–25 min per sonobuoy run when kubectl would answer in seconds.**
   A `--focus` run is slow and can hang (watchdog reaps the namespace at 10 min,
   ginkgo then flails ~15 more min). Iterating diagnosis on sonobuoy is the single
@@ -933,18 +966,18 @@ When a worker returns from a VM/sonobuoy-touching bead:
 - **Hook split: pre-commit checks fmt; pre-push checks test+clippy.** Workers
   who only run `cargo fmt` before committing will hit a test failure at push
   time with no stacktrace. Quality gate (test+clippy) must run before commit,
-  not just before push. See "Git hooks & cargo verification" in the common
-  preamble for the full order-of-operations.
+  not just before push. See worker.md's Workflow steps 5-7 for the full
+  order-of-operations — every worker already has it, no injection needed.
 - **Workers re-run `cargo test` after a green pass to grep for FAILURE/ERROR.**
   Observed repeatedly: worker runs `cargo test --workspace --quiet`, sees no
   failure lines, doesn't trust the silent-success, re-runs piped to `grep -E
   'FAILED|ERROR'` — duplicating the test-suite run (~25-30s warm-cache, more
-  on a cold worktree — see "Git hooks & cargo verification") for zero
+  on a cold worktree — see "Git hooks & cargo verification" below) for zero
   additional signal. `cargo test`'s summary line (`test result: ok. N passed;
-  0 failed;`) IS authoritative; grep-verification adds nothing. The "Reading
-  `cargo test` output" note in the common preamble tells the worker to trust
-  the summary line and use `cargo test -- --nocapture <testname>` if a
-  specific test's stacktrace is needed.
+  0 failed;`) IS authoritative; grep-verification adds nothing. worker.md's
+  Workflow step 5 already tells the worker to trust the summary line and use
+  `cargo test -- --nocapture <testname>` if a specific test's stacktrace is
+  needed.
 - **Workers manually re-run test+clippy right before `git push`.** They ran it
   before commit (correct), then re-run it before push "to be safe" — but the
   pre-push hook runs the exact same commands unconditionally right after. Cargo
@@ -955,8 +988,9 @@ When a worker returns from a VM/sonobuoy-touching bead:
   speedup from 45.5s to 15.8s warm, since propagated to `.claude/settings.json`
   (mayor-snjh1, PR #1214) and CI (mayor-dajfe, PR #1215)). Net: ~40-50s of
   duplicated wall-clock per push, for zero signal (the hook would have caught
-  anything a manual re-run would have caught). Common preamble now explicitly
-  says: run test+clippy ONCE before commit, do NOT re-run before push.
+  anything a manual re-run would have caught). worker.md's Workflow step 7
+  now explicitly says: run test+clippy ONCE before commit, do NOT re-run
+  before push.
 - **Mayor "gets into the flow" and codes instead of dispatching.** The
   four-condition exception test is easy to rationalize past once the mayor has
   already read several files. The fourth condition (≤2 files read) is the
@@ -977,7 +1011,7 @@ When a worker returns from a VM/sonobuoy-touching bead:
   but using it again is safe (everything regenerates consistently). The Lima VM protocol
   block states this explicitly; enforce it at return-review time.
 - **Workers embed bead IDs and task refs in source comments.** These rot
-  immediately as beads close and PRs age. The common preamble bans bead IDs
+  immediately as beads close and PRs age. worker.md Rule 10 bans bead IDs
   in source. Enforce it at review time — if a diff contains `(mayor-`, send
   the worker back.
 - **Generic prompts produce generic work.** Always include file:line

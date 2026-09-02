@@ -33,6 +33,9 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
    - **Never lead with `cd`** — use `git -C <path>` or your worktree CWD + path args.
    - A denied Bash call = your command was mis-shaped (inline env, batch, leading `cd`/`export`, non-allowlisted first token). Reshape into single allowlisted commands; don't abandon the task.
 8. **Grep-to-locate before Read** — before `Read`-ing a file you haven't windowed yet, grep (or an LSP call at a known position) to find the target region first, then `Read` with `offset`/`limit`. A bare full-file `Read` is a last resort, not a default first move — it silently truncates at the tool's line-count cap with no error, so an unfamiliar file's tail can vanish from context without you noticing.
+9. **LSP-first code navigation** — for callers, usage paths, rename impact, or a symbol's type, use the `mcp__mcpls__*` LSP tools: grep to find the symbol string + line, then `get_references`/`get_definition`/`get_hover` at that position for the compiler's real view (`prepare_call_hierarchy` + `get_incoming_calls` for multi-hop callers). To understand an external/vendored crate's API, `get_hover`/`get_definition` on the call site resolves generics, docs, and jumps straight into the vendored source — don't grep `~/.cargo/registry` by hand. `workspace_symbol_search` (whole-workspace name search) needs a warm index and can return empty in a fresh worktree; that caveat is specific to name search — hover/definition/references at a position work fine.
+10. **Code style** — do not hard-wrap text destined for the GitHub UI (PR bodies, PR/issue comments): GFM renders a manual newline as a hard break there, so wrapped text can't reflow. Do hard-wrap repo markdown (`docs/`, `ai/`, READMEs) — plain markdown collapses single newlines, so wrapping there is free and gives cleaner diffs. Write no comments by default; add one only for a non-obvious WHY. Never reference bead IDs, PR numbers, or issue refs in source or comments — they rot the moment the bead closes; that history belongs in git/PR history. Never reference callers or "used by X" in code for the same reason.
+11. **Evidence & time discipline** — before asserting WHEN something happened or what a gap means, confirm it against an actual timestamp (the log line's own timestamp, a run-directory name, `gh pr view --json mergedAt`, commit time) — never infer ordering from memory. Don't say "a previous run", "predates PR #X", or "stale binary" unless you checked. Watch timezones (apiserver logs are UTC; e2e/run-dir names are often local) and normalize before comparing. Quote the evidence for any claim; say explicitly if you didn't verify it.
 
 ## Worktree boundary (mandatory)
 
@@ -94,11 +97,22 @@ bd show <id>
 
 # 4. Implement — surgical, minimal changes
 
-# 5. Run quality gates (CWD is already the worktree root)
+# 5. Sync with main, then run quality gates ONCE, before commit
+# (CWD is already the worktree root). Do this before every push, not just
+# fix rounds — the branch drifts behind main during a long dispatch.
+git fetch origin main
+git rev-list --count HEAD..origin/main   # nonzero → merge and resolve now
 cargo test --workspace --quiet 2>&1 | tail -30
 cargo clippy --workspace --tests --quiet --no-deps -- -D warnings 2>&1 | tail -20
+# `0 failed` in cargo test's summary line is authoritative — don't re-run
+# piped to grep to double-check a green pass; use `cargo test -- --nocapture
+# <testname>` if you need one failing test's stacktrace. A cold worktree's
+# first-ever cargo invocation compiles test binaries from scratch (~80-85s
+# for this pair) — set a longer Bash timeout up front rather than let a
+# default fire mid-build.
 
-# 6. Commit — draft the message from your own diff, not from memory of what
+# 6. Commit — pre-commit re-checks `cargo fmt` only (fix + recommit if it
+# fails). Draft the message from your own diff, not from memory of what
 # you wrote. For a non-trivial diff, ground the message with
 # Agent(subagent_type="diff-summarizer", prompt="<your `git diff` output>")
 # instead of re-reading the whole diff yourself; use its summary/
@@ -106,7 +120,8 @@ cargo clippy --workspace --tests --quiet --no-deps -- -D warnings 2>&1 | tail -2
 git add <files>
 git commit -m "feat(<area>): <what and why>"
 
-# 7. Push and open PR
+# 7. Push and open PR — pre-push re-runs test+clippy; don't manually re-run
+# them yourself right before this, the hook already will.
 git push
 gh pr create --title "..." --body "..."
 
