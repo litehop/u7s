@@ -1038,12 +1038,19 @@ When a worker returns from a VM/sonobuoy-touching bead:
   assigned VM name, port, and kubelet port from the mayor. Hard-coding the defaults causes
   collisions when multiple workers run in parallel. Always use the values from the dispatch
   prompt. Workers always bind to `127.0.0.1`; port is the only isolation boundary.
-- **Worker skips `--reset` on first run.** The first `run-all.sh` call in a worktree
-  must use `--reset` — the VM may have stale certs or port-forward config from a previous
-  owner. Omitting it on the first run risks inheriting stale VM state. Subsequent calls
-  in the same worktree should omit `--reset` to avoid the ~5 min VM reprovision penalty,
-  but using it again is safe (everything regenerates consistently). The Lima VM protocol
-  block states this explicitly; enforce it at return-review time.
+- **Worker applies `--reset` to a warm, cleanly-reaped slot.** `--reset` is required only
+  when the assigned VM is COLD (first use this session, not yet provisioned), known-broken,
+  or was left running by a DIFFERENT/unknown prior owner — it may carry stale certs or
+  port-forward config from that owner. When the dispatch brief notes the slot was CLEANLY
+  REAPED by the immediately-prior round (that round ran `reset.sh --host-only`; the VM is
+  still fully provisioned, only host processes were killed), the worker must reconnect
+  WITHOUT `--reset` (memory `lima-vm-reset-only-for-cold-or-broken-vm-not-warm-reaped`).
+  `--reset` forces a full `limactl delete --force` + reprovision — ~15-20min, can stall on
+  cri-o/sonobuoy checks (memory `run-all-sh-reset-does-full-vm-delete-recreate`; corrects
+  this doc's earlier ~5min estimate) — so applying it to an already-warm slot wastes a full
+  reprovision for nothing: observed on #1517/mayor-j1oq9 rounds 3-5, all on `lima-node-4`,
+  each cleanly reaped by the prior round. State explicitly in every continuation-round
+  dispatch which case applies; enforce it at return-review time.
 - **Workers embed bead IDs and task refs in source comments.** These rot
   immediately as beads close and PRs age. worker.md Rule 10 bans bead IDs
   in source. Enforce it at review time — if a diff contains `(mayor-`, send
