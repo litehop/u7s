@@ -203,6 +203,7 @@ pub async fn patch_resource_status<S: Store>(
                         }
                         PatchType::Json => unreachable!(),
                     }
+                    reject_non_object_status(entry)?;
                 }
             }
             merge_incoming_metadata(&mut current.body, &patch, &meta.kind);
@@ -382,6 +383,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
                         }
                         PatchType::Json => unreachable!(),
                     }
+                    reject_non_object_status(entry)?;
                 }
             }
             merge_incoming_metadata(&mut current.body, &patch, &kind);
@@ -398,6 +400,22 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     current.set_resource_version(new_rv);
     inject_type_meta(&mut current.body, &group, &version, &kind);
     Ok(Json(current.body))
+}
+
+/// A resource's `status` is always a message/object type in the Kubernetes API — never a
+/// scalar or array. `merge_patch` (RFC 7396) legitimately replaces `target` wholesale
+/// whenever `patch` is not itself an object, so a merge-patch body like `{"status":"x"}`
+/// would otherwise silently persist a scalar `status`. That corrupts the object's own
+/// schema and, worse, panics any code that later stamps status fields in place via
+/// `obj.body["status"]["field"] = ...` (e.g. `apply_delete_policy`), crashing the apiserver.
+/// Reject before it's ever written to the store.
+fn reject_non_object_status(status: &serde_json::Value) -> Result<(), crate::status::StatusError> {
+    if status.is_object() {
+        return Ok(());
+    }
+    Err(Status::unprocessable_entity(format!(
+        "status must be an object, got {status}"
+    )))
 }
 
 /// Validate that every op in a JSON Patch sent to a /status subresource targets
@@ -1274,6 +1292,146 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(v["status"]["phase"], "Ready");
         assert_eq!(v["spec"]["drivers"][0]["name"], "csi.io");
+    }
+
+    /// patch_resource_status with a merge-patch body `{"status":"x"}` must be rejected with
+    /// 422, not persisted.
+    ///
+    /// WHY this matters: `status` is a message/object type for every Kubernetes resource.
+    /// `merge_patch` (RFC 7396) legitimately replaces the whole target with the patch value
+    /// whenever the patch is not itself an object, so without this check a scalar `status`
+    /// would silently overwrite the object's status field. That corrupts the stored object's
+    /// own schema AND panics `apply_delete_policy`'s in-place `status["phase"] = ...` stamp on
+    /// the next DELETE of this object — crashing the apiserver for every other request in
+    /// flight, not just failing this one write.
+    #[tokio::test]
+    async fn patch_resource_status_rejects_scalar_status_merge_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "scalar-status-node", "resourceVersion": "1" },
+            "spec": { "drivers": [] },
+            "status": { "phase": "Ready" }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/scalar-status-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!({"status": "x"});
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "scalar-status-node".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a scalar status merge-patch must be rejected, not accepted — it would \
+                 corrupt the object's schema and later crash apply_delete_policy on DELETE"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Ready",
+            "the rejected patch must not have been persisted — status must remain the \
+             original object"
+        );
+    }
+
+    /// patch_namespaced_resource_status with a merge-patch body `{"status":"x"}` must be
+    /// rejected with 422, not persisted — same protection as the cluster-scoped handler above,
+    /// exercised on the namespaced route since most real resources (Deployments, Leases, etc.)
+    /// are namespaced.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_rejects_scalar_status_merge_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "scalar-status-lease", "namespace": "kube-node-lease", "resourceVersion": "1" },
+            "spec": { "holderIdentity": "scalar-status-lease" },
+            "status": { "phase": "Active" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/scalar-status-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!({"status": "x"});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "scalar-status-lease".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a scalar status merge-patch must be rejected, not accepted"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Active",
+            "the rejected patch must not have been persisted — status must remain the \
+             original object"
+        );
     }
 
     /// patch_resource_status with JSON Patch (`application/json-patch+json`) applies operations
