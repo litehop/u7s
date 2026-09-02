@@ -409,7 +409,9 @@ pub async fn patch_namespaced_resource_status<S: Store>(
 /// schema and, worse, panics any code that later stamps status fields in place via
 /// `obj.body["status"]["field"] = ...` (e.g. `apply_delete_policy`), crashing the apiserver.
 /// Reject before it's ever written to the store.
-fn reject_non_object_status(status: &serde_json::Value) -> Result<(), crate::status::StatusError> {
+pub(crate) fn reject_non_object_status(
+    status: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
     if status.is_object() {
         return Ok(());
     }

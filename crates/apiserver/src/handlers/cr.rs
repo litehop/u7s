@@ -4385,6 +4385,7 @@ pub async fn patch_cr_status<S: Store>(
                         }
                         PatchType::Json => unreachable!(),
                     }
+                    crate::handlers::status::reject_non_object_status(entry)?;
                 }
             }
             crate::handlers::status::merge_incoming_metadata(&mut current, &patch, &kind);
@@ -11814,6 +11815,75 @@ mod tests {
         assert_eq!(
             obj["spec"]["color"], "blue",
             "patch_cr_status must not alter .spec — status is a separate subresource"
+        );
+    }
+
+    /// patch_cr_status with a merge-patch body `{"status":"x"}` must be rejected with 422,
+    /// not persisted. This is the cluster-scoped catch-all status route (covers every
+    /// non-core-group cluster-scoped built-in resource, e.g. CSINode, plus cluster-scoped
+    /// CRDs) — `status` is a message/object type for every resource, so a scalar `status`
+    /// corrupts the object's schema and later panics `apply_delete_policy`'s in-place
+    /// `status["field"] = ...` stamp on the next DELETE, crashing the apiserver for every
+    /// other request in flight.
+    #[tokio::test]
+    async fn patch_cr_status_rejects_scalar_status_merge_patch() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "scalar-status-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(serde_json::json!({ "status": "x" }).to_string());
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                headers,
+                patch_body,
+            )
+            .await,
+            "a scalar status merge-patch must be rejected, not accepted — it would corrupt \
+             the object's schema and later crash apply_delete_policy on DELETE",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let resp = get_cr_status(State(state.clone()), Path((group, version, plural, name)))
+            .await
+            .expect("get_cr_status must still succeed")
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            obj.get("status").is_none() || obj["status"].is_object(),
+            "the rejected patch must not have been persisted — status must remain absent \
+             or an object, never the scalar \"x\""
         );
     }
 
