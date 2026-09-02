@@ -6467,9 +6467,17 @@ mod tests {
     }
 
     /// Symmetric baseline for the test above: a user who already holds every rule of a Role
-    /// must be allowed to SSA-create a RoleBinding to it. Without this, the escalation check
-    /// above could be over-broad and reject legitimate `kubectl apply --server-side` of
-    /// RoleBindings a caller is entitled to create.
+    /// in the target namespace must be allowed to SSA-create a RoleBinding to it. Without
+    /// this, the escalation check above could be over-broad and reject legitimate `kubectl
+    /// apply --server-side` of RoleBindings a caller is entitled to create.
+    ///
+    /// "eve" here is a plain low-priv user (no `bind` verb on the Role, not
+    /// `system:masters`), so unlike an admin identity she cannot satisfy
+    /// check_rb_escalation's earlier bind-verb `is_allowed` bypass — reaching CREATED
+    /// requires falling through to `user_holds_all_rules_in_namespace` and it returning
+    /// true. If that function wrongly returned false for a user who already holds every
+    /// rule, this test would fail with a 403 instead of the RoleBinding a legitimate
+    /// low-priv caller is entitled to create.
     #[tokio::test]
     async fn ssa_create_rolebinding_allowed_for_user_holding_role_rules() {
         use axum::response::IntoResponse;
@@ -6485,30 +6493,24 @@ mod tests {
                 "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]}]
             }),
         );
-
-        // Seed cluster-admin and system:masters binding so "admin" passes escalation.
+        // "eve" already holds get/list-pods in "default" via her own RoleBinding to that
+        // same Role — no `bind` verb, no system:masters group membership.
         state.rbac_index.apply_object(
-            &format!("/apis/{group}/v1/clusterroles/cluster-admin"),
+            &format!("/apis/{group}/v1/namespaces/{ns}/rolebindings/eve-pod-reader"),
             &serde_json::json!({
-                "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
-            }),
-        );
-        state.rbac_index.apply_object(
-            &format!("/apis/{group}/v1/clusterrolebindings/system-masters-cluster-admin"),
-            &serde_json::json!({
-                "subjects": [{"kind": "Group", "name": "system:masters"}],
-                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "cluster-admin"}
+                "subjects": [{"kind": "User", "name": "eve"}],
+                "roleRef": {"apiGroup": group, "kind": "Role", "name": "pod-reader"}
             }),
         );
 
-        let admin = Extension(crate::auth::UserInfo {
-            username: "admin".into(),
+        let eve = Extension(crate::auth::UserInfo {
+            username: "eve".into(),
             uid: String::new(),
-            groups: vec!["system:masters".into()],
+            groups: vec![],
             extra: Default::default(),
         });
 
-        // "admin" (system:masters) SSA-creates a RoleBinding granting pod-reader to "bob".
+        // eve grants "bob" the exact same pod-reader role she already holds.
         let rb_body = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "RoleBinding",
@@ -6533,17 +6535,18 @@ mod tests {
                 "bob-pod-reader".to_string(),
             )),
             axum::extract::Query(PatchQuery::default()),
-            admin,
+            eve,
             ssa_headers,
             bytes::Bytes::from(serde_json::to_vec(&rb_body).unwrap()),
         )
         .await
         .unwrap_or_else(|e| {
             panic!(
-                "escalation-prevention must not block a system:masters admin from \
-                 SSA-creating a RoleBinding to a Role they already hold every rule of — this \
-                 test isolates that the check above is denying alice on privilege grounds, \
-                 not by accident rejecting every SSA-created RoleBinding: {e:?}"
+                "escalation-prevention must not block a low-priv user from SSA-creating a \
+                 RoleBinding to a Role they already hold every rule of in this namespace — \
+                 this test isolates that user_holds_all_rules_in_namespace is allowing eve \
+                 on privilege grounds, not by accident rejecting every SSA-created \
+                 RoleBinding: {e:?}"
             )
         })
         .into_response();
