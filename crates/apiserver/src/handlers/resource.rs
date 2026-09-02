@@ -1546,6 +1546,31 @@ pub(crate) async fn do_patch<S: Store>(
         super::defaults::validate_resource(group, plural, &current.body)
             .map_err(Status::unprocessable_entity)?;
 
+        // Escalation prevention: this PATCH merges into an existing Role/ClusterRole/
+        // RoleBinding/ClusterRoleBinding, so the merged rules must be checked exactly like
+        // the SSA-create-on-missing branch above and create_resource/replace_resource's
+        // checks — otherwise a caller who holds PATCH (but not `escalate`) on an existing
+        // Role/ClusterRole could raise their own privileges by patching its rules, a bypass
+        // a full PUT/POST on the same object would have rejected.
+        check_crb_escalation(plural, group, user, &current.body, state)?;
+        check_clusterrole_escalation(plural, group, user, &current.body, state)?;
+        check_rb_escalation(
+            plural,
+            group,
+            ns.unwrap_or_default(),
+            user,
+            &current.body,
+            state,
+        )?;
+        check_role_escalation(
+            plural,
+            group,
+            ns.unwrap_or_default(),
+            user,
+            &current.body,
+            state,
+        )?;
+
         if let Some(ref spec_before) = spec_before_patch {
             // Restore the stored generation before computing the increment so that a patch
             // attempting to set metadata.generation is ignored — same restore-then-increment
@@ -5901,6 +5926,120 @@ mod tests {
         .into_response();
 
         assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+    }
+
+    /// do_patch's patch-into-EXISTING-object branch (as opposed to the SSA create-on-missing
+    /// branch tested above) called none of the four escalation checks before this fix — a
+    /// caller who holds `patch` (but not `escalate`) on an already-bound ClusterRole could
+    /// merge-patch its `rules` to grant themselves arbitrary privileges, a bypass a PUT/POST
+    /// on the same object would have rejected. This is the regression test for that gap:
+    /// "mallory" holds only get-pods, and PATCHes an already-bound ClusterRole's rules to
+    /// wildcard — the escalation check must deny it, and the stored rules must stay
+    /// unchanged.
+    #[tokio::test]
+    async fn patch_resource_denies_clusterrole_rule_escalation_on_existing_bound_role() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        // "escalate-target" ClusterRole already exists (in the store, so do_patch's
+        // stored_opt is Some — this is the patch-EXISTING path, not SSA create-on-missing)
+        // with a narrow rule, and is already bound by a ClusterRoleBinding — both conditions
+        // check_clusterrole_escalation requires before it applies at all (an unbound role
+        // has nothing to escalate).
+        let cr_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "escalate-target"},
+            "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+        });
+        let key = crate::keys::group_object_key(group, "clusterroles", None, "escalate-target");
+        state
+            .store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&cr_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("seed escalate-target ClusterRole");
+
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/escalate-target"),
+            &cr_body,
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/escalate-target-binding"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "someone-else"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "escalate-target"}
+            }),
+        );
+
+        // "mallory" holds only get-pods cluster-wide — nowhere near the wildcard rule she's
+        // about to try to grant herself.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/pod-getter"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+            }),
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/mallory-pod-getter"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "mallory"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "pod-getter"}
+            }),
+        );
+
+        let mallory = Extension(crate::auth::UserInfo {
+            username: "mallory".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let escalating_patch = serde_json::json!({
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+
+        let result = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                "v1".to_string(),
+                "clusterroles".to_string(),
+                "escalate-target".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            mallory,
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&escalating_patch).unwrap()),
+        )
+        .await;
+
+        const INVARIANT: &str = "a caller without `escalate` must not be able to raise their \
+             own privileges by PATCHing the rules of an already-bound ClusterRole — the same \
+             guard a PUT/POST already enforces";
+        match result {
+            Err(err) => assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN, "{INVARIANT}"),
+            Ok(_) => panic!("{INVARIANT}"),
+        }
+
+        // Ordering: a rejected escalation must not leave the wildcard rule persisted.
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["rules"],
+            serde_json::json!([{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]),
+            "the escalation check must run before the store write — if this fails, the \
+             wildcard rule was persisted despite the 403 (do_patch's patch-existing branch \
+             went back to skipping check_clusterrole_escalation)"
+        );
     }
 
     /// SSA apply-create (do_patch's is_ssa && stored_opt.is_none() upsert branch) had no
