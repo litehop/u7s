@@ -347,7 +347,7 @@ pub(crate) async fn create_resource<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: create_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -419,7 +419,7 @@ pub(crate) async fn create_resource<S: Store>(
                         "groups": user.groups,
                         "extra": user.extra,
                     })),
-                    dry_run: false,
+                    dry_run: create_query.is_dry_run(),
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
@@ -759,7 +759,7 @@ pub(crate) async fn replace_resource<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: replace_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -1546,6 +1546,31 @@ pub(crate) async fn do_patch<S: Store>(
         super::defaults::validate_resource(group, plural, &current.body)
             .map_err(Status::unprocessable_entity)?;
 
+        // Escalation prevention: this PATCH merges into an existing Role/ClusterRole/
+        // RoleBinding/ClusterRoleBinding, so the merged rules must be checked exactly like
+        // the SSA-create-on-missing branch above and create_resource/replace_resource's
+        // checks — otherwise a caller who holds PATCH (but not `escalate`) on an existing
+        // Role/ClusterRole could raise their own privileges by patching its rules, a bypass
+        // a full PUT/POST on the same object would have rejected.
+        check_crb_escalation(plural, group, user, &current.body, state)?;
+        check_clusterrole_escalation(plural, group, user, &current.body, state)?;
+        check_rb_escalation(
+            plural,
+            group,
+            ns.unwrap_or_default(),
+            user,
+            &current.body,
+            state,
+        )?;
+        check_role_escalation(
+            plural,
+            group,
+            ns.unwrap_or_default(),
+            user,
+            &current.body,
+            state,
+        )?;
+
         if let Some(ref spec_before) = spec_before_patch {
             // Restore the stored generation before computing the increment so that a patch
             // attempting to set metadata.generation is ignored — same restore-then-increment
@@ -1586,7 +1611,7 @@ pub(crate) async fn do_patch<S: Store>(
             namespace: ns,
             operation: "UPDATE",
             user_info: user_info.clone(),
-            dry_run: false,
+            dry_run,
         };
         current.body = run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
         run_validating_webhooks(state, &current.body, None, &admission_ctx).await?;
@@ -2571,7 +2596,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: create_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -2670,7 +2695,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
                         "groups": user.groups,
                         "extra": user.extra,
                     })),
-                    dry_run: false,
+                    dry_run: create_query.is_dry_run(),
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
@@ -3235,7 +3260,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: replace_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -5901,6 +5926,120 @@ mod tests {
         .into_response();
 
         assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+    }
+
+    /// do_patch's patch-into-EXISTING-object branch (as opposed to the SSA create-on-missing
+    /// branch tested above) called none of the four escalation checks before this fix — a
+    /// caller who holds `patch` (but not `escalate`) on an already-bound ClusterRole could
+    /// merge-patch its `rules` to grant themselves arbitrary privileges, a bypass a PUT/POST
+    /// on the same object would have rejected. This is the regression test for that gap:
+    /// "mallory" holds only get-pods, and PATCHes an already-bound ClusterRole's rules to
+    /// wildcard — the escalation check must deny it, and the stored rules must stay
+    /// unchanged.
+    #[tokio::test]
+    async fn patch_resource_denies_clusterrole_rule_escalation_on_existing_bound_role() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        // "escalate-target" ClusterRole already exists (in the store, so do_patch's
+        // stored_opt is Some — this is the patch-EXISTING path, not SSA create-on-missing)
+        // with a narrow rule, and is already bound by a ClusterRoleBinding — both conditions
+        // check_clusterrole_escalation requires before it applies at all (an unbound role
+        // has nothing to escalate).
+        let cr_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "escalate-target"},
+            "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+        });
+        let key = crate::keys::group_object_key(group, "clusterroles", None, "escalate-target");
+        state
+            .store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&cr_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("seed escalate-target ClusterRole");
+
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/escalate-target"),
+            &cr_body,
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/escalate-target-binding"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "someone-else"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "escalate-target"}
+            }),
+        );
+
+        // "mallory" holds only get-pods cluster-wide — nowhere near the wildcard rule she's
+        // about to try to grant herself.
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterroles/pod-getter"),
+            &serde_json::json!({
+                "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]
+            }),
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/v1/clusterrolebindings/mallory-pod-getter"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "mallory"}],
+                "roleRef": {"apiGroup": group, "kind": "ClusterRole", "name": "pod-getter"}
+            }),
+        );
+
+        let mallory = Extension(crate::auth::UserInfo {
+            username: "mallory".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let escalating_patch = serde_json::json!({
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+
+        let result = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                "v1".to_string(),
+                "clusterroles".to_string(),
+                "escalate-target".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            mallory,
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&escalating_patch).unwrap()),
+        )
+        .await;
+
+        const INVARIANT: &str = "a caller without `escalate` must not be able to raise their \
+             own privileges by PATCHing the rules of an already-bound ClusterRole — the same \
+             guard a PUT/POST already enforces";
+        match result {
+            Err(err) => assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN, "{INVARIANT}"),
+            Ok(_) => panic!("{INVARIANT}"),
+        }
+
+        // Ordering: a rejected escalation must not leave the wildcard rule persisted.
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["rules"],
+            serde_json::json!([{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]),
+            "the escalation check must run before the store write — if this fails, the \
+             wildcard rule was persisted despite the 403 (do_patch's patch-existing branch \
+             went back to skipping check_clusterrole_escalation)"
+        );
     }
 
     /// SSA apply-create (do_patch's is_ssa && stored_opt.is_none() upsert branch) had no
@@ -17210,6 +17349,122 @@ mod tests {
             stored.is_none(),
             "dry-run POST must NOT persist the object — store must remain empty; \
              if this fails, the dryRun=All check in create_namespaced_resource was removed"
+        );
+    }
+
+    /// A `sideEffects: Some` mutating webhook has no contractual guarantee it honors
+    /// `dryRun: true` in the AdmissionReview it receives — invoking it anyway on a
+    /// `--dry-run=server` create could trigger a real external side effect the client
+    /// explicitly opted out of. Before this fix, create_namespaced_resource constructed
+    /// AdmissionContext with `dry_run: false` hardcoded regardless of the real ?dryRun=All
+    /// query param, so admission.rs's sideEffects gate never saw dry_run=true and let every
+    /// webhook through unconditionally. Reverting that fix makes this test fail: the
+    /// webhook's HTTP endpoint gets called (call_count > 0) and the request succeeds
+    /// instead of being rejected with 400 "does not support dry run".
+    #[tokio::test]
+    async fn create_namespaced_resource_dry_run_does_not_invoke_side_effects_some_webhook() {
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counter = call_count.clone();
+        let router = Router::new().route(
+            "/mutate",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": { "uid": "uid-dry-run-side-effects", "allowed": true }
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = start_mock_admission_webhook_server(router).await;
+
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "dry-run-side-effects-mwc"},
+            "webhooks": [{
+                "name": "side-effects-some.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{
+                    "apiGroups": ["*"], "apiVersions": ["*"], "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "sideEffects": "Some"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/dry-run-side-effects-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "dry-run-cm", "namespace": "default" },
+            "data": { "k": "v" }
+        });
+        let dry_run_query = CreateQuery {
+            _field_manager: None,
+            field_validation: None,
+            dry_run: Some("All".to_string()),
+        };
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(dry_run_query),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "dryRun=All against a sideEffects:Some webhook (default failurePolicy=Fail) must \
+                 be rejected with 400 \"does not support dry run\", not silently allowed through \
+                 — a 2xx here means the sideEffects gate never saw dry_run=true"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "dryRun=All against a sideEffects:Some webhook (default failurePolicy=Fail) must be \
+             rejected with 400 \"does not support dry run\", not silently allowed through — a \
+             2xx here means the sideEffects gate never saw dry_run=true"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "AdmissionContext.dry_run must reflect the real ?dryRun=All flag; if this fails, \
+             create_namespaced_resource went back to hardcoding dry_run: false and the \
+             sideEffects:Some webhook's HTTP endpoint was wrongly invoked on a dry-run request"
         );
     }
 

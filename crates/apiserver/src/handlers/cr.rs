@@ -14,6 +14,7 @@ use crate::{
     },
     auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
+    handlers::json_patch::is_dry_run_header,
     keys::cluster_object_key,
     state::AppState,
     status::Status,
@@ -2350,7 +2351,7 @@ pub async fn create_cr<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
@@ -2400,7 +2401,7 @@ pub async fn create_cr<S: Store>(
                         "groups": user.groups,
                         "extra": user.extra,
                     })),
-                    dry_run: false,
+                    dry_run: is_dry_run_header(&headers),
                 };
                 run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
             }
@@ -2536,7 +2537,7 @@ pub async fn replace_cr<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     debug_assert_eq!(
@@ -3260,7 +3261,7 @@ pub async fn create_cr_namespaced<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
@@ -3333,7 +3334,7 @@ pub async fn create_cr_namespaced<S: Store>(
                         "groups": user.groups,
                         "extra": user.extra,
                     })),
-                    dry_run: false,
+                    dry_run: is_dry_run_header(&headers),
                 };
                 run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
             }
@@ -3470,7 +3471,7 @@ pub async fn replace_cr_namespaced<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     debug_assert_eq!(
@@ -3786,7 +3787,7 @@ pub async fn patch_cr<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
-            dry_run: false,
+            dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
@@ -3892,7 +3893,7 @@ pub async fn patch_cr<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
@@ -3993,7 +3994,7 @@ pub async fn patch_cr_namespaced<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
-            dry_run: false,
+            dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
@@ -4114,7 +4115,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
@@ -15833,6 +15834,115 @@ mod tests {
             "validating webhook with failurePolicy=Fail must deny CR creation — \
              if the validating webhook chain is not called, the Fail-policy webhook \
              would be skipped and the create would incorrectly succeed"
+        );
+    }
+
+    /// A `sideEffects: Some` mutating webhook has no contractual guarantee it honors
+    /// `dryRun: true` in the AdmissionReview it receives — invoking it anyway on a
+    /// dry-run CR create could trigger a real external side effect the client explicitly
+    /// opted out of. Before this fix, create_cr_namespaced constructed AdmissionContext
+    /// with `dry_run: false` hardcoded regardless of the real request (create_cr_namespaced
+    /// has no Query extractor of its own — it's invoked directly by resource.rs's
+    /// CRD-fallback path, not dispatched by axum), so the sideEffects gate never saw
+    /// dry_run=true and always invoked the webhook. Reverting the fix makes this test
+    /// fail: the webhook's HTTP endpoint gets called (call_count > 0) and the create
+    /// succeeds instead of being rejected with 400 "does not support dry run".
+    #[tokio::test]
+    async fn create_cr_namespaced_dry_run_does_not_invoke_side_effects_some_webhook() {
+        use bytes::Bytes;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::net::TcpListener;
+        use u7s_store::Store;
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counter = call_count.clone();
+        let router = axum::Router::new().route(
+            "/mutate",
+            axum::routing::post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": { "uid": "uid-cr-dry-run", "allowed": true }
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock webhook server must not fail");
+        });
+
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "cr-dry-run-side-effects-mwc"},
+            "webhooks": [{
+                "name": "cr-side-effects-some.example.com",
+                "clientConfig": { "url": format!("http://{addr}/mutate") },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                "sideEffects": "Some"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/cr-dry-run-side-effects-mwc",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Mirrors what the router-wide inject_dry_run_header layer (lib.rs) stamps onto a
+        // real ?dryRun=All request before it reaches create_cr_namespaced — this test calls
+        // the handler directly, bypassing the router, so the header is set by hand.
+        let mut dry_run_headers = axum::http::HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let result = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            test_user(),
+            dry_run_headers,
+            app_body("dry-run-app", "argocd"),
+        )
+        .await;
+
+        let err = expect_err_status(
+            result,
+            "dryRun=All against a sideEffects:Some webhook (default failurePolicy=Fail) must \
+             be rejected with 400 \"does not support dry run\", not silently allowed through \
+             — an Ok here means the CR create path never saw dry_run=true",
+        );
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "dry-run rejection must come from the sideEffects gate (400), not some other \
+             admission failure"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "AdmissionContext.dry_run must reflect the real dry-run flag on the CR path; if \
+             this fails, create_cr_namespaced went back to hardcoding dry_run: false and the \
+             sideEffects:Some webhook's HTTP endpoint was wrongly invoked on a dry-run request"
         );
     }
 

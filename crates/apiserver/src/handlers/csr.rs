@@ -36,6 +36,7 @@ use crate::{
             parse_field_selector, parse_label_selector, resolve_name, stamp_metadata,
             validate_name, wants_generate_name, CollectionQuery, MAX_GENERATE_NAME_CREATE_ATTEMPTS,
         },
+        json_patch::is_dry_run_header,
         watch::{fetch_initial_events, watch_generic, WatchConfig},
     },
     keys::{group_list_prefix, group_object_key},
@@ -293,7 +294,7 @@ pub async fn create_csr<S: Store>(
             "groups": user.groups.clone(),
             "extra": user.extra.clone(),
         })),
-        dry_run: false,
+        dry_run: is_dry_run_header(&headers),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -347,7 +348,7 @@ pub async fn create_csr<S: Store>(
                         "groups": user.groups.clone(),
                         "extra": user.extra.clone(),
                     })),
-                    dry_run: false,
+                    dry_run: is_dry_run_header(&headers),
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }

@@ -1252,6 +1252,13 @@ fn build_router(state: AppState) -> Router {
             state.clone(),
             handlers::aggregation::proxy_middleware::<SqliteStore>,
         ))
+        // Threads the real ?dryRun=All flag into handlers with no Query<...> extractor of
+        // their own (CRD/CSR/Namespace create/replace/patch, and CR create/replace/patch
+        // reached via resource.rs's fallback) — see json_patch::DRY_RUN_HEADER for why
+        // AdmissionContext.dry_run otherwise stays hardcoded false on those paths.
+        .layer(axum::middleware::from_fn(
+            handlers::json_patch::inject_dry_run_header,
+        ))
         .with_state(state)
 }
 
