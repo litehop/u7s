@@ -2111,8 +2111,8 @@ pub fn resolve_pod_container_port(
 /// `validate_webhook_url`'s identical, already-reviewed exemption in admission.rs, and this
 /// file's own test suite dials an in-process TCP listener at 127.0.0.1 to stand in for a
 /// pod/Service backend throughout. Every *other* encoding of loopback (IPv6 `::1`, or an
-/// IPv4 loopback embedded in an IPv6-mapped literal) has no such legitimate use and is still
-/// rejected below, along with every other reserved range.
+/// IPv4 loopback embedded in an IPv6-mapped/compatible literal) has no such legitimate use
+/// and is still rejected below, along with every other reserved range.
 fn validate_proxy_target_ip(addr: &str) -> Result<(), String> {
     let ip: std::net::IpAddr = addr
         .parse()
@@ -2121,15 +2121,22 @@ fn validate_proxy_target_ip(addr: &str) -> Result<(), String> {
     let reserved = match ip {
         std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_multicast() || v4.is_unspecified(),
         std::net::IpAddr::V6(v6) => {
+            // These direct checks must run (logically) ahead of the embedded-v4 unwrap
+            // below: e.g. `::1`.to_ipv4() is Some(0.0.0.1), which no IPv4 range check
+            // would flag on its own, so `::1` is only ever caught because is_loopback()
+            // is also part of this same OR.
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 // fe80::/10 — IPv6 link-local, analogous to IPv4's 169.254.0.0/16.
                 || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80)
-                // ::ffff:a.b.c.d (RFC 4291 §2.5.5.2) carries an IPv4 address in the low 32
-                // bits that the checks above never inspect — an attacker could otherwise
-                // bypass every IPv4 range check just by writing the mapped IPv6 form.
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
+                // `to_ipv4()` unwraps BOTH the IPv4-mapped (::ffff:a.b.c.d, RFC 4291
+                // §2.5.5.2) and the older IPv4-compatible (::a.b.c.d, no `ffff:`) forms,
+                // which both carry an IPv4 address in the low 32 bits that the checks
+                // above never inspect. `to_ipv4_mapped()` alone only catches the mapped
+                // form — the compatible form (e.g. `::169.254.169.254`) would otherwise
+                // parse as a valid IpAddr and bypass every IPv4 range check.
+                || v6.to_ipv4().is_some_and(|v4| {
                     v4.is_loopback()
                         || v4.is_link_local()
                         || v4.is_multicast()
@@ -3238,6 +3245,22 @@ mod tests {
             result.is_err(),
             "::ffff:169.254.169.254 must be rejected — it carries the same blocked IPv4 \
              payload as 169.254.169.254 and must not bypass the check via IPv6-mapped form"
+        );
+    }
+
+    /// The older, legacy IPv4-*compatible* form (`::a.b.c.d`, no `ffff:` prefix) of a
+    /// blocked IPv4 address must also be rejected. `to_ipv4_mapped()` alone only unwraps
+    /// the `::ffff:a.b.c.d` form; `"::169.254.169.254".parse::<IpAddr>()` succeeds and,
+    /// with only that narrower unwrap, would pass every check here and reach the dial —
+    /// the exact SSRF bypass this test locks in against a regression.
+    #[test]
+    fn validate_proxy_target_ip_rejects_ipv4_compatible_cloud_metadata() {
+        let result = validate_proxy_target_ip("::169.254.169.254");
+        assert!(
+            result.is_err(),
+            "::169.254.169.254 must be rejected — it carries the same blocked IPv4 payload \
+             as 169.254.169.254 and must not bypass the check via the legacy IPv4-compatible \
+             IPv6 form"
         );
     }
 
