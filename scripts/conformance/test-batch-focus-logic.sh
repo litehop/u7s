@@ -100,6 +100,65 @@ assert "1 spec / batch-size 12 -> 1 batch of 1" \
   "$([ "$(count_batches 1 12)" -eq 1 ] && [ "$(last_batch_size 1 12)" -eq 1 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# ran_count_from_summary() -- mirrors batch-focus.sh's own function verbatim.
+# ---------------------------------------------------------------------------
+ran_count_from_summary() {
+  printf '%s' "$1" | grep -oE '^Ran [0-9]+ of' | grep -oE '[0-9]+' || true
+}
+
+# 9. A real ginkgo summary line yields the actual ran count.
+assert "ran_count_from_summary extracts 4 from a real 'Ran 4 of 7579 Specs' summary" \
+  "$([ "$(ran_count_from_summary 'Ran 4 of 7579 Specs in 32.269 seconds SUCCESS! -- 4 Passed')" = "4" ] && echo 1 || echo 0)"
+# 10. The exact regression this fix targets: a 0-match focus still reports
+#     "Ran 0 of ... SUCCESS!" -- must extract 0, not treat it as "no line
+#     found" (those two cases need different handling: an empty result means
+#     the log had no summary at all, e.g. a crash; "0" means ginkgo ran and
+#     legitimately matched nothing).
+assert "ran_count_from_summary extracts 0 (not empty) from a genuine 0-match summary" \
+  "$([ "$(ran_count_from_summary 'Ran 0 of 7579 Specs in 0.1 seconds SUCCESS! -- 0 Passed')" = "0" ] && echo 1 || echo 0)"
+# 11. No "Ran ..." line at all (e.g. a crashed batch never reached ginkgo's
+#     own summary printer) must yield empty, not a false "0" or a script
+#     abort -- see the `|| true` comment in the real function: under
+#     `set -e`, an unguarded failing pipeline here would abort every
+#     remaining batch, not just flag this one.
+assert "ran_count_from_summary returns empty (not aborting under set -e) when no Ran line exists" \
+  "$([ -z "$(ran_count_from_summary 'panic: runtime error' || true)" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# Count-mismatch-forces-failure -- mirrors the real script's BATCH_EXIT
+# escalation. This is the actual regression target: a batch ginkgo reports
+# as exit 0 must not stay "green" if it ran the wrong number of specs.
+# ---------------------------------------------------------------------------
+mismatch_forces_fail() {
+  local batch_exit="$1" ran_count="$2" intended_count="$3"
+  local count_mismatch=0
+  if [ -z "$ran_count" ] || [ "$ran_count" -ne "$intended_count" ]; then
+    count_mismatch=1
+  fi
+  if [ "$batch_exit" -eq 0 ] && [ "$count_mismatch" -eq 1 ]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# 12. The exact bug report: exit 0 + 0-of-N ran -> must be forced to fail.
+assert "exit=0 with ran=0 (intended=4) is forced to fail" \
+  "$([ "$(mismatch_forces_fail 0 0 4)" = "1" ] && echo 1 || echo 0)"
+# 13. exit=0 with an exact count match must NOT be touched -- a correct
+#     batch must still report as a genuine pass.
+assert "exit=0 with ran=4 (intended=4) is NOT forced to fail" \
+  "$([ "$(mismatch_forces_fail 0 4 4)" = "0" ] && echo 1 || echo 0)"
+# 14. An already-nonzero exit (real FAIL/CRASH) is already loud; the
+#     mismatch check must not mask or double-escalate it differently.
+assert "exit=2 (crash) with ran=0 is left alone (already loud, not re-flagged as 0/1)" \
+  "$([ "$(mismatch_forces_fail 2 0 4)" = "0" ] && echo 1 || echo 0)"
+# 15. Over-match (ran MORE than intended, e.g. an escaping bug causing a
+#     sibling spec to also match) must be caught too, not just under-match.
+assert "exit=0 with ran=5 (intended=4, over-match) is forced to fail" \
+  "$([ "$(mismatch_forces_fail 0 5 4)" = "1" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Structural checks against the real script -- fail if the fix/design is
 # reverted, unlike the mirrored functions above which pass regardless.
 # ---------------------------------------------------------------------------
@@ -119,6 +178,29 @@ assert "batch-focus.sh's watchdog uses the 900s (15m) any-phase threshold, unmod
   "$(grep -qF -- '"$age_s" -ge 900' "$SCRIPT" && echo 1 || echo 0)"
 assert "batch-focus.sh invokes e2e.test directly (no separate ginkgo CLI wrapper)" \
   "$(grep -qF -- '/usr/local/bin/e2e.test' "$SCRIPT" && ! grep -qE -- '(^|[^.])\bginkgo\s+--focus' "$SCRIPT" && echo 1 || echo 0)"
+# 16. Fix: `trap cleanup EXIT` must be installed BEFORE the ConfigMap/Pod are
+#     created, not after -- otherwise the zero-match-pool exit and
+#     --list-only's own exit (both of which happen after pod creation, since
+#     -list-tests only exists inside the conformance image) leak the debug
+#     Pod + ConfigMap in `default`. Checked by line number, not just
+#     presence, since both lines already existed before the fix.
+TRAP_LINE=$(grep -n -- 'trap cleanup EXIT' "$SCRIPT" | head -1 | cut -d: -f1)
+CONFIGMAP_LINE=$(grep -n -- 'create configmap' "$SCRIPT" | head -1 | cut -d: -f1)
+assert "batch-focus.sh installs 'trap cleanup EXIT' before creating the ConfigMap" \
+  "$([ -n "$TRAP_LINE" ] && [ -n "$CONFIGMAP_LINE" ] && [ "$TRAP_LINE" -lt "$CONFIGMAP_LINE" ] && echo 1 || echo 0)"
+# shellcheck disable=SC2016 # intentional: matching the literal, unexpanded source text, not expanding it ourselves.
+assert "batch-focus.sh's cleanup() deletes the Pod with --ignore-not-found (safe pre-creation)" \
+  "$(grep -qF -- 'delete pod "$POD_NAME" -n default --ignore-not-found' "$SCRIPT" && echo 1 || echo 0)"
+# shellcheck disable=SC2016 # intentional: matching the literal, unexpanded source text, not expanding it ourselves.
+assert "batch-focus.sh's cleanup() deletes the ConfigMap with --ignore-not-found (safe pre-creation)" \
+  "$(grep -qF -- 'delete configmap "${POD_NAME}-kubeconfig" -n default --ignore-not-found' "$SCRIPT" && echo 1 || echo 0)"
+# 17. Fix: a per-batch ran-count assertion must exist and be wired to force
+#     BATCH_EXIT nonzero -- guards against silently dropping the whole
+#     mismatch-detection mechanism in a future edit.
+assert "batch-focus.sh defines ran_count_from_summary" \
+  "$(grep -qF -- 'ran_count_from_summary()' "$SCRIPT" && echo 1 || echo 0)"
+assert "batch-focus.sh forces BATCH_EXIT nonzero on a count mismatch" \
+  "$(grep -qF -- 'BATCH_EXIT=1' "$SCRIPT" && grep -qF -- 'COUNT_MISMATCH' "$SCRIPT" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Real end-to-end invocation: arg validation runs before any limactl/kubectl

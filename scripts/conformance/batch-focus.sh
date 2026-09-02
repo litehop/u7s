@@ -148,7 +148,23 @@ fi
 ALL_SPECS=$(mktemp)
 MATCHED_SPECS=$(mktemp)
 REWRITTEN=$(mktemp)
-trap 'rm -f "$ALL_SPECS" "$MATCHED_SPECS" "$REWRITTEN"' EXIT
+
+# Installed BEFORE the ConfigMap/Pod exist (not after, as an earlier version
+# of this script did) so every exit path from here on — including the
+# zero-match error below and --list-only's own early exit, both of which
+# happen AFTER the pod is created because e2e.test (and therefore -list-tests)
+# only exists inside the conformance image — reaps them. `--ignore-not-found`
+# on both deletes makes this safe to run even before either object exists.
+_WATCHDOG_PID=""
+cleanup() {
+  [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true
+  rm -f "$ALL_SPECS" "$MATCHED_SPECS" "$REWRITTEN"
+  if [ "$KEEP_POD" -eq 0 ]; then
+    kubectl --kubeconfig="$KUBECONFIG" delete pod "$POD_NAME" -n default --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl --kubeconfig="$KUBECONFIG" delete configmap "${POD_NAME}-kubeconfig" -n default --ignore-not-found >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # Debug pod + kubeconfig ConfigMap. Lives in `default` (not a throwaway
@@ -248,6 +264,20 @@ escape_spec() {
   printf '%s' "$1" | sed -E 's/(\]|\[|\.|\^|\$|\*|\+|\?|\(|\)|\{|\}|\||\\)/\\\1/g'
 }
 
+# Extracts N from ginkgo's own "Ran N of ... Specs" summary line. A batch
+# whose focus regex under- or over-matches the intended spec set (e.g. an
+# escaping bug, or one spec's regex accidentally also matching a sibling)
+# can still exit 0 while having run the WRONG specs — silently lying about
+# what was actually exercised, which is exactly the signal a bisection tool
+# must not lose. Empty output means no "Ran ..." line was found at all.
+ran_count_from_summary() {
+  # `|| true`: under `set -e`, a bare failing pipeline as a function's last
+  # command propagates through `RAN_COUNT=$(...)` at the call site and
+  # aborts the whole script (a normal "no Ran line found" case, e.g. a
+  # crashed batch, would otherwise take down every remaining batch with it).
+  printf '%s' "$1" | grep -oE '^Ran [0-9]+ of' | grep -oE '[0-9]+' || true
+}
+
 if [ "$LIST_ONLY" -eq 1 ]; then
   BATCH_NUM=0
   START=1
@@ -266,9 +296,10 @@ fi
 # Namespace TTL watchdog — mirrors 06-run-sonobuoy.sh's watchdog_loop
 # verbatim (same 10m Active / 15m any-phase thresholds; DO NOT change them,
 # see bd memory watchdog-thresholds-are-final-do-not-raise). A real sonobuoy
-# run has this; the 4t2c9 spike's prototype omitted it and hit exactly the
-# failure mode it exists to prevent — a namespace a crashing spec never
-# cleaned up starving every later batch's own namespace-scoped waits.
+# run has this; an earlier prototype of this harness omitted it and hit
+# exactly the failure mode it exists to prevent — a namespace a crashing
+# spec never cleaned up starving every later batch's own namespace-scoped
+# waits.
 # ---------------------------------------------------------------------------
 watchdog_loop() {
   local kubeconfig="$1"
@@ -314,17 +345,6 @@ watchdog_loop() {
       | jq -c '.items[] | {name: .metadata.name, phase: .status.phase, created: .metadata.creationTimestamp}')
   done
 }
-
-_WATCHDOG_PID=""
-cleanup() {
-  [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true
-  rm -f "$ALL_SPECS" "$MATCHED_SPECS" "$REWRITTEN"
-  if [ "$KEEP_POD" -eq 0 ]; then
-    kubectl --kubeconfig="$KUBECONFIG" delete pod "$POD_NAME" -n default --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    kubectl --kubeconfig="$KUBECONFIG" delete configmap "${POD_NAME}-kubeconfig" -n default --ignore-not-found >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
 
 watchdog_loop "$KUBECONFIG" &
 _WATCHDOG_PID=$!
@@ -373,7 +393,26 @@ while [ "$START" -le "$TOTAL" ]; do
     > "$BATCH_LOG" 2>&1 || BATCH_EXIT=$?
 
   SUMMARY=$(grep -E "^(Ran |SUCCESS!|FAIL!)" "$BATCH_LOG" | tr '\n' ' ')
-  echo "[batch $BATCH_NUM/$NUM_BATCHES] specs=${#BATCH_SPECS[@]} exit=$BATCH_EXIT ${SUMMARY:-<no summary line — see $BATCH_LOG>}"
+  INTENDED_COUNT=${#BATCH_SPECS[@]}
+  RAN_COUNT=$(ran_count_from_summary "$SUMMARY")
+  COUNT_MISMATCH=0
+  if [ -z "$RAN_COUNT" ] || [ "$RAN_COUNT" -ne "$INTENDED_COUNT" ]; then
+    COUNT_MISMATCH=1
+  fi
+  # A batch that ran the wrong number of specs is NOT a genuine pass even if
+  # ginkgo itself exited 0 (e.g. a 0-match focus reports "SUCCESS! -- 0
+  # Passed" — indistinguishable from a real pass by exit code alone). Force
+  # it loud instead of letting bisection quietly skip specs it claims to
+  # have covered.
+  if [ "$BATCH_EXIT" -eq 0 ] && [ "$COUNT_MISMATCH" -eq 1 ]; then
+    BATCH_EXIT=1
+  fi
+  echo "[batch $BATCH_NUM/$NUM_BATCHES] specs=$INTENDED_COUNT exit=$BATCH_EXIT ${SUMMARY:-<no summary line — see $BATCH_LOG>}"
+  if [ "$COUNT_MISMATCH" -eq 1 ]; then
+    echo "  *** COUNT MISMATCH: ginkgo ran ${RAN_COUNT:-0} spec(s), batch intended $INTENDED_COUNT — focus regex under/over-matched. Not a genuine result. ***"
+    echo "  Intended specs in this batch:"
+    printf '    - %s\n' "${BATCH_SPECS[@]}"
+  fi
   if [ "$BATCH_EXIT" -eq 2 ]; then
     echo "  *** CRASH (exit 2) — likely an unrecovered panic. Log: $BATCH_LOG ***"
     echo "  Suspect specs in this batch:"
