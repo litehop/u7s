@@ -661,6 +661,21 @@ pub async fn replace_crd<S: Store>(
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
 
+    // PUT .../customresourcedefinitions/{name} is the MAIN endpoint; the CRD's own status
+    // (Established/NamesAccepted/StoredVersions conditions) is a dedicated subresource —
+    // clients must use PUT .../status. Restore whatever is already stored rather than
+    // trusting `crd.status` as parsed from the client body: unlike a Custom Resource's
+    // schema-typed status, `CustomResourceDefinition.status` is a bare
+    // `Option<serde_json::Value>`, so a body like {"status":"x"} deserializes successfully
+    // in parse_crd and would otherwise persist an invalid scalar status (or, on any normal
+    // status-omitting PUT, silently wipe the conditions create_crd stamped).
+    let stored_status = existing["status"].clone();
+    crd.status = if stored_status.is_null() {
+        None
+    } else {
+        Some(stored_status)
+    };
+
     reject_structural_field_change(&existing, &crd.spec, &name)?;
 
     // Preserve server-assigned creationTimestamp from stored copy if not present in incoming.
@@ -952,6 +967,14 @@ pub async fn patch_crd<S: Store>(
     // otherwise be lost by the time we can compare against them.
     let existing = current.clone();
 
+    // Snapshot .status before applying the patch: the CRD's own status
+    // (Established/NamesAccepted/StoredVersions conditions) is a dedicated subresource
+    // (.../status) — a main-endpoint patch must never change it, including via JSON Patch,
+    // whose array shape slips past an object-key "status" strip. Restored below before
+    // `current` is deserialized into `CustomResourceDefinition`, whose status field is a
+    // bare `Option<serde_json::Value>` (not a typed shape that would reject a scalar).
+    let stored_status = existing["status"].clone();
+
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
     let patch: serde_json::Value = if is_ssa {
@@ -968,6 +991,12 @@ pub async fn patch_crd<S: Store>(
         PatchType::Json => {
             apply_json_patch(&mut current, &patch)?;
         }
+    }
+
+    if stored_status.is_null() {
+        current.as_object_mut().map(|m| m.remove("status"));
+    } else {
+        current["status"] = stored_status;
     }
 
     // Validate that the patched value is still a valid CRD shape.
@@ -2143,6 +2172,160 @@ mod tests {
             json["code"], 422,
             "merge-patch changing spec.names.plural must be rejected with 422 Invalid, not \
              silently merged — otherwise every CR already stored under the old plural is orphaned"
+        );
+    }
+
+    /// Round 5 of the non-object-status bug class: replace_crd is the MAIN `/customresourcedefinitions/{name}` PUT
+    /// endpoint (not `.../status`). Unlike a Custom Resource's has_status_subresource-gated
+    /// restore (replace_cr), replace_crd built `CustomResourceDefinition` straight from
+    /// `parse_crd(&body)` and persisted whatever `crd.status` — a bare
+    /// `Option<serde_json::Value>`, not a typed shape — the client's body happened to
+    /// deserialize into, with no restore of the stored value at all.
+    ///
+    /// Fails on revert: create_crd stamps status.conditions (Established/NamesAccepted) at
+    /// creation; without restoring stored_status in replace_crd, a PUT body that simply
+    /// omits "status" (as a real `kubectl replace -f crd.yaml` does) silently wipes those
+    /// conditions to null, and a malicious body `{"status":"x"}` persists a scalar that
+    /// later panics any in-place status stamper.
+    #[tokio::test]
+    async fn replace_crd_ignores_body_status_uses_stored_status() {
+        let state = make_state();
+        let name = "widgets.example.com";
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, "example.com", "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let stored = state
+            .store
+            .get(&store_key(name))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("parse stored");
+        assert!(
+            stored_val["status"]["conditions"][0]["type"] == "Established",
+            "sanity check: create_crd must stamp status.conditions"
+        );
+        let rv = stored_val["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        // A PUT body carrying a scalar "status" — a real client would never send this, but
+        // it must not be trusted even if it does — plus a real, unrelated spec change.
+        let replace_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": name, "resourceVersion": rv, "labels": { "env": "prod" } },
+                "spec": {
+                    "group": "example.com",
+                    "names": { "plural": "widgets", "singular": "widget", "kind": "Widget" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                },
+                "status": "x"
+            })
+            .to_string(),
+        );
+
+        assert!(
+            replace_crd(
+                State(state.clone()),
+                Path(name.to_string()),
+                test_user(),
+                HeaderMap::new(),
+                replace_body,
+            )
+            .await
+            .is_ok(),
+            "PUT must still succeed — status is silently ignored, not rejected"
+        );
+
+        let after = state
+            .store
+            .get(&store_key(name))
+            .await
+            .expect("store get")
+            .expect("must still exist");
+        let after_val: serde_json::Value =
+            serde_json::from_slice(&after.value).expect("parse after replace");
+        assert_eq!(
+            after_val["status"]["conditions"][0]["type"], "Established",
+            "PUT body status must be ignored; the create_crd-stamped conditions must survive \
+             — a scalar status here would panic the next in-place status stamper"
+        );
+        assert_eq!(
+            after_val["metadata"]["labels"]["env"], "prod",
+            "the PUT's actual metadata update (labels) must still apply"
+        );
+    }
+
+    /// Round 5 sibling of the replace_crd fix above: patch_crd (the MAIN PATCH
+    /// endpoint, not `.../status`) deserializes the merge-patched raw JSON straight into
+    /// `CustomResourceDefinition`, whose status field is a bare `Option<serde_json::Value>`
+    /// — a merge-patch body `{"status":"x"}` deserialized and persisted successfully with no
+    /// object-type check.
+    ///
+    /// Fails on revert: without restoring stored_status after the patch is applied, the
+    /// stored status becomes the raw string "x" instead of staying the create_crd-stamped
+    /// conditions object.
+    #[tokio::test]
+    async fn patch_crd_rejects_scalar_status_merge_patch() {
+        let state = make_state();
+        let name = "widgets.example.com";
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, "example.com", "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let patch = serde_json::json!({ "status": "x" });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_crd(
+                State(state.clone()),
+                Path(name.to_string()),
+                test_user(),
+                headers,
+                patch_bytes,
+            )
+            .await
+            .is_ok(),
+            "PATCH must still succeed — status is silently ignored, not rejected"
+        );
+
+        let after = state
+            .store
+            .get(&store_key(name))
+            .await
+            .expect("store get")
+            .expect("must still exist");
+        let after_val: serde_json::Value =
+            serde_json::from_slice(&after.value).expect("parse after patch");
+        assert!(
+            !after_val["status"].is_string(),
+            "a merge-patch body's scalar status must never be persisted as-is — got {:?}",
+            after_val["status"]
+        );
+        assert_eq!(
+            after_val["status"]["conditions"][0]["type"], "Established",
+            "the create_crd-stamped conditions must survive an unrelated main-endpoint patch"
         );
     }
 

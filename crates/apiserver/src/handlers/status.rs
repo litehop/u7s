@@ -4656,6 +4656,94 @@ mod tests {
         );
     }
 
+    /// Rounds 1-4 closed every `/status` subresource hole this bug class hid in — round 5's
+    /// independent re-enumeration then found it hiding on the OTHER axis: `patch_namespace`,
+    /// the MAIN `/api/v1/namespaces/{name}` PATCH handler (not `/status`), applied a
+    /// merge-patch to the whole stored object body and restored only `metadata.uid`. A body
+    /// `{"status":"x"}` therefore persisted a scalar status using only ordinary `namespaces`
+    /// `patch` rights — no `namespaces/status` rights needed — corrupting the object exactly
+    /// like the four `/status` holes did, just reached through a different endpoint.
+    ///
+    /// This test covers that other axis: every MAIN-resource (non-status) handler that
+    /// itself persists a write (calls `.put(`, as opposed to a thin wrapper delegating to an
+    /// already-covered handler like `do_patch`) must restore whatever status is already
+    /// stored rather than trust the request body — following the `stored_status` naming
+    /// convention `do_patch` (resource.rs) established, which every fixed site in this repo
+    /// (including this round's `patch_namespace`/`replace_crd`/`patch_crd` fixes) already
+    /// uses. A handler that never touches `status` at all is listed in SAFE with a comment
+    /// proving it structurally cannot.
+    #[test]
+    fn every_main_resource_write_handler_preserves_stored_status() {
+        // Verified by reading each one: `patch_ephemeral_containers` only ever writes
+        // `spec.ephemeralContainers` and never reads `incoming["status"]`; `patch_approval`
+        // only ever writes `status.conditions` from a typed `CertificateSigningRequestStatus`
+        // round-trip (a scalar body value fails to deserialize and is silently ignored via
+        // `.ok()`), and unconditionally restores `spec`/`status.certificate` regardless of
+        // patch type; `patch_pod_resize`'s `apply_resize_patch` never reads
+        // `incoming["status"]` either, only stamping the fixed leaf `status.resize` behind
+        // its own is-object-or-null guard (not the `stored_status` convention, but not a
+        // whole-body clobber this test is about).
+        const SAFE: &[&str] = &[
+            "patch_ephemeral_containers",
+            "patch_approval",
+            "patch_pod_resize",
+        ];
+
+        let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
+        let mut checked = Vec::new();
+        let mut unguarded = Vec::new();
+
+        for entry in std::fs::read_dir(&handlers_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", handlers_dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for (name, body) in main_resource_handler_bodies(&source) {
+                // A handler whose own body never calls `.put(` doesn't persist anything
+                // itself — it's a thin wrapper delegating to an already-checked handler
+                // (patch_resource/patch_namespaced_resource -> do_patch, the core.rs/
+                // certificates.rs wrappers -> resource.rs, the scale PATCH handlers ->
+                // their shared *_impl). Nothing new to check.
+                if !body.contains(".put(") {
+                    continue;
+                }
+                checked.push(name.clone());
+                if SAFE.contains(&name.as_str()) {
+                    continue;
+                }
+                if !body.contains("stored_status") {
+                    unguarded.push(format!("{name} in {}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            checked.len() >= 10,
+            "sanity check: expected at least 10 main-resource write handlers (replace_namespace, \
+             patch_namespace, replace_resource, replace_namespaced_resource, replace_cr, \
+             replace_cr_namespaced, patch_cr, patch_cr_namespaced, replace_crd, patch_crd, \
+             replace_pod, patch_pod, ...), found {} — did the replace_/patch_ naming \
+             convention change (this test would otherwise pass vacuously)?",
+            checked.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "main-resource (non-status) write handler(s) can persist the request body's \
+             `status` field without restoring the stored value first: {unguarded:?} — a \
+             caller holding only ordinary (non-status-subresource) write rights could \
+             persist a scalar status and later panic the next in-place status stamper, \
+             crashing the apiserver for every other request in flight. Capture \
+             `stored_status` before applying the patch/replace and restore it after (see \
+             do_patch in resource.rs), or add the handler to SAFE with a comment proving it \
+             structurally cannot touch status."
+        );
+    }
+
     /// Extracts `(function_name, body)` for every top-level `pub`/`pub(crate)` function in
     /// `source` whose name satisfies `matches_name`. Deliberately requires the signature to
     /// start at column 0 (`line.starts_with("pub")`) so indented `#[tokio::test] async fn
@@ -4725,6 +4813,14 @@ mod tests {
     fn patch_status_handler_bodies(source: &str) -> Vec<(String, String)> {
         handler_bodies_matching(source, |name| {
             name.starts_with("patch_") && name.contains("status")
+        })
+    }
+
+    /// Naming convention every MAIN-resource (non-status) mutating handler in this codebase
+    /// follows: a full-object PUT is always named `replace_*`, a PATCH is always `patch_*`.
+    fn main_resource_handler_bodies(source: &str) -> Vec<(String, String)> {
+        handler_bodies_matching(source, |name| {
+            (name.starts_with("patch_") || name.starts_with("replace_")) && !name.contains("status")
         })
     }
 }
