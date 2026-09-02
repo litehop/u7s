@@ -34,13 +34,50 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
    - A denied Bash call = your command was mis-shaped (inline env, batch, leading `cd`/`export`, non-allowlisted first token). Reshape into single allowlisted commands; don't abandon the task.
 8. **Grep-to-locate before Read** — before `Read`-ing a file you haven't windowed yet, grep (or an LSP call at a known position) to find the target region first, then `Read` with `offset`/`limit`. A bare full-file `Read` is a last resort, not a default first move — it silently truncates at the tool's line-count cap with no error, so an unfamiliar file's tail can vanish from context without you noticing.
 
+## Worktree boundary (mandatory)
+
+Shell workdir is not enough protection: `apply_patch`/`Write`-style edit tools
+have no workdir, so a relative write path can resolve against the WRONG
+checkout on a project where the mayor also has its own checkout. This is the
+path-resolution leak failure mode — it happens mid-session in a single tool
+call, so Step 0's one-time guard below does not catch it.
+
+Your dispatch brief supplies two absolute paths: `<ASSIGNED_WORKTREE>` (yours
+— matches Step 0's `git rev-parse --show-toplevel`) and `<MAYOR_CHECKOUT>`
+(the mayor's own checkout — never edit it).
+
+Before every file edit: `pwd; git rev-parse --show-toplevel; git status --short --branch`
+— only proceed if the toplevel path is exactly `<ASSIGNED_WORKTREE>`. Use
+ABSOLUTE paths under `<ASSIGNED_WORKTREE>` for every `Write`/`Edit` call —
+never a bare repo-relative path unless your own session root IS the assigned
+worktree.
+
+After your first edit, verify both sides:
+```bash
+git -C <ASSIGNED_WORKTREE> status --short --branch   # must be dirty
+git -C <MAYOR_CHECKOUT> status --short --branch       # must show nothing new
+```
+
+New-file extra check: a brand-new file's `Write` (most commonly
+`ai/findings/<name>.md`) is the highest-risk case, since the path doesn't
+exist in either tree yet to disambiguate against. After writing one, verify:
+```bash
+ls <ASSIGNED_WORKTREE>/<repo-relative-path>   # must exist
+ls <MAYOR_CHECKOUT>/<repo-relative-path>      # must NOT exist
+```
+
+If anything lands outside `<ASSIGNED_WORKTREE>`: STOP. Do not repair,
+restore, commit, or push — report both `git status` outputs and let the
+mayor decide.
+
 ## Workflow
 
 ```bash
 # 0. Verify your worktree — BEFORE touching any file
 #
 # The harness sets your CWD to the worktree root automatically.
-# Verify before doing anything else.
+# Verify before doing anything else. See "Worktree boundary" above for the
+# per-edit checks that follow — this one-time guard does not repeat them.
 #
 pwd                              # your CWD — this is your worktree root
 git rev-parse --show-toplevel    # must match pwd

@@ -43,64 +43,17 @@ git root. Symptoms:
 must be IMMEDIATELY followed by verifying the file landed in the worker
 worktree and NOT in the mayor checkout (see the block below).
 
-### The block (paste verbatim into every editing-worker dispatch)
+### The block (paste into every editing-worker dispatch)
+
+The full checklist (per-edit verification, the after-first-edit check, the
+new-file extra check, the stop condition) now lives in worker.md's "Worktree
+boundary" section, loaded automatically for every worker — do not re-paste
+it here. A dispatch brief only needs to supply the two bead-specific
+absolute paths worker.md's block references as placeholders:
 
 ```text
-WORKTREE BOUNDARY - MANDATORY
-
-Your assigned worktree is:
-<ASSIGNED_WORKTREE>
-
-The mayor checkout is:
-<MAYOR_CHECKOUT>
-
-Never edit the mayor checkout.
-
-Shell workdir is not enough protection. apply_patch and Write tools have no
-workdir, so relative patch / write paths can land in the mayor checkout.
-This is the path-resolution leak failure mode — the worktree guard at
-session start does NOT catch it, because the leak happens mid-session in a
-single tool call.
-
-Before every file edit, run:
-
-pwd; git rev-parse --show-toplevel; git status --short --branch
-
-Only edit if git rev-parse --show-toplevel prints exactly:
-<ASSIGNED_WORKTREE>
-
-When using apply_patch, Write, or any edit tool, use ABSOLUTE file paths
-under <ASSIGNED_WORKTREE> wherever the tool accepts them. If the tool only
-accepts relative paths, use paths relative to the session root that
-explicitly target the worker worktree:
-<WORKTREE_ROOT>/<WORKTREE_NAME>/<repo-relative-path>
-Never use bare repo-relative paths unless `git rev-parse --show-toplevel`
-for the agent session root is itself the assigned worktree.
-
-After the first edit, immediately run:
-
-git -C <ASSIGNED_WORKTREE> status --short --branch
-git -C <MAYOR_CHECKOUT> status --short --branch
-
-Continue only if the worker worktree is dirty and the mayor checkout did
-not receive code edits.
-
-NEW-FILE EXTRA CHECK (path-resolution leak). When you Write a brand-new
-file (most-common offender: ai/findings/<name>.md from an audit), the
-path-resolution leak silently routes the write into the mayor checkout
-because the file did not previously exist in either tree. After every
-new-file Write, verify BOTH locations:
-
-  ls <ASSIGNED_WORKTREE>/<repo-relative-path>    # must exist
-  ls <MAYOR_CHECKOUT>/<repo-relative-path>       # must NOT exist
-
-Only the first should succeed. If the mayor-side ls returns a file, STOP —
-you've leaked. Do not retry the write, do not delete the leaked file, do
-not commit. Report the leak with both results and let the mayor decide.
-
-If any edit lands outside <ASSIGNED_WORKTREE>, stop immediately and report
-it. Do not repair, restore, commit, or push until the mayor tells you what
-to do.
+Your assigned worktree: <ASSIGNED_WORKTREE>
+The mayor checkout: <MAYOR_CHECKOUT>
 ```
 
 ### Mayor checks after dispatch
