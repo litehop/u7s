@@ -2841,7 +2841,7 @@ impl<'a> HostNetworkPodIp<'a> {
 pub(crate) fn apply_status_patch(
     stored: &serde_json::Value,
     patch: &serde_json::Value,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, crate::status::StatusError> {
     let mut result = stored.clone();
     if let Some(patch_status) = patch.get("status") {
         if result["status"].is_object() && patch_status.is_object() {
@@ -2905,6 +2905,15 @@ pub(crate) fn apply_status_patch(
             result["status"] = patch_status.clone();
         }
     }
+    // status is always a message/object type — a merge-patch body like {"status":"x"}
+    // would otherwise silently persist a scalar (the `else` branch above replaces status
+    // wholesale with whatever the patch carried, RFC 7396's own semantics for a non-object
+    // patch value). That corrupts the object's schema and panics any LATER call that
+    // stamps status fields in place via `["status"]["field"] = ...` on this same stored
+    // object (e.g. `apply_resize_patch`'s resize stamp), crashing the apiserver on the next
+    // resize/delete of this pod. Reject before it's ever written to the store.
+    crate::handlers::status::reject_non_object_status(&result["status"])?;
+
     // Apply metadata changes from the patch body (annotations, etc.) via the same guard the
     // generic status handlers use: identity fields, lifecycle-control fields, and `labels`
     // are preserved from the stored object rather than reimplementing the same protected-field
@@ -2934,7 +2943,7 @@ pub(crate) fn apply_status_patch(
         result["status"]["podIPs"] = serde_json::json!([{"ip": host_ip}]);
     }
 
-    result
+    Ok(result)
 }
 
 /// Merge a patch conditions array into stored conditions, keyed by `type`.
@@ -3036,7 +3045,7 @@ pub(crate) async fn patch_pod_status<S: Store>(
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-        current_obj.body = apply_status_patch(&current_obj.body, &patch);
+        current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
 
         let expected_rv = parse_resource_version(current_obj.resource_version())?;
         match state
@@ -3469,6 +3478,14 @@ pub(crate) fn apply_resize_patch(
             }
         }
     }
+    // A prior status-subresource write could (bug notwithstanding) have left `status` as a
+    // non-object scalar/array; indexing that with ["resize"] below would panic and crash
+    // the apiserver on every resize PATCH/PUT for that pod. Coerce back to an empty object
+    // first so this stamp is panic-safe regardless of what's stored, mirroring
+    // apply_delete_policy's (generic.rs) same guard.
+    if !result["status"].is_object() && !result["status"].is_null() {
+        result["status"] = serde_json::json!({});
+    }
     result["status"]["resize"] = serde_json::json!("Proposed");
     result
 }
@@ -3827,7 +3844,7 @@ mod status_tests {
         });
         let patch = serde_json::json!({"status": {"phase": "Running"}});
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
 
         assert_eq!(
             result["status"]["phase"], "Running",
@@ -3852,7 +3869,7 @@ mod status_tests {
             "spec": {"nodeName": "hacked"}
         });
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
 
         assert_eq!(
             result["status"]["phase"], "Running",
@@ -3882,7 +3899,7 @@ mod status_tests {
         });
         let patch = serde_json::json!({"status": {"phase": "Running"}});
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
 
         assert_eq!(
             result["status"]["phase"], "Running",
@@ -3941,7 +3958,7 @@ mod status_tests {
             }
         });
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
 
         assert_eq!(
             result["status"]["containerStatuses"][0]["restartCount"], 3,
@@ -3985,7 +4002,7 @@ mod status_tests {
             }
         });
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         let conditions = result["status"]["conditions"]
             .as_array()
             .expect("conditions array");
@@ -4039,7 +4056,7 @@ mod status_tests {
             }
         });
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
 
         let conditions = result["status"]["conditions"]
             .as_array()
@@ -4062,6 +4079,52 @@ mod status_tests {
         assert!(
             containers_ready.is_some(),
             "ContainersReady condition must be added by the patch"
+        );
+    }
+
+    /// apply_status_patch must reject a merge-patch body `{"status":"x"}` (scalar), not
+    /// persist it. `status` is a message/object type for every resource; without this
+    /// check the `else` branch (see line above) replaces `result["status"]` with the
+    /// scalar, corrupting the pod's schema and later panicking the hostNetwork podIP
+    /// override in this same function (and `apply_resize_patch`'s in-place stamp) on the
+    /// very next call, indexing a JSON string with a str key.
+    #[test]
+    fn apply_status_patch_rejects_scalar_status() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "resourceVersion": "1"},
+            "spec": {},
+            "status": {"phase": "Running"}
+        });
+        let patch = serde_json::json!({"status": "x"});
+
+        let err = apply_status_patch(&stored, &patch)
+            .expect_err("a scalar status merge-patch must be rejected, not accepted");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+    }
+
+    /// apply_status_patch must ACCEPT a merge-patch body `{"status": null}` — RFC 7396's
+    /// own field-deletion syntax, not an invalid scalar. Kubelet/controllers clearing
+    /// status entirely via /status must not be wrongly 422'd.
+    #[test]
+    fn apply_status_patch_accepts_null_status_as_field_deletion() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "resourceVersion": "1"},
+            "spec": {},
+            "status": {"phase": "Running"}
+        });
+        let patch = serde_json::json!({"status": null});
+
+        let result = apply_status_patch(&stored, &patch)
+            .expect("a null status merge-patch is RFC 7396 field deletion, not a 422");
+        assert!(
+            result["status"].is_null(),
+            "status must be cleared, not left at its old value or rejected"
         );
     }
 
@@ -4133,7 +4196,7 @@ mod status_tests {
             }
         });
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
 
         assert_eq!(
             result["status"]["podIP"], "192.168.5.15",
@@ -4176,7 +4239,7 @@ mod status_tests {
             }
         });
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
 
         assert_eq!(
             result["status"]["podIP"], "10.85.1.153",
@@ -4215,7 +4278,7 @@ mod status_tests {
             }
         });
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
 
         let conditions = result["status"]["conditions"]
             .as_array()
@@ -4325,7 +4388,7 @@ mod status_tests {
             }
         });
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         let status = result["status"].as_object().expect("status must be object");
 
         assert!(
@@ -4388,7 +4451,7 @@ mod status_tests {
             }
         });
 
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         let conds = result["status"]["conditions"]
             .as_array()
             .expect("conditions must be an array");
@@ -13735,6 +13798,55 @@ mod handler_tests {
         );
     }
 
+    /// PATCH /status with a merge-patch body `{"status":"x"}` must be rejected with 422,
+    /// not persisted. This exercises the real HTTP handler end to end (not just the pure
+    /// apply_status_patch function) so it fails if the guard is wired to the wrong call
+    /// site. Without this, a scalar status corrupts the pod's schema and later panics
+    /// apply_resize_patch's in-place status["resize"] stamp on the next resize of this pod.
+    #[tokio::test]
+    async fn patch_pod_status_rejects_scalar_status_merge_patch() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "scalar-status-pod",
+            serde_json::json!({"status": {"phase": "Running"}}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"status": "x"});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/scalar-status-pod/status")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status must be rejected with 422, matching upstream schema validation"
+        );
+
+        let key = "/registry/pods/default/scalar-status-pod";
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "the rejected patch must not have been persisted — status must remain the \
+             original object"
+        );
+    }
+
     /// PATCH /status must reject a smuggled metadata.labels change while still applying a
     /// legitimate status update. A caller granted only `pods/status` RBAC rights
     /// (e.g. the kubelet) must not be able to rewrite a pod's labels through this endpoint —
@@ -17017,6 +17129,45 @@ mod handler_tests {
 mod resize_tests {
     use super::*;
 
+    /// apply_resize_patch must not panic when the stored pod's `status` is a scalar
+    /// (possible if a status-subresource merge-patch bypassed schema validation before
+    /// this was guarded). `result["status"]["resize"] = ...` indexes a JSON string with a
+    /// str key, which panics without the guard — crashing the apiserver on every resize
+    /// PATCH/PUT for that pod, a total denial of service for every other request in
+    /// flight, not just this one.
+    #[test]
+    fn apply_resize_patch_does_not_panic_on_scalar_status() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            },
+            "status": "corrupted-scalar-status"
+        });
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {"limits": {"cpu": "200m"}, "requests": {"cpu": "200m"}}
+                }]
+            }
+        });
+
+        let result = apply_resize_patch(&stored, &incoming);
+
+        assert_eq!(
+            result["status"]["resize"], "Proposed",
+            "a scalar status must be coerced back to an object so the resize stamp can \
+             still be applied, matching apply_delete_policy's same defense-in-depth guard"
+        );
+    }
+
     /// apply_resize_patch merges container resources by name and sets status.resize = "Proposed".
     ///
     /// This is the primary in-place resize contract: if the container resources are not updated
@@ -19163,7 +19314,7 @@ mod status_patch_metadata_tests {
             "metadata": { "annotations": { "xzmpcheck": "ok" } },
             "status": { "phase": "Running" }
         });
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         assert_eq!(
             result["metadata"]["annotations"]["xzmpcheck"], "ok",
             "annotation from the patch body must survive apply_status_patch; \
@@ -19192,7 +19343,7 @@ mod status_patch_metadata_tests {
             "metadata": { "uid": "attacker-uid", "annotations": { "safe": "yes" } },
             "status": { "phase": "Failed" }
         });
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         assert_eq!(
             result["metadata"]["uid"], "real-uid",
             "uid must not be overwritten by a status patch; \
@@ -19217,7 +19368,7 @@ mod status_patch_metadata_tests {
             "spec": { "nodeName": "node-evil" },
             "status": { "phase": "Pending" }
         });
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         assert_eq!(
             result["spec"]["nodeName"], "node-1",
             "spec must not change via a status patch; \
@@ -19245,7 +19396,7 @@ mod status_patch_metadata_tests {
                 "conditions": [{"type": "Ready", "status": "True"}]
             }
         });
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         let conds = result["status"]["conditions"]
             .as_array()
             .expect("conditions must be array");
@@ -19293,7 +19444,7 @@ mod status_patch_metadata_tests {
             },
             "status": { "phase": "Succeeded", "conditions": [] }
         });
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         let finalizers = result["metadata"]["finalizers"]
             .as_array()
             .map(|a| a.len())
@@ -19326,7 +19477,7 @@ mod status_patch_metadata_tests {
             "metadata": { "labels": { "app": "evil", "escalated": "true" } },
             "status": { "phase": "Running" }
         });
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         assert_eq!(
             result["metadata"]["labels"],
             serde_json::json!({ "app": "web" }),
@@ -19352,7 +19503,7 @@ mod status_patch_metadata_tests {
             "metadata": { "deletionTimestamp": "2026-06-25T00:00:00Z" },
             "status": { "phase": "Running" }
         });
-        let result = apply_status_patch(&stored, &patch);
+        let result = apply_status_patch(&stored, &patch).unwrap();
         assert!(
             result["metadata"]["deletionTimestamp"].is_null(),
             "status subresource must not set deletionTimestamp; \
