@@ -2093,8 +2093,8 @@ pub fn resolve_pod_container_port(
 }
 
 /// Returns `Err(reason)` when `addr` is not a plain IPv4/IPv6 address literal, or names a
-/// link-local/multicast/cloud-metadata address, or an IPv6 loopback/unspecified address —
-/// ranges no legitimate pod IP or Service-backing endpoint address should ever occupy.
+/// loopback/link-local/multicast/cloud-metadata address — ranges no legitimate pod IP or
+/// Service-backing endpoint address should ever occupy.
 ///
 /// `status.podIP` and EndpointSlice `addresses[]` are both attacker-influenced: a
 /// compromised node can PATCH its own pod's `status.podIP` to any string (the Node
@@ -2107,19 +2107,23 @@ pub fn resolve_pod_container_port(
 /// into konnectivity-server's stream via an embedded CRLF (request splitting), since a
 /// string containing "\r\n" can never parse as `std::net::IpAddr` either.
 ///
-/// Bare dotted-decimal IPv4 loopback (127.0.0.0/8) is intentionally NOT rejected — matches
-/// `validate_webhook_url`'s identical, already-reviewed exemption in admission.rs, and this
-/// file's own test suite dials an in-process TCP listener at 127.0.0.1 to stand in for a
-/// pod/Service backend throughout. Every *other* encoding of loopback (IPv6 `::1`, or an
-/// IPv4 loopback embedded in an IPv6-mapped/compatible literal) has no such legitimate use
-/// and is still rejected below, along with every other reserved range.
+/// Bare dotted-decimal IPv4 loopback (127.0.0.0/8) IS rejected here, unlike
+/// `validate_webhook_url`'s loopback exemption in admission.rs — that exemption is safe
+/// only because a webhook URL is admin-controlled config (loopback is a legitimate
+/// in-process-test target), whereas `status.podIP`/EndpointSlice addresses are
+/// node-controlled and untrusted in this threat model: a compromised node could otherwise
+/// set its pod's podIP to 127.0.0.1 and redirect the apiserver's own proxy dial to a
+/// service on its own host (pprof/debug/metadata). This function is not shared with the
+/// webhook path, so this change cannot affect it.
 fn validate_proxy_target_ip(addr: &str) -> Result<(), String> {
     let ip: std::net::IpAddr = addr
         .parse()
         .map_err(|_| "not a valid IP address literal".to_owned())?;
 
     let reserved = match ip {
-        std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_multicast() || v4.is_unspecified(),
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_link_local() || v4.is_multicast() || v4.is_unspecified()
+        }
         std::net::IpAddr::V6(v6) => {
             // These direct checks must run (logically) ahead of the embedded-v4 unwrap
             // below: e.g. `::1`.to_ipv4() is Some(0.0.0.1), which no IPv4 range check
@@ -2203,10 +2207,10 @@ fn ipv4_in_cidr(ip: &str, cidr: &str) -> bool {
 /// node-writable even post-NodeRestriction), so the hostNetwork branch cannot treat a
 /// podIP/hostIP match alone as proof of a real node identity — it only proves the two
 /// node-controlled fields agree with each other. A compromised node could set both to
-/// 127.0.0.1 to redirect the proxy dial to a service on the apiserver's own host. Bare
-/// IPv4 loopback (which `validate_proxy_target_ip` intentionally allows elsewhere, for
-/// this file's own real-in-process-listener test fixtures) is therefore rejected
-/// unconditionally in this branch, regardless of what hostIP claims.
+/// 127.0.0.1 to try to redirect the proxy dial to a service on the apiserver's own host;
+/// that is caught unconditionally by the `validate_proxy_target_ip` call below (which now
+/// rejects bare IPv4 loopback outright) before this branch is ever reached, regardless of
+/// what hostIP claims.
 async fn validate_pod_ip_against_node<S: Store>(
     state: &AppState<S>,
     pod: &serde_json::Value,
@@ -2219,15 +2223,6 @@ async fn validate_pod_ip_against_node<S: Store>(
 
     let host_network = pod["spec"]["hostNetwork"].as_bool().unwrap_or(false);
     if host_network {
-        if pod_ip
-            .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|v4| v4.is_loopback())
-        {
-            return Err(
-                "hostNetwork pod's podIP is IPv4 loopback — rejected regardless of hostIP"
-                    .to_owned(),
-            );
-        }
         return match pod["status"]["hostIP"].as_str().filter(|s| !s.is_empty()) {
             Some(host_ip) if host_ip == pod_ip => Ok(()),
             Some(host_ip) => Err(format!(
@@ -3251,6 +3246,26 @@ mod tests {
             .expect("seed node");
     }
 
+    /// A real, non-loopback IP address this host can both bind and dial itself on.
+    ///
+    /// `validate_proxy_target_ip` now rejects bare IPv4 loopback in every proxy dial arm
+    /// — the whole point of this module's SSRF fix — so tests that need a real, connectable
+    /// in-process listener standing in for a pod/Service backend can no longer address it
+    /// as a forged 127.0.0.1 podIP/EndpointSlice address. This discovers the host's own
+    /// LAN-routable address so those tests can keep dialing a real listener without relying
+    /// on the loopback exemption the fix removes.
+    ///
+    /// `UdpSocket::connect` never sends a packet — it only asks the kernel to pick a local
+    /// source address for the given route, which needs no external reachability, just a
+    /// non-loopback interface in the routing table (true of every dev machine and CI runner
+    /// this suite runs on).
+    fn test_backend_ip() -> std::net::IpAddr {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind ephemeral UDP socket");
+        sock.connect("8.8.8.8:80")
+            .expect("resolve a local route to pick a non-loopback source address");
+        sock.local_addr().expect("query bound local address").ip()
+    }
+
     // -----------------------------------------------------------------------
     // buffer_capped: response-body size cap for the html-rewrite proxy path
     // -----------------------------------------------------------------------
@@ -3366,15 +3381,19 @@ mod tests {
         assert!(validate_proxy_target_ip("::1").is_err());
     }
 
-    /// Bare dotted-decimal IPv4 loopback (127.0.0.1) is intentionally NOT rejected — matches
-    /// `validate_webhook_url`'s identical, already-reviewed exemption for in-process test
-    /// servers (admission.rs), which this file's own proxy test suite depends on throughout
-    /// (dialing a real TCP listener at 127.0.0.1 as a stand-in for a pod/Service backend).
-    /// Rejecting it here would break that entire test harness for no security gain, since
-    /// the IPv6-mapped/loopback forms below are still blocked for any real bypass attempt.
+    /// Bare dotted-decimal IPv4 loopback (127.0.0.1) must be rejected — unlike
+    /// `validate_webhook_url`'s loopback exemption (admin-controlled config), a podIP or
+    /// EndpointSlice address is node-controlled, so a compromised node could otherwise set
+    /// it to 127.0.0.1 and redirect the apiserver's own proxy dial to a service on its own
+    /// host (e.g. pprof/debug/metadata).
     #[test]
-    fn validate_proxy_target_ip_accepts_ipv4_loopback() {
-        assert!(validate_proxy_target_ip("127.0.0.1").is_ok());
+    fn validate_proxy_target_ip_rejects_ipv4_loopback() {
+        assert!(
+            validate_proxy_target_ip("127.0.0.1").is_err(),
+            "127.0.0.1 must be rejected as a pod/EndpointSlice dial target — a compromised \
+             node forging its pod's podIP as loopback must not be able to redirect the \
+             apiserver's own outbound proxy dial to itself"
+        );
     }
 
     /// The IPv6-mapped form of a blocked IPv4 address (::ffff:169.254.169.254) must also be
@@ -3591,6 +3610,62 @@ mod tests {
                  node-ipam-controller is enabled",
             );
         assert_eq!(ip, "10.85.3.40");
+    }
+
+    /// A non-hostNetwork pod whose node has no spec.podCIDR assigned (this codebase's own
+    /// conformance stack's default — node-ipam-controller disabled) must still reject a
+    /// forged podIP of 127.0.0.1.
+    ///
+    /// The CIDR allowlist tested above is a no-op in this configuration, falling back to
+    /// the blocklist floor alone — the exact arm a critical-reviewer of PR #1525 found
+    /// still let a compromised node redirect the apiserver's own outbound pods/proxy dial
+    /// to a service on its own host (pprof/debug/metadata). If the blocklist's loopback
+    /// rejection is ever reverted, this test starts passing 502 traffic to 127.0.0.1
+    /// instead of rejecting it, and fails.
+    #[tokio::test]
+    async fn pod_proxy_rejects_loopback_pod_ip_when_node_has_no_pod_cidr_assigned() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "evil-no-ipam", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "node-f", "containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"podIP": "127.0.0.1"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "evil-no-ipam"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-f", "resourceVersion": "1"},
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-f"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let result = resolve_pod_proxy_target(&state, "default", "evil-no-ipam").await;
+
+        assert!(
+            result.is_err(),
+            "a podIP of 127.0.0.1 must be rejected even when the CIDR allowlist is a no-op \
+             (no spec.podCIDR assigned) — a compromised node forging this podIP must not be \
+             able to redirect the apiserver's own proxy dial to a service on its own host"
+        );
     }
 
     /// A hostNetwork pod's podIP matching its own status.hostIP (a real routable node
@@ -8474,7 +8549,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_ip = test_backend_ip();
+        let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let pod_port = listener.local_addr().unwrap().port();
 
         tokio::spawn(async move {
@@ -8498,7 +8574,7 @@ mod tests {
                 "nodeName": "node-1",
                 "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
             },
-            "status": {"podIP": "127.0.0.1"}
+            "status": {"podIP": backend_ip.to_string()}
         });
         state
             .store
@@ -8509,11 +8585,10 @@ mod tests {
             )
             .await
             .expect("seed pod");
-        // podCIDR covers loopback only because this test needs a real, connectable
-        // in-process listener as the pod backend — not a realistic node assignment; see
-        // validate_proxy_target_ip_accepts_ipv4_loopback for why this file's test harness
-        // relies on dialing an actual 127.0.0.1 listener throughout.
-        seed_node_with_pod_cidr(&state, "node-1", "127.0.0.0/8").await;
+        // podCIDR is maximally permissive because this test needs a real, connectable
+        // in-process listener as the pod backend, not a realistic node assignment — CIDR
+        // matching itself is covered separately by pod_proxy_rejects_pod_ip_outside_node_pod_cidr.
+        seed_node_with_pod_cidr(&state, "node-1", "0.0.0.0/0").await;
 
         let mut router = make_router(state);
         let req = axum::http::Request::builder()
@@ -8669,7 +8744,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_ip = test_backend_ip();
+        let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let ep_port = listener.local_addr().unwrap().port();
 
         tokio::spawn(async move {
@@ -8711,7 +8787,7 @@ mod tests {
                 "labels": {"kubernetes.io/service-name": "my-svc"}
             },
             "addressType": "IPv4",
-            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}],
+            "endpoints": [{"addresses": [backend_ip.to_string()], "conditions": {"ready": true}}],
             "ports": [{"name": "http", "port": ep_port, "protocol": "TCP"}]
         });
         state
@@ -8910,7 +8986,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_ip = test_backend_ip();
+        let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let pod_port = listener.local_addr().unwrap().port();
 
         tokio::spawn(async move {
@@ -8934,7 +9011,7 @@ mod tests {
                 "nodeName": "node-1",
                 "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
             },
-            "status": {"podIP": "127.0.0.1"}
+            "status": {"podIP": backend_ip.to_string()}
         });
         state
             .store
@@ -8945,7 +9022,7 @@ mod tests {
             )
             .await
             .expect("seed pod");
-        seed_node_with_pod_cidr(&state, "node-1", "127.0.0.0/8").await;
+        seed_node_with_pod_cidr(&state, "node-1", "0.0.0.0/0").await;
 
         let mut router = make_router(state);
         let req = axum::http::Request::builder()
@@ -9021,7 +9098,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_ip = test_backend_ip();
+        let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let pod_port = listener.local_addr().unwrap().port();
 
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
@@ -9046,7 +9124,7 @@ mod tests {
                 "nodeName": "node-1",
                 "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
             },
-            "status": {"podIP": "127.0.0.1"}
+            "status": {"podIP": backend_ip.to_string()}
         });
         state
             .store
@@ -9057,7 +9135,7 @@ mod tests {
             )
             .await
             .expect("seed pod");
-        seed_node_with_pod_cidr(&state, "node-1", "127.0.0.0/8").await;
+        seed_node_with_pod_cidr(&state, "node-1", "0.0.0.0/0").await;
 
         let mut router = make_router(state);
         let req = axum::http::Request::builder()
@@ -10147,6 +10225,77 @@ mod tests {
         );
     }
 
+    /// Service proxy must not dial a ready EndpointSlice address of bare IPv4 loopback
+    /// (127.0.0.1).
+    ///
+    /// EndpointSlice addresses are copied verbatim from Service-owning controllers, which
+    /// in turn source them from node-reported pod IPs — equally attacker-influenced as
+    /// status.podIP (see `validate_proxy_target_ip`'s doc comment). Without this check, a
+    /// compromised node could get itself listed as a Service endpoint and redirect the
+    /// apiserver's own services/proxy dial to a service on its own host (pprof/debug/
+    /// metadata). Since this is the only (ready) endpoint, filtering it out must surface
+    /// as the same "no ready endpoints" 503 as if none existed.
+    #[tokio::test]
+    async fn service_proxy_rejects_loopback_endpoint_address() {
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "my-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "my-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [
+                {"addresses": ["127.0.0.1"], "conditions": {"ready": true}}
+            ],
+            "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "my-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let result = resolve_service_proxy_target(&state, "default", "my-svc").await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            503,
+            "a ready EndpointSlice address of 127.0.0.1 must be filtered out, not dialed — \
+             a compromised node listed as a Service endpoint must not be able to redirect \
+             the apiserver's own services/proxy dial to itself"
+        );
+    }
+
     /// Service proxy route must resolve to the handler, not return 404.
     ///
     /// Without the route registration in main.rs the request falls through to the
@@ -10224,7 +10373,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_ip = test_backend_ip();
+        let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let ep_port = listener.local_addr().unwrap().port();
 
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
@@ -10268,7 +10418,7 @@ mod tests {
             },
             "addressType": "IPv4",
             "endpoints": [
-                {"addresses": ["127.0.0.1"], "conditions": {"ready": true}}
+                {"addresses": [backend_ip.to_string()], "conditions": {"ready": true}}
             ],
             "ports": [{"name": "http", "port": ep_port, "protocol": "TCP"}]
         });
