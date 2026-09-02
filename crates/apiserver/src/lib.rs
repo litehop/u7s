@@ -1456,10 +1456,16 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["services"],     "verbs": ["get","list","watch"] },
             { "apiGroups": [""], "resources": ["configmaps"],          "verbs": ["get","list","watch"] },
             { "apiGroups": [""], "resources": ["secrets"],             "verbs": ["get","list","watch"] },
+            // Needed for the (legacy) glusterfs in-tree volume plugin, per upstream's own comment.
+            { "apiGroups": [""], "resources": ["endpoints"], "verbs": ["get"] },
             // Kubelet calls TokenRequest to project SA tokens into pods (projected volumes).
             // Without this rule the kubelet's POST to serviceaccounts/{name}/token returns 403
             // and containers never get an SA token, breaking in-cluster API calls.
             { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
+            // Only activates when a kubelet credentialProviders config entry requests SA tokens
+            // for image-pull auth (KubeletServiceAccountTokenForCredentialProviders, default-true
+            // upstream since 1.34).
+            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["get"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] },
@@ -1483,6 +1489,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // SubjectAccessReview and TokenReview. Without these the kubelet denies all
             // proxy requests (logs, exec, attach) with "Authorization error".
             { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["localsubjectaccessreviews"], "verbs": ["create"] },
             { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
             // Used to create a certificatesigningrequest for a node-specific client certificate,
             // and watch for it to be signed. This allows the kubelet to rotate its own
@@ -5187,6 +5194,62 @@ mod tests {
                  modern Events API"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_system_node_clusterrole_allows_kubelet_sar_and_endpoints_and_sa_reads() {
+        // Regression test for the three P2 NodeRules parity gaps: localsubjectaccessreviews
+        // (paired with subjectaccessreviews upstream), endpoints get (glusterfs volumes per
+        // upstream's own comment), and plain serviceaccounts get (kubelet credential providers
+        // requesting SA tokens for image-pull auth).
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store
+            .get(&cr_key)
+            .await
+            .expect("get must not fail")
+            .expect("ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value = serde_json::from_slice(&cr_obj.value).expect("valid json");
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+
+        let has_rule = |api_group: &str, resource: &str, verb: &str| {
+            rules.iter().any(|r| {
+                let groups_match = r["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|v| v.as_str() == Some(api_group)));
+                let resources_match = r["resources"]
+                    .as_array()
+                    .is_some_and(|res| res.iter().any(|v| v.as_str() == Some(resource)));
+                let verbs_match = r["verbs"]
+                    .as_array()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == Some(verb)));
+                groups_match && resources_match && verbs_match
+            })
+        };
+
+        assert!(
+            has_rule(
+                "authorization.k8s.io",
+                "localsubjectaccessreviews",
+                "create"
+            ),
+            "system:node must be able to create localsubjectaccessreviews, matching upstream's \
+             pairing with the cluster-scoped subjectaccessreviews rule"
+        );
+        assert!(
+            has_rule("", "endpoints", "get"),
+            "system:node must be able to get endpoints for the (legacy) glusterfs in-tree \
+             volume plugin, per upstream NodeRules()"
+        );
+        assert!(
+            has_rule("", "serviceaccounts", "get"),
+            "system:node must be able to get serviceaccounts so kubelet credential providers \
+             can request SA tokens for image-pull auth"
+        );
     }
 
     #[tokio::test]
