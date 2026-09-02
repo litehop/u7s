@@ -1561,7 +1561,8 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
 
         // No field selector: SQL-level pagination when limit is set (fetch limit+1 rows).
         None => {
-            let fetch_limit = opts.limit.map(|l| (l + 1) as i64);
+            let limit = clamp_list_limit(opts.limit);
+            let fetch_limit = limit.map(|l| (l + 1) as i64);
             let raw = if upper.is_empty() {
                 match (ck.is_empty(), fetch_limit) {
                     (true, None)       => query_all(conn,
@@ -1595,7 +1596,7 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
             };
             // If we fetched limit+1 rows, there are more items. Discard the extra row
             // and use the last returned item's key as the cursor for the next page.
-            if let Some(limit) = opts.limit.map(|l| l as usize) {
+            if let Some(limit) = limit.map(|l| l as usize) {
                 if raw.len() > limit {
                     let mut items = raw;
                     items.pop(); // discard the probe row; it belongs to the next page
@@ -1647,6 +1648,19 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         continue_key,
         remaining_count,
     })
+}
+
+/// Clamp a client-supplied LIST `limit` to a value safe for the SQL-level pagination
+/// fast-path's `fetch_limit = limit + 1` widening cast to `i64`.
+///
+/// `limit == u64::MAX` would wrap `limit + 1` to 0, turning `LIMIT 0` into a permanently
+/// empty page instead of the requested (effectively unlimited) list. A `limit` anywhere in
+/// `i64::MAX-1 ..= u64::MAX` casts to a *negative* `i64`, which SQLite silently treats as
+/// "no limit" rather than erroring. Both are treated the same as an absent `limit`
+/// (unlimited) here, matching `paginate_in_memory` below, which already tolerates huge
+/// limits safely via a `usize` comparison instead of an `i64` cast.
+fn clamp_list_limit(limit: Option<u64>) -> Option<u64> {
+    limit.filter(|&l| l < i64::MAX as u64 - 1)
 }
 
 /// Apply in-memory pagination: if limit is set, return at most limit items and
@@ -2891,6 +2905,75 @@ mod tests {
             "field-selector list by namespace=prod must return 1 pod; returning 0 means the \
              ns indexed column was not correctly populated by the single-parse put path, \
              breaking all namespace-scoped list queries"
+        );
+    }
+
+    /// A LIST `limit=u64::MAX` must not turn into `LIMIT 0`.
+    ///
+    /// `clamp_list_limit` feeds `list_sync`'s SQL fast-path `fetch_limit = limit + 1` cast.
+    /// If it let `u64::MAX` through, `limit + 1` wraps to 0 (or panics under debug
+    /// overflow-checks, which `cargo test` builds with by default) and the resulting
+    /// `LIMIT 0` would hand a client asking for "everything" a permanently empty page
+    /// instead of their results.
+    #[test]
+    fn clamp_list_limit_rejects_u64_max_to_avoid_wrapping_fetch_limit_to_zero() {
+        assert_eq!(
+            clamp_list_limit(Some(u64::MAX)),
+            None,
+            "limit=u64::MAX must be treated as unlimited; passing it through unchanged would \
+             wrap the SQL fast-path's `limit + 1` computation to 0, silently emptying every \
+             page for a client that asked for an unlimited list"
+        );
+    }
+
+    /// A LIST `limit` anywhere in `2^63..=u64::MAX-1` must not reach the SQL fast-path's
+    /// `as i64` cast, because that cast reinterprets it as a *negative* i64 and SQLite
+    /// treats a negative LIMIT as "no limit" — silently returning the entire unbounded
+    /// result set instead of erroring or falling back through code that says so explicitly.
+    #[test]
+    fn clamp_list_limit_rejects_limits_that_would_cast_negative_for_sqlite() {
+        for hostile in [1u64 << 63, (1u64 << 63) + 12345, u64::MAX - 1] {
+            assert_eq!(
+                clamp_list_limit(Some(hostile)),
+                None,
+                "limit={hostile} would cast to a negative i64 in the SQL fast-path's LIMIT \
+                 parameter; letting it through relies on SQLite's negative-LIMIT-means-unlimited \
+                 convention instead of this function's own explicit unlimited fallback"
+            );
+        }
+    }
+
+    /// End-to-end proof that `list_sync` itself, not just the clamp helper, survives a
+    /// `limit=u64::MAX` LIST: it must return the seeded objects, not an empty page.
+    #[test]
+    fn list_sync_limit_u64_max_returns_objects_not_an_empty_page() {
+        let conn = Connection::open_in_memory().expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, \
+             revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID; \
+             CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL); \
+             INSERT INTO meta (key, value) VALUES ('revision', '1'); \
+             INSERT INTO objects (key, value, revision, ns, obj_name) VALUES \
+             ('/registry/pods/default/foo', x'7b7d', 1, 'default', 'foo');",
+        )
+        .expect("schema");
+
+        let resp = list_sync(
+            &conn,
+            "/registry/pods/",
+            &ListOptions {
+                limit: Some(u64::MAX),
+                ..Default::default()
+            },
+        )
+        .expect("list with limit=u64::MAX must not error");
+
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "a client sending limit=u64::MAX (a hostile-but-plausible 'give me everything' \
+             value) must get the seeded object back; before the fix the SQL fast-path's \
+             `limit + 1` wraps to 0, producing `LIMIT 0` and an empty page forever"
         );
     }
 
