@@ -1,4 +1,4 @@
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 
 use crate::{status::Status, util::content_type};
@@ -68,6 +68,44 @@ impl ReplaceQuery {
     pub(crate) fn is_dry_run(&self) -> bool {
         self.dry_run.as_deref() == Some("All")
     }
+}
+
+/// Header used to thread the real `?dryRun=All` flag into handlers that have no
+/// `Query<...>` extractor of their own (CRD/CSR/Namespace create/replace/patch, and CR
+/// create/replace/patch reached via resource.rs's fallback). `inject_dry_run_header`
+/// (lib.rs) sets this from the raw query string as a router-wide layer, so every handler
+/// reachable through axum sees it regardless of which typed Query struct (if any) it
+/// declares. Without this, AdmissionContext.dry_run stays hardcoded false on those paths,
+/// wrongly invoking a `sideEffects: Some` webhook on a dry-run request.
+pub(crate) const DRY_RUN_HEADER: &str = "x-u7s-dry-run";
+
+/// Returns true when `inject_dry_run_header` marked this request as dry-run. See
+/// `DRY_RUN_HEADER` for why handlers without their own typed dry-run query field need this.
+pub(crate) fn is_dry_run_header(headers: &HeaderMap) -> bool {
+    headers.contains_key(DRY_RUN_HEADER)
+}
+
+/// Router-wide layer (installed in lib.rs's `build_router`) that stamps `DRY_RUN_HEADER`
+/// onto the request before any handler runs, read straight from the raw query string
+/// rather than a typed `Query<...>` extractor — the only way to reach handlers that don't
+/// declare one of their own. "All" is the only server-meaningful value (see
+/// `CreateQuery::is_dry_run` etc.); "client" is handled by kubectl itself and never reaches
+/// the server as `dryRun=All`.
+pub(crate) async fn inject_dry_run_header(
+    mut req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_dry_run = req
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|kv| kv == "dryRun=All"));
+    if is_dry_run {
+        req.headers_mut().insert(
+            HeaderName::from_static(DRY_RUN_HEADER),
+            HeaderValue::from_static("true"),
+        );
+    }
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------------------

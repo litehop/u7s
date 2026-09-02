@@ -347,7 +347,7 @@ pub(crate) async fn create_resource<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: create_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -419,7 +419,7 @@ pub(crate) async fn create_resource<S: Store>(
                         "groups": user.groups,
                         "extra": user.extra,
                     })),
-                    dry_run: false,
+                    dry_run: create_query.is_dry_run(),
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
@@ -759,7 +759,7 @@ pub(crate) async fn replace_resource<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: replace_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -1586,7 +1586,7 @@ pub(crate) async fn do_patch<S: Store>(
             namespace: ns,
             operation: "UPDATE",
             user_info: user_info.clone(),
-            dry_run: false,
+            dry_run,
         };
         current.body = run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
         run_validating_webhooks(state, &current.body, None, &admission_ctx).await?;
@@ -2571,7 +2571,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: create_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -2670,7 +2670,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
                         "groups": user.groups,
                         "extra": user.extra,
                     })),
-                    dry_run: false,
+                    dry_run: create_query.is_dry_run(),
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
@@ -3235,7 +3235,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: replace_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -17210,6 +17210,122 @@ mod tests {
             stored.is_none(),
             "dry-run POST must NOT persist the object — store must remain empty; \
              if this fails, the dryRun=All check in create_namespaced_resource was removed"
+        );
+    }
+
+    /// A `sideEffects: Some` mutating webhook has no contractual guarantee it honors
+    /// `dryRun: true` in the AdmissionReview it receives — invoking it anyway on a
+    /// `--dry-run=server` create could trigger a real external side effect the client
+    /// explicitly opted out of. Before this fix, create_namespaced_resource constructed
+    /// AdmissionContext with `dry_run: false` hardcoded regardless of the real ?dryRun=All
+    /// query param, so admission.rs's sideEffects gate never saw dry_run=true and let every
+    /// webhook through unconditionally. Reverting that fix makes this test fail: the
+    /// webhook's HTTP endpoint gets called (call_count > 0) and the request succeeds
+    /// instead of being rejected with 400 "does not support dry run".
+    #[tokio::test]
+    async fn create_namespaced_resource_dry_run_does_not_invoke_side_effects_some_webhook() {
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counter = call_count.clone();
+        let router = Router::new().route(
+            "/mutate",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": { "uid": "uid-dry-run-side-effects", "allowed": true }
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = start_mock_admission_webhook_server(router).await;
+
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "dry-run-side-effects-mwc"},
+            "webhooks": [{
+                "name": "side-effects-some.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{
+                    "apiGroups": ["*"], "apiVersions": ["*"], "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "sideEffects": "Some"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/dry-run-side-effects-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "dry-run-cm", "namespace": "default" },
+            "data": { "k": "v" }
+        });
+        let dry_run_query = CreateQuery {
+            _field_manager: None,
+            field_validation: None,
+            dry_run: Some("All".to_string()),
+        };
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(dry_run_query),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "dryRun=All against a sideEffects:Some webhook (default failurePolicy=Fail) must \
+                 be rejected with 400 \"does not support dry run\", not silently allowed through \
+                 — a 2xx here means the sideEffects gate never saw dry_run=true"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "dryRun=All against a sideEffects:Some webhook (default failurePolicy=Fail) must be \
+             rejected with 400 \"does not support dry run\", not silently allowed through — a \
+             2xx here means the sideEffects gate never saw dry_run=true"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "AdmissionContext.dry_run must reflect the real ?dryRun=All flag; if this fails, \
+             create_namespaced_resource went back to hardcoding dry_run: false and the \
+             sideEffects:Some webhook's HTTP endpoint was wrongly invoked on a dry-run request"
         );
     }
 
