@@ -22,15 +22,15 @@ konnectivity-server carrying the apiserver's own trusted TLS identity.
 
 ## Current mitigation
 
-`validate_proxy_target_ip` (`proxy.rs`) rejects any `pod_ip` that does not
-parse as `std::net::IpAddr`, which rejects an embedded CRLF as a side
-effect (a string containing `"\r\n"` can never parse as an IP literal), and
-separately rejects loopback/link-local/multicast/unspecified ranges.
-`validate_pod_ip_against_node` further cross-checks the value against the
-owning node's `spec.podCIDR` or `status.hostIP`. Both landed in PR #1525
-(mayor-ek41c) — the CRLF/request-splitting vector against
-konnectivity-server via this CONNECT line is closed as of that fix, not an
-open issue.
+`validate_proxy_target_ip` (`proxy.rs`, landed in PR #1513) rejects any
+`pod_ip` that does not parse as `std::net::IpAddr`, which rejects an
+embedded CRLF as a side effect (a string containing `"\r\n"` can never
+parse as an IP literal), and separately rejects
+loopback/link-local/multicast/unspecified ranges. `validate_pod_ip_against_node`
+(landed in PR #1525) further cross-checks the value against the owning
+node's `spec.podCIDR` or `status.hostIP`. The CRLF/request-splitting vector
+against konnectivity-server via this CONNECT line is closed as of PR
+#1513, not an open issue.
 
 ## Out of scope here
 
