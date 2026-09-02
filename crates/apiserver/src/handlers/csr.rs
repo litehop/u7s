@@ -378,12 +378,16 @@ pub async fn delete_collection_csr<S: Store>(
     State(state): State<AppState<S>>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     crate::handlers::resource::delete_collection_resource(
         State(state),
         Path((GROUP.to_string(), VERSION.to_string(), PLURAL.to_string())),
         Query(query),
         Extension(user),
+        headers,
+        body,
     )
     .await
 }
@@ -732,6 +736,8 @@ mod tests {
                 groups: vec!["system:masters".into()],
                 extra: Default::default(),
             }),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await;
 

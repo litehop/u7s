@@ -2697,6 +2697,10 @@ pub async fn delete_cr<S: Store>(
     } else {
         serde_json::from_slice(&body).unwrap_or_default()
     };
+    // client-go's typed Delete() sends DryRun in the DeleteOptions body; a raw/proxied
+    // caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
@@ -2717,7 +2721,7 @@ pub async fn delete_cr<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run,
     };
     run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
@@ -2739,6 +2743,11 @@ pub async fn delete_cr<S: Store>(
     // apply_delete_policy: if the CR has finalizers (including the `orphan` one just added),
     // stamp deletionTimestamp and soft-delete instead of removing it outright.
     if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut obj) {
+        // Dry-run: validation passed and this is what a real DELETE would soft-delete to;
+        // return it without persisting or cascading.
+        if dry_run {
+            return Ok(Json(soft).into_response());
+        }
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
             .store
@@ -2748,6 +2757,18 @@ pub async fn delete_cr<S: Store>(
         let mut resp_body = Object { body: soft };
         resp_body.set_resource_version(new_rv);
         return Ok(Json(resp_body.body).into_response());
+    }
+
+    // Dry-run: validation passed and this is what a real DELETE would hard-delete; return
+    // the would-be Success status without persisting or cascading.
+    if dry_run {
+        return Ok(Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Success",
+            "code": 200
+        }))
+        .into_response());
     }
 
     state
@@ -2789,9 +2810,23 @@ pub async fn delete_collection_cr<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
     query: super::generic::CollectionQuery,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
+
+    // Parse DeleteOptions from the request body (same pattern as single-object delete
+    // handlers). client-go's typed DeleteCollection() sends DryRun in this body; a
+    // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let prefix = cr_list_prefix(&group, &plural, None);
     let resp = state
@@ -2866,9 +2901,15 @@ pub async fn delete_collection_cr<S: Store>(
                     "groups": user.groups,
                     "extra": user.extra,
                 })),
-                dry_run: false,
+                dry_run,
             };
             run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+
+            // Dry-run: validation passed; skip the actual write entirely (both the
+            // soft-delete branch and the hard-delete fallback below) for this object.
+            if dry_run {
+                continue;
+            }
 
             let mut typed = Object { body: parsed };
             if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut typed) {
@@ -3558,6 +3599,10 @@ pub async fn delete_cr_namespaced<S: Store>(
     } else {
         serde_json::from_slice(&body).unwrap_or_default()
     };
+    // client-go's typed Delete() sends DryRun in the DeleteOptions body; a raw/proxied
+    // caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
@@ -3576,7 +3621,7 @@ pub async fn delete_cr_namespaced<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run,
     };
     run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
@@ -3595,6 +3640,11 @@ pub async fn delete_cr_namespaced<S: Store>(
     // apply_delete_policy: if the CR has finalizers (including the `orphan` one just added),
     // stamp deletionTimestamp and soft-delete instead of removing it outright.
     if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut obj) {
+        // Dry-run: validation passed and this is what a real DELETE would soft-delete to;
+        // return it without persisting or cascading.
+        if dry_run {
+            return Ok(Json(soft).into_response());
+        }
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
             .store
@@ -3604,6 +3654,18 @@ pub async fn delete_cr_namespaced<S: Store>(
         let mut resp_body = Object { body: soft };
         resp_body.set_resource_version(new_rv);
         return Ok(Json(resp_body.body).into_response());
+    }
+
+    // Dry-run: validation passed and this is what a real DELETE would hard-delete; return
+    // the would-be Success status without persisting or cascading.
+    if dry_run {
+        return Ok(Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Success",
+            "code": 200
+        }))
+        .into_response());
     }
 
     state
@@ -3643,7 +3705,9 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
     query: super::generic::CollectionQuery,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
@@ -3653,6 +3717,18 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
             "Resource",
         ));
     }
+
+    // Parse DeleteOptions from the request body (same pattern as single-object delete
+    // handlers). client-go's typed DeleteCollection() sends DryRun in this body; a
+    // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let prefix = cr_list_prefix(&group, &plural, Some(&ns));
     let resp = state
@@ -3727,9 +3803,15 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                     "groups": user.groups,
                     "extra": user.extra,
                 })),
-                dry_run: false,
+                dry_run,
             };
             run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+
+            // Dry-run: validation passed; skip the actual write entirely (both the
+            // soft-delete branch and the hard-delete fallback below) for this object.
+            if dry_run {
+                continue;
+            }
 
             let mut typed = Object { body: parsed };
             if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut typed) {
@@ -6906,7 +6988,9 @@ mod tests {
                 "gizmos".to_string(),
             )),
             test_user(),
+            HeaderMap::new(),
             query,
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("v1 DeleteCollection with fieldSelector must succeed: {e:?}"));
@@ -7022,7 +7106,9 @@ mod tests {
                 plural.to_string(),
             )),
             test_user(),
+            HeaderMap::new(),
             no_watch_query(),
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("delete_collection_cr_namespaced must succeed: {e:?}"));
@@ -8839,7 +8925,9 @@ mod tests {
             crd::delete_crd(
                 State(state.clone()),
                 Path("widgets.example.io".to_string()),
-                test_user()
+                test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -14093,6 +14181,8 @@ mod tests {
             State(state.clone()),
             Path("gizmos.multiver.example.com".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("delete CRD A must succeed");
@@ -15281,6 +15371,8 @@ mod tests {
                 State(state.clone()),
                 axum::extract::Path("applications.argoproj.io".to_string()),
                 test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -15344,6 +15436,8 @@ mod tests {
             State(state.clone()),
             axum::extract::Path("applications.argoproj.io".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -15358,7 +15452,9 @@ mod tests {
                     "applications".to_string(),
                 )),
                 test_user(),
+                HeaderMap::new(),
                 no_watch_query(),
+                Bytes::new(),
             )
             .await,
             "deleteCollection must error after CRD deletion",
@@ -15390,6 +15486,8 @@ mod tests {
             State(state.clone()),
             axum::extract::Path("widgets.example.io".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -15434,6 +15532,8 @@ mod tests {
             State(state.clone()),
             axum::extract::Path("applications.argoproj.io".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -15495,6 +15595,8 @@ mod tests {
             State(state.clone()),
             axum::extract::Path("widgets.example.io".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -15579,6 +15681,8 @@ mod tests {
             State(state.clone()),
             axum::extract::Path("applications.argoproj.io".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -15642,6 +15746,8 @@ mod tests {
             State(state.clone()),
             axum::extract::Path("widgets.example.io".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -20989,6 +21095,72 @@ mod tests {
             review["request"]["oldObject"]["spec"]["destination"]["namespace"], "default",
             "old_object on DELETE must be the object that was actually stored, not an \
              empty or unrelated placeholder"
+        );
+    }
+
+    /// `kubectl delete app my-app --dry-run=server` must NOT actually delete the CR — a
+    /// dry-run that deletes anyway silently mutates cluster state against the client's
+    /// explicit intent. DeleteOptions.dryRun=["All"] is sent in the DELETE request BODY
+    /// (client-go's typed Delete(), unlike Create/Update/Patch which use a ?dryRun=All query
+    /// param) — this test fails on revert with the CR removed from the store.
+    #[tokio::test]
+    async fn delete_cr_namespaced_dry_run_does_not_delete_object() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "dry-run-delete-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let delete_opts_body = Bytes::from(
+            serde_json::json!({
+                "kind": "DeleteOptions",
+                "apiVersion": "v1",
+                "dryRun": ["All"]
+            })
+            .to_string(),
+        );
+
+        let result = delete_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            delete_opts_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run delete must still return a success response"
+        );
+
+        let key = cr_store_key(&group, &plural, Some(&ns), &name);
+        assert!(
+            state.store.get(&key).await.unwrap().is_some(),
+            "dryRun=All in the DeleteOptions body must NOT delete the CR — if this fails, \
+             delete_cr_namespaced's dry-run guard was removed and the CR was actually deleted \
+             from the store"
         );
     }
 }

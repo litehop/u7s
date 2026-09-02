@@ -22,7 +22,10 @@ use crate::{
     proto,
     state::AppState,
     status::Status,
-    types::{NamespacePhase, NamespaceSpec, NamespaceStatus, Object, ObjectMeta, ResourceMeta},
+    types::{
+        DeleteOptions, NamespacePhase, NamespaceSpec, NamespaceStatus, Object, ObjectMeta,
+        ResourceMeta,
+    },
     util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
@@ -1188,6 +1191,8 @@ pub(crate) async fn delete_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let key = cluster_object_key("namespaces", &name);
 
@@ -1201,6 +1206,18 @@ pub(crate) async fn delete_namespace<S: Store>(
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    // Parse DeleteOptions from the request body (same pattern as other delete handlers).
+    // client-go's typed Delete() sends DryRun in this body; a raw/proxied caller may
+    // instead send it as ?dryRun=All (caught by the router-wide inject_dry_run_header
+    // layer) — accept either.
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
     // Run once here, before branching into soft-delete/finalizer logic below, matching every
@@ -1218,7 +1235,7 @@ pub(crate) async fn delete_namespace<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run,
     };
     run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
@@ -1230,6 +1247,13 @@ pub(crate) async fn delete_namespace<S: Store>(
         // of an already-terminating namespace, discarding the real KCM namespace-controller's
         // drain-progress signal that a client polls for.
         obj.body = soft;
+
+        // Dry-run: validation passed and this is what a real DELETE would soft-delete to
+        // (status.phase=Terminating); return it without persisting or cascading into
+        // delete_namespace_scoped_crds below.
+        if dry_run {
+            return Ok(Json(obj.body).into_response());
+        }
 
         // spec.finalizers (including "kubernetes") is left untouched. deletionTimestamp +
         // "kubernetes" in spec.finalizers is the real KCM namespace-controller's ONLY watch
@@ -1267,6 +1291,21 @@ pub(crate) async fn delete_namespace<S: Store>(
         delete_namespace_scoped_crds(&state, &name).await;
 
         return Ok(Json(obj.body).into_response());
+    }
+
+    // Dry-run: no spec.finalizers means a real DELETE would cascade-delete all namespace
+    // content and hard-delete the namespace immediately; return the would-be Success status
+    // without running that cascade (cascade_delete_namespace_resources_until_stable actually
+    // deletes every object in the namespace — must not run on a dry-run request) or the
+    // namespace's own store.delete.
+    if dry_run {
+        return Ok(Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Success",
+            "code": 200
+        }))
+        .into_response());
     }
 
     // No spec.finalizers — hard-delete immediately (namespace was not given a lifecycle
@@ -1450,7 +1489,9 @@ mod tests {
             delete_namespace(
                 State(state.clone()),
                 Path("term-ns".to_string()),
-                test_user()
+                test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -2417,7 +2458,9 @@ mod tests {
             delete_namespace(
                 State(state.clone()),
                 Path("del-ns".to_string()),
-                test_user()
+                test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -2510,7 +2553,9 @@ mod tests {
             delete_namespace(
                 State(state.clone()),
                 Path("ext-fin-ns".to_string()),
-                test_user()
+                test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -3044,6 +3089,8 @@ mod tests {
             State(state.clone()),
             Path("ghost-ns".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await;
         let err = match result {
@@ -3092,7 +3139,9 @@ mod tests {
             delete_namespace(
                 State(state.clone()),
                 Path("fin-ns".to_string()),
-                test_user()
+                test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -3151,7 +3200,9 @@ mod tests {
             delete_namespace(
                 State(state.clone()),
                 Path("repeat-delete-ns".to_string()),
-                test_user()
+                test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -3210,7 +3261,9 @@ mod tests {
             delete_namespace(
                 State(state.clone()),
                 Path("repeat-delete-ns".to_string()),
-                test_user()
+                test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -3271,7 +3324,9 @@ mod tests {
             delete_namespace(
                 State(state.clone()),
                 Path("no-fin-ns".to_string()),
-                test_user()
+                test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -3326,6 +3381,8 @@ mod tests {
             State(state.clone()),
             Path("no-fin-ns".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("delete without finalizers must succeed");
@@ -3403,6 +3460,8 @@ mod tests {
             State(state.clone()),
             Path("recycled-ns".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("namespace delete must succeed");
@@ -3535,6 +3594,8 @@ mod tests {
             State(state.clone()),
             Path("revoke-ns".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("namespace delete must succeed");
@@ -7241,9 +7302,15 @@ mod admission_tests {
 
         // Soft-delete the namespace.
         assert!(
-            delete_namespace(State(state.clone()), Path(ns_name.to_string()), test_user())
-                .await
-                .is_ok(),
+            delete_namespace(
+                State(state.clone()),
+                Path(ns_name.to_string()),
+                test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await
+            .is_ok(),
             "namespace soft-delete must succeed"
         );
 

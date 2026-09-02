@@ -679,9 +679,22 @@ pub struct DeleteOptions {
     /// spec.terminationGracePeriodSeconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grace_period_seconds: Option<i64>,
+    /// Matches upstream `metav1.DeleteOptions.DryRun`: client-go's typed Delete() clients send
+    /// this in the request BODY (unlike Create/Update/Patch, which send their dry-run flag as
+    /// a `?dryRun=All` query param) — see `is_dry_run` for why only "All" is meaningful.
+    #[serde(default, rename = "dryRun", skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<Vec<String>>,
 }
 
 impl DeleteOptions {
+    /// Returns true when the request must be a dry-run (no store write). Only "All" is
+    /// server-meaningful, matching CreateQuery/ReplaceQuery/PatchQuery::is_dry_run.
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
+            .as_deref()
+            .is_some_and(|v| v.iter().any(|s| s == "All"))
+    }
+
     /// Returns true when the caller has explicitly requested Orphan propagation.
     /// `orphanDependents: true` is the legacy spelling; `propagationPolicy: Orphan` is current.
     pub fn is_orphan(&self) -> bool {

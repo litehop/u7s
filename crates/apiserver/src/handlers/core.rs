@@ -320,12 +320,16 @@ pub(crate) async fn core_delete_collection_resource<S: Store>(
     Path(plural): Path<String>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     delete_collection_resource(
         State(state),
         Path(("".into(), "v1".into(), plural)),
         Query(query),
         Extension(user),
+        headers,
+        body,
     )
     .await
 }
@@ -461,12 +465,16 @@ pub(crate) async fn core_delete_collection_namespaced_resource<S: Store>(
     Path((ns, plural)): Path<(String, String)>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     delete_collection_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural)),
         Query(query),
         Extension(user),
+        headers,
+        body,
     )
     .await
 }

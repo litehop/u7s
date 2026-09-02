@@ -5964,6 +5964,8 @@ mod tests {
             State(state.clone()),
             Path("gadgets.invalidation-check.example.com".to_string()),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .expect("delete_crd must succeed");

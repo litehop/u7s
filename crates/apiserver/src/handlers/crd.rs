@@ -17,7 +17,7 @@ use crate::{
     auth::UserInfo,
     state::AppState,
     status::Status,
-    types::Object,
+    types::{DeleteOptions, Object},
     util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
@@ -775,6 +775,8 @@ pub async fn delete_crd<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let key = store_key(&name);
 
@@ -785,6 +787,18 @@ pub async fn delete_crd<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, KIND))?;
+
+    // Parse DeleteOptions from the request body (same pattern as single-object delete
+    // handlers). client-go's typed Delete() sends DryRun in this body; a raw/proxied caller
+    // may instead send it as ?dryRun=All (caught by the router-wide inject_dry_run_header
+    // layer) — accept either.
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     // Parse once: used both for the tombstone's group below and as the admission review object.
     let existing: serde_json::Value =
@@ -805,9 +819,21 @@ pub async fn delete_crd<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run,
     };
     run_validating_webhooks(&state, &existing, Some(&existing), &admission_ctx).await?;
+
+    // Dry-run: validation passed; return the would-be Success status without persisting or
+    // running any of the cascade side effects (schema/conversion-cache evict, watch-ring
+    // free, discovery refresh, group tombstone) below.
+    if dry_run {
+        return Ok(Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Success",
+            "code": 200
+        })));
+    }
 
     state
         .store
@@ -879,6 +905,8 @@ pub async fn delete_collection_crds<S: Store>(
     State(state): State<AppState<S>>,
     Query(query): Query<super::generic::CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let prefix = list_prefix();
     let resp = state
@@ -909,7 +937,14 @@ pub async fn delete_collection_crds<S: Store>(
                 continue;
             }
         }
-        delete_crd(State(state.clone()), Path(name), Extension(user.clone())).await?;
+        delete_crd(
+            State(state.clone()),
+            Path(name),
+            Extension(user.clone()),
+            headers.clone(),
+            body.clone(),
+        )
+        .await?;
     }
 
     Ok(Json(serde_json::json!({
@@ -1452,6 +1487,8 @@ mod tests {
                 State(state),
                 Path("missing.example.com".to_string()),
                 test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await,
         );
@@ -1864,12 +1901,18 @@ mod tests {
             allow_watch_bookmarks: None,
             timeout_seconds: None,
         });
-        delete_collection_crds(State(state.clone()), query, test_user())
-            .await
-            .expect(
-                "delete collection must succeed — before the fix this route did not \
+        delete_collection_crds(
+            State(state.clone()),
+            query,
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect(
+            "delete collection must succeed — before the fix this route did not \
                      exist and DELETE on the collection returned 405",
-            );
+        );
 
         assert!(
             get_crd(State(state.clone()), Path("foos.example.io".to_string()))
@@ -3824,9 +3867,15 @@ mod tests {
         .await
         .expect("initial create must succeed");
 
-        delete_crd(State(state.clone()), Path(name.to_string()), test_user())
-            .await
-            .expect("delete must succeed");
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
 
         let tombstone_key = deleted_group_tombstone_key(group);
         let after_delete = store
@@ -3924,9 +3973,15 @@ mod tests {
              horizon 0 while it is still live"
         );
 
-        delete_crd(State(state.clone()), Path(name.to_string()), test_user())
-            .await
-            .expect("delete must succeed");
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
 
         assert_eq!(
             store.compaction_horizon_for(&prefix),
@@ -4012,9 +4067,15 @@ mod tests {
         assert_eq!(store.compaction_horizon_for(&ns_prefix), 0);
         assert_eq!(store.compaction_horizon_for(&cluster_prefix), 0);
 
-        delete_crd(State(state.clone()), Path(name.to_string()), test_user())
-            .await
-            .expect("delete must succeed");
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
 
         assert_eq!(
             store.compaction_horizon_for(&cluster_prefix),
