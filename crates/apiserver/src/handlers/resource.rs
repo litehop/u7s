@@ -1204,6 +1204,21 @@ pub(crate) async fn do_patch<S: Store>(
             &obj.body,
             state,
         )?;
+        // NodeRestriction-equivalent admission: an SSA apply-create is a create just like the
+        // plain-POST create_resource path above (see its own restrict_node_self_write call) —
+        // without this, `kubectl apply --server-side` on a not-yet-registered node name would
+        // let a compromised kubelet set podCIDR/taints/providerID that upstream never trusts a
+        // node to set for itself.
+        if group.is_empty() && plural == "nodes" {
+            crate::node_authz::restrict_node_self_write(
+                &user.username,
+                &user.groups,
+                name,
+                None,
+                &obj.body,
+            )
+            .map_err(Status::forbidden)?;
+        }
         if dry_run {
             // Dry-run: validation passed; return the would-be created object without persisting.
             if let Some(fm) = field_manager {
@@ -1240,6 +1255,13 @@ pub(crate) async fn do_patch<S: Store>(
                     .ok_or_else(|| Status::not_found(name, &meta.kind))?;
                 let mut current = Object::from_bytes(&stored.value)
                     .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+                // Full body (not just spec): restrict_node_self_write below also needs
+                // metadata.labels/ownerReferences, not only spec.
+                let node_before = if group.is_empty() && plural == "nodes" {
+                    Some(current.body.clone())
+                } else {
+                    None
+                };
                 let mut patch: serde_json::Value = ssa_body_to_json(&body)?;
                 strip_managed_fields(&mut patch);
                 // The winner of the create race already persisted this object, so from here
@@ -1288,6 +1310,20 @@ pub(crate) async fn do_patch<S: Store>(
                     &current.body,
                     state,
                 )?;
+                // NodeRestriction-equivalent admission: same rationale as the primary create
+                // path above — a lost create/create race still merges the caller's own SSA
+                // body onto the winner's object, so it must not skip the check that blocks a
+                // `system:node:<name>` identity from setting podCIDR/taints/providerID/labels.
+                if group.is_empty() && plural == "nodes" {
+                    crate::node_authz::restrict_node_self_write(
+                        &user.username,
+                        &user.groups,
+                        name,
+                        node_before.as_ref(),
+                        &current.body,
+                    )
+                    .map_err(Status::forbidden)?;
+                }
                 if let Some(fm) = field_manager {
                     let api_ver = current.body["apiVersion"]
                         .as_str()
@@ -26245,5 +26281,58 @@ mod tests {
                  in the URL), so this admission check is the only thing stopping it"
             ),
         }
+    }
+
+    /// The SSA-create branch (`do_patch`'s `is_ssa && stored_opt.is_none()` upsert) is a
+    /// separate code path from `create_resource` above and previously ran none of the node
+    /// admission checks at all — `kubectl apply --server-side` on a not-yet-registered node
+    /// name returned 201 with `spec.podCIDR` set verbatim from the request body. Mirrors
+    /// `ssa_create_clusterrolebinding_denied_for_user_lacking_role_rules`, which closed the
+    /// same is_ssa-create gap for RBAC escalation.
+    #[tokio::test]
+    async fn ssa_create_node_denies_self_registration_with_pod_cidr() {
+        use axum::http::StatusCode;
+
+        let state = make_state();
+        let node = node_body("evil-node", Some("10.244.99.0/24"));
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("".into(), "v1".into(), "nodes".into(), "evil-node".into())),
+            axum::extract::Query(PatchQuery::default()),
+            node_identity_user("evil-node"),
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                StatusCode::FORBIDDEN,
+                "a `system:node:evil-node` identity's SSA-create of its OWN node with \
+                 spec.podCIDR set must be 403 Forbidden, not 201 — podCIDR is a \
+                 controller-only assignment for ANY caller wearing a system:node identity, \
+                 on CREATE exactly as on PATCH/PUT"
+            ),
+            Ok(resp) => panic!(
+                "SSA-create of a node with an attacker-chosen podCIDR must be rejected (got \
+                 {:?}) — this is the exact SSA-create bypass a compromised kubelet could use \
+                 to forge its own pod CIDR, redirecting traffic meant for real pod IPs",
+                resp.into_response().status()
+            ),
+        }
+
+        let key = crate::keys::group_object_key("", "nodes", None, "evil-node");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "the rejected SSA-create must not persist the Node object it just denied"
+        );
     }
 }
