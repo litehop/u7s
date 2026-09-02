@@ -333,6 +333,22 @@ pub(crate) async fn create_resource<S: Store>(
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
 
+    // NodeRestriction-equivalent admission: a `system:node:<name>` identity's own Node CREATE
+    // has no name in the URL to scope against, so without this check node_authz's blanket
+    // `"create" => true` (see its own doc comment) would let a compromised kubelet register a
+    // Node object under ANY name, and set fields (podCIDR, taints, ...) upstream never trusts
+    // it with. A plain `create` verb on `nodes` carries no name of its own to check against.
+    if group.is_empty() && plural == "nodes" {
+        crate::node_authz::restrict_node_self_write(
+            &user.username,
+            &user.groups,
+            &name,
+            None,
+            &obj.body,
+        )
+        .map_err(Status::forbidden)?;
+    }
+
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
         group: &group,
@@ -600,7 +616,7 @@ pub(crate) async fn replace_resource<S: Store>(
         stored_deletion_grace,
         pv_spec_before_replace,
         storageclass_before_replace,
-        node_spec_before_replace,
+        node_before_replace,
     ) = if needs_stored_read {
         let parsed = state
             .store
@@ -657,11 +673,9 @@ pub(crate) async fn replace_resource<S: Store>(
         } else {
             None
         };
-        let node_spec_before_replace = if is_node {
-            parsed.as_ref().map(|v| v["spec"].clone())
-        } else {
-            None
-        };
+        // Full body (not just spec): restrict_node_self_write below also needs
+        // metadata.labels/ownerReferences, not only spec.
+        let node_before_replace = if is_node { parsed.clone() } else { None };
         (
             status,
             uid,
@@ -669,7 +683,7 @@ pub(crate) async fn replace_resource<S: Store>(
             deletion_grace,
             pv_spec_before_replace,
             storageclass_before_replace,
-            node_spec_before_replace,
+            node_before_replace,
         )
     } else {
         (None, None, None, None, None, None, None)
@@ -740,9 +754,22 @@ pub(crate) async fn replace_resource<S: Store>(
         validate_storageclass_immutable(old_body, &obj.body)
             .map_err(Status::unprocessable_entity)?;
     }
-    if let Some(ref old_spec) = node_spec_before_replace {
-        validate_node_spec_immutable(old_spec, &obj.body["spec"])
+    if let Some(ref old_body) = node_before_replace {
+        validate_node_spec_immutable(&old_body["spec"], &obj.body["spec"])
             .map_err(Status::unprocessable_entity)?;
+    }
+    // NodeRestriction-equivalent admission: see restrict_node_self_write's doc comment for why
+    // this — not RBAC/node_authz's own broader grant — is what stops a `system:node:<name>`
+    // identity from rewriting its own Node's podCIDR/taints/providerID/labels via a plain PUT.
+    if is_node {
+        crate::node_authz::restrict_node_self_write(
+            &user.username,
+            &user.groups,
+            &name,
+            node_before_replace.as_ref(),
+            &obj.body,
+        )
+        .map_err(Status::forbidden)?;
     }
 
     // Admission webhook pipeline (mutating then validating).
@@ -1390,8 +1417,10 @@ pub(crate) async fn do_patch<S: Store>(
         } else {
             None
         };
-        let node_spec_before_patch = if group.is_empty() && plural == "nodes" {
-            Some(current.body["spec"].clone())
+        // Full body (not just spec): restrict_node_self_write below also needs
+        // metadata.labels/ownerReferences, not only spec.
+        let node_before_patch = if group.is_empty() && plural == "nodes" {
+            Some(current.body.clone())
         } else {
             None
         };
@@ -1504,9 +1533,23 @@ pub(crate) async fn do_patch<S: Store>(
                 .map_err(Status::unprocessable_entity)?;
         }
 
-        if let Some(ref old_spec) = node_spec_before_patch {
-            validate_node_spec_immutable(old_spec, &current.body["spec"])
+        if let Some(ref old_body) = node_before_patch {
+            validate_node_spec_immutable(&old_body["spec"], &current.body["spec"])
                 .map_err(Status::unprocessable_entity)?;
+        }
+        // NodeRestriction-equivalent admission: see restrict_node_self_write's doc comment for
+        // why this — not RBAC/node_authz's own broader grant — is what stops a
+        // `system:node:<name>` identity from rewriting its own Node's
+        // podCIDR/taints/providerID/labels via a plain PATCH.
+        if group.is_empty() && plural == "nodes" {
+            crate::node_authz::restrict_node_self_write(
+                &user.username,
+                &user.groups,
+                name,
+                node_before_patch.as_ref(),
+                &current.body,
+            )
+            .map_err(Status::forbidden)?;
         }
 
         if let Some(ref old_spec) = svc_spec_before_patch {
@@ -25991,5 +26034,197 @@ mod tests {
             "once Node.spec.podCIDR is non-empty, a further change must be rejected — only \
              the initial empty -> valid transition is permitted"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // NodeRestriction-equivalent admission, exercised end-to-end through the real PATCH/CREATE
+    // handlers (not just the pure restrict_node_self_write unit tests in node_authz.rs): before
+    // this fix, a `system:node:<name>` identity's plain PATCH to its own /api/v1/nodes/<name>
+    // (no subresource) returned 200 OK for ANY spec field, live-confirmed against
+    // spec.podCIDR going empty -> attacker-chosen. These fail on a revert because
+    // node_authz::authorize's own-node "" subresource arm (unchanged by this fix, by design —
+    // see its own doc comment) still returns `true` for these exact requests.
+    // -----------------------------------------------------------------------
+
+    fn node_identity_user(node_name: &str) -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: format!("system:node:{node_name}"),
+            uid: String::new(),
+            groups: vec!["system:nodes".into()],
+            extra: Default::default(),
+        })
+    }
+
+    async fn strategic_merge_patch_node<S: Store>(
+        state: AppState<S>,
+        node_name: &str,
+        user: axum::Extension<crate::auth::UserInfo>,
+        patch: serde_json::Value,
+    ) -> Result<Response, crate::status::StatusError> {
+        use axum::extract::{Path, Query, State};
+        let mut headers = json_headers();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        patch_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into(), node_name.into())),
+            Query(PatchQuery::default()),
+            user,
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .map(IntoResponse::into_response)
+    }
+
+    /// A compromised kubelet rewriting its own Node's podCIDR is a live-confirmed SSRF vector:
+    /// the podIP-in-podCIDR trust chain other components rely on assumes podCIDR is
+    /// controller-assigned, not attacker-chosen.
+    #[tokio::test]
+    async fn patch_resource_denies_node_self_patch_of_own_pod_cidr() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let node = node_body("lima-node-5", None);
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await
+        .expect("Node create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "podCIDR": "10.244.99.0/24" } });
+        let result = strategic_merge_patch_node(
+            state,
+            "lima-node-5",
+            node_identity_user("lima-node-5"),
+            patch,
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::FORBIDDEN,
+                "a node identity's own-node PATCH of spec.podCIDR must be 403 Forbidden, not \
+                 the 422 a non-node caller would get from the once-set immutability check — \
+                 this field is a controller-only assignment for ANY caller wearing a \
+                 system:node identity, even on the very first (empty -> value) transition"
+            ),
+            Ok(resp) => panic!(
+                "node-a's own PATCH setting spec.podCIDR must be rejected (got {:?}) — this is \
+                 the exact live-confirmed exploit: a compromised kubelet forging its own pod \
+                 CIDR to redirect traffic meant for real pod IPs",
+                resp.status()
+            ),
+        }
+    }
+
+    /// A node forging its own taints can steer disallowed workloads onto (or away from)
+    /// itself, bypassing whatever scheduling constraints those taints exist to enforce.
+    #[tokio::test]
+    async fn patch_resource_denies_node_self_patch_of_own_taints() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let node = node_body("taint-node", None);
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await
+        .expect("Node create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "taints": [
+            {"key": "evil", "effect": "NoSchedule"}
+        ] } });
+        let result = strategic_merge_patch_node(
+            state,
+            "taint-node",
+            node_identity_user("taint-node"),
+            patch,
+        )
+        .await;
+
+        assert_eq!(
+            result.err().map(|e| e.0),
+            Some(axum::http::StatusCode::FORBIDDEN),
+            "a node identity's own-node PATCH of spec.taints must be 403 Forbidden — nothing \
+             else in u7s's admission chain restricts this field by identity"
+        );
+    }
+
+    /// The own-node scoping must hold even for admission, not just the authorizer: node-a's
+    /// identity reaching this far (e.g. via a future authorizer bug, or an RBAC grant an admin
+    /// mistakenly bound to a `system:node:` username) must still be stopped here.
+    #[tokio::test]
+    async fn patch_resource_denies_node_patching_a_different_nodes_object() {
+        let state = make_state();
+        let node = node_body("node-b", None);
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("".into(), "v1".into(), "nodes".into())),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await
+        .expect("Node create must succeed");
+
+        let patch = serde_json::json!({ "metadata": { "labels": { "owned-by": "node-a" } } });
+        let result =
+            strategic_merge_patch_node(state, "node-b", node_identity_user("node-a"), patch).await;
+
+        assert_eq!(
+            result.err().map(|e| e.0),
+            Some(axum::http::StatusCode::FORBIDDEN),
+            "node-a's identity must not be able to modify node-b's Node object through any \
+             field — cross-node writes are exactly what node identity scoping exists to stop"
+        );
+    }
+
+    /// The gap this closes isn't limited to PATCH/PUT: node_authz's own doc comment notes CREATE
+    /// has no name in the URL to scope ("self-registration ... can't be scoped to own node
+    /// only at this layer"), so without this admission check a compromised kubelet could
+    /// register a brand-new Node object under ANY name it chooses.
+    #[tokio::test]
+    async fn create_resource_denies_node_registering_under_a_different_name() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let node = node_body("node-c", None);
+        let result = create_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            node_identity_user("node-a"),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::FORBIDDEN,
+                "node-a registering a Node object named node-c must be 403 Forbidden"
+            ),
+            Ok(_) => panic!(
+                "a `system:node:node-a` identity must not be able to CREATE a Node object under \
+                 any name but its own — node_authz's create arm alone can't scope this (no name \
+                 in the URL), so this admission check is the only thing stopping it"
+            ),
+        }
     }
 }
