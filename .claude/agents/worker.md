@@ -32,6 +32,7 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
    - **kubeconfig: always `kubectl --kubeconfig <path> …`** (the flag), never the env var. Prefer a flag over an env var for any tool; if debug logging is needed use the script's `--verbose`, never `export RUST_LOG=`.
    - **Never lead with `cd`** — use `git -C <path>` or your worktree CWD + path args.
    - A denied Bash call = your command was mis-shaped (inline env, batch, leading `cd`/`export`, non-allowlisted first token). Reshape into single allowlisted commands; don't abandon the task.
+8. **Grep-to-locate before Read** — before `Read`-ing a file you haven't windowed yet, grep (or an LSP call at a known position) to find the target region first, then `Read` with `offset`/`limit`. A bare full-file `Read` is a last resort, not a default first move — it silently truncates at the tool's line-count cap with no error, so an unfamiliar file's tail can vanish from context without you noticing.
 
 ## Workflow
 
