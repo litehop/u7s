@@ -2,13 +2,14 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use serde::Deserialize;
 use u7s_store::Store;
 
 use crate::{
+    auth::UserInfo,
     keys::group_object_key,
     state::AppState,
     status::Status,
@@ -108,6 +109,7 @@ pub async fn get_resource_status<S: Store>(
 pub async fn put_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -127,10 +129,31 @@ pub async fn put_resource_status<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    // node_authz's own doc comment on restrict_node_self_write: upstream's NodeRestriction
+    // admission plugin runs on every subresource, not just the main resource — a
+    // `system:node:<name>` identity holding only `nodes/status` RBAC (which is all kubelet
+    // ever needs) could otherwise set a `node-restriction.kubernetes.io/*` label through this
+    // path even though the main-resource PUT/PATCH above already blocks it.
+    let node_before = if group.is_empty() && plural == "nodes" {
+        Some(current.body.clone())
+    } else {
+        None
+    };
 
     // Replace status and merge metadata; leave spec and identity fields untouched.
     replace_status_field(&mut current.body, &incoming.body["status"])?;
     merge_incoming_metadata(&mut current.body, &incoming.body, &meta.kind);
+
+    if let Some(ref old_node) = node_before {
+        crate::node_authz::restrict_node_self_write(
+            &user.username,
+            &user.groups,
+            &name,
+            Some(old_node),
+            &current.body,
+        )
+        .map_err(Status::forbidden)?;
+    }
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
@@ -147,6 +170,7 @@ pub async fn put_resource_status<S: Store>(
 pub async fn patch_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -165,6 +189,12 @@ pub async fn patch_resource_status<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    // See put_resource_status's node_before comment: same gap applies to PATCH /status.
+    let node_before = if group.is_empty() && plural == "nodes" {
+        Some(current.body.clone())
+    } else {
+        None
+    };
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
     // every other patch type here is JSON.
@@ -207,6 +237,17 @@ pub async fn patch_resource_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     reject_non_object_status(&current.body["status"])?;
+
+    if let Some(ref old_node) = node_before {
+        crate::node_authz::restrict_node_self_write(
+            &user.username,
+            &user.groups,
+            &name,
+            Some(old_node),
+            &current.body,
+        )
+        .map_err(Status::forbidden)?;
+    }
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
@@ -499,6 +540,27 @@ mod tests {
         h
     }
 
+    /// A non-node identity: restrict_node_self_write is a no-op for anyone but a genuine
+    /// `system:node:<name>`, so this is the safe default for every test that isn't itself
+    /// exercising node self-write restriction.
+    fn test_user() -> UserInfo {
+        UserInfo {
+            username: "test-user".into(),
+            uid: "test-uid".into(),
+            groups: vec!["system:authenticated".into()],
+            extra: Default::default(),
+        }
+    }
+
+    fn node_user(name: &str) -> UserInfo {
+        UserInfo {
+            username: format!("system:node:{name}"),
+            uid: "kubelet-uid".into(),
+            groups: vec!["system:nodes".into()],
+            extra: Default::default(),
+        }
+    }
+
     /// get_resource_status returns 404 when the cluster-scoped object does not exist.
     /// Status reads delegate to get_resource; a missing object must never return 200.
     #[tokio::test]
@@ -584,6 +646,7 @@ mod tests {
                 "csinodes".into(),
                 "nonexistent".into(),
             )),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -640,6 +703,7 @@ mod tests {
                 "csinodes".into(),
                 "worker-3".into(),
             )),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&null_body).unwrap()),
         )
@@ -701,6 +765,7 @@ mod tests {
                     "csinodes".into(),
                     "put-scalar-node".into(),
                 )),
+                axum::Extension(test_user()),
                 json_headers(),
                 bytes::Bytes::from(serde_json::to_vec(&bad_body).unwrap()),
             )
@@ -745,6 +810,7 @@ mod tests {
                 "csinodes".into(),
                 "nonexistent".into(),
             )),
+            axum::Extension(test_user()),
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -1140,6 +1206,7 @@ mod tests {
                 "csinodes".into(),
                 "smp-node".into(),
             )),
+            axum::Extension(test_user()),
             smp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -1201,6 +1268,7 @@ mod tests {
                 "csinodes".into(),
                 "ssa-node".into(),
             )),
+            axum::Extension(test_user()),
             ssa_headers,
             bytes::Bytes::from(yaml_body),
         )
@@ -1401,6 +1469,7 @@ mod tests {
                 "csinodes".into(),
                 "worker-1".into(),
             )),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -1458,6 +1527,7 @@ mod tests {
                 "csinodes".into(),
                 "worker-2".into(),
             )),
+            axum::Extension(test_user()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -1518,6 +1588,7 @@ mod tests {
                 "csinodes".into(),
                 "scalar-status-node".into(),
             )),
+            axum::Extension(test_user()),
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -1593,6 +1664,7 @@ mod tests {
                 "csinodes".into(),
                 "scalar-status-jp-node".into(),
             )),
+            axum::Extension(test_user()),
             jp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -1662,6 +1734,7 @@ mod tests {
                 "csinodes".into(),
                 "null-status-node".into(),
             )),
+            axum::Extension(test_user()),
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -1859,6 +1932,7 @@ mod tests {
                 "csinodes".into(),
                 "jp-node".into(),
             )),
+            axum::Extension(test_user()),
             jp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2084,6 +2158,7 @@ mod tests {
                 "csinodes".into(),
                 "".into(), // empty name
             )),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -2532,6 +2607,7 @@ mod tests {
                 "csinodes".into(),
                 "node-occ".into(),
             )),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -2670,6 +2746,7 @@ mod tests {
                 "validatingadmissionpolicies".into(),
                 "test-vap".into(),
             )),
+            axum::Extension(test_user()),
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2972,6 +3049,10 @@ mod tests {
         let result = patch_resource_status(
             axum::extract::State(state),
             axum::extract::Path(("".into(), "v1".into(), "nodes".into(), "worker-1".into())),
+            // A genuine kubelet identity: proves the NodeRestriction label check added
+            // alongside this test (which blocks node-restriction.kubernetes.io/* labels)
+            // does not also block the CSI topology labels kubelet legitimately publishes.
+            axum::Extension(node_user("worker-1")),
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2992,6 +3073,78 @@ mod tests {
         assert_eq!(
             v["status"]["nodeInfo"]["architecture"], "arm64",
             "the legitimate status change in the same patch must still apply"
+        );
+    }
+
+    /// Unlike the CSI topology label above, a `node-restriction.kubernetes.io/*` label exists
+    /// precisely so an RBAC-holding human/controller can place a trust marker a compromised
+    /// kubelet cannot forge for itself. `merge_incoming_metadata`'s Node exception lets ALL
+    /// labels through on /status (needed for the CSI case), so without a NodeRestriction-style
+    /// check on this path specifically, a `system:node:<name>` identity — which upstream only
+    /// ever grants `nodes/status` RBAC, never plain `nodes` write — could set this label on
+    /// itself via /status even though the main-resource PATCH/PUT already blocks it.
+    #[tokio::test]
+    async fn patch_resource_status_denies_node_restriction_label_for_node() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "worker-1", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        let key = "/registry/nodes/worker-1";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "metadata": { "labels": {
+                "node-restriction.kubernetes.io/trusted": "true"
+            } },
+            "status": { "nodeInfo": { "architecture": "arm64" } }
+        });
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path(("".into(), "v1".into(), "nodes".into(), "worker-1".into())),
+            axum::Extension(node_user("worker-1")),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a system:node identity setting a node-restriction.kubernetes.io/* label via \
+                 nodes/status must be rejected — this label namespace exists so it can't be \
+                 forged by the node itself"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::FORBIDDEN,
+            "the label rejection must surface as 403, matching the main-resource PATCH/PUT \
+             behavior for the same label"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["labels"]["node-restriction.kubernetes.io/trusted"].is_null(),
+            "the rejected patch must not have been persisted"
         );
     }
 
@@ -3097,6 +3250,7 @@ mod tests {
                 "csinodes".into(),
                 "specguard-node".into(),
             )),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -3232,6 +3386,7 @@ mod tests {
                 "csinodes".into(),
                 "fin-node".into(),
             )),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -3609,6 +3764,7 @@ mod tests {
                 "csinodes".into(),
                 "rv-test-node".into(),
             )),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -3674,6 +3830,7 @@ mod tests {
                 "csinodes".into(),
                 "no-rv-node".into(),
             )),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -3733,6 +3890,7 @@ mod tests {
         let result = put_resource_status(
             axum::extract::State(state),
             axum::extract::Path(("".into(), "v1".into(), "nodes".into(), "lima-node-5".into())),
+            axum::Extension(test_user()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -3937,6 +4095,7 @@ mod tests {
                 "csinodes".into(),
                 "spec-guard-node".into(),
             )),
+            axum::Extension(test_user()),
             json_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4007,6 +4166,7 @@ mod tests {
                 "csinodes".into(),
                 "status-ok-node".into(),
             )),
+            axum::Extension(test_user()),
             json_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4208,6 +4368,7 @@ mod tests {
                 "csinodes".into(),
                 "stale-node".into(),
             )),
+            axum::Extension(test_user()),
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4267,6 +4428,7 @@ mod tests {
                 "csinodes".into(),
                 "norev-node".into(),
             )),
+            axum::Extension(test_user()),
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )

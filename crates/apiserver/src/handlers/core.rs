@@ -340,12 +340,14 @@ pub(crate) async fn core_get_resource_status<S: Store>(
 pub(crate) async fn core_put_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     put_resource_status(
         State(state),
         Path(("".into(), "v1".into(), plural, name)),
+        Extension(user),
         headers,
         body,
     )
@@ -355,12 +357,14 @@ pub(crate) async fn core_put_resource_status<S: Store>(
 pub(crate) async fn core_patch_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     patch_resource_status(
         State(state),
         Path(("".into(), "v1".into(), plural, name)),
+        Extension(user),
         headers,
         body,
     )

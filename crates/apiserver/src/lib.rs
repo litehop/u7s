@@ -9022,7 +9022,7 @@ mod tests {
         });
         let create_result = handlers::csr::create_csr(
             axum::extract::State(state.clone()),
-            axum::Extension(user),
+            axum::Extension(user.clone()),
             json_headers.clone(),
             bytes::Bytes::from(create_body.to_string()),
         )
@@ -9182,6 +9182,7 @@ mod tests {
                 "certificatesigningrequests".into(),
                 "lifecycle-csr".into(),
             )),
+            axum::Extension(user.clone()),
             json_headers.clone(),
             bytes::Bytes::from(status_body.to_string()),
         )

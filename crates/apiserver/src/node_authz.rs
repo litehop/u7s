@@ -406,6 +406,179 @@ pub fn authorize_pod_create(
     is_mirror_pod && pod_body["spec"]["nodeName"].as_str() == Some(node_name)
 }
 
+const NODE_RESTRICTION_LABEL_NAMESPACE: &str = "node-restriction.kubernetes.io";
+
+/// Labels kubelet itself is known to set on its own Node object at registration, taken from
+/// upstream's `k8s.io/kubelet/pkg/apis.KubeletLabels()` (release-1.36) — anything else in the
+/// `kubernetes.io`/`k8s.io` namespace family is reserved for controllers/humans, not a node.
+const KUBELET_LABELS: &[&str] = &[
+    "kubernetes.io/hostname",
+    "topology.kubernetes.io/zone",
+    "topology.kubernetes.io/region",
+    "failure-domain.beta.kubernetes.io/zone",
+    "failure-domain.beta.kubernetes.io/region",
+    "beta.kubernetes.io/instance-type",
+    "node.kubernetes.io/instance-type",
+    "kubernetes.io/os",
+    "kubernetes.io/arch",
+    "beta.kubernetes.io/os",
+    "beta.kubernetes.io/arch",
+];
+
+/// Label namespaces kubelet may freely set under, per upstream's `KubeletLabelNamespaces()`.
+const KUBELET_LABEL_NAMESPACES: &[&str] = &["kubelet.kubernetes.io", "node.kubernetes.io"];
+
+fn label_namespace(key: &str) -> &str {
+    key.split_once('/').map_or("", |(ns, _)| ns)
+}
+
+fn namespace_is_or_ends_with(namespace: &str, suffix: &str) -> bool {
+    namespace == suffix || namespace.ends_with(&format!(".{suffix}"))
+}
+
+fn is_kubelet_label(key: &str) -> bool {
+    KUBELET_LABELS.contains(&key)
+        || KUBELET_LABEL_NAMESPACES
+            .iter()
+            .any(|ns| namespace_is_or_ends_with(label_namespace(key), ns))
+}
+
+fn is_kubernetes_label(key: &str) -> bool {
+    let ns = label_namespace(key);
+    namespace_is_or_ends_with(ns, "kubernetes.io") || namespace_is_or_ends_with(ns, "k8s.io")
+}
+
+/// Mirrors upstream's `getForbiddenLabels` (NodeRestriction admission,
+/// `plugin/pkg/admission/noderestriction/admission.go`, release-1.36): a node may never
+/// set/change a `node-restriction.kubernetes.io/*` label — that namespace exists precisely so
+/// an RBAC-holding human/controller can place a trust marker a compromised kubelet cannot forge
+/// for itself — nor any other `kubernetes.io`/`k8s.io` label outside the fixed set kubelet is
+/// actually known to set (`is_kubelet_label`).
+fn is_forbidden_node_label(key: &str) -> bool {
+    namespace_is_or_ends_with(label_namespace(key), NODE_RESTRICTION_LABEL_NAMESPACE)
+        || (is_kubernetes_label(key) && !is_kubelet_label(key))
+}
+
+/// First label key that changed value between `old`/`new` (mirrors upstream's
+/// `getModifiedLabels`, which diffs both directions) AND is forbidden for a node to touch.
+fn first_forbidden_modified_label(
+    old: Option<&serde_json::Map<String, serde_json::Value>>,
+    new: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let empty = serde_json::Map::new();
+    let old = old.unwrap_or(&empty);
+    let new = new.unwrap_or(&empty);
+    old.keys()
+        .chain(new.keys())
+        .find(|k| old.get(k.as_str()) != new.get(k.as_str()) && is_forbidden_node_label(k))
+        .cloned()
+}
+
+/// `true` for anything JSON would consider "actually set" — a bare absent/null field and an
+/// explicit empty string/array both count as unset, matching how a real kubelet's client-go
+/// struct marshals a zero-value field (it doesn't emit a literal `""`/`[]`, but some client
+/// bodies do, and either must be treated as "no opinion", not as an assignment attempt).
+fn field_is_set(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        _ => true,
+    }
+}
+
+/// `true` if two possibly-array-or-null JSON values are the same once "absent" and "present but
+/// empty" are treated as equivalent — needed for `spec.taints`/`metadata.ownerReferences` below,
+/// since a client that never touches an empty array field commonly round-trips it as JSON
+/// `null` instead of `[]`, which a plain `!=` would wrongly flag as "the node changed this".
+fn array_or_null_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let is_empty = |v: &serde_json::Value| {
+        matches!(v, serde_json::Value::Null)
+            || matches!(v, serde_json::Value::Array(a) if a.is_empty())
+    };
+    if is_empty(a) && is_empty(b) {
+        true
+    } else {
+        a == b
+    }
+}
+
+/// NodeRestriction-equivalent admission for a `system:node:<name>` identity's own Node
+/// create/update, mirroring upstream's `admitNode`
+/// (`plugin/pkg/admission/noderestriction/admission.go`, release-1.36). `authorize_node` above
+/// grants such an identity the same *broad* verb access upstream's own Node authorizer does
+/// (full-object create/update/patch, not just `nodes/status`) and — like upstream — relies on
+/// this check, not a narrower RBAC/authorizer grant, to restrict which fields that access can
+/// actually touch. `old_node` is `None` on create.
+///
+/// `spec.podCIDR`/`spec.podCIDRs`/`spec.providerID` additionally get a from-empty-once-only
+/// immutability check regardless of caller identity (`validate_node_spec_immutable`,
+/// handlers/resource.rs) — upstream doesn't need an equivalent rule here because its
+/// `system:node` ClusterRole never grants a plain (non-`status`) node update/patch at all, so a
+/// kubelet can't reach `spec.podCIDR` in the first place. u7s's Node authorizer, by design,
+/// grants that broader access instead (matching upstream's *newer*, admission-gated
+/// `AuthorizeNodeWithSelectors` posture) — which makes this the ONLY thing stopping a
+/// compromised kubelet from self-assigning its own pod CIDR / cloud-provider ID, so it is
+/// forbidden unconditionally rather than only "once already set".
+pub fn restrict_node_self_write(
+    username: &str,
+    groups: &[String],
+    requested_name: &str,
+    old_node: Option<&serde_json::Value>,
+    new_node: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(node_name) = node_identity(username, groups) else {
+        return Ok(());
+    };
+    if requested_name != node_name {
+        return Err(format!(
+            "node {node_name:?} is not allowed to modify node {requested_name:?}"
+        ));
+    }
+
+    let no_spec = serde_json::Value::Null;
+    let old_spec = old_node.map_or(&no_spec, |n| &n["spec"]);
+    let new_spec = &new_node["spec"];
+
+    for field in ["podCIDR", "podCIDRs", "providerID", "configSource"] {
+        if field_is_set(&new_spec[field]) && new_spec[field] != old_spec[field] {
+            return Err(format!(
+                "node {node_name:?} is not allowed to set spec.{field} — only a controller \
+                 may assign it"
+            ));
+        }
+    }
+
+    // Taints/ownerReferences steer which workloads land on this node and who owns it; upstream
+    // only checks these on UPDATE (a fresh registration's taints come from kubelet's own
+    // `--register-with-taints` flag and are legitimate), hence the `old_node.is_some()` guard.
+    if let Some(old) = old_node {
+        if !array_or_null_eq(&new_spec["taints"], &old["spec"]["taints"]) {
+            return Err(format!(
+                "node {node_name:?} is not allowed to modify spec.taints"
+            ));
+        }
+        if !array_or_null_eq(
+            &new_node["metadata"]["ownerReferences"],
+            &old["metadata"]["ownerReferences"],
+        ) {
+            return Err(format!(
+                "node {node_name:?} is not allowed to modify metadata.ownerReferences"
+            ));
+        }
+    }
+
+    let old_labels = old_node.and_then(|n| n["metadata"]["labels"].as_object());
+    let new_labels = new_node["metadata"]["labels"].as_object();
+    if let Some(label) = first_forbidden_modified_label(old_labels, new_labels) {
+        return Err(format!(
+            "node {node_name:?} is not allowed to set label {label:?}"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Node authorization entry point. Returns `true` only for a genuine `system:node:<name>`
 /// identity whose request targets something related to `<name>`'s own node; `false`
 /// otherwise (including for every non-node caller), so callers must OR this with a normal
@@ -1021,6 +1194,181 @@ mod tests {
             !authorize(&req, None, &graph, &idx),
             "once pod-a is hard-deleted, node-a must lose access to what only pod-a \
              referenced — permissions must not outlive the object that granted them"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // restrict_node_self_write: node_authz's own-node "" subresource grant above hands a
+    // system:node identity update/patch on the FULL Node object, not just status — this is the
+    // NodeRestriction-equivalent admission that must narrow it back down, or a single
+    // compromised kubelet can rewrite its own Node's networking/scheduling fields (SSRF via a
+    // forged podCIDR, workload steering via forged taints/labels) with nothing else in u7s
+    // standing in the way.
+    // -----------------------------------------------------------------------
+
+    fn own_node(fields: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({"metadata": {"name": "node-a"}, "spec": {}});
+        if let Some(spec) = fields.get("spec") {
+            body["spec"] = spec.clone();
+        }
+        if let Some(metadata) = fields.get("metadata") {
+            for (k, v) in metadata.as_object().unwrap() {
+                body["metadata"][k] = v.clone();
+            }
+        }
+        body
+    }
+
+    #[test]
+    fn node_cannot_set_its_own_pod_cidr_from_empty() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        let old = own_node(serde_json::json!({}));
+        let new = own_node(serde_json::json!({"spec": {"podCIDR": "10.244.99.0/24"}}));
+        assert!(
+            restrict_node_self_write("system:node:node-a", &groups, "node-a", Some(&old), &new)
+                .is_err(),
+            "a compromised kubelet must not be able to self-assign spec.podCIDR — this is the \
+             live-confirmed PATCH (empty -> attacker value, 200 OK) this admission check exists \
+             to close, since only kube-controller-manager's node-ipam-controller may assign it"
+        );
+    }
+
+    #[test]
+    fn node_cannot_set_its_own_taints() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        let old = own_node(serde_json::json!({}));
+        let new = own_node(serde_json::json!({"spec": {"taints": [
+            {"key": "evil", "effect": "NoSchedule"}
+        ]}}));
+        assert!(
+            restrict_node_self_write("system:node:node-a", &groups, "node-a", Some(&old), &new)
+                .is_err(),
+            "a compromised kubelet must not be able to add/remove its own taints — that would \
+             let it steer disallowed workloads onto (or away from) itself"
+        );
+    }
+
+    #[test]
+    fn node_cannot_set_provider_id_or_config_source() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        let old = own_node(serde_json::json!({}));
+        for (field, value) in [
+            (
+                "providerID",
+                serde_json::json!("aws:///us-east-1a/i-abc123"),
+            ),
+            (
+                "configSource",
+                serde_json::json!({"configMap": {"name": "evil"}}),
+            ),
+        ] {
+            let mut new = own_node(serde_json::json!({}));
+            new["spec"][field] = value;
+            assert!(
+                restrict_node_self_write("system:node:node-a", &groups, "node-a", Some(&old), &new)
+                    .is_err(),
+                "a compromised kubelet must not be able to set spec.{field} — configSource is a \
+                 documented view-escalation vector upstream forbids for the same reason"
+            );
+        }
+    }
+
+    #[test]
+    fn node_cannot_set_a_node_restriction_label_on_itself() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        let old = own_node(serde_json::json!({}));
+        let new = own_node(serde_json::json!({"metadata": {"labels": {
+            "node-restriction.kubernetes.io/trusted": "true"
+        }}}));
+        assert!(
+            restrict_node_self_write("system:node:node-a", &groups, "node-a", Some(&old), &new)
+                .is_err(),
+            "a compromised kubelet must not be able to forge a node-restriction.kubernetes.io/* \
+             label on itself — that namespace exists so only RBAC-holding humans/controllers, \
+             never a node, can place a trust marker workloads are scheduled against"
+        );
+    }
+
+    #[test]
+    fn node_can_still_register_itself_with_ordinary_kubelet_labels_and_taints() {
+        // The kubelet registration flow this fix must not break: a fresh node's CREATE body
+        // legitimately carries standard kubernetes.io labels and --register-with-taints.
+        let groups = vec![NODES_GROUP.to_owned()];
+        let new = own_node(serde_json::json!({
+            "metadata": {"labels": {
+                "kubernetes.io/hostname": "node-a",
+                "kubernetes.io/os": "linux",
+                "kubernetes.io/arch": "amd64",
+            }},
+            "spec": {"taints": [{"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"}]},
+        }));
+        assert!(
+            restrict_node_self_write("system:node:node-a", &groups, "node-a", None, &new).is_ok(),
+            "kubelet's own node registration (standard labels + --register-with-taints) must \
+             still succeed, or every real node in the cluster fails to join"
+        );
+    }
+
+    #[test]
+    fn node_cannot_register_itself_with_a_pod_cidr_already_set() {
+        // Unlike taints/labels, a FRESH node must never carry podCIDR/providerID either — only
+        // a controller assigns those, never kubelet itself, even at first registration.
+        let groups = vec![NODES_GROUP.to_owned()];
+        let new = own_node(serde_json::json!({"spec": {"podCIDR": "10.244.5.0/24"}}));
+        assert!(
+            restrict_node_self_write("system:node:node-a", &groups, "node-a", None, &new).is_err(),
+            "a node registering itself must not be able to walk in already claiming a \
+             podCIDR — that value is controller-assigned, never kubelet-chosen"
+        );
+    }
+
+    #[test]
+    fn node_can_still_patch_its_own_unrelated_spec_fields() {
+        // A narrow-but-real allowance: unschedulable is a legitimate field kubelet's own
+        // drain/cordon-adjacent logic can toggle on itself, and isn't in any forbidden set
+        // above — this must stay Ok or the fix has silently become "node can never PATCH
+        // itself at all", failing every real heartbeat-adjacent path in a different way.
+        let groups = vec![NODES_GROUP.to_owned()];
+        let old = own_node(serde_json::json!({}));
+        let new = own_node(serde_json::json!({"spec": {"unschedulable": true}}));
+        assert!(
+            restrict_node_self_write("system:node:node-a", &groups, "node-a", Some(&old), &new)
+                .is_ok(),
+            "fields outside the upstream-mirrored forbidden set must remain writable, or this \
+             fix over-restricts far beyond what NodeRestriction actually blocks"
+        );
+    }
+
+    #[test]
+    fn node_cannot_modify_a_different_nodes_object() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        let old = serde_json::json!({"metadata": {"name": "node-b"}, "spec": {}});
+        let new =
+            serde_json::json!({"metadata": {"name": "node-b"}, "spec": {"unschedulable": true}});
+        assert!(
+            restrict_node_self_write("system:node:node-a", &groups, "node-b", Some(&old), &new)
+                .is_err(),
+            "node-a's identity must not be able to touch node-b's Node object at all, \
+             regardless of which field — own-node scoping must hold even if some other bug \
+             ever let the request reach this admission check"
+        );
+    }
+
+    #[test]
+    fn non_node_identity_is_never_restricted_by_this_check() {
+        // kube-controller-manager's node-ipam-controller (a controller/SA identity, never
+        // system:node) must retain its empty -> valid podCIDR assignment path untouched, or
+        // this fix breaks every real cluster's node bring-up.
+        let old = serde_json::json!({"metadata": {"name": "node-a"}, "spec": {}});
+        let new = serde_json::json!({
+            "metadata": {"name": "node-a"},
+            "spec": {"podCIDR": "10.244.7.0/24", "taints": [{"key": "x", "effect": "NoSchedule"}]},
+        });
+        assert!(
+            restrict_node_self_write("kube-controller-manager", &[], "node-a", Some(&old), &new)
+                .is_ok(),
+            "a non-system:node caller (KCM, an admin) must be completely unaffected by this \
+             check — it exists only to narrow what a NODE's own identity can write"
         );
     }
 }
