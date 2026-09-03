@@ -575,6 +575,16 @@ pub struct PendingPod {
     /// would push its topology domain's skew beyond `maxSkew`, see
     /// `TopologySpreadContext`.
     pub topology_spread_constraints: Vec<TopologySpreadConstraint>,
+    /// New CSI volumes this pod needs, grouped by driver name — the
+    /// CSILimits/NodeVolumeLimits predicate's per-driver volume count. Like
+    /// `pv_node_affinities`, never populated by `needs_scheduling` itself
+    /// (resolving a PVC's driver via its bound PV or StorageClass needs its
+    /// own GETs) — the caller fetches it once via `fetch_csi_volume_counts`
+    /// and fills it in right before the first `pick_node` attempt. Empty for
+    /// a pod with no PVC-backed volumes, or whose PVCs resolve to no CSI
+    /// driver at all, which `csi_volume_limits_fit` then treats as "nothing
+    /// to check" — the same convention `pv_node_affinities` uses.
+    pub csi_volume_counts: std::collections::BTreeMap<String, i64>,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -669,6 +679,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         pvc_names,
         pv_node_affinities: Vec::new(),
         topology_spread_constraints,
+        csi_volume_counts: std::collections::BTreeMap::new(),
     })
 }
 
@@ -972,6 +983,15 @@ pub struct NodeItem {
     pub spec: NodeSpec,
     #[serde(default)]
     pub status: NodeStatus,
+    /// Remaining CSI attach capacity per driver — `CSINode.spec.drivers[].allocatable.count`
+    /// minus how many volumes of that driver are already attached to this node, for every
+    /// driver the node advertises a limit for. Never present in the raw `/api/v1/nodes` JSON
+    /// (hence `skip_deserializing`) — `pick_node` fills this in from a separate CSINode GET
+    /// plus a cluster-wide pod scan, only when the pending pod itself needs CSI volumes, right
+    /// before calling `select_and_reserve_node`. A driver absent here has no advertised limit
+    /// (or the pod needs none of it) — see `csi_volume_limits_fit`.
+    #[serde(default, skip_deserializing)]
+    pub csi_driver_headroom: std::collections::BTreeMap<String, i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1900,6 +1920,14 @@ pub fn select_node_with_capacity(
     let affinity_ctx = InterPodAffinityContext::build(pod, tallied_pods, &node_labels_by_name);
     let topology_ctx = TopologySpreadContext::build(pod, tallied_pods, &node_labels_by_name);
     let usage_of = |name: &str| node_usage.get(name).cloned().unwrap_or_default();
+    // Set when some node satisfies every OTHER conjunct below and is
+    // rejected ONLY by `csi_volume_limits_fit` — lets the final error below
+    // report the CSILimits-specific reason (matching upstream's own
+    // `ErrReasonMaxVolumeCountExceeded`) instead of the generic
+    // NodeResourcesFit message, which the volumeLimits conformance test's
+    // `PodScheduled=False` condition message must match via a
+    // `max.+volume.+count` regex.
+    let mut csi_limit_was_the_only_blocker = false;
     let candidates: Vec<NodeItem> = list
         .items
         .into_iter()
@@ -1924,8 +1952,16 @@ pub fn select_node_with_capacity(
             if cap != 0 && usage.pod_count >= cap {
                 return false;
             }
-            resource_fits(&n.status.allocatable, &usage.requests, &pod.requests)
-                && host_ports_fit(&usage.host_ports, &pod.host_ports)
+            if !resource_fits(&n.status.allocatable, &usage.requests, &pod.requests)
+                || !host_ports_fit(&usage.host_ports, &pod.host_ports)
+            {
+                return false;
+            }
+            if !csi_volume_limits_fit(&n.csi_driver_headroom, &pod.csi_volume_counts) {
+                csi_limit_was_the_only_blocker = true;
+                return false;
+            }
+            true
         })
         .collect();
     // `min_by_key` returns the FIRST minimal element on a tie, preserving
@@ -1941,9 +1977,15 @@ pub fn select_node_with_capacity(
             usage.requests.ephemeral_storage_milli,
         )
     });
-    found.map(|n| n.metadata.name).context(
-        "no node satisfies the pod's nodeSelector/tolerations with free pod/resource capacity (NodeResourcesFit)",
-    )
+    found.map(|n| n.metadata.name).ok_or_else(|| {
+        if csi_limit_was_the_only_blocker {
+            anyhow::anyhow!("node(s) exceed max volume count")
+        } else {
+            anyhow::anyhow!(
+                "no node satisfies the pod's nodeSelector/tolerations with free pod/resource capacity (NodeResourcesFit)"
+            )
+        }
+    })
 }
 
 /// Select the pods to evict from one node so that a pending pod at
@@ -2759,10 +2801,16 @@ pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
 /// next watch tick would otherwise have retried cleanly.
 #[derive(Debug, thiserror::Error)]
 pub enum PickNodeError {
-    #[error(
-        "no node satisfies the pod's nodeSelector/tolerations with free pod/resource capacity (NodeResourcesFit)"
-    )]
-    NoCapacity,
+    /// Carries `select_node_with_capacity`'s own specific reason (e.g. the
+    /// generic NodeResourcesFit message, or CSILimits' "node(s) exceed max
+    /// volume count") rather than a single fixed string — `handle_pod_event`
+    /// reuses this text as the eventual `FailedScheduling`/`PodScheduled=False`
+    /// message when a subsequent preemption attempt ALSO fails, since
+    /// `find_preemption_plan`'s own failure text is generic and would
+    /// otherwise overwrite a predicate-specific reason a conformance test's
+    /// condition-message check relies on (see the volumeLimits e2e test).
+    #[error("{0}")]
+    NoCapacity(String),
     #[error(transparent)]
     ApiError(#[from] anyhow::Error),
 }
@@ -2819,7 +2867,8 @@ pub async fn pick_node(
             "GET /api/v1/nodes returned {status}: {body}"
         )));
     }
-    let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
+    let mut list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
+    populate_csi_driver_headroom(connector, server, &mut list, pod).await?;
     select_and_reserve_node(list, pod, tally)
 }
 
@@ -2865,9 +2914,9 @@ fn select_and_reserve_node(
         &tally_guard.usage_by_node(),
         &tally_guard.tallied_pod_labels(),
     )
-    .map_err(|_| {
+    .map_err(|e| {
         debug!(pod = %pod.pod_name, candidates, "pick_node: no node had capacity");
-        PickNodeError::NoCapacity
+        PickNodeError::NoCapacity(e.to_string())
     })?;
     tally_guard.assume(
         &pod.namespace,
@@ -3393,12 +3442,14 @@ struct PvcSpecView {
     storage_class_name: Option<String>,
 }
 
-/// `volumeBindingMode` sits directly on a StorageClass object, not under a
-/// `.spec` wrapper — mirrors `apiserver::types::StorageClassFields`.
+/// `volumeBindingMode`/`provisioner` sit directly on a StorageClass object,
+/// not under a `.spec` wrapper — mirrors `apiserver::types::StorageClassFields`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StorageClassObject {
     volume_binding_mode: Option<String>,
+    #[serde(default)]
+    provisioner: String,
 }
 
 /// The subset of a PVC's state `selected_node_patches` needs to decide
@@ -3527,6 +3578,28 @@ async fn fetch_storage_class_binding_mode(
     Ok(obj.volume_binding_mode)
 }
 
+/// The CSI driver name a StorageClass provisions through — its `provisioner`
+/// field — for `resolve_csi_driver`'s unbound-PVC fallback. A separate GET
+/// from `fetch_storage_class_binding_mode` (rather than widening its return
+/// type): the two are independent call sites (selected-node stamping vs. the
+/// CSILimits predicate) that happen to read the same object.
+async fn fetch_storage_class_provisioner(
+    connector: &TlsConnector,
+    server: &str,
+    name: &str,
+) -> anyhow::Result<Option<String>> {
+    let path = storage_class_path(name);
+    let (status, body) = http_get(connector, server, &path).await?;
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        bail!("GET {path} returned {status}: {body}");
+    }
+    let obj: StorageClassObject = serde_json::from_str(&body).context("parse StorageClass")?;
+    Ok(Some(obj.provisioner).filter(|p| !p.is_empty()))
+}
+
 /// Stamp `volume.kubernetes.io/selected-node` on every one of `pvc_names`
 /// (in `namespace`) that is unbound and whose StorageClass has
 /// `volumeBindingMode: WaitForFirstConsumer` — see this module's doc comment
@@ -3625,6 +3698,15 @@ struct PvObject {
 struct PvSpecView {
     #[serde(default)]
     node_affinity: Option<PvNodeAffinity>,
+    #[serde(default)]
+    csi: Option<PvCsiSource>,
+}
+
+/// A PV's `spec.csi` — only `driver` matters here, for the CSILimits/
+/// NodeVolumeLimits predicate's per-driver volume count.
+#[derive(Debug, Default, Deserialize)]
+struct PvCsiSource {
+    driver: String,
 }
 
 /// A PV's `spec.nodeAffinity`. Unlike a pod's `nodeAffinity`, this wraps its
@@ -3653,6 +3735,29 @@ async fn fetch_pv_node_affinity(
     }
     let obj: PvObject = serde_json::from_str(&body).context("parse PersistentVolume")?;
     Ok(obj.spec.node_affinity.and_then(|a| a.required))
+}
+
+/// The CSI driver name backing PV `name` — `spec.csi.driver` — for
+/// `resolve_csi_driver`'s bound-PVC path. `None` when the PV is gone, or has
+/// no `spec.csi` source at all (an in-tree, non-CSI volume type this MVP does
+/// not model) — `resolve_csi_driver` then falls back to the PVC's
+/// StorageClass, matching upstream's own in-tree-to-CSI fallback shape
+/// (without the migration machinery this scheduler has no need for).
+async fn fetch_pv_csi_driver(
+    connector: &TlsConnector,
+    server: &str,
+    name: &str,
+) -> anyhow::Result<Option<String>> {
+    let path = pv_path(name);
+    let (status, body) = http_get(connector, server, &path).await?;
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        bail!("GET {path} returned {status}: {body}");
+    }
+    let obj: PvObject = serde_json::from_str(&body).context("parse PersistentVolume")?;
+    Ok(obj.spec.csi.map(|c| c.driver).filter(|d| !d.is_empty()))
 }
 
 /// Resolve the `spec.nodeAffinity.required` selector of every PV already
@@ -3693,6 +3798,269 @@ pub async fn fetch_bound_pv_node_affinities(
         }
     }
     Ok(affinities)
+}
+
+/// Resolve the CSI driver backing `pvc_name` (in `namespace`): prefer its
+/// already-bound PV's `spec.csi.driver`; fall back to its StorageClass's
+/// `provisioner` when unbound, or when the bound PV resolves to no CSI
+/// driver at all — mirrors upstream's `getCSIDriverInfo`/
+/// `getCSIDriverInfoFromSC` two-step fallback (minus the in-tree migration
+/// machinery this scheduler has no need for). `None` when neither resolves
+/// (PVC/PV gone, or the PVC has no StorageClass) — such a volume is simply
+/// not counted, matching upstream's own no-op for a non-CSI-backed volume.
+async fn resolve_csi_driver(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pvc_name: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await? else {
+        return Ok(None);
+    };
+    if !info.volume_name.is_empty() {
+        if let Some(driver) = fetch_pv_csi_driver(connector, server, &info.volume_name).await? {
+            return Ok(Some(driver));
+        }
+    }
+    let Some(sc_name) = info.storage_class_name.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    fetch_storage_class_provisioner(connector, server, sc_name).await
+}
+
+/// Count how many CSI volumes `pvc_names` (deduplicated — the same PVC
+/// mounted twice by one pod is one volume) resolve to, grouped by driver
+/// name — the CSILimits/NodeVolumeLimits predicate's per-driver volume
+/// count. `cache` (keyed by "namespace/pvcName") is shared across every call
+/// within one scheduling decision, so a PVC referenced by more than one pod
+/// — or checked again while tallying a second node — is only ever resolved
+/// once.
+async fn count_csi_volumes_by_driver(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pvc_names: &[String],
+    cache: &mut std::collections::HashMap<String, Option<String>>,
+) -> anyhow::Result<std::collections::BTreeMap<String, i64>> {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for pvc_name in pvc_names {
+        if !seen.insert(pvc_name.clone()) {
+            continue;
+        }
+        let cache_key = format!("{namespace}/{pvc_name}");
+        let driver = if let Some(cached) = cache.get(&cache_key) {
+            cached.clone()
+        } else {
+            let resolved = resolve_csi_driver(connector, server, namespace, pvc_name).await?;
+            cache.insert(cache_key, resolved.clone());
+            resolved
+        };
+        if let Some(driver) = driver {
+            *counts.entry(driver).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// Resolve `pvc_names`' CSI driver volume counts for the PENDING pod — see
+/// `count_csi_volumes_by_driver`. The caller (`main.rs`'s `handle_pod_event`)
+/// fetches this once and fills it into `PendingPod::csi_volume_counts` right
+/// before the first `pick_node` attempt, exactly like
+/// `fetch_bound_pv_node_affinities`.
+pub async fn fetch_csi_volume_counts(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pvc_names: &[String],
+) -> anyhow::Result<std::collections::BTreeMap<String, i64>> {
+    let mut cache = std::collections::HashMap::new();
+    count_csi_volumes_by_driver(connector, server, namespace, pvc_names, &mut cache).await
+}
+
+/// Build the path for the (cluster-scoped) CSINode list.
+const CSI_NODES_PATH: &str = "/apis/storage.k8s.io/v1/csinodes";
+
+#[derive(Debug, Default, Deserialize)]
+struct CsiNodeList {
+    #[serde(default)]
+    items: Vec<CsiNodeItem>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CsiNodeItem {
+    #[serde(default)]
+    metadata: CsiNodeMetadata,
+    #[serde(default)]
+    spec: CsiNodeSpecView,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CsiNodeMetadata {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CsiNodeSpecView {
+    #[serde(default)]
+    drivers: Vec<CsiNodeDriverView>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CsiNodeDriverView {
+    name: String,
+    #[serde(default)]
+    allocatable: Option<CsiNodeAllocatable>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CsiNodeAllocatable {
+    #[serde(default)]
+    count: Option<i64>,
+}
+
+/// Fetch every node's advertised per-driver attach limit
+/// (`CSINode.spec.drivers[].allocatable.count`), keyed by node name then
+/// driver name. A driver with no `allocatable.count` set advertises no
+/// limit at all and is simply absent from the inner map — matching
+/// `csi_volume_limits_fit`'s "absent means unchecked" convention.
+async fn fetch_csi_driver_limits_by_node(
+    connector: &TlsConnector,
+    server: &str,
+) -> anyhow::Result<std::collections::HashMap<String, std::collections::BTreeMap<String, i64>>> {
+    let (status, body) = http_get(connector, server, CSI_NODES_PATH).await?;
+    if !status.is_success() {
+        bail!("GET {CSI_NODES_PATH} returned {status}: {body}");
+    }
+    let list: CsiNodeList = serde_json::from_str(&body).context("parse CSINodeList")?;
+    Ok(list
+        .items
+        .into_iter()
+        .map(|item| {
+            let limits = item
+                .spec
+                .drivers
+                .into_iter()
+                .filter_map(|d| d.allocatable.and_then(|a| a.count).map(|c| (d.name, c)))
+                .collect();
+            (item.metadata.name, limits)
+        })
+        .collect())
+}
+
+/// Minimal typed view of a `GET /api/v1/pods` list item, as needed to find
+/// which node (if any) each non-terminal pod occupies and which PVCs its
+/// volumes reference — reuses `PreemptionPodListItem`'s fields (identity,
+/// phase, `spec.volumes`) since both need exactly the same subset of a Pod.
+#[derive(Default, Deserialize)]
+struct PodListForVolumes {
+    #[serde(default)]
+    items: Vec<PreemptionPodListItem>,
+}
+
+/// Fetch every non-terminal, node-bound pod's CSI volume counts across the
+/// WHOLE cluster, grouped by node name then driver — the CSILimits/
+/// NodeVolumeLimits predicate's "already attached" side. One cluster-wide
+/// `GET /api/v1/pods` (not one GET per candidate node): a real cluster's pod
+/// count dwarfs its node count, and `pick_node` only calls this at all when
+/// the pending pod itself needs CSI volumes (see its doc comment), mirroring
+/// upstream's own PreFilter skip for pods with no such volumes.
+async fn fetch_attached_csi_volume_counts_by_node(
+    connector: &TlsConnector,
+    server: &str,
+) -> anyhow::Result<std::collections::HashMap<String, std::collections::BTreeMap<String, i64>>> {
+    let (status, body) = http_get(connector, server, "/api/v1/pods").await?;
+    if !status.is_success() {
+        bail!("GET /api/v1/pods returned {status}: {body}");
+    }
+    let list: PodListForVolumes = serde_json::from_str(&body).context("parse PodList")?;
+    let mut cache = std::collections::HashMap::new();
+    let mut by_node: std::collections::HashMap<String, std::collections::BTreeMap<String, i64>> =
+        std::collections::HashMap::new();
+    for pod in list.items {
+        let terminal = matches!(pod.status.phase.as_str(), "Succeeded" | "Failed");
+        if terminal {
+            continue;
+        }
+        let Some(node_name) = pod.spec.node_name.filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        let pod_name = pod.metadata.name.unwrap_or_default();
+        if pod_name.is_empty() {
+            continue;
+        }
+        let namespace = pod
+            .metadata
+            .namespace
+            .unwrap_or_else(|| "default".to_owned());
+        let pvc_names = referenced_pvc_names(&pod_name, pod.spec.volumes.as_deref().unwrap_or(&[]));
+        if pvc_names.is_empty() {
+            continue;
+        }
+        let counts =
+            count_csi_volumes_by_driver(connector, server, &namespace, &pvc_names, &mut cache)
+                .await?;
+        let node_counts = by_node.entry(node_name).or_default();
+        for (driver, count) in counts {
+            *node_counts.entry(driver).or_insert(0) += count;
+        }
+    }
+    Ok(by_node)
+}
+
+/// Populate `list`'s `csi_driver_headroom` fields — remaining attach
+/// capacity per driver, per node — from a CSINode GET plus a cluster-wide
+/// pod scan. Called by `pick_node` right before `select_and_reserve_node`,
+/// only when `pod` actually needs CSI volumes: the overwhelming majority of
+/// pods reference no PVC at all, and for those this does nothing (no extra
+/// GETs), matching upstream's own PreFilter skip for the CSILimits plugin.
+async fn populate_csi_driver_headroom(
+    connector: &TlsConnector,
+    server: &str,
+    list: &mut NodeList,
+    pod: &PendingPod,
+) -> anyhow::Result<()> {
+    if pod.csi_volume_counts.is_empty() {
+        return Ok(());
+    }
+    let limits_by_node = fetch_csi_driver_limits_by_node(connector, server).await?;
+    let attached_by_node = fetch_attached_csi_volume_counts_by_node(connector, server).await?;
+    for node in &mut list.items {
+        let Some(limits) = limits_by_node.get(&node.metadata.name) else {
+            continue;
+        };
+        let attached = attached_by_node.get(&node.metadata.name);
+        node.csi_driver_headroom = limits
+            .iter()
+            .map(|(driver, &limit)| {
+                let used = attached.and_then(|m| m.get(driver)).copied().unwrap_or(0);
+                (driver.clone(), limit - used)
+            })
+            .collect();
+    }
+    Ok(())
+}
+
+/// The CSILimits/NodeVolumeLimits predicate: true when adding `pod`'s new
+/// CSI volumes would not push any driver past this node's advertised
+/// per-driver attach limit. A driver `pod` needs but that is absent from
+/// `csi_driver_headroom` has no limit advertised on this node (or the node
+/// has no CSINode entry at all) — not checked, mirroring `resource_fits`'s
+/// "unknown means unlimited" convention for missing allocatable fields.
+///
+/// `pub` (not module-private) so `benches/predicates.rs` can call it
+/// directly, for the same reason `resource_fits`/`host_ports_fit` are.
+pub fn csi_volume_limits_fit(
+    csi_driver_headroom: &std::collections::BTreeMap<String, i64>,
+    csi_volume_counts: &std::collections::BTreeMap<String, i64>,
+) -> bool {
+    csi_volume_counts.iter().all(|(driver, &want)| {
+        csi_driver_headroom
+            .get(driver)
+            .is_none_or(|&headroom| want <= headroom)
+    })
 }
 
 /// Bind a pod to a node via POST .../pods/:name/binding.
@@ -4416,7 +4784,7 @@ mod tests {
         // on a truly full cluster would stay Pending forever, since nothing
         // would ever try to preempt for it.
         assert!(
-            !should_retry_without_preempting(&PickNodeError::NoCapacity),
+            !should_retry_without_preempting(&PickNodeError::NoCapacity("no room".to_owned())),
             "a real NoCapacity must fall through to preemption, not a bare retry"
         );
     }
@@ -5395,6 +5763,7 @@ mod tests {
                     },
                     spec: NodeSpec::default(),
                     status: NodeStatus::default(),
+                    csi_driver_headroom: Default::default(),
                 },
                 NodeItem {
                     metadata: NodeMetadata {
@@ -5403,6 +5772,7 @@ mod tests {
                     },
                     spec: NodeSpec::default(),
                     status: NodeStatus::default(),
+                    csi_driver_headroom: Default::default(),
                 },
             ],
         };
@@ -5503,6 +5873,7 @@ mod tests {
                 },
                 spec: NodeSpec::default(),
                 status: NodeStatus::default(),
+                csi_driver_headroom: Default::default(),
             }],
         };
         let name = select_first_node(list).expect("single-item list must return Ok");
@@ -5527,6 +5898,7 @@ mod tests {
             },
             spec: NodeSpec::default(),
             status: NodeStatus::default(),
+            csi_driver_headroom: Default::default(),
         }
     }
 
@@ -6739,6 +7111,7 @@ mod tests {
                     ..Default::default()
                 },
             },
+            csi_driver_headroom: Default::default(),
         }
     }
 
@@ -6773,6 +7146,7 @@ mod tests {
             pvc_names: Vec::new(),
             pv_node_affinities: Vec::new(),
             topology_spread_constraints: Vec::new(),
+            csi_volume_counts: Default::default(),
         }
     }
 
@@ -9874,5 +10248,103 @@ mod tests {
     fn events_path_produces_correct_api_path() {
         let path = events_path("kube-system");
         assert_eq!(path, "/api/v1/namespaces/kube-system/events");
+    }
+
+    // ---------------------------------------------------------------------------
+    // csi_volume_limits_fit / CSILimits predicate — a pod exceeding the CSI
+    // driver's advertised per-node attach limit (CSINode.spec.drivers[].
+    // allocatable.count) must stay Pending/Unschedulable instead of running: a
+    // node's real hardware/driver cannot actually attach more volumes than it
+    // advertises, so binding past the limit leaves the kubelet stuck retrying
+    // a mount that can never succeed. Before this predicate existed,
+    // `crates/scheduler/src/lib.rs` had zero notion of CSINode allocatable
+    // counts and an over-limit pod scheduled and ran anyway.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn csi_volume_limits_fit_rejects_a_driver_at_its_advertised_limit() {
+        // Node already has 2 volumes of "hostpath.csi.k8s.io" attached (headroom
+        // 0 remaining out of a limit of 2); the pending pod needs one more of
+        // the SAME driver. Reverting this predicate would let the pod bind onto
+        // a node the CSI driver itself says it cannot serve.
+        let headroom = [("hostpath.csi.k8s.io".to_owned(), 0i64)].into();
+        let wants = [("hostpath.csi.k8s.io".to_owned(), 1i64)].into();
+        assert!(
+            !csi_volume_limits_fit(&headroom, &wants),
+            "a pod requesting one more volume than a driver's remaining headroom must not fit"
+        );
+    }
+
+    #[test]
+    fn csi_volume_limits_fit_allows_a_driver_with_remaining_headroom() {
+        let headroom = [("hostpath.csi.k8s.io".to_owned(), 3i64)].into();
+        let wants = [("hostpath.csi.k8s.io".to_owned(), 1i64)].into();
+        assert!(
+            csi_volume_limits_fit(&headroom, &wants),
+            "a pod requesting fewer volumes than remaining headroom must fit"
+        );
+    }
+
+    #[test]
+    fn csi_volume_limits_fit_does_not_check_a_driver_with_no_advertised_limit() {
+        // Mirrors resource_fits' "unknown capacity means unchecked" convention:
+        // a driver absent from CSINode's allocatable map advertises no limit at
+        // all, so requesting it must never be treated as a fail-closed reject.
+        let headroom = std::collections::BTreeMap::new();
+        let wants = [("some-other.csi.k8s.io".to_owned(), 5i64)].into();
+        assert!(
+            csi_volume_limits_fit(&headroom, &wants),
+            "a driver with no advertised limit must not block scheduling"
+        );
+    }
+
+    #[test]
+    fn csi_volume_limits_fit_is_true_when_pod_needs_no_csi_volumes() {
+        let headroom = [("hostpath.csi.k8s.io".to_owned(), 0i64)].into();
+        assert!(
+            csi_volume_limits_fit(&headroom, &std::collections::BTreeMap::new()),
+            "a pod needing no CSI volumes must never be blocked by a volume-count predicate"
+        );
+    }
+
+    #[test]
+    fn select_node_with_capacity_rejects_a_node_over_its_csi_attach_limit() {
+        // Before CSILimits existed, this scenario (a node with zero remaining
+        // CSI headroom) had no predicate to reject it at all, so
+        // `select_node_with_capacity` would bind the pod here — the exact bug
+        // the csi-hostpath `volumeLimits` conformance test caught (pod stayed
+        // Running instead of Pending/Unschedulable).
+        let mut node = make_node("worker-0", &[]);
+        node.csi_driver_headroom = [("hostpath.csi.k8s.io".to_owned(), 0i64)].into();
+        let list = NodeList { items: vec![node] };
+        let mut pod = empty_pending_pod();
+        pod.csi_volume_counts = [("hostpath.csi.k8s.io".to_owned(), 1i64)].into();
+        let usage = std::collections::HashMap::new();
+        let err = select_node_with_capacity(list, &pod, &usage, &[])
+            .expect_err("a node with no remaining CSI attach headroom must not be selected");
+        // The conformance test's PodScheduled=False condition message is
+        // matched against the regex `max.+volume.+count` — asserting the
+        // literal upstream-equivalent text here, not just Err(_), so a future
+        // change that silently reverts to the generic NodeResourcesFit
+        // message (correct rejection, wrong reason) is caught too.
+        assert!(
+            err.to_string().contains("max")
+                && err.to_string().contains("volume")
+                && err.to_string().contains("count"),
+            "the rejection reason must mention the volume-count limit (got: {err})"
+        );
+    }
+
+    #[test]
+    fn select_node_with_capacity_allows_a_node_under_its_csi_attach_limit() {
+        let mut node = make_node("worker-0", &[]);
+        node.csi_driver_headroom = [("hostpath.csi.k8s.io".to_owned(), 1i64)].into();
+        let list = NodeList { items: vec![node] };
+        let mut pod = empty_pending_pod();
+        pod.csi_volume_counts = [("hostpath.csi.k8s.io".to_owned(), 1i64)].into();
+        let usage = std::collections::HashMap::new();
+        let name = select_node_with_capacity(list, &pod, &usage, &[])
+            .expect("a node with enough remaining CSI attach headroom must be selected");
+        assert_eq!(name, "worker-0");
     }
 }

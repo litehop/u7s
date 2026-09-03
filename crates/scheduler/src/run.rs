@@ -30,8 +30,8 @@ use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 
 use crate::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
-    failed_scheduling_status_patch, fetch_bound_pv_node_affinities, fetch_node,
-    find_preemption_plan, http_get, is_bind_already_assigned, needs_scheduling,
+    failed_scheduling_status_patch, fetch_bound_pv_node_affinities, fetch_csi_volume_counts,
+    fetch_node, find_preemption_plan, http_get, is_bind_already_assigned, needs_scheduling,
     nominated_node_name_patch, patch_pod_status, pick_node, pods_needing_resync,
     preemption_reservation_still_fits, scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
@@ -599,6 +599,32 @@ fn handle_pod_event(
                     return;
                 }
             }
+            // Same reasoning as the PV nodeAffinity resolution above, for the
+            // CSILimits/NodeVolumeLimits predicate: without this, a pod whose
+            // PVCs already resolve to a CSI driver never gets its per-driver
+            // volume count populated, so `csi_volume_limits_fit` always sees
+            // an empty want-set and the pod is bound even past the node's
+            // advertised attach limit.
+            match fetch_csi_volume_counts(
+                &connector_clone,
+                &server_clone,
+                &namespace,
+                &pending.pvc_names,
+            )
+            .await
+            {
+                Ok(counts) => pending.csi_volume_counts = counts,
+                Err(e) => {
+                    error!(
+                        "could not resolve CSI volume counts while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"
+                    );
+                    in_flight_clone
+                        .lock()
+                        .expect("in_flight lock poisoned")
+                        .remove(&key);
+                    return;
+                }
+            }
         }
         // Ok(node_name) on a successful bind, Err on any failure to schedule
         // (no node fits, even after preemption) or to bind. Distinguishing
@@ -633,7 +659,7 @@ fn handle_pod_event(
         let outcome: SchedulingOutcome = async {
             let node = match first_pick {
                 Ok(node) => node,
-                Err(_no_capacity) => {
+                Err(no_capacity_err) => {
                     // No node has a free slot — try preemption before giving
                     // up: evict lower-priority pods to make room rather than
                     // leaving a higher-priority pod Pending forever.
@@ -665,8 +691,22 @@ fn handle_pod_event(
                             );
                             return SchedulingOutcome::Skipped;
                         }
-                        Err(PreemptionFailure::Fail(e)) => {
-                            return SchedulingOutcome::Done(Err(e))
+                        Err(PreemptionFailure::Fail(preemption_err)) => {
+                            // `find_preemption_plan`'s own failure text ("no
+                            // node still fits after preemption...") says
+                            // nothing about WHY no node worked in the first
+                            // place — reporting the ORIGINAL `pick_node`
+                            // failure instead preserves a predicate-specific
+                            // reason (e.g. CSILimits' "node(s) exceed max
+                            // volume count") that a conformance test's
+                            // PodScheduled condition message may depend on,
+                            // and is more actionable either way. Logged (not
+                            // dropped) so the preemption-specific detail
+                            // isn't lost entirely.
+                            error!(
+                                "preemption also failed while scheduling {key}: {preemption_err}"
+                            );
+                            return SchedulingOutcome::Done(Err(no_capacity_err.into()));
                         }
                     }
                 }
