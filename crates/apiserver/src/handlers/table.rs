@@ -50,6 +50,8 @@ pub fn build_table(
         ("", "serviceaccounts") => build_serviceaccount_table(objects),
         ("batch", "jobs") => build_job_table(objects),
         ("batch", "cronjobs") => build_cronjob_table(objects),
+        ("", "persistentvolumeclaims") => build_pvc_table(objects),
+        ("", "persistentvolumes") => build_pv_table(objects),
         _ => build_generic_table(objects),
     }
 }
@@ -1083,6 +1085,266 @@ fn cronjob_row(obj: serde_json::Value) -> serde_json::Value {
     })
 }
 
+// ── PersistentVolumeClaims ───────────────────────────────────────────────────
+
+fn build_pvc_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+    let columns = vec![
+        col("Name", "Name of the persistentvolumeclaim", "string"),
+        col("Status", "Phase the claim is in", "string"),
+        col("Volume", "Name of the bound persistentvolume", "string"),
+        col("Capacity", "Size of the bound volume", "string"),
+        col("Access Modes", "Access modes of the bound volume", "string"),
+        col(
+            "StorageClass",
+            "Name of the requested storage class",
+            "string",
+        ),
+        col(
+            "VolumeAttributesClass",
+            "Name of the requested volume attributes class",
+            "string",
+        ),
+        col("Age", "Time since creation", "string"),
+        wide_col("VolumeMode", "Filesystem or Block mode", "string"),
+    ];
+    let rows: Vec<serde_json::Value> = objects.into_iter().map(pvc_row).collect();
+    serde_json::json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "Table",
+        "columnDefinitions": columns,
+        "rows": rows
+    })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PvcSpecView {
+    #[serde(default)]
+    volume_name: Option<String>,
+    #[serde(default)]
+    storage_class_name: Option<String>,
+    #[serde(default)]
+    volume_attributes_class_name: Option<String>,
+    #[serde(default)]
+    volume_mode: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PvcStatusView {
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    access_modes: Option<Vec<String>>,
+    #[serde(default)]
+    capacity: Option<BTreeMap<String, String>>,
+}
+
+fn pvc_row(obj: serde_json::Value) -> serde_json::Value {
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+
+    let spec: PvcSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let status: PvcStatusView = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+
+    // Upstream only reports the bound volume's actual capacity/access modes once
+    // spec.volumeName is set; before binding it must stay blank, not the request size.
+    let (capacity, access_modes) = if spec.volume_name.as_deref().unwrap_or("").is_empty() {
+        (String::new(), String::new())
+    } else {
+        let capacity = status
+            .capacity
+            .as_ref()
+            .and_then(|c| c.get("storage"))
+            .cloned()
+            .unwrap_or_default();
+        let modes = access_modes_short_string(status.access_modes.as_deref().unwrap_or(&[]));
+        (capacity, modes)
+    };
+
+    let status_phase = if meta.deletion_timestamp.is_some() {
+        "Terminating".to_string()
+    } else {
+        status.phase.unwrap_or_default()
+    };
+    let volume = spec.volume_name.unwrap_or_default();
+    let storage_class = spec.storage_class_name.unwrap_or_default();
+    let volume_attributes_class = spec
+        .volume_attributes_class_name
+        .unwrap_or_else(|| "<unset>".to_string());
+    let volume_mode = spec.volume_mode.unwrap_or_else(|| "<unset>".to_string());
+
+    let object_ref = make_object_ref(&obj, "PersistentVolumeClaim");
+    serde_json::json!({
+        "cells": [
+            name,
+            status_phase,
+            volume,
+            capacity,
+            access_modes,
+            storage_class,
+            volume_attributes_class,
+            age,
+            volume_mode
+        ],
+        "object": object_ref
+    })
+}
+
+// ── PersistentVolumes ─────────────────────────────────────────────────────────
+
+fn build_pv_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+    let columns = vec![
+        col("Name", "Name of the persistentvolume", "string"),
+        col("Capacity", "Size of the volume", "string"),
+        col("Access Modes", "Access modes of the volume", "string"),
+        col(
+            "Reclaim Policy",
+            "What happens to the volume when its claim is deleted",
+            "string",
+        ),
+        col("Status", "Phase the volume is in", "string"),
+        col(
+            "Claim",
+            "Bound persistentvolumeclaim, as namespace/name",
+            "string",
+        ),
+        col("StorageClass", "Name of the storage class", "string"),
+        col(
+            "VolumeAttributesClass",
+            "Name of the volume attributes class",
+            "string",
+        ),
+        col(
+            "Reason",
+            "Reason the volume is in its current status",
+            "string",
+        ),
+        col("Age", "Time since creation", "string"),
+        wide_col("VolumeMode", "Filesystem or Block mode", "string"),
+    ];
+    let rows: Vec<serde_json::Value> = objects.into_iter().map(pv_row).collect();
+    serde_json::json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "Table",
+        "columnDefinitions": columns,
+        "rows": rows
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct PvClaimRefView {
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PvSpecView {
+    #[serde(default)]
+    capacity: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    access_modes: Option<Vec<String>>,
+    #[serde(default)]
+    persistent_volume_reclaim_policy: Option<String>,
+    #[serde(default)]
+    claim_ref: Option<PvClaimRefView>,
+    #[serde(default)]
+    storage_class_name: Option<String>,
+    #[serde(default)]
+    volume_attributes_class_name: Option<String>,
+    #[serde(default)]
+    volume_mode: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PvStatusView {
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn pv_row(obj: serde_json::Value) -> serde_json::Value {
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+
+    let spec: PvSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let status: PvStatusView = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+
+    let capacity = spec
+        .capacity
+        .as_ref()
+        .and_then(|c| c.get("storage"))
+        .cloned()
+        .unwrap_or_default();
+    let access_modes = access_modes_short_string(spec.access_modes.as_deref().unwrap_or(&[]));
+    let reclaim_policy = spec.persistent_volume_reclaim_policy.unwrap_or_default();
+    let status_phase = if meta.deletion_timestamp.is_some() {
+        "Terminating".to_string()
+    } else {
+        status.phase.unwrap_or_default()
+    };
+    let claim = spec
+        .claim_ref
+        .map(|c| {
+            format!(
+                "{}/{}",
+                c.namespace.unwrap_or_default(),
+                c.name.unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    let storage_class = spec.storage_class_name.unwrap_or_default();
+    let volume_attributes_class = spec
+        .volume_attributes_class_name
+        .unwrap_or_else(|| "<unset>".to_string());
+    let reason = status.reason.unwrap_or_default();
+    let volume_mode = spec.volume_mode.unwrap_or_else(|| "<unset>".to_string());
+
+    let object_ref = make_object_ref(&obj, "PersistentVolume");
+    serde_json::json!({
+        "cells": [
+            name,
+            capacity,
+            access_modes,
+            reclaim_policy,
+            status_phase,
+            claim,
+            storage_class,
+            volume_attributes_class,
+            reason,
+            age,
+            volume_mode
+        ],
+        "object": object_ref
+    })
+}
+
+/// Mirrors upstream `helper.GetAccessModesAsString`: modes are always rendered
+/// in this fixed order (RWO,ROX,RWX,RWOP), not the order they appear in the spec.
+fn access_modes_short_string(modes: &[String]) -> String {
+    let mut parts = Vec::new();
+    if modes.iter().any(|m| m == "ReadWriteOnce") {
+        parts.push("RWO");
+    }
+    if modes.iter().any(|m| m == "ReadOnlyMany") {
+        parts.push("ROX");
+    }
+    if modes.iter().any(|m| m == "ReadWriteMany") {
+        parts.push("RWX");
+    }
+    if modes.iter().any(|m| m == "ReadWriteOncePod") {
+        parts.push("RWOP");
+    }
+    parts.join(",")
+}
+
 // ── Generic ───────────────────────────────────────────────────────────────────
 
 fn build_generic_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
@@ -2031,6 +2293,196 @@ mod tests {
         assert_eq!(
             cells[6], "nginx:latest,envoy:v1",
             "IMAGES must match container order so they correspond to the right container"
+        );
+    }
+
+    // ── PersistentVolumeClaim tests ──────────────────────────────────────────
+    // Storage triage (`kubectl get pvc`) relies on STATUS/CAPACITY/ACCESS MODES
+    // being present; a regression here silently drops back to NAME+AGE only.
+
+    #[test]
+    fn build_table_for_pvcs_bound_shows_all_columns_from_status() {
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "data-mariadb-0", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {
+                "volumeName": "pvc-1234",
+                "storageClassName": "csi-hostpath-sc",
+                "resources": {"requests": {"storage": "10Gi"}}
+            },
+            "status": {
+                "phase": "Bound",
+                "accessModes": ["ReadWriteOnce"],
+                "capacity": {"storage": "10Gi"}
+            }
+        });
+
+        let table = build_table("", "persistentvolumeclaims", vec![pvc]);
+        let cols = table["columnDefinitions"].as_array().unwrap();
+        let col_names: Vec<&str> = cols.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            col_names,
+            [
+                "Name",
+                "Status",
+                "Volume",
+                "Capacity",
+                "Access Modes",
+                "StorageClass",
+                "VolumeAttributesClass",
+                "Age",
+                "VolumeMode"
+            ],
+            "kubectl get pvc must show the upstream column set, not just NAME/AGE"
+        );
+        assert_eq!(
+            cols[8]["priority"], 1,
+            "VolumeMode must be wide-only (priority 1) to match upstream `-o wide` behavior"
+        );
+        for (i, c) in cols.iter().enumerate().take(8) {
+            assert_eq!(
+                c["priority"], 0,
+                "column {i} must render in plain `kubectl get pvc`"
+            );
+        }
+
+        let cells = table["rows"][0]["cells"].as_array().unwrap();
+        assert_eq!(cells[0], "data-mariadb-0");
+        assert_eq!(cells[1], "Bound", "STATUS must be status.phase");
+        assert_eq!(cells[2], "pvc-1234", "VOLUME must be spec.volumeName");
+        assert_eq!(
+            cells[3], "10Gi",
+            "CAPACITY must be status.capacity.storage once bound, not the request size"
+        );
+        assert_eq!(
+            cells[4], "RWO",
+            "ACCESS MODES must render the upstream short form (RWO), not the raw enum name"
+        );
+        assert_eq!(
+            cells[5], "csi-hostpath-sc",
+            "STORAGECLASS must be spec.storageClassName"
+        );
+        assert_eq!(cells[6], "<unset>");
+        assert_eq!(cells[8], "<unset>");
+    }
+
+    #[test]
+    fn build_table_for_pvcs_pending_hides_capacity_and_access_modes() {
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "unbound-pvc", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {
+                "storageClassName": "csi-hostpath-sc",
+                "resources": {"requests": {"storage": "5Gi"}}
+            },
+            "status": {"phase": "Pending"}
+        });
+
+        let table = build_table("", "persistentvolumeclaims", vec![pvc]);
+        let cells = table["rows"][0]["cells"].as_array().unwrap();
+        assert_eq!(cells[1], "Pending");
+        assert_eq!(cells[2], "", "VOLUME must be blank before binding");
+        assert_eq!(
+            cells[3], "",
+            "CAPACITY must stay blank pre-binding — showing the request size would mislead \
+             an operator into thinking storage is already provisioned"
+        );
+        assert_eq!(cells[4], "", "ACCESS MODES must stay blank pre-binding");
+    }
+
+    // ── PersistentVolume tests ────────────────────────────────────────────────
+
+    #[test]
+    fn build_table_for_pvs_bound_shows_all_columns() {
+        let pv = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {"name": "pvc-1234", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {
+                "capacity": {"storage": "10Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "claimRef": {"namespace": "default", "name": "data-mariadb-0"},
+                "storageClassName": "csi-hostpath-sc"
+            },
+            "status": {"phase": "Bound"}
+        });
+
+        let table = build_table("", "persistentvolumes", vec![pv]);
+        let cols = table["columnDefinitions"].as_array().unwrap();
+        let col_names: Vec<&str> = cols.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            col_names,
+            [
+                "Name",
+                "Capacity",
+                "Access Modes",
+                "Reclaim Policy",
+                "Status",
+                "Claim",
+                "StorageClass",
+                "VolumeAttributesClass",
+                "Reason",
+                "Age",
+                "VolumeMode"
+            ],
+            "kubectl get pv must show the upstream column set, not just NAME/AGE"
+        );
+        assert_eq!(
+            cols[10]["priority"], 1,
+            "VolumeMode must be wide-only (priority 1) to match upstream `-o wide` behavior"
+        );
+
+        let cells = table["rows"][0]["cells"].as_array().unwrap();
+        assert_eq!(cells[0], "pvc-1234");
+        assert_eq!(cells[1], "10Gi", "CAPACITY must be spec.capacity.storage");
+        assert_eq!(
+            cells[2], "RWO",
+            "ACCESS MODES must render the upstream short form (RWO), not the raw enum name"
+        );
+        assert_eq!(
+            cells[3], "Delete",
+            "RECLAIM POLICY must be spec.persistentVolumeReclaimPolicy"
+        );
+        assert_eq!(cells[4], "Bound", "STATUS must be status.phase");
+        assert_eq!(
+            cells[5], "default/data-mariadb-0",
+            "CLAIM must render as namespace/name so operators can find the bound claim"
+        );
+        assert_eq!(
+            cells[6], "csi-hostpath-sc",
+            "STORAGECLASS must be spec.storageClassName"
+        );
+        assert_eq!(cells[7], "<unset>");
+        assert_eq!(cells[8], "");
+    }
+
+    #[test]
+    fn build_table_for_pvs_unbound_has_empty_claim_and_no_capacity_gate() {
+        let pv = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {"name": "pv-standalone", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {
+                "capacity": {"storage": "1Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Retain"
+            },
+            "status": {"phase": "Available"}
+        });
+
+        let table = build_table("", "persistentvolumes", vec![pv]);
+        let cells = table["rows"][0]["cells"].as_array().unwrap();
+        assert_eq!(
+            cells[1], "1Gi",
+            "PV CAPACITY is always spec.capacity.storage, unlike PVC which gates on binding"
+        );
+        assert_eq!(cells[4], "Available");
+        assert_eq!(
+            cells[5], "",
+            "CLAIM must be blank when spec.claimRef is unset — no PVC bound yet"
         );
     }
 
