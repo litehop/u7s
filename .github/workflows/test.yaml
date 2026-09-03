@@ -102,7 +102,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
         with:
-          components: rust-src
+          components: clippy, rustfmt, rust-src
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: crates/servicelb
@@ -110,8 +110,31 @@ jobs:
       - name: Install bpf-linker
         run: cargo install bpf-linker --locked
 
+      # `cargo fmt`/`clippy --manifest-path` silently no-op on a nested
+      # workspace when invoked from the outer u7s workspace's directory
+      # (verified: introducing a formatting error and re-running with
+      # --manifest-path alone stayed green) -- `working-directory` per
+      # step is what actually resolves into crates/servicelb's own
+      # nested workspace.
+      - name: Format check (u7s-servicelb + servicelb-ebpf)
+        working-directory: crates/servicelb
+        run: cargo fmt --check
+
+      - name: Clippy (u7s-servicelb loader)
+        working-directory: crates/servicelb
+        run: cargo clippy --tests -- -D warnings
+
+      # servicelb-ebpf is #![no_std] and only builds for bpfel-unknown-none;
+      # clippy needs the same target + build-std the real build uses, run
+      # separately from its own directory (u7s-servicelb's own clippy run
+      # above only type-checks it via build.rs, no lints).
+      - name: Clippy (servicelb-ebpf)
+        working-directory: crates/servicelb/servicelb-ebpf
+        run: cargo clippy --release --target bpfel-unknown-none -Z build-std=core -- -D warnings
+
       - name: Build servicelb-ebpf + u7s-servicelb
-        run: cargo build --release --manifest-path crates/servicelb/Cargo.toml
+        working-directory: crates/servicelb
+        run: cargo build --release
 
   # runs the whole suite _and_ checks coverage too
   test-coverage:
