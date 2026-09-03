@@ -9048,14 +9048,20 @@ mod tests {
         );
     }
 
-    /// decode_deployment_proto must write spec.replicas=0 — not drop it.
+    /// decode_deployment_proto must preserve an EXPLICIT spec.replicas=0 — not drop it.
     ///
-    /// proto3 encodes 0 as absent, so the decoder receives no replicas field.
-    /// Dropping it causes the defaulter to set replicas=1, corrupting scale-to-zero.
+    /// `replicas` is `optional int32` (proto3-optional field presence, matching upstream's
+    /// gogoproto-nullable `*int32`): a client that explicitly scales to zero sends the field 1
+    /// varint tag on the wire with value 0, distinct from a client that never touched the field
+    /// at all (which omits the tag entirely — see
+    /// `decode_deployment_proto_omitted_replicas_stays_absent` below for that case). Collapsing
+    /// this explicit-zero case to "absent" would let the defaulter silently set replicas=1,
+    /// reviving pods a `kubectl scale --replicas=0` deliberately shut down.
     #[test]
     fn decode_deployment_proto_replicas_zero_not_dropped() {
-        // spec_bytes with no replicas field — proto3 omits default (0) values on the wire
-        let mut spec_bytes = vec![];
+        // field 1 (replicas), varint 0 — the wire tag IS present; this is not proto3's
+        // "unset scalar" omission (that only applies to non-optional fields).
+        let mut spec_bytes = vec![0x08, 0x00];
 
         let mut label_entry = encode_length_delimited(1, b"app");
         label_entry.extend_from_slice(&encode_length_delimited(2, b"test"));
@@ -9074,18 +9080,18 @@ mod tests {
 
         assert_eq!(
             result["spec"]["replicas"], 0,
-            "spec.replicas must be 0 after proto decode — dropped replicas=0 causes defaulter to \
-             set 1, corrupting scale-to-zero"
+            "an explicit spec.replicas=0 on the wire must survive proto decode — dropping it \
+             lets the defaulter revive it to 1, undoing a deliberate scale-to-zero"
         );
     }
 
-    /// decode_statefulset_proto must write spec.replicas=0 — not drop it.
+    /// decode_statefulset_proto must preserve an EXPLICIT spec.replicas=0 — not drop it.
     ///
-    /// proto3 encodes 0 as absent, so the decoder receives no replicas field.
-    /// Dropping it causes the defaulter to set replicas=1, corrupting scale-to-zero.
+    /// See `decode_deployment_proto_replicas_zero_not_dropped` for why the wire tag is present
+    /// for an explicit zero (proto3-optional field presence), unlike a genuinely untouched field.
     #[test]
     fn decode_statefulset_proto_replicas_zero_not_dropped() {
-        let mut spec_bytes = vec![];
+        let mut spec_bytes = vec![0x08, 0x00]; // field 1 (replicas), varint 0 — explicit zero
 
         let mut label_entry = encode_length_delimited(1, b"app");
         label_entry.extend_from_slice(&encode_length_delimited(2, b"sts-test"));
@@ -9104,18 +9110,18 @@ mod tests {
 
         assert_eq!(
             result["spec"]["replicas"], 0,
-            "spec.replicas must be 0 after proto decode — dropped replicas=0 causes defaulter to \
-             set 1, corrupting scale-to-zero"
+            "an explicit spec.replicas=0 on the wire must survive proto decode — dropping it \
+             lets the defaulter revive it to 1, undoing a deliberate scale-to-zero"
         );
     }
 
-    /// decode_replicaset_proto must write spec.replicas=0 — not drop it.
+    /// decode_replicaset_proto must preserve an EXPLICIT spec.replicas=0 — not drop it.
     ///
-    /// proto3 encodes 0 as absent, so the decoder receives no replicas field.
-    /// Dropping it causes the defaulter to set replicas=1, corrupting scale-to-zero.
+    /// See `decode_deployment_proto_replicas_zero_not_dropped` for why the wire tag is present
+    /// for an explicit zero (proto3-optional field presence), unlike a genuinely untouched field.
     #[test]
     fn decode_replicaset_proto_replicas_zero_not_dropped() {
-        let mut spec_bytes = vec![];
+        let mut spec_bytes = vec![0x08, 0x00]; // field 1 (replicas), varint 0 — explicit zero
 
         let mut label_entry = encode_length_delimited(1, b"app");
         label_entry.extend_from_slice(&encode_length_delimited(2, b"rs-test"));
@@ -9134,22 +9140,22 @@ mod tests {
 
         assert_eq!(
             result["spec"]["replicas"], 0,
-            "spec.replicas must be 0 after proto decode — dropped replicas=0 causes defaulter to \
-             set 1, corrupting scale-to-zero"
+            "an explicit spec.replicas=0 on the wire must survive proto decode — dropping it \
+             lets the defaulter revive it to 1, undoing a deliberate scale-to-zero"
         );
     }
 
-    /// decode_replicationcontroller_proto must write spec.replicas=0 — not drop it.
+    /// decode_replicationcontroller_proto must preserve an EXPLICIT spec.replicas=0 — not drop it.
     ///
-    /// proto3 encodes 0 as absent, so the decoder receives no replicas field.
-    /// Dropping it causes the defaulter to set replicas=1, corrupting scale-to-zero.
+    /// See `decode_deployment_proto_replicas_zero_not_dropped` for why the wire tag is present
+    /// for an explicit zero (proto3-optional field presence), unlike a genuinely untouched field.
     #[test]
     fn decode_replicationcontroller_proto_replicas_zero_not_dropped() {
         // ReplicationControllerSpec: replicas=field 1, selector=field 2 (map), template=field 3
-        // Encode a spec with only a selector entry (no replicas field — proto3 omits 0)
+        let mut spec_bytes = vec![0x08, 0x00]; // field 1 (replicas), varint 0 — explicit zero
         let mut map_entry = encode_length_delimited(1, b"app");
         map_entry.extend_from_slice(&encode_length_delimited(2, b"rc-test"));
-        let spec_bytes = encode_length_delimited(2, &map_entry);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &map_entry));
 
         let name_bytes = encode_length_delimited(1, b"my-rc");
         let mut proto = encode_length_delimited(1, &name_bytes);
@@ -9160,8 +9166,138 @@ mod tests {
 
         assert_eq!(
             result["spec"]["replicas"], 0,
-            "spec.replicas must be 0 after proto decode — dropped replicas=0 causes defaulter to \
-             set 1, corrupting scale-to-zero"
+            "an explicit spec.replicas=0 on the wire must survive proto decode — dropping it \
+             lets the defaulter revive it to 1, undoing a deliberate scale-to-zero"
+        );
+    }
+
+    /// decode_deployment_proto must leave spec.replicas ABSENT when the client never touched
+    /// the field (wire tag entirely missing, not just zero) — so `apply_defaults` still sees it
+    /// as unset and applies the documented default of 1.
+    ///
+    /// Client-go's typed Clientset (used by kube-controller-manager's own controllers and every
+    /// e2e test's `f.ClientSet`) defaults to protobuf request encoding. Before this fix, the
+    /// decoder unconditionally wrote `replicas.unwrap_or(0)` into the JSON regardless of wire
+    /// presence, so ANY protobuf-encoded Deployment/ReplicaSet create that omitted `replicas`
+    /// (the common case — most manifests don't set it) was permanently persisted as
+    /// `replicas: 0`. The real-world consequence: the AnyVolumeDataSource conformance test's
+    /// `hello-populator` Deployment (created via a typed Clientset, no explicit replicas) was
+    /// stored with `spec.replicas: 0`, so the ReplicaSet controller never created its pod.
+    #[test]
+    fn decode_deployment_proto_omitted_replicas_stays_absent() {
+        // No replicas tag at all — a genuinely untouched `optional int32` field omits the tag
+        // entirely on the wire, unlike the explicit-zero case above.
+        let mut spec_bytes = vec![];
+
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-deploy");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("Deployment", &proto)
+            .expect("Deployment proto must decode successfully");
+
+        assert!(
+            result["spec"].get("replicas").is_none(),
+            "an omitted spec.replicas must decode as ABSENT, not fabricated 0 — a fabricated \
+             0 short-circuits apply_defaults's 'replicas defaults to 1' logic and leaves the \
+             ReplicaSet controller with nothing to do, so a Deployment created with no explicit \
+             replicas never gets a pod. Got: {:?}",
+            result["spec"].get("replicas")
+        );
+    }
+
+    /// decode_replicaset_proto must leave spec.replicas ABSENT when the client never touched
+    /// the field — see `decode_deployment_proto_omitted_replicas_stays_absent` for why this
+    /// matters (the Deployment controller's own generated ReplicaSet inherits the same
+    /// omitted-field shape, so this is the exact ReplicaSet-level manifestation of that bug).
+    #[test]
+    fn decode_replicaset_proto_omitted_replicas_stays_absent() {
+        let mut spec_bytes = vec![]; // no replicas tag — genuinely untouched field
+
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"rs-test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-rs");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("ReplicaSet", &proto)
+            .expect("ReplicaSet proto must decode successfully");
+
+        assert!(
+            result["spec"].get("replicas").is_none(),
+            "an omitted spec.replicas must decode as ABSENT, not fabricated 0 — a fabricated \
+             0 short-circuits apply_defaults's 'replicas defaults to 1' logic, so the \
+             ReplicaSet controller computes zero desired pods and never creates one. Got: {:?}",
+            result["spec"].get("replicas")
+        );
+    }
+
+    /// decode_statefulset_proto must leave spec.replicas ABSENT when the client never touched
+    /// the field — same class of bug as Deployment/ReplicaSet, see
+    /// `decode_deployment_proto_omitted_replicas_stays_absent`.
+    #[test]
+    fn decode_statefulset_proto_omitted_replicas_stays_absent() {
+        let mut spec_bytes = vec![]; // no replicas tag — genuinely untouched field
+
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"sts-test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-sts");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("StatefulSet", &proto)
+            .expect("StatefulSet proto must decode successfully");
+
+        assert!(
+            result["spec"].get("replicas").is_none(),
+            "an omitted spec.replicas must decode as ABSENT, not fabricated 0 — a fabricated \
+             0 short-circuits apply_defaults's 'replicas defaults to 1' logic. Got: {:?}",
+            result["spec"].get("replicas")
+        );
+    }
+
+    /// decode_replicationcontroller_proto must leave spec.replicas ABSENT when the client never
+    /// touched the field — same class of bug as Deployment/ReplicaSet, see
+    /// `decode_deployment_proto_omitted_replicas_stays_absent`.
+    #[test]
+    fn decode_replicationcontroller_proto_omitted_replicas_stays_absent() {
+        // ReplicationControllerSpec: replicas=field 1, selector=field 2 (map), template=field 3
+        let mut map_entry = encode_length_delimited(1, b"app");
+        map_entry.extend_from_slice(&encode_length_delimited(2, b"rc-test"));
+        let spec_bytes = encode_length_delimited(2, &map_entry); // no replicas tag
+
+        let name_bytes = encode_length_delimited(1, b"my-rc");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("ReplicationController", &proto)
+            .expect("ReplicationController proto must decode successfully");
+
+        assert!(
+            result["spec"].get("replicas").is_none(),
+            "an omitted spec.replicas must decode as ABSENT, not fabricated 0 — a fabricated \
+             0 short-circuits apply_defaults's 'replicas defaults to 1' logic. Got: {:?}",
+            result["spec"].get("replicas")
         );
     }
 
