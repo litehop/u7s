@@ -1706,20 +1706,24 @@ pub(crate) async fn do_patch<S: Store>(
         }
 
         // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+        // dryRun=All must not actually delete the object — checked here, before the store
+        // delete below, since this branch returns before do_patch's own later dry_run check.
         if finalizer_drain_complete(&current.body) {
-            complete_finalizer_drain(
-                state,
-                FinalizerDrainCtx {
-                    key,
-                    meta,
-                    group,
-                    version,
-                    plural,
-                    ns,
-                    name,
-                },
-            )
-            .await?;
+            if !dry_run {
+                complete_finalizer_drain(
+                    state,
+                    FinalizerDrainCtx {
+                        key,
+                        meta,
+                        group,
+                        version,
+                        plural,
+                        ns,
+                        name,
+                    },
+                )
+                .await?;
+            }
             return Ok(Json(current.body).into_response());
         }
 
@@ -2696,7 +2700,8 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     if group.is_empty() && plural == "services" {
         super::defaults::validate_service_ip_family_fields(&obj.body)
             .map_err(Status::unprocessable_entity)?;
-        maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body).await?;
+        maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body, create_query.is_dry_run())
+            .await?;
     }
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
@@ -3333,7 +3338,14 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     if group.is_empty() && plural == "services" {
         super::defaults::validate_service_ip_family_fields(&obj.body)
             .map_err(Status::unprocessable_entity)?;
-        maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body).await?;
+        maybe_allocate_cluster_ip(
+            &state,
+            &ns,
+            &name,
+            &mut obj.body,
+            replace_query.is_dry_run(),
+        )
+        .await?;
     }
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
@@ -4308,11 +4320,18 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
 /// Sets `spec.clusterIP` in `body` when allocation succeeds.
 /// If `spec.clusterIP` is already set (non-empty string), does nothing.
 /// ExternalName services are skipped entirely — they must not have a ClusterIP.
+///
+/// `dry_run`: `allocate_service_ip` reserves the IP via a real create-only store write
+/// (it doubles as the allocator's distributed lock) — there is no side-effect-free way to
+/// compute a candidate address. Under `dryRun=All` this must be skipped entirely rather
+/// than calling it and leaking a permanently-reserved sentinel for an object that is never
+/// actually created; the dry-run response is left with `spec.clusterIP` unset instead.
 async fn maybe_allocate_cluster_ip<S: Store>(
     state: &AppState<S>,
     ns: &str,
     name: &str,
     body: &mut serde_json::Value,
+    dry_run: bool,
 ) -> Result<(), crate::status::StatusError> {
     // ExternalName services must not have a ClusterIP; skip allocation entirely.
     let svc_type = body["spec"]["type"].as_str().unwrap_or("");
@@ -4323,6 +4342,10 @@ async fn maybe_allocate_cluster_ip<S: Store>(
     // Only auto-allocate when clusterIP is absent or empty.
     let existing = body["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
     if !existing.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
         return Ok(());
     }
 
@@ -9617,6 +9640,78 @@ mod tests {
         );
     }
 
+    /// `PATCH ...?dryRun=All` draining the last finalizer must NOT hard-delete the object.
+    ///
+    /// Regression test for an ordering bug: do_patch's finalizer-drain-complete check (shared
+    /// by patch_resource and patch_namespaced_resource) used to run BEFORE its own dry-run
+    /// check, so a dry-run PATCH draining the last finalizer actually deleted the object for
+    /// real — the exact opposite of what dryRun=All promises.
+    #[tokio::test]
+    async fn patch_namespaced_resource_dry_run_all_draining_last_finalizer_does_not_hard_delete() {
+        let state = make_state();
+        let ns = "default";
+
+        let rc_key = crate::keys::group_object_key(
+            "",
+            "replicationcontrollers",
+            Some(ns),
+            "draining-rc-dry-run",
+        );
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": {
+                "name": "draining-rc-dry-run",
+                "namespace": ns,
+                "uid": "drain-uid-dry-run",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["orphan"]
+            },
+            "spec": { "replicas": 0, "selector": { "app": "draining-rc-dry-run" } }
+        });
+        state
+            .store
+            .put(
+                &rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed draining RC");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({ "metadata": { "finalizers": [] } });
+        patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "draining-rc-dry-run".into(),
+            )),
+            axum::extract::Query(PatchQuery {
+                dry_run: Some("All".to_string()),
+                ..Default::default()
+            }),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dry-run finalizer-drain patch must succeed: {e:?}"));
+
+        assert!(
+            state.store.get(&rc_key).await.unwrap().is_some(),
+            "dryRun=All must not hard-delete the object even though the patch drains its last \
+             finalizer"
+        );
+    }
+
     /// Security invariant: a soft-deleted ClusterRoleBinding must be removed from the
     /// RBAC index immediately when DELETE is requested.
     #[tokio::test]
@@ -13732,6 +13827,57 @@ mod tests {
             u32::from(ip) & mask,
             base & mask,
             "allocated clusterIP {ip} must be within 10.96.0.0/12"
+        );
+    }
+
+    /// `POST ...?dryRun=All` for a ClusterIP Service with no explicit clusterIP must NOT
+    /// reserve a real sentinel from the allocator.
+    ///
+    /// Before this fix, maybe_allocate_cluster_ip called `state.allocate_service_ip` (a real
+    /// create-only store write) unconditionally, even under dryRun=All — the Service object
+    /// itself correctly never persisted, but every dry-run create permanently burned one IP
+    /// from the pool, since nothing ever releases an allocation for an object that was never
+    /// actually created.
+    #[tokio::test]
+    async fn allocate_dry_run_all_does_not_reserve_a_sentinel() {
+        use axum::extract::{Path, State};
+
+        let state = make_state_with_cidr_for_resource_tests("10.96.0.0/29");
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "dry-run-svc", "namespace": "default" },
+            "spec": { "type": "ClusterIP", "ports": [{ "port": 80 }] }
+        });
+
+        let _ = create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery {
+                dry_run: Some("All".to_string()),
+                ..Default::default()
+            }),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dry-run Service create must succeed: {e:?}"));
+
+        let sentinels = state
+            .store
+            .list(
+                crate::state::SERVICE_IP_PREFIX,
+                u7s_store::ListOptions::default(),
+            )
+            .await
+            .expect("list sentinels");
+        assert_eq!(
+            sentinels.items.len(),
+            0,
+            "dryRun=All must not reserve a clusterIP sentinel — every dry-run create would \
+             otherwise permanently leak one IP from the pool"
         );
     }
 

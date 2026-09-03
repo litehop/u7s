@@ -1170,6 +1170,12 @@ pub async fn put_crd_status<S: Store>(
 
     crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
 
+    // Dry-run: return the would-be status object without persisting — mirrors
+    // put_resource_status's dry-run early-return.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current.body));
+    }
+
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
         .store
@@ -1248,6 +1254,12 @@ pub async fn patch_crd_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     crate::handlers::status::reject_non_object_status(&current.body["status"])?;
+
+    // Dry-run: same convergence point as reject_non_object_status above — return the
+    // would-be patched status object without persisting.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current.body));
+    }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -2937,6 +2949,75 @@ mod tests {
         assert_eq!(v2["status"]["conditions"][0]["type"], "Established");
     }
 
+    /// `PUT .../{name}/status?dryRun=All` must return the would-be status object but leave
+    /// the stored CRD's status untouched. Before this fix, put_crd_status had no dry-run
+    /// check at all.
+    #[tokio::test]
+    async fn put_crd_status_dry_run_all_does_not_persist() {
+        let state = make_state();
+        let name = "dryrunwidgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "dryrunwidgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let get_resp = get_crd(State(state.clone()), Path(name.to_string()))
+            .await
+            .expect("get must succeed");
+        let get_body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut current: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+        current["status"] = serde_json::json!({
+            "conditions": [{ "type": "Established", "status": "True", "reason": "InitialNamesAccepted" }]
+        });
+        let put_body = Bytes::from(current.to_string());
+
+        let mut dry_run_headers = HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let resp = put_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            dry_run_headers,
+            put_body,
+        )
+        .await
+        .expect("dry-run put status must succeed")
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["status"]["conditions"][0]["type"], "Established",
+            "dry-run response must show the would-be status"
+        );
+
+        // create_crd stamps exactly two conditions (Established + NamesAccepted, see
+        // build_new_crd). The dry-run PUT body above replaces status wholesale with a
+        // single-entry array — if that were persisted, NamesAccepted would be gone.
+        let reget = get_crd(State(state), Path(name.to_string()))
+            .await
+            .expect("get must succeed after dry-run");
+        let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
+        let stored_conditions = v2["status"]["conditions"].as_array().unwrap();
+        assert_eq!(
+            stored_conditions.len(),
+            2,
+            "dryRun=All must not persist the PUT's replacement status — the CRD's \
+             creation-time Established+NamesAccepted conditions must be unchanged"
+        );
+        assert_eq!(stored_conditions[1]["type"], "NamesAccepted");
+    }
+
     /// PUT .../{name}/status with a scalar or array `status` body must be rejected with
     /// 422, not persisted. `status` is a message/object type for every resource including a
     /// CustomResourceDefinition's own status; a PUT that wholesale-replaces it with a scalar
@@ -3051,6 +3132,68 @@ mod tests {
             v["spec"]["group"], "example.io",
             "PATCH on the status subresource must not touch spec"
         );
+    }
+
+    /// `PATCH .../{name}/status?dryRun=All` must return the would-be patched status but leave
+    /// the stored CRD's status untouched. Before this fix, patch_crd_status had no dry-run
+    /// check at all.
+    #[tokio::test]
+    async fn patch_crd_status_dry_run_all_does_not_persist() {
+        let state = make_state();
+        let name = "dryrunpatchwidgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "dryrunpatchwidgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let patch = serde_json::json!({
+            "status": { "conditions": [{ "type": "NamesAccepted", "status": "True" }] }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let resp = patch_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .expect("dry-run patch status must succeed")
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["status"]["conditions"][0]["type"], "NamesAccepted",
+            "dry-run response must show the would-be patched condition"
+        );
+
+        let reget = get_crd(State(state), Path(name.to_string()))
+            .await
+            .expect("get must succeed after dry-run");
+        let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
+        let stored_conditions = v2["status"]["conditions"].as_array().unwrap();
+        assert_eq!(
+            stored_conditions.len(),
+            2,
+            "dryRun=All must not persist the PATCH's replacement conditions array — the CRD's \
+             creation-time Established+NamesAccepted conditions must be unchanged"
+        );
+        assert_eq!(stored_conditions[0]["type"], "Established");
     }
 
     /// PATCH .../{name}/status with a merge-patch body `{"status":"x"}` must be rejected

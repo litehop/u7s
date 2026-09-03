@@ -682,6 +682,12 @@ pub(crate) async fn finalize_namespace<S: Store>(
         .map(|f| f.is_empty())
         .unwrap_or(true);
 
+    // Dry-run: return the would-be finalized namespace without persisting — mirrors
+    // replace_namespace's dry-run early-return above.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current.body).into_response());
+    }
+
     // Persist the updated object first.
     // CAS on the INCOMING request's resourceVersion, not the stored object's: /finalize is
     // a replace subresource, so a client holding a stale snapshot must get 409 and retry
@@ -763,6 +769,12 @@ pub(crate) async fn put_namespace_status<S: Store>(
         &incoming.body,
         "Namespace",
     );
+
+    // Dry-run: return the would-be status object without persisting — mirrors
+    // put_resource_status's dry-run early-return.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current.body));
+    }
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
@@ -846,6 +858,12 @@ pub(crate) async fn patch_namespace_status<S: Store>(
     // handler previously guarded neither branch, so a merge-patch or JSON Patch `/status`
     // replace could persist a scalar status and later panic the in-place terminating-stamp.
     crate::handlers::status::reject_non_object_status(&current.body["status"])?;
+
+    // Dry-run: same convergence point as reject_non_object_status above — return the
+    // would-be patched status object without persisting.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current.body));
+    }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -4264,6 +4282,79 @@ mod tests {
         );
     }
 
+    /// `PUT /finalize?dryRun=All` draining the last finalizer must NOT hard-delete the
+    /// namespace. Before this fix, finalize_namespace had no dry-run check at all.
+    #[tokio::test]
+    async fn finalize_namespace_dry_run_all_does_not_hard_delete_or_persist() {
+        use u7s_store::Store;
+        let state = make_state();
+
+        let key = crate::keys::cluster_object_key("namespaces", "finalize-ns-dry-run");
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "finalize-ns-dry-run",
+                "uid": "00000000-0000-0000-0000-000000000003",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["other-controller"] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(ns.to_string()), Some(0))
+            .await
+            .expect("direct store write must succeed");
+
+        let finalize_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "finalize-ns-dry-run" },
+                "spec": { "finalizers": [] }
+            })
+            .to_string(),
+        );
+
+        let mut dry_run_headers = axum::http::HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let resp = finalize_namespace(
+            State(state.clone()),
+            Path("finalize-ns-dry-run".to_string()),
+            dry_run_headers,
+            finalize_body,
+        )
+        .await
+        .expect("dry-run finalize must succeed");
+        let resp_body = axum::body::to_bytes(resp.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert!(
+            v["spec"]["finalizers"].as_array().unwrap().is_empty(),
+            "dry-run response must show the would-be empty finalizers list"
+        );
+
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .expect("store get must not error")
+            .expect("dryRun=All must not hard-delete the namespace");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["spec"]["finalizers"],
+            serde_json::json!(["other-controller"]),
+            "dryRun=All must not persist the finalizer removal"
+        );
+    }
+
     // finalize_namespace must only update finalizers and persist (not hard-delete)
     // when spec.finalizers is non-empty after the PUT.
     //
@@ -4714,6 +4805,71 @@ mod tests {
         );
     }
 
+    /// `PUT /status?dryRun=All` must return the would-be status object but leave the stored
+    /// namespace's status untouched. Before this fix, put_namespace_status had no dry-run
+    /// check at all.
+    #[tokio::test]
+    async fn put_namespace_status_dry_run_all_does_not_persist() {
+        let state = make_state();
+
+        assert!(create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            namespace_body("status-put-dry-run-ns"),
+        )
+        .await
+        .is_ok());
+
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "status-put-dry-run-ns" },
+                "status": { "phase": "Terminating" }
+            })
+            .to_string(),
+        );
+
+        let mut dry_run_headers = axum::http::HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let resp = put_namespace_status(
+            State(state.clone()),
+            Path("status-put-dry-run-ns".to_string()),
+            dry_run_headers,
+            status_body,
+        )
+        .await
+        .expect("dry-run put must succeed");
+        let resp_body = axum::body::to_bytes(resp.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Terminating",
+            "dry-run response must show the would-be status"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-put-dry-run-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["status"]["phase"], "Active",
+            "dryRun=All must not persist the status change (create_namespace defaults to Active)"
+        );
+    }
+
     // put_namespace_status routes the incoming status through NamespaceStatus instead of
     // copying the raw Value. That only pays off if NamespaceStatus's flattened `rest` field
     // actually preserves every status field the raw copy used to preserve verbatim — not just
@@ -4919,6 +5075,76 @@ mod tests {
         assert_eq!(
             body["metadata"]["name"], "status-patch-ns",
             "metadata must be unchanged after PATCH /status"
+        );
+    }
+
+    /// `PATCH /status?dryRun=All` must return the would-be patched status but leave the
+    /// stored namespace's status untouched. Before this fix, patch_namespace_status had no
+    /// dry-run check at all.
+    #[tokio::test]
+    async fn patch_namespace_status_dry_run_all_does_not_persist() {
+        let state = make_state();
+
+        assert!(create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            namespace_body("status-patch-dry-run-ns"),
+        )
+        .await
+        .is_ok());
+
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "status": {
+                    "conditions": [{
+                        "type": "NamespaceDeletionContentFailure",
+                        "status": "False"
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let resp = patch_namespace_status(
+            State(state.clone()),
+            Path("status-patch-dry-run-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await
+        .expect("dry-run patch must succeed");
+        let resp_body = axum::body::to_bytes(resp.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(
+            v["status"]["conditions"][0]["type"], "NamespaceDeletionContentFailure",
+            "dry-run response must show the would-be patched condition"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-patch-dry-run-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            stored_v["status"]["conditions"].is_null(),
+            "dryRun=All must not persist the condition"
         );
     }
 

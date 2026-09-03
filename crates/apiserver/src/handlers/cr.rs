@@ -2529,8 +2529,12 @@ pub async fn replace_cr<S: Store>(
     // replace_cr (PUT) did not, so the object sat forever with deletionTimestamp set and
     // no finalizers — never actually removed — and callers waiting for it to disappear
     // (e.g. the e2e client's WaitForGVRDeletion poll) timed out after 5 minutes.
+    // dryRun=All must not actually delete the object — checked here, before the store
+    // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
-        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
+        if !is_dry_run_header(&headers) {
+            complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
+        }
         return Ok(Json(obj));
     }
 
@@ -3520,8 +3524,12 @@ pub async fn replace_cr_namespaced<S: Store>(
     // deletionTimestamp set and no finalizers — never actually removed — and callers
     // waiting for it to disappear (e.g. the e2e client's WaitForNamespacedGVRDeletion
     // poll) timed out after 5 minutes.
+    // dryRun=All must not actually delete the object — checked here, before the store
+    // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
-        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
+        if !is_dry_run_header(&headers) {
+            complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
+        }
         return Ok(Json(obj));
     }
 
@@ -4000,8 +4008,12 @@ pub async fn patch_cr<S: Store>(
     // controller completes an Orphan-marked delete_cr: it strips ownerReferences from every
     // dependent CR, then removes the owner's `orphan` finalizer via PATCH. Complete the delete
     // instead of storing the update, or the CR stays stuck Terminating forever.
+    // dryRun=All must not actually delete the object — checked here, before the store
+    // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
-        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
+        if !is_dry_run_header(&headers) {
+            complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
+        }
         return Ok(Json(obj).into_response());
     }
 
@@ -4244,8 +4256,12 @@ pub async fn patch_cr_namespaced<S: Store>(
     // controller completes an Orphan-marked delete_cr_namespaced: it strips ownerReferences
     // from every dependent CR, then removes the owner's `orphan` finalizer via PATCH. Complete
     // the delete instead of storing the update, or the CR stays stuck Terminating forever.
+    // dryRun=All must not actually delete the object — checked here, before the store
+    // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
-        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
+        if !is_dry_run_header(&headers) {
+            complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
+        }
         return Ok(Json(obj).into_response());
     }
 
@@ -4373,6 +4389,12 @@ pub async fn put_cr_status<S: Store>(
     crate::handlers::status::replace_status_field(&mut current, &incoming["status"])?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current, &incoming, &kind);
+
+    // Dry-run: return the would-be status object without persisting — mirrors
+    // put_resource_status's dry-run early-return.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current));
+    }
 
     let incoming_meta: crate::types::ObjectMeta =
         serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();
@@ -4545,6 +4567,12 @@ pub async fn patch_cr_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     crate::handlers::status::reject_non_object_status(&current["status"])?;
+
+    // Dry-run: same convergence point as reject_non_object_status above — return the
+    // would-be patched status object without persisting.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current));
+    }
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
@@ -4723,10 +4751,24 @@ async fn cr_scale_put_impl<S: Store>(
 
     scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas as i64);
 
-    let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
     let old_rv = obj["metadata"]["resourceVersion"]
         .as_str()
         .map(str::to_string);
+
+    // Dry-run: spec.replicas was computed above; return the would-be Scale object without
+    // persisting — mirrors apps/v1's scale_put_impl in scale.rs.
+    if is_dry_run_header(headers) {
+        return Ok(Json(super::scale::build_scale(
+            target.name,
+            target.ns.unwrap_or(""),
+            new_replicas as i64,
+            status_replicas,
+            old_rv.as_deref().unwrap_or(""),
+            &selector,
+        )));
+    }
+
+    let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
@@ -4789,10 +4831,24 @@ async fn cr_scale_patch_impl<S: Store>(
         None => scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
     };
 
-    let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
     let old_rv = obj["metadata"]["resourceVersion"]
         .as_str()
         .map(str::to_string);
+
+    // Dry-run: spec.replicas was computed above; return the would-be Scale object without
+    // persisting — mirrors apps/v1's scale_patch_impl in scale.rs.
+    if is_dry_run_header(headers) {
+        return Ok(Json(super::scale::build_scale(
+            target.name,
+            target.ns.unwrap_or(""),
+            new_replicas,
+            status_replicas,
+            old_rv.as_deref().unwrap_or(""),
+            &selector,
+        )));
+    }
+
+    let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
@@ -11978,6 +12034,76 @@ mod tests {
         );
     }
 
+    /// `PATCH .../status?dryRun=All` must return the would-be patched status but leave the
+    /// stored CR's status untouched. Before this fix, patch_cr_status had no dry-run check.
+    #[tokio::test]
+    async fn patch_cr_status_dry_run_all_does_not_persist() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "patch-status-dry-run-widget".to_string();
+
+        create_cr(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), plural.clone())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body(&name),
+        )
+        .await
+        .expect("create must succeed");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let patch_body =
+            Bytes::from(serde_json::json!({ "status": { "readyToUse": true } }).to_string());
+
+        let resp = patch_cr_status(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+            headers,
+            patch_body,
+        )
+        .await
+        .expect("dry-run patch status must succeed")
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["status"]["readyToUse"], true,
+            "dry-run response must show the would-be patched status"
+        );
+
+        let reget = get_cr(
+            State(state),
+            Path((group, version, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .expect("get must succeed after dry-run");
+        let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
+        assert!(
+            v2["status"]["readyToUse"].is_null(),
+            "dryRun=All must not persist the status change"
+        );
+    }
+
     /// patch_cr_status with a merge-patch body `{"status":"x"}` must be rejected with 422,
     /// not persisted. This is the cluster-scoped catch-all status route (covers every
     /// non-core-group cluster-scoped built-in resource, e.g. CSINode, plus cluster-scoped
@@ -17622,6 +17748,74 @@ mod tests {
         );
     }
 
+    /// `PATCH ...?dryRun=All` draining the last finalizer must NOT hard-delete the CR.
+    ///
+    /// Regression test for an ordering bug: patch_cr's finalizer-drain-complete check used
+    /// to run BEFORE its own dry-run check, so a dry-run PATCH draining the last finalizer
+    /// actually deleted the object for real.
+    #[tokio::test]
+    async fn patch_cr_dry_run_all_draining_last_finalizer_does_not_hard_delete() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        let owner_key = cr_store_key(group, plural, None, "draining-owner-dry-run");
+        let owner = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "draining-owner-dry-run",
+                "uid": "drain-uid-dry-run",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["orphan"]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &owner_key,
+                Bytes::from(serde_json::to_vec(&owner).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed draining owner CR");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let patch = serde_json::json!({ "metadata": { "finalizers": [] } });
+        patch_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "draining-owner-dry-run".to_string(),
+            )),
+            test_user(),
+            headers,
+            Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dry-run finalizer-drain patch must succeed: {e:?}"));
+
+        assert!(
+            state.store.get(&owner_key).await.unwrap().is_some(),
+            "dryRun=All must not hard-delete the object even though the patch drains its last \
+             finalizer"
+        );
+    }
+
     /// A PUT (replace_cr) whose body has deletionTimestamp set and finalizers now empty is
     /// how a controller that removes its own protection finalizer via Update rather than
     /// Patch signals drain completion — e.g. external-snapshotter's snapshot-controller
@@ -17699,6 +17893,84 @@ mod tests {
             "object must be hard-deleted once its last finalizer drains via PUT — a \
              controller that uses Update rather than Patch to remove its own finalizer must \
              not leave the object stuck Terminating forever"
+        );
+    }
+
+    /// `PUT ...?dryRun=All` draining the last finalizer must NOT hard-delete the CR.
+    ///
+    /// Regression test for an ordering bug: replace_cr's finalizer-drain-complete check used
+    /// to run BEFORE its own dry-run check, so a dry-run PUT draining the last finalizer
+    /// actually deleted the object for real — the exact opposite of what dryRun=All promises.
+    #[tokio::test]
+    async fn replace_cr_dry_run_all_draining_last_finalizer_does_not_hard_delete() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        let key = cr_store_key(group, plural, None, "draining-widget-dry-run");
+        let widget = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "draining-widget-dry-run",
+                "uid": "drain-uid-put-dry-run",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["snapshot.storage.k8s.io/vsc-protection"]
+            },
+            "spec": { "color": "blue" }
+        });
+        state
+            .store
+            .put(
+                &key,
+                Bytes::from(serde_json::to_vec(&widget).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed draining widget CR");
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "draining-widget-dry-run",
+                    "deletionTimestamp": "2026-07-22T00:00:00Z",
+                    "finalizers": []
+                },
+                "spec": { "color": "blue" }
+            })
+            .to_string(),
+        );
+
+        let mut dry_run_headers = axum::http::HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        replace_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "draining-widget-dry-run".to_string(),
+            )),
+            test_user(),
+            dry_run_headers,
+            put_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dry-run finalizer-drain PUT must succeed: {e:?}"));
+
+        assert!(
+            state.store.get(&key).await.unwrap().is_some(),
+            "dryRun=All must not hard-delete the object even though the PUT drains its last \
+             finalizer"
         );
     }
 
@@ -18381,6 +18653,90 @@ mod tests {
             result.is_ok(),
             "absent resourceVersion in PUT /cr/status body must succeed (unconditional write) — \
              single-writer clients that omit rv must not be broken by the stale-RV CAS fix"
+        );
+    }
+
+    /// `PUT .../status?dryRun=All` must return the would-be status object but leave the
+    /// stored CR's status untouched. Before this fix, put_cr_status had no dry-run check.
+    #[tokio::test]
+    async fn put_cr_status_dry_run_all_does_not_persist() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "dry-run-widget" },
+                "spec": { "color": "red" }
+            })
+            .to_string(),
+        );
+        create_cr(
+            State(state.clone()),
+            Path(("example.io".into(), "v1".into(), "widgets".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            create_body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "dry-run-widget" },
+                "status": { "ready": true }
+            })
+            .to_string(),
+        );
+        let mut dry_run_headers = axum::http::HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let resp = put_cr_status(
+            State(state.clone()),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "widgets".into(),
+                "dry-run-widget".into(),
+            )),
+            dry_run_headers,
+            put_body,
+        )
+        .await
+        .expect("dry-run put status must succeed");
+        let body = axum::body::to_bytes(resp.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["status"]["ready"], true,
+            "dry-run response must show the would-be status"
+        );
+
+        let reget = get_cr(
+            State(state),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "widgets".into(),
+                "dry-run-widget".into(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .expect("get must succeed after dry-run");
+        let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
+        assert!(
+            v2["status"]["ready"].is_null(),
+            "dryRun=All must not persist the status change"
         );
     }
 
@@ -20699,6 +21055,94 @@ mod tests {
             "PUT /scale must write the new replica count at the CRD-declared \
              specReplicasPath (.spec.desiredReplicas) — an HPA scale-up that landed anywhere \
              else would never actually resize the workload"
+        );
+    }
+
+    /// `PUT /scale?dryRun=All` must return the would-be Scale object but leave the stored
+    /// CR's replica count untouched. Before this fix, cr_scale_put_impl (shared by
+    /// put_cr_scale and put_cr_namespaced_scale) had no dry-run check at all.
+    #[tokio::test]
+    async fn namespaced_cr_scale_put_dry_run_all_does_not_persist() {
+        let state = make_state();
+        install_namespaced_crd_with_scale_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let ns = "default".to_string();
+        let plural = "gizmos".to_string();
+        let name = "dry-run-gizmo".to_string();
+
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Gizmo",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "desiredReplicas": 2 }
+            })
+            .to_string(),
+        );
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            create_body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let scale_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "autoscaling/v1",
+                "kind": "Scale",
+                "spec": { "replicas": 7 }
+            })
+            .to_string(),
+        );
+
+        let mut dry_run_headers = axum::http::HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let resp = put_cr_namespaced_scale(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+            dry_run_headers,
+            scale_body,
+        )
+        .await
+        .expect("dry-run PUT /scale must succeed");
+        let body = axum::body::to_bytes(resp.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let scale: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            scale["spec"]["replicas"], 7,
+            "dry-run response must show the would-be replica count"
+        );
+
+        let resp = get_cr_namespaced(
+            State(state),
+            Path((group, version, ns, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .expect("get must succeed");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["spec"]["desiredReplicas"], 2,
+            "dryRun=All must not persist the new replica count"
         );
     }
 

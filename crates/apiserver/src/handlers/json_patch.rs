@@ -2027,4 +2027,225 @@ mod tests {
              write"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Completeness sweep: every write function must be dry-run aware
+    // -----------------------------------------------------------------------
+    //
+    // Round 3's "8/8 complete" close missed 7 more unguarded persisting write paths in
+    // pods.rs/namespaces.rs; round 4's own independent re-enumeration then found 15 MORE
+    // across crd.rs/cr.rs/pods.rs/resource.rs (CRD status, cluster-scoped CR status, CRD-scale
+    // PUT/PATCH, pod status PUT/PATCH, a Service clusterIP-allocator side-effect leak, and a
+    // finalizer-drain hard-delete that ran before its own function's dry-run check in 6 call
+    // sites) — per-handler whack-a-mole was not converging. This sweep is the backstop: it
+    // fails on ANY future handler that persists a write with no dry-run reference anywhere in
+    // its own body, so a missed guard is a compile-time-adjacent test failure, not a round 5.
+    //
+    // It cannot catch the "ordering" half of round 4's findings (a dry-run check present but
+    // positioned AFTER a different store-write call in the same function, e.g. a
+    // finalizer-drain hard-delete) — that requires per-call-site reasoning a text sweep can't
+    // generalize. Those 6 sites were fixed by inspection this round; the fix is a `dry_run`
+    // reference right at that specific call site, which this sweep does verify stays in place.
+
+    /// Every `Store` (or store-backed allocator) method whose call persists or removes data.
+    /// `create_if_namespace_active` and `allocate_service_ip` wrap `put` internally — listed
+    /// separately since a caller persisting solely through one of them has no literal `.put(`
+    /// substring in its own body and would otherwise be silently skipped.
+    fn calls_a_persisting_entry_point(body: &str) -> bool {
+        const ENTRY_POINTS: &[&str] = &[
+            ".put(",
+            ".delete(",
+            ".create_if_namespace_active(",
+            ".delete_namespace_resources(",
+            ".allocate_service_ip(",
+        ];
+        ENTRY_POINTS.iter().any(|e| body.contains(e))
+    }
+
+    /// True when `body` references dry-run status anywhere — `is_dry_run_header(`, the typed
+    /// `*Query::is_dry_run()`/`DeleteOptions::is_dry_run()` helpers, or a `dry_run` bool
+    /// (parameter, local binding, or struct field) threaded in from a caller that already
+    /// computed it (e.g. `do_patch`'s `cfg.dry_run`, `cr_scale_put_impl`'s `headers` param).
+    /// Deliberately permissive (substring only, not "is it checked before the write") — this
+    /// sweep's job is to catch a write function with NO dry-run awareness at all, the round-3
+    /// and round-4 Category-A bug shape; ordering bugs are called out in the doc comment above.
+    fn references_dry_run(body: &str) -> bool {
+        body.contains("is_dry_run") || body.contains("dry_run")
+    }
+
+    /// Extracts `(fn_name, body)` for every top-level function definition in `source`,
+    /// regardless of visibility or async-ness. Anchoring the `fn` keyword's line at column 0
+    /// (mirrors status.rs's `handler_bodies_matching`) keeps indented `#[test] fn ...` bodies
+    /// inside `mod tests` from ever being mistaken for a production function.
+    fn all_top_level_fn_bodies(source: &str) -> Vec<(String, String)> {
+        const PREFIXES: &[&str] = &[
+            "pub async fn ",
+            "pub fn ",
+            "pub(crate) async fn ",
+            "pub(crate) fn ",
+            "async fn ",
+            "fn ",
+        ];
+        let mut results = Vec::new();
+        let lines: Vec<&str> = source.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if let Some(name) = PREFIXES
+                .iter()
+                .find(|p| line.starts_with(**p))
+                .and_then(|_| line.find("fn "))
+                .map(|fn_idx| {
+                    let after = &line[fn_idx + 3..];
+                    let end = after
+                        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(after.len());
+                    after[..end].to_string()
+                })
+            {
+                let mut depth = 0i32;
+                let mut started = false;
+                let mut body = String::new();
+                let mut j = i;
+                while j < lines.len() {
+                    let l = lines[j];
+                    for ch in l.chars() {
+                        if ch == '{' {
+                            depth += 1;
+                            started = true;
+                        } else if ch == '}' {
+                            depth -= 1;
+                        }
+                    }
+                    body.push_str(l);
+                    body.push('\n');
+                    j += 1;
+                    if started && depth <= 0 {
+                        break;
+                    }
+                }
+                results.push((name, body));
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+        results
+    }
+
+    /// Functions that persist through a Store entry point but structurally cannot check
+    /// dry-run themselves — none takes `headers`, a dry-run-capable `Query<...>`, or a
+    /// `dry_run` bool from its caller. Every one is an internal cascade/cleanup helper;
+    /// tracing each call site confirmed every call is reached only downstream of the
+    /// CALLER's own dry-run early-return, which is what actually prevents the persist.
+    /// Adding a function here without also verifying that is reintroducing exactly the bug
+    /// class this sweep exists to catch.
+    const SAFE_NO_DRY_RUN_SIGNAL: &[&str] = &[
+        "complete_finalizer_drain",
+        "complete_cr_finalizer_drain",
+        "maybe_finalize_terminating_namespace",
+        "cascade_delete_namespace_resources",
+        "stamp_terminating_and_recheck_completion",
+        "cascade_delete_cr_dependents",
+        "delete_namespace_scoped_crds",
+        "delete_pods_owned_by",
+        "delete_replicasets_owned_by",
+        "delete_jobs_owned_by",
+        "remove_job_tracking_finalizer_from_pods",
+        "strip_or_delete_dependent",
+        "update_quota_status",
+        "write_vap_status",
+        "write_flowcontrol_status",
+        "release_service_ip",
+        "allocate_service_ip",
+        "propagate_rs_revision_to_deployment",
+        // Background APIService health-probe reconciler (reconcile_apiservice_availability /
+        // ensure_availability_checked) — runs off a timer / a GET's side effect, never as part
+        // of any client write request, so no dryRun=All ever reaches it to check.
+        "check_and_persist_availability",
+    ];
+
+    #[test]
+    fn every_write_function_references_dry_run_or_is_an_audited_safe_helper() {
+        let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
+        let mut checked = Vec::new();
+        let mut unguarded = Vec::new();
+
+        for entry in std::fs::read_dir(&handlers_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", handlers_dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for (name, body) in all_top_level_fn_bodies(&source) {
+                if !calls_a_persisting_entry_point(&body) {
+                    continue;
+                }
+                checked.push(name.clone());
+                if SAFE_NO_DRY_RUN_SIGNAL.contains(&name.as_str()) {
+                    continue;
+                }
+                if !references_dry_run(&body) {
+                    unguarded.push(format!("{name} in {}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            checked.len() >= 40,
+            "sanity check: expected at least 40 persisting functions across the apiserver \
+             handlers (create/replace/patch/delete for pods, namespaces, CRDs, CRs, generic \
+             resources, status/scale/approval subresources, plus their internal cascade \
+             helpers) — found {}. Did the Store write-entry-point substrings, or the file \
+             layout, change enough that this sweep now passes vacuously?",
+            checked.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "write function(s) persist via a Store entry point with no dry-run reference \
+             anywhere in their own body: {unguarded:?} — either thread the request's dry-run \
+             status in and add an early-return before the store write (mirror \
+             put_resource_status in status.rs), or, if this is a purely internal helper that \
+             genuinely cannot see the request's dry-run status, add it to \
+             SAFE_NO_DRY_RUN_SIGNAL ONLY after confirming every call site is unreachable under \
+             dryRun=All (i.e. the caller already returned)."
+        );
+    }
+
+    /// Fails on revert: broadening `calls_a_persisting_entry_point` back to only `.put(`/
+    /// `.delete(` would silently exempt `maybe_allocate_cluster_ip` (resource.rs), whose only
+    /// persisting call is `state.allocate_service_ip(...)` — the exact round-4 finding where a
+    /// Service create/replace's clusterIP-sentinel reservation leaked under dryRun=All even
+    /// though the Service object itself was correctly never persisted.
+    #[test]
+    fn calls_a_persisting_entry_point_catches_allocate_service_ip_only_functions() {
+        assert!(calls_a_persisting_entry_point(
+            "state.store.put(&key, bytes, None).await"
+        ));
+        assert!(calls_a_persisting_entry_point(
+            "state.allocate_service_ip(is_kubernetes_service).await?"
+        ));
+        assert!(!calls_a_persisting_entry_point(
+            "state.store.get(&key).await"
+        ));
+    }
+
+    /// Fails on revert: narrowing `references_dry_run` to require the exact call
+    /// `is_dry_run_header(` would miss every site that threads a pre-computed `dry_run: bool`
+    /// through instead (e.g. `do_patch`'s `cfg.dry_run`, `cr_scale_put_impl`'s `is_dry_run_header
+    /// (headers)` behind a `&HeaderMap` param) — this sweep must accept both shapes since both
+    /// are used throughout the codebase for the same guarantee.
+    #[test]
+    fn references_dry_run_accepts_both_header_check_and_threaded_bool_shapes() {
+        assert!(references_dry_run(
+            "if is_dry_run_header(&headers) { return Ok(x); }"
+        ));
+        assert!(references_dry_run("if dry_run { return Ok(x); }"));
+        assert!(references_dry_run("dry_run: bool,"));
+        assert!(!references_dry_run("state.store.put(&key, v, r).await"));
+    }
 }
