@@ -10,10 +10,10 @@ All 3 failures are genuine u7s gaps, not flakes. Only one (#1) has a watchdog-re
 
 | # | Test | Root cause | Genuine / reap | Severity | Fix-bead |
 |---|------|------------|-----------------|----------|----------|
-| 1 | AnyVolumeDataSource provisioning | `hello-populator` Deployment's ReplicaSet never gets a Pod created | Genuine (reap only shaped the error message) | HIGH | mayor-2c3wa |
-| 2 | RWOP preemption | scheduler has zero ReadWriteOncePod volume-exclusivity awareness | Genuine | HIGH | mayor-nqm4v |
-| 3 | volumeLimits | scheduler has zero CSI per-node attach-count-limit awareness | Genuine | HIGH | mayor-e7cwn |
-| — | (infra) watchdog namespace-reap threshold | 600s reap threshold < some Serial CSI tests' own 900s budget | Infra, not product code | LOW | mayor-yvby5 |
+| 1 | AnyVolumeDataSource provisioning | `hello-populator` Deployment's ReplicaSet never gets a Pod created | Genuine (reap only shaped the error message) | HIGH | mayor-6dj51.1 |
+| 2 | RWOP preemption | scheduler has zero ReadWriteOncePod volume-exclusivity awareness | Genuine | HIGH | mayor-6dj51.2 |
+| 3 | volumeLimits | scheduler has zero CSI per-node attach-count-limit awareness | Genuine | HIGH | mayor-6dj51.3 |
+| — | (infra) watchdog namespace-reap threshold | 600s reap threshold < some Serial CSI tests' own 900s budget | Infra, not product code | LOW | mayor-6dj51.4 |
 
 ## Failure 1 — AnyVolumeDataSource provisioning
 
@@ -25,9 +25,9 @@ The test provisions `pvc-bc2ec` via `dataSourceRef` to a custom `Hello` CR (`hel
 
 Consequently `pvc-bc2ec` never got provisioned (`kubelet.log:27849` onward: `error processing PVC provisioning-4898/pvc-bc2ec: PVC is not bound`, repeating every ~13s until the namespace died), and `hostpath-client` stayed stuck in `ContainerCreating` for its entire lifetime. The in-tree PV controller's `persistent-volume-binder` behavior (`kcm.log:5521` then the recurring `PATCH .../events/pvc-bc2ec...` every 15s from `10:55:45` to `10:59:45`) is textbook "waiting for external provisioner" — expected once ownership is handed to the CSI sidecar, not itself a bug.
 
-Separately: the operator's watchdog force-deleted `provisioning-4898` and its 3 sibling namespaces at `2026-09-03T11:06:01Z` — `terminal.log:212-223`: `[watchdog] force-deleting namespace 'provisioning-4898' (Active for 628s (>= 10m threshold))`. That is *why* the failure message reads "Namespace ... not found" instead of a plain timeout — the reap fired mid-poll, 272s before the test's own 900s budget would have expired. **The reap is cosmetic here**: with the populator pod never created, the test was already doomed to fail on its own clock; the watchdog only changed the error text, not the outcome. Filed the reap-threshold mismatch as its own LOW-severity infra bead (mayor-yvby5) rather than conflating it with the genuine bug.
+Separately: the operator's watchdog force-deleted `provisioning-4898` and its 3 sibling namespaces at `2026-09-03T11:06:01Z` — `terminal.log:212-223`: `[watchdog] force-deleting namespace 'provisioning-4898' (Active for 628s (>= 10m threshold))`. That is *why* the failure message reads "Namespace ... not found" instead of a plain timeout — the reap fired mid-poll, 272s before the test's own 900s budget would have expired. **The reap is cosmetic here**: with the populator pod never created, the test was already doomed to fail on its own clock; the watchdog only changed the error text, not the outcome. Filed the reap-threshold mismatch as its own LOW-severity infra bead (mayor-6dj51.4) rather than conflating it with the genuine bug.
 
-Root cause of the missing Pod is not pinned to an exact line — reproducing live (VM) is needed to confirm whether it's a stale informer read in the pod-count reconcile, a lost watch event, or something u7s-side in `crates/apiserver/src/handlers/defaults.rs`'s `default_deployment`/`default_replicaset` (`crates/apiserver/src/handlers/defaults.rs:1244-1284`, `:1071-1084`) failing to persist `replicas: 1` under this specific request shape. Filed as mayor-2c3wa with the full evidence trail above.
+Root cause of the missing Pod is not pinned to an exact line — reproducing live (VM) is needed to confirm whether it's a stale informer read in the pod-count reconcile, a lost watch event, or something u7s-side in `crates/apiserver/src/handlers/defaults.rs`'s `default_deployment`/`default_replicaset` (`crates/apiserver/src/handlers/defaults.rs:1244-1284`, `:1071-1084`) failing to persist `replicas: 1` under this specific request shape. Filed as mayor-6dj51.1 with the full evidence trail above.
 
 ## Failure 2 — RWOP preemption
 
@@ -56,7 +56,7 @@ Upstream mechanics: the test fills a node to its CSI driver's advertised attach 
 
 ## Fix-beads filed
 
-- mayor-2c3wa (HIGH): AnyVolumeDataSource populator Deployment/ReplicaSet never gets a Pod created — needs live-cluster repro to pin exact code path.
-- mayor-nqm4v (HIGH): scheduler missing ReadWriteOncePod volume-exclusivity filter + preemption support.
-- mayor-e7cwn (HIGH): scheduler missing CSI per-node attach-count-limit filter (CSINode.allocatable).
-- mayor-yvby5 (LOW): watchdog namespace-reap threshold (600s) shorter than some Serial CSI tests' own budget (900s) — causes misleading "Namespace not found" failure text on tests that are already going to time out on their own, and could false-positive-reap tests that are still making genuine progress.
+- mayor-6dj51.1 (HIGH): AnyVolumeDataSource populator Deployment/ReplicaSet never gets a Pod created — needs live-cluster repro to pin exact code path.
+- mayor-6dj51.2 (HIGH): scheduler missing ReadWriteOncePod volume-exclusivity filter + preemption support.
+- mayor-6dj51.3 (HIGH): scheduler missing CSI per-node attach-count-limit filter (CSINode.allocatable).
+- mayor-6dj51.4 (LOW): watchdog namespace-reap threshold (600s) shorter than some Serial CSI tests' own budget (900s) — causes misleading "Namespace not found" failure text on tests that are already going to time out on their own, and could false-positive-reap tests that are still making genuine progress.
