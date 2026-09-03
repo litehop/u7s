@@ -107,8 +107,16 @@ jobs:
         with:
           workspaces: crates/servicelb
 
-      - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+      # `cargo install bpf-linker` needs a matching system LLVM (llvm-config
+      # on PATH) and isn't recommended for regular installs (bpf-linker's
+      # own build.rs warns as much) -- ubuntu-latest has no LLVM installed
+      # by default, so that failed outright. taiki-e/install-action fetches
+      # aya-rs/bpf-linker's prebuilt, hash-verified release binary instead.
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: bpf-linker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # `cargo fmt`/`clippy --manifest-path` silently no-op on a nested
       # workspace when invoked from the outer u7s workspace's directory
