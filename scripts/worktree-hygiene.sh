@@ -309,12 +309,15 @@ step_d_gone_upstream_branches() {
 # ---------------------------------------------------------------------------
 
 # Bead ID from a findings file's `Bead: <id>` header (first 5 lines), or
-# empty if absent. Mirrors check-findings-closed-bead-refs.sh's own
-# extraction exactly so this step flags the same files that gate would.
+# empty if absent. Extracts only the leading bead-ID token, stopping before
+# any trailing descriptive text (e.g. a parenthetical naming related beads)
+# -- the old whitespace-stripped whole-line slurp mangled such a header into
+# a compound string that would never match any live bd record, making this
+# step warn to delete a finding that's actually still open.
 bead_id_from_finding() {
   local f="$1" bead_line
   bead_line=$(head -n 5 "$f" | grep -m1 -E '^Bead: ' || true)
-  printf '%s' "$bead_line" | sed -E 's/^Bead: *//' | tr -d '[:space:]'
+  printf '%s' "$bead_line" | grep -oE 'mayor-[a-z0-9.]+' | head -1
 }
 
 # True (exit 0) iff a bead in the given live-bd status is stale enough to
