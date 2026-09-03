@@ -1675,7 +1675,7 @@ pub(crate) async fn evict_pod<S: Store>(
             state.node_graph.remove_pod(ns.as_str(), &name);
         }
     } else if !already_terminating {
-        check_pdb_allows_eviction(&state, ns.as_str(), &obj.body).await?;
+        check_pdb_allows_eviction(&state, ns.as_str(), &obj.body, dry_run).await?;
 
         // Dry-run: validation passed and this is what a real eviction would soft-delete to
         // (deletionTimestamp stamped); return without persisting.
@@ -1700,20 +1700,72 @@ pub(crate) async fn evict_pod<S: Store>(
     Ok((StatusCode::CREATED, Json(eviction)))
 }
 
+/// Bounded retry count for the verify-and-decrement CAS loop below. Upstream's
+/// `EvictionsRetry` (pkg/registry/core/pod/storage/eviction.go) spaces 20 attempts with a
+/// 500ms backoff because it races other API servers over etcd; our store is in-process, so a
+/// resourceVersion conflict resolves on the very next read with no network round-trip, and a
+/// small bound is enough to serialize any realistic number of concurrent evictions.
+const MAX_PDB_DECREMENT_ATTEMPTS: u32 = 10;
+
+/// Verify a PodDisruptionBudget still has a disruption to give and, if so, return its body
+/// with `status.disruptionsAllowed` decremented by one.
+///
+/// Split out as a pure function (mirroring upstream's `checkAndDecrement`) so the core
+/// admission rule — reject once the budget is exhausted, otherwise spend one — can be unit
+/// tested without a store or a live CAS retry loop.
+///
+/// Also stamps `status.disruptedPods[podName]`, exactly as upstream's `checkAndDecrement`
+/// does. This is not optional bookkeeping: KCM's real DisruptionController recomputes
+/// `disruptionsAllowed` from scratch on every reconcile (`currentHealthy - desiredHealthy`,
+/// see `pkg/controller/disruption/disruption.go`'s `countHealthyPods`) and only excludes a
+/// pod from `currentHealthy` if it is either already carrying `deletionTimestamp` in the
+/// controller's informer cache, or listed in `disruptedPods`. A decrement that skips
+/// `disruptedPods` gets silently overwritten back up the moment the controller's cache
+/// resyncs before it observes the evicted pod's `deletionTimestamp` — reproduced live: a
+/// second sequential eviction in the same PDB budget succeeded because the first eviction's
+/// decrement to 0 had already been reconciled back to 1.
+fn decrement_pdb_disruptions_allowed(
+    pdb: &serde_json::Value,
+    pod_name: &str,
+    now_rfc3339: &str,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    let disruptions_allowed = pdb["status"]["disruptionsAllowed"].as_i64().unwrap_or(0);
+    if disruptions_allowed <= 0 {
+        let message =
+            "Cannot evict pod as it would violate the pod's disruption budget.".to_string();
+        return Err(Status::too_many_requests_with_cause(
+            message.clone(),
+            "DisruptionBudget",
+            message,
+        ));
+    }
+    let mut updated = pdb.clone();
+    updated["status"]["disruptionsAllowed"] = serde_json::Value::from(disruptions_allowed - 1);
+    updated["status"]["disruptedPods"][pod_name] =
+        serde_json::Value::String(now_rfc3339.to_string());
+    Ok(updated)
+}
+
 /// Reject the eviction with 429 if the pod is covered by a PodDisruptionBudget that has no
-/// disruptions left to give.
+/// disruptions left to give; otherwise atomically spend one.
 ///
 /// PDBs are the primary safety mechanism against voluntary disruption (drain, descheduler,
 /// cluster-autoscaler): a Deployment/StatefulSet relies on `disruptionsAllowed` staying above
 /// zero to guarantee availability during rolling changes. u7s does not compute
-/// `disruptionsAllowed` itself — KCM's DisruptionController owns that reconciliation and
-/// writes it to `status.disruptionsAllowed` — this function only enforces what's already there.
-/// Without this check, `kubectl drain` and the descheduler can evict every pod backing a
-/// service simultaneously, taking it fully down.
+/// `disruptionsAllowed` itself — KCM's DisruptionController owns that reconciliation — but
+/// relying solely on the controller's periodic resync to catch up after every eviction leaves
+/// a window where two evictions issued close together both observe a stale
+/// `disruptionsAllowed > 0` and both succeed, exceeding the budget. Matching upstream's
+/// eviction REST path, this function verifies and decrements `status.disruptionsAllowed`
+/// inside the eviction request itself, via a resourceVersion-guarded compare-and-swap that
+/// retries past a losing race instead of trusting the value it just read. Without this check,
+/// `kubectl drain` and the descheduler can evict every pod backing a service simultaneously,
+/// taking it fully down.
 async fn check_pdb_allows_eviction<S: Store>(
     state: &AppState<S>,
     ns: &str,
     pod: &serde_json::Value,
+    dry_run: bool,
 ) -> Result<(), crate::status::StatusError> {
     let pod_labels: std::collections::BTreeMap<String, String> = pod["metadata"]["labels"]
         .as_object()
@@ -1736,10 +1788,14 @@ async fn check_pdb_allows_eviction<S: Store>(
         }
     };
 
-    let matching: Vec<serde_json::Value> = items
+    let matching: Vec<(String, serde_json::Value)> = items
         .into_iter()
-        .filter_map(|item| serde_json::from_slice::<serde_json::Value>(&item.value).ok())
-        .filter(|pdb| {
+        .filter_map(|item| {
+            serde_json::from_slice::<serde_json::Value>(&item.value)
+                .ok()
+                .map(|pdb| (item.key, pdb))
+        })
+        .filter(|(_, pdb)| {
             // Upstream semantics: "A null selector will match no pods, while an empty ({})
             // selector will select all pods within the namespace." `label_selector_matches`
             // treats `None` as match-all, so a null/missing selector must be special-cased
@@ -1760,38 +1816,72 @@ async fn check_pdb_allows_eviction<S: Store>(
         ));
     }
 
-    if let Some(pdb) = matching.first() {
-        // Upstream (pkg/registry/core/pod/storage/eviction.go): a healthy (Ready) pod is
-        // always subject to the budget. An unhealthy pod bypasses `disruptionsAllowed`
-        // under AlwaysAllow, or under the default/IfHealthyBudget policy when the budget
-        // is already met — evicting a pod that isn't serving traffic doesn't disrupt the
-        // application further, so operators shouldn't be blocked from clearing it out.
-        if !is_pod_ready(pod) {
-            let always_allow =
-                pdb["spec"]["unhealthyPodEvictionPolicy"].as_str() == Some("AlwaysAllow");
-            if always_allow {
-                return Ok(());
-            }
-            let current_healthy = pdb["status"]["currentHealthy"].as_i64().unwrap_or(0);
-            let desired_healthy = pdb["status"]["desiredHealthy"].as_i64().unwrap_or(0);
-            if desired_healthy > 0 && current_healthy >= desired_healthy {
-                return Ok(());
-            }
-        }
+    let Some((pdb_key, mut pdb)) = matching.into_iter().next() else {
+        return Ok(());
+    };
 
-        let disruptions_allowed = pdb["status"]["disruptionsAllowed"].as_i64().unwrap_or(0);
-        if disruptions_allowed <= 0 {
-            let message =
-                "Cannot evict pod as it would violate the pod's disruption budget.".to_string();
-            return Err(Status::too_many_requests_with_cause(
-                message.clone(),
-                "DisruptionBudget",
-                message,
-            ));
+    // Upstream (pkg/registry/core/pod/storage/eviction.go): a healthy (Ready) pod is
+    // always subject to the budget. An unhealthy pod bypasses `disruptionsAllowed`
+    // under AlwaysAllow, or under the default/IfHealthyBudget policy when the budget
+    // is already met — evicting a pod that isn't serving traffic doesn't disrupt the
+    // application further, so operators shouldn't be blocked from clearing it out. This
+    // bypass is evaluated once, before the CAS loop, exactly as upstream does: unhealthy-pod
+    // eviction never spends a disruption, so there is nothing to retry.
+    if !is_pod_ready(pod) {
+        let always_allow =
+            pdb["spec"]["unhealthyPodEvictionPolicy"].as_str() == Some("AlwaysAllow");
+        if always_allow {
+            return Ok(());
+        }
+        let current_healthy = pdb["status"]["currentHealthy"].as_i64().unwrap_or(0);
+        let desired_healthy = pdb["status"]["desiredHealthy"].as_i64().unwrap_or(0);
+        if desired_healthy > 0 && current_healthy >= desired_healthy {
+            return Ok(());
         }
     }
 
-    Ok(())
+    let pod_name = pod["metadata"]["name"].as_str().unwrap_or_default();
+    let now_rfc3339 = utc_now_rfc3339();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let updated = decrement_pdb_disruptions_allowed(&pdb, pod_name, &now_rfc3339)?;
+
+        // A dry-run eviction must validate that a disruption is available without actually
+        // spending it — matching evict_pod's own dry-run contract of never mutating the store.
+        if dry_run {
+            return Ok(());
+        }
+
+        let expected_rv = parse_resource_version(pdb["metadata"]["resourceVersion"].as_str())?;
+        match state
+            .store
+            .put(
+                &pdb_key,
+                Bytes::from(serde_json::to_vec(&updated).unwrap()),
+                expected_rv,
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(StoreError::RevisionMismatch { .. }) if attempt < MAX_PDB_DECREMENT_ATTEMPTS => {
+                // Lost the race to another concurrent eviction's decrement — re-read the
+                // latest PDB state and retry the verify-and-decrement against it, exactly as
+                // upstream's `retry.RetryOnConflict` does.
+                pdb = match state.store.get(&pdb_key).await {
+                    Ok(Some(stored)) => serde_json::from_slice(&stored.value).unwrap_or(pdb),
+                    _ => pdb,
+                };
+            }
+            Err(StoreError::RevisionMismatch { .. }) => {
+                return Err(Status::conflict(format!(
+                    "couldn't update PodDisruptionBudget {:?} due to repeated write conflicts",
+                    pdb["metadata"]["name"].as_str().unwrap_or_default()
+                )));
+            }
+            Err(e) => return Err(Status::internal(e.to_string())),
+        }
+    }
 }
 
 /// A pod is healthy for PDB eviction purposes iff it has a `Ready` condition with
@@ -13192,6 +13282,122 @@ mod handler_tests {
             StatusCode::TOO_MANY_REQUESTS,
             "IfHealthyBudget must still block an unready pod while the budget is below its \
              desired healthy count — the exemption is conditional, not unconditional"
+        );
+    }
+
+    /// Two evictions issued concurrently against a PDB with `disruptionsAllowed: 1` must not
+    /// both succeed — that is exactly the over-eviction a PDB exists to prevent (e.g. a
+    /// StatefulSet's last two Ready replicas both getting drained at once because each request
+    /// read the same stale `disruptionsAllowed` before either write landed). This test fails
+    /// on revert: a read-only check (no CAS decrement) lets every concurrent evictor observe
+    /// `disruptionsAllowed: 1` and all of them succeed instead of just one, reproduced 2/2 in
+    /// the `[sig-apps] DisruptionController` conformance run this fixes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evict_pod_concurrent_evictions_never_exceed_disruptions_allowed() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        for name in ["web-0", "web-1", "web-2"] {
+            seed_pod(
+                &store,
+                "default",
+                name,
+                serde_json::json!({
+                    "metadata": {"name": name, "namespace": "default", "resourceVersion": "1", "labels": {"app": "web"}},
+                    "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+                }),
+            )
+            .await;
+        }
+
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default" },
+            "spec": { "selector": { "matchLabels": { "app": "web" } }, "maxUnavailable": 1 },
+            "status": { "disruptionsAllowed": 1, "currentHealthy": 3, "desiredHealthy": 2 }
+        });
+        store
+            .put(
+                "/registry/policy/poddisruptionbudgets/default/web-pdb",
+                Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let headers = {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            h
+        };
+        let make_body = |name: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "policy/v1",
+                    "kind": "Eviction",
+                    "metadata": { "name": name, "namespace": "default" }
+                })
+                .to_string(),
+            )
+        };
+
+        // Three concurrent evictions against a budget with only 1 disruption to give.
+        let (r1, r2, r3) = tokio::join!(
+            evict_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(), "web-0".to_string())),
+                auth_layer(),
+                headers.clone(),
+                make_body("web-0"),
+            ),
+            evict_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(), "web-1".to_string())),
+                auth_layer(),
+                headers.clone(),
+                make_body("web-1"),
+            ),
+            evict_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(), "web-2".to_string())),
+                auth_layer(),
+                headers.clone(),
+                make_body("web-2"),
+            ),
+        );
+
+        let statuses: Vec<StatusCode> = [r1, r2, r3]
+            .into_iter()
+            .map(|r| match r {
+                Ok(resp) => resp.into_response().status(),
+                Err(status_err) => status_err.0,
+            })
+            .collect();
+
+        let created = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CREATED)
+            .count();
+        let too_many = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+            .count();
+
+        assert_eq!(
+            created, 1,
+            "exactly 1 of 3 concurrent evictions must succeed against disruptionsAllowed:1 — \
+             without an atomic verify-and-decrement, every request reads the same stale \
+             disruptionsAllowed and all of them succeed, evicting more pods than the budget \
+             permits and breaking the availability guarantee the PDB exists to provide"
+        );
+        assert_eq!(
+            too_many, 2,
+            "the 2 losing evictions must see 429 Too Many Requests, not succeed or 500 — \
+             kubectl drain and the descheduler rely on 429 to know to retry once the budget \
+             recovers"
         );
     }
 
