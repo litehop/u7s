@@ -28,22 +28,24 @@ stands unchanged.
    `validation.go:7033-7045`, verified against `release-1.36` — see
    addendum). The prior recommendation — reject this at admission — would
    have made u7s non-conformant. Corrected recommendation: **accept the
-   overlap.** The Pod's raw reply never carries the VIP (it was DNAT'd
-   away before the Pod ever saw it) — that fact from the original brief is
-   unchanged. The fix does not put the VIP *in* the reply; the backend
-   captures it once, off the still-untouched forward-leg inner
-   destination (step 4, before it rewrites anything), holds it in
-   per-flow state, and on return keys that state off the reply's own
-   natural reverse tuple `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
-   — which the raw reply *does* carry — to echo the VIP forward to the
-   ingress node (step 6). Per decision 2, un-DNAT is performed at the
-   **ingress** node, not the backend — gjbov is not Cilium-style DSR,
-   where the backend sources its own reply directly to the client. The
-   "fold VIP into the backend key" idea in the mechanism doc still doesn't
-   work (the reply has nothing to key a *wider* lookup by), but the fix
-   was never in the lookup — it's upstream of it, in what gets captured at
-   write time and reapplied by the node decision 2 already designates.
-   Gates Phase 3 (`mayor-pa0ze`) as intended.
+   overlap; keep the map's key/value split as already designed.** The
+   backend's reverse-flow key, `(CLIENT_IP, SRC_PORT, PodIP, TargetPort,
+   proto)`, already contains no VIP — it's symmetric, buildable from
+   either the forward packet or the reply's own reverse tuple — and the
+   VIP is the stored *value* under it, captured once at write time (step
+   4, off the still-untouched forward-leg inner destination, before any
+   rewrite). The Pod's raw reply never carries the VIP (unchanged from the
+   original brief); on return the backend rebuilds the same key from the
+   reply's own tuple, reads the VIP back out of the *value*, and stamps it
+   into the **outer** Geneve header for the hop to the ingress node (step
+   6) — the VIP re-enters the wire from stored state, never from the Pod.
+   Per decision 2, un-DNAT itself happens at the **ingress** node, not the
+   backend — gjbov is not Cilium-style DSR. The doc's own proposed
+   variant — folding the VIP *into* the key — is what's rejected: a
+   VIP-bearing key can't be rebuilt from a reply that carries no VIP. Left
+   **open** (Rule 12, not asserted either way): whether the existing
+   VIP-less key can actually collide under multi-LB-same-Pod at all — see
+   addendum. Gates Phase 3 (`mayor-pa0ze`) as intended.
 
 Decision 3 is genuinely locked into Phase 3's scope as framed. Decision 2
 needs settling before Phase 2 starts, not before Phase 3 closes. Decision
@@ -183,77 +185,99 @@ backend Pod at the same targetPort? Two LB Services (different VIPs)
 routing to the same Pod:TargetPort, hit by a client that reuses one
 ephemeral src port for both, produce an identical backend key.
 
-**Why the doc's own proposed fix doesn't hold up.** The suggested fix
-(`ebpf-lb-dataplane.md:148-149`, restated in `bd show mayor-pa0ze`)
-is "fold the captured VIP into the backend key too." But the raw pod
-reply the backend intercepts at step 6 carries only `(PodIP, TargetPort,
-CLIENT_IP, SRC_PORT)` — the VIP is never present in that packet
+**Key vs. value — the distinction the original framing blurred.** The
+backend's reverse-flow key, `(CLIENT_IP, SRC_PORT, PodIP, TargetPort,
+proto)`, already contains no VIP. It's symmetric: the forward packet
+carries `src=CLIENT_IP:SRC_PORT, dst=PodIP:TargetPort` and the reply
+carries the same pair swapped, so the identical key is buildable from
+either direction without ever touching the VIP. The VIP is the *value*
+stored under that key, captured once at write time (step 4, off the
+still-untouched forward-leg inner destination, before any rewrite) — this
+is the same key/value split kube-proxy's own conntrack-based un-DNAT
+relies on. On return, the backend rebuilds the key from the reply's own
+tuple, reads the VIP back out of the value, and stamps it into the
+**outer** Geneve header for the hop to the ingress node (step 6): the VIP
+re-enters the wire from stored state, never from the Pod, whose raw reply
+carries no VIP either way. Per decision 2, actual un-DNAT happens at the
+**ingress** node using that value once echoed (step 6-7) — not at the
+backend; gjbov is not Cilium-style DSR, where the backend sources its own
+reply directly to the client.
+
+**Why the doc's own proposed variant doesn't hold up.** The mechanism
+doc's open question (`ebpf-lb-dataplane.md:148-149`, restated in `bd show
+mayor-pa0ze`) proposes folding the VIP *into* the key too. That's the one
+part of this design that's a genuine dead end: a VIP-bearing key can't be
+rebuilt from a reply that carries no VIP at all
 (`ebpf-lb-dataplane.md:54-56`: "same pair, read in reverse — nothing
-rewrote either side here"). A wider *write* key doesn't help a *lookup*
-that has nothing to key by; it only stops one connection's stored VIP
-from silently overwriting another's in a shared map slot, it does not let
-step 6 pick the right one. This is a map-design dead end, not a fix — worth
+rewrote either side here"). Widening the *write* key doesn't help the
+*read* side; it only stops one connection's value from silently
+overwriting another's in a shared slot, which presupposes the collision
+this brief has not established is real (see open item below). Worth
 flagging so Phase 3 doesn't spend effort implementing it before hitting
 this wall itself.
 
-**A second, separate observation on severity.** For TCP, two connections
-cannot both stay alive at the destination Pod on one literal 4-tuple —
-the Pod's own kernel TCP stack, not the LB, already collapses/rejects a
-second SYN to an already-established 4-tuple. The genuinely live risk
-window is narrower than "concurrent collision": it's a *stale-entry
-misattribution* after LRU eviction or connection teardown, where a later,
-sequential reuse of the same client port to a *different* VIP reads back
-a not-yet-evicted prior entry and gets the wrong VIP echoed on return.
-UDP/QUIC has no such protocol-level self-protection — but QUIC already
-uses DCID-keyed matching (`ebpf-lb-dataplane.md:90-96`), which sidesteps
-the 4-tuple-reuse problem entirely by construction.
+**Open question the mechanism doc's proposal implies but never states
+(Rule 12 — flagged, not resolved here):** does the existing VIP-less key
+actually collide under multi-LB-same-Pod? One client socket is one
+connection to one remote VIP; two different VIPs from the same client
+reaching the same backend Pod:TargetPort would need the client to reuse
+one local port across both — allowed by the client's own kernel (remotes
+differ), but then, for TCP, the Pod's own kernel TCP stack already
+forbids two *live* connections at an identical `(local=PodIP:TargetPort,
+remote=CLIENT_IP:SRC_PORT)` 4-tuple, rejecting the second SYN outright.
+Whether a narrower window remains — e.g. a stale, not-yet-evicted entry
+from a torn-down connection being misattributed to a later, sequential
+reuse of the same client port against a different VIP — is not
+established either way in this pass; it may be a real residual risk, or
+the mechanism doc's key-folding instinct may have been over-cautious
+about a collision that cannot actually occur. See research addendum;
+resolve in Phase 3, not by assumption here. UDP/QUIC sidesteps this
+question by construction — QUIC already uses DCID-keyed matching
+(`ebpf-lb-dataplane.md:90-96`), not a client-tuple key.
 
 **Options — CORRECTED.** Admission-time prevention is no longer a valid
-option: upstream Kubernetes allows two `type=LoadBalancer` Services to
-route to the same backend Pod + targetPort with no cross-Service selector
-check (`ValidateServiceCreate`, `validation.go:7033-7045`, `release-1.36`
-— see research addendum), so rejecting it would make u7s non-conformant.
+option regardless of how the open question above resolves: upstream
+Kubernetes allows two `type=LoadBalancer` Services to route to the same
+backend Pod + targetPort with no cross-Service selector check
+(`ValidateServiceCreate`, `validation.go:7033-7045`, `release-1.36` — see
+research addendum), so rejecting it would make u7s non-conformant.
 
-| | Fold VIP into key | Admission-time prevention (REJECTED — non-conformant) | Accept overlap; rely on existing per-flow VIP capture |
+| | Fold VIP into key | Admission-time prevention (REJECTED — non-conformant) | Accept overlap; keep the existing VIP-less key / VIP-value split |
 |---|---|---|---|
-| Wire/map complexity | Dead end (see above) | None, but not viable | None new — this is already the mechanism doc's step-4 capture + step-6 echo; decision 1 only makes the echo's encoding mandatory-raw |
+| Wire/map complexity | Dead end (see above) | None, but not viable | None new — already the mechanism doc's step-4 capture + step-6 echo; decision 1 only makes the echo's encoding mandatory-raw |
 | Conformance | N/A | Blocks a legal upstream configuration | Conformant — no restriction added |
-| Correctness | Does not fix the lookup side | Would be correct by construction, but for a scenario u7s has no right to forbid | Structurally correct for TCP: the Pod's own kernel stack already forbids two live connections at one 4-tuple, so no *live* collision at the backend's key is possible; the residual is a narrower *stale-entry misattribution* window after LRU eviction/teardown (see observation above) |
-| Debuggability | N/A (doesn't work) | N/A | Bounded and measurable — add a metric for stale-misattribution events rather than assume zero risk |
+| Correctness | Does not fix the read side | Would be correct by construction, but for a scenario u7s has no right to forbid | Depends on the open question above — not yet established either way |
+| Debuggability | N/A (doesn't work) | N/A | If a residual window is confirmed in Phase 3, straightforward to add a metric for it; nothing to build until confirmed |
 | User-facing cost | — | Breaks a legal pattern (different Services, same Pod) | None — no new restriction on Service authors |
 | Reversibility | — | — | Pure dataplane/observability detail; tightenable later without an API change |
 
-**What the docs lean toward.** Mechanism doc proposes the key-folding fix
-as the presumed answer (`ebpf-lb-dataplane.md:148-149`) without checking
-it against what the return packet actually carries; `mayor-pa0ze`'s bead
-text repeats it verbatim as "likely fix." Neither the mechanism doc nor
-either ADR checked the scenario against upstream's own validation code.
+**What the docs lean toward.** Mechanism doc proposes the key-folding
+variant as the presumed answer (`ebpf-lb-dataplane.md:148-149`) without
+checking it against what the return packet actually carries, and without
+stating what collision it's guarding against; `mayor-pa0ze`'s bead text
+repeats it verbatim as "likely fix." Neither the mechanism doc nor either
+ADR checked the scenario against upstream's own validation code.
 
 **Recommendation — FLIPPED.** Accept the overlap; do not add
-admission-time rejection. The mechanism doc's design already has what
-correctness requires here: the backend captures the VIP once, off the
-still-untouched forward-leg inner destination, before it rewrites
-anything (step 4) — never from the reply, which carries no VIP either way
-— and holds it in its own per-flow reverse entry. Decision 2 already
-designates the ingress node to perform the un-DNAT using that captured
-value once it's echoed back (step 6-7); this is not Cilium-style DSR, and
-nothing here asks the backend to source its own reply. Decision 1 making
-that echo mandatory-raw, not compact, is what keeps this capture reliable
-rather than adding decision 3's own collision surface back in as a second
-one. Add a metric for the stale-entry-misattribution window identified
-above (post-eviction/teardown reuse of the same client port to a
-different VIP); do not spend Phase 3 effort on the key-fold, which the
-reply's own contents make structurally unworkable regardless of which
-option is chosen here.
+admission-time rejection; keep the reverse-flow map's existing key/value
+split as designed — it needs no eBPF-side change for this decision.
+Decision 1 making the VIP-echo encoding mandatory-raw (not compact) is
+what keeps the value's round trip reliable. Do not spend Phase 3 effort
+on the key-fold, which the reply's own contents make structurally
+unworkable regardless of whether a real collision exists. Before closing
+this out, Phase 3 should resolve the open question above — whether the
+existing key can collide at all — rather than carrying it forward
+unresolved into implementation.
 
 **Gates:** Phase 3 (`mayor-pa0ze`) — this is exactly the decision that
-bead was filed to resolve, with the corrected verdict.
+bead was filed to resolve, with the corrected verdict plus one item still
+open (see addendum).
 
-**Reversibility:** This is now a dataplane-behavior + observability
-commitment, not a control-plane admission policy — it locks in once Phase
-3 ships decision 1's mandatory raw echo and the existing reverse-flow
-capture. The stale-misattribution metric and any TTL tuning around it
-remain freely adjustable afterward without a wire change.
+**Reversibility:** This is now a dataplane-behavior commitment, not a
+control-plane admission policy — it locks in once Phase 3 ships decision
+1's mandatory raw echo and the existing reverse-flow capture. Whatever the
+open question resolves to, any resulting mitigation (e.g. a metric or TTL
+tuning) remains freely adjustable afterward without a wire change.
 
 ## Already-settled question, for the record
 
@@ -312,6 +336,14 @@ metallb.universe.tf/usage/. All five URLs verified resolving (HTTP 200) on
 
 **Open verification items for Phase 3 — not settled by this brief:**
 
+- Whether the existing VIP-less reverse-flow key `(CLIENT_IP, SRC_PORT,
+  PodIP, TargetPort, proto)` can actually collide under multi-LB-same-Pod
+  at all (see Decision 3 above for the reasoning either way). The
+  mechanism doc's "fold VIP into key" proposal implies it believed a
+  collision exists; this brief could not construct one that survives the
+  Pod's own TCP-4-tuple uniqueness, but also cannot rule one out. Confirm
+  before Phase 3 implementation, rather than building a mitigation for an
+  unconfirmed risk or skipping one that's needed.
 - Whether decision 1's backend→ingress Geneve VIP echo is strictly
   necessary at all, given the ingress node already writes its own
   flow-affinity entry at step 2 (keyed on `CLIENT_IP, SRC_PORT, VIP_IP,
