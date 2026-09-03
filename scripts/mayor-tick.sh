@@ -644,7 +644,13 @@ cleanup_merged_worktrees() {
     num=$(printf '%s' "$pr_state" | jq -r '.number')
     if [ "$st" = "MERGED" ]; then
       if [ "$did_pull" -eq 0 ]; then
-        run_cmd git -C "$REPO_ROOT" pull --ff-only
+        # Explicit fetch+merge of ONLY main, not a bare `pull --ff-only`:
+        # the wildcard fetch refspec populates FETCH_HEAD with every
+        # updated branch during a multi-PR merge cascade, and a bare pull
+        # then tries to fast-forward to all of FETCH_HEAD at once ("Cannot
+        # fast-forward to multiple branches", exit 128).
+        run_cmd git -C "$REPO_ROOT" fetch origin main
+        run_cmd git -C "$REPO_ROOT" merge --ff-only origin/main
         run_cmd git -C "$REPO_ROOT" remote prune origin
         did_pull=1
       fi
