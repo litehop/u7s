@@ -18,7 +18,9 @@ use crate::{
 };
 
 use super::generic::{lookup, store_err, validate_name};
-use super::json_patch::{apply_json_patch, detect_patch_type, ssa_body_to_json, PatchType};
+use super::json_patch::{
+    apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
+};
 use super::resource::{get_namespaced_resource, get_resource, inject_type_meta};
 
 /// Merge incoming metadata onto the current object's metadata, preserving fields that
@@ -155,6 +157,14 @@ pub async fn put_resource_status<S: Store>(
         .map_err(Status::forbidden)?;
     }
 
+    // Dry-run: validation and node-restriction checks passed; return the would-be
+    // status object without persisting — mirrors replace_pod/replace_namespace's
+    // dry-run early-return.
+    if is_dry_run_header(&headers) {
+        inject_type_meta(&mut current.body, &group, &version, &meta.kind);
+        return Ok(Json(current.body));
+    }
+
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
         .store
@@ -249,6 +259,13 @@ pub async fn patch_resource_status<S: Store>(
         .map_err(Status::forbidden)?;
     }
 
+    // Dry-run: same convergence point as reject_non_object_status above — return the
+    // would-be patched status object without persisting.
+    if is_dry_run_header(&headers) {
+        inject_type_meta(&mut current.body, &group, &version, &meta.kind);
+        return Ok(Json(current.body));
+    }
+
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
         .store
@@ -331,6 +348,13 @@ pub async fn put_namespaced_resource_status<S: Store>(
 
     replace_status_field(&mut current.body, &incoming.body["status"])?;
     merge_incoming_metadata(&mut current.body, &incoming.body, &kind);
+
+    // Dry-run: return the would-be status object without persisting — mirrors
+    // put_resource_status's dry-run early-return above.
+    if is_dry_run_header(&headers) {
+        inject_type_meta(&mut current.body, &group, &version, &kind);
+        return Ok(Json(current.body));
+    }
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
@@ -426,6 +450,13 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     reject_non_object_status(&current.body["status"])?;
+
+    // Dry-run: same convergence point as reject_non_object_status above — return the
+    // would-be patched status object without persisting.
+    if is_dry_run_header(&headers) {
+        inject_type_meta(&mut current.body, &group, &version, &kind);
+        return Ok(Json(current.body));
+    }
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
@@ -658,6 +689,87 @@ mod tests {
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
+    /// PUT /status with dryRun=All must compute and return the would-be status object
+    /// but never persist it — a kubelet or CSI driver probing "would this write
+    /// succeed" (or a client that accidentally left dryRun set) must not actually
+    /// flip a CSINode's status in the store.
+    #[tokio::test]
+    async fn put_resource_status_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "dry-run-node" },
+            "spec": { "drivers": [] },
+            "status": { "ready": false }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/dry-run-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut dry_run_headers = json_headers();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "dry-run-node" },
+            "status": { "ready": true }
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "dry-run-node".into(),
+            )),
+            axum::Extension(test_user()),
+            dry_run_headers,
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let resp = match result {
+            Ok(r) => r.into_response(),
+            Err(e) => {
+                panic!("dry-run PUT /status must still return a success response, got: {e:?}")
+            }
+        };
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_json["status"]["ready"], true,
+            "dry-run response must show the would-be status change so the caller can \
+             tell the write would have succeeded"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["ready"], false,
+            "dryRun=All must NOT persist the status change — if this fails, \
+             put_resource_status's dry-run guard was removed and status.ready was \
+             actually flipped to true in the store"
+        );
+    }
+
     /// put_resource_status with a null status body removes the status field.
     /// When a controller explicitly sets status=null, the field must be removed
     /// rather than set to null — Kubernetes serializes absent and null fields differently.
@@ -822,6 +934,82 @@ mod tests {
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
+    /// PATCH /status with dryRun=All must compute and return the would-be patched
+    /// status object but never persist it — the guard sits at the same convergence
+    /// point as reject_non_object_status (reached by every patch content-type), so
+    /// this also proves that shared guard placement doesn't accidentally skip the
+    /// dry-run check for merge-patch specifically.
+    #[tokio::test]
+    async fn patch_resource_status_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "dry-run-patch-node" },
+            "spec": { "drivers": [] },
+            "status": { "ready": false }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/dry-run-patch-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut dry_run_headers = merge_patch_headers();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let patch = serde_json::json!({"status": {"ready": true}});
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "dry-run-patch-node".into(),
+            )),
+            axum::Extension(test_user()),
+            dry_run_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        let resp = match result {
+            Ok(r) => r.into_response(),
+            Err(e) => {
+                panic!("dry-run PATCH /status must still return a success response, got: {e:?}")
+            }
+        };
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_json["status"]["ready"], true,
+            "dry-run response must show the would-be status change"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["ready"], false,
+            "dryRun=All must NOT persist the patched status — if this fails, \
+             patch_resource_status's dry-run guard was removed and status.ready was \
+             actually flipped to true in the store"
+        );
+    }
+
     /// get_namespaced_resource_status returns the stored object when it exists.
     /// Namespaced controllers (e.g. Deployment controller) read status via this path.
     #[tokio::test]
@@ -975,6 +1163,86 @@ mod tests {
             Ok(_) => panic!("expected 404 error"),
         };
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// PUT /status on a namespaced resource with dryRun=All must compute and return
+    /// the would-be status object but never persist it — a Lease-holding kubelet
+    /// probing dry-run (or a client that left dryRun set by mistake) must not
+    /// actually flip the Lease's status in the store.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-a" },
+            "status": { "phase": "Active" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut dry_run_headers = json_headers();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease" },
+            "status": { "phase": "Expired" }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "dry-run-lease".into(),
+            )),
+            dry_run_headers,
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let resp = match result {
+            Ok(r) => r.into_response(),
+            Err(e) => {
+                panic!("dry-run PUT /status must still return a success response, got: {e:?}")
+            }
+        };
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_json["status"]["phase"], "Expired",
+            "dry-run response must show the would-be status change"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Active",
+            "dryRun=All must NOT persist the status change — if this fails, \
+             put_namespaced_resource_status's dry-run guard was removed and \
+             status.phase was actually flipped to Expired in the store"
+        );
     }
 
     /// put_namespaced_resource_status with null status removes the status field.
@@ -1421,6 +1689,79 @@ mod tests {
             Ok(_) => panic!("expected 404 error"),
         };
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// PATCH /status on a namespaced resource with dryRun=All must compute and
+    /// return the would-be patched status object but never persist it.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "dry-run-patch-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-b" },
+            "status": { "phase": "Active" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-patch-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut dry_run_headers = merge_patch_headers();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let patch = serde_json::json!({"status": {"phase": "Expired"}});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "dry-run-patch-lease".into(),
+            )),
+            dry_run_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        let resp = match result {
+            Ok(r) => r.into_response(),
+            Err(e) => {
+                panic!("dry-run PATCH /status must still return a success response, got: {e:?}")
+            }
+        };
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_json["status"]["phase"], "Expired",
+            "dry-run response must show the would-be status change"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Active",
+            "dryRun=All must NOT persist the patched status — if this fails, \
+             patch_namespaced_resource_status's dry-run guard was removed and \
+             status.phase was actually flipped to Expired in the store"
+        );
     }
 
     /// put_resource_status replaces only the status field, leaving spec untouched.

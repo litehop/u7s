@@ -2409,3 +2409,95 @@ mod condition_tests {
         );
     }
 }
+
+// DeleteOptions::is_dry_run — every apiserver write path that honors dryRun via the DELETE
+// body (as opposed to a `?dryRun=All` query param) trusts this to gate whether the object
+// actually gets deleted. A wrong answer here either silently deletes real data on a
+// client's dry-run probe, or silently no-ops a genuine delete request.
+#[cfg(test)]
+mod delete_options_tests {
+    use super::*;
+
+    /// client-go's typed Delete() sends `dryRun: ["All"]` in the DELETE body — this is the
+    /// one shape every real dry-run DELETE request actually takes on the wire.
+    #[test]
+    fn dry_run_all_is_true() {
+        let opts: DeleteOptions =
+            serde_json::from_value(serde_json::json!({ "dryRun": ["All"] })).unwrap();
+        assert!(
+            opts.is_dry_run(),
+            "dryRun: [\"All\"] must be recognized as dry-run, or a genuine \
+             `kubectl delete --dry-run=server` actually deletes the object"
+        );
+    }
+
+    /// A present-but-empty `dryRun` array (e.g. a client that serializes `DryRun: []`
+    /// instead of omitting the field) must NOT be treated as dry-run — the empty array
+    /// carries no "All" value, so treating it as dry-run would silently no-op a delete
+    /// the caller never asked to skip.
+    #[test]
+    fn dry_run_empty_array_is_false() {
+        let opts: DeleteOptions =
+            serde_json::from_value(serde_json::json!({ "dryRun": [] })).unwrap();
+        assert!(
+            !opts.is_dry_run(),
+            "an empty dryRun array must not be treated as dry-run, or a plain DELETE \
+             from a client that always sets an (empty) DryRun slice would never persist"
+        );
+    }
+
+    /// A completely absent `dryRun` field (the common case: almost every DELETE request)
+    /// must default to false, not panic or error on the missing key.
+    #[test]
+    fn dry_run_absent_is_false() {
+        let opts: DeleteOptions = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(
+            !opts.is_dry_run(),
+            "DeleteOptions with no dryRun field at all must not be treated as dry-run — \
+             this is the default shape of nearly every real DELETE request"
+        );
+    }
+
+    /// Only the literal string "All" is server-meaningful (matching upstream's
+    /// `metav1.DryRunAll`). An unrecognized value must be ignored rather than treated
+    /// as dry-run — a typo or a future dry-run mode this server doesn't implement must
+    /// fail safe by actually deleting, not silently skip the delete.
+    #[test]
+    fn dry_run_unrecognized_value_is_false() {
+        let opts: DeleteOptions =
+            serde_json::from_value(serde_json::json!({ "dryRun": ["Invalid"] })).unwrap();
+        assert!(
+            !opts.is_dry_run(),
+            "an unrecognized dryRun value must not trigger dry-run behavior — only the \
+             literal \"All\" is server-meaningful"
+        );
+    }
+
+    /// "all" (lowercase) is a different string from "All" and must not match — the
+    /// Kubernetes API is case-sensitive here, and silently accepting a case variant
+    /// would make this server accept requests upstream apiservers reject.
+    #[test]
+    fn dry_run_is_case_sensitive() {
+        let opts: DeleteOptions =
+            serde_json::from_value(serde_json::json!({ "dryRun": ["all"] })).unwrap();
+        assert!(
+            !opts.is_dry_run(),
+            "dryRun matching must be case-sensitive — \"all\" is not \"All\" and must not \
+             be treated as dry-run"
+        );
+    }
+
+    /// "All" must be recognized no matter where it sits in the slice — client-go's
+    /// DryRun field is a `[]string`, and nothing in the API guarantees "All" is the
+    /// only or first element.
+    #[test]
+    fn dry_run_all_among_other_values_is_true() {
+        let opts: DeleteOptions =
+            serde_json::from_value(serde_json::json!({ "dryRun": ["Foo", "All"] })).unwrap();
+        assert!(
+            opts.is_dry_run(),
+            "\"All\" must be recognized anywhere in the dryRun slice, not just as the \
+             sole or first element"
+        );
+    }
+}

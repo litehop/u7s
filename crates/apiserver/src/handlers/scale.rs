@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::generic::store_err;
+use super::json_patch::is_dry_run_header;
 
 // ---------------------------------------------------------------------------
 // Typed Scale structs — local to this file (single-use, not in types.rs)
@@ -471,6 +472,20 @@ async fn scale_put_impl<S: Store>(
 
     write_scale_replicas(&mut obj, new_replicas)?;
 
+    // Dry-run: spec.replicas was computed above; return the would-be Scale object
+    // without persisting — this is the shared impl behind both apps/v1 and
+    // ReplicationController scale PUT routes, so guarding here covers both.
+    if is_dry_run_header(headers) {
+        return Ok(Json(build_scale(
+            name,
+            ns,
+            new_replicas as i64,
+            status_replicas,
+            obj.resource_version().unwrap_or(""),
+            &selector,
+        )));
+    }
+
     let expected_rv =
         crate::util::parse_resource_version(scale.metadata.resource_version.as_deref())?;
     let new_rv = state
@@ -540,6 +555,19 @@ async fn scale_patch_impl<S: Store>(
         }
         None => extract_replicas(&obj.body),
     };
+
+    // Dry-run: same shared-impl reasoning as scale_put_impl above — covers both
+    // apps/v1 and ReplicationController scale PATCH routes.
+    if is_dry_run_header(headers) {
+        return Ok(Json(build_scale(
+            name,
+            ns,
+            new_replicas,
+            status_replicas,
+            obj.resource_version().unwrap_or(""),
+            &selector,
+        )));
+    }
 
     let expected_rv =
         crate::util::parse_resource_version(patch_body["metadata"]["resourceVersion"].as_str())?;
@@ -1496,6 +1524,64 @@ mod handler_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// PUT scale with ?dryRun=All must compute and return the would-be Scale object
+    /// but never write spec.replicas back to the stored workload — kubectl scale
+    /// --dry-run=server (and HPA's own "would this scale" preview, if it ever adds
+    /// one) must not accidentally resize a Deployment.
+    #[tokio::test]
+    async fn put_scale_dry_run_all_does_not_mutate_store() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 1).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::handlers::json_patch::inject_dry_run_header,
+            ))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "spec": { "replicas": 5 }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale?dryRun=All")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "dry-run PUT scale must still return a success response"
+        );
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(
+            json["spec"]["replicas"], 5,
+            "dry-run response must show the would-be replica count"
+        );
+
+        let key = "/registry/apps/deployments/default/my-deploy";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_obj["spec"]["replicas"], 1,
+            "dryRun=All must NOT persist the new replica count — if this fails, \
+             scale_put_impl's dry-run guard was removed and the Deployment was \
+             actually resized to 5 in the store"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // patch_scale
     // -----------------------------------------------------------------------
@@ -1634,6 +1720,58 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// PATCH scale with ?dryRun=All must compute and return the would-be Scale
+    /// object but never write spec.replicas back to the stored workload.
+    #[tokio::test]
+    async fn patch_scale_dry_run_all_does_not_mutate_store() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 1).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::handlers::json_patch::inject_dry_run_header,
+            ))
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "replicas": 5 } });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale?dryRun=All")
+            .header("content-type", "application/merge-patch+json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "dry-run PATCH scale must still return a success response"
+        );
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(
+            json["spec"]["replicas"], 5,
+            "dry-run response must show the would-be replica count"
+        );
+
+        let key = "/registry/apps/deployments/default/my-deploy";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_obj["spec"]["replicas"], 1,
+            "dryRun=All must NOT persist the new replica count — if this fails, \
+             scale_patch_impl's dry-run guard was removed and the Deployment was \
+             actually resized to 5 in the store"
+        );
     }
 
     // -----------------------------------------------------------------------

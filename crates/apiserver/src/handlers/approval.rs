@@ -24,7 +24,9 @@ use bytes::Bytes;
 
 use crate::{
     handlers::generic::{store_err, validate_name},
-    handlers::json_patch::{apply_json_patch, detect_patch_type, ssa_body_to_json, PatchType},
+    handlers::json_patch::{
+        apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
+    },
     handlers::status::merge_incoming_metadata,
     keys::group_object_key,
     state::AppState,
@@ -72,6 +74,12 @@ pub async fn put_approval<S: Store>(
     // and clients (e.g. this conformance test) also PATCH/PUT annotations via /approval.
     merge_approval_conditions(&mut current, &incoming);
     merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+
+    // Dry-run: return the would-be approval object without persisting — mirrors
+    // put_resource_status's dry-run early-return.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current.body));
+    }
 
     let new_rv = state
         .store
@@ -183,6 +191,12 @@ pub async fn patch_approval<S: Store>(
                 s.remove("certificate");
             }
         }
+    }
+
+    // Dry-run: return the would-be patched approval object without persisting —
+    // mirrors put_approval's dry-run early-return above.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current.body));
     }
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
@@ -550,6 +564,74 @@ mod tests {
         }
     }
 
+    /// PUT /approval with dryRun=All must compute and return the would-be approval
+    /// object but never persist it — `kubectl certificate approve --dry-run=server`
+    /// must not actually approve a CSR (and thus must not let a signer controller
+    /// pick it up and issue a certificate).
+    #[tokio::test]
+    async fn put_approval_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let name = "dry-run-approval-csr";
+        seed_csr(&state.store, name, None).await;
+
+        let mut dry_run_headers = json_headers();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let put_body = json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": name, "resourceVersion": "1"},
+            "spec": {
+                "request": "dGVzdA==",
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            },
+            "status": {
+                "conditions": [{
+                    "type": "Approved",
+                    "status": "True",
+                    "reason": "ManualApproval",
+                    "message": "approved via dry-run PUT"
+                }]
+            }
+        });
+
+        let result = put_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            dry_run_headers,
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        let resp = match result {
+            Ok(r) => r.into_response(),
+            Err(e) => {
+                panic!("dry-run PUT /approval must still return a success response, got: {e:?}")
+            }
+        };
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_json["status"]["conditions"][0]["type"], "Approved",
+            "dry-run response must show the would-be Approved condition"
+        );
+
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["conditions"].as_array().unwrap().len(),
+            0,
+            "dryRun=All must NOT persist the Approved condition — if this fails, \
+             put_approval's dry-run guard was removed and the CSR was actually \
+             approved in the store"
+        );
+    }
+
     /// PATCH /approval with merge-patch+json must update status.conditions.
     ///
     /// kubectl certificate approve sends a strategic-merge-patch or merge-patch.
@@ -611,6 +693,79 @@ mod tests {
         assert!(
             v["status"]["certificate"].is_null() || v["status"].get("certificate").is_none(),
             "patch_approval must not write certificate field — that belongs to the signer"
+        );
+    }
+
+    /// PATCH /approval with dryRun=All must compute and return the would-be patched
+    /// approval object but never persist it.
+    #[tokio::test]
+    async fn patch_approval_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "dry-run-patch-approval-csr";
+        seed_csr(&store, name, None).await;
+
+        let patch_body = json!({
+            "status": {
+                "conditions": [{
+                    "type": "Approved",
+                    "status": "True",
+                    "reason": "ManualApproval",
+                    "message": "approved via dry-run patch"
+                }]
+            }
+        });
+
+        let mut dry_run_headers = axum::http::HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            dry_run_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+        let resp = match result {
+            Ok(r) => r.into_response(),
+            Err(e) => {
+                panic!("dry-run PATCH /approval must still return a success response, got: {e:?}")
+            }
+        };
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_json["status"]["conditions"][0]["type"], "Approved",
+            "dry-run response must show the would-be Approved condition"
+        );
+
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["conditions"].as_array().unwrap().len(),
+            0,
+            "dryRun=All must NOT persist the patched Approved condition — if this fails, \
+             patch_approval's dry-run guard was removed and the CSR was actually \
+             approved in the store"
         );
     }
 
