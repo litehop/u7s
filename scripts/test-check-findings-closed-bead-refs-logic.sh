@@ -203,6 +203,24 @@ assert "malformed-export failure states the export is invalid, not a bare jq err
   "$(grep -qF 'not valid JSONL' "$S8/.gate-out" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 9. Finding's `Bead:` header carries a trailing parenthetical (e.g. a note
+#    naming a related bead) and the bead IS closed -> still fails. A whole-
+#    line slurp would mangle the header into a compound string that never
+#    matches any live record, silently passing a finding this check exists
+#    to catch -- the same bug class fixed on the advisory side in
+#    scripts/worktree-hygiene.sh.
+# ---------------------------------------------------------------------------
+S9="$SANDBOX_ROOT/9-trailing-parenthetical"
+new_sandbox "$S9"
+mkdir -p "$S9/.beads" "$S9/ai/findings"
+printf '{"id":"fixture-closed-9","status":"closed"}\n' > "$S9/.beads/issues.jsonl"
+printf 'Bead: fixture-closed-9 (see also fixture-other)\n\nSome finding body.\n' > "$S9/ai/findings/2026-08-27-fixture-trailing-test.md"
+git -C "$S9" add ai/findings/2026-08-27-fixture-trailing-test.md .beads/issues.jsonl
+RC9=$(run_gate "$S9")
+assert "finding whose Bead: header has a trailing parenthetical still fails when the bead is closed" \
+  "$([ "$RC9" -ne 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
