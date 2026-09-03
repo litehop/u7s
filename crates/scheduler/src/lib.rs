@@ -585,6 +585,16 @@ pub struct PendingPod {
     /// driver at all, which `csi_volume_limits_fit` then treats as "nothing
     /// to check" — the same convention `pv_node_affinities` uses.
     pub csi_volume_counts: std::collections::BTreeMap<String, i64>,
+    /// Names of this pod's `pvc_names` that carry the `ReadWriteOncePod`
+    /// access mode — the VolumeRestrictions predicate's exclusivity
+    /// dimension: at most one pod cluster-wide may use such a PVC at a time.
+    /// Like `pv_node_affinities`/`csi_volume_counts`, never populated by
+    /// `needs_scheduling` itself (needs a PVC GET) — the caller fetches it
+    /// once via `fetch_read_write_once_pod_pvc_names` and fills it in right
+    /// before the first `pick_node` attempt. Empty for a pod with no RWOP
+    /// PVCs, which `read_write_once_pod_conflict` then treats as "nothing to
+    /// check".
+    pub read_write_once_pod_pvcs: Vec<String>,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -680,6 +690,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         pv_node_affinities: Vec::new(),
         topology_spread_constraints,
         csi_volume_counts: std::collections::BTreeMap::new(),
+        read_write_once_pod_pvcs: Vec::new(),
     })
 }
 
@@ -1264,25 +1275,31 @@ struct PodListItemStatus {
 /// A node's already-committed usage from its non-terminated pods: the pod
 /// count (against `status.allocatable.pods`), summed cpu/memory/
 /// ephemeral-storage requests (against `status.allocatable.{cpu,memory,ephemeral-storage}`),
-/// and every hostPort already claimed by those pods (the NodePorts
-/// predicate's conflict-detection dimension). Computed by `NodeTally::usage_by_node`.
+/// every hostPort already claimed by those pods (the NodePorts predicate's
+/// conflict-detection dimension), and every PVC name they reference (the
+/// VolumeRestrictions/ReadWriteOncePod predicate's exclusivity dimension).
+/// Computed by `NodeTally::usage_by_node`.
 #[derive(Debug, Default, Clone)]
 pub struct NodeUsage {
     pub pod_count: u32,
     pub requests: ResourceRequests,
     pub host_ports: Vec<HostPortClaim>,
+    pub pvc_names: Vec<String>,
 }
 
 /// A pod already on a node, as needed by preemption victim selection: its
 /// "namespace/name" key (to DELETE it), its scheduling priority (to decide
-/// whether it is a legal victim for a given pending pod), and its own
-/// resource requests (how much pod-count/cpu/memory/ephemeral-storage/
-/// extended-resource capacity evicting it would actually free).
+/// whether it is a legal victim for a given pending pod), its own resource
+/// requests (how much pod-count/cpu/memory/ephemeral-storage/extended-resource
+/// capacity evicting it would actually free), and the PVC names it
+/// references (whether evicting it would also resolve a ReadWriteOncePod
+/// conflict).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePod {
     pub key: String,
     pub priority: i32,
     pub requests: ResourceRequests,
+    pub pvc_names: Vec<String>,
 }
 
 /// Minimal typed view of a pod watch event's object needed to maintain
@@ -1301,12 +1318,14 @@ struct PreemptionPodListItem {
 /// One pod's contribution to `NodeTally`: which node it currently occupies a
 /// slot on, its namespace/labels (what an inter-pod affinity/anti-affinity
 /// term matches against), its priority (preemption eligibility), its
-/// resource requests, and its hostPort claims.
+/// resource requests, its hostPort claims, and the PVC names its volumes
+/// reference (the ReadWriteOncePod exclusivity predicate's conflict-detection
+/// dimension — see `referenced_pvc_names`).
 ///
 /// Populated both by `apply_event` (a real watch event carries the pod's full
-/// `metadata`/`spec.containers`) and by `assume`'s fast path (the pending
-/// pod's own already-computed `labels`/`host_ports`) — see `NodeTally::assume`'s
-/// doc comment for why the latter matters.
+/// `metadata`/`spec.containers`/`spec.volumes`) and by `assume`'s fast path
+/// (the pending pod's own already-computed `labels`/`host_ports`/`pvc_names`)
+/// — see `NodeTally::assume`'s doc comment for why the latter matters.
 #[derive(Debug, Clone)]
 struct TalliedPod {
     node_name: String,
@@ -1315,6 +1334,7 @@ struct TalliedPod {
     priority: i32,
     requests: ResourceRequests,
     host_ports: Vec<HostPortClaim>,
+    pvc_names: Vec<String>,
 }
 
 /// A preemption plan whose victims have all had their graceful DELETE issued
@@ -1476,6 +1496,10 @@ impl NodeTally {
         let priority = watch_event.object.spec.priority.unwrap_or(0);
         let requests = pod_total_requests(&watch_event.object.spec);
         let host_ports = container_host_ports(&watch_event.object.spec.containers);
+        let pvc_names = referenced_pvc_names(
+            &name,
+            watch_event.object.spec.volumes.as_deref().unwrap_or(&[]),
+        );
         let node_name = watch_event.object.spec.node_name.filter(|n| !n.is_empty());
         match node_name {
             Some(node_name) if !terminal => {
@@ -1488,6 +1512,7 @@ impl NodeTally {
                         priority,
                         requests,
                         host_ports,
+                        pvc_names,
                     },
                 );
                 Vec::new()
@@ -1525,15 +1550,17 @@ impl NodeTally {
     /// called the instant the scheduler decides to bind, before the bind's
     /// HTTP call even completes. `remove` undoes this if the bind then fails.
     ///
-    /// `host_ports`/`labels` — like `requests` — are the pending pod's own
-    /// already-computed values at decision time, not something read back from
-    /// a watch event: without them, a hostPort a scheduling decision just
-    /// reserved on `node_name` would stay invisible to `usage_by_node`/the
-    /// NodePorts filter, and this pod's labels would stay invisible to
-    /// inter-pod affinity/anti-affinity, for every OTHER concurrent decision
-    /// until the real bind's watch event round-tripped through `apply_event`
-    /// — the same read-after-write race `requests` already closes for
-    /// cpu/memory (see this struct's doc comment).
+    /// `host_ports`/`labels`/`pvc_names` — like `requests` — are the pending
+    /// pod's own already-computed values at decision time, not something read
+    /// back from a watch event: without them, a hostPort a scheduling
+    /// decision just reserved on `node_name` would stay invisible to
+    /// `usage_by_node`/the NodePorts filter, this pod's labels would stay
+    /// invisible to inter-pod affinity/anti-affinity, and this pod's PVCs
+    /// would stay invisible to the ReadWriteOncePod exclusivity filter, for
+    /// every OTHER concurrent decision until the real bind's watch event
+    /// round-tripped through `apply_event` — the same read-after-write race
+    /// `requests` already closes for cpu/memory (see this struct's doc
+    /// comment).
     #[allow(clippy::too_many_arguments)]
     pub fn assume(
         &mut self,
@@ -1544,6 +1571,7 @@ impl NodeTally {
         requests: ResourceRequests,
         host_ports: Vec<HostPortClaim>,
         labels: std::collections::HashMap<String, String>,
+        pvc_names: Vec<String>,
     ) {
         self.pods.insert(
             format!("{namespace}/{pod_name}"),
@@ -1554,6 +1582,7 @@ impl NodeTally {
                 priority,
                 requests,
                 host_ports,
+                pvc_names,
             },
         );
     }
@@ -1638,9 +1667,9 @@ impl NodeTally {
         }
     }
 
-    /// Non-terminal pod count, summed resource requests, and claimed
-    /// hostPorts per node — the shape `select_node_with_capacity` consumes in
-    /// place of a live GET.
+    /// Non-terminal pod count, summed resource requests, claimed hostPorts,
+    /// and referenced PVC names per node — the shape
+    /// `select_node_with_capacity` consumes in place of a live GET.
     pub fn usage_by_node(&self) -> std::collections::HashMap<String, NodeUsage> {
         let mut usage: std::collections::HashMap<String, NodeUsage> =
             std::collections::HashMap::new();
@@ -1649,6 +1678,7 @@ impl NodeTally {
             entry.pod_count += 1;
             entry.requests = entry.requests.clone() + pod.requests.clone();
             entry.host_ports.extend(pod.host_ports.iter().cloned());
+            entry.pvc_names.extend(pod.pvc_names.iter().cloned());
         }
         usage
     }
@@ -1673,6 +1703,7 @@ impl NodeTally {
                 key: key.clone(),
                 priority: p.priority,
                 requests: p.requests.clone(),
+                pvc_names: p.pvc_names.clone(),
             })
             .collect()
     }
@@ -1957,6 +1988,9 @@ pub fn select_node_with_capacity(
             {
                 return false;
             }
+            if !read_write_once_pod_conflict_free(&usage.pvc_names, &pod.read_write_once_pod_pvcs) {
+                return false;
+            }
             if !csi_volume_limits_fit(&n.csi_driver_headroom, &pod.csi_volume_counts) {
                 csi_limit_was_the_only_blocker = true;
                 return false;
@@ -2136,6 +2170,52 @@ fn resource_deficiency_relevant(
         let candidate_has = candidate.extended.get(name).copied().unwrap_or(0);
         used + want > cap && candidate_has > 0
     })
+}
+
+/// The VolumeRestrictions/ReadWriteOncePod predicate: true when none of
+/// `rwop_pvcs` (the pending pod's ReadWriteOncePod PVC names) is already
+/// referenced by a pod tallied on this node (`node_pvc_names`). A PVC with
+/// the ReadWriteOncePod access mode may be mounted by at most one pod at a
+/// time — Kubernetes' strictest access mode, stricter than ReadWriteOnce's
+/// "one node" — so a second pod wanting the same PVC must never be bound
+/// alongside the first, on any node.
+///
+/// `pub` (not module-private) so `benches/predicates.rs` can call it
+/// directly, for the same reason `resource_fits`/`host_ports_fit` are.
+pub fn read_write_once_pod_conflict_free(node_pvc_names: &[String], rwop_pvcs: &[String]) -> bool {
+    !rwop_pvcs.iter().any(|pvc| node_pvc_names.contains(pvc))
+}
+
+/// Every tallied pod on this candidate node that already references one of
+/// `pod`'s ReadWriteOncePod PVCs, as MANDATORY preemption victims: unlike
+/// `select_preemption_victims`'s resource-dimension candidates (evicted only
+/// if doing so helps the pending pod fit), evicting an RWOP conflict holder
+/// is not optional — no amount of free cpu/memory/pod-count capacity lets
+/// this node admit `pod` while that holder is still there.
+///
+/// Returns `None` — meaning this node can NEVER become viable via preemption
+/// — when any conflicting pod's priority is not strictly lower than
+/// `pending_priority`: kube-scheduler (and this scheduler, see
+/// `select_preemption_victims`) never preempts an equal-or-higher-priority
+/// pod, so such a conflict can never be resolved by eviction. Returns
+/// `Some(&[])` when `pod` has no ReadWriteOncePod PVCs at all, or none of
+/// them conflict with anything on this node — nothing extra to preempt here.
+fn read_write_once_pod_preemption_victims(
+    node_pods: &[NodePod],
+    rwop_pvcs: &[String],
+    pending_priority: i32,
+) -> Option<Vec<String>> {
+    if rwop_pvcs.is_empty() {
+        return Some(Vec::new());
+    }
+    let conflicting: Vec<&NodePod> = node_pods
+        .iter()
+        .filter(|p| p.pvc_names.iter().any(|name| rwop_pvcs.contains(name)))
+        .collect();
+    if conflicting.iter().any(|p| p.priority >= pending_priority) {
+        return None;
+    }
+    Some(conflicting.into_iter().map(|p| p.key.clone()).collect())
 }
 
 /// Return true when all entries in `selector` are satisfied by `labels`.
@@ -2926,6 +3006,7 @@ fn select_and_reserve_node(
         pod.requests.clone(),
         pod.host_ports.clone(),
         pod.labels.clone(),
+        pod.pvc_names.clone(),
     );
     Ok(node)
 }
@@ -3117,13 +3198,36 @@ fn find_preemption_candidate(
             .expect("tally lock poisoned")
             .pods_on(node_name);
 
-        let victims = select_preemption_victims(
+        let mut victims = select_preemption_victims(
             pod.priority,
             &pod.requests,
             &node_pods,
             capacity,
             &node.status.allocatable,
         );
+        // A ReadWriteOncePod PVC conflict is never a resource-dimension
+        // problem `select_preemption_victims` can see — the node may have
+        // plenty of free cpu/memory/pod-count and still be unusable because
+        // another pod on it already holds the exclusive volume `pod` needs.
+        // Such a holder is a MANDATORY victim (not a cost/benefit choice like
+        // a resource-short candidate): evicting it is the only way this
+        // node's RWOP conflict resolves, no matter how much capacity is
+        // otherwise free. `None` means some conflicting pod's priority is
+        // not strictly lower than `pod`'s own — kube-scheduler never
+        // preempts an equal-or-higher-priority pod, so this node can never
+        // become viable via preemption at all and must be skipped outright.
+        let Some(rwop_victims) = read_write_once_pod_preemption_victims(
+            &node_pods,
+            &pod.read_write_once_pod_pvcs,
+            pod.priority,
+        ) else {
+            continue;
+        };
+        for victim in rwop_victims {
+            if !victims.contains(&victim) {
+                victims.push(victim);
+            }
+        }
         if victims.is_empty() {
             continue;
         }
@@ -3233,6 +3337,7 @@ fn verify_and_reserve_preemption(
         pod.requests.clone(),
         pod.host_ports.clone(),
         pod.labels.clone(),
+        pod.pvc_names.clone(),
     );
     // Claim the victims under this SAME lock acquisition, not a later one —
     // otherwise a fresher concurrent plan's search could still see them as
@@ -3440,6 +3545,8 @@ struct PvcSpecView {
     #[serde(default)]
     volume_name: String,
     storage_class_name: Option<String>,
+    #[serde(default)]
+    access_modes: Vec<String>,
 }
 
 /// `volumeBindingMode`/`provisioner` sit directly on a StorageClass object,
@@ -3464,6 +3571,10 @@ struct PvcBindingInfo {
     /// value, if any — read back so an already-correct stamp is not
     /// needlessly re-PATCHed.
     selected_node: Option<String>,
+    /// `spec.accessModes` — read by `fetch_read_write_once_pod_pvc_names` to
+    /// find which of a pod's PVCs carry `ReadWriteOncePod`, the
+    /// VolumeRestrictions predicate's exclusivity dimension.
+    access_modes: Vec<String>,
 }
 
 /// One intended selected-node PATCH: which PVC to stamp, and the node name
@@ -3558,7 +3669,35 @@ async fn fetch_pvc_binding_info(
             .annotations
             .get(SELECTED_NODE_ANNOTATION)
             .cloned(),
+        access_modes: obj.spec.access_modes,
     }))
+}
+
+/// Resolve which of `pvc_names` (in `namespace`) carry the
+/// `ReadWriteOncePod` access mode — the VolumeRestrictions predicate's
+/// exclusivity dimension. The caller (`main.rs`'s `handle_pod_event`)
+/// fetches this once and fills it into `PendingPod::read_write_once_pod_pvcs`
+/// right before the first `pick_node` attempt, exactly like
+/// `fetch_bound_pv_node_affinities`/`fetch_csi_volume_counts`. A PVC that no
+/// longer exists (404) contributes nothing — mirrors
+/// `fetch_bound_pv_node_affinities`'s own convention for a gone PVC.
+pub async fn fetch_read_write_once_pod_pvc_names(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pvc_names: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for pvc_name in pvc_names {
+        let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await?
+        else {
+            continue;
+        };
+        if info.access_modes.iter().any(|m| m == "ReadWriteOncePod") {
+            names.push(pvc_name.clone());
+        }
+    }
+    Ok(names)
 }
 
 async fn fetch_storage_class_binding_mode(
@@ -4629,6 +4768,7 @@ mod tests {
             volume_name: String::new(),
             storage_class_name: Some(storage_class_name.to_owned()),
             selected_node: None,
+            access_modes: Vec::new(),
         }
     }
 
@@ -4681,6 +4821,7 @@ mod tests {
                 volume_name: "pv-123".to_owned(),
                 storage_class_name: Some("wfc-class".to_owned()),
                 selected_node: None,
+                access_modes: Vec::new(),
             },
         )]
         .into_iter()
@@ -4706,6 +4847,7 @@ mod tests {
                 volume_name: String::new(),
                 storage_class_name: Some("wfc-class".to_owned()),
                 selected_node: Some("worker-0".to_owned()),
+                access_modes: Vec::new(),
             },
         )]
         .into_iter()
@@ -4732,6 +4874,7 @@ mod tests {
                 volume_name: String::new(),
                 storage_class_name: Some("wfc-class".to_owned()),
                 selected_node: Some("worker-1".to_owned()),
+                access_modes: Vec::new(),
             },
         )]
         .into_iter()
@@ -7123,6 +7266,7 @@ mod tests {
             pod_count,
             requests: ResourceRequests::default(),
             host_ports: Vec::new(),
+            pvc_names: Vec::new(),
         }
     }
 
@@ -7147,6 +7291,7 @@ mod tests {
             pv_node_affinities: Vec::new(),
             topology_spread_constraints: Vec::new(),
             csi_volume_counts: Default::default(),
+            read_write_once_pod_pvcs: Vec::new(),
         }
     }
 
@@ -7288,6 +7433,7 @@ mod tests {
                 ResourceRequests::default(),
                 Vec::new(),
                 std::collections::HashMap::new(),
+                Vec::new(),
             );
         }
 
@@ -7461,6 +7607,7 @@ mod tests {
             requests(5600, 0, 0),
             Vec::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
         );
 
         let mut node = make_node_with_capacity("worker-0", &[], "110");
@@ -7577,6 +7724,7 @@ mod tests {
                 requests(1000, 0, 0),
                 Vec::new(),
                 std::collections::HashMap::new(),
+                Vec::new(),
             );
             guard.assume(
                 "default",
@@ -7586,6 +7734,7 @@ mod tests {
                 requests(1000, 0, 0),
                 Vec::new(),
                 std::collections::HashMap::new(),
+                Vec::new(),
             );
         }
 
@@ -7662,6 +7811,7 @@ mod tests {
                     requests(1000, 0, 0),
                     Vec::new(),
                     std::collections::HashMap::new(),
+                    Vec::new(),
                 );
             }
         }
@@ -7772,6 +7922,7 @@ mod tests {
                 requests(1000, 0, 0),
                 Vec::new(),
                 std::collections::HashMap::new(),
+                Vec::new(),
             );
             guard.assume(
                 "default",
@@ -7781,6 +7932,7 @@ mod tests {
                 requests(1000, 0, 0),
                 Vec::new(),
                 std::collections::HashMap::new(),
+                Vec::new(),
             );
         }
         // Saturated by the two fillers — the first plan needs to evict
@@ -7844,6 +7996,7 @@ mod tests {
             requests(1000, 0, 0),
             Vec::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
         );
 
         let mut node = make_node_with_capacity("worker-0", &[], "110");
@@ -7877,6 +8030,7 @@ mod tests {
             requests(1000, 0, 0),
             Vec::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
         );
 
         // Now saturated by preemptor-1 + the recreated filler-a; a second
@@ -7978,6 +8132,7 @@ mod tests {
                 ResourceRequests::default(),
                 Vec::new(),
                 [("app".to_owned(), "web".to_owned())].into(),
+                Vec::new(),
             );
             // zone-b's only slot is occupied by an unrelated low-priority
             // filler, so zone-b ALSO needs preemption — this pod cannot
@@ -7991,6 +8146,7 @@ mod tests {
                 ResourceRequests::default(),
                 Vec::new(),
                 [("app".to_owned(), "other".to_owned())].into(),
+                Vec::new(),
             );
         }
         let tallied_pods = tally
@@ -8078,6 +8234,7 @@ mod tests {
                 ResourceRequests::default(),
                 Vec::new(),
                 [("app".to_owned(), "web".to_owned())].into(),
+                Vec::new(),
             );
             // node-a2's occupant is ALSO a matching sibling, but too
             // high-priority to ever be selected as a victim — it must
@@ -8091,6 +8248,7 @@ mod tests {
                 ResourceRequests::default(),
                 Vec::new(),
                 [("app".to_owned(), "web".to_owned())].into(),
+                Vec::new(),
             );
             // zone-b's only slot is an unrelated low-priority filler, so
             // zone-b needs preemption too but carries no matching sibling.
@@ -8102,6 +8260,7 @@ mod tests {
                 ResourceRequests::default(),
                 Vec::new(),
                 [("app".to_owned(), "other".to_owned())].into(),
+                Vec::new(),
             );
         }
         let tallied_pods = tally
@@ -8177,6 +8336,7 @@ mod tests {
                 ResourceRequests::default(),
                 Vec::new(),
                 [("app".to_owned(), "web".to_owned())].into(),
+                Vec::new(),
             );
             guard.assume(
                 "default",
@@ -8186,6 +8346,7 @@ mod tests {
                 ResourceRequests::default(),
                 Vec::new(),
                 [("app".to_owned(), "other".to_owned())].into(),
+                Vec::new(),
             );
         }
         let tallied_pods = tally
@@ -8226,6 +8387,7 @@ mod tests {
             requests(8000, 0, 0),
             Vec::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
         );
         tally.remove("default", "filler");
 
@@ -8290,6 +8452,7 @@ mod tests {
             requests(1000, 0, 0),
             Vec::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
         );
 
         // Mirrors the nominatedNodeName status PATCH's watch-echo: same pod,
@@ -8522,6 +8685,7 @@ mod tests {
             ResourceRequests::default(),
             pod_a.host_ports.clone(),
             pod_a.labels.clone(),
+            pod_a.pvc_names.clone(),
         );
 
         // No `apply_event` call in between — pod-b's decision must not need
@@ -8706,6 +8870,7 @@ mod tests {
             ResourceRequests::default(),
             Vec::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
         );
         tally.register_preemption_waiter(
             preemptor,
@@ -8839,6 +9004,7 @@ mod tests {
             pod.requests.clone(),
             Vec::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
         );
 
         // Baseline: with nothing else on the node, the reservation still
@@ -8859,6 +9025,7 @@ mod tests {
             requests(1000, 0, 0),
             Vec::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
         );
 
         assert!(
@@ -9347,6 +9514,7 @@ mod tests {
                 pod_count: 1,
                 requests: requests(4000, 0, 0), // node already fully committed at 4 cores
                 host_ports: Vec::new(),
+                pvc_names: Vec::new(),
             },
         )]
         .into();
@@ -9374,6 +9542,7 @@ mod tests {
                 pod_count: 1,
                 requests: requests(1000, 0, 0), // 1 of 4 cores already used
                 host_ports: Vec::new(),
+                pvc_names: Vec::new(),
             },
         )]
         .into();
@@ -9596,6 +9765,7 @@ mod tests {
             key: key.to_owned(),
             priority,
             requests: ResourceRequests::default(),
+            pvc_names: Vec::new(),
         }
     }
 
@@ -9609,6 +9779,7 @@ mod tests {
             key: key.to_owned(),
             priority,
             requests,
+            pvc_names: Vec::new(),
         }
     }
 
@@ -10346,5 +10517,170 @@ mod tests {
         let name = select_node_with_capacity(list, &pod, &usage, &[])
             .expect("a node with enough remaining CSI attach headroom must be selected");
         assert_eq!(name, "worker-0");
+    }
+
+    // ---------------------------------------------------------------------------
+    // read_write_once_pod_conflict_free / read_write_once_pod_preemption_victims
+    // — the VolumeRestrictions/ReadWriteOncePod predicate. A PVC with the
+    // ReadWriteOncePod access mode is Kubernetes' strictest volume guarantee:
+    // at most ONE pod, cluster-wide, may use it at a time. Before this
+    // predicate existed, two pods mounting the same ReadWriteOncePod PVC could
+    // both bind to the same node with no conflict detected at all — the exact
+    // bug the csi-hostpath RWOP preemption conformance test caught.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn read_write_once_pod_conflict_free_rejects_a_node_already_using_the_pvc() {
+        let node_pvc_names = vec!["data-pvc".to_owned()];
+        let rwop_pvcs = vec!["data-pvc".to_owned()];
+        assert!(
+            !read_write_once_pod_conflict_free(&node_pvc_names, &rwop_pvcs),
+            "a node where another pod already references the SAME ReadWriteOncePod \
+             PVC must not be usable — Kubernetes guarantees at most one pod may \
+             mount it at a time"
+        );
+    }
+
+    #[test]
+    fn read_write_once_pod_conflict_free_allows_a_node_with_no_overlapping_pvc() {
+        let node_pvc_names = vec!["other-pvc".to_owned()];
+        let rwop_pvcs = vec!["data-pvc".to_owned()];
+        assert!(
+            read_write_once_pod_conflict_free(&node_pvc_names, &rwop_pvcs),
+            "an unrelated PVC on the node must never block a pod wanting a \
+             DIFFERENT ReadWriteOncePod PVC"
+        );
+    }
+
+    #[test]
+    fn read_write_once_pod_conflict_free_is_true_when_pod_has_no_rwop_pvcs() {
+        let node_pvc_names = vec!["data-pvc".to_owned()];
+        assert!(
+            read_write_once_pod_conflict_free(&node_pvc_names, &[]),
+            "a pod with no ReadWriteOncePod PVCs at all must never be blocked by \
+             this predicate, regardless of what else is on the node"
+        );
+    }
+
+    #[test]
+    fn select_node_with_capacity_rejects_a_node_where_another_pod_already_uses_the_rwop_pvc() {
+        // Regression test: before this predicate existed, `select_node_with_capacity`
+        // had no notion of PVC access modes at all, so a second pod wanting the
+        // same ReadWriteOncePod PVC as an already-tallied pod on this node would
+        // have been bound right alongside it.
+        let list = NodeList {
+            items: vec![make_node("worker-0", &[])],
+        };
+        let mut pod = empty_pending_pod();
+        pod.read_write_once_pod_pvcs = vec!["data-pvc".to_owned()];
+        let usage: std::collections::HashMap<String, NodeUsage> = [(
+            "worker-0".to_owned(),
+            NodeUsage {
+                pvc_names: vec!["data-pvc".to_owned()],
+                ..Default::default()
+            },
+        )]
+        .into();
+        let result = select_node_with_capacity(list, &pod, &usage, &[]);
+        assert!(
+            result.is_err(),
+            "a node already running a pod that holds this pod's ReadWriteOncePod \
+             PVC must be rejected, not selected"
+        );
+    }
+
+    #[test]
+    fn read_write_once_pod_preemption_victims_targets_the_lower_priority_pvc_holder() {
+        let node_pods = vec![NodePod {
+            key: "default/holder".to_owned(),
+            priority: 0,
+            requests: ResourceRequests::default(),
+            pvc_names: vec!["data-pvc".to_owned()],
+        }];
+        let victims =
+            read_write_once_pod_preemption_victims(&node_pods, &["data-pvc".to_owned()], 1000)
+                .expect("a strictly-lower-priority holder must always be a legal victim");
+        assert_eq!(
+            victims,
+            vec!["default/holder".to_owned()],
+            "the pod holding the contended ReadWriteOncePod PVC must be named as \
+             a mandatory victim — nothing else on the node is even relevant to \
+             this conflict"
+        );
+    }
+
+    #[test]
+    fn read_write_once_pod_preemption_victims_refuses_when_holder_priority_is_not_lower() {
+        // kube-scheduler (and this scheduler) never preempts an equal-or-higher
+        // priority pod. If this returned Some(victims) here, a same-priority
+        // pod could be evicted just for holding a contended volume — violating
+        // the priority guarantee preemption exists to respect.
+        let node_pods = vec![NodePod {
+            key: "default/holder".to_owned(),
+            priority: 1000,
+            requests: ResourceRequests::default(),
+            pvc_names: vec!["data-pvc".to_owned()],
+        }];
+        let victims =
+            read_write_once_pod_preemption_victims(&node_pods, &["data-pvc".to_owned()], 1000);
+        assert!(
+            victims.is_none(),
+            "a same-or-higher-priority PVC holder must make this node permanently \
+             non-viable for preemption, not silently offer it as a victim"
+        );
+    }
+
+    #[test]
+    fn find_preemption_candidate_evicts_the_pod_holding_a_conflicting_read_write_once_pod_pvc() {
+        // The exact csi-hostpath RWOP conformance scenario: pod1 (default
+        // priority) holds a ReadWriteOncePod PVC and runs with room to spare;
+        // pod2 (higher priority) wants the SAME PVC. Direct scheduling already
+        // rejects every node (read_write_once_pod_conflict_free), so this is
+        // the ONLY path that can ever get pod2 running — if it doesn't select
+        // pod1 as a victim, pod2 stays Pending forever despite outranking pod1.
+        let list = NodeList {
+            items: vec![make_node_with_capacity("worker-0", &[], "110")],
+        };
+        let node_labels_by_name: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = list
+            .items
+            .iter()
+            .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+            .collect();
+        let tally = std::sync::Mutex::new(NodeTally::default());
+        tally.lock().expect("tally lock poisoned").assume(
+            "default",
+            "pod1",
+            "worker-0",
+            0,
+            ResourceRequests::default(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            vec!["data-pvc".to_owned()],
+        );
+        let tallied_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .tallied_pod_labels();
+
+        let mut pod2 = empty_pending_pod();
+        pod2.pod_name = "pod2".to_owned();
+        pod2.priority = 1000;
+        pod2.read_write_once_pod_pvcs = vec!["data-pvc".to_owned()];
+
+        let (_, plan) =
+            find_preemption_candidate(&list, &pod2, &tallied_pods, &node_labels_by_name, &tally)
+                .expect(
+                    "evicting pod1 fully resolves the RWOP conflict — this node must \
+                     be a viable preemption target",
+                );
+        assert_eq!(
+            plan.victims,
+            vec!["default/pod1".to_owned()],
+            "pod1 is the only thing blocking pod2 (plenty of spare cpu/memory/pod \
+             slots) — it must be the preemption plan's sole victim"
+        );
     }
 }

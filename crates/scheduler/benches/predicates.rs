@@ -32,6 +32,7 @@ fn realistic_pending_pod() -> PendingPod {
         pv_node_affinities: Vec::new(),
         topology_spread_constraints: Vec::new(),
         csi_volume_counts: Default::default(),
+        read_write_once_pod_pvcs: Vec::new(),
     }
 }
 

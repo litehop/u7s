@@ -31,9 +31,10 @@ use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use crate::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
     failed_scheduling_status_patch, fetch_bound_pv_node_affinities, fetch_csi_volume_counts,
-    fetch_node, find_preemption_plan, http_get, is_bind_already_assigned, needs_scheduling,
-    nominated_node_name_patch, patch_pod_status, pick_node, pods_needing_resync,
-    preemption_reservation_still_fits, scheduling_gate_status_patch, scheduling_gate_status_reset,
+    fetch_node, fetch_read_write_once_pod_pvc_names, find_preemption_plan, http_get,
+    is_bind_already_assigned, needs_scheduling, nominated_node_name_patch, patch_pod_status,
+    pick_node, pods_needing_resync, preemption_reservation_still_fits,
+    scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
     stamp_selected_node_for_pvcs, stream_watch_events, BindError, NodeTally, PendingPod, PodList,
 };
@@ -625,6 +626,32 @@ fn handle_pod_event(
                     return;
                 }
             }
+            // Same reasoning again, for the VolumeRestrictions/
+            // ReadWriteOncePod predicate: without this, a pod's PVCs never
+            // get checked for the ReadWriteOncePod access mode, so
+            // `read_write_once_pod_conflict_free` always sees an empty
+            // want-set and two pods can be bound onto the same node sharing
+            // a volume Kubernetes guarantees at most one pod may use at a time.
+            match fetch_read_write_once_pod_pvc_names(
+                &connector_clone,
+                &server_clone,
+                &namespace,
+                &pending.pvc_names,
+            )
+            .await
+            {
+                Ok(names) => pending.read_write_once_pod_pvcs = names,
+                Err(e) => {
+                    error!(
+                        "could not resolve ReadWriteOncePod PVCs while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"
+                    );
+                    in_flight_clone
+                        .lock()
+                        .expect("in_flight lock poisoned")
+                        .remove(&key);
+                    return;
+                }
+            }
         }
         // Ok(node_name) on a successful bind, Err on any failure to schedule
         // (no node fits, even after preemption) or to bind. Distinguishing
@@ -1129,6 +1156,7 @@ mod tests {
                 },
                 Vec::new(),
                 std::collections::HashMap::new(),
+                Vec::new(),
             );
             guard.assume(
                 "default",
@@ -1141,6 +1169,7 @@ mod tests {
                 },
                 Vec::new(),
                 std::collections::HashMap::new(),
+                Vec::new(),
             );
         }
 
