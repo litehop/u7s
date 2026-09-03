@@ -1,5 +1,5 @@
 // This module provides the RBAC engine; callers (handlers) are added by other workers.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -77,8 +77,25 @@ struct RbacInner {
     // fallback branch racing the primary create path — both target the same
     // ClusterRoleBinding) are reordered by the store's blocking-threadpool
     // scheduling relative to the order their writes actually committed.
+    //
+    // remove_object intentionally does NOT clear a key's entry here: the floor
+    // must survive delete so a stale apply_object racing behind a delete can't
+    // resurrect the deleted object into the authorizer index (it would fail the
+    // floor check in accept_update instead). resource_version_order tracks
+    // first-seen insertion order so the map can be capped at
+    // MAX_TRACKED_RESOURCE_VERSIONS — otherwise create/delete churn on RBAC
+    // objects would grow this map forever.
     resource_versions: HashMap<String, u64>,
+    resource_version_order: VecDeque<String>,
 }
+
+/// Cap on `resource_versions` entries (live keys plus delete tombstones). RBAC
+/// object counts (Roles/ClusterRoles/bindings) in a real cluster are in the
+/// hundreds to low thousands, so this comfortably covers normal usage while
+/// bounding worst-case memory under adversarial create/delete churn to a few
+/// hundred KB. Eviction is FIFO by first-seen key: the oldest tracked key
+/// (live or tombstoned) is dropped first once the cap is exceeded.
+const MAX_TRACKED_RESOURCE_VERSIONS: usize = 4096;
 
 impl RbacIndex {
     pub fn new() -> Self {
@@ -89,6 +106,7 @@ impl RbacIndex {
                 cluster_bindings: Vec::new(),
                 namespace_bindings: Vec::new(),
                 resource_versions: HashMap::new(),
+                resource_version_order: VecDeque::new(),
             })),
         }
     }
@@ -100,21 +118,37 @@ impl RbacIndex {
         //   /apis/rbac.authorization.k8s.io/v1/namespaces/<ns>/roles/<name>
         //   /apis/rbac.authorization.k8s.io/v1/clusterrolebindings/<name>
         //   /apis/rbac.authorization.k8s.io/v1/namespaces/<ns>/rolebindings/<name>
-        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        // Reborrow as a plain reference so the disjoint resource_versions /
+        // resource_version_order field borrows below type-check: two `&mut
+        // guard.field` calls both go through RwLockWriteGuard's DerefMut, which
+        // the borrow checker can't prove disjoint, but two `&mut inner.field`
+        // through a plain `&mut RbacInner` can.
+        let inner = &mut *guard;
         let incoming_rv = value["metadata"]["resourceVersion"]
             .as_str()
             .and_then(|s| s.parse::<u64>().ok());
 
         if key.contains("/clusterroles/") {
             if let Ok(role) = serde_json::from_value::<RbacRole>(value.clone()) {
-                if accept_update(&mut inner.resource_versions, key, incoming_rv) {
+                if accept_update(
+                    &mut inner.resource_versions,
+                    &mut inner.resource_version_order,
+                    key,
+                    incoming_rv,
+                ) {
                     let name = extract_last_segment(key);
                     inner.cluster_roles.insert(name, role.rules);
                 }
             }
         } else if key.contains("/clusterrolebindings/") {
             if let Ok(binding) = serde_json::from_value::<RbacBinding>(value.clone()) {
-                if accept_update(&mut inner.resource_versions, key, incoming_rv) {
+                if accept_update(
+                    &mut inner.resource_versions,
+                    &mut inner.resource_version_order,
+                    key,
+                    incoming_rv,
+                ) {
                     // Remove old entry with this key first, then push.
                     inner.cluster_bindings.retain(|(k, _)| k != key);
                     inner.cluster_bindings.push((key.to_owned(), binding));
@@ -122,7 +156,12 @@ impl RbacIndex {
             }
         } else if key.contains("/roles/") {
             if let Ok(role) = serde_json::from_value::<RbacRole>(value.clone()) {
-                if accept_update(&mut inner.resource_versions, key, incoming_rv) {
+                if accept_update(
+                    &mut inner.resource_versions,
+                    &mut inner.resource_version_order,
+                    key,
+                    incoming_rv,
+                ) {
                     let ns = extract_namespace(key).unwrap_or_default();
                     let name = extract_last_segment(key);
                     inner.roles.insert((ns, name), role.rules);
@@ -139,7 +178,12 @@ impl RbacIndex {
                 if binding.namespace.is_none() {
                     binding.namespace = extract_namespace(key);
                 }
-                if accept_update(&mut inner.resource_versions, key, incoming_rv) {
+                if accept_update(
+                    &mut inner.resource_versions,
+                    &mut inner.resource_version_order,
+                    key,
+                    incoming_rv,
+                ) {
                     inner.namespace_bindings.retain(|(k, _)| k != key);
                     inner.namespace_bindings.push((key.to_owned(), binding));
                 }
@@ -150,7 +194,12 @@ impl RbacIndex {
     /// Remove a role or binding when its store object is deleted.
     pub fn remove_object(&self, key: &str) {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        inner.resource_versions.remove(key);
+        // Deliberately does NOT clear resource_versions[key]: that entry is the
+        // rV floor a stale, delayed apply_object (from an earlier in-flight
+        // create-race) must not be able to beat. Clearing it here would let
+        // such a stale apply resurrect this just-deleted object right back
+        // into the index. See accept_update and MAX_TRACKED_RESOURCE_VERSIONS
+        // for how the floor is bounded so tombstones don't accumulate forever.
 
         if key.contains("/clusterroles/") {
             let name = extract_last_segment(key);
@@ -447,19 +496,34 @@ pub fn user_holds_all_rules_in_namespace(
 /// Decides whether an `apply_object` update for `key` should be applied, given the
 /// object's resourceVersion (`None` for callers — mostly tests and bootstrap fixtures
 /// — that don't carry one). An object with no resourceVersion always applies, matching
-/// prior behavior. Otherwise the update is rejected if a strictly newer resourceVersion
-/// was already recorded for this key, and accepted (recording `rv`) otherwise — so two
-/// concurrent writers indexing the same key converge on whichever one actually holds
-/// the higher (i.e. more recently persisted) resourceVersion, regardless of which
-/// caller's `apply_object` call happens to run last.
-fn accept_update(versions: &mut HashMap<String, u64>, key: &str, incoming_rv: Option<u64>) -> bool {
+/// prior behavior. Otherwise the update is rejected if a resourceVersion at or above
+/// `rv` was already recorded for this key, and accepted (recording `rv`) otherwise —
+/// so two concurrent writers indexing the same key converge on whichever one actually
+/// holds the higher (i.e. more recently persisted) resourceVersion, regardless of
+/// which caller's `apply_object` call happens to run last. The reject condition is
+/// `>=` rather than `>` so that a floor left behind by `remove_object` (the deleted
+/// object's exact last-seen rV) also blocks a same-rV resurrection, not just a
+/// strictly-older one.
+fn accept_update(
+    versions: &mut HashMap<String, u64>,
+    order: &mut VecDeque<String>,
+    key: &str,
+    incoming_rv: Option<u64>,
+) -> bool {
     match incoming_rv {
         None => true,
         Some(rv) => {
-            if versions.get(key).is_some_and(|&recorded| recorded > rv) {
+            if versions.get(key).is_some_and(|&recorded| recorded >= rv) {
                 false
             } else {
-                versions.insert(key.to_owned(), rv);
+                if versions.insert(key.to_owned(), rv).is_none() {
+                    order.push_back(key.to_owned());
+                    if order.len() > MAX_TRACKED_RESOURCE_VERSIONS {
+                        if let Some(evicted) = order.pop_front() {
+                            versions.remove(&evicted);
+                        }
+                    }
+                }
                 true
             }
         }
@@ -2286,6 +2350,159 @@ mod tests {
              carried a lower resourceVersion than what's already indexed, so applying it \
              would leave the authorizer's index diverged from the object actually \
              persisted in the store"
+        );
+    }
+
+    fn tracked_resource_version_count(idx: &RbacIndex) -> usize {
+        idx.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .resource_versions
+            .len()
+    }
+
+    #[test]
+    fn remove_object_keeps_rv_floor_so_a_stale_apply_cannot_resurrect_a_deleted_binding() {
+        // PR #1546 added a per-key resourceVersion floor so two racing apply_object
+        // calls for the same key converge on whichever carries the higher (i.e.
+        // actually persisted) resourceVersion. But if delete wiped that floor, a
+        // stale apply_object from an earlier in-flight create-race could arrive
+        // *after* the delete and re-insert the binding — resurrecting access for a
+        // subject an operator explicitly removed. That's stale authorization after
+        // delete: the subject must stay denied no matter when the stale call lands.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-lister",
+            json!([{ "apiGroups": [""], "resources": ["pods"], "verbs": ["list"] }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        let bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/crb-resurrect".to_owned();
+        let binding_at_rv = |rv: &str| {
+            json!({
+                "metadata": { "resourceVersion": rv },
+                "subjects": [{ "kind": "User", "name": "removed-sa" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "pod-lister"
+                }
+            })
+        };
+
+        idx.apply_object(&bind_key, &binding_at_rv("5"));
+        let groups: Vec<String> = vec![];
+        let removed_req = req("removed-sa", &groups, "list", "pods", "", None, None);
+        assert!(
+            idx.is_allowed(&removed_req),
+            "sanity check: the binding must actually grant access before it's deleted"
+        );
+
+        idx.remove_object(&bind_key);
+        assert!(
+            !idx.is_allowed(&removed_req),
+            "deleting the ClusterRoleBinding must immediately de-authorize its subject"
+        );
+
+        // A delayed apply_object from an earlier in-flight create-race arrives after
+        // the delete, carrying a resourceVersion strictly below the deleted object's
+        // last-seen rV (5) — exactly the reordering that would resurrect the binding
+        // if remove_object had cleared the rV floor instead of keeping it.
+        idx.apply_object(&bind_key, &binding_at_rv("3"));
+        assert!(
+            !idx.is_allowed(&removed_req),
+            "a stale apply_object (lower resourceVersion than the deleted object's \
+             last-seen rV) arriving after delete must NOT resurrect the binding — the \
+             subject must stay de-authorized"
+        );
+
+        // A delayed replay carrying the *exact* rV the deleted object last held must
+        // also be rejected — the object is gone, and re-applying its exact last state
+        // is still a resurrection, not a no-op.
+        idx.apply_object(&bind_key, &binding_at_rv("5"));
+        assert!(
+            !idx.is_allowed(&removed_req),
+            "a delayed replay of the exact resourceVersion the deleted object last held \
+             must also be rejected, not just strictly-older ones"
+        );
+    }
+
+    #[test]
+    fn remove_object_still_allows_a_genuine_recreate_with_a_newer_resource_version() {
+        // The rV floor left behind by delete must only block *stale* resurrection,
+        // not a legitimate recreate: if an operator deletes a ClusterRoleBinding and
+        // then creates a new one under the same name, the new object always gets a
+        // strictly higher resourceVersion from the store and must be indexed
+        // normally — the floor must not permanently wall off the key.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-lister",
+            json!([{ "apiGroups": [""], "resources": ["pods"], "verbs": ["list"] }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        let bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/crb-recreate".to_owned();
+        let binding_at_rv = |subject: &str, rv: &str| {
+            json!({
+                "metadata": { "resourceVersion": rv },
+                "subjects": [{ "kind": "User", "name": subject }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "pod-lister"
+                }
+            })
+        };
+
+        idx.apply_object(&bind_key, &binding_at_rv("old-sa", "5"));
+        idx.remove_object(&bind_key);
+        idx.apply_object(&bind_key, &binding_at_rv("new-sa", "6"));
+
+        let groups: Vec<String> = vec![];
+        let new_req = req("new-sa", &groups, "list", "pods", "", None, None);
+        assert!(
+            idx.is_allowed(&new_req),
+            "recreating the binding with a genuinely newer resourceVersion after \
+             delete must still authorize the new subject — the delete tombstone must \
+             not permanently block this key from being reused"
+        );
+    }
+
+    #[test]
+    fn resource_versions_floor_map_stays_bounded_under_sustained_create_delete_churn() {
+        // remove_object deliberately keeps a deleted key's rV floor (see the
+        // resurrection tests above), so unlike before, delete no longer shrinks
+        // resource_versions. Without a cap, a long-running cluster or a noisy
+        // create/delete loop would grow this map forever — a slow memory leak.
+        // MAX_TRACKED_RESOURCE_VERSIONS must keep it bounded.
+        let idx = RbacIndex::new();
+        let churn = MAX_TRACKED_RESOURCE_VERSIONS + 500;
+        for i in 0..churn {
+            let key = format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/churn-{i}");
+            let val = json!({
+                "metadata": { "resourceVersion": (i + 1).to_string() },
+                "subjects": [{ "kind": "User", "name": "irrelevant" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "irrelevant"
+                }
+            });
+            idx.apply_object(&key, &val);
+            idx.remove_object(&key);
+        }
+
+        let tracked = tracked_resource_version_count(&idx);
+        assert!(
+            tracked <= MAX_TRACKED_RESOURCE_VERSIONS,
+            "resource_versions must stay capped at MAX_TRACKED_RESOURCE_VERSIONS \
+             ({MAX_TRACKED_RESOURCE_VERSIONS}) even after {churn} create/delete \
+             cycles, but has {tracked} entries — an unbounded map here would be a \
+             slow memory leak on any cluster with routine RBAC object churn"
         );
     }
 }
