@@ -1673,6 +1673,24 @@ async fn check_pdb_allows_eviction<S: Store>(
     }
 
     if let Some(pdb) = matching.first() {
+        // Upstream (pkg/registry/core/pod/storage/eviction.go): a healthy (Ready) pod is
+        // always subject to the budget. An unhealthy pod bypasses `disruptionsAllowed`
+        // under AlwaysAllow, or under the default/IfHealthyBudget policy when the budget
+        // is already met — evicting a pod that isn't serving traffic doesn't disrupt the
+        // application further, so operators shouldn't be blocked from clearing it out.
+        if !is_pod_ready(pod) {
+            let always_allow =
+                pdb["spec"]["unhealthyPodEvictionPolicy"].as_str() == Some("AlwaysAllow");
+            if always_allow {
+                return Ok(());
+            }
+            let current_healthy = pdb["status"]["currentHealthy"].as_i64().unwrap_or(0);
+            let desired_healthy = pdb["status"]["desiredHealthy"].as_i64().unwrap_or(0);
+            if desired_healthy > 0 && current_healthy >= desired_healthy {
+                return Ok(());
+            }
+        }
+
         let disruptions_allowed = pdb["status"]["disruptionsAllowed"].as_i64().unwrap_or(0);
         if disruptions_allowed <= 0 {
             let message =
@@ -1686,6 +1704,18 @@ async fn check_pdb_allows_eviction<S: Store>(
     }
 
     Ok(())
+}
+
+/// A pod is healthy for PDB eviction purposes iff it has a `Ready` condition with
+/// `status: "True"`, matching upstream's `podutil.IsPodReady` check in the eviction path.
+fn is_pod_ready(pod: &serde_json::Value) -> bool {
+    pod["status"]["conditions"]
+        .as_array()
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|c| c["type"] == "Ready" && c["status"] == "True")
+        })
 }
 
 /// Set (or refresh) the pod's `DisruptionTarget` condition so pod-failure-policy consumers
@@ -12565,6 +12595,281 @@ mod handler_tests {
             v["metadata"]["deletionTimestamp"].is_null(),
             "a PDB-blocked eviction must not stamp deletionTimestamp — the pod was never \
              actually terminated"
+        );
+    }
+
+    /// `unhealthyPodEvictionPolicy: AlwaysAllow` must permit evicting a NotReady pod even
+    /// when `disruptionsAllowed: 0`.
+    ///
+    /// AlwaysAllow exists so an operator can clear out pods that are already broken (crash
+    /// looping, failing readiness) without waiting on other pods to become healthy first —
+    /// a resource-constrained cluster that can't evict its unready pods can never recover.
+    /// This test fails on revert: without policy handling, `check_pdb_allows_eviction` looks
+    /// only at `disruptionsAllowed` and would return 429 here.
+    #[tokio::test]
+    async fn evict_pod_always_allow_permits_unready_pod_despite_exhausted_budget() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "web-0",
+            serde_json::json!({
+                "metadata": {"name": "web-0", "namespace": "default", "resourceVersion": "1", "labels": {"app": "web"}},
+                "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "False"}]}
+            }),
+        )
+        .await;
+
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "web" } },
+                "unhealthyPodEvictionPolicy": "AlwaysAllow"
+            },
+            "status": { "disruptionsAllowed": 0, "currentHealthy": 0, "desiredHealthy": 1 }
+        });
+        store
+            .put(
+                "/registry/policy/poddisruptionbudgets/default/web-pdb",
+                Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-0", "namespace": "default" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&eviction_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "AlwaysAllow must permit evicting a NotReady pod regardless of disruptionsAllowed"
+        );
+    }
+
+    /// `AlwaysAllow` only exempts unhealthy pods — a Ready pod covered by the same PDB must
+    /// still be blocked when `disruptionsAllowed: 0`.
+    ///
+    /// If the policy check bypassed the budget for every pod instead of gating on health
+    /// first, `kubectl drain` could evict an entire healthy Deployment at once through a PDB
+    /// that only meant to fast-track already-broken pods — the exact outage the budget exists
+    /// to prevent. This test fails on revert to a "policy always wins" implementation.
+    #[tokio::test]
+    async fn evict_pod_always_allow_does_not_exempt_ready_pod_from_budget() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "web-0",
+            serde_json::json!({
+                "metadata": {"name": "web-0", "namespace": "default", "resourceVersion": "1", "labels": {"app": "web"}},
+                "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+            }),
+        )
+        .await;
+
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "web" } },
+                "unhealthyPodEvictionPolicy": "AlwaysAllow"
+            },
+            "status": { "disruptionsAllowed": 0, "currentHealthy": 1, "desiredHealthy": 1 }
+        });
+        store
+            .put(
+                "/registry/policy/poddisruptionbudgets/default/web-pdb",
+                Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-0", "namespace": "default" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&eviction_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a Ready pod must remain subject to the budget even under AlwaysAllow — the \
+             policy only relaxes eviction of pods that are already unhealthy"
+        );
+    }
+
+    /// Under the default policy (no `unhealthyPodEvictionPolicy` set, equivalent to
+    /// `IfHealthyBudget`), a NotReady pod must be evictable once the budget is already met
+    /// (`currentHealthy >= desiredHealthy`), even with `disruptionsAllowed: 0`.
+    ///
+    /// Evicting a pod that isn't serving traffic doesn't reduce the application's actual
+    /// availability, so an operator draining a node shouldn't be stuck waiting for
+    /// `disruptionsAllowed` to reflect that. This test fails on revert: before this fix,
+    /// `check_pdb_allows_eviction` only ever looked at `disruptionsAllowed`.
+    #[tokio::test]
+    async fn evict_pod_default_policy_permits_unready_pod_when_budget_already_met() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "web-0",
+            serde_json::json!({
+                "metadata": {"name": "web-0", "namespace": "default", "resourceVersion": "1", "labels": {"app": "web"}},
+                "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "False"}]}
+            }),
+        )
+        .await;
+
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default" },
+            "spec": { "selector": { "matchLabels": { "app": "web" } } },
+            "status": { "disruptionsAllowed": 0, "currentHealthy": 2, "desiredHealthy": 2 }
+        });
+        store
+            .put(
+                "/registry/policy/poddisruptionbudgets/default/web-pdb",
+                Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-0", "namespace": "default" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&eviction_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "default (IfHealthyBudget) policy must permit evicting an unready pod once the \
+             budget is already met, regardless of disruptionsAllowed"
+        );
+    }
+
+    /// Under `IfHealthyBudget`, a NotReady pod must still be blocked when the budget is NOT
+    /// met (`currentHealthy < desiredHealthy`) — the unhealthy-pod exemption only applies once
+    /// the application is already back to full health.
+    ///
+    /// Without this guard, an unready pod would always bypass the budget under
+    /// IfHealthyBudget/Default, collapsing it to AlwaysAllow — letting a drain evict every
+    /// unready pod of a struggling application while it's still below its desired healthy
+    /// count, the opposite of what IfHealthyBudget promises.
+    #[tokio::test]
+    async fn evict_pod_if_healthy_budget_blocks_unready_pod_when_budget_not_met() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "web-0",
+            serde_json::json!({
+                "metadata": {"name": "web-0", "namespace": "default", "resourceVersion": "1", "labels": {"app": "web"}},
+                "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "False"}]}
+            }),
+        )
+        .await;
+
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "web" } },
+                "unhealthyPodEvictionPolicy": "IfHealthyBudget"
+            },
+            "status": { "disruptionsAllowed": 0, "currentHealthy": 1, "desiredHealthy": 2 }
+        });
+        store
+            .put(
+                "/registry/policy/poddisruptionbudgets/default/web-pdb",
+                Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-0", "namespace": "default" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&eviction_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "IfHealthyBudget must still block an unready pod while the budget is below its \
+             desired healthy count — the exemption is conditional, not unconditional"
         );
     }
 
