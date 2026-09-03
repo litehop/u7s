@@ -1748,18 +1748,19 @@ const REPLICATION_CONTROLLER: &str = ".k8s.io.api.core.v1.ReplicationController"
 const REPLICATION_CONTROLLER_SPEC: &str = ".k8s.io.api.core.v1.ReplicationControllerSpec";
 const REPLICATION_CONTROLLER_STATUS: &str = ".k8s.io.api.core.v1.ReplicationControllerStatus";
 
-/// `replicas` is unconditionally emitted, defaulting to 0 (matching the hand-rolled body this
-/// migration replaces exactly — upstream's own `+default=1` doc notwithstanding, since this
-/// decoder has never treated an absent `replicas` as anything other than 0 on the wire).
+/// `replicas` needs no entry: an absent `optional int32 replicas` must stay absent in the
+/// decoded JSON (not fabricate `0`) so `apply_defaults`'s "replicas defaults to 1 when unset"
+/// logic still sees it as unset — a protobuf-encoded create (the default content-type for every
+/// client-go typed Clientset, including kube-controller-manager's own controllers and e2e test
+/// clients) that omits `replicas` must still get the documented default of 1, not silently
+/// persist a scale-to-zero. The mechanical walker's default "emit whenever `Some`, no zero
+/// filter" int32 handling already does this correctly.
 /// `minReadySeconds` is a zero-filtered `optional int32`, the same class of guard as
 /// `PodStatus.observedGeneration`. `template` delegates to the existing hand-written
 /// `gen_pod_template_spec_to_json`. `selector` needs no entry: a genuine `map<string, string>`
 /// the mechanical walker already handles correctly.
 fn replicationcontroller_spec_delegated_field(field_name: &str) -> Option<&'static str> {
     match field_name {
-        "replicas" => Some(
-            "    spec_map.insert(\"replicas\".to_string(), serde_json::Value::Number(spec.replicas.unwrap_or(0).into()));\n",
-        ),
         "minReadySeconds" => Some(
             "    if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {\n        spec_map.insert(\"minReadySeconds\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
         ),
@@ -3702,28 +3703,27 @@ const REPLICASET_SPEC: &str = ".k8s.io.api.apps.v1.ReplicaSetSpec";
 const REPLICASET_STATUS: &str = ".k8s.io.api.apps.v1.ReplicaSetStatus";
 const CONTROLLER_REVISION: &str = ".k8s.io.api.apps.v1.ControllerRevision";
 
-/// `replicas` is unconditionally emitted, defaulting an unset field to `0` rather than omitting
-/// the key — matching every apps/v1 workload spec's own "the API always reports a concrete
-/// replica count" convention, the same shape `lease_spec_delegated_field`'s own zero-default
-/// fields document but inverted (always-emit instead of only-emit-if-nonzero). `selector`
-/// delegates wholesale to the hand-written `gen_apps_spec_to_json` (shared verbatim across all
-/// four apps/v1 workload kinds this migration touches) and, in the same statement, consumes
-/// `template` too — the mechanical walker has no per-field hook that lets two sibling proto
-/// fields merge into one JSON object, so `template`'s own entry below is a deliberate no-op.
-/// `strategy`'s own `rollingUpdate.maxUnavailable`/`.maxSurge` are `IntOrString`, opaque to the
-/// mechanical walker (it only special-cases `Quantity` by FQN), so the whole field delegates to
-/// the hand-written `gen_apps_int_or_string_to_json`. `minReadySeconds` is zero-filtered, unlike
-/// the mechanical walker's default no-filter int32 handling. `paused` is only ever emitted when
-/// `true`, never `false` — matching `kubectl rollout pause`/`resume`'s own asymmetric JSON patch,
-/// which only ever sets `paused: true` and unsets the field entirely to resume, never sends
-/// `paused: false`. `revisionHistoryLimit`/`progressDeadlineSeconds` need no entry: the
-/// mechanical walker's default "emit whenever `Some`, no zero filter" int32 handling already
-/// matches the pre-migration decoder exactly.
+/// `replicas` needs no entry: an absent `optional int32 replicas` must stay absent in the
+/// decoded JSON (not fabricate `0`) so `apply_defaults`'s "replicas defaults to 1 when unset"
+/// logic still sees it as unset — a protobuf-encoded create (the default content-type for every
+/// client-go typed Clientset, including kube-controller-manager's own controllers and e2e test
+/// clients) that omits `replicas` must still get the documented default of 1, not silently
+/// persist a scale-to-zero the ReplicaSet controller then dutifully honors by never creating a
+/// pod. `selector` delegates wholesale to the hand-written `gen_apps_spec_to_json` (shared
+/// verbatim across all four apps/v1 workload kinds this migration touches) and, in the same
+/// statement, consumes `template` too — the mechanical walker has no per-field hook that lets two
+/// sibling proto fields merge into one JSON object, so `template`'s own entry below is a
+/// deliberate no-op. `strategy`'s own `rollingUpdate.maxUnavailable`/`.maxSurge` are
+/// `IntOrString`, opaque to the mechanical walker (it only special-cases `Quantity` by FQN), so
+/// the whole field delegates to the hand-written `gen_apps_int_or_string_to_json`.
+/// `minReadySeconds` is zero-filtered, unlike the mechanical walker's default no-filter int32
+/// handling. `paused` is only ever emitted when `true`, never `false` — matching `kubectl rollout
+/// pause`/`resume`'s own asymmetric JSON patch, which only ever sets `paused: true` and unsets the
+/// field entirely to resume, never sends `paused: false`.
+/// `revisionHistoryLimit`/`progressDeadlineSeconds` need no entry either: the mechanical walker's
+/// default "emit whenever `Some`, no zero filter" int32 handling already matches.
 fn deployment_spec_delegated_field(field_name: &str) -> Option<&'static str> {
     match field_name {
-        "replicas" => Some(
-            "    m.insert(\"replicas\".to_string(), serde_json::Value::Number(spec.replicas.unwrap_or(0).into()));\n",
-        ),
         "selector" => Some(
             "    if let Some(serde_json::Value::Object(sm)) = gen_apps_spec_to_json(spec.selector, spec.template) {\n        m.extend(sm);\n    }\n",
         ),
@@ -3886,9 +3886,11 @@ pub fn generate_deployment(descriptor_bytes: &[u8]) -> String {
     out
 }
 
-/// `replicas`/`selector`+`template` mirror `deployment_spec_delegated_field`'s own entries
-/// exactly (StatefulSet shares the same "always report a concrete replica count" and
-/// selector/template merge trick). `volumeClaimTemplates` delegates wholesale to the hand-written
+/// `replicas` needs no entry, for the same reason `deployment_spec_delegated_field` gives:
+/// an absent `optional int32 replicas` must stay absent so `apply_defaults` still defaults it to
+/// 1, not silently persist a protobuf-fabricated `0`. `selector`+`template` mirror
+/// `deployment_spec_delegated_field`'s own selector/template merge trick.
+/// `volumeClaimTemplates` delegates wholesale to the hand-written
 /// `gen_persistent_volume_claim_to_json` (already covers `PersistentVolumeClaim`'s own
 /// completeness, tested separately in `core_gen_adapter.rs`) — this is the field StatefulSet
 /// exists for, per the type's own doc comment. `updateStrategy`'s own
@@ -3905,9 +3907,6 @@ pub fn generate_deployment(descriptor_bytes: &[u8]) -> String {
 /// pre-migration decoder exactly.
 fn statefulset_spec_delegated_field(field_name: &str) -> Option<&'static str> {
     match field_name {
-        "replicas" => Some(
-            "    m.insert(\"replicas\".to_string(), serde_json::Value::Number(spec.replicas.unwrap_or(0).into()));\n",
-        ),
         "selector" => Some(
             "    if let Some(serde_json::Value::Object(sm)) = gen_apps_spec_to_json(spec.selector, spec.template) {\n        m.extend(sm);\n    }\n",
         ),
@@ -4230,13 +4229,13 @@ pub fn generate_daemonset(descriptor_bytes: &[u8]) -> String {
     out
 }
 
-/// `replicas`/`selector`+`template` mirror `deployment_spec_delegated_field`'s own entries.
+/// `replicas` needs no entry, for the same reason `deployment_spec_delegated_field` gives: an
+/// absent `optional int32 replicas` must stay absent so `apply_defaults` still defaults it to 1,
+/// not silently persist a protobuf-fabricated `0` that leaves the ReplicaSet controller with
+/// nothing to do. `selector`+`template` mirror `deployment_spec_delegated_field`'s own entries.
 /// `minReadySeconds` is zero-filtered.
 fn replicaset_spec_delegated_field(field_name: &str) -> Option<&'static str> {
     match field_name {
-        "replicas" => Some(
-            "    m.insert(\"replicas\".to_string(), serde_json::Value::Number(spec.replicas.unwrap_or(0).into()));\n",
-        ),
         "minReadySeconds" => Some(
             "    if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {\n        m.insert(\"minReadySeconds\".to_string(), v.into());\n    }\n",
         ),

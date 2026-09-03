@@ -24,7 +24,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy
+      # save-if: only main writes the shared cache; branches restore it read-only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
         run: cargo clippy --workspace --tests --no-deps -- -D warnings
@@ -45,7 +48,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt
+      # save-if: only main writes the shared cache; branches restore it read-only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format check
         run: cargo fmt --check
@@ -68,7 +74,10 @@ jobs:
       # test-sensitive-conformance-gate-logic.sh builds and runs the real
       # u7s-junit-reuse-check binary (bd mayor-3k83f) -- needs cargo on PATH.
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # save-if: only main writes the shared cache; branches restore it read-only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run scripts/**/test-*-logic.sh + test-critical-reviewer-hook.sh + test-install-checksum.sh + test-release-tarball-licenses.sh + test-add-node-warning.sh
         run: |
@@ -88,6 +97,64 @@ jobs:
           rm -f "$tests_file"
           exit "$fail"
 
+  # crates/servicelb is its own nested workspace, excluded from the root
+  # Cargo.toml (its userspace loader links Linux-only syscalls, and its
+  # servicelb-ebpf sibling needs nightly + bpf-linker + -Z build-std=core),
+  # so it needs its own build gate instead of riding along with the other
+  # jobs' `cargo build --workspace`.
+  ebpf-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+        with:
+          components: clippy, rustfmt, rust-src
+      # save-if: only main writes the shared cache; branches restore it read-only.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: crates/servicelb
+
+      # `cargo install bpf-linker` needs a matching system LLVM (llvm-config
+      # on PATH) and isn't recommended for regular installs (bpf-linker's
+      # own build.rs warns as much) -- ubuntu-latest has no LLVM installed
+      # by default, so that failed outright. taiki-e/install-action fetches
+      # aya-rs/bpf-linker's prebuilt, hash-verified release binary instead.
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: bpf-linker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # `cargo fmt`/`clippy --manifest-path` silently no-op on a nested
+      # workspace when invoked from the outer u7s workspace's directory
+      # (verified: introducing a formatting error and re-running with
+      # --manifest-path alone stayed green) -- `working-directory` per
+      # step is what actually resolves into crates/servicelb's own
+      # nested workspace.
+      - name: Format check (u7s-servicelb + servicelb-ebpf)
+        working-directory: crates/servicelb
+        run: cargo fmt --check
+
+      - name: Clippy (u7s-servicelb loader)
+        working-directory: crates/servicelb
+        run: cargo clippy --tests -- -D warnings
+
+      # servicelb-ebpf is #![no_std] and only builds for bpfel-unknown-none;
+      # clippy needs the same target + build-std the real build uses, run
+      # separately from its own directory (u7s-servicelb's own clippy run
+      # above only type-checks it via build.rs, no lints).
+      - name: Clippy (servicelb-ebpf)
+        working-directory: crates/servicelb/servicelb-ebpf
+        run: cargo clippy --release --target bpfel-unknown-none -Z build-std=core -- -D warnings
+
+      - name: Build servicelb-ebpf + u7s-servicelb
+        working-directory: crates/servicelb
+        run: cargo build --release
+
   # runs the whole suite _and_ checks coverage too
   test-coverage:
     runs-on: ubuntu-latest
@@ -97,7 +164,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # save-if: only main writes the shared cache; branches restore it read-only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
