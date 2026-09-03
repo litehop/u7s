@@ -761,6 +761,7 @@ pub(crate) async fn get_pod<S: Store>(
 pub(crate) async fn replace_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    Query(replace_query): Query<super::json_patch::ReplaceQuery>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
@@ -890,7 +891,7 @@ pub(crate) async fn replace_pod<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run: replace_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     validate_pod_spec_immutable(&spec_before, &obj.body["spec"])
@@ -903,6 +904,12 @@ pub(crate) async fn replace_pod<S: Store>(
     // status the client's PUT body carried (see stored_status comment above) is
     // discarded in favor of the server's own record.
     obj.body["status"] = stored_status;
+
+    // Dry-run: validation and admission passed; return the would-be replaced object without
+    // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
+    if replace_query.is_dry_run() {
+        return Ok(Json(obj.body));
+    }
 
     // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
     // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
@@ -1138,6 +1145,10 @@ pub(crate) async fn delete_collection_pods<S: Store>(
     let requested_grace = delete_opts
         .grace_period_seconds
         .or(grace_query.grace_period_seconds);
+    // client-go's typed DeleteCollection() sends DryRun in the DeleteOptions body; a
+    // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let dry_run = delete_opts.is_dry_run() || super::json_patch::is_dry_run_header(&headers);
     let prefix = list_prefix("pods", ns.as_str());
 
     let resp = state
@@ -1176,6 +1187,13 @@ pub(crate) async fn delete_collection_pods<S: Store>(
             let already_terminating = meta.deletion_timestamp.is_some();
             let force_requested = requested_grace == Some(0);
             let hard_delete_now = !has_finalizers && (already_terminating || force_requested);
+
+            // Dry-run: validation passed; skip the actual write entirely (both the
+            // soft-delete branch and the hard-delete fallback below) for this pod.
+            if dry_run {
+                continue;
+            }
+
             if !hard_delete_now {
                 if already_terminating {
                     // Redundant re-DELETE of an already-Terminating, finalizer-carrying pod
@@ -1223,6 +1241,11 @@ pub(crate) async fn delete_collection_pods<S: Store>(
         if soft_deleted {
             continue;
         }
+        // Also covers the (unparseable-JSON) fallback case for a dry-run request: the
+        // `if dry_run { continue; }` above only runs for successfully-parsed items.
+        if dry_run {
+            continue;
+        }
         let _ = state.store.delete(&obj.key, None).await;
         if let Some(pod_name) = obj.key.rsplit('/').next() {
             state.node_graph.remove_pod(ns.as_str(), pod_name);
@@ -1255,6 +1278,10 @@ pub(crate) async fn delete_pod<S: Store>(
     let requested_grace = delete_opts
         .grace_period_seconds
         .or(grace_query.grace_period_seconds);
+    // client-go's typed Delete() sends DryRun in the DeleteOptions body; a raw/proxied
+    // caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let dry_run = delete_opts.is_dry_run() || super::json_patch::is_dry_run_header(&headers);
 
     let key = object_key("pods", ns.as_str(), &name);
 
@@ -1292,7 +1319,7 @@ pub(crate) async fn delete_pod<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
-            dry_run: false,
+            dry_run,
         };
         run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
@@ -1321,6 +1348,17 @@ pub(crate) async fn delete_pod<S: Store>(
         // with a minimal tombstone (no spec), and the container is never sent SIGTERM — it keeps
         // running indefinitely while the StatefulSet controller waits for the pod to terminate.
         if !has_finalizers && (already_terminating || force_requested) {
+            // Dry-run: validation passed and this is what a real DELETE would hard-delete;
+            // return the would-be Success status without persisting or running the quota
+            // refresh side effect below.
+            if dry_run {
+                return Ok(Json(serde_json::json!({
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "status": "Success",
+                    "code": 200
+                })));
+            }
             // Hard-delete: pod is already Terminating, or the caller forced it, and all
             // finalizers are gone. No resourceVersion precondition is passed here, so this
             // path cannot RevisionMismatch.
@@ -1384,6 +1422,14 @@ pub(crate) async fn delete_pod<S: Store>(
             let current_gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
             obj.body["metadata"]["generation"] = serde_json::json!(current_gen + 1);
         }
+
+        // Dry-run: validation passed and this is what a real DELETE would soft-delete to
+        // (deletionTimestamp stamped, or the shortened grace period applied); return it
+        // without persisting.
+        if dry_run {
+            return Ok(Json(obj.body));
+        }
+
         let expected_rv = parse_resource_version(obj.resource_version())?;
         match state.store.put(&key, obj.to_bytes(), expected_rv).await {
             Ok(new_rv) => {
@@ -1504,6 +1550,13 @@ pub(crate) async fn patch_pod<S: Store>(
             finalizers_empty,
             "patch_pod: post-patch hard-delete check"
         );
+        // Dry-run: validation passed; return the would-be patched object without persisting
+        // or hard-deleting — checked BEFORE the hard-delete branch below, since a patch that
+        // drains the last finalizer must not actually delete the pod under dryRun=All.
+        if patch_query.is_dry_run() {
+            return Ok(Json(current_obj.body));
+        }
+
         if deletion_ts_set && finalizers_empty {
             tracing::debug!(name = %name, "patch_pod: hard-deleting pod (deletionTimestamp set, finalizers empty)");
             state
@@ -1516,11 +1569,6 @@ pub(crate) async fn patch_pod<S: Store>(
             // This handles OrderedNamespaceDeletion: once all finalizer'd pods are cleared,
             // the Terminating namespace hard-deletes.
             super::namespaces::maybe_finalize_terminating_namespace(&state, ns.as_str()).await;
-            return Ok(Json(current_obj.body));
-        }
-
-        // Dry-run: validation passed; return the would-be patched object without persisting.
-        if patch_query.is_dry_run() {
             return Ok(Json(current_obj.body));
         }
 
@@ -1558,10 +1606,27 @@ use crate::util::utc_now_rfc3339;
 pub(crate) async fn evict_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
     let key = object_key("pods", ns.as_str(), &name);
+
+    let eviction: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|_| {
+        serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": name, "namespace": ns.as_str() }
+        })
+    });
+    // Eviction embeds metav1.DeleteOptions at .deleteOptions; a raw/proxied caller may
+    // instead send ?dryRun=All (caught by the router-wide inject_dry_run_header layer,
+    // which is what kubectl's generic `create --dry-run=server` path uses for POST-based
+    // subresources like Eviction) — accept either.
+    let delete_opts: DeleteOptions =
+        serde_json::from_value(eviction["deleteOptions"].clone()).unwrap_or_default();
+    let dry_run = delete_opts.is_dry_run() || super::json_patch::is_dry_run_header(&headers);
 
     let stored = state
         .store
@@ -1573,42 +1638,65 @@ pub(crate) async fn evict_pod<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    // Admission webhook pipeline (validating only — eviction's effect on the pod is
+    // delete-like, mirroring delete_pod's validating-only admission point). A
+    // `sideEffects: Some` webhook has no contractual guarantee it honors `dryRun: true`,
+    // so it must not be invoked at all on a dry-run eviction — see webhook_dry_run_supported.
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "pods/eviction",
+        name: &name,
+        namespace: Some(ns.as_str()),
+        operation: "CREATE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+            "extra": user.extra,
+        })),
+        dry_run,
+    };
+    run_validating_webhooks(&state, &eviction, None, &admission_ctx).await?;
+
     let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
     let already_terminating = meta.deletion_timestamp.is_some();
     let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
 
     if already_terminating && !has_finalizers {
-        state
-            .store
-            .delete(&key, None)
-            .await
-            .map_err(|e| store_err_to_status(e, &name))?;
-        state.node_graph.remove_pod(ns.as_str(), &name);
+        // Dry-run: validation passed and this is what a real eviction would hard-delete;
+        // return without persisting.
+        if !dry_run {
+            state
+                .store
+                .delete(&key, None)
+                .await
+                .map_err(|e| store_err_to_status(e, &name))?;
+            state.node_graph.remove_pod(ns.as_str(), &name);
+        }
     } else if !already_terminating {
         check_pdb_allows_eviction(&state, ns.as_str(), &obj.body).await?;
 
-        obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-        set_disruption_target_condition(
-            &mut obj.body,
-            &utc_now_rfc3339(),
-            "EvictionByEvictionAPI",
-            "Eviction API: evicting pod",
-        );
-        let expected_rv = parse_resource_version(obj.resource_version())?;
-        state
-            .store
-            .put(&key, obj.to_bytes(), expected_rv)
-            .await
-            .map_err(|e| store_err_to_status(e, &name))?;
+        // Dry-run: validation passed and this is what a real eviction would soft-delete to
+        // (deletionTimestamp stamped); return without persisting.
+        if !dry_run {
+            obj.body["metadata"]["deletionTimestamp"] =
+                serde_json::Value::String(utc_now_rfc3339());
+            set_disruption_target_condition(
+                &mut obj.body,
+                &utc_now_rfc3339(),
+                "EvictionByEvictionAPI",
+                "Eviction API: evicting pod",
+            );
+            let expected_rv = parse_resource_version(obj.resource_version())?;
+            state
+                .store
+                .put(&key, obj.to_bytes(), expected_rv)
+                .await
+                .map_err(|e| store_err_to_status(e, &name))?;
+        }
     }
 
-    let eviction: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|_| {
-        serde_json::json!({
-            "apiVersion": "policy/v1",
-            "kind": "Eviction",
-            "metadata": { "name": name, "namespace": ns.as_str() }
-        })
-    });
     Ok((StatusCode::CREATED, Json(eviction)))
 }
 
@@ -2814,6 +2902,12 @@ pub(crate) async fn replace_pod_status<S: Store>(
 
     crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, "Pod");
 
+    // Dry-run: return the would-be status object without persisting — mirrors
+    // put_resource_status's dry-run early-return.
+    if super::json_patch::is_dry_run_header(&headers) {
+        return Ok(Json(current_obj.body));
+    }
+
     // CAS on the INCOMING body's resourceVersion, not the stored object's: a client
     // holding a stale snapshot must get 409 and retry, not silently clobber a concurrent
     // write. Absent rv stays unconditional (parse_resource_version returns None).
@@ -3076,6 +3170,12 @@ pub(crate) async fn patch_pod_status<S: Store>(
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
         current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
+
+        // Dry-run: validation passed; return the would-be patched status without
+        // persisting — mirrors replace_pod_status's dry-run early-return.
+        if super::json_patch::is_dry_run_header(&headers) {
+            return Ok(Json(current_obj.body));
+        }
 
         let expected_rv = parse_resource_version(current_obj.resource_version())?;
         match state
@@ -3552,6 +3652,12 @@ pub(crate) async fn patch_pod_resize<S: Store>(
     current_obj.body = apply_resize_patch(&current_obj.body, &incoming);
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
 
+    // Dry-run: validation passed; return the would-be resized pod without persisting —
+    // mirrors replace_pod's dry-run early-return.
+    if super::json_patch::is_dry_run_header(&headers) {
+        return Ok(Json(current_obj.body));
+    }
+
     // CAS on the INCOMING body's resourceVersion. This route serves both PUT and PATCH:
     // a PUT client sends its rv and must get 409 on a stale write; a PATCH omits rv, so
     // parse_resource_version returns None and the write stays unconditional.
@@ -3693,6 +3799,12 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
     current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &patch);
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
 
+    // Dry-run: validation passed; return the would-be patched pod without persisting —
+    // mirrors replace_pod's dry-run early-return.
+    if super::json_patch::is_dry_run_header(&headers) {
+        return Ok(Json(current_obj.body));
+    }
+
     let expected_rv = parse_resource_version(current_obj.resource_version())?;
     let new_rv = state
         .store
@@ -3734,6 +3846,12 @@ pub(crate) async fn put_ephemeral_containers<S: Store>(
     let spec_before = current_obj.body["spec"].clone();
     current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &incoming);
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
+
+    // Dry-run: validation passed; return the would-be replaced pod without persisting —
+    // mirrors replace_pod's dry-run early-return.
+    if super::json_patch::is_dry_run_header(&headers) {
+        return Ok(Json(current_obj.body));
+    }
 
     // CAS on the INCOMING body's resourceVersion, not the stored object's, so a stale
     // PUT is rejected with 409. Absent rv stays unconditional (returns None).
@@ -8075,6 +8193,13 @@ pub(crate) async fn bind_pod<S: Store>(
     let now = utc_now_rfc3339();
     set_pod_scheduled_true(&mut obj.body, &now);
 
+    // Dry-run: validation passed; return the would-be bound pod without persisting it or
+    // registering it with the node-authorization graph — mirrors replace_pod's dry-run
+    // early-return.
+    if super::json_patch::is_dry_run_header(&headers) {
+        return Ok((StatusCode::CREATED, Json(obj.body)));
+    }
+
     let expected_rv = parse_resource_version(obj.resource_version())?;
 
     let new_rv = state
@@ -11384,6 +11509,65 @@ mod handler_tests {
         );
     }
 
+    /// `kubectl delete pod --dry-run=server` must NOT actually delete (or even soft-delete)
+    /// the pod — a dry-run that mutates anyway silently terminates a workload against the
+    /// client's explicit intent. DeleteOptions.dryRun=["All"] is sent in the DELETE request
+    /// BODY (client-go's typed Delete(), unlike Create/Update/Patch which use a ?dryRun=All
+    /// query param) — this test fails on revert with deletionTimestamp stamped in the store.
+    #[tokio::test]
+    async fn delete_pod_dry_run_does_not_mutate_store() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/to-delete";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "to-delete", "namespace": "default", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "dryRun": ["All"]
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/to-delete")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "dry-run delete must still return a success response"
+        );
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("pod must still exist after a dry-run DELETE");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_null(),
+            "dryRun=All must NOT stamp deletionTimestamp — if this fails, delete_pod's \
+             dry-run guard was removed and the pod was actually soft-deleted in the store"
+        );
+    }
+
     /// Second DELETE on a pod that is already Terminating (has deletionTimestamp) and has no
     /// finalizers must hard-delete it — this is the path taken by the kubelet after it stops
     /// the container and calls DELETE with gracePeriodSeconds=0.
@@ -12339,6 +12523,73 @@ mod handler_tests {
         }
     }
 
+    /// `kubectl delete pods --all --dry-run=server` must NOT mutate any matched pod — a
+    /// dry-run DeleteCollection that soft-deletes anyway silently terminates every workload
+    /// in the namespace against the client's explicit intent. This test fails on revert
+    /// with deletionTimestamp stamped on both pods.
+    #[tokio::test]
+    async fn delete_collection_pods_dry_run_does_not_mutate_store() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key_a = "/registry/pods/default/pod-a";
+        let key_b = "/registry/pods/default/pod-b";
+        for (key, name) in [(key_a, "pod-a"), (key_b, "pod-b")] {
+            let pod = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": name, "namespace": "default", "resourceVersion": "1" },
+                "spec": {},
+                "status": {}
+            });
+            store
+                .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+                .await
+                .unwrap();
+        }
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods",
+                delete(delete_collection_pods),
+            )
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "dryRun": ["All"]
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "dry-run DeleteCollection must still return a success response"
+        );
+
+        for key in [key_a, key_b] {
+            let stored = store
+                .get(key)
+                .await
+                .unwrap()
+                .expect("pod must still exist after a dry-run DeleteCollection");
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            assert!(
+                v["metadata"]["deletionTimestamp"].is_null(),
+                "{key}: dryRun=All must NOT stamp deletionTimestamp — if this fails, \
+                 delete_collection_pods's dry-run guard was removed and the pod was \
+                 actually soft-deleted in the store"
+            );
+        }
+    }
+
     /// A single graceful DELETE (no explicit `gracePeriodSeconds`, mirroring exactly what
     /// u7s-scheduler's preemption eviction sends) must leave the pod visible to a subsequent
     /// GET — 200 with `.metadata.deletionTimestamp` set — not 404.
@@ -12474,6 +12725,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -12507,6 +12759,71 @@ mod handler_tests {
             "eviction must stamp deletionTimestamp so the kubelet sends SIGTERM and the \
              StatefulSet controller sees the pod as terminating — without this the orphan \
              pod runs forever and the 'Should recreate evicted statefulset' test hangs"
+        );
+    }
+
+    /// `kubectl -n <ns> ... create eviction --dry-run=server` (or any client setting
+    /// Eviction.deleteOptions.dryRun) must NOT actually evict the pod — eviction is a
+    /// delete-like mutation, and a dry-run that evicts anyway silently terminates a workload
+    /// against the client's explicit intent. This test fails on revert with
+    /// deletionTimestamp stamped in the store.
+    #[tokio::test]
+    async fn evict_pod_dry_run_does_not_mutate_store() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/ss-0";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "ss-0", "namespace": "default", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .layer(auth_layer())
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "ss-0", "namespace": "default" },
+            "deleteOptions": { "dryRun": ["All"] }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/ss-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&eviction_body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "dry-run eviction must still return 201 Created with the would-be Eviction object"
+        );
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("pod must still exist after a dry-run eviction");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_null(),
+            "dryRun=All in Eviction.deleteOptions must NOT stamp deletionTimestamp — if this \
+             fails, evict_pod's dry-run guard was removed and the pod was actually evicted"
         );
     }
 
@@ -12552,6 +12869,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -12645,6 +12963,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -12713,6 +13032,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -12780,6 +13100,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -12850,6 +13171,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -12892,6 +13214,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -12943,6 +13266,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let req = Request::builder()
@@ -13874,6 +14198,58 @@ mod handler_tests {
         assert_eq!(v["spec"]["containers"][0]["name"], "app");
     }
 
+    /// `PUT /status?dryRun=All` must return the would-be status object but leave the stored
+    /// pod's status untouched. Before this fix, replace_pod_status had no dry-run check.
+    #[tokio::test]
+    async fn replace_pod_status_dry_run_all_does_not_persist() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::handlers::json_patch::inject_dry_run_header,
+            ))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "status": {"phase": "Running"}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "dry-run response must show the would-be status"
+        );
+
+        let key = "/registry/pods/default/my-pod";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["status"]["phase"], "Pending",
+            "dryRun=All must not persist the status change (seed_pod's default is Pending)"
+        );
+    }
+
     /// A protobuf-encoded PUT to /status must not destroy `containerStatuses`.
     ///
     /// `replace_pod_status` replaces the whole stored `status` subtree with whatever
@@ -14018,6 +14394,56 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `PATCH /status?dryRun=All` must return the would-be patched status but leave the
+    /// stored pod's status untouched. Before this fix, patch_pod_status had no dry-run check.
+    #[tokio::test]
+    async fn patch_pod_status_dry_run_all_does_not_persist() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::handlers::json_patch::inject_dry_run_header,
+            ))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"status": {"phase": "Running"}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status?dryRun=All")
+            .header(
+                header::CONTENT_TYPE,
+                "application/strategic-merge-patch+json",
+            )
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "dry-run response must show the would-be patched status"
+        );
+
+        let key = "/registry/pods/default/my-pod";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["status"]["phase"], "Pending",
+            "dryRun=All must not persist the status change (seed_pod's default is Pending)"
+        );
     }
 
     /// PATCH /status must persist the new phase to the store and the response body.
@@ -14408,6 +14834,61 @@ mod handler_tests {
         assert_eq!(
             v["spec"]["nodeName"], "worker-1",
             "bind_pod must set spec.nodeName to the target node"
+        );
+    }
+
+    /// `POST /binding?dryRun=All` must return the would-be bound pod (201, spec.nodeName set
+    /// in the response) but leave the pod unbound in the store. Before this fix, bind_pod had
+    /// no dry-run check at all: `kubectl` (or a scheduler plugin) verifying a binding decision
+    /// with `--dry-run=server` would have actually scheduled the pod for real.
+    #[tokio::test]
+    async fn bind_pod_dry_run_all_does_not_bind_or_persist() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "unscheduled-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::handlers::json_patch::inject_dry_run_header,
+            ))
+            .with_state(state);
+
+        let binding = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Binding",
+            "metadata": {"name": "unscheduled-pod", "namespace": "default"},
+            "target": {"kind": "Node", "name": "worker-1"}
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/unscheduled-pod/binding?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&binding))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resp_body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            resp_body["spec"]["nodeName"], "worker-1",
+            "dry-run response must show the would-be binding"
+        );
+
+        let key = "/registry/pods/default/unscheduled-pod";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["nodeName"],
+            serde_json::Value::Null,
+            "dryRun=All must not actually bind the pod in the store"
         );
     }
 
@@ -14923,6 +15404,69 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `kubectl replace --dry-run=server` on a pod must NOT persist the replacement — a
+    /// dry-run that writes anyway silently mutates cluster state against the client's
+    /// explicit intent. This test fails on revert with the stored image changed to
+    /// "nginx:latest".
+    #[tokio::test]
+    async fn replace_pod_dry_run_does_not_mutate_store() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let stored_rv = {
+            let obj = store
+                .get("/registry/pods/default/my-pod")
+                .await
+                .unwrap()
+                .unwrap();
+            obj.revision
+        };
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx:latest"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/my-pod?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "dry-run replace must still return a success response"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["containers"][0]["image"], "nginx",
+            "dryRun=All must NOT persist the replacement — if this fails, replace_pod's \
+             dry-run guard was removed and the image was actually updated to nginx:latest \
+             in the store"
+        );
     }
 
     /// A plain PUT to the main /pods endpoint must never let the client body's `.status`
@@ -16575,6 +17119,59 @@ mod handler_tests {
         );
     }
 
+    /// `PATCH ...?dryRun=All` that drains the last finalizer must NOT hard-delete the pod.
+    ///
+    /// Regression test for an ordering bug: patch_pod's hard-delete-on-finalizer-drain check
+    /// used to run BEFORE its own dry-run check, so a dry-run request draining the last
+    /// finalizer actually deleted the pod for real — the exact opposite of what dryRun=All
+    /// promises.
+    #[tokio::test]
+    async fn patch_pod_dry_run_all_draining_last_finalizer_does_not_hard_delete() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/finalized-pod-dry-run";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "finalized-pod-dry-run",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2025-01-01T00:00:00Z",
+                "finalizers": ["my.io/cleanup"]
+            },
+            "spec": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state.clone());
+
+        let patch_body = serde_json::json!({"metadata": {"finalizers": []}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/finalized-pod-dry-run?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store.get(key).await.unwrap();
+        assert!(
+            stored.is_some(),
+            "dryRun=All must not hard-delete the pod even though the patch drains its last \
+             finalizer"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // PATCH with json-patch+json and a valid remove op must succeed.
     // -----------------------------------------------------------------------
@@ -16793,6 +17390,80 @@ mod handler_tests {
             v["status"]["resize"], "Proposed",
             "status.resize must be set to 'Proposed' after /resize PATCH — \
              conformance tests assert this field to verify the resize was acknowledged"
+        );
+    }
+
+    /// `PATCH /resize?dryRun=All` must return the would-be resized pod but leave the stored
+    /// pod's resources untouched. Before this fix, patch_pod_resize had no dry-run check.
+    #[tokio::test]
+    async fn patch_pod_resize_dry_run_all_does_not_persist() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/resize-pod-dry-run";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "resize-pod-dry-run", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {
+                        "limits": {"cpu": "100m"},
+                        "requests": {"cpu": "100m"}
+                    }
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                patch(patch_pod_resize).put(patch_pod_resize),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::handlers::json_patch::inject_dry_run_header,
+            ))
+            .with_state(state);
+
+        let resize_body = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {"limits": {"cpu": "200m"}, "requests": {"cpu": "200m"}}
+                }]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/resize-pod-dry-run/resize?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&resize_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["spec"]["containers"][0]["resources"]["limits"]["cpu"], "200m",
+            "dry-run response must show the would-be resized resources"
+        );
+
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["spec"]["containers"][0]["resources"]["limits"]["cpu"], "100m",
+            "dryRun=All must not persist the resize"
         );
     }
 
@@ -18879,6 +19550,68 @@ mod ephemeral_containers_route_tests {
         );
     }
 
+    /// `PATCH /ephemeralcontainers?dryRun=All` must return the would-be patched pod but leave
+    /// the stored pod's ephemeral containers untouched. Before this fix, patch_ephemeral_
+    /// containers had no dry-run check.
+    #[tokio::test]
+    async fn patch_ephemeral_containers_dry_run_all_does_not_persist() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/ephemeral-dry-run";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "ephemeral-dry-run", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
+                patch(patch_ephemeral_containers),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::handlers::json_patch::inject_dry_run_header,
+            ))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({
+            "spec": { "ephemeralContainers": [{"name": "debugger", "image": "busybox"}] }
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/ephemeral-dry-run/ephemeralcontainers?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            v["spec"]["ephemeralContainers"].as_array().unwrap().len(),
+            1,
+            "dry-run response must show the would-be ephemeral container"
+        );
+
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            stored_v["spec"]["ephemeralContainers"].is_null(),
+            "dryRun=All must not persist the ephemeral container"
+        );
+    }
+
     /// PATCH /ephemeralcontainers on a missing pod must return 404.
     #[tokio::test]
     async fn patch_ephemeral_containers_missing_pod_returns_404() {
@@ -18992,6 +19725,84 @@ mod ephemeral_containers_route_tests {
         assert!(
             names.contains(&"second"),
             "newly PUT ephemeral container 'second' must appear in response"
+        );
+    }
+
+    /// `PUT /ephemeralcontainers?dryRun=All` must return the would-be replaced pod but leave
+    /// the stored pod's ephemeral containers untouched. Before this fix, put_ephemeral_
+    /// containers had no dry-run check.
+    #[tokio::test]
+    async fn put_ephemeral_containers_dry_run_all_does_not_persist() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/put-dry-run";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "put-dry-run", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}],
+                "ephemeralContainers": [{"name": "first", "image": "busybox"}]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
+                put(put_ephemeral_containers),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::handlers::json_patch::inject_dry_run_header,
+            ))
+            .with_state(state);
+
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "put-dry-run", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}],
+                "ephemeralContainers": [
+                    {"name": "first", "image": "busybox"},
+                    {"name": "second", "image": "alpine"}
+                ]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/put-dry-run/ephemeralcontainers?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&put_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            v["spec"]["ephemeralContainers"].as_array().unwrap().len(),
+            2,
+            "dry-run response must show the would-be second ephemeral container"
+        );
+
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["spec"]["ephemeralContainers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "dryRun=All must not persist the second ephemeral container"
         );
     }
 }
@@ -19576,6 +20387,7 @@ mod admission_tests {
         let result = replace_pod(
             axum::extract::State(state),
             axum::extract::Path(("default".to_string(), "my-pod".to_string())),
+            axum::extract::Query(crate::handlers::json_patch::ReplaceQuery::default()),
             test_user(),
             headers,
             pod_body,

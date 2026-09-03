@@ -28,7 +28,8 @@ use super::generic::{
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
-    ssa_body_to_json, strip_managed_fields, CreateQuery, PatchQuery, PatchType, ReplaceQuery,
+    is_dry_run_header, ssa_body_to_json, strip_managed_fields, CreateQuery, PatchQuery, PatchType,
+    ReplaceQuery,
 };
 use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
@@ -889,6 +890,10 @@ pub(crate) async fn delete_resource<S: Store>(
     } else {
         serde_json::from_slice(&body).unwrap_or_default()
     };
+    // client-go's typed Delete() sends DryRun in the DeleteOptions body; a raw/proxied
+    // caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -944,7 +949,7 @@ pub(crate) async fn delete_resource<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
-            dry_run: false,
+            dry_run,
         };
         run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
@@ -960,6 +965,12 @@ pub(crate) async fn delete_resource<S: Store>(
         }
 
         if let Some(soft) = apply_delete_policy(&mut obj) {
+            // Dry-run: validation passed and this is what a real DELETE would soft-delete
+            // to; return it without persisting — `kubectl delete --dry-run=server` must not
+            // actually stamp deletionTimestamp on a finalizer'd object.
+            if dry_run {
+                return Ok(Json(soft).into_response());
+            }
             // Soft-delete: persist modified object, return it.
             let expected_rv = parse_resource_version(obj.resource_version())?;
             let new_rv = match state.store.put(&key, obj.to_bytes(), expected_rv).await {
@@ -987,6 +998,18 @@ pub(crate) async fn delete_resource<S: Store>(
             let mut resp_body = Object { body: soft };
             resp_body.set_resource_version(new_rv);
             return Ok(Json(resp_body.body).into_response());
+        }
+
+        // Dry-run: validation passed and this is what a real DELETE would hard-delete;
+        // return the would-be Success status without persisting.
+        if dry_run {
+            return Ok(Json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Success",
+                "code": 200
+            }))
+            .into_response());
         }
 
         state
@@ -1683,20 +1706,24 @@ pub(crate) async fn do_patch<S: Store>(
         }
 
         // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+        // dryRun=All must not actually delete the object — checked here, before the store
+        // delete below, since this branch returns before do_patch's own later dry_run check.
         if finalizer_drain_complete(&current.body) {
-            complete_finalizer_drain(
-                state,
-                FinalizerDrainCtx {
-                    key,
-                    meta,
-                    group,
-                    version,
-                    plural,
-                    ns,
-                    name,
-                },
-            )
-            .await?;
+            if !dry_run {
+                complete_finalizer_drain(
+                    state,
+                    FinalizerDrainCtx {
+                        key,
+                        meta,
+                        group,
+                        version,
+                        plural,
+                        ns,
+                        name,
+                    },
+                )
+                .await?;
+            }
             return Ok(Json(current.body).into_response());
         }
 
@@ -2673,7 +2700,8 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     if group.is_empty() && plural == "services" {
         super::defaults::validate_service_ip_family_fields(&obj.body)
             .map_err(Status::unprocessable_entity)?;
-        maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body).await?;
+        maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body, create_query.is_dry_run())
+            .await?;
     }
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
@@ -3310,7 +3338,14 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     if group.is_empty() && plural == "services" {
         super::defaults::validate_service_ip_family_fields(&obj.body)
             .map_err(Status::unprocessable_entity)?;
-        maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body).await?;
+        maybe_allocate_cluster_ip(
+            &state,
+            &ns,
+            &name,
+            &mut obj.body,
+            replace_query.is_dry_run(),
+        )
+        .await?;
     }
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
@@ -3470,6 +3505,10 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
     } else {
         serde_json::from_slice(&body).unwrap_or_default()
     };
+    // client-go's typed Delete() sends DryRun in the DeleteOptions body; a raw/proxied
+    // caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -3545,7 +3584,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
                 "groups": user.groups,
                 "extra": user.extra,
             })),
-            dry_run: false,
+            dry_run,
         };
         run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
@@ -3569,6 +3608,11 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
         }
 
         if let Some(soft) = apply_delete_policy(&mut obj) {
+            // Dry-run: validation passed and this is what a real DELETE would soft-delete
+            // to; return it without persisting or running any cascade side effect below.
+            if dry_run {
+                return Ok(Json(soft).into_response());
+            }
             let expected_rv = parse_resource_version(obj.resource_version())?;
             let new_rv = match state.store.put(&key, obj.to_bytes(), expected_rv).await {
                 Ok(rv) => rv,
@@ -3588,6 +3632,20 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             let mut resp_body = Object { body: soft };
             resp_body.set_resource_version(new_rv);
             return Ok(Json(resp_body.body).into_response());
+        }
+
+        // Dry-run: validation passed and this is what a real DELETE would hard-delete;
+        // return the would-be Success status without persisting or running any of the
+        // cascade side effects (RBAC evict, clusterIP release, owned-pod cleanup, quota
+        // refresh, namespace-finalize check) below.
+        if dry_run {
+            return Ok(Json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Success",
+                "code": 200
+            }))
+            .into_response());
         }
 
         state
@@ -3897,6 +3955,8 @@ pub(crate) async fn delete_collection_resource<S: Store>(
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Resources not in the static registry are CRD-backed; fall back to CR handling exactly
     // like every other verb dispatched from this file (list_resource -> cr::list_cr,
@@ -3906,11 +3966,25 @@ pub(crate) async fn delete_collection_resource<S: Store>(
             State(state),
             Path((group, version, plural)),
             Extension(user),
+            headers,
             query,
+            body,
         )
         .await
         .map(IntoResponse::into_response);
     }
+
+    // Parse DeleteOptions from the request body (same pattern as single-object delete
+    // handlers). client-go's typed DeleteCollection() sends DryRun in this body; a
+    // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let prefix = group_list_prefix(&group, &plural, None);
     // "events" needs multi-term, in-memory filtering (see list_resource); every other
@@ -3986,9 +4060,15 @@ pub(crate) async fn delete_collection_resource<S: Store>(
                 namespace: None,
                 operation: "DELETE",
                 user_info: user_info.clone(),
-                dry_run: false,
+                dry_run,
             };
             run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+
+            // Dry-run: validation passed; skip the actual write entirely (RBAC-index evict,
+            // clusterIP release, soft/hard delete) for this object.
+            if dry_run {
+                continue;
+            }
 
             if group == RBAC_GROUP && !name.is_empty() {
                 let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
@@ -4021,20 +4101,23 @@ pub(crate) async fn delete_collection_resource<S: Store>(
         }
         // NotFound means another writer deleted this object concurrently — tolerate it.
         // Any other error (disk full, DB corruption, …) means some objects survived;
-        // propagate so the caller does not believe all objects were deleted.
-        match state.store.delete(&obj.key, None).await {
-            Ok(_) | Err(StoreError::NotFound { .. }) => {}
-            Err(e) => return Err(Status::internal(e.to_string())),
-        }
-        if let Some(ref ip) = cluster_ip_to_release {
-            state.release_service_ip(ip).await;
+        // propagate so the caller does not believe all objects were deleted. Also covers
+        // the (unparseable-JSON) fallback case for a dry-run request: skip the write.
+        if !dry_run {
+            match state.store.delete(&obj.key, None).await {
+                Ok(_) | Err(StoreError::NotFound { .. }) => {}
+                Err(e) => return Err(Status::internal(e.to_string())),
+            }
+            if let Some(ref ip) = cluster_ip_to_release {
+                state.release_service_ip(ip).await;
+            }
         }
     }
-    if group == ADMISSION_GROUP {
+    if !dry_run && group == ADMISSION_GROUP {
         // One re-list after all deletions in the collection — cheaper than per-object.
         state.refresh_admission_config(&plural).await;
     }
-    if group == APISERVICE_GROUP {
+    if !dry_run && group == APISERVICE_GROUP {
         state.refresh_apiservice_cache().await;
     }
 
@@ -4055,6 +4138,8 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
     // Resources not in the static registry are CRD-backed; fall back to CR handling exactly
@@ -4066,11 +4151,25 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
             State(state),
             Path((group, version, ns, plural)),
             Extension(user),
+            headers,
             query,
+            body,
         )
         .await
         .map(IntoResponse::into_response);
     }
+
+    // Parse DeleteOptions from the request body (same pattern as single-object delete
+    // handlers). client-go's typed DeleteCollection() sends DryRun in this body; a
+    // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
+    // inject_dry_run_header layer) — accept either.
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
     // "events" needs multi-term, in-memory filtering (see list_namespaced_resource); every
@@ -4149,9 +4248,15 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 namespace: Some(&ns),
                 operation: "DELETE",
                 user_info: user_info.clone(),
-                dry_run: false,
+                dry_run,
             };
             run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+
+            // Dry-run: validation passed; skip the actual write entirely (RBAC-index evict,
+            // soft/hard delete) for this object.
+            if dry_run {
+                continue;
+            }
 
             if group == RBAC_GROUP && !name.is_empty() {
                 let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
@@ -4177,13 +4282,16 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
         }
         // NotFound means another writer deleted this object concurrently — tolerate it.
         // Any other error (disk full, DB corruption, …) means some objects survived;
-        // propagate so the caller does not believe all objects were deleted.
-        match state.store.delete(&obj.key, None).await {
-            Ok(_) | Err(StoreError::NotFound { .. }) => {}
-            Err(e) => return Err(Status::internal(e.to_string())),
-        }
-        if let Some(ref ip) = cluster_ip_to_release {
-            state.release_service_ip(ip).await;
+        // propagate so the caller does not believe all objects were deleted. Also covers
+        // the (unparseable-JSON) fallback case for a dry-run request: skip the write.
+        if !dry_run {
+            match state.store.delete(&obj.key, None).await {
+                Ok(_) | Err(StoreError::NotFound { .. }) => {}
+                Err(e) => return Err(Status::internal(e.to_string())),
+            }
+            if let Some(ref ip) = cluster_ip_to_release {
+                state.release_service_ip(ip).await;
+            }
         }
     }
 
@@ -4212,11 +4320,18 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
 /// Sets `spec.clusterIP` in `body` when allocation succeeds.
 /// If `spec.clusterIP` is already set (non-empty string), does nothing.
 /// ExternalName services are skipped entirely — they must not have a ClusterIP.
+///
+/// `dry_run`: `allocate_service_ip` reserves the IP via a real create-only store write
+/// (it doubles as the allocator's distributed lock) — there is no side-effect-free way to
+/// compute a candidate address. Under `dryRun=All` this must be skipped entirely rather
+/// than calling it and leaking a permanently-reserved sentinel for an object that is never
+/// actually created; the dry-run response is left with `spec.clusterIP` unset instead.
 async fn maybe_allocate_cluster_ip<S: Store>(
     state: &AppState<S>,
     ns: &str,
     name: &str,
     body: &mut serde_json::Value,
+    dry_run: bool,
 ) -> Result<(), crate::status::StatusError> {
     // ExternalName services must not have a ClusterIP; skip allocation entirely.
     let svc_type = body["spec"]["type"].as_str().unwrap_or("");
@@ -4227,6 +4342,10 @@ async fn maybe_allocate_cluster_ip<S: Store>(
     // Only auto-allocate when clusterIP is absent or empty.
     let existing = body["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
     if !existing.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
         return Ok(());
     }
 
@@ -7615,6 +7734,77 @@ mod tests {
         assert_eq!(val["status"], "Success");
     }
 
+    /// `kubectl delete lease node-b --dry-run=server` must NOT actually delete the object —
+    /// a dry-run that deletes anyway silently mutates cluster state against the client's
+    /// explicit intent. DeleteOptions.dryRun=["All"] is sent in the DELETE request BODY
+    /// (client-go's typed Delete(), unlike Create/Update/Patch which use a ?dryRun=All query
+    /// param) — this test fails on revert with the lease removed from the store.
+    #[tokio::test]
+    async fn delete_namespaced_resource_dry_run_does_not_delete_object() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-b", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-b" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/node-b";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let delete_opts_body = bytes::Bytes::from(
+            serde_json::json!({
+                "kind": "DeleteOptions",
+                "apiVersion": "v1",
+                "dryRun": ["All"]
+            })
+            .to_string(),
+        );
+
+        let result = delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "node-b".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            delete_opts_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run delete must still return a success response"
+        );
+
+        assert!(
+            store.get(key).await.unwrap().is_some(),
+            "dryRun=All in the DeleteOptions body must NOT delete the object — if this fails, \
+             delete_namespaced_resource's dry-run guard was removed and the lease was actually \
+             deleted from the store"
+        );
+    }
+
     /// A namespace stuck Terminating on exactly one blocking child must complete once that
     /// child is removed via a plain DELETE — even though its finalizer was cleared by a
     /// separate write, not by this DELETE itself.
@@ -9450,6 +9640,78 @@ mod tests {
         );
     }
 
+    /// `PATCH ...?dryRun=All` draining the last finalizer must NOT hard-delete the object.
+    ///
+    /// Regression test for an ordering bug: do_patch's finalizer-drain-complete check (shared
+    /// by patch_resource and patch_namespaced_resource) used to run BEFORE its own dry-run
+    /// check, so a dry-run PATCH draining the last finalizer actually deleted the object for
+    /// real — the exact opposite of what dryRun=All promises.
+    #[tokio::test]
+    async fn patch_namespaced_resource_dry_run_all_draining_last_finalizer_does_not_hard_delete() {
+        let state = make_state();
+        let ns = "default";
+
+        let rc_key = crate::keys::group_object_key(
+            "",
+            "replicationcontrollers",
+            Some(ns),
+            "draining-rc-dry-run",
+        );
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": {
+                "name": "draining-rc-dry-run",
+                "namespace": ns,
+                "uid": "drain-uid-dry-run",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["orphan"]
+            },
+            "spec": { "replicas": 0, "selector": { "app": "draining-rc-dry-run" } }
+        });
+        state
+            .store
+            .put(
+                &rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed draining RC");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({ "metadata": { "finalizers": [] } });
+        patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "draining-rc-dry-run".into(),
+            )),
+            axum::extract::Query(PatchQuery {
+                dry_run: Some("All".to_string()),
+                ..Default::default()
+            }),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dry-run finalizer-drain patch must succeed: {e:?}"));
+
+        assert!(
+            state.store.get(&rc_key).await.unwrap().is_some(),
+            "dryRun=All must not hard-delete the object even though the patch drains its last \
+             finalizer"
+        );
+    }
+
     /// Security invariant: a soft-deleted ClusterRoleBinding must be removed from the
     /// RBAC index immediately when DELETE is requested.
     #[tokio::test]
@@ -9655,6 +9917,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await;
         assert!(result.is_ok(), "collection delete must succeed");
@@ -13442,6 +13706,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|_| panic!("delete_collection must succeed"));
@@ -13561,6 +13827,57 @@ mod tests {
             u32::from(ip) & mask,
             base & mask,
             "allocated clusterIP {ip} must be within 10.96.0.0/12"
+        );
+    }
+
+    /// `POST ...?dryRun=All` for a ClusterIP Service with no explicit clusterIP must NOT
+    /// reserve a real sentinel from the allocator.
+    ///
+    /// Before this fix, maybe_allocate_cluster_ip called `state.allocate_service_ip` (a real
+    /// create-only store write) unconditionally, even under dryRun=All — the Service object
+    /// itself correctly never persisted, but every dry-run create permanently burned one IP
+    /// from the pool, since nothing ever releases an allocation for an object that was never
+    /// actually created.
+    #[tokio::test]
+    async fn allocate_dry_run_all_does_not_reserve_a_sentinel() {
+        use axum::extract::{Path, State};
+
+        let state = make_state_with_cidr_for_resource_tests("10.96.0.0/29");
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "dry-run-svc", "namespace": "default" },
+            "spec": { "type": "ClusterIP", "ports": [{ "port": 80 }] }
+        });
+
+        let _ = create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery {
+                dry_run: Some("All".to_string()),
+                ..Default::default()
+            }),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dry-run Service create must succeed: {e:?}"));
+
+        let sentinels = state
+            .store
+            .list(
+                crate::state::SERVICE_IP_PREFIX,
+                u7s_store::ListOptions::default(),
+            )
+            .await
+            .expect("list sentinels");
+        assert_eq!(
+            sentinels.items.len(),
+            0,
+            "dryRun=All must not reserve a clusterIP sentinel — every dry-run create would \
+             otherwise permanently leak one IP from the pool"
         );
     }
 
@@ -13843,6 +14160,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|_| panic!("delete_collection must succeed"));
@@ -13942,6 +14261,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("delete_collection must succeed: {e:?}"));
@@ -23862,6 +24183,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await;
 
@@ -23936,6 +24259,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await;
 
@@ -24128,6 +24453,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await;
 
@@ -24211,6 +24538,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await;
 
@@ -24308,6 +24637,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await;
 
@@ -24433,6 +24764,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| {
@@ -24544,6 +24877,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| {
@@ -24638,6 +24973,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("delete_collection with field_selector must succeed: {e:?}"));
@@ -24715,6 +25052,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("DeleteCollection over finalizer'd object must succeed: {e:?}"));
@@ -24786,6 +25125,8 @@ mod tests {
                 timeout_seconds: None,
             }),
             test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("delete_collection with field_selector must succeed: {e:?}"));

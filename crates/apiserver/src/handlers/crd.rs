@@ -17,7 +17,7 @@ use crate::{
     auth::UserInfo,
     state::AppState,
     status::Status,
-    types::Object,
+    types::{DeleteOptions, Object},
     util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
@@ -590,6 +590,12 @@ pub async fn create_crd<S: Store>(
     let name = crd.metadata.name.clone();
     let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
 
+    // Dry-run: validation and admission passed; return the would-be created CRD without
+    // persisting — mirrors create_resource's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        return Ok((StatusCode::CREATED, Json(crd)));
+    }
+
     let key = store_key(&name);
     let rv = state
         .store
@@ -739,6 +745,12 @@ pub async fn replace_crd<S: Store>(
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
 
+    // Dry-run: validation and admission passed; return the would-be replaced CRD without
+    // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(crd));
+    }
+
     let rv = state
         .store
         .put(&key, to_bytes(&crd)?, expected_rv)
@@ -763,6 +775,8 @@ pub async fn delete_crd<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let key = store_key(&name);
 
@@ -773,6 +787,18 @@ pub async fn delete_crd<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, KIND))?;
+
+    // Parse DeleteOptions from the request body (same pattern as single-object delete
+    // handlers). client-go's typed Delete() sends DryRun in this body; a raw/proxied caller
+    // may instead send it as ?dryRun=All (caught by the router-wide inject_dry_run_header
+    // layer) — accept either.
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     // Parse once: used both for the tombstone's group below and as the admission review object.
     let existing: serde_json::Value =
@@ -793,9 +819,21 @@ pub async fn delete_crd<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: false,
+        dry_run,
     };
     run_validating_webhooks(&state, &existing, Some(&existing), &admission_ctx).await?;
+
+    // Dry-run: validation passed; return the would-be Success status without persisting or
+    // running any of the cascade side effects (schema/conversion-cache evict, watch-ring
+    // free, discovery refresh, group tombstone) below.
+    if dry_run {
+        return Ok(Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Success",
+            "code": 200
+        })));
+    }
 
     state
         .store
@@ -867,6 +905,8 @@ pub async fn delete_collection_crds<S: Store>(
     State(state): State<AppState<S>>,
     Query(query): Query<super::generic::CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let prefix = list_prefix();
     let resp = state
@@ -897,7 +937,14 @@ pub async fn delete_collection_crds<S: Store>(
                 continue;
             }
         }
-        delete_crd(State(state.clone()), Path(name), Extension(user.clone())).await?;
+        delete_crd(
+            State(state.clone()),
+            Path(name),
+            Extension(user.clone()),
+            headers.clone(),
+            body.clone(),
+        )
+        .await?;
     }
 
     Ok(Json(serde_json::json!({
@@ -940,6 +987,12 @@ pub async fn patch_crd<S: Store>(
             Status::unprocessable_entity(format!("invalid CustomResourceDefinition: {e}"))
         })?;
         let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
+
+        // Dry-run: validation and admission passed; return the would-be created CRD without
+        // persisting — mirrors create_crd's dry-run early-return.
+        if is_dry_run_header(&headers) {
+            return Ok((StatusCode::CREATED, Json(crd)).into_response());
+        }
 
         let rv = state
             .store
@@ -1051,6 +1104,12 @@ pub async fn patch_crd<S: Store>(
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
 
+    // Dry-run: validation and admission passed; return the would-be patched CRD without
+    // persisting — mirrors do_patch's dry-run early-return in resource.rs.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(crd).into_response());
+    }
+
     let rv = state
         .store
         .put(&key, to_bytes(&crd)?, None)
@@ -1110,6 +1169,12 @@ pub async fn put_crd_status<S: Store>(
     crate::handlers::status::replace_status_field(&mut current.body, &incoming.body["status"])?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+
+    // Dry-run: return the would-be status object without persisting — mirrors
+    // put_resource_status's dry-run early-return.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current.body));
+    }
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
@@ -1189,6 +1254,12 @@ pub async fn patch_crd_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     crate::handlers::status::reject_non_object_status(&current.body["status"])?;
+
+    // Dry-run: same convergence point as reject_non_object_status above — return the
+    // would-be patched status object without persisting.
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current.body));
+    }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -1428,6 +1499,8 @@ mod tests {
                 State(state),
                 Path("missing.example.com".to_string()),
                 test_user(),
+                HeaderMap::new(),
+                Bytes::new(),
             )
             .await,
         );
@@ -1554,6 +1627,139 @@ mod tests {
                 .await
                 .is_ok(),
             "correct name widgets.example.io must be accepted"
+        );
+    }
+
+    fn dry_run_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        h
+    }
+
+    /// `kubectl create -f my-crd.yaml --dry-run=server` must NOT persist the CRD — a
+    /// dry-run that actually creates it silently mutates cluster state (and the discovery
+    /// cache) against the client's explicit intent. This test fails on revert with the CRD
+    /// present in the store.
+    #[tokio::test]
+    async fn create_crd_dry_run_does_not_persist() {
+        let state = make_state();
+        let name = "applications.argoproj.io";
+
+        let result = create_crd(
+            State(state.clone()),
+            test_user(),
+            dry_run_headers(),
+            minimal_crd_bytes(name),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run create must still return a success response with the would-be CRD"
+        );
+
+        let stored = state.store.get(&store_key(name)).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "dryRun=All must NOT persist the CRD — if this fails, create_crd's dry-run \
+             guard was removed and the CRD was actually written to the store"
+        );
+    }
+
+    /// `kubectl apply --server-side --dry-run=server -f my-crd.yaml` against a CRD name
+    /// that does not exist yet takes patch_crd's SSA create-on-missing branch — a separate
+    /// code path from create_crd with its own store.put. This test fails on revert with the
+    /// CRD present in the store.
+    #[tokio::test]
+    async fn patch_crd_ssa_create_dry_run_does_not_persist() {
+        let state = make_state();
+        let name = "applications.argoproj.io";
+
+        let mut headers = dry_run_headers();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+        let yaml_body = Bytes::from_static(
+            b"apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: applications.argoproj.io\nspec:\n  group: argoproj.io\n  names:\n    plural: applications\n    singular: application\n    kind: Application\n    listKind: ApplicationList\n  scope: Namespaced\n  versions:\n  - name: v1alpha1\n    served: true\n    storage: true\n",
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            yaml_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run SSA create-on-missing must still return a success response"
+        );
+
+        let stored = state.store.get(&store_key(name)).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "dryRun=All must NOT persist the CRD via the SSA create-on-missing branch — if \
+             this fails, patch_crd's SSA-create dry-run guard was removed and the CRD was \
+             actually written to the store"
+        );
+    }
+
+    /// `kubectl patch --dry-run=server` against an EXISTING CRD must NOT mutate the stored
+    /// object — this exercises patch_crd's merge-into-existing branch, a distinct code path
+    /// from the SSA create-on-missing branch above with its own store.put. This test fails
+    /// on revert with the stored metadata.labels actually updated.
+    #[tokio::test]
+    async fn patch_crd_merge_dry_run_does_not_mutate_store() {
+        let state = make_state();
+        let name = "applications.argoproj.io";
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes(name),
+        )
+        .await
+        .expect("create must succeed");
+
+        let mut headers = dry_run_headers();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!({ "metadata": { "labels": { "team": "dry-run" } } }).to_string(),
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "dry-run patch must still return a success response"
+        );
+
+        let stored = state
+            .store
+            .get(&store_key(name))
+            .await
+            .unwrap()
+            .expect("CRD must still exist");
+        let stored_json: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            stored_json["metadata"]["labels"].is_null(),
+            "dryRun=All must NOT mutate the stored CRD — if this fails, patch_crd's \
+             merge-branch dry-run guard was removed and metadata.labels.team was actually \
+             persisted as \"dry-run\""
         );
     }
 
@@ -1707,12 +1913,18 @@ mod tests {
             allow_watch_bookmarks: None,
             timeout_seconds: None,
         });
-        delete_collection_crds(State(state.clone()), query, test_user())
-            .await
-            .expect(
-                "delete collection must succeed — before the fix this route did not \
+        delete_collection_crds(
+            State(state.clone()),
+            query,
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect(
+            "delete collection must succeed — before the fix this route did not \
                      exist and DELETE on the collection returned 405",
-            );
+        );
 
         assert!(
             get_crd(State(state.clone()), Path("foos.example.io".to_string()))
@@ -2737,6 +2949,75 @@ mod tests {
         assert_eq!(v2["status"]["conditions"][0]["type"], "Established");
     }
 
+    /// `PUT .../{name}/status?dryRun=All` must return the would-be status object but leave
+    /// the stored CRD's status untouched. Before this fix, put_crd_status had no dry-run
+    /// check at all.
+    #[tokio::test]
+    async fn put_crd_status_dry_run_all_does_not_persist() {
+        let state = make_state();
+        let name = "dryrunwidgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "dryrunwidgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let get_resp = get_crd(State(state.clone()), Path(name.to_string()))
+            .await
+            .expect("get must succeed");
+        let get_body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut current: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+        current["status"] = serde_json::json!({
+            "conditions": [{ "type": "Established", "status": "True", "reason": "InitialNamesAccepted" }]
+        });
+        let put_body = Bytes::from(current.to_string());
+
+        let mut dry_run_headers = HeaderMap::new();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let resp = put_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            dry_run_headers,
+            put_body,
+        )
+        .await
+        .expect("dry-run put status must succeed")
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["status"]["conditions"][0]["type"], "Established",
+            "dry-run response must show the would-be status"
+        );
+
+        // create_crd stamps exactly two conditions (Established + NamesAccepted, see
+        // build_new_crd). The dry-run PUT body above replaces status wholesale with a
+        // single-entry array — if that were persisted, NamesAccepted would be gone.
+        let reget = get_crd(State(state), Path(name.to_string()))
+            .await
+            .expect("get must succeed after dry-run");
+        let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
+        let stored_conditions = v2["status"]["conditions"].as_array().unwrap();
+        assert_eq!(
+            stored_conditions.len(),
+            2,
+            "dryRun=All must not persist the PUT's replacement status — the CRD's \
+             creation-time Established+NamesAccepted conditions must be unchanged"
+        );
+        assert_eq!(stored_conditions[1]["type"], "NamesAccepted");
+    }
+
     /// PUT .../{name}/status with a scalar or array `status` body must be rejected with
     /// 422, not persisted. `status` is a message/object type for every resource including a
     /// CustomResourceDefinition's own status; a PUT that wholesale-replaces it with a scalar
@@ -2851,6 +3132,68 @@ mod tests {
             v["spec"]["group"], "example.io",
             "PATCH on the status subresource must not touch spec"
         );
+    }
+
+    /// `PATCH .../{name}/status?dryRun=All` must return the would-be patched status but leave
+    /// the stored CRD's status untouched. Before this fix, patch_crd_status had no dry-run
+    /// check at all.
+    #[tokio::test]
+    async fn patch_crd_status_dry_run_all_does_not_persist() {
+        let state = make_state();
+        let name = "dryrunpatchwidgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "dryrunpatchwidgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let patch = serde_json::json!({
+            "status": { "conditions": [{ "type": "NamesAccepted", "status": "True" }] }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let resp = patch_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .expect("dry-run patch status must succeed")
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["status"]["conditions"][0]["type"], "NamesAccepted",
+            "dry-run response must show the would-be patched condition"
+        );
+
+        let reget = get_crd(State(state), Path(name.to_string()))
+            .await
+            .expect("get must succeed after dry-run");
+        let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
+        let stored_conditions = v2["status"]["conditions"].as_array().unwrap();
+        assert_eq!(
+            stored_conditions.len(),
+            2,
+            "dryRun=All must not persist the PATCH's replacement conditions array — the CRD's \
+             creation-time Established+NamesAccepted conditions must be unchanged"
+        );
+        assert_eq!(stored_conditions[0]["type"], "Established");
     }
 
     /// PATCH .../{name}/status with a merge-patch body `{"status":"x"}` must be rejected
@@ -3667,9 +4010,15 @@ mod tests {
         .await
         .expect("initial create must succeed");
 
-        delete_crd(State(state.clone()), Path(name.to_string()), test_user())
-            .await
-            .expect("delete must succeed");
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
 
         let tombstone_key = deleted_group_tombstone_key(group);
         let after_delete = store
@@ -3767,9 +4116,15 @@ mod tests {
              horizon 0 while it is still live"
         );
 
-        delete_crd(State(state.clone()), Path(name.to_string()), test_user())
-            .await
-            .expect("delete must succeed");
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
 
         assert_eq!(
             store.compaction_horizon_for(&prefix),
@@ -3855,9 +4210,15 @@ mod tests {
         assert_eq!(store.compaction_horizon_for(&ns_prefix), 0);
         assert_eq!(store.compaction_horizon_for(&cluster_prefix), 0);
 
-        delete_crd(State(state.clone()), Path(name.to_string()), test_user())
-            .await
-            .expect("delete must succeed");
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
 
         assert_eq!(
             store.compaction_horizon_for(&cluster_prefix),

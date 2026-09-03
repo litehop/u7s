@@ -204,6 +204,8 @@ pub(crate) async fn delete_collection_cluster_trust_bundles<S: Store>(
     State(state): State<AppState<S>>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     super::resource::delete_collection_resource(
         State(state),
@@ -214,6 +216,8 @@ pub(crate) async fn delete_collection_cluster_trust_bundles<S: Store>(
         )),
         Query(query),
         Extension(user),
+        headers,
+        body,
     )
     .await
 }
@@ -391,6 +395,8 @@ pub(crate) async fn delete_collection_pod_certificate_requests<S: Store>(
     Path(ns): Path<String>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     super::resource::delete_collection_namespaced_resource(
         State(state),
@@ -402,6 +408,8 @@ pub(crate) async fn delete_collection_pod_certificate_requests<S: Store>(
         )),
         Query(query),
         Extension(user),
+        headers,
+        body,
     )
     .await
 }
