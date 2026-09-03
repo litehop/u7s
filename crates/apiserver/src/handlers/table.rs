@@ -2392,6 +2392,32 @@ mod tests {
         assert_eq!(cells[4], "", "ACCESS MODES must stay blank pre-binding");
     }
 
+    #[test]
+    fn pvc_terminating_status_overrides_phase() {
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "dying-pvc",
+                "creationTimestamp": "2020-01-01T00:00:00Z",
+                "deletionTimestamp": "2020-01-02T00:00:00Z"
+            },
+            "spec": {
+                "volumeName": "pvc-1234",
+                "storageClassName": "csi-hostpath-sc"
+            },
+            "status": { "phase": "Bound" }
+        });
+
+        let table = build_table("", "persistentvolumeclaims", vec![pvc]);
+        let cells = table["rows"][0]["cells"].as_array().unwrap();
+        assert_eq!(
+            cells[1], "Terminating",
+            "pvc with deletionTimestamp must show Terminating regardless of phase — \
+             otherwise `kubectl get pvc` hides an in-progress delete from operators"
+        );
+    }
+
     // ── PersistentVolume tests ────────────────────────────────────────────────
 
     #[test]
@@ -2483,6 +2509,32 @@ mod tests {
         assert_eq!(
             cells[5], "",
             "CLAIM must be blank when spec.claimRef is unset — no PVC bound yet"
+        );
+    }
+
+    #[test]
+    fn pv_terminating_status_overrides_phase() {
+        let pv = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {
+                "name": "dying-pv",
+                "creationTimestamp": "2020-01-01T00:00:00Z",
+                "deletionTimestamp": "2020-01-02T00:00:00Z"
+            },
+            "spec": {
+                "capacity": {"storage": "10Gi"},
+                "persistentVolumeReclaimPolicy": "Delete"
+            },
+            "status": { "phase": "Bound" }
+        });
+
+        let table = build_table("", "persistentvolumes", vec![pv]);
+        let cells = table["rows"][0]["cells"].as_array().unwrap();
+        assert_eq!(
+            cells[4], "Terminating",
+            "pv with deletionTimestamp must show Terminating regardless of phase — \
+             otherwise `kubectl get pv` hides an in-progress delete from operators"
         );
     }
 
