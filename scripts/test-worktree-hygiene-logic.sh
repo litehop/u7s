@@ -281,15 +281,38 @@ assert "without DRY_RUN, run_cmd executes the real command" \
 #    elsewhere, just not automatable here without a disposable bd database.
 # ---------------------------------------------------------------------------
 
+# Fixture suffixes below are intentionally 2 chars, one below the real
+# generator's 3-5 char range (see check-bead-id-refs.sh), so these
+# synthetic bead-ID-shaped strings don't trip that guard's rot check --
+# they're placeholders for the parser test, not references to real beads.
 FINDING_CLOSED="$SANDBOX_ROOT/finding-closed.md"
-printf 'Bead: fixture-closed-1\n\nBody text.\n' > "$FINDING_CLOSED"
+printf 'Bead: mayor-fx\n\nBody text.\n' > "$FINDING_CLOSED"
 assert "bead_id_from_finding extracts the bead id from a well-formed header" \
-  "$([ "$(call bead_id_from_finding "$FINDING_CLOSED")" = "fixture-closed-1" ] && echo 1 || echo 0)"
+  "$([ "$(call bead_id_from_finding "$FINDING_CLOSED")" = "mayor-fx" ] && echo 1 || echo 0)"
 
 FINDING_NO_HEADER="$SANDBOX_ROOT/finding-no-header.md"
 printf 'Just prose, no bead reference.\n' > "$FINDING_NO_HEADER"
 assert "bead_id_from_finding returns empty for a file with no Bead: header (must not be treated as a match for any bead)" \
   "$([ -z "$(call bead_id_from_finding "$FINDING_NO_HEADER")" ] && echo 1 || echo 0)"
+
+# Regression: a header with trailing descriptive text (e.g. a parenthetical
+# naming related beads) used to be slurped whole, whitespace stripped, into
+# one mangled compound token that matches no live bd record -- so a real,
+# still-open finding got flagged stale and recommended for deletion. The
+# parser must stop at the first bead-ID token and ignore everything after.
+FINDING_TRAILING="$SANDBOX_ROOT/finding-trailing.md"
+printf 'Bead: mayor-tp (decision-prep for mayor-ab Phase 3 / mayor-cd)\n\nBody text.\n' > "$FINDING_TRAILING"
+EXTRACTED_TRAILING=$(call bead_id_from_finding "$FINDING_TRAILING")
+assert "bead_id_from_finding stops at the bead-ID token instead of slurping trailing text (incl. other mayor-* mentions) into a mangled string that would never match any live bead" \
+  "$([ "$EXTRACTED_TRAILING" = "mayor-tp" ] && echo 1 || echo 0)"
+
+# Feeding the correctly-extracted id's status through is_stale_bead_status
+# as "open" proves the fix, not a coincidental match, is what keeps a live
+# finding with a trailing-parenthetical header from being flagged stale.
+RC=0
+call is_stale_bead_status "open" || RC=$?
+assert "a trailing-parenthetical header for an open bead ($EXTRACTED_TRAILING) is NOT flagged stale once the id is extracted correctly" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
 RC=0
 call is_stale_bead_status "closed" || RC=$?
