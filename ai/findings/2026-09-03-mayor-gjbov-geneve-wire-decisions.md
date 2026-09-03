@@ -6,7 +6,7 @@ Bead: mayor-gjbov (decision-prep for mayor-aie31 Phase 3 / mayor-pa0ze)
 
 1. Option encoding: raw pod IP for the pod identifier; raw `VIP_IP:VIP_PORT` for the VIP echo. Compact alternatives (backend-index, flow-id) save a handful of bytes the mechanism doc's own sizing treats as noise (`ebpf-lb-dataplane.md:98-107`) while each adds a cross-node coordination or id-collision surface. The raw VIP echo is load-bearing, not a debugging nicety: the un-DNAT node must recover a VIP the reply never carries, so a reliable forward-leg VIP channel is required (decision 3). No ADR touches wire encoding.
 2. NAT placement: DNAT on the backend, un-DNAT on the ingress node. This is the mechanism doc's packet-flow narrative and what mayor-g7jh2 (Phase 2) is written against, so it gates Phase 2, not Phase 3. kube-proxy likewise places un-DNAT at the node that owns the VIP's conntrack, never at the backend. The symmetric-return ADR fixes the return route, not the rewrite node.
-3. Backend reverse-flow key uniqueness: accept overlapping LoadBalancers. Do NOT reject at admission (upstream permits the overlap) and do NOT fold the VIP into the key (unrecoverable on return). The reverse key can genuinely alias; the real decision is per-flow SNAT vs. real-client-IP (below), settled in Phase 3/4.
+3. Backend reverse-flow key uniqueness: accept overlapping LoadBalancers, and make the reverse key unique by construction via a backend **source-port remap applied on-conflict only** (settled 2026-09-03). Do NOT reject at admission (upstream permits the overlap), do NOT fold the front address into the key (unrecoverable on return), and do NOT per-flow SNAT the client IP (destroys real-client-IP-at-L3, an ADR invariant — `servicelb-ebpf-geneve-dataplane.md:14`). Preserves the client source IP:port unchanged on the happy path; remaps only the source port of a colliding second flow. Gates Phase 3 (mayor-pa0ze). See Decision 3.
 
 ## Decision 1 — Geneve option wire encoding
 
@@ -32,11 +32,19 @@ Severity: for TCP the collision is largely self-limiting — a pod's kernel will
 
 Upstream permits the overlap: Kubernetes has no cross-Service selector validation — `ValidateServiceCreate` in `pkg/apis/core/validation/validation.go` validates a Service only against itself/its prior version, and the endpoints controller lists each Service's selector in isolation. Multiple `type=LoadBalancer` Services targeting the same `Pod:TargetPort` are legal, so admission-time rejection is non-conformant and is not an option.
 
-The design decision, for Phase 3/4:
-- Per-flow SNAT at the ingress: rewrite the client source to an ingress-owned unique IP:port, making the reverse key unique by construction, at the cost of the real client IP. (kube-proxy takes this trade in some modes; it relies on Linux conntrack's conflict resolution, which may SNAT or reject rather than making the bare tuple unique.)
-- Preserve the real client IP: keep the client 5-tuple key and accept the stale-misattribution window, mitigated by evicting the reverse entry on connection teardown (FIN/RST) plus a metric for the residual window.
+**Resolution (2026-09-03): backend source-port remap, on-conflict only.** On the forward-leg write, the backend checks whether the reverse key already holds a *different* front address (the node's own `NODE_IP:SVC_PORT` the client dialed — model corrected to node-IP exposure on 2026-09-03, see `ebpf-lb-dataplane.md`). If it does, the backend allocates a synthetic source port unique per `(CLIENT_IP, PodIP, TargetPort)`, stores it, and un-remaps it on the return leg. The reverse tuple is then unique by construction — protocol-agnostic, so it closes the UDP case that has no teardown signal — while the client's source IP:port is left untouched for every non-colliding flow (the happy path carries only the DNAT every flow already needs).
 
-Real-client-IP is a stated gjbov goal, which favors the second option plus mitigation; the first is correct-by-construction if client-IP visibility is expendable. Gates Phase 3 (mayor-pa0ze); admission policy or SNAT choice is pure control-plane/dataplane policy, changeable without touching the wire format.
+Why not the two alternatives originally sketched here:
+- *Per-flow SNAT of the client IP* rewrites the source address, destroying real-client-IP-at-L3 — the defining requirement of `servicelb-ebpf-geneve-dataplane.md:14`, and the whole reason this dataplane exists instead of the klipper-lb-alike. Off the table unless that ADR is reopened.
+- *Keep the full 5-tuple and accept a mitigated window* (evict-on-FIN/RST + metric) does not close UDP, which has no teardown — and the flagship workload (a single-instance DNS pod reachable via any node's IP) is exactly UDP with a client that can legitimately reuse one source port across node IPs. Mitigation is weakest precisely where the collision is most reachable.
+
+The remap's only cost — a synthetic source port as the pod sees it — falls solely on the rare colliding flow; the sole readers of the absolute source-port value are privileged-port auth (NFS `secure`, r-services) and external CGNAT log correlation, neither of which touches DNS. Note the collision corrupts two things at once — which front address to restore *and* which ingress node to route the reply through — both eliminated once the key cannot alias.
+
+Gates Phase 3 (mayor-pa0ze); pure dataplane policy, changeable without touching the wire format.
+
+## Decision 4 — QUIC connection routing
+
+Route QUIC by DCID, not the 4-tuple. The Decision 3 source-port remap is a 4-tuple tool QUIC doesn't need — the pod demuxes by Connection ID — and one that breaks it: remapping a migrated 4-tuple shatters connection migration. Stay pass-through; leave the client IP:port untouched.
 
 ## Precedent
 
