@@ -230,10 +230,15 @@ latest_reviewer_review() {
 # the review-verdict gate at all. CLEAN and BEHIND both qualify -- queuing
 # a BEHIND PR is the merge queue's job to rebase, not the mayor's, so it
 # must not be silently skipped forever; anything else (DIRTY, BLOCKED,
-# DRAFT, UNKNOWN, ...) does not. Checks must be genuinely complete and
-# non-failing regardless of merge state.
+# UNKNOWN, ...) does not. Checks must be genuinely complete and non-failing
+# regardless of merge state. A draft PR is excluded via its own isDraft
+# field rather than folded into the mss case above -- GitHub has been
+# observed reporting mergeStateStatus=CLEAN for a draft PR (a deliberate
+# mayor hold), and `gh pr merge` unconditionally rejects a draft with a
+# GraphQL error that would otherwise abort the whole tick under `set -e`.
 pr_gate_eligible() {
-  local mss="$1" pending="$2" failed="$3"
+  local mss="$1" pending="$2" failed="$3" is_draft="${4:-false}"
+  [ "$is_draft" = "true" ] && return 1
   case "$mss" in
     CLEAN|BEHIND) ;;
     *) return 1 ;;
@@ -596,14 +601,15 @@ process_review_queue() {
 # SubagentStop hook that feeds the queue never fires for the mayor's own
 # top-level turn), so gating them here would just wedge them forever.
 gate_and_merge_prs() {
-  local prs_json n pr mss pending failed reviews_json latest body verdict
-  prs_json=$(gh pr list --state open --json number,headRefName,mergeStateStatus,statusCheckRollup 2>/dev/null || echo '[]')
+  local prs_json n pr mss pending failed is_draft reviews_json latest body verdict
+  prs_json=$(gh pr list --state open --json number,headRefName,mergeStateStatus,statusCheckRollup,isDraft 2>/dev/null || echo '[]')
   for n in $(printf '%s' "$prs_json" | jq -r '.[] | select(.headRefName | startswith("worker/agent-")) | .number' 2>/dev/null || true); do
     pr=$(printf '%s' "$prs_json" | jq -c --argjson n "$n" '.[] | select(.number==$n)')
     mss=$(printf '%s' "$pr" | jq -r '.mergeStateStatus')
     pending=$(printf '%s' "$pr" | jq '[.statusCheckRollup[]? | select(.status!=null and .status!="COMPLETED")] | length')
     failed=$(printf '%s' "$pr" | jq '[.statusCheckRollup[]? | select(.conclusion!=null and (.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT" or .conclusion=="ACTION_REQUIRED"))] | length')
-    pr_gate_eligible "$mss" "$pending" "$failed" || continue
+    is_draft=$(printf '%s' "$pr" | jq -r '.isDraft')
+    pr_gate_eligible "$mss" "$pending" "$failed" "$is_draft" || continue
 
     reviews_json=$(gh pr view "$n" --json reviews --jq '.reviews' 2>/dev/null || echo '[]')
     latest=$(latest_reviewer_review "$reviews_json")
