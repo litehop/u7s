@@ -3,27 +3,52 @@
 Date: 2026-09-03
 Bead: mayor-gjbov (decision-prep for `mayor-aie31` Phase 3, `mayor-pa0ze`)
 
+**Correction (2026-09-03):** decisions 1 and 3 below were revised after
+verifying upstream Kubernetes source directly — see "Research addendum"
+near the end. Decision 2 was checked against real-dataplane precedent and
+stands unchanged.
+
 ## Recommendation summary
 
-1. **Option encoding**: raw pod IP for the pod identifier, raw
-   `VIP_IP:VIP_PORT` for the echo — both compact-encoding alternatives buy
-   a few bytes at the cost of new cross-node state or opaque debugging;
-   neither is worth it here. Not settled by any ADR.
+1. **Option encoding**: raw pod IP for the pod identifier. Raw
+   `VIP_IP:VIP_PORT` for the VIP echo is **mandatory**, not optional —
+   decision 3 depends on it being correct and unambiguous, not merely on
+   it being debuggable. Compact alternatives for either sub-choice buy a
+   few bytes at the cost of new cross-node state or a second collision
+   surface; neither is worth it. Not settled by any ADR.
 2. **NAT placement**: keep DNAT-on-backend + un-DNAT-on-ingress — it is
    already the mechanism doc's literal Packet-flow narrative and what
    `mayor-g7jh2` (Phase 2) is written against, so this decision actually
    gates Phase 2, not Phase 3 as currently framed. Not settled by the
    symmetric-return ADR (that ADR fixes the *route*, not which node does
-   the rewrite).
-3. **Backend key uniqueness**: the doc's own proposed fix ("fold VIP into
-   the backend key") is not viable as stated — the return packet never
-   carries the VIP, so a wider key has nothing to look itself up by.
-   Recommend admission-time prevention (reject two LB Services sharing a
-   backend Pod + targetPort) instead of an eBPF-side fix. Not settled by
-   any ADR; gates Phase 3 (`mayor-pa0ze`) as intended.
+   the rewrite). Unchanged by this correction.
+3. **Backend key uniqueness — CORRECTED.** Upstream Kubernetes places no
+   restriction on two `type=LoadBalancer` Services routing to the same
+   backend Pod + targetPort (`ValidateServiceCreate`,
+   `validation.go:7033-7045`, verified against `release-1.36` — see
+   addendum). The prior recommendation — reject this at admission — would
+   have made u7s non-conformant. Corrected recommendation: **accept the
+   overlap.** The Pod's raw reply never carries the VIP (it was DNAT'd
+   away before the Pod ever saw it) — that fact from the original brief is
+   unchanged. The fix does not put the VIP *in* the reply; the backend
+   captures it once, off the still-untouched forward-leg inner
+   destination (step 4, before it rewrites anything), holds it in
+   per-flow state, and on return keys that state off the reply's own
+   natural reverse tuple `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
+   — which the raw reply *does* carry — to echo the VIP forward to the
+   ingress node (step 6). Per decision 2, un-DNAT is performed at the
+   **ingress** node, not the backend — gjbov is not Cilium-style DSR,
+   where the backend sources its own reply directly to the client. The
+   "fold VIP into the backend key" idea in the mechanism doc still doesn't
+   work (the reply has nothing to key a *wider* lookup by), but the fix
+   was never in the lookup — it's upstream of it, in what gets captured at
+   write time and reapplied by the node decision 2 already designates.
+   Gates Phase 3 (`mayor-pa0ze`) as intended.
 
-Only decision 3 is genuinely locked-into-Phase-3's scope as framed;
-decision 2 needs settling before Phase 2 starts, not before Phase 3 closes.
+Decision 3 is genuinely locked into Phase 3's scope as framed. Decision 2
+needs settling before Phase 2 starts, not before Phase 3 closes. Decision
+1's VIP-echo sub-choice is now load-bearing for decision 3's correctness,
+not an independent debuggability call.
 
 ---
 
@@ -71,15 +96,30 @@ map-ordering" / "smaller, format-agnostic",
 `ebpf-lb-dataplane.md:137-139`) but does not pick. No ADR touches wire
 encoding at all.
 
-**Recommendation.** Raw encoding for both (a) and (b). Rationale: the
-project's own memory table already treats sub-20-byte option overhead as
-noise against total packet cost (`ebpf-lb-dataplane.md:98-107`), so the
-compact options' only real benefit evaporates, while their cost — new
-cross-node ordering coordination for (a), a second id-collision surface for
-(b) — is exactly the class of correctness risk this brief exists to avoid
-building into an unproven mechanism (Phase 2 is flagged HIGH risk,
-"unproven in this codebase", `bd show mayor-g7jh2`). Debuggability matters
-disproportionately right now because the mechanism itself is unproven.
+**Recommendation.** Raw encoding for both (a) and (b) — and for (b), this
+is now a **correctness requirement, not a preference.** Decision 3
+(corrected below) depends on the ingress node being able to recover the
+right VIP for a reply that itself carries no VIP; some reliable channel
+from decision 3's per-flow capture back to the ingress node's un-DNAT step
+is load-bearing, and raw `VIP_IP:VIP_PORT` is the only one of the two
+options that doesn't introduce its own id-collision surface on top of the
+one decision 3 is already managing. Beyond that, the project's own memory
+table already treats sub-20-byte option overhead as noise against total
+packet cost (`ebpf-lb-dataplane.md:98-107`), so the compact options' only
+real benefit evaporates, while their cost — new cross-node ordering
+coordination for (a), a second id-collision surface for (b) — is exactly
+the class of correctness risk this brief exists to avoid building into an
+unproven mechanism (Phase 2 is flagged HIGH risk, "unproven in this
+codebase", `bd show mayor-g7jh2`). Debuggability matters disproportionately
+right now because the mechanism itself is unproven.
+
+**Open item (not settled here):** whether an explicit backend→ingress
+Geneve echo is even the right mechanism, versus the ingress node
+recovering the VIP purely from its own step-2 flow-affinity state keyed
+against the reply's natural reverse tuple, is a Phase-3 design question —
+see "Open verification items" below. This recommendation covers the
+*encoding* if a wire echo is used; it does not settle whether one is
+strictly necessary.
 
 **Gates:** Phase 3 (`mayor-pa0ze`) as framed by the epic.
 
@@ -120,7 +160,10 @@ correctness and only trades one wire option for one map lookup. Revisit
 only if Phase 3/4 prototype data shows the VIP-echo option (decision 1b)
 is itself a problem — record that as a documented revisit trigger, mirroring
 the pattern `ebpf-toolchain-aya.md:38-41` already uses for the toolchain
-choice.
+choice. **Unchanged by this doc's research addendum** — kube-proxy's
+un-DNAT likewise happens at the node that owns the VIP's conntrack (never
+at the backend), so real precedent reinforces this placement rather than
+challenging it; see addendum.
 
 **Gates:** Phase 2 (`mayor-g7jh2`), **not** Phase 3 as the epic currently
 frames it — flag this explicitly to the operator, since `mayor-pa0ze`'s
@@ -165,38 +208,52 @@ UDP/QUIC has no such protocol-level self-protection — but QUIC already
 uses DCID-keyed matching (`ebpf-lb-dataplane.md:90-96`), which sidesteps
 the 4-tuple-reuse problem entirely by construction.
 
-**Options**
+**Options — CORRECTED.** Admission-time prevention is no longer a valid
+option: upstream Kubernetes allows two `type=LoadBalancer` Services to
+route to the same backend Pod + targetPort with no cross-Service selector
+check (`ValidateServiceCreate`, `validation.go:7033-7045`, `release-1.36`
+— see research addendum), so rejecting it would make u7s non-conformant.
 
-| | Fold VIP into key | Admission-time prevention | Accept + document as known limitation |
+| | Fold VIP into key | Admission-time prevention (REJECTED — non-conformant) | Accept overlap; rely on existing per-flow VIP capture |
 |---|---|---|---|
-| Wire/map complexity | Dead end (see above) | None — app-layer validation, zero eBPF/wire change | None |
-| Correctness | Does not fix the lookup side | Correct by construction — collision becomes structurally impossible | Probabilistic; residual risk remains indefinitely |
-| Debuggability | N/A (doesn't work) | Trivial — rejected at admission time with a clear reason | A misattributed reply is silent unless instrumented |
-| User-facing cost | — | Blocks a rare pattern: two LB Services sharing one Pod at the identical targetPort (common case — different targetPorts per Service — is unaffected) | None |
-| Reversibility | — | Fully reversible later (app-layer policy, no wire/eBPF coupling) | Can be tightened later without wire changes |
+| Wire/map complexity | Dead end (see above) | None, but not viable | None new — this is already the mechanism doc's step-4 capture + step-6 echo; decision 1 only makes the echo's encoding mandatory-raw |
+| Conformance | N/A | Blocks a legal upstream configuration | Conformant — no restriction added |
+| Correctness | Does not fix the lookup side | Would be correct by construction, but for a scenario u7s has no right to forbid | Structurally correct for TCP: the Pod's own kernel stack already forbids two live connections at one 4-tuple, so no *live* collision at the backend's key is possible; the residual is a narrower *stale-entry misattribution* window after LRU eviction/teardown (see observation above) |
+| Debuggability | N/A (doesn't work) | N/A | Bounded and measurable — add a metric for stale-misattribution events rather than assume zero risk |
+| User-facing cost | — | Breaks a legal pattern (different Services, same Pod) | None — no new restriction on Service authors |
+| Reversibility | — | — | Pure dataplane/observability detail; tightenable later without an API change |
 
 **What the docs lean toward.** Mechanism doc proposes the key-folding fix
 as the presumed answer (`ebpf-lb-dataplane.md:148-149`) without checking
 it against what the return packet actually carries; `mayor-pa0ze`'s bead
-text repeats it verbatim as "likely fix." Neither ADR discusses backend
-port-sharing across Services at all.
+text repeats it verbatim as "likely fix." Neither the mechanism doc nor
+either ADR checked the scenario against upstream's own validation code.
 
-**Recommendation.** Admission-time prevention (reject/flag two
-`type=LoadBalancer` Services that would route to the same backend
-Pod + targetPort) over any eBPF-side key change. Rationale: it is the only
-option that is actually correct rather than probabilistic, costs nothing
-in the dataplane, and avoids sinking Phase 3 effort into a key-widening
-approach that the return packet's own contents make unworkable. If
-admission-time validation is judged too much scope for Phase 3, fall back
-to "accept + document + add a metric for the stale-misattribution window"
-rather than attempting the key fold.
+**Recommendation — FLIPPED.** Accept the overlap; do not add
+admission-time rejection. The mechanism doc's design already has what
+correctness requires here: the backend captures the VIP once, off the
+still-untouched forward-leg inner destination, before it rewrites
+anything (step 4) — never from the reply, which carries no VIP either way
+— and holds it in its own per-flow reverse entry. Decision 2 already
+designates the ingress node to perform the un-DNAT using that captured
+value once it's echoed back (step 6-7); this is not Cilium-style DSR, and
+nothing here asks the backend to source its own reply. Decision 1 making
+that echo mandatory-raw, not compact, is what keeps this capture reliable
+rather than adding decision 3's own collision surface back in as a second
+one. Add a metric for the stale-entry-misattribution window identified
+above (post-eviction/teardown reuse of the same client port to a
+different VIP); do not spend Phase 3 effort on the key-fold, which the
+reply's own contents make structurally unworkable regardless of which
+option is chosen here.
 
 **Gates:** Phase 3 (`mayor-pa0ze`) — this is exactly the decision that
-bead was filed to resolve.
+bead was filed to resolve, with the corrected verdict.
 
-**Reversibility:** Least wire-locked of the three. Admission-time
-validation is pure control-plane policy; it can be added, loosened, or
-removed at any time without touching the eBPF programs or wire format.
+**Reversibility:** This is now a dataplane-behavior + observability
+commitment, not a control-plane admission policy — it locks in once Phase
+3 ships decision 1's mandatory raw echo and the existing reverse-flow
+capture. The stale-misattribution metric and any TTL tuning around it
+remain freely adjustable afterward without a wire change.
 
 ## Already-settled question, for the record
 
@@ -213,6 +270,72 @@ operator should settle it *before* `mayor-g7jh2` starts, not batch it with
 the other two at Phase 3's gate — otherwise Phase 2 risks shipping against
 an assumption Phase 3 later reopens.
 
+## Research addendum — correction to decisions 1 and 3 (2026-09-03)
+
+**Load-bearing fact, verified against upstream source.** Kubernetes places
+no restriction on multiple `type=LoadBalancer` Services selecting the same
+backend Pod, including at the identical `targetPort`.
+`ValidateServiceCreate` (`pkg/apis/core/validation/validation.go:7033-7045`
+in `release-1.36`, confirmed by direct fetch) calls
+`validateService(service, nil)` — a function whose signature
+(`validateService(service, oldService *core.Service)`) only ever compares
+a Service to itself or its own prior version, never to any other Service
+in the cluster; there is no lister/indexer of other Services anywhere in
+the path. The endpoints controller confirms the same absence at the
+control loop: `Controller.syncService`
+(`pkg/controller/endpoint/endpoints_controller.go:348`) lists Pods per
+Service via `labels.Set(service.Spec.Selector).AsSelectorPreValidated()`
+(line 392), independently for each Service key, with no cross-Service
+selector-overlap check anywhere in the sync path. This is why decision 3's
+prior "reject at admission" recommendation was wrong: it would have
+rejected a configuration upstream explicitly permits.
+
+**Real-dataplane precedent.** Cited only for how each system carries the
+VIP across the round trip — not as precedent for *where* the un-DNAT
+happens. Cilium's Direct Server Return (backend replies straight to the
+client) is a different topology from gjbov's decision 2 (reply always
+transits the ingress node); it is not evidence for or against decision 2.
+
+| Implementation | VIP-carry mechanism | Where the reply is re-sourced as the VIP |
+|---|---|---|
+| Cilium (eBPF + Geneve DSR) | Raw service address+port in a Geneve option (`geneve_dsr_opt4`/`geneve_dsr_opt6`, `bpf/lib/tunnel.h`) — precedent for decision 1's raw-not-compact encoding | The **backend**, directly to the client (DSR) — not gjbov's model; decision 2 keeps this at the ingress node instead |
+| kube-proxy (iptables/IPVS) | Per-Service conntrack entry, created on the node that performs the DNAT | The **same node that DNAT'd**, via conntrack un-DNAT on the return leg — the precedent decision 2 actually matches |
+| MetalLB | Announces the VIP (BGP/ARP); delegates all Service NAT to kube-proxy | Inherits kube-proxy's placement; adds nothing at the NAT layer |
+
+Sources: kubernetes.io/docs/reference/networking/virtual-ips/;
+blog.stonegarden.dev/articles/2026/02/cilium-dsr/;
+cilium.io/use-cases/load-balancer/; Kubernetes `release-1.36`
+`pkg/apis/core/validation/validation.go` and
+`pkg/controller/endpoint/endpoints_controller.go`;
+metallb.universe.tf/usage/. All five URLs verified resolving (HTTP 200) on
+2026-09-03.
+
+**Open verification items for Phase 3 — not settled by this brief:**
+
+- Whether decision 1's backend→ingress Geneve VIP echo is strictly
+  necessary at all, given the ingress node already writes its own
+  flow-affinity entry at step 2 (keyed on `CLIENT_IP, SRC_PORT, VIP_IP,
+  VIP_PORT`). If that entry were also indexed by the chosen backend's
+  `PodIP:TargetPort`, the ingress could in principle recover the VIP
+  purely from the reply's own natural reverse tuple, with no wire signal
+  from the backend at all. Whether the echo is instead needed for
+  backend→ingress-node attribution or return-tunnel routing (e.g. in a
+  multi-ingress topology) is unresolved here — the load-bearing
+  requirement (VIP recoverable on return, never derived from the raw
+  reply) holds regardless of how this resolves, but the exact mechanism
+  and wire necessity is a Phase-3 design question, not a settled claim.
+- Cilium's exact reverse-lookup code path for Geneve-DSR when one backend
+  Pod serves multiple VIPs was not fully traced in this pass —
+  `ct_lazy_lookup4(SCOPE_REVERSE)` / `lb4_lookup_rev_nat_entry` were the
+  entry points found, but map population for the Geneve-DSR case
+  specifically was not confirmed. Lower priority given Cilium's DSR
+  topology differs from gjbov's (see table above).
+- Whether the reverse-flow map structure already sketched in
+  `ai/extended-context/ebpf-lb-dataplane.md` actually satisfies the
+  now-load-bearing VIP-capture requirement (captures the correct VIP at
+  write time, per flow, before any possible key collision) needs to be
+  checked as part of Phase 3 design, not assumed from this brief.
+
 ## References
 
 `ai/extended-context/ebpf-lb-dataplane.md`;
@@ -220,4 +343,11 @@ an assumption Phase 3 later reopens.
 `docs/decisions/servicelb-symmetric-geneve-return.md`;
 `docs/decisions/ebpf-toolchain-aya.md`; `bd show mayor-aie31/g6u8s/g7jh2/pa0ze`;
 Cilium `bpf/lib/tunnel.h` (cached `temp/research/cilium-tunnel.h`, not
-committed — untracked research scratch).
+committed — untracked research scratch); Kubernetes `release-1.36`
+`pkg/apis/core/validation/validation.go` and
+`pkg/controller/endpoint/endpoints_controller.go` (cached
+`temp/research/k8s-validation.go`,
+`temp/research/k8s-endpoints_controller.go`, not committed — untracked
+research scratch); kubernetes.io/docs/reference/networking/virtual-ips/;
+blog.stonegarden.dev/articles/2026/02/cilium-dsr/;
+cilium.io/use-cases/load-balancer/; metallb.universe.tf/usage/.
