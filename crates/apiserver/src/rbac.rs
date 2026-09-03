@@ -71,6 +71,13 @@ struct RbacInner {
     roles: HashMap<(String, String), Vec<PolicyRule>>,
     cluster_bindings: Vec<(String, RbacBinding)>, // (key, binding)
     namespace_bindings: Vec<(String, RbacBinding)>,
+    // Last-applied resourceVersion per store key. Lets apply_object converge on
+    // whichever update is actually persisted last even when two concurrent writers'
+    // apply_object calls for the *same* key (e.g. do_patch's SSA-create-race
+    // fallback branch racing the primary create path — both target the same
+    // ClusterRoleBinding) are reordered by the store's blocking-threadpool
+    // scheduling relative to the order their writes actually committed.
+    resource_versions: HashMap<String, u64>,
 }
 
 impl RbacIndex {
@@ -81,6 +88,7 @@ impl RbacIndex {
                 roles: HashMap::new(),
                 cluster_bindings: Vec::new(),
                 namespace_bindings: Vec::new(),
+                resource_versions: HashMap::new(),
             })),
         }
     }
@@ -93,23 +101,32 @@ impl RbacIndex {
         //   /apis/rbac.authorization.k8s.io/v1/clusterrolebindings/<name>
         //   /apis/rbac.authorization.k8s.io/v1/namespaces/<ns>/rolebindings/<name>
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let incoming_rv = value["metadata"]["resourceVersion"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok());
 
         if key.contains("/clusterroles/") {
             if let Ok(role) = serde_json::from_value::<RbacRole>(value.clone()) {
-                let name = extract_last_segment(key);
-                inner.cluster_roles.insert(name, role.rules);
+                if accept_update(&mut inner.resource_versions, key, incoming_rv) {
+                    let name = extract_last_segment(key);
+                    inner.cluster_roles.insert(name, role.rules);
+                }
             }
         } else if key.contains("/clusterrolebindings/") {
             if let Ok(binding) = serde_json::from_value::<RbacBinding>(value.clone()) {
-                // Remove old entry with this key first, then push.
-                inner.cluster_bindings.retain(|(k, _)| k != key);
-                inner.cluster_bindings.push((key.to_owned(), binding));
+                if accept_update(&mut inner.resource_versions, key, incoming_rv) {
+                    // Remove old entry with this key first, then push.
+                    inner.cluster_bindings.retain(|(k, _)| k != key);
+                    inner.cluster_bindings.push((key.to_owned(), binding));
+                }
             }
         } else if key.contains("/roles/") {
             if let Ok(role) = serde_json::from_value::<RbacRole>(value.clone()) {
-                let ns = extract_namespace(key).unwrap_or_default();
-                let name = extract_last_segment(key);
-                inner.roles.insert((ns, name), role.rules);
+                if accept_update(&mut inner.resource_versions, key, incoming_rv) {
+                    let ns = extract_namespace(key).unwrap_or_default();
+                    let name = extract_last_segment(key);
+                    inner.roles.insert((ns, name), role.rules);
+                }
             }
         } else if key.contains("/rolebindings/") {
             if let Ok(mut binding) = serde_json::from_value::<RbacBinding>(value.clone()) {
@@ -122,8 +139,10 @@ impl RbacIndex {
                 if binding.namespace.is_none() {
                     binding.namespace = extract_namespace(key);
                 }
-                inner.namespace_bindings.retain(|(k, _)| k != key);
-                inner.namespace_bindings.push((key.to_owned(), binding));
+                if accept_update(&mut inner.resource_versions, key, incoming_rv) {
+                    inner.namespace_bindings.retain(|(k, _)| k != key);
+                    inner.namespace_bindings.push((key.to_owned(), binding));
+                }
             }
         }
     }
@@ -131,6 +150,7 @@ impl RbacIndex {
     /// Remove a role or binding when its store object is deleted.
     pub fn remove_object(&self, key: &str) {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        inner.resource_versions.remove(key);
 
         if key.contains("/clusterroles/") {
             let name = extract_last_segment(key);
@@ -423,6 +443,28 @@ pub fn user_holds_all_rules_in_namespace(
 }
 
 // --- helpers ---
+
+/// Decides whether an `apply_object` update for `key` should be applied, given the
+/// object's resourceVersion (`None` for callers — mostly tests and bootstrap fixtures
+/// — that don't carry one). An object with no resourceVersion always applies, matching
+/// prior behavior. Otherwise the update is rejected if a strictly newer resourceVersion
+/// was already recorded for this key, and accepted (recording `rv`) otherwise — so two
+/// concurrent writers indexing the same key converge on whichever one actually holds
+/// the higher (i.e. more recently persisted) resourceVersion, regardless of which
+/// caller's `apply_object` call happens to run last.
+fn accept_update(versions: &mut HashMap<String, u64>, key: &str, incoming_rv: Option<u64>) -> bool {
+    match incoming_rv {
+        None => true,
+        Some(rv) => {
+            if versions.get(key).is_some_and(|&recorded| recorded > rv) {
+                false
+            } else {
+                versions.insert(key.to_owned(), rv);
+                true
+            }
+        }
+    }
+}
 
 fn extract_last_segment(key: &str) -> String {
     key.split('/')
@@ -2184,6 +2226,66 @@ mod tests {
         assert!(
             !idx.is_allowed(&r_other),
             "RoleBinding in 'test-ns' must not grant access in 'other-ns'"
+        );
+    }
+
+    #[test]
+    fn apply_object_rejects_stale_resource_version_for_same_key() {
+        // do_patch's SSA-create-race fallback branch calls apply_object on the same
+        // ClusterRoleBinding key as the primary create path it raced against — the two
+        // calls happen on separate concurrently-scheduled async tasks (each backed by
+        // the store's blocking threadpool), so nothing guarantees the call carrying the
+        // object that actually ended up persisted (the higher resourceVersion) runs
+        // *last*. If apply_object just blindly overwrote on every call, whichever one
+        // happened to run last would win the index even if it carried the *older*,
+        // now-overwritten content — leaving the authorizer denying the subject that is
+        // actually in the store. Feeding the higher resourceVersion first and the lower
+        // one second (the exact reordering that made the flaky race test fail) must
+        // leave the index reflecting the higher-resourceVersion (i.e. truly persisted)
+        // subject.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "service-lister",
+            json!([{ "apiGroups": [""], "resources": ["services"], "verbs": ["list"] }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        let bind_key = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/crb-race".to_owned();
+        let binding_with_subject = |subject: &str, resource_version: &str| {
+            json!({
+                "metadata": { "resourceVersion": resource_version },
+                "subjects": [{ "kind": "User", "name": subject }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "service-lister"
+                }
+            })
+        };
+
+        // The actually-persisted content (resourceVersion "2") is indexed first...
+        idx.apply_object(&bind_key, &binding_with_subject("winner-sa", "2"));
+        // ...then a stale update (resourceVersion "1", from the call that lost the race
+        // to actually reach apply_object last) arrives and must be rejected.
+        idx.apply_object(&bind_key, &binding_with_subject("stale-sa", "1"));
+
+        let groups: Vec<String> = vec![];
+        let winner_req = req("winner-sa", &groups, "list", "services", "", None, None);
+        assert!(
+            idx.is_allowed(&winner_req),
+            "the higher-resourceVersion subject (winner-sa) must remain authorized after \
+             a stale (lower-resourceVersion) apply_object call arrives later — this is \
+             the actually-persisted content and must not be evicted by a stale update"
+        );
+
+        let stale_req = req("stale-sa", &groups, "list", "services", "", None, None);
+        assert!(
+            !idx.is_allowed(&stale_req),
+            "the stale subject (stale-sa) must NOT be authorized — its apply_object call \
+             carried a lower resourceVersion than what's already indexed, so applying it \
+             would leave the authorizer's index diverged from the object actually \
+             persisted in the store"
         );
     }
 }
