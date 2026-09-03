@@ -12963,6 +12963,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -13031,6 +13032,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -13098,6 +13100,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
@@ -13168,6 +13171,7 @@ mod handler_tests {
                 "/api/v1/namespaces/{ns}/pods/{name}/eviction",
                 post(evict_pod),
             )
+            .layer(auth_layer())
             .with_state(state);
 
         let eviction_body = serde_json::json!({
