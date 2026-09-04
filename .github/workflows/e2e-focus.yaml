@@ -142,9 +142,21 @@ jobs:
             pull_request) RANGE="${PR_BASE}...${PR_HEAD}" ;;
             merge_group)  RANGE="${MG_BASE}...${MG_HEAD}" ;;
             push)
-              RANGE="${PUSH_BEFORE}..${PUSH_AFTER}"
-              # First push of a branch reports an all-zero "before" SHA.
-              case "$PUSH_BEFORE" in 0000000*) RANGE="HEAD^..HEAD" ;; esac
+              # Diff the branch's WHOLE divergence from main, not just the
+              # pushed commits: before..after would miss a sensitive change made
+              # in an earlier commit that the latest push didn't touch (and is
+              # all-zeros on a branch's first push). merge-base with main covers
+              # the full branch footprint regardless of how it was pushed. On a
+              # push to main itself the merge-base IS HEAD, so fall back to the
+              # just-pushed commits there.
+              git fetch --no-tags --quiet origin main || true
+              BASE=$(git merge-base FETCH_HEAD HEAD 2>/dev/null || true)
+              if [ -n "$BASE" ] && [ "$BASE" != "$(git rev-parse HEAD)" ]; then
+                RANGE="${BASE}..HEAD"
+              else
+                RANGE="${PUSH_BEFORE}..${PUSH_AFTER}"
+                case "$PUSH_BEFORE" in 0000000*) RANGE="HEAD^..HEAD" ;; esac
+              fi
               ;;
             *) RANGE="HEAD^..HEAD" ;;
           esac
