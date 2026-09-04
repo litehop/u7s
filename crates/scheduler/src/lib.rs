@@ -714,6 +714,17 @@ fn referenced_pvc_names(pod_name: &str, volumes: &[PodVolume]) -> Vec<String> {
         .collect()
 }
 
+/// Namespace-qualify a bare PVC name into the key `NodeTally`'s cross-pod,
+/// cross-namespace aggregates (`TalliedPod`/`NodeUsage`/`NodePod`'s
+/// `pvc_names`) use. A PVC name is only unique within its own namespace —
+/// two unrelated PVCs in different namespaces may share a name — so any
+/// collection that tallies PVC references across MULTIPLE pods (which may
+/// span multiple namespaces) must key on this, not the bare name, or a
+/// same-named PVC elsewhere in the cluster gets treated as the same volume.
+fn pvc_key(namespace: &str, pvc_name: &str) -> String {
+    format!("{namespace}/{pvc_name}")
+}
+
 /// The `PodScheduled` condition type name — matches `v1.PodScheduled`.
 const POD_SCHEDULED: &str = "PodScheduled";
 /// The reason upstream's real scheduler stamps on a gated pod — matches
@@ -1276,9 +1287,11 @@ struct PodListItemStatus {
 /// count (against `status.allocatable.pods`), summed cpu/memory/
 /// ephemeral-storage requests (against `status.allocatable.{cpu,memory,ephemeral-storage}`),
 /// every hostPort already claimed by those pods (the NodePorts predicate's
-/// conflict-detection dimension), and every PVC name they reference (the
-/// VolumeRestrictions/ReadWriteOncePod predicate's exclusivity dimension).
-/// Computed by `NodeTally::usage_by_node`.
+/// conflict-detection dimension), and every PVC `pvc_key(namespace, name)`
+/// key they reference (the VolumeRestrictions/ReadWriteOncePod predicate's
+/// exclusivity dimension) — namespace-qualified because these pods may span
+/// multiple namespaces, and a bare name can collide with an unrelated PVC
+/// elsewhere in the cluster. Computed by `NodeTally::usage_by_node`.
 #[derive(Debug, Default, Clone)]
 pub struct NodeUsage {
     pub pod_count: u32,
@@ -1291,9 +1304,10 @@ pub struct NodeUsage {
 /// "namespace/name" key (to DELETE it), its scheduling priority (to decide
 /// whether it is a legal victim for a given pending pod), its own resource
 /// requests (how much pod-count/cpu/memory/ephemeral-storage/extended-resource
-/// capacity evicting it would actually free), and the PVC names it
-/// references (whether evicting it would also resolve a ReadWriteOncePod
-/// conflict).
+/// capacity evicting it would actually free), and the `pvc_key(namespace,
+/// name)`-qualified PVC keys it references (whether evicting it would also
+/// resolve a ReadWriteOncePod conflict — see `NodeUsage`'s doc comment for
+/// why this must be namespace-qualified, not a bare name).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePod {
     pub key: String,
@@ -1318,9 +1332,11 @@ struct PreemptionPodListItem {
 /// One pod's contribution to `NodeTally`: which node it currently occupies a
 /// slot on, its namespace/labels (what an inter-pod affinity/anti-affinity
 /// term matches against), its priority (preemption eligibility), its
-/// resource requests, its hostPort claims, and the PVC names its volumes
-/// reference (the ReadWriteOncePod exclusivity predicate's conflict-detection
-/// dimension — see `referenced_pvc_names`).
+/// resource requests, its hostPort claims, and the `pvc_key`-qualified PVC
+/// keys its volumes reference (the ReadWriteOncePod exclusivity predicate's
+/// conflict-detection dimension — see `referenced_pvc_names`/`pvc_key`;
+/// namespace-qualified, not bare `referenced_pvc_names` output, so a
+/// same-named PVC in another namespace is never conflated with this one).
 ///
 /// Populated both by `apply_event` (a real watch event carries the pod's full
 /// `metadata`/`spec.containers`/`spec.volumes`) and by `assume`'s fast path
@@ -1496,10 +1512,13 @@ impl NodeTally {
         let priority = watch_event.object.spec.priority.unwrap_or(0);
         let requests = pod_total_requests(&watch_event.object.spec);
         let host_ports = container_host_ports(&watch_event.object.spec.containers);
-        let pvc_names = referenced_pvc_names(
+        let pvc_names: Vec<String> = referenced_pvc_names(
             &name,
             watch_event.object.spec.volumes.as_deref().unwrap_or(&[]),
-        );
+        )
+        .into_iter()
+        .map(|n| pvc_key(&namespace, &n))
+        .collect();
         let node_name = watch_event.object.spec.node_name.filter(|n| !n.is_empty());
         match node_name {
             Some(node_name) if !terminal => {
@@ -1561,6 +1580,12 @@ impl NodeTally {
     /// round-tripped through `apply_event` — the same read-after-write race
     /// `requests` already closes for cpu/memory (see this struct's doc
     /// comment).
+    ///
+    /// `pvc_names` is BARE names (`PendingPod::pvc_names`'s own convention) —
+    /// this qualifies each into `pvc_key(namespace, ..)` before storing, the
+    /// same convention `apply_event` uses, so `usage_by_node`/`pods_on` never
+    /// see an unqualified name that could collide with a same-named PVC in a
+    /// different namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn assume(
         &mut self,
@@ -1573,6 +1598,10 @@ impl NodeTally {
         labels: std::collections::HashMap<String, String>,
         pvc_names: Vec<String>,
     ) {
+        let pvc_names = pvc_names
+            .into_iter()
+            .map(|n| pvc_key(namespace, &n))
+            .collect();
         self.pods.insert(
             format!("{namespace}/{pod_name}"),
             TalliedPod {
@@ -1951,6 +1980,15 @@ pub fn select_node_with_capacity(
     let affinity_ctx = InterPodAffinityContext::build(pod, tallied_pods, &node_labels_by_name);
     let topology_ctx = TopologySpreadContext::build(pod, tallied_pods, &node_labels_by_name);
     let usage_of = |name: &str| node_usage.get(name).cloned().unwrap_or_default();
+    // `NodeUsage::pvc_names` is namespace-qualified (see its doc comment) —
+    // qualify `pod`'s own RWOP PVCs the same way before comparing, or a
+    // same-named PVC in a DIFFERENT namespace would be treated as the same
+    // volume as `pod`'s own.
+    let rwop_pvcs: Vec<String> = pod
+        .read_write_once_pod_pvcs
+        .iter()
+        .map(|n| pvc_key(&pod.namespace, n))
+        .collect();
     // Set when some node satisfies every OTHER conjunct below and is
     // rejected ONLY by `csi_volume_limits_fit` — lets the final error below
     // report the CSILimits-specific reason (matching upstream's own
@@ -1958,6 +1996,14 @@ pub fn select_node_with_capacity(
     // NodeResourcesFit message, which the volumeLimits conformance test's
     // `PodScheduled=False` condition message must match via a
     // `max.+volume.+count` regex.
+    //
+    // Imprecise across MULTIPLE rejected nodes: once any node's sole failure
+    // is CSI, this stays `true` even if a LATER node in the same call also
+    // fails for a resource reason — so the final error can name "max volume
+    // count" when a different node was actually blocked by cpu/memory. Only
+    // cosmetic (the pod correctly stays unscheduled either way) — scoping
+    // this per-node needs the filter to record more than a single failure
+    // reason per candidate, which no caller currently needs.
     let mut csi_limit_was_the_only_blocker = false;
     let candidates: Vec<NodeItem> = list
         .items
@@ -1988,7 +2034,7 @@ pub fn select_node_with_capacity(
             {
                 return false;
             }
-            if !read_write_once_pod_conflict_free(&usage.pvc_names, &pod.read_write_once_pod_pvcs) {
+            if !read_write_once_pod_conflict_free(&usage.pvc_names, &rwop_pvcs) {
                 return false;
             }
             if !csi_volume_limits_fit(&n.csi_driver_headroom, &pod.csi_volume_counts) {
@@ -3119,7 +3165,13 @@ pub async fn find_preemption_plan(
             "GET /api/v1/nodes returned {status}: {body}"
         )));
     }
-    let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
+    let mut list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
+    // Same reason `pick_node` populates this before `select_and_reserve_node`
+    // runs: without it, every node's `csi_driver_headroom` stays an empty
+    // map ("no limit"), letting `find_preemption_candidate` preempt-bind a
+    // pod onto a node whose CSI driver actually has zero remaining attach
+    // headroom.
+    populate_csi_driver_headroom(connector, server, &mut list, pod).await?;
     let node_labels_by_name: std::collections::HashMap<
         String,
         std::collections::HashMap<String, String>,
@@ -3185,10 +3237,33 @@ fn find_preemption_candidate(
 ) -> Option<(usize, PreemptionPlan)> {
     let affinity_ctx = InterPodAffinityContext::build(pod, tallied_pods, node_labels_by_name);
     let topology_ctx = TopologySpreadContext::build(pod, tallied_pods, node_labels_by_name);
+    // `NodePod::pvc_names` is namespace-qualified (see its doc comment) —
+    // qualify `pod`'s own RWOP PVCs the same way before comparing, exactly
+    // like `select_node_with_capacity` does, or a same-named PVC in a
+    // DIFFERENT namespace would be picked as a mandatory victim here for no
+    // real conflict.
+    let rwop_pvcs: Vec<String> = pod
+        .read_write_once_pod_pvcs
+        .iter()
+        .map(|n| pvc_key(&pod.namespace, n))
+        .collect();
 
     let mut best: Option<(usize, PreemptionPlan)> = None;
     for (index, node) in list.items.iter().enumerate() {
         if !node_qualifies_for_pod(node, pod) {
+            continue;
+        }
+        // Unlike RWOP's exact PVC-name match, there is no per-pod CSI-driver
+        // attach-count tracked in `NodePod` to name a specific mandatory
+        // victim from — the node-wide headroom populated by
+        // `find_preemption_plan`'s `populate_csi_driver_headroom` call is the
+        // only signal available. So an unresolved CSI-limit conflict makes
+        // this node NON-VIABLE outright, the same fail-closed outcome RWOP
+        // reaches for a conflict against an equal-or-higher-priority holder —
+        // never silently treated as "no limit" (an empty/unpopulated
+        // `csi_driver_headroom` already means that via `csi_volume_limits_fit`'s
+        // own convention, so this is safe for pods that need no CSI volumes).
+        if !csi_volume_limits_fit(&node.csi_driver_headroom, &pod.csi_volume_counts) {
             continue;
         }
         let capacity = pod_count_capacity(node);
@@ -3216,11 +3291,9 @@ fn find_preemption_candidate(
         // not strictly lower than `pod`'s own — kube-scheduler never
         // preempts an equal-or-higher-priority pod, so this node can never
         // become viable via preemption at all and must be skipped outright.
-        let Some(rwop_victims) = read_write_once_pod_preemption_victims(
-            &node_pods,
-            &pod.read_write_once_pod_pvcs,
-            pod.priority,
-        ) else {
+        let Some(rwop_victims) =
+            read_write_once_pod_preemption_victims(&node_pods, &rwop_pvcs, pod.priority)
+        else {
             continue;
         };
         for victim in rwop_victims {
@@ -10573,10 +10646,14 @@ mod tests {
         };
         let mut pod = empty_pending_pod();
         pod.read_write_once_pod_pvcs = vec!["data-pvc".to_owned()];
+        // `NodeUsage::pvc_names` holds namespace-qualified keys (as
+        // `NodeTally::usage_by_node` produces them) — "default" matches
+        // `pod`'s own namespace (`empty_pending_pod`), so this is the
+        // SAME-namespace conflict this predicate must catch.
         let usage: std::collections::HashMap<String, NodeUsage> = [(
             "worker-0".to_owned(),
             NodeUsage {
-                pvc_names: vec!["data-pvc".to_owned()],
+                pvc_names: vec!["default/data-pvc".to_owned()],
                 ..Default::default()
             },
         )]
@@ -10586,6 +10663,37 @@ mod tests {
             result.is_err(),
             "a node already running a pod that holds this pod's ReadWriteOncePod \
              PVC must be rejected, not selected"
+        );
+    }
+
+    #[test]
+    fn select_node_with_capacity_allows_a_node_when_the_conflicting_pvc_name_is_in_a_different_namespace(
+    ) {
+        // Two PVCs can share a bare name across namespaces (e.g. both teams
+        // provisioned a PVC called "data-pvc"). Before namespace-qualifying
+        // `NodeUsage`/`NodePod`'s PVC keys, this pod would have been wrongly
+        // rejected here forever — a same-named PVC in an unrelated namespace
+        // is not the same volume and must never block scheduling.
+        let list = NodeList {
+            items: vec![make_node("worker-0", &[])],
+        };
+        let mut pod = empty_pending_pod();
+        pod.namespace = "team-b".to_owned();
+        pod.read_write_once_pod_pvcs = vec!["data-pvc".to_owned()];
+        let usage: std::collections::HashMap<String, NodeUsage> = [(
+            "worker-0".to_owned(),
+            NodeUsage {
+                pvc_names: vec!["team-a/data-pvc".to_owned()],
+                ..Default::default()
+            },
+        )]
+        .into();
+        let result = select_node_with_capacity(list, &pod, &usage, &[]);
+        assert_eq!(
+            result.unwrap(),
+            "worker-0",
+            "a PVC named \"data-pvc\" in namespace team-a must never conflict \
+             with a DIFFERENT PVC of the same bare name in namespace team-b"
         );
     }
 
@@ -10681,6 +10789,111 @@ mod tests {
             vec!["default/pod1".to_owned()],
             "pod1 is the only thing blocking pod2 (plenty of spare cpu/memory/pod \
              slots) — it must be the preemption plan's sole victim"
+        );
+    }
+
+    #[test]
+    fn find_preemption_candidate_never_evicts_a_pod_over_a_same_named_pvc_in_a_different_namespace()
+    {
+        // Same setup as the RWOP-conflict test above, EXCEPT pod1 and pod2 are
+        // in different namespaces. Before namespace-qualifying `NodeTally`'s
+        // PVC keys, "data-pvc" in namespace team-a matched "data-pvc" in
+        // namespace team-b, so pod1 would have been wrongly named a mandatory
+        // preemption victim for a PVC it does not actually contend with —
+        // an innocent workload evicted for no real conflict.
+        let list = NodeList {
+            items: vec![make_node_with_capacity("worker-0", &[], "110")],
+        };
+        let node_labels_by_name: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = list
+            .items
+            .iter()
+            .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+            .collect();
+        let tally = std::sync::Mutex::new(NodeTally::default());
+        tally.lock().expect("tally lock poisoned").assume(
+            "team-a",
+            "pod1",
+            "worker-0",
+            0,
+            ResourceRequests::default(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            vec!["data-pvc".to_owned()],
+        );
+        let tallied_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .tallied_pod_labels();
+
+        let mut pod2 = empty_pending_pod();
+        pod2.namespace = "team-b".to_owned();
+        pod2.pod_name = "pod2".to_owned();
+        pod2.priority = 1000;
+        pod2.read_write_once_pod_pvcs = vec!["data-pvc".to_owned()];
+
+        let result =
+            find_preemption_candidate(&list, &pod2, &tallied_pods, &node_labels_by_name, &tally);
+        assert!(
+            result.is_none(),
+            "pod1's PVC is in a DIFFERENT namespace from pod2's — there is no \
+             real RWOP conflict here, so no preemption plan (and certainly \
+             not one evicting pod1) should exist: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn find_preemption_candidate_never_preempt_binds_onto_a_node_with_zero_csi_headroom() {
+        // A node with a lower-priority pod occupying its only pod slot AND
+        // zero remaining CSI attach headroom for the driver the pending pod
+        // needs. Evicting the low-priority pod frees the pod-count slot, but
+        // does nothing for the CSI driver's attach limit (this scheduler
+        // tracks no per-pod CSI-driver usage to know otherwise) — so this
+        // node must stay non-viable. Before `find_preemption_plan` populated
+        // `csi_driver_headroom` and this function checked it, the pod-count
+        // eviction alone would have made this node look viable, preempt-
+        // binding the pending pod onto a node the CSI driver cannot actually
+        // serve.
+        let mut node = make_node_with_capacity("worker-0", &[], "1");
+        node.csi_driver_headroom = [("hostpath.csi.k8s.io".to_owned(), 0i64)].into();
+        let list = NodeList { items: vec![node] };
+        let node_labels_by_name: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = list
+            .items
+            .iter()
+            .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+            .collect();
+        let tally = std::sync::Mutex::new(NodeTally::default());
+        tally.lock().expect("tally lock poisoned").assume(
+            "default",
+            "low-priority-pod",
+            "worker-0",
+            0,
+            ResourceRequests::default(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+        );
+        let tallied_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .tallied_pod_labels();
+
+        let mut pod = empty_pending_pod();
+        pod.priority = 1000;
+        pod.csi_volume_counts = [("hostpath.csi.k8s.io".to_owned(), 1i64)].into();
+
+        let result =
+            find_preemption_candidate(&list, &pod, &tallied_pods, &node_labels_by_name, &tally);
+        assert!(
+            result.is_none(),
+            "evicting the low-priority pod frees a pod-count slot but not any \
+             CSI attach headroom, so this node must never be offered as a \
+             preemption target: got {result:?}"
         );
     }
 }
