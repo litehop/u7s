@@ -1,6 +1,7 @@
 # Registry of known-recurring-regression files and the sonobuoy --focus
-# regex that MUST record a PASS before a push touching them is allowed
-# through .githooks/pre-push.
+# regex that MUST record a PASS before a PR touching them can merge -- enforced
+# by the sensitive-e2e-guard job in .github/workflows/e2e-focus.yaml (a required
+# CI check on Lima-free ubuntu runners).
 #
 # Why this exists: validate_pod_spec_immutable (crates/apiserver/src/
 # handlers/pods.rs) regressed the same upstream conformance spec 3 times
@@ -10,17 +11,27 @@
 # `conformance-pr-merge-gate` and the postmortem for the full
 # history this registry operationalizes.
 #
-# Parsed by .githooks/pre-push with grep/awk, NOT a YAML library -- a git
-# hook must not depend on yq/python being installed (a missing dependency
-# would either silently skip the gate or hard-block every push). This means
-# the schema below is a HARD REQUIREMENT, not just a style preference:
+# SCOPE -- SINGLE-NODE ONLY. The CI guard runs a SINGLE-NODE cluster, so only
+# register specs that are fully verifiable on one node (the entries below are).
+# A spec that depends on multi-node topology must NOT be added here: the guard
+# would either false-block or, worse, PASS spuriously without exercising the
+# multi-node behavior (silent false confidence on a safety gate). Multi-node CI
+# is not built today and would be a substantial effort -- such a spec needs
+# local Lima multi-node verification or new CI plumbing instead. See bd memory
+# `ci-conformance-gate-is-single-node-only`.
 #
-#   - file: <path (or substring of a path), matched against the outgoing
-#            push's changed files>
-#     function: <name of the guarded function -- audit trail only, the hook
+# Parsed by scripts/sensitive-focus-for-diff.sh (the sensitive-e2e-guard detect
+# step) with grep/awk, NOT a YAML library -- a CI step must not depend on
+# yq/python being installed (a missing dependency would either silently skip the
+# gate or hard-fail every run). This means the schema below is a HARD
+# REQUIREMENT, not just a style preference:
+#
+#   - file: <path (or substring of a path), matched against the PR/push
+#            changed files>
+#     function: <name of the guarded function -- audit trail only, the detector
 #                does not parse or match on this field>
 #     focus: <sonobuoy --focus regex (ginkgo alternation syntax) that must
-#             PASS before a push touching `file` is allowed>
+#             PASS before a PR touching `file` can merge>
 #     specs: <exact number of specs `focus` runs -- asserted against ginkgo's
 #             "Ran N of" line so a typo or over-match in `focus` fails loud
 #             instead of silently guarding nothing. Declared explicitly (not

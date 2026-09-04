@@ -67,7 +67,7 @@ any=0
 while IFS=$'\t' read -r pattern focus specs; do
   [ -z "$pattern" ] && continue
   # A registry `file:` is a path (or path substring) matched against the
-  # changed-file list -- same semantics as sensitive-conformance-gate.sh.
+  # changed-file list (grep -F substring match).
   grep -Fq -- "$pattern" "$CHANGED" || continue
   if ! printf '%s' "$specs" | grep -qE '^[0-9]+$'; then
     echo "sensitive-focus-for-diff: registry entry for '$pattern' has no valid 'specs:' count (got '$specs')" >&2
