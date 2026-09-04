@@ -1707,6 +1707,13 @@ pub(crate) async fn evict_pod<S: Store>(
 /// small bound is enough to serialize any realistic number of concurrent evictions.
 const MAX_PDB_DECREMENT_ATTEMPTS: u32 = 10;
 
+/// Upstream's `MaxDisruptedPodSize` (pkg/registry/core/pod/storage/eviction.go): the eviction
+/// handler refuses to spend a disruption once `status.disruptedPods` already holds more entries
+/// than this. The map is meant to self-correct as the DisruptionController reconciles evicted
+/// pods off it; without this cap a burst of concurrent evictions the controller hasn't caught up
+/// with yet can grow the map without bound.
+const MAX_DISRUPTED_POD_SIZE: usize = 2000;
+
 /// Verify a PodDisruptionBudget still has a disruption to give and, if so, return its body
 /// with `status.disruptionsAllowed` decremented by one.
 ///
@@ -1729,6 +1736,35 @@ fn decrement_pdb_disruptions_allowed(
     pod_name: &str,
     now_rfc3339: &str,
 ) -> Result<serde_json::Value, crate::status::StatusError> {
+    // Upstream (eviction.go checkAndDecrement): a PDB whose status hasn't caught up to the
+    // object's current generation yet cannot be trusted — the DisruptionController may still be
+    // recomputing `disruptionsAllowed` from a stale pod set. Treat it the same as a temporarily
+    // exhausted budget (429) so the client retries once the controller has observed the latest
+    // spec, instead of evicting against a count that's about to change.
+    let generation = pdb["metadata"]["generation"].as_i64().unwrap_or(0);
+    let observed_generation = pdb["status"]["observedGeneration"].as_i64().unwrap_or(0);
+    if observed_generation < generation {
+        let pdb_name = pdb["metadata"]["name"].as_str().unwrap_or_default();
+        return Err(Status::too_many_requests_with_cause(
+            "Cannot evict pod as it would violate the pod's disruption budget.".to_string(),
+            "DisruptionBudget",
+            format!("The disruption budget {pdb_name} is still being processed by the server."),
+        ));
+    }
+
+    // Upstream MaxDisruptedPodSize: `disruptedPods` self-corrects as the DisruptionController
+    // reconciles evicted pods off it, but a burst of concurrent evictions the controller hasn't
+    // caught up with yet must not be allowed to grow the map without bound.
+    if pdb["status"]["disruptedPods"]
+        .as_object()
+        .is_some_and(|m| m.len() > MAX_DISRUPTED_POD_SIZE)
+    {
+        return Err(Status::forbidden(
+            "DisruptedPods map too big - too many evictions not confirmed by PDB controller"
+                .to_string(),
+        ));
+    }
+
     let disruptions_allowed = pdb["status"]["disruptionsAllowed"].as_i64().unwrap_or(0);
     if disruptions_allowed <= 0 {
         let message =
@@ -13398,6 +13434,290 @@ mod handler_tests {
             "the 2 losing evictions must see 429 Too Many Requests, not succeed or 500 — \
              kubectl drain and the descheduler rely on 429 to know to retry once the budget \
              recovers"
+        );
+    }
+
+    /// Upstream (eviction.go MaxDisruptedPodSize=2000): once a PDB's `disruptedPods` map already
+    /// holds more entries than the DisruptionController can plausibly have reconciled, further
+    /// evictions must be refused rather than adding yet another entry. Without this cap, a burst
+    /// of concurrent evictions the controller hasn't caught up with yet grows the map without
+    /// bound instead of self-correcting via the controller's periodic resync.
+    #[tokio::test]
+    async fn evict_pod_over_max_disrupted_pod_size_does_not_grow_disrupted_pods() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "web-0",
+            serde_json::json!({"metadata": {"name": "web-0", "namespace": "default", "resourceVersion": "1", "labels": {"app": "web"}}}),
+        )
+        .await;
+
+        let mut disrupted_pods = serde_json::Map::new();
+        for i in 0..2001 {
+            disrupted_pods.insert(
+                format!("stale-pod-{i}"),
+                serde_json::json!("2020-01-01T00:00:00Z"),
+            );
+        }
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default" },
+            "spec": { "selector": { "matchLabels": { "app": "web" } } },
+            "status": { "disruptionsAllowed": 5, "disruptedPods": disrupted_pods }
+        });
+        store
+            .put(
+                "/registry/policy/poddisruptionbudgets/default/web-pdb",
+                Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .layer(auth_layer())
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-0", "namespace": "default" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&eviction_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "eviction against a PDB whose disruptedPods already exceeds MaxDisruptedPodSize \
+             (2000) must be refused — without the cap, disruptedPods keeps accepting entries \
+             the DisruptionController isn't reconciling fast enough and grows without bound"
+        );
+
+        let stored = store
+            .get("/registry/policy/poddisruptionbudgets/default/web-pdb")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["disruptedPods"].as_object().unwrap().len(),
+            2001,
+            "a capped eviction must not add its own entry to disruptedPods — the map must stay \
+             at its pre-eviction size, not grow past the cap"
+        );
+    }
+
+    /// Upstream (eviction.go checkAndDecrement): a PDB whose `status.observedGeneration` trails
+    /// `metadata.generation` hasn't been reconciled by the DisruptionController since its last
+    /// spec change, so its `disruptionsAllowed` cannot be trusted yet. Acting on it anyway could
+    /// let an eviction through against a budget the controller is about to recompute downward.
+    #[tokio::test]
+    async fn evict_pod_stale_pdb_observed_generation_returns_429_without_decrementing() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "web-0",
+            serde_json::json!({"metadata": {"name": "web-0", "namespace": "default", "resourceVersion": "1", "labels": {"app": "web"}}}),
+        )
+        .await;
+
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default", "generation": 2 },
+            "spec": { "selector": { "matchLabels": { "app": "web" } } },
+            "status": { "disruptionsAllowed": 5, "observedGeneration": 1 }
+        });
+        store
+            .put(
+                "/registry/policy/poddisruptionbudgets/default/web-pdb",
+                Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .layer(auth_layer())
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-0", "namespace": "default" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&eviction_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an eviction must not proceed against a PDB the DisruptionController hasn't \
+             finished reconciling (observedGeneration < generation) — the stale \
+             disruptionsAllowed:5 in this status cannot be trusted, so acting on it must not \
+             return 201"
+        );
+
+        let stored = store
+            .get("/registry/policy/poddisruptionbudgets/default/web-pdb")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["disruptionsAllowed"], 5,
+            "the observedGeneration guard must reject before spending a disruption — \
+             disruptionsAllowed must be untouched by the rejected attempt"
+        );
+    }
+
+    /// The `dry_run` flag threaded into `check_pdb_allows_eviction` must gate the store write,
+    /// not the admission verdict: a dry-run against an available budget must report the same
+    /// allow verdict a real eviction would get, without spending the disruption it evaluated —
+    /// otherwise `kubectl drain --dry-run` would silently exhaust a real budget before any pod
+    /// was actually evicted, and a dry-run against an exhausted budget must still report deny.
+    #[tokio::test]
+    async fn evict_pod_dry_run_reports_pdb_verdict_without_spending_budget() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        for name in ["web-0", "web-1", "web-2"] {
+            seed_pod(
+                &store,
+                "default",
+                name,
+                serde_json::json!({"metadata": {"name": name, "namespace": "default", "resourceVersion": "1", "labels": {"app": "web"}}}),
+            )
+            .await;
+        }
+
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default" },
+            "spec": { "selector": { "matchLabels": { "app": "web" } } },
+            "status": { "disruptionsAllowed": 1 }
+        });
+        store
+            .put(
+                "/registry/policy/poddisruptionbudgets/default/web-pdb",
+                Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .layer(auth_layer())
+            .with_state(state);
+
+        // A dry-run against disruptionsAllowed:1 must report the allow verdict (201)...
+        let dry_run_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-0", "namespace": "default" },
+            "deleteOptions": { "dryRun": ["All"] }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&dry_run_body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a dry-run eviction against a PDB with disruptionsAllowed:1 must report the allow \
+             verdict (201) a real eviction against the same budget would get"
+        );
+
+        // ...without spending it: a real eviction against the same budget right after must
+        // still succeed, proving the dry-run left disruptionsAllowed untouched.
+        let real_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-1", "namespace": "default" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-1/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&real_body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "the prior dry-run must not have decremented disruptionsAllowed — if it had, this \
+             real eviction against the same budget would wrongly see 429 instead of succeeding"
+        );
+
+        let stored = store
+            .get("/registry/policy/poddisruptionbudgets/default/web-pdb")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["disruptionsAllowed"], 0,
+            "exactly one disruption (from the real eviction) must have been spent — the \
+             dry-run must have contributed zero to the decrement"
+        );
+        assert!(
+            v["status"]["disruptedPods"]["web-0"].is_null(),
+            "dry-run must not stamp disruptedPods for the pod it evaluated — that bookkeeping \
+             exists to inform the DisruptionController of real evictions only"
+        );
+
+        // The budget is now exhausted (disruptionsAllowed:0) — a dry-run must report the deny
+        // verdict too, not just the allow case.
+        let dry_run_deny_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-2", "namespace": "default" },
+            "deleteOptions": { "dryRun": ["All"] }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-2/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&dry_run_deny_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a dry-run against an exhausted budget must report the same deny verdict (429) a \
+             real eviction would get — `kubectl drain --dry-run` must not lie about what a real \
+             drain would do"
         );
     }
 
