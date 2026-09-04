@@ -31,6 +31,8 @@ fn realistic_pending_pod() -> PendingPod {
         pvc_names: Vec::new(),
         pv_node_affinities: Vec::new(),
         topology_spread_constraints: Vec::new(),
+        csi_volume_counts: Default::default(),
+        read_write_once_pod_pvcs: Vec::new(),
     }
 }
 
@@ -51,6 +53,7 @@ fn roomy_node(name: String, selector_value: &str) -> NodeItem {
             },
             capacity: NodeAllocatable::default(),
         },
+        csi_driver_headroom: Default::default(),
     }
 }
 
