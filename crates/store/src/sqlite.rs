@@ -1,7 +1,7 @@
 use super::*;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -169,7 +169,7 @@ impl RingShard {
 /// this stream," which nothing else in `watch()`'s own body observes.
 struct ShardWatcherGuard {
     shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
-    reclaimed_horizons: Arc<RwLock<HashMap<String, u64>>>,
+    reclaimed_horizons: Arc<RwLock<ReclaimedHorizons>>,
     key: String,
     shard: Arc<RingShard>,
 }
@@ -177,7 +177,7 @@ struct ShardWatcherGuard {
 impl ShardWatcherGuard {
     fn attach(
         shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
-        reclaimed_horizons: Arc<RwLock<HashMap<String, u64>>>,
+        reclaimed_horizons: Arc<RwLock<ReclaimedHorizons>>,
         key: String,
         shard: Arc<RingShard>,
     ) -> Self {
@@ -217,7 +217,7 @@ impl Drop for ShardWatcherGuard {
 /// live for the rest of the process's life).
 fn schedule_idle_gc(
     shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
-    reclaimed_horizons: Arc<RwLock<HashMap<String, u64>>>,
+    reclaimed_horizons: Arc<RwLock<ReclaimedHorizons>>,
     key: String,
     shard: Arc<RingShard>,
 ) {
@@ -276,13 +276,11 @@ fn schedule_idle_gc(
 /// NOT simply discarded the way a plain LRU cache would: a later watch that consults the removed
 /// key would see `find_reclaimed_horizon` return 0 (no horizon known) and wrongly treat a
 /// from_revision that really is stale as already caught up, silently skipping every event it
-/// should have replayed. Instead its floor is folded (by max) into its resource-type root's own
-/// entry via `parent_prefix` — the exact other key `find_reclaimed_horizon`'s fallback checks for
-/// any prefix under that same resource type. A reconnect that would have hit the removed key now
-/// instead hits its root and gets a horizon that is AT LEAST as high as the true one, so it can
-/// only become MORE likely to be (correctly) rejected as expired, never less — the same
-/// "over-reject is safe, under-reject is not" direction `compaction_horizon()`'s own doc already
-/// accepts for its coarser, cross-resource-type max.
+/// should have replayed. Instead its floor is folded (by max) into its `parent_prefix`, and that
+/// parent is marked (`fold_targets`) as PERMANENTLY ineligible for eviction — see
+/// `ReclaimedHorizons::fold_targets`' doc for why a resource-type root cannot be protected only
+/// while some namespace child of it happens to still be present, and `find_reclaimed_horizon` for
+/// how a lookup recovers a value that has been folded upward more than once.
 ///
 /// The victim is the entry with the SMALLEST preserved horizon, not an arbitrary or
 /// insertion-order one: revisions only ever increase, so a low horizon is both the entry least
@@ -290,7 +288,7 @@ fn schedule_idle_gc(
 /// much closer to the store's current, much larger revision) and a reasonable proxy for "least
 /// recently abandoned" without needing a separate ordering structure just for this bound.
 fn preserve_reclaimed_horizon(
-    reclaimed_horizons: &RwLock<HashMap<String, u64>>,
+    reclaimed_horizons: &RwLock<ReclaimedHorizons>,
     key: &str,
     shard: &RingShard,
 ) {
@@ -307,34 +305,33 @@ fn preserve_reclaimed_horizon(
     let mut guard = reclaimed_horizons
         .write()
         .expect("reclaimed_horizons poisoned");
-    guard.insert(key.to_string(), horizon);
-    if guard.len() <= MAX_RECLAIMED_HORIZONS {
+    guard.horizons.insert(key.to_string(), horizon);
+    if guard.horizons.len() <= MAX_RECLAIMED_HORIZONS {
         return;
     }
-    // Never pick a fold TARGET as the victim: if some other still-present entry's own
-    // `parent_prefix` points at it, evicting it again would push its value one level further up
-    // than `find_reclaimed_horizon`'s single-level fallback ever looks — the exact information
-    // loss the fold exists to prevent, just delayed by one extra eviction round. A resource-type
-    // root stays protected for as long as at least one of its namespace entries is still present.
-    let referenced_parents: std::collections::HashSet<String> =
-        guard.keys().filter_map(|k| parent_prefix(k)).collect();
     let Some(victim) = guard
+        .horizons
         .iter()
-        .filter(|(k, _)| k.as_str() != key && !referenced_parents.contains(k.as_str()))
+        .filter(|(k, _)| k.as_str() != key && !guard.fold_targets.contains(k.as_str()))
         .min_by_key(|(_, &v)| v)
         .map(|(k, _)| k.clone())
     else {
         return;
     };
-    let Some(victim_horizon) = guard.remove(&victim) else {
+    let Some(victim_horizon) = guard.horizons.remove(&victim) else {
         return;
     };
     if let Some(parent) = parent_prefix(&victim) {
+        guard.fold_targets.insert(parent.clone());
         guard
+            .horizons
             .entry(parent)
             .and_modify(|v| *v = (*v).max(victim_horizon))
             .or_insert(victim_horizon);
     }
+    // `parent_prefix` returns `None` only for a key with no `/` segment left to strip, which no
+    // real shard key (always rooted at "/registry/...") ever reaches — nothing to fold into here
+    // is an unreachable case in practice, not a silent-loss path this needs to guard against.
 }
 
 /// The one-level-shorter prefix a lookup for `key` falls back to when nothing matches `key`
@@ -346,6 +343,29 @@ fn preserve_reclaimed_horizon(
 fn parent_prefix(key: &str) -> Option<String> {
     let trimmed = key.strip_suffix('/').unwrap_or(key);
     trimmed.rsplit_once('/').map(|(root, _)| format!("{root}/"))
+}
+
+/// Compaction floors preserved for torn-down shard prefixes, bounded at `MAX_RECLAIMED_HORIZONS`
+/// — see `SqliteStore::reclaimed_horizons`'s doc for why this can't rely on reuse alone.
+#[derive(Default)]
+pub(crate) struct ReclaimedHorizons {
+    horizons: HashMap<String, u64>,
+    /// Keys that are themselves the fold TARGET of some other evicted entry (see
+    /// `preserve_reclaimed_horizon`), and so can never be evicted themselves.
+    ///
+    /// Excluding only entries a namespace SIBLING currently still references (the earlier design
+    /// this replaced) is not enough: a resource type watched only cluster-wide/all-namespaces has
+    /// no namespace sibling to ever protect its root, so that root is just as evictable as any
+    /// namespace leaf — and folding a childless root one level further up would produce a THIRD,
+    /// shallower-than-root key shape that `find_reclaimed_horizon`'s single-level fallback never
+    /// checks (this is exactly how an earlier revision of this fix under-protected a root with no
+    /// live children). Marking a fold target permanently ineligible, independent of whatever else
+    /// happens to reference it at any given moment, is what keeps every fold exactly one level
+    /// deep for good: once a key becomes a fold destination, nothing can ever push its contents
+    /// one level further, so the single-level fallback is always enough to find it again. Bounded
+    /// by the number of distinct resource-type (or coarser) prefixes a fold has ever landed on,
+    /// not by namespace churn — the same small, natural bound `shards`' own root count has.
+    fold_targets: HashSet<String>,
 }
 
 pub struct SqliteStore {
@@ -386,7 +406,7 @@ pub struct SqliteStore {
     /// see `preserve_reclaimed_horizon` for how entries beyond that cap are folded into their
     /// resource-type root's own entry rather than discarded, and `find_reclaimed_horizon` for how
     /// lookups stay O(1) despite that root-vs-namespace fan-out.
-    reclaimed_horizons: Arc<RwLock<HashMap<String, u64>>>,
+    reclaimed_horizons: Arc<RwLock<ReclaimedHorizons>>,
     /// Lowest revision still in the ring buffer of whichever shard has compacted furthest, across
     /// every resource type (advanced via `fetch_max` from each shard's own eviction — see
     /// `push_event_locked`). Deliberately one process-wide value rather than per-shard: the HTTP
@@ -451,7 +471,7 @@ impl SqliteStore {
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let shards = Arc::new(RwLock::new(HashMap::new()));
-        let reclaimed_horizons = Arc::new(RwLock::new(HashMap::new()));
+        let reclaimed_horizons = Arc::new(RwLock::new(ReclaimedHorizons::default()));
         let compaction_horizon = Arc::new(AtomicU64::new(0));
         let last_written_revision = Arc::new(AtomicU64::new(0));
 
@@ -780,7 +800,7 @@ fn push_into_shard(
 fn push_event_locked(
     tx: &broadcast::Sender<Arc<InternalEvent>>,
     shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
-    reclaimed_horizons: &Arc<RwLock<HashMap<String, u64>>>,
+    reclaimed_horizons: &Arc<RwLock<ReclaimedHorizons>>,
     shard_key: &str,
     compaction_horizon: &AtomicU64,
     now_secs: u32,
@@ -864,15 +884,15 @@ fn push_event_locked(
 /// the live shard doesn't already have, and removing it is what keeps `reclaimed_horizons` from
 /// growing forever for a resource type that keeps getting reclaimed-then-reused.
 ///
-/// Falling back to `find_reclaimed_horizon`'s longest-prefix match (NOT removing what it finds)
-/// covers the other case that fallback exists for: `preserve_reclaimed_horizon`'s cap eviction
-/// folds an abandoned namespace's floor into its resource-type root's own entry rather than this
-/// exact key. Removing that folded entry here would be wrong — it can still be the correct floor
-/// for OTHER, not-yet-recreated namespaces of this same resource type; only an exact match is
+/// Falling back to `find_reclaimed_horizon`'s walk (NOT removing what it finds) covers the other
+/// case that fallback exists for: `preserve_reclaimed_horizon`'s cap eviction folds an abandoned
+/// prefix's floor one or two levels up rather than keeping it at this exact key. Removing
+/// whatever that walk finds here would be wrong — a folded entry can still be the correct floor
+/// for OTHER, not-yet-recreated prefixes under this same resource type; only an exact match is
 /// this one shard's own history to consume.
 fn get_or_create_shard(
     shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
-    reclaimed_horizons: &Arc<RwLock<HashMap<String, u64>>>,
+    reclaimed_horizons: &Arc<RwLock<ReclaimedHorizons>>,
     shard: &str,
 ) -> Arc<RingShard> {
     if let Some(existing) = shards.read().expect("shards poisoned").get(shard) {
@@ -886,7 +906,7 @@ fn get_or_create_shard(
         let mut rh = reclaimed_horizons
             .write()
             .expect("reclaimed_horizons poisoned");
-        match rh.remove(shard) {
+        match rh.horizons.remove(shard) {
             Some(horizon) => horizon,
             None => find_reclaimed_horizon(&rh, shard),
         }
@@ -919,7 +939,7 @@ fn get_or_create_shard(
 /// no longer exists, which is unconditionally correct regardless of `watchers`.
 pub(crate) fn tear_down_shard(
     shards: &RwLock<HashMap<String, Arc<RingShard>>>,
-    reclaimed_horizons: &RwLock<HashMap<String, u64>>,
+    reclaimed_horizons: &RwLock<ReclaimedHorizons>,
     key: &str,
 ) -> Option<Arc<RingShard>> {
     let removed = shards.write().expect("shards poisoned").remove(key);
@@ -1009,16 +1029,28 @@ fn find_shard_key(
 /// `compaction_horizon_for` consults on EVERY watch open when no LIVE shard matches `prefix`, so
 /// unlike `find_shard` (bounded by the small, naturally-reused set of live shards) this cannot
 /// afford a scan that grows with how many resource-type prefixes have ever been torn down over
-/// the process's life. An exact match on `prefix`, then one on `parent_prefix(prefix)`, finds the
-/// same longest-prefix match a full scan would (see `parent_prefix`'s doc for why no key can ever
-/// exist strictly between the two) in two O(1) lookups instead.
-fn find_reclaimed_horizon(reclaimed_horizons: &HashMap<String, u64>, prefix: &str) -> u64 {
-    if let Some(horizon) = reclaimed_horizons.get(prefix) {
-        return *horizon;
+/// the process's life.
+///
+/// Walks `parent_prefix` repeatedly rather than checking just one level up: a NAMESPACE-scoped
+/// `prefix`'s own root can itself have been evicted (a childless root — one with no namespace
+/// entry currently in the map — is just as evictable as any namespace leaf), and that root's
+/// fold target sits one level ABOVE the root, i.e. two levels above `prefix` itself, one level
+/// further than a single fallback check reaches. `fold_targets` (see that field's doc) still
+/// bounds how far this ever has to walk: once a value is folded into some key, that key can never
+/// itself be folded again, so the walk from any given `prefix` is at most two hops (its own root,
+/// then that root's own fold target) — bounded by a fixed constant, never by how many prefixes
+/// have ever been torn down or how many times any of them has been folded.
+fn find_reclaimed_horizon(reclaimed_horizons: &ReclaimedHorizons, prefix: &str) -> u64 {
+    let mut current = prefix.to_string();
+    loop {
+        if let Some(horizon) = reclaimed_horizons.horizons.get(&current) {
+            return *horizon;
+        }
+        match parent_prefix(&current) {
+            Some(parent) => current = parent,
+            None => return 0,
+        }
     }
-    parent_prefix(prefix)
-        .and_then(|parent| reclaimed_horizons.get(&parent).copied())
-        .unwrap_or(0)
 }
 
 fn open_conn(path: &str) -> Result<Connection> {
@@ -2813,7 +2845,7 @@ mod tests {
             read_conn,
             tx,
             shards: Arc::new(RwLock::new(HashMap::new())),
-            reclaimed_horizons: Arc::new(RwLock::new(HashMap::new())),
+            reclaimed_horizons: Arc::new(RwLock::new(ReclaimedHorizons::default())),
             compaction_horizon: Arc::new(AtomicU64::new(0)),
             last_written_revision: last_written,
             epoch: Instant::now(),
@@ -5918,6 +5950,7 @@ mod tests {
             .reclaimed_horizons
             .read()
             .expect("reclaimed_horizons poisoned")
+            .horizons
             .len();
         assert!(
             len <= MAX_RECLAIMED_HORIZONS + 8,
@@ -5932,6 +5965,7 @@ mod tests {
                 .reclaimed_horizons
                 .read()
                 .expect("reclaimed_horizons poisoned")
+                .horizons
                 .contains_key(&evicted_prefix),
             "test setup broken: ns-0 (lowest horizon, so the first eviction candidate) must \
              actually have been evicted for the rest of this test to prove the fold path works, \
@@ -5965,6 +5999,91 @@ mod tests {
                  was evicted under the cap must get 410 Expired, not a live stream that \
                  silently starts from scratch as if nothing had ever been discarded. \
                  Got: {other:?}"
+            ),
+        }
+    }
+
+    /// Evicting a resource-type ROOT that has no namespace child present (the normal shape for
+    /// any type only ever watched cluster-wide/all-namespaces) must still leave its floor
+    /// reachable by a later query for a namespace under that same type that has NEVER been seen
+    /// before.
+    ///
+    /// Why it matters: an earlier revision of this fix only protected a fold target while some
+    /// OTHER, still-present entry's `parent_prefix` referenced it — which never happens for a
+    /// childless root, since nothing in the map points at it. That root was then just as
+    /// evictable as any namespace leaf, and folding it produced a THIRD, shallower-than-root key
+    /// shape that a single-level lookup fallback never checks — so a brand-new namespace under
+    /// that resource type would see `compaction_horizon_for` return 0 and silently treat a
+    /// genuinely stale from_revision as already caught up.
+    ///
+    /// Fails on revert: reverting the permanent `fold_targets` set back to "protected only while
+    /// some other CURRENT entry references it" makes `horizon` below come back as 0 (or, given
+    /// enough further churn, an unrelated root's leaked-in value instead of exactly 2) and the
+    /// final reconnect get a live stream instead of `Compacted`.
+    #[tokio::test]
+    async fn reclaimed_horizons_evicted_childless_root_still_gets_correct_nonzero_horizon() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // Distinct resource-type ROOTS only — no namespace child is ever inserted for any of
+        // them, so none is ever protected by a "referenced by a currently-present sibling"
+        // check. Each root also gets its OWN unique group segment (not a shared one like
+        // "/registry/core/"), so its fold target has no OTHER sibling referencing it either —
+        // otherwise this test would pass even under the old, reference-counted design purely by
+        // coincidence of every root sharing one common parent.
+        // Seeded from i+2 (not i+1): from_revision=0 is treated by `watch()` as "fresh, no
+        // history claimed" and skips the expiry check entirely, so the reconnect below needs a
+        // from_revision that is both > 0 AND strictly less than root-churn-0's own floor —
+        // impossible if that floor were exactly 1.
+        let churn = MAX_RECLAIMED_HORIZONS + 10;
+        for i in 0..churn {
+            let root = format!("/registry/group-{i}/root-churn-{i}/");
+            store.set_compaction_horizon_for_test(&root, (i + 2) as u64);
+            tear_down_shard(&store.shards, &store.reclaimed_horizons, &root);
+        }
+
+        let evicted_root = "/registry/group-0/root-churn-0/";
+        assert!(
+            !store
+                .reclaimed_horizons
+                .read()
+                .expect("reclaimed_horizons poisoned")
+                .horizons
+                .contains_key(evicted_root),
+            "test setup broken: root-churn-0 (lowest horizon, so the first eviction candidate) \
+             must actually have been evicted — a CHILDLESS root, unlike the sibling test's \
+             namespace leaves — for the rest of this test to prove the childless-root fold path"
+        );
+
+        // A namespace under root-churn-0's resource type that has never been seen before — no
+        // exact entry for it could possibly exist. root-churn-0 itself is also gone (evicted
+        // above), so `compaction_horizon_for` can only report anything but 0 here by walking TWO
+        // levels up from this prefix: past root-churn-0's own (now-empty) slot to its fold
+        // target. Asserting the EXACT value (not just non-zero) rules out this passing only
+        // because some OTHER, unrelated churned root's floor happened to also land nearby.
+        let fresh_namespace_prefix = format!("{evicted_root}never-seen-ns/");
+        let horizon = store.compaction_horizon_for(&fresh_namespace_prefix);
+        assert_eq!(
+            horizon, 2,
+            "root-churn-0's own entry was evicted (it had no namespace child to protect it via \
+             the old, reference-counted design), but its EXACT floor of 2 must still be \
+             reachable from a brand-new namespace query under the SAME resource type — 0 here \
+             would silently tell a reconnecting watch on that namespace it is already caught up, \
+             even though this resource type's own history was discarded, and anything other \
+             than 2 would mean an unrelated root's floor leaked into this one's fold target"
+        );
+
+        let reconnect = store.watch(&fresh_namespace_prefix, 1).await.expect(
+            "reconnect itself must succeed at the transport level — the 410 arrives as a \
+             WatchEvent on the stream, not an Err from watch()",
+        );
+        futures_util::pin_mut!(reconnect);
+        match tokio::time::timeout(Duration::from_millis(500), reconnect.next()).await {
+            Ok(Some(WatchEvent::Compacted { .. })) => {}
+            other => panic!(
+                "a watch on a brand-new namespace under a resource type whose childless ROOT was \
+                 evicted under the cap must still get 410 Expired for a stale from_revision, not \
+                 a live stream that silently starts from scratch as if this resource type had no \
+                 history at all. Got: {other:?}"
             ),
         }
     }
