@@ -68,8 +68,14 @@ findings=$(git ls-files 'ai/findings/*.md' | grep -v '^ai/findings/legacy/' || t
 
 fail=0
 for f in $findings; do
+  # Extract only the leading bead-ID token, stopping before any trailing
+  # descriptive text (e.g. a parenthetical naming related beads). A
+  # whitespace-stripped whole-line slurp would mangle such a header into a
+  # single compound string that jq below would never match against a real
+  # record -- silently passing a finding for a bead that IS closed, exactly
+  # what this script exists to catch.
   bead_line=$(head -n 5 "$f" | grep -m1 -E '^Bead: ' || true)
-  bead_id=$(printf '%s' "$bead_line" | sed -E 's/^Bead: *//' | tr -d '[:space:]')
+  bead_id=$(printf '%s' "$bead_line" | sed -E 's/^Bead: *//' | awk '{print $1}')
   if [ -z "$bead_id" ]; then
     echo "ERROR: $f has no 'Bead: <bead-id>' header -- cannot verify its bead isn't closed" >&2
     fail=1

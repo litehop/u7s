@@ -281,6 +281,23 @@ assert "a CLEAN PR with a failed check is not gate-eligible" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 1d. A draft PR is never gate-eligible even when otherwise CLEAN with no
+#     pending/failed checks -- GitHub has been observed reporting
+#     mergeStateStatus=CLEAN for a deliberately-held draft PR, and
+#     `gh pr merge` unconditionally rejects a draft, which would otherwise
+#     abort the whole tick under `set -e` instead of just skipping it.
+# ---------------------------------------------------------------------------
+RC=0
+call pr_gate_eligible CLEAN 0 0 true || RC=$?
+assert "a draft PR is not gate-eligible even though mss/pending/failed all look mergeable" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call pr_gate_eligible CLEAN 0 0 false || RC=$?
+assert "an explicit non-draft flag does not change the otherwise-eligible outcome" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 2. Verdict parsing.
 # ---------------------------------------------------------------------------
 
@@ -1183,6 +1200,50 @@ NAME_A=$(basename "$(find "$QDIR_DETERMINISM_A" -maxdepth 1 -name '*.md' -type f
 NAME_B=$(basename "$(find "$QDIR_DETERMINISM_B" -maxdepth 1 -name '*.md' -type f)")
 assert "the reconcile queue filename is deterministic (PR number + the review's own submittedAt), not wall-clock-based -- two independent runs against the identical PR/review state compute the SAME name, which is what lets the noclobber guard actually engage across genuinely overlapping processes" \
   "$([ -n "$NAME_A" ] && [ "$NAME_A" = "$NAME_B" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 20. Draft-PR skip, end-to-end through the REAL gate_and_merge_prs (not
+#     just the pure pr_gate_eligible check above): a CLEAN worker/agent-*
+#     PR with an LGTM verdict AND isDraft=true must never reach `gh pr
+#     merge`. Before this fix, GitHub's own rejection of a draft-merge
+#     attempt ("Pull request is a draft") would abort the whole tick under
+#     `set -e` with an unhandled exit code outside the 0/10/20/30 contract.
+# ---------------------------------------------------------------------------
+
+STUB_PR_DRAFT_BIN="$WORKDIR/stub-pr-draft-bin"
+mkdir -p "$STUB_PR_DRAFT_BIN"
+# Canned single open worker PR (#4444), CLEAN with an LGTM review but
+# isDraft=true -- the exact shape observed to slip past a mss-only check.
+cat > "$STUB_PR_DRAFT_BIN/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" view "* ]]; then
+  base='{"reviews":[{"body":"## critical-reviewer findings\n**Verdict**: LGTM","submittedAt":"2026-01-01T00:00:00Z"}]}'
+else
+  base='[{"number":4444,"url":"https://github.com/example/repo/pull/4444","headRefName":"worker/agent-draft-test","mergeStateStatus":"CLEAN","statusCheckRollup":[],"isDraft":true}]'
+fi
+jq_filter=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--jq" ] && jq_filter="$a"
+  prev="$a"
+done
+if [ -n "$jq_filter" ]; then
+  printf '%s' "$base" | jq "$jq_filter"
+else
+  printf '%s' "$base"
+fi
+EOF
+cat > "$STUB_PR_DRAFT_BIN/bd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$STUB_PR_DRAFT_BIN/gh" "$STUB_PR_DRAFT_BIN/bd"
+
+run_full_tick "$STUB_PR_DRAFT_BIN"
+assert "a draft PR is never enqueued via gh pr merge, even with a CLEAN mergeStateStatus and an LGTM verdict" \
+  "$(! printf '%s' "$TICK_OUT" | grep -q 'would run: gh pr merge 4444' && echo 1 || echo 0)"
+assert "...and the tick exits with a normal in-contract code (not an unhandled error from a rejected draft-merge attempt)" \
+  "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
