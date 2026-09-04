@@ -162,9 +162,12 @@ jobs:
   # on ubuntu-latest (amd64, no Lima/cross-build) in ~70s. Own job, not
   # folded into ebpf-build above, since it exercises the loaded runtime
   # (verifier + dataplane + eBPF map memory) rather than just compilation.
-  # Asserts total bytes_memlock across the servicelb maps stays under a
-  # gross-regression ceiling (measured today: ~21.5 KiB, ~45x headroom) --
-  # not a tight bound, just a tripwire for an accidental max_entries blow-up.
+  # Asserts the discovered map set is EXACTLY the 5 known servicelb maps
+  # (catches partial-discovery regressions a byte-sum-only check would miss:
+  # e.g. finding only 4 of 5 maps still sums to a smaller, still-passing
+  # total) and that their summed bytes_memlock stays under a gross-regression
+  # ceiling (measured today: ~21.5 KiB, ~45x headroom) -- not a tight bound,
+  # just a tripwire for an accidental max_entries blow-up.
   ebpf-memory-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -213,39 +216,26 @@ jobs:
           sudo install -m 0755 crates/servicelb/target/release/u7s-servicelb /tmp/u7s-servicelb-smoke
           sudo bash scripts/servicelb/smoke-remote.sh run
 
-      - name: Assert total eBPF map memory stays under the gross-regression ceiling
+      - name: Sample eBPF map memory into a fresh, single-tick CSV for the CI assertion
         run: |
-          set -euo pipefail
-          csv=/tmp/servicelb-ebpf-memory/ebpf-map-memory.csv
-          [ -f "$csv" ] || { echo "FAIL: $csv not produced by smoke-remote.sh" >&2; exit 1; }
-          # Sum only the most recent tick's rows, not the whole file --
-          # smoke-remote.sh's `run` writes two ticks (before/after the round
-          # trip, often the same wall-clock second since the whole fixture
-          # completes in under one), so grouping by ts would double-count a
-          # same-second pair. Each tick emits exactly one row per unioned
-          # map id, and the map id set is stable for the run's one fixture
-          # load, so "how many unique map ids appear anywhere in the file"
-          # is exactly one tick's row count -- take that many rows off the
-          # end.
-          total=$(awk -F, '
-            NR>1 {
-              if (!($2 in ids)) { ids[$2]=1; n++ }
-              rows[NR]=$0; last=NR
-            }
-            END {
-              if (n=="" || n==0) { exit 1 }
-              sum=0
-              for (i=last-n+1; i<=last; i++) {
-                split(rows[i], f, ",")
-                sum += f[6]
-              }
-              print sum+0
-            }
-          ' "$csv")
-          echo "total bytes_memlock across the unioned map ids (latest tick): $total"
-          [ "$total" -gt 0 ] || { echo "FAIL: total bytes_memlock is 0 -- map discovery broken?" >&2; exit 1; }
-          limit=$((1024*1024))
-          [ "$total" -lt "$limit" ] || { echo "FAIL: total bytes_memlock ($total) >= 1 MiB gross-regression ceiling" >&2; exit 1; }
+          # A fresh --out-dir + one `once` call means every data row below
+          # belongs to exactly one tick, with zero ambiguity about which
+          # rows are "the latest" -- unlike reading smoke-remote.sh's own
+          # before/after-round-trip CSV (two `once` calls appended to the
+          # same file), where two ticks with different row counts (e.g. a
+          # partial-map-discovery regression) can blend a stale row from the
+          # wrong tick into the sum (verified against PR #1568's review: a
+          # constructed 5-then-4-map CSV silently produced a plausible,
+          # still-passing total instead of surfacing the drop). The pinned
+          # programs stay loaded until the Cleanup step below, so this can
+          # observe the exact same live pin-dir as smoke-remote.sh's own
+          # bracketing snapshots.
+          sudo bash scripts/servicelb/sample-ebpf-memory.sh once \
+            --pin-dir /sys/fs/bpf/servicelb-smoke \
+            --out-dir /tmp/servicelb-ebpf-memory-assert
+
+      - name: Assert the discovered map set is exactly the 5 known servicelb maps, under the gross-regression byte ceiling
+        run: bash scripts/servicelb/assert-ebpf-map-memory.sh /tmp/servicelb-ebpf-memory-assert/ebpf-map-memory.csv
 
       - name: Cleanup
         if: always()
