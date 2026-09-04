@@ -383,9 +383,9 @@ pub type CrSchemaCacheKey = (String, String, String);
 /// from the store's global, never-reused revision counter and changes on every write
 /// to the CRD — so a cache hit can only ever be the schema compiled from that exact
 /// CRD generation, and a schema-changing CRD update is always a guaranteed miss with
-/// no extra bookkeeping. `handlers/crd.rs` calls `invalidate` after a CRD write and
-/// eviction on delete purely to reclaim the now-unreachable previous-generation entry
-/// rather than leaving it in the map forever; correctness does not depend on it.
+/// no extra bookkeeping. Every code path that writes to or deletes a CRD calls `invalidate`
+/// purely to reclaim the now-unreachable previous-generation entry rather than leaving it in
+/// the map forever; correctness does not depend on it.
 pub struct CrSchemaCache {
     inner: RwLock<HashMap<CrSchemaCacheKey, Arc<CompiledCrSchema>>>,
     /// Counts `insert` calls, i.e. cache-miss compiles. Per-instance (not a global static)
@@ -467,43 +467,87 @@ pub type CrContextCacheKey = (String, String, String);
 /// own `resourceVersion`: at lookup time (before the matching CRD has even been found) the
 /// current rv is exactly the information a store list-scan would produce, and looking it up
 /// first would defeat the point of caching at all. That means a hit here cannot self-verify
-/// freshness the way the rv-keyed caches do — `handlers/crd.rs`'s create/replace/patch/delete
-/// handlers MUST actively invalidate every served-version entry for a CRD whenever its schema
-/// could have changed (see `evict_cr_context_cache`), or a stale `CrContext` — and therefore a
-/// stale `openAPIV3Schema` — would be served to every CR request indefinitely after a CRD
-/// update, silently accepting bodies the new schema would have rejected (or rejecting ones it
-/// would have allowed).
+/// freshness the way the rv-keyed caches do — every code path that writes to or deletes a CRD
+/// MUST actively invalidate every served-version entry for it whenever its schema could have
+/// changed (see `evict_cr_context_cache`), or a stale `CrContext` — and therefore a stale
+/// `openAPIV3Schema` — would be served to every CR request indefinitely after a CRD update,
+/// silently accepting bodies the new schema would have rejected (or rejecting ones it would
+/// have allowed).
+///
+/// A second, narrower race sits on top of that: `find_crd` reads the CRD store, builds a
+/// `CrContext`, and only then inserts it — a concurrent writer's `invalidate` can land in that
+/// window, after which `find_crd`'s insert of data read *before* the write would silently
+/// reinstate the stale entry with nothing left to evict it again. `epoch` closes this: it is
+/// bumped inside the same write-lock critical section `invalidate` uses to remove a key, so a
+/// caller that captures `epoch()` before its store scan and passes it to `insert_if_current`
+/// is guaranteed to see the bump if a racing `invalidate` happened anywhere between — the two
+/// operations can never interleave without one seeing the other's effect.
 pub struct CrContextCache {
-    inner: RwLock<HashMap<CrContextCacheKey, Arc<crate::handlers::cr::CrContext>>>,
-    /// Counts `insert` calls, i.e. cache-miss rebuilds (a fresh list-scan + CRD parse). Used
-    /// only by tests to assert that a repeat `find_crd` call for an unchanged CRD is served
-    /// from cache instead of re-scanning the store.
+    inner: RwLock<CrContextCacheState>,
+    /// Counts successful `insert_if_current` calls, i.e. cache-miss rebuilds (a fresh
+    /// list-scan + CRD parse) that actually landed in the cache. Used only by tests to assert
+    /// that a repeat `find_crd` call for an unchanged CRD is served from cache instead of
+    /// re-scanning the store.
     #[cfg(test)]
     miss_count: std::sync::atomic::AtomicUsize,
+}
+
+struct CrContextCacheState {
+    map: HashMap<CrContextCacheKey, Arc<crate::handlers::cr::CrContext>>,
+    /// Bumped by every `invalidate` call. See `CrContextCache`'s doc for why this is what
+    /// makes `insert_if_current` safe against the insert-after-evict race.
+    epoch: u64,
 }
 
 impl CrContextCache {
     pub fn new() -> Self {
         CrContextCache {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwLock::new(CrContextCacheState {
+                map: HashMap::new(),
+                epoch: 0,
+            }),
             #[cfg(test)]
             miss_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     pub fn get(&self, key: &CrContextCacheKey) -> Option<Arc<crate::handlers::cr::CrContext>> {
-        self.inner.read().unwrap().get(key).cloned()
+        self.inner.read().unwrap().map.get(key).cloned()
     }
 
-    pub fn insert(&self, key: CrContextCacheKey, value: Arc<crate::handlers::cr::CrContext>) {
+    /// Current invalidation epoch. A caller must capture this *before* starting the store scan
+    /// it will use to build the value it later passes to `insert_if_current` — see that
+    /// method's doc.
+    pub fn epoch(&self) -> u64 {
+        self.inner.read().unwrap().epoch
+    }
+
+    /// Insert `value` under `key` unless a racing `invalidate` bumped the epoch past
+    /// `expected_epoch` since the caller last called `epoch()` — in which case the scan that
+    /// produced `value` may already be stale and the insert is silently skipped (the caller's
+    /// own in-hand `value` is still returned to its request; only the cache write is refused).
+    /// Returns whether the insert happened (test/observability only).
+    pub fn insert_if_current(
+        &self,
+        key: CrContextCacheKey,
+        value: Arc<crate::handlers::cr::CrContext>,
+        expected_epoch: u64,
+    ) -> bool {
+        let mut state = self.inner.write().unwrap();
+        if state.epoch != expected_epoch {
+            return false;
+        }
         #[cfg(test)]
         self.miss_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.write().unwrap().insert(key, value);
+        state.map.insert(key, value);
+        true
     }
 
     pub fn invalidate(&self, key: &CrContextCacheKey) {
-        self.inner.write().unwrap().remove(key);
+        let mut state = self.inner.write().unwrap();
+        state.epoch = state.epoch.wrapping_add(1);
+        state.map.remove(key);
     }
 
     #[cfg(test)]
@@ -1917,6 +1961,50 @@ mod tests {
         assert!(
             cache.contains(&("999".to_string(), "example.io/v1".to_string())),
             "the most-recently-inserted key must survive its own insert"
+        );
+    }
+
+    // Models find_crd's insert-after-evict race: a store scan captures `epoch()` before
+    // reading the store, builds a `CrContext` from what it read, and only inserts afterward.
+    // If a concurrent CRD write's `invalidate` lands in that window, the scan's data is
+    // already stale and must not win — `insert_if_current` must refuse it, or a
+    // replace_crd/patch_crd/delete_crd racing a slow find_crd scan would have its eviction
+    // silently undone by the very insert it was supposed to prevent, permanently reinstating
+    // a schema the write just replaced (no resourceVersion in this cache's key means nothing
+    // would ever evict it again).
+    #[test]
+    fn cr_context_cache_insert_if_current_refuses_a_stale_insert_after_a_concurrent_evict() {
+        let cache = CrContextCache::new();
+        let key: CrContextCacheKey = ("example.io".into(), "v1".into(), "widgets".into());
+
+        let epoch_before_scan = cache.epoch();
+
+        // The concurrent writer's evict landing while our "scan" is still in flight — nothing
+        // to remove yet (no prior insert), but the epoch bump is what insert_if_current below
+        // must observe.
+        cache.invalidate(&key);
+
+        let stale_ctx = Arc::new(crate::handlers::cr::CrContext {
+            kind: "Widget".to_string(),
+            namespaced: true,
+            has_status_subresource: false,
+            schema: None,
+            conversion_webhook_client_config: None,
+            selectable_fields: vec![],
+            schema_cache_key: ("example.io".to_string(), "v1".to_string(), "1".to_string()),
+            scale: None,
+        });
+        let inserted = cache.insert_if_current(key.clone(), stale_ctx, epoch_before_scan);
+
+        assert!(
+            !inserted,
+            "insert_if_current must refuse an insert whose captured epoch predates a \
+             concurrent evict — otherwise the stale pre-write scan wins the race and silently \
+             reinstates a CrContext a concurrent CRD write already invalidated"
+        );
+        assert!(
+            cache.get(&key).is_none(),
+            "the refused insert must not be visible in the cache"
         );
     }
 

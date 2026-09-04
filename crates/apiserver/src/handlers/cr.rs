@@ -180,8 +180,10 @@ pub struct CrContext {
     /// concurrent request instead of deep-cloning it per request.
     pub schema: Option<std::sync::Arc<serde_json::Value>>,
     /// Conversion configuration from the CRD spec. Present only when
-    /// `spec.conversion.strategy == "Webhook"`.
-    pub conversion_webhook_client_config: Option<serde_json::Value>,
+    /// `spec.conversion.strategy == "Webhook"`. `Arc`-wrapped for the same reason as `schema`
+    /// above: a `find_crd` cache hit hands this out to every concurrent request without
+    /// deep-cloning the `clientConfig` object per request.
+    pub conversion_webhook_client_config: Option<std::sync::Arc<serde_json::Value>>,
     /// Field paths (`x-kubernetes-selectable-fields`, leading '.' stripped) the matched
     /// version declared selectable, e.g. `["host", "port"]`. Each version may declare a
     /// different set, so this is scoped to the specific version a request named — never
@@ -236,6 +238,11 @@ pub async fn find_crd<S: Store>(
     if let Some(cached) = state.cr_context_cache.get(&cache_key) {
         return Ok((*cached).clone());
     }
+    // Captured before the store scan below so `insert_if_current` can detect a concurrent
+    // `replace_crd`/`patch_crd`/`delete_crd` that evicts this key while we're scanning — see
+    // `CrContextCache`'s doc for why an unconditional insert here would let that race silently
+    // reinstate the pre-write `CrContext` this scan is about to build.
+    let epoch_before_scan = state.cr_context_cache.epoch();
 
     let prefix = CRD_LIST_PREFIX;
     let resp = state
@@ -331,7 +338,7 @@ pub async fn find_crd<S: Store>(
             .as_ref()
             .filter(|c| c["strategy"].as_str() == Some("Webhook"))
             .and_then(|c| c["webhook"]["clientConfig"].as_object())
-            .map(|cfg| serde_json::Value::Object(cfg.clone()));
+            .map(|cfg| std::sync::Arc::new(serde_json::Value::Object(cfg.clone())));
         let schema_cache_key = (
             crd.spec.group.clone(),
             matched_version.name.clone(),
@@ -347,9 +354,11 @@ pub async fn find_crd<S: Store>(
             schema_cache_key,
             scale,
         };
-        state
-            .cr_context_cache
-            .insert(cache_key, std::sync::Arc::new(ctx.clone()));
+        state.cr_context_cache.insert_if_current(
+            cache_key,
+            std::sync::Arc::new(ctx.clone()),
+            epoch_before_scan,
+        );
         return Ok(ctx);
     }
 
@@ -2098,7 +2107,7 @@ pub async fn list_cr<S: Store>(
         if let Some((items, _)) = initial_items.as_mut() {
             convert_cr_list_items(
                 &state,
-                ctx.conversion_webhook_client_config.as_ref(),
+                ctx.conversion_webhook_client_config.as_deref(),
                 items,
                 &desired_api_version,
             )
@@ -2124,7 +2133,10 @@ pub async fn list_cr<S: Store>(
             super::watch::CrFieldSelectorContext {
                 namespaced: ctx.namespaced,
                 selectable_fields: ctx.selectable_fields.clone(),
-                conversion_webhook_client_config: ctx.conversion_webhook_client_config.clone(),
+                conversion_webhook_client_config: ctx
+                    .conversion_webhook_client_config
+                    .as_deref()
+                    .cloned(),
                 desired_api_version,
             },
         )
@@ -2178,7 +2190,7 @@ pub async fn list_cr<S: Store>(
     let desired_api_version = format!("{group}/{version}");
     convert_cr_list_items(
         &state,
-        ctx.conversion_webhook_client_config.as_ref(),
+        ctx.conversion_webhook_client_config.as_deref(),
         &mut items,
         &desired_api_version,
     )
@@ -2262,9 +2274,9 @@ pub async fn get_cr<S: Store>(
     if object_needs_conversion(
         &obj,
         &desired_api_version,
-        ctx.conversion_webhook_client_config.as_ref(),
+        ctx.conversion_webhook_client_config.as_deref(),
     ) {
-        if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
+        if let Some(cfg) = ctx.conversion_webhook_client_config.as_deref() {
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
             let mut converted_obj = converted
@@ -2879,7 +2891,7 @@ pub async fn delete_collection_cr<S: Store>(
         .collect();
     convert_cr_list_items(
         &state,
-        ctx.conversion_webhook_client_config.as_ref(),
+        ctx.conversion_webhook_client_config.as_deref(),
         &mut filter_view,
         &desired_api_version,
     )
@@ -3068,7 +3080,7 @@ pub async fn list_cr_namespaced<S: Store>(
         if let Some((items, _)) = initial_items.as_mut() {
             convert_cr_list_items(
                 &state,
-                ctx.conversion_webhook_client_config.as_ref(),
+                ctx.conversion_webhook_client_config.as_deref(),
                 items,
                 &desired_api_version,
             )
@@ -3094,7 +3106,10 @@ pub async fn list_cr_namespaced<S: Store>(
             super::watch::CrFieldSelectorContext {
                 namespaced: ctx.namespaced,
                 selectable_fields: ctx.selectable_fields.clone(),
-                conversion_webhook_client_config: ctx.conversion_webhook_client_config.clone(),
+                conversion_webhook_client_config: ctx
+                    .conversion_webhook_client_config
+                    .as_deref()
+                    .cloned(),
                 desired_api_version,
             },
         )
@@ -3148,7 +3163,7 @@ pub async fn list_cr_namespaced<S: Store>(
     let desired_api_version = format!("{group}/{version}");
     convert_cr_list_items(
         &state,
-        ctx.conversion_webhook_client_config.as_ref(),
+        ctx.conversion_webhook_client_config.as_deref(),
         &mut items,
         &desired_api_version,
     )
@@ -3232,9 +3247,9 @@ pub async fn get_cr_namespaced<S: Store>(
     if object_needs_conversion(
         &obj,
         &desired_api_version,
-        ctx.conversion_webhook_client_config.as_ref(),
+        ctx.conversion_webhook_client_config.as_deref(),
     ) {
-        if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
+        if let Some(cfg) = ctx.conversion_webhook_client_config.as_deref() {
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
             let mut converted_obj = converted
@@ -3785,7 +3800,7 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
         .collect();
     convert_cr_list_items(
         &state,
-        ctx.conversion_webhook_client_config.as_ref(),
+        ctx.conversion_webhook_client_config.as_deref(),
         &mut filter_view,
         &desired_api_version,
     )
@@ -9183,6 +9198,190 @@ mod tests {
             "find_crd must return the UPDATED schema (color now required) after \
              crd::replace_crd — a stale cached CrContext would still validate against the \
              pre-update schema and let an invalid CR body through"
+        );
+    }
+
+    // Same regression as find_crd_serves_updated_schema_after_crd_replace_not_the_stale_cached_one
+    // above, but for crd::patch_crd's merge-into-existing branch — a separate write path with
+    // its own cache-eviction call site that could drift out of sync with replace_crd's.
+    #[tokio::test]
+    async fn find_crd_serves_updated_schema_after_crd_patch_not_the_stale_cached_one() {
+        let state = make_state();
+        use crate::handlers::crd;
+
+        let versions_with_schema = |color_required: bool| {
+            let required: Vec<&str> = if color_required {
+                vec!["color"]
+            } else {
+                vec![]
+            };
+            serde_json::json!([{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {
+                                "type": "object",
+                                "properties": { "color": { "type": "string" } },
+                                "required": required
+                            }
+                        }
+                    }
+                }
+            }])
+        };
+
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": { "name": "widgets.example.io" },
+                        "spec": {
+                            "group": "example.io",
+                            "names": {
+                                "plural": "widgets",
+                                "singular": "widget",
+                                "kind": "Widget",
+                                "listKind": "WidgetList"
+                            },
+                            "scope": "Namespaced",
+                            "versions": versions_with_schema(false)
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .is_ok(),
+            "install CRD where spec.color is optional"
+        );
+
+        // Warm the cache under the pre-patch schema — this is the entry the patch below must
+        // invalidate.
+        let ctx = find_crd(&state, "example.io", "v1", "widgets")
+            .await
+            .expect("CRD must be found right after installing it");
+        assert!(
+            validate_cr_schema(
+                &serde_json::json!({ "spec": {} }),
+                &ctx,
+                &state.cr_schema_cache,
+                None
+            )
+            .is_ok(),
+            "sanity check: spec.color must be optional under the original schema"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!({ "spec": { "versions": versions_with_schema(true) } }).to_string(),
+        );
+
+        crd::patch_crd(
+            State(state.clone()),
+            Path("widgets.example.io".to_string()),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await
+        .expect("patch_crd must succeed");
+
+        let ctx = find_crd(&state, "example.io", "v1", "widgets")
+            .await
+            .expect("CRD must still be found after patch");
+        assert!(
+            validate_cr_schema(
+                &serde_json::json!({ "spec": {} }),
+                &ctx,
+                &state.cr_schema_cache,
+                None
+            )
+            .is_err(),
+            "find_crd must return the UPDATED schema (color now required) after \
+             crd::patch_crd — a stale cached CrContext would still validate against the \
+             pre-patch schema and let an invalid CR body through"
+        );
+    }
+
+    // Without crd::delete_crd's cr_context_cache eviction, a deleted CRD's CrContext has no
+    // resourceVersion in its cache key to self-expire on (see CrContextCache's doc) — find_crd
+    // would keep resolving the group/version/plural against a CRD that no longer exists,
+    // instead of the 410 Gone client-go informers rely on to stop retrying (a 404 is retried
+    // forever instead, hanging namespace/CRD teardown).
+    #[tokio::test]
+    async fn find_crd_returns_gone_after_crd_delete_not_the_stale_cached_context() {
+        let state = make_state();
+        use crate::handlers::crd;
+
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": { "name": "widgets.example.io" },
+                        "spec": {
+                            "group": "example.io",
+                            "names": {
+                                "plural": "widgets",
+                                "singular": "widget",
+                                "kind": "Widget",
+                                "listKind": "WidgetList"
+                            },
+                            "scope": "Namespaced",
+                            "versions": [{ "name": "v1", "served": true, "storage": true }]
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .is_ok(),
+            "install CRD"
+        );
+
+        find_crd(&state, "example.io", "v1", "widgets")
+            .await
+            .expect("CRD must be found right after installing it, warming cr_context_cache");
+
+        crd::delete_crd(
+            State(state.clone()),
+            Path("widgets.example.io".to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete_crd must succeed");
+
+        let err = match find_crd(&state, "example.io", "v1", "widgets").await {
+            Ok(_) => panic!(
+                "find_crd must error after crd::delete_crd — a stale cached CrContext would \
+                 keep serving CR requests against a CRD that no longer exists"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GONE,
+            "must be 410 Gone specifically (not a stale Ok(ctx)) — informers treat 404 as \
+             transient and retry forever, but only 410 tells them to stop"
         );
     }
 

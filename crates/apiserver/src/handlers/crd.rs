@@ -362,7 +362,7 @@ fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::Stat
 /// correctness requirement: the CRD's next resourceVersion is always different (the
 /// store's revision counter is global and never reused), so a stale entry could never
 /// be looked up again even if this were never called.
-fn evict_cr_schema_cache<S: Store>(
+pub(crate) fn evict_cr_schema_cache<S: Store>(
     state: &AppState<S>,
     old_group: &str,
     old_version_names: &[String],
@@ -388,7 +388,7 @@ fn evict_cr_schema_cache<S: Store>(
 /// out the pre-write `CrContext` forever. `group`/`plural` are invariant across a CRD's
 /// lifetime (rejected by `reject_structural_field_change`), so the same (group, plural) is
 /// correct whether called with the pre- or post-write version list.
-fn evict_cr_context_cache<S: Store>(
+pub(crate) fn evict_cr_context_cache<S: Store>(
     state: &AppState<S>,
     group: &str,
     plural: &str,
@@ -406,7 +406,7 @@ fn evict_cr_context_cache<S: Store>(
 /// Extract `(spec.group, [versions[].name], spec.names.plural, metadata.resourceVersion)`
 /// from a raw CRD `Value` — used to find the `cr_schema_cache`/`cr_context_cache` keys a CRD
 /// generation was cached under, without needing a full `CustomResourceDefinition` parse.
-fn crd_cache_identity(crd: &serde_json::Value) -> (String, Vec<String>, String, String) {
+pub(crate) fn crd_cache_identity(crd: &serde_json::Value) -> (String, Vec<String>, String, String) {
     let group = crd["spec"]["group"]
         .as_str()
         .unwrap_or_default()
