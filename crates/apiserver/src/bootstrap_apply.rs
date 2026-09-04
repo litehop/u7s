@@ -896,6 +896,8 @@ mod tests {
                 Arc::clone(&state.sa_sig_cache),
                 Arc::clone(&state.flowcontrol_cache),
                 Arc::clone(&state.node_graph),
+                Arc::clone(&state.resource_registry),
+                Arc::clone(&state.discovery_cache),
             ))
             .layer(crate::inflight::InflightLayer::new())
             .layer(axum::extract::DefaultBodyLimit::max(crate::MAX_BODY_BYTES));
