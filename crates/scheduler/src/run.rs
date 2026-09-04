@@ -442,6 +442,54 @@ const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const POD_WATCH_PATH: &str =
     "/api/v1/pods?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
 
+/// Cluster-wide watch paths feeding `NodeTally`'s PVC/PV/StorageClass/CSINode
+/// caches (see `NodeTally::resolve_csi_driver`) — same
+/// `allowWatchBookmarks=true&sendInitialEvents=true` rationale as
+/// `POD_WATCH_PATH`'s doc comment.
+const PVC_WATCH_PATH: &str =
+    "/api/v1/persistentvolumeclaims?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
+const PV_WATCH_PATH: &str =
+    "/api/v1/persistentvolumes?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
+const STORAGE_CLASS_WATCH_PATH: &str = "/apis/storage.k8s.io/v1/storageclasses?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
+const CSI_NODE_WATCH_PATH: &str =
+    "/apis/storage.k8s.io/v1/csinodes?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
+
+/// Run one of the scheduler's secondary cache-maintenance watches (PVC/PV/
+/// StorageClass/CSINode). Unlike the primary pod watch, these never trigger
+/// scheduling directly — they only keep `NodeTally`'s CSI-driver-resolution
+/// caches current, so `populate_csi_driver_headroom` can resolve a PVC's
+/// backing driver synchronously (zero I/O) at scheduling-decision time
+/// instead of a live GET chain per decision (see that function's doc
+/// comment for why the live-GET version raced under concurrent scheduling).
+///
+/// `clear` runs before every (re)connect, including the first, for the same
+/// reason `NodeTally::clear` runs on the pod watch's own reconnect: a delete
+/// missed while disconnected would otherwise leave a phantom cache entry the
+/// fresh `sendInitialEvents=true` relist never corrects (it only re-adds
+/// what still exists).
+async fn run_cache_watch_loop(
+    connector: TlsConnector,
+    server: String,
+    tally: Arc<Mutex<NodeTally>>,
+    path: &'static str,
+    apply: fn(&mut NodeTally, &serde_json::Value),
+    clear: fn(&mut NodeTally),
+) {
+    loop {
+        info!("starting cache watch on {path}");
+        clear(&mut tally.lock().expect("tally lock poisoned"));
+        let tally_ref = &tally;
+        let result = stream_watch_events(&connector, &server, path, |event| {
+            apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event);
+        })
+        .await;
+        if let Err(e) = result {
+            error!("cache watch on {path} error: {e} — reconnecting in 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
 /// Handle one pod watch event — a real one from the live watch, or a
 /// synthetic `{"type": "MODIFIED", "object": ...}` manufactured by the
 /// periodic resync loop from a fresh `/api/v1/pods` list (see
@@ -906,6 +954,41 @@ pub async fn run_scheduler(
                 }
             }
         });
+    }
+
+    // Secondary caches feeding NodeTally's CSI-driver resolution (see
+    // `run_cache_watch_loop`'s doc comment) — each watched independently so
+    // one's reconnect never blocks the others or the primary pod watch.
+    for (path, apply, clear) in [
+        (
+            PVC_WATCH_PATH,
+            NodeTally::apply_pvc_event as fn(&mut NodeTally, &serde_json::Value),
+            NodeTally::clear_pvc_cache as fn(&mut NodeTally),
+        ),
+        (
+            PV_WATCH_PATH,
+            NodeTally::apply_pv_event as fn(&mut NodeTally, &serde_json::Value),
+            NodeTally::clear_pv_cache as fn(&mut NodeTally),
+        ),
+        (
+            STORAGE_CLASS_WATCH_PATH,
+            NodeTally::apply_storage_class_event as fn(&mut NodeTally, &serde_json::Value),
+            NodeTally::clear_storage_class_cache as fn(&mut NodeTally),
+        ),
+        (
+            CSI_NODE_WATCH_PATH,
+            NodeTally::apply_csi_node_event as fn(&mut NodeTally, &serde_json::Value),
+            NodeTally::clear_csi_node_cache as fn(&mut NodeTally),
+        ),
+    ] {
+        tokio::spawn(run_cache_watch_loop(
+            connector.clone(),
+            server.clone(),
+            tally.clone(),
+            path,
+            apply,
+            clear,
+        ));
     }
 
     // Watch loop — reconnect on error with a short backoff.
