@@ -3617,9 +3617,9 @@ mod tests {
     /// forged podIP of 127.0.0.1.
     ///
     /// The CIDR allowlist tested above is a no-op in this configuration, falling back to
-    /// the blocklist floor alone — the exact arm a critical-reviewer of PR #1525 found
-    /// still let a compromised node redirect the apiserver's own outbound pods/proxy dial
-    /// to a service on its own host (pprof/debug/metadata). If the blocklist's loopback
+    /// the blocklist floor alone — the exact arm a critical-reviewer found still let a
+    /// compromised node redirect the apiserver's own outbound pods/proxy dial to a
+    /// service on its own host (pprof/debug/metadata). If the blocklist's loopback
     /// rejection is ever reverted, this test starts passing 502 traffic to 127.0.0.1
     /// instead of rejecting it, and fails.
     #[tokio::test]
