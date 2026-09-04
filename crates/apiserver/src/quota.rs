@@ -1003,31 +1003,64 @@ async fn adjust_pod_quota_usage<S: Store>(
                 let new_count =
                     pod_count_new_value(state, namespace, quota, quota_resource, sign).await;
                 updates.push((quota_resource.clone(), new_count.to_string()));
-            } else if let Some((field, resource_key)) = quota_to_pod_resource(quota_resource) {
-                let delta_milli = sign * pod_resource_milli(Some(pod), field, &resource_key);
-                let new_milli = pod_resource_milli_new_value(
-                    state,
-                    namespace,
-                    quota,
-                    quota_resource,
-                    field,
-                    &resource_key,
-                    delta_milli,
-                )
-                .await;
-                let formatted = match quantity_format_type(quota_resource) {
-                    "cpu" => format_milli_cpu(new_milli),
-                    "bytes" => format_milli_bytes(new_milli),
-                    _ => format_milli_integer(new_milli),
-                };
-                updates.push((quota_resource.clone(), formatted));
             }
         }
+        updates.extend(
+            adjust_pod_resource_quota_usage(state, namespace, quota, hard, |field, key| {
+                sign * pod_resource_milli(Some(pod), field, key)
+            })
+            .await,
+        );
         if updates.is_empty() {
             continue;
         }
         write_quota_used_updates(state, namespace, &quota_name, updates).await;
     }
+}
+
+/// Compute `status.used` updates for every resource-request-based quota entry
+/// (`requests.cpu`, `requests.memory`, ...) in `hard`, given a per-`(field, resource)` delta
+/// callback. Shared by `adjust_pod_quota_usage` (create/delete: delta is the whole pod's
+/// signed contribution) and `record_pod_resized` (resize: delta is just the pre/post
+/// difference) so both compute a quota's incremental resource-request usage identically —
+/// they differ only in how much of a pod's request counts as the delta. Always calls
+/// `pod_resource_milli_new_value` even for a zero delta: when `status.used` has no prior
+/// entry yet, that call's fallback full scan is what bootstraps it (see
+/// `pod_resource_milli_new_value`'s doc) — skipping on a zero delta would silently defer that
+/// bootstrap and reintroduce an O(n) scan on every subsequent admission check until some other
+/// call happens to carry a non-zero delta for that resource.
+async fn adjust_pod_resource_quota_usage<S: Store>(
+    state: &AppState<S>,
+    namespace: &str,
+    quota: &Value,
+    hard: &serde_json::Map<String, Value>,
+    delta_milli_for: impl Fn(&str, &str) -> i64,
+) -> Vec<(String, String)> {
+    let mut updates = Vec::new();
+    for (quota_resource, _) in hard {
+        let (field, resource_key) = match quota_to_pod_resource(quota_resource) {
+            Some(v) => v,
+            None => continue,
+        };
+        let delta_milli = delta_milli_for(field, &resource_key);
+        let new_milli = pod_resource_milli_new_value(
+            state,
+            namespace,
+            quota,
+            quota_resource,
+            field,
+            &resource_key,
+            delta_milli,
+        )
+        .await;
+        let formatted = match quantity_format_type(quota_resource) {
+            "cpu" => format_milli_cpu(new_milli),
+            "bytes" => format_milli_bytes(new_milli),
+            _ => format_milli_integer(new_milli),
+        };
+        updates.push((quota_resource.clone(), formatted));
+    }
+    updates
 }
 
 /// Record that `pod` was just admitted (persisted) in `namespace`. Call exactly once, strictly
@@ -1041,6 +1074,73 @@ pub async fn record_pod_created<S: Store>(state: &AppState<S>, namespace: &str, 
 /// site (plain DELETE, finalizer-drain completion via PATCH/PUT, DeleteCollection, eviction).
 pub async fn record_pod_removed<S: Store>(state: &AppState<S>, namespace: &str, pod: &Value) {
     adjust_pod_quota_usage(state, namespace, pod, -1).await;
+}
+
+/// Adjust every ResourceQuota's resource-request-based `status.used` entries in `namespace`
+/// for a pod that was just resized via PATCH/PUT .../resize. Pod count entries (`pods`,
+/// `count/pods`) are untouched — resize neither creates nor destroys a pod. Call exactly once,
+/// strictly after the resize's store write succeeds.
+///
+/// Without this, `status.used` is only ever adjusted by the pod's create-time request amount
+/// and its eventual delete-time (post-resize) amount: a pod created with `requests.cpu: 100m`
+/// then resized up to `500m` adds 100m at create and subtracts 500m at delete, permanently
+/// leaking 400m out of `requests.cpu` usage even though no pod remains — a namespace can end
+/// up unable to schedule pods a fresh ResourceQuota calculation would allow.
+///
+/// `old_spec` is the pod's `spec` exactly as stored before the resize patch was applied;
+/// `new_pod` is the full pod object after. In-place resize cannot change QoS class (rejected
+/// before this is ever called — see `validate_resize_patch`), so scope membership (BestEffort/
+/// NotBestEffort etc.) cannot change either; matching scopes against the post-resize pod is
+/// therefore equivalent to matching pre-resize.
+pub async fn record_pod_resized<S: Store>(
+    state: &AppState<S>,
+    namespace: &str,
+    old_spec: &Value,
+    new_pod: &Value,
+) {
+    let quotas = fetch_resource_quotas(state, namespace).await;
+    if quotas.is_empty() {
+        return;
+    }
+    let old_pod = serde_json::json!({ "spec": old_spec });
+
+    for quota in &quotas {
+        let quota_name = match quota["metadata"]["name"].as_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let hard = match quota["spec"]["hard"].as_object() {
+            Some(m) => m,
+            None => continue,
+        };
+
+        if let Some(scopes) = quota["spec"]["scopes"].as_array() {
+            let matches = scopes
+                .iter()
+                .filter_map(|s| s.as_str())
+                .all(|s| object_matches_scope(s, Some(new_pod)));
+            if !matches {
+                continue;
+            }
+        }
+        let scope_selector = &quota["spec"]["scopeSelector"];
+        if scope_selector.is_object()
+            && !object_matches_scope_selector(scope_selector, Some(new_pod))
+        {
+            continue;
+        }
+
+        let updates =
+            adjust_pod_resource_quota_usage(state, namespace, quota, hard, |field, key| {
+                pod_resource_milli(Some(new_pod), field, key)
+                    - pod_resource_milli(Some(&old_pod), field, key)
+            })
+            .await;
+        if updates.is_empty() {
+            continue;
+        }
+        write_quota_used_updates(state, namespace, &quota_name, updates).await;
+    }
 }
 
 /// Check ResourceQuota constraints before a CREATE operation.
