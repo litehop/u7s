@@ -5,6 +5,7 @@ use axum::{
     Extension, Json,
 };
 use bytes::Bytes;
+use std::collections::HashSet;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
@@ -1207,9 +1208,26 @@ async fn delete_namespace_scoped_crds<S: Store>(state: &AppState<S>, namespace_n
             tracing::warn!("cascade-delete CRD {crd_name} for namespace {namespace_name}: {e}");
             continue;
         }
-        let tombstone_key = crate::handlers::crd::deleted_group_tombstone_key(group);
+
+        // This is a direct store write on the CRD key, not a call into crd::delete_crd — so it
+        // must run the exact same cache eviction crd::delete_crd runs after its own delete, or
+        // find_crd (cr.rs) keeps serving the pre-delete CrContext/schema forever (its cache
+        // check has no tombstone/404 fallback to fall through to).
+        let (group, versions, plural, resource_version) =
+            crate::handlers::crd::crd_cache_identity(&crd);
+        crate::handlers::crd::evict_cr_schema_cache(state, &group, &versions, &resource_version);
+        crate::handlers::crd::evict_cr_context_cache(state, &group, &plural, &versions);
+        if !versions.is_empty() {
+            let target_api_versions: HashSet<String> =
+                versions.iter().map(|v| format!("{group}/{v}")).collect();
+            state
+                .cr_conversion_cache
+                .invalidate_by_target_api_versions(&target_api_versions);
+        }
+
+        let tombstone_key = crate::handlers::crd::deleted_group_tombstone_key(&group);
         let tombstone_val =
-            serde_json::to_vec(&serde_json::json!({ "group": group })).unwrap_or_default();
+            serde_json::to_vec(&serde_json::json!({ "group": &group })).unwrap_or_default();
         let _ = state
             .store
             .put(&tombstone_key, bytes::Bytes::from(tombstone_val), None)
@@ -4115,6 +4133,71 @@ mod tests {
              immediately — otherwise every CR destroyed by a namespace delete leaves its \
              converted body resident in the cache forever, an unbounded leak on any cluster \
              using conversion webhooks"
+        );
+    }
+
+    // HIGH-severity regression: delete_namespace_scoped_crds deletes a namespace-scoped CRD via
+    // a direct store write, not crd::delete_crd — so unlike that handler it must run the exact
+    // same cache eviction itself, or find_crd's cache check (which runs BEFORE any
+    // tombstone/404 fallback) keeps resolving CR requests against a CRD that no longer exists,
+    // indefinitely, silently mis-validating every CR write against a deleted schema.
+    #[tokio::test]
+    async fn delete_namespace_scoped_crds_evicts_cr_context_cache_so_find_crd_does_not_serve_a_deleted_crd(
+    ) {
+        use crate::handlers::{cr::find_crd, crd};
+
+        let state = make_state();
+        let group = "stable.nscrd-test.example.com";
+
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": { "name": format!("crontabs.{group}") },
+                        "spec": {
+                            "group": group,
+                            "names": {
+                                "plural": "crontabs",
+                                "singular": "crontab",
+                                "kind": "CronTab",
+                                "listKind": "CronTabList"
+                            },
+                            "scope": "Namespaced",
+                            "versions": [{ "name": "v1", "served": true, "storage": true }]
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .is_ok(),
+            "install namespace-scoped CRD whose group embeds the namespace name"
+        );
+
+        find_crd(&state, group, "v1", "crontabs")
+            .await
+            .expect("CRD must be found right after installing it, warming cr_context_cache");
+
+        delete_namespace_scoped_crds(&state, "nscrd-test").await;
+
+        let err = match find_crd(&state, group, "v1", "crontabs").await {
+            Ok(_) => panic!(
+                "find_crd must error once delete_namespace_scoped_crds removed the CRD — a \
+                 stale cached CrContext would keep validating CR writes against a schema for a \
+                 CRD that no longer exists"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GONE,
+            "must be 410 Gone (delete_namespace_scoped_crds writes a group tombstone) rather \
+             than a stale Ok(ctx) or an uncached 404"
         );
     }
 
