@@ -380,10 +380,33 @@ fn evict_cr_schema_cache<S: Store>(
     }
 }
 
-/// Extract `(spec.group, [versions[].name], metadata.resourceVersion)` from a raw CRD
-/// `Value` — used to find the `cr_schema_cache` keys a CRD generation was cached under,
-/// without needing a full `CustomResourceDefinition` parse.
-fn crd_schema_cache_identity(crd: &serde_json::Value) -> (String, Vec<String>, String) {
+/// Remove `cr_context_cache` entries for a CRD's every served version. Unlike
+/// `evict_cr_schema_cache` above, this IS a correctness requirement, not just hygiene: the
+/// cache key (`state::CrContextCache`) has no resourceVersion component, so a stale entry
+/// stays a "hit" indefinitely until explicitly removed — a write that changes the CRD's
+/// schema, subresources, or served-version list must evict here or `find_crd` keeps handing
+/// out the pre-write `CrContext` forever. `group`/`plural` are invariant across a CRD's
+/// lifetime (rejected by `reject_structural_field_change`), so the same (group, plural) is
+/// correct whether called with the pre- or post-write version list.
+fn evict_cr_context_cache<S: Store>(
+    state: &AppState<S>,
+    group: &str,
+    plural: &str,
+    version_names: &[String],
+) {
+    for version in version_names {
+        state.cr_context_cache.invalidate(&(
+            group.to_string(),
+            version.clone(),
+            plural.to_string(),
+        ));
+    }
+}
+
+/// Extract `(spec.group, [versions[].name], spec.names.plural, metadata.resourceVersion)`
+/// from a raw CRD `Value` — used to find the `cr_schema_cache`/`cr_context_cache` keys a CRD
+/// generation was cached under, without needing a full `CustomResourceDefinition` parse.
+fn crd_cache_identity(crd: &serde_json::Value) -> (String, Vec<String>, String, String) {
     let group = crd["spec"]["group"]
         .as_str()
         .unwrap_or_default()
@@ -396,11 +419,15 @@ fn crd_schema_cache_identity(crd: &serde_json::Value) -> (String, Vec<String>, S
                 .collect()
         })
         .unwrap_or_default();
+    let plural = crd["spec"]["names"]["plural"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let resource_version = crd["metadata"]["resourceVersion"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    (group, versions, resource_version)
+    (group, versions, plural, resource_version)
 }
 
 // ---------------------------------------------------------------------------
@@ -763,8 +790,9 @@ pub async fn replace_crd<S: Store>(
     let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
     let _ = state.store.delete(&tombstone_key, None).await;
 
-    let (old_group, old_versions, old_rv) = crd_schema_cache_identity(&existing);
+    let (old_group, old_versions, old_plural, old_rv) = crd_cache_identity(&existing);
     evict_cr_schema_cache(&state, &old_group, &old_versions, &old_rv);
+    evict_cr_context_cache(&state, &old_group, &old_plural, &old_versions);
     crate::handlers::discovery::refresh_discovery_cache(&state).await;
 
     crd.metadata.resource_version = rv.to_string();
@@ -803,7 +831,7 @@ pub async fn delete_crd<S: Store>(
     // Parse once: used both for the tombstone's group below and as the admission review object.
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
-    let (group, versions, resource_version) = crd_schema_cache_identity(&existing);
+    let (group, versions, plural, resource_version) = crd_cache_identity(&existing);
 
     // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
     let admission_ctx = AdmissionContext {
@@ -842,6 +870,7 @@ pub async fn delete_crd<S: Store>(
         .map_err(|e| store_err_crd(e, &name))?;
 
     evict_cr_schema_cache(&state, &group, &versions, &resource_version);
+    evict_cr_context_cache(&state, &group, &plural, &versions);
     crate::handlers::discovery::refresh_discovery_cache(&state).await;
 
     // A deleted CRD's versions can never be requested (or converted to) again, so every
@@ -1014,7 +1043,7 @@ pub async fn patch_crd<S: Store>(
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
     // Captured before the patch mutates `current` in place, so this reflects the CRD
     // generation the pre-patch cr_schema_cache entries were cached under.
-    let (old_group, old_versions, old_rv) = crd_schema_cache_identity(&current);
+    let (old_group, old_versions, old_plural, old_rv) = crd_cache_identity(&current);
     // Snapshot the pre-patch value for reject_structural_field_change below — `current` is
     // mutated in place by the patch application, so the stored spec.group/scope/names.* would
     // otherwise be lost by the time we can compare against them.
@@ -1117,6 +1146,7 @@ pub async fn patch_crd<S: Store>(
         .map_err(|e| store_err_crd(e, &name))?;
 
     evict_cr_schema_cache(&state, &old_group, &old_versions, &old_rv);
+    evict_cr_context_cache(&state, &old_group, &old_plural, &old_versions);
     crate::handlers::discovery::refresh_discovery_cache(&state).await;
 
     crd.metadata.resource_version = rv.to_string();

@@ -455,6 +455,63 @@ impl CrSchemaCache {
     }
 }
 
+/// (CRD `spec.group`, requested version name, CRD `spec.names.plural`) — identifies exactly
+/// one `handlers::cr::find_crd` lookup.
+pub type CrContextCacheKey = (String, String, String);
+
+/// Cache of `handlers::cr::find_crd`'s resolved `CrContext`, so a CR request skips the
+/// O(CRD-count) store list-scan + per-CRD JSON parse `find_crd` would otherwise run on every
+/// single CR create/get/list/update/delete.
+///
+/// Unlike `CrSchemaCache`/`CrConversionCache`, this cache's key does NOT include the CRD's
+/// own `resourceVersion`: at lookup time (before the matching CRD has even been found) the
+/// current rv is exactly the information a store list-scan would produce, and looking it up
+/// first would defeat the point of caching at all. That means a hit here cannot self-verify
+/// freshness the way the rv-keyed caches do — `handlers/crd.rs`'s create/replace/patch/delete
+/// handlers MUST actively invalidate every served-version entry for a CRD whenever its schema
+/// could have changed (see `evict_cr_context_cache`), or a stale `CrContext` — and therefore a
+/// stale `openAPIV3Schema` — would be served to every CR request indefinitely after a CRD
+/// update, silently accepting bodies the new schema would have rejected (or rejecting ones it
+/// would have allowed).
+pub struct CrContextCache {
+    inner: RwLock<HashMap<CrContextCacheKey, Arc<crate::handlers::cr::CrContext>>>,
+    /// Counts `insert` calls, i.e. cache-miss rebuilds (a fresh list-scan + CRD parse). Used
+    /// only by tests to assert that a repeat `find_crd` call for an unchanged CRD is served
+    /// from cache instead of re-scanning the store.
+    #[cfg(test)]
+    miss_count: std::sync::atomic::AtomicUsize,
+}
+
+impl CrContextCache {
+    pub fn new() -> Self {
+        CrContextCache {
+            inner: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            miss_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn get(&self, key: &CrContextCacheKey) -> Option<Arc<crate::handlers::cr::CrContext>> {
+        self.inner.read().unwrap().get(key).cloned()
+    }
+
+    pub fn insert(&self, key: CrContextCacheKey, value: Arc<crate::handlers::cr::CrContext>) {
+        #[cfg(test)]
+        self.miss_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.write().unwrap().insert(key, value);
+    }
+
+    pub fn invalidate(&self, key: &CrContextCacheKey) {
+        self.inner.write().unwrap().remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn miss_count(&self) -> usize {
+        self.miss_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// (CR object's own stored `metadata.resourceVersion`, target `apiVersion`) — identifies
 /// exactly one webhook-converted CR body.
 pub type CrConversionCacheKey = (String, String);
@@ -747,6 +804,10 @@ pub struct AppState<S = SqliteStore> {
     /// resourceVersion, target apiVersion). See `CrConversionCache` for the cache-key
     /// rationale and invalidation strategy.
     pub cr_conversion_cache: Arc<CrConversionCache>,
+    /// Cache of `handlers::cr::find_crd`'s resolved `CrContext`, keyed by (group, version,
+    /// plural). See `CrContextCache` for why this one requires active invalidation on every
+    /// CRD write, unlike the rv-keyed caches above.
+    pub cr_context_cache: Arc<CrContextCache>,
     /// Cache of SA-JWT signature-verification outcomes, so repeat presentation of the same
     /// token skips the RSA modexp. Not part of `AppStateConfig` (same reasoning as
     /// `node_kubelet_ports`: no test caller needs a non-default capacity at construction
@@ -836,6 +897,7 @@ impl<S> Clone for AppState<S> {
             quota_admission_locks: self.quota_admission_locks.clone(),
             cr_schema_cache: self.cr_schema_cache.clone(),
             cr_conversion_cache: self.cr_conversion_cache.clone(),
+            cr_context_cache: self.cr_context_cache.clone(),
             sa_sig_cache: self.sa_sig_cache.clone(),
             flowcontrol_cache: self.flowcontrol_cache.clone(),
             boot_ready: self.boot_ready.clone(),
@@ -1037,6 +1099,7 @@ impl<S: Store> AppState<S> {
             quota_admission_locks: QuotaAdmissionLocks::new(),
             cr_schema_cache: Arc::new(CrSchemaCache::new()),
             cr_conversion_cache: Arc::new(CrConversionCache::new()),
+            cr_context_cache: Arc::new(CrContextCache::new()),
             // See the field's doc: overwritten by run() once the CLI/env-resolved capacity
             // is known; every test gets the default, matching node_kubelet_ports' pattern.
             sa_sig_cache: Arc::new(SigCache::new_with_capacity(

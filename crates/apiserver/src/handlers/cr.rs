@@ -162,6 +162,11 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
 // ---------------------------------------------------------------------------
 
 /// Information extracted from a CRD needed to serve a CR request.
+///
+/// `Clone` is cheap: `schema` is an `Arc`, and every other field is a short string, bool, or
+/// small `Vec` — this is what lets `find_crd` hand a cached instance to concurrent requests
+/// without deep-cloning the (potentially large) `openAPIV3Schema` on every one.
+#[derive(Clone)]
 pub struct CrContext {
     pub kind: String,
     pub namespaced: bool,
@@ -170,8 +175,10 @@ pub struct CrContext {
     /// the `/status` subresource endpoint is active.
     pub has_status_subresource: bool,
     /// The `openAPIV3Schema` from the matched version's schema field, if present.
-    /// Used for server-side CR body validation on CREATE and UPDATE.
-    pub schema: Option<serde_json::Value>,
+    /// Used for server-side CR body validation on CREATE and UPDATE. `Arc`-wrapped so a
+    /// `find_crd` cache hit (see `state::CrContextCache`) shares this schema with every
+    /// concurrent request instead of deep-cloning it per request.
+    pub schema: Option<std::sync::Arc<serde_json::Value>>,
     /// Conversion configuration from the CRD spec. Present only when
     /// `spec.conversion.strategy == "Webhook"`.
     pub conversion_webhook_client_config: Option<serde_json::Value>,
@@ -214,12 +221,22 @@ pub struct CrScaleConfig {
 ///   Without 410, informers treat the response as a transient 404 and retry
 ///   indefinitely, causing namespace deletion to hang.
 /// - `Err(404 NotFound)` when the group/version/plural was never registered.
+///
+/// A hit on `state.cr_context_cache` (see that type's doc for the invalidation contract)
+/// skips the store list-scan and CRD re-parse below entirely. Only successful lookups are
+/// cached — a 404/410 is cheap (no list-scan match, or a single tombstone `get`) and caching
+/// it would need its own invalidation on CRD create, for no meaningful benefit.
 pub async fn find_crd<S: Store>(
     state: &AppState<S>,
     group: &str,
     version: &str,
     plural: &str,
 ) -> Result<CrContext, crate::status::StatusError> {
+    let cache_key = (group.to_string(), version.to_string(), plural.to_string());
+    if let Some(cached) = state.cr_context_cache.get(&cache_key) {
+        return Ok((*cached).clone());
+    }
+
     let prefix = CRD_LIST_PREFIX;
     let resp = state
         .store
@@ -250,12 +267,15 @@ pub async fn find_crd<S: Store>(
                 "Resource",
             ));
         };
-        // Extract openAPIV3Schema from the matched version's schema field.
+        // Extract openAPIV3Schema from the matched version's schema field. Arc-wrapped (see
+        // CrContext::schema's doc) so a cache hit below shares this schema instead of
+        // deep-cloning it.
         let schema = matched_version
             .schema
             .as_ref()
             .and_then(|s| s.get("openAPIV3Schema"))
-            .cloned();
+            .cloned()
+            .map(std::sync::Arc::new);
         // Selectable fields are declared per-version (see CrContext::selectable_fields) —
         // only the version this request named, never the whole CRD.
         let selectable_fields = matched_version
@@ -317,7 +337,7 @@ pub async fn find_crd<S: Store>(
             matched_version.name.clone(),
             crd.metadata.resource_version.clone(),
         );
-        return Ok(CrContext {
+        let ctx = CrContext {
             kind: crd.spec.names.kind.clone(),
             namespaced,
             has_status_subresource,
@@ -326,7 +346,11 @@ pub async fn find_crd<S: Store>(
             selectable_fields,
             schema_cache_key,
             scale,
-        });
+        };
+        state
+            .cr_context_cache
+            .insert(cache_key, std::sync::Arc::new(ctx.clone()));
+        return Ok(ctx);
     }
 
     // No live CRD found. Check whether this group was previously deleted.
@@ -757,7 +781,7 @@ fn validate_cr_schema(
     cache: &crate::state::CrSchemaCache,
     old_object: Option<&serde_json::Value>,
 ) -> Result<(), crate::status::StatusError> {
-    let Some(schema) = &ctx.schema else {
+    let Some(schema) = ctx.schema.as_deref() else {
         return Ok(());
     };
     // Defense in depth: CRD admission (crd.rs::validate_crd_schema) already rejects
@@ -2160,7 +2184,7 @@ pub async fn list_cr<S: Store>(
     )
     .await?;
 
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         for item in items.iter_mut() {
             apply_crd_schema_defaults(schema, item);
         }
@@ -2247,7 +2271,7 @@ pub async fn get_cr<S: Store>(
                 .pop()
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
             stamp_cr_envelope(&mut converted_obj, &group, &version, &ctx.kind);
-            if let Some(schema) = ctx.schema.as_ref() {
+            if let Some(schema) = ctx.schema.as_deref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
             }
             if pom {
@@ -2273,7 +2297,7 @@ pub async fn get_cr<S: Store>(
     }
 
     stamp_cr_envelope(&mut obj, &group, &version, &ctx.kind);
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
     // kcm's GC verifies owner references via metadata-only Get() calls
@@ -2323,12 +2347,12 @@ pub async fn create_cr<S: Store>(
 
     let warn_header = apply_cr_field_validation(
         &mut obj,
-        ctx.schema.as_ref(),
+        ctx.schema.as_deref(),
         field_validation_mode(&headers).as_deref(),
         false,
     )?;
 
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
@@ -2353,7 +2377,7 @@ pub async fn create_cr<S: Store>(
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
-    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+    prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
     // Dry-run: validation and admission passed; return the would-be created object without
     // persisting — mirrors create_resource's dry-run early-return in resource.rs.
@@ -2514,7 +2538,7 @@ pub async fn replace_cr<S: Store>(
         }
     }
 
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
@@ -2558,7 +2582,7 @@ pub async fn replace_cr<S: Store>(
          state, not a stray object — otherwise oldSelf/immutability checks compare unrelated UIDs"
     );
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
-    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+    prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
     // Dry-run: validation and admission passed; return the would-be replaced object without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -2860,7 +2884,7 @@ pub async fn delete_collection_cr<S: Store>(
         &desired_api_version,
     )
     .await?;
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         for item in filter_view.iter_mut() {
             apply_crd_schema_defaults(schema, item);
         }
@@ -3130,7 +3154,7 @@ pub async fn list_cr_namespaced<S: Store>(
     )
     .await?;
 
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         for item in items.iter_mut() {
             apply_crd_schema_defaults(schema, item);
         }
@@ -3217,7 +3241,7 @@ pub async fn get_cr_namespaced<S: Store>(
                 .pop()
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
             stamp_cr_envelope(&mut converted_obj, &group, &version, &ctx.kind);
-            if let Some(schema) = ctx.schema.as_ref() {
+            if let Some(schema) = ctx.schema.as_deref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
             }
             if pom {
@@ -3243,7 +3267,7 @@ pub async fn get_cr_namespaced<S: Store>(
     }
 
     stamp_cr_envelope(&mut obj, &group, &version, &ctx.kind);
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
     // kcm's GC verifies owner references via metadata-only Get() calls
@@ -3293,12 +3317,12 @@ pub async fn create_cr_namespaced<S: Store>(
 
     let warn_header = apply_cr_field_validation(
         &mut obj,
-        ctx.schema.as_ref(),
+        ctx.schema.as_deref(),
         field_validation_mode(&headers).as_deref(),
         false,
     )?;
 
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
@@ -3324,7 +3348,7 @@ pub async fn create_cr_namespaced<S: Store>(
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
-    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+    prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
     // ResourceQuota: ensure object count does not exceed hard limits (e.g. `count/<crd>.<group>`).
     // Custom resources went through admission webhooks above but were never checked against
@@ -3508,7 +3532,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         }
     }
 
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
@@ -3553,7 +3577,7 @@ pub async fn replace_cr_namespaced<S: Store>(
          state, not a stray object — otherwise oldSelf/immutability checks compare unrelated UIDs"
     );
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
-    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+    prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
     // Dry-run: validation and admission passed; return the would-be replaced object without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -3766,7 +3790,7 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
         &desired_api_version,
     )
     .await?;
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         for item in filter_view.iter_mut() {
             apply_crd_schema_defaults(schema, item);
         }
@@ -3885,12 +3909,12 @@ pub async fn patch_cr<S: Store>(
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
-            ctx.schema.as_ref(),
+            ctx.schema.as_deref(),
             field_validation.as_deref(),
             is_ssa,
         )?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
-        if let Some(schema) = ctx.schema.as_ref() {
+        if let Some(schema) = ctx.schema.as_deref() {
             apply_crd_schema_defaults(schema, &mut obj);
         }
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
@@ -3911,7 +3935,7 @@ pub async fn patch_cr<S: Store>(
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
-        prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+        prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
         // Dry-run: validation and admission passed; return the would-be created object
         // without persisting — mirrors create_cr's dry-run early-return.
@@ -3973,7 +3997,7 @@ pub async fn patch_cr<S: Store>(
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
         }
         crate::handlers::json_patch::PatchType::StrategicMerge => {
-            crate::patch::strategic_merge_patch_for_cr(&mut obj, &patch, ctx.schema.as_ref())
+            crate::patch::strategic_merge_patch_for_cr(&mut obj, &patch, ctx.schema.as_deref())
                 .map_err(|e| Status::bad_request(e.to_string()))?;
         }
         crate::handlers::json_patch::PatchType::Merge => {
@@ -3991,12 +4015,12 @@ pub async fn patch_cr<S: Store>(
 
     let warn_header = apply_cr_field_validation(
         &mut obj,
-        ctx.schema.as_ref(),
+        ctx.schema.as_deref(),
         field_validation.as_deref(),
         is_ssa,
     )?;
 
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
@@ -4042,7 +4066,7 @@ pub async fn patch_cr<S: Store>(
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
-    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+    prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
     // Dry-run: validation and admission passed; return the would-be patched object without
     // persisting — mirrors do_patch's dry-run early-return in resource.rs.
@@ -4112,7 +4136,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
-            ctx.schema.as_ref(),
+            ctx.schema.as_deref(),
             field_validation.as_deref(),
             is_ssa,
         )?;
@@ -4123,7 +4147,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             meta.namespace = Some(ns.clone());
             obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
         }
-        if let Some(schema) = ctx.schema.as_ref() {
+        if let Some(schema) = ctx.schema.as_deref() {
             apply_crd_schema_defaults(schema, &mut obj);
         }
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
@@ -4144,7 +4168,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
-        prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+        prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
         // Dry-run: validation and admission passed; return the would-be created object
         // without persisting — mirrors create_cr_namespaced's dry-run early-return.
@@ -4221,7 +4245,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
         }
         crate::handlers::json_patch::PatchType::StrategicMerge => {
-            crate::patch::strategic_merge_patch_for_cr(&mut obj, &patch, ctx.schema.as_ref())
+            crate::patch::strategic_merge_patch_for_cr(&mut obj, &patch, ctx.schema.as_deref())
                 .map_err(|e| Status::bad_request(e.to_string()))?;
         }
         crate::handlers::json_patch::PatchType::Merge => {
@@ -4239,12 +4263,12 @@ pub async fn patch_cr_namespaced<S: Store>(
 
     let warn_header = apply_cr_field_validation(
         &mut obj,
-        ctx.schema.as_ref(),
+        ctx.schema.as_deref(),
         field_validation.as_deref(),
         is_ssa,
     )?;
 
-    if let Some(schema) = ctx.schema.as_ref() {
+    if let Some(schema) = ctx.schema.as_deref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
@@ -4290,7 +4314,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
-    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+    prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
     // Dry-run: validation and admission passed; return the would-be patched object without
     // persisting — mirrors do_patch's dry-run early-return in resource.rs.
@@ -8636,7 +8660,7 @@ mod tests {
             kind: "Test".into(),
             namespaced: false,
             has_status_subresource: false,
-            schema: Some(schema),
+            schema: Some(std::sync::Arc::new(schema)),
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("test".into(), "v1".into(), "0".into()),
@@ -8771,7 +8795,7 @@ mod tests {
             kind: "Test".into(),
             namespaced: false,
             has_status_subresource: false,
-            schema: Some(schema),
+            schema: Some(std::sync::Arc::new(schema)),
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
@@ -8820,7 +8844,7 @@ mod tests {
             kind: "Test".into(),
             namespaced: false,
             has_status_subresource: false,
-            schema: Some(schema),
+            schema: Some(std::sync::Arc::new(schema)),
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
@@ -8886,7 +8910,7 @@ mod tests {
             kind: "Test".into(),
             namespaced: false,
             has_status_subresource: false,
-            schema: Some(schema.clone()),
+            schema: Some(std::sync::Arc::new(schema.clone())),
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), rv.into()),
@@ -8993,6 +9017,172 @@ mod tests {
             "deleting a CRD must evict its compiled schema from the cache — otherwise the map \
              grows by one entry per CRD generation forever, even for CRDs that can never be \
              looked up again"
+        );
+    }
+
+    // The actual perf fix this cache exists for: without it, every single CR request re-runs
+    // find_crd's O(CRD-count) store list-scan and re-parses every CRD into a
+    // CustomResourceDefinition, even when nothing about the CRD changed between requests. A
+    // miss-count (not a timing assertion — real store list-scans are fast enough in tests that
+    // timing would be flaky) so a regression that reintroduces the scan on every call is caught
+    // even under a small/fast test store.
+    #[tokio::test]
+    async fn find_crd_reuses_cached_context_across_repeated_lookups_of_unchanged_crd() {
+        let state = make_state();
+        use crate::handlers::crd;
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                crd_bytes,
+            )
+            .await
+            .is_ok(),
+            "install CRD"
+        );
+
+        for _ in 0..5 {
+            find_crd(&state, "example.io", "v1", "widgets")
+                .await
+                .expect("CRD must be found");
+        }
+
+        assert_eq!(
+            state.cr_context_cache.miss_count(),
+            1,
+            "5 lookups of the same unchanged CRD must rebuild the CrContext (a fresh store \
+             list-scan + CRD parse) only once — a regression here reintroduces an \
+             O(CRD-count) list-scan and parse on every single CR request"
+        );
+    }
+
+    // Regression guard for this cache's one correctness risk (see CrContextCache's doc): a
+    // lookup key with no resourceVersion component cannot self-verify freshness, so
+    // crd::replace_crd's invalidation is the ONLY thing standing between a schema update and a
+    // stale cache serving the pre-update schema forever. If that invalidation regresses, this
+    // test fails because a CR body the new schema requires (color) would still validate
+    // against the cached old schema — silently letting invalid data through right after an
+    // operator tightened the schema specifically to reject it.
+    #[tokio::test]
+    async fn find_crd_serves_updated_schema_after_crd_replace_not_the_stale_cached_one() {
+        let state = make_state();
+        use crate::handlers::crd;
+
+        let crd_with_schema = |color_required: bool| {
+            let required: Vec<&str> = if color_required {
+                vec!["color"]
+            } else {
+                vec![]
+            };
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "CustomResourceDefinition",
+                    "metadata": { "name": "widgets.example.io" },
+                    "spec": {
+                        "group": "example.io",
+                        "names": {
+                            "plural": "widgets",
+                            "singular": "widget",
+                            "kind": "Widget",
+                            "listKind": "WidgetList"
+                        },
+                        "scope": "Namespaced",
+                        "versions": [{
+                            "name": "v1",
+                            "served": true,
+                            "storage": true,
+                            "schema": {
+                                "openAPIV3Schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "spec": {
+                                            "type": "object",
+                                            "properties": { "color": { "type": "string" } },
+                                            "required": required
+                                        }
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+        };
+
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                crd_with_schema(false),
+            )
+            .await
+            .is_ok(),
+            "install CRD where spec.color is optional"
+        );
+
+        // Warm the cache under the pre-update schema — this is the entry the replace below
+        // must invalidate.
+        let ctx = find_crd(&state, "example.io", "v1", "widgets")
+            .await
+            .expect("CRD must be found right after installing it");
+        assert!(
+            validate_cr_schema(
+                &serde_json::json!({ "spec": {} }),
+                &ctx,
+                &state.cr_schema_cache,
+                None
+            )
+            .is_ok(),
+            "sanity check: spec.color must be optional under the original schema"
+        );
+
+        crd::replace_crd(
+            State(state.clone()),
+            Path("widgets.example.io".to_string()),
+            test_user(),
+            HeaderMap::new(),
+            crd_with_schema(true),
+        )
+        .await
+        .expect("replace_crd must succeed");
+
+        let ctx = find_crd(&state, "example.io", "v1", "widgets")
+            .await
+            .expect("CRD must still be found after replace");
+        assert!(
+            validate_cr_schema(
+                &serde_json::json!({ "spec": {} }),
+                &ctx,
+                &state.cr_schema_cache,
+                None
+            )
+            .is_err(),
+            "find_crd must return the UPDATED schema (color now required) after \
+             crd::replace_crd — a stale cached CrContext would still validate against the \
+             pre-update schema and let an invalid CR body through"
         );
     }
 
