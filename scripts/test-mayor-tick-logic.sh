@@ -1246,6 +1246,54 @@ assert "...and the tick exits with a normal in-contract code (not an unhandled e
   "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 21. Draft-PR skip in reconcile_missing_queue_entries specifically -- the
+#     sibling gap section 20 doesn't cover. gate_and_merge_prs's isDraft
+#     exclusion only stops a draft from reaching `gh pr merge`; it says
+#     nothing about reconcile's separate "no queue entry and no review yet"
+#     synth branch, which mfh0s's fix never touched. Observed live: a
+#     deliberately-held draft PR with no review kept getting synthesized
+#     into pending_reviews every tick, nagging the mayor about a PR nobody
+#     asked to be reviewed yet.
+# ---------------------------------------------------------------------------
+
+STUB_RECONCILE_DRAFT_BIN="$WORKDIR/stub-reconcile-draft-bin"
+mkdir -p "$STUB_RECONCILE_DRAFT_BIN"
+# One open worker PR (#5555), isDraft=true, with NO reviews at all -- the
+# exact shape that hits reconcile's "no review-queue entry and no
+# critical-reviewer review" synth branch if the draft check doesn't fire
+# first.
+cat > "$STUB_RECONCILE_DRAFT_BIN/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" view "* ]]; then
+  base='{"reviews":[]}'
+else
+  base='[{"number":5555,"url":"https://github.com/example/repo/pull/5555","headRefName":"worker/agent-draft-reconcile-test","mergeStateStatus":"CLEAN","statusCheckRollup":[],"isDraft":true}]'
+fi
+jq_filter=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--jq" ] && jq_filter="$a"
+  prev="$a"
+done
+if [ -n "$jq_filter" ]; then
+  printf '%s' "$base" | jq "$jq_filter"
+else
+  printf '%s' "$base"
+fi
+EOF
+cat > "$STUB_RECONCILE_DRAFT_BIN/bd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$STUB_RECONCILE_DRAFT_BIN/gh" "$STUB_RECONCILE_DRAFT_BIN/bd"
+
+run_full_tick "$STUB_RECONCILE_DRAFT_BIN"
+assert "a draft PR with no queue entry and no review is NOT synthesized into pending_reviews by reconcile -- a deliberately-held draft must not get nagged every tick" \
+  "$([ "$(jq -r '.pending_reviews | index(5555) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
+assert "...and reconcile never even logs the synthesizing message for it" \
+  "$(! printf '%s' "$TICK_OUT" | grep -q 'synthesizing pending_reviews entry' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

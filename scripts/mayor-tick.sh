@@ -782,12 +782,17 @@ surface_pending_review() {
 # the noclobber write below (_write_file_contents_if_absent) then lets only
 # the first one through instead of both writing distinct duplicate files.
 reconcile_missing_queue_entries() {
-  local prs_json n url reviews_json latest verdict body submitted_at commits_json queued_at qfile
-  prs_json=$(gh pr list --state open --json number,url,headRefName --jq \
+  local prs_json n url is_draft reviews_json latest verdict body submitted_at commits_json queued_at qfile
+  prs_json=$(gh pr list --state open --json number,url,headRefName,isDraft --jq \
     '[.[] | select(.headRefName | startswith("worker/agent-"))]' 2>/dev/null || echo '[]')
 
   for n in $(printf '%s' "$prs_json" | jq -r '.[].number' 2>/dev/null || true); do
     url=$(printf '%s' "$prs_json" | jq -r --argjson n "$n" '.[] | select(.number==$n) | .url')
+    is_draft=$(printf '%s' "$prs_json" | jq -r --argjson n "$n" '.[] | select(.number==$n) | .isDraft')
+    # Same exclusion as pr_gate_eligible's isDraft check above: a
+    # deliberately-held draft must not get nagged into pending_reviews
+    # every tick just because it lacks a queue entry or review yet.
+    [ "$is_draft" = "true" ] && continue
 
     pr_already_queued "$url" && continue
 
