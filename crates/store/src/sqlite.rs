@@ -277,7 +277,7 @@ fn schedule_idle_gc(
 /// a later lookup for the evicted key would otherwise see `find_reclaimed_horizon` return 0 ("no
 /// horizon known") and wrongly treat a from_revision that really is stale as already caught up,
 /// silently skipping every event it should have replayed. Folding into the atomic rather than a
-/// parent map key (the design PR #1556 tried three times) is what makes this insert
+/// parent map key (an earlier design tried and abandoned) is what makes this insert
 /// structurally always net -1 on `entries` when over cap, with no cap re-check needed: the fold
 /// destination can never itself be a novel key that leaves the map still over cap.
 ///
@@ -343,7 +343,7 @@ fn parent_prefix(prefix: &str) -> Option<String> {
 /// `find_reclaimed_horizon` always has a valid, monotonically non-decreasing lower bound to fall
 /// back to for ANY evicted prefix, regardless of its shape (resource-type root, childless root,
 /// or namespace child) — no per-shape special-casing needed, unlike the fold-to-a-parent-map-key
-/// design this replaced (PR #1556), whose fold target was itself just another map key subject to
+/// design this replaced, whose fold target was itself just another map key subject to
 /// the same unbounded-growth problem one tier up.
 #[derive(Default)]
 pub(crate) struct ReclaimedHorizons {
@@ -854,18 +854,26 @@ fn push_event_locked(
 /// this is the one place that can correctly cover both origins with a single grace-period check.
 ///
 /// A brand-new shard's `horizon` is seeded from `reclaimed_horizons`, not always 0: if this exact
-/// key was torn down earlier (idle-GC) and is only now being recreated, the discarded history
-/// behind it must not be forgotten just because a live shard object exists again — otherwise a
-/// watch that resolves this freshly (re)created shard would see `horizon == 0` and wrongly treat
-/// every from_revision as caught up. Consuming (removing) the entry here is what keeps
-/// `reclaimed_horizons` from growing forever for a resource type that keeps getting
-/// reclaimed-then-reused: once its floor is baked into the live shard's own `horizon` field, the
-/// side entry no longer carries information the live shard doesn't already have.
+/// key — or its shard-root parent, per `find_reclaimed_horizon`'s one-hop rule — was torn down
+/// earlier (idle-GC) and is only now being recreated, the discarded history behind it must not be
+/// forgotten just because a live shard object exists again. This matters even when `shard` itself
+/// was NEVER torn down before: a namespace-scoped CHILD watch's first-ever open creates a shard
+/// keyed to the child prefix, and if its resource-type ROOT was torn down earlier with a real
+/// floor still sitting in `entries` (not yet evicted past the cap), that floor is exactly as
+/// applicable to the child as it would be to a reconnect on the root itself — skipping the
+/// parent-hop here would seed the child's `horizon` at 0, and `compaction_horizon_for` reads a
+/// LIVE shard's own `horizon` field directly (see that method's doc), so once seeded wrong it
+/// stays wrong for this shard's entire lifetime: every from_revision would be wrongly treated as
+/// caught up, silently skipping every event that really was discarded.
 ///
-/// Falls back to `overflow.load()`, NOT `unwrap_or(0)`, when the exact entry is already gone: an
-/// abandoned prefix's entry can age out of `entries`' cap (see `preserve_reclaimed_horizon`)
-/// before it is ever recreated, and seeding horizon 0 in that case would under-report exactly
-/// like a map-miss at lookup time would.
+/// Uses `find_reclaimed_horizon` for the lookup — the exact same exact/parent/overflow chain
+/// `compaction_horizon_for` falls back to for a shard that doesn't exist at all — so the two can
+/// never drift apart on what floor a given prefix is entitled to. Only the EXACT entry (never a
+/// matched parent entry, which may still be relevant to a sibling or the root itself) is then
+/// removed: consuming it here is what keeps `reclaimed_horizons` from growing forever for a
+/// resource type that keeps getting reclaimed-then-reused, since once its floor is baked into the
+/// live shard's own `horizon` field, the side entry no longer carries information the live shard
+/// doesn't already have.
 fn get_or_create_shard(
     shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
     reclaimed_horizons: &Arc<RwLock<ReclaimedHorizons>>,
@@ -882,9 +890,9 @@ fn get_or_create_shard(
         let mut rh = reclaimed_horizons
             .write()
             .expect("reclaimed_horizons poisoned");
-        rh.entries
-            .remove(shard)
-            .unwrap_or_else(|| rh.overflow.load(Ordering::Relaxed))
+        let seeded = find_reclaimed_horizon(&rh, shard);
+        rh.entries.remove(shard);
+        seeded
     };
     let created = Arc::new(RingShard::new());
     created.horizon.store(seeded_horizon, Ordering::Relaxed);
@@ -1000,9 +1008,13 @@ fn find_shard_key(
         .map(|(shard, ring)| (shard.clone(), Arc::clone(ring)))
 }
 
-/// The fallback `compaction_horizon_for` consults when no LIVE shard matches `prefix`. Three O(1)
-/// steps, replacing the old `.iter().filter(starts_with).max_by_key` linear scan that used to run
-/// on every watch-open (`watch.rs`'s pre-watch 410 check):
+/// The fallback `compaction_horizon_for` consults when no LIVE shard matches `prefix`, and the
+/// lookup `get_or_create_shard` shares to seed a brand-new shard's `horizon` field (see that
+/// function's doc for why sharing this exact chain, rather than duplicating a subset of it,
+/// matters) — both need the same answer to "what floor is `prefix` entitled to right now", and
+/// only ONE of them consumes (removes) what it finds. Three O(1) steps, replacing the old
+/// `.iter().filter(starts_with).max_by_key` linear scan that used to run on every watch-open
+/// (`watch.rs`'s pre-watch 410 check):
 /// 1. Exact match on `prefix` itself.
 /// 2. Exact match on `parent_prefix(prefix)` (the one-level-up shard root) — see that function's
 ///    doc for why one hop is always enough.
@@ -6019,7 +6031,7 @@ mod tests {
     /// seen before must still get a correct, nonzero floor.
     ///
     /// Why it matters: this is exactly the shape that broke every prior fold-to-a-parent-map-key
-    /// design (PR #1556, three times). Each root here also gets its OWN unique group segment, so
+    /// design (three attempts). Each root here also gets its OWN unique group segment, so
     /// its `parent_prefix` fold target is a NOVEL key every single time — under a design that
     /// folds an evicted victim into that parent key, an unconditional insert of a novel key
     /// leaves the map's net size unchanged (not -1), so it never shrinks back under the cap. This
@@ -6027,7 +6039,7 @@ mod tests {
     /// never be a "novel key" the map has to grow to hold.
     ///
     /// Fails on revert: reverting `preserve_reclaimed_horizon`'s fold-to-atomic back to
-    /// fold-to-parent-map-key (PR #1556 round 3's shape) leaves `entries.len()` growing by
+    /// fold-to-parent-map-key (the prior design's shape) leaves `entries.len()` growing by
     /// roughly one per churned root below instead of staying capped, which the length assertion
     /// catches. Reverting to a cap that discards instead of folds makes `horizon` below come back
     /// as 0 and the final reconnect get a live stream instead of `Compacted`.
@@ -6057,7 +6069,7 @@ mod tests {
             "reclaimed_horizons.entries must stay bounded even when every evicted victim's \
              parent_prefix fold target is a novel key — {churn} torn-down childless roots left \
              {len} entries behind, which is unbounded growth by another name (this is the exact \
-             shape that broke PR #1556's fold-to-parent-key design)"
+             shape that broke the prior fold-to-parent-key design)"
         );
 
         let evicted_root = "/registry/group-0/root-churn-0/";
@@ -6102,6 +6114,59 @@ mod tests {
                  history at all. Got: {other:?}"
             ),
         }
+    }
+
+    /// A namespace-scoped CHILD shard created for the first time AFTER its all-namespaces ROOT
+    /// sibling was torn down (with a real, un-evicted floor still sitting in
+    /// `reclaimed_horizons.entries`) must inherit that floor at creation — not seed 0 — because
+    /// `compaction_horizon_for` reads a LIVE shard's own `horizon` field directly once the shard
+    /// exists (see that method's doc), never consulting `reclaimed_horizons` again for the rest
+    /// of that shard's life.
+    ///
+    /// Why it matters: a shard seeded at 0 tells every future reconnect on that namespace it is
+    /// already caught up regardless of how stale its `from_revision` really is — the exact
+    /// silent event loss `reclaimed_horizons` exists to prevent, just triggered by the ONE path
+    /// (shard creation, not lookup) that used a narrower exact-match-only chain than
+    /// `find_reclaimed_horizon`'s own exact/parent/overflow chain.
+    ///
+    /// Fails on revert: reverting `get_or_create_shard`'s reseed to exact-match-then-overflow
+    /// (skipping the one parent hop) makes `horizon` below come back as 0 instead of the root's
+    /// true floor of 100, since neither the exact child key nor `overflow` (never bumped here —
+    /// the root's single entry never exceeded the cap) carries it.
+    #[tokio::test]
+    async fn get_or_create_shard_reseeds_child_from_torn_down_root_parent_entry() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let root = "/registry/core/widgets/";
+        let child = "/registry/core/widgets/default/";
+
+        // A real, nonzero floor whose entry survives (the cap is 4096, and this is the only
+        // entry ever inserted) — exactly the "un-evicted parent record" shape the review
+        // reproduced, ruling out the already-correct overflow fallback from covering for a
+        // missing parent hop here.
+        store.set_compaction_horizon_for_test(root, 100);
+        tear_down_shard(&store.shards, &store.reclaimed_horizons, root);
+
+        // from_revision=0 means "no history claimed" (see `watch()`'s own doc), so this always
+        // opens live rather than 410ing — the shard for `child` is created for the first time
+        // right here, via `get_or_create_shard`'s reseed path. The returned stream must be kept
+        // alive: dropping it would release `ShardWatcherGuard` and let idle-GC race the
+        // assertion below.
+        let watch = store
+            .watch(child, 0)
+            .await
+            .expect("fresh watch with from_revision=0 must always open live, never 410");
+
+        let horizon = store.compaction_horizon_for(child);
+        assert!(
+            horizon >= 100,
+            "child's own resource-type root was torn down with a real floor of 100 that is \
+             still an un-evicted entry in reclaimed_horizons — the child shard's reseed must \
+             recover it via the same parent-hop find_reclaimed_horizon uses, not silently seed \
+             0 and tell every future reconnect on this namespace it is already caught up. \
+             Got horizon={horizon}"
+        );
+
+        drop(watch);
     }
 
     /// A shard idle-GC teardown racing against a concurrent write to the same prefix must never
