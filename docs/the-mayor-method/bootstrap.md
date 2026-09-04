@@ -119,8 +119,12 @@ The canonical loop bodies live in `dispatch-prompt-template.md` and prior
 session output; paste verbatim or adapt as needed.
 
 **Mayor tick loop body (mayor-zhwjg) — GitHub Merge Queue is active on
-this repo.** The main-branch ruleset (18156794) requires 5 status checks
-(lint, test-coverage, fmt, e2e-focus 1.36.4, script-tests), enforced.
+this repo.** The main-branch ruleset (18156794) requires 6 status checks
+(lint, test-coverage, fmt, e2e-focus 1.36.4, sensitive-e2e-guard 1.36.4,
+script-tests), enforced. (sensitive-e2e-guard 1.36.4 — the CI home of the
+sensitive-conformance --focus gate, moved off the local Lima pre-push hook in
+mayor-8r5lp / PR #1562 — joins the required set once it is confirmed green on
+main; until that ruleset edit lands the enforced set is the other five.)
 `strict_required_status_checks_policy` is deliberately `false` — the
 project moved to a GitHub org specifically to get merge queues and escape
 the up-to-date-branch treadmill, and the queue is why that requirement is
