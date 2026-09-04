@@ -494,7 +494,7 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
         }
         let key = conversion_cache_key(item, desired_api_version);
         if let Some(cached) = key.as_ref().and_then(|k| state.cr_conversion_cache.get(k)) {
-            *item = (*cached).clone();
+            *item = cached;
             continue;
         }
         pending.push(i);
@@ -540,9 +540,7 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
                 leader_indices.into_iter().zip(converted).zip(leader_keys)
             {
                 if let Some(k) = key {
-                    state
-                        .cr_conversion_cache
-                        .resolve(&k, Some(std::sync::Arc::new(converted_item.clone())));
+                    state.cr_conversion_cache.resolve(&k, Some(&converted_item));
                 }
                 items[i] = converted_item;
             }
@@ -552,7 +550,7 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
         for (i, key, notified) in waiters {
             notified.await;
             match state.cr_conversion_cache.get(&key) {
-                Some(cached) => items[i] = (*cached).clone(),
+                Some(cached) => items[i] = cached,
                 None => pending.push(i),
             }
         }
@@ -14011,17 +14009,17 @@ mod tests {
         // this write.
         state.cr_conversion_cache.insert(
             (rv.clone(), "example.io/v2".to_string()),
-            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+            &serde_json::json!({"apiVersion": "example.io/v2"}),
         );
         state.cr_conversion_cache.insert(
             (rv.clone(), "example.io/v3".to_string()),
-            Arc::new(serde_json::json!({"apiVersion": "example.io/v3"})),
+            &serde_json::json!({"apiVersion": "example.io/v3"}),
         );
         // An entry under a DIFFERENT rv (a different write) must survive this delete —
         // eviction must be scoped to the deleted object's own rv, not a blanket clear.
         state.cr_conversion_cache.insert(
             ("999".to_string(), "example.io/v2".to_string()),
-            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+            &serde_json::json!({"apiVersion": "example.io/v2"}),
         );
 
         delete_cr(
@@ -14100,13 +14098,13 @@ mod tests {
         // What a watcher of a different served version would have cached for the create.
         state.cr_conversion_cache.insert(
             (old_rv.clone(), "example.io/v2".to_string()),
-            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+            &serde_json::json!({"apiVersion": "example.io/v2"}),
         );
         // An entry under a DIFFERENT rv (a different write) must survive this update —
         // eviction must be scoped to the superseded rv only, never a blanket clear.
         state.cr_conversion_cache.insert(
             ("999".to_string(), "example.io/v2".to_string()),
-            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+            &serde_json::json!({"apiVersion": "example.io/v2"}),
         );
 
         let update_body = Bytes::from(
@@ -14183,7 +14181,7 @@ mod tests {
 
         state.cr_conversion_cache.insert(
             (old_rv.clone(), "example.io/v2".to_string()),
-            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+            &serde_json::json!({"apiVersion": "example.io/v2"}),
         );
 
         let patch_body =
@@ -14292,15 +14290,15 @@ mod tests {
 
         state.cr_conversion_cache.insert(
             ("10".to_string(), "multiver.example.com/v1".to_string()),
-            Arc::new(serde_json::json!({"apiVersion": "multiver.example.com/v1"})),
+            &serde_json::json!({"apiVersion": "multiver.example.com/v1"}),
         );
         state.cr_conversion_cache.insert(
             ("10".to_string(), "multiver.example.com/v2".to_string()),
-            Arc::new(serde_json::json!({"apiVersion": "multiver.example.com/v2"})),
+            &serde_json::json!({"apiVersion": "multiver.example.com/v2"}),
         );
         state.cr_conversion_cache.insert(
             ("20".to_string(), "other.example.com/v1".to_string()),
-            Arc::new(serde_json::json!({"apiVersion": "other.example.com/v1"})),
+            &serde_json::json!({"apiVersion": "other.example.com/v1"}),
         );
 
         crd::delete_crd(
@@ -14745,7 +14743,7 @@ mod tests {
         });
         state
             .cr_conversion_cache
-            .insert(key.clone(), std::sync::Arc::new(pre_converted.clone()));
+            .insert(key.clone(), &pre_converted);
 
         let mut items = vec![serde_json::json!({
             "apiVersion": "example.io/v1",

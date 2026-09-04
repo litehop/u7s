@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -459,6 +459,20 @@ impl CrSchemaCache {
 /// exactly one webhook-converted CR body.
 pub type CrConversionCacheKey = (String, String);
 
+struct CrConversionCacheState {
+    /// Serialized (not parsed) conversion result — see `CrConversionCache`'s doc for why
+    /// bytes rather than a live `Value` tree.
+    map: HashMap<CrConversionCacheKey, Arc<Vec<u8>>>,
+    /// Insertion-order queue used only to pick an eviction victim once `map` is at
+    /// capacity — same FIFO-not-LRU tradeoff as `SigCache`'s `order` field (see that
+    /// module's doc for why insertion order is sufficient here). Every removal path
+    /// (`invalidate`, `invalidate_by_rv`, `invalidate_by_target_api_versions`, and the
+    /// eviction loop itself) keeps this in exact sync with `map` so it can never grow
+    /// past `map`'s own size — otherwise this queue would just relocate the unbounded
+    /// growth this cache exists to fix, rather than close it.
+    order: VecDeque<CrConversionCacheKey>,
+}
+
 /// Cache of CR conversion webhook results, so a cross-version conversion runs once per
 /// (write, target version) instead of once per LIST request or watcher that happens to
 /// observe that write.
@@ -475,8 +489,23 @@ pub type CrConversionCacheKey = (String, String);
 /// group+version): the never-reused rv means a stale entry can never be served for a
 /// different write, so `invalidate` exists purely so a future eviction pass (memory
 /// hygiene, not correctness) has something to call.
+///
+/// Values are stored pre-serialized (`Vec<u8>` of the JSON body) rather than as a parsed
+/// `Value` tree: `serde_json::Value`'s per-node overhead (enum tag + Vec/Map allocations
+/// per nested field) runs roughly 10x the wire size, so caching the parsed form at CR-list
+/// scale (thousands of live CRs times a handful of served target versions) projects to
+/// gigabytes where the serialized form is a few hundred MB. It also means a hit
+/// (`get`) hands back a freshly-deserialized, independently-owned `Value` with no clone of
+/// a cached tree required, and an insert (`insert`/`resolve`) serializes from a borrow
+/// instead of deep-cloning the caller's `Value` just to hand a copy to the cache.
+///
+/// `map` is bounded at `DEFAULT_CAPACITY` entries with FIFO eviction (`order`) — unlike
+/// `CrSchemaCache`/`ReclaimedHorizons`-style caches, a `CrConversionCache` miss is always
+/// safe to fall back on (`convert_cr_list_items` just re-invokes the conversion webhook),
+/// so there is no correctness reason to keep an entry alive past its eviction turn.
 pub struct CrConversionCache {
-    inner: RwLock<HashMap<CrConversionCacheKey, Arc<serde_json::Value>>>,
+    capacity: usize,
+    inner: RwLock<CrConversionCacheState>,
     /// Single-flight registry: while a key has an entry here, some caller has already
     /// claimed it via `claim` and is computing its conversion. Concurrent callers that
     /// hit the same cold key join that one computation (`claim` returns `Follow`) instead
@@ -497,23 +526,66 @@ pub enum ConversionClaim {
 }
 
 impl CrConversionCache {
+    /// 5x headroom over a single CRD's worth of served-version fanout at the CR-churn rates
+    /// observed so far (see the bead's 10k-CR/2-target-version projection): bounds this
+    /// cache's resident size independent of live-CR count, at the cost of a re-conversion
+    /// webhook call on an evicted key's next request — see the struct doc for why that
+    /// fallback is always safe here.
+    const DEFAULT_CAPACITY: usize = 4096;
+
     pub fn new() -> Self {
+        Self::new_with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    /// `pub(crate)` (rather than test-gated) so a capacity-bound regression test can
+    /// exercise eviction with a small cap instead of inserting `DEFAULT_CAPACITY` entries
+    /// first.
+    pub(crate) fn new_with_capacity(capacity: usize) -> Self {
         CrConversionCache {
-            inner: RwLock::new(HashMap::new()),
+            capacity: capacity.max(1),
+            inner: RwLock::new(CrConversionCacheState {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn get(&self, key: &CrConversionCacheKey) -> Option<Arc<serde_json::Value>> {
-        self.inner.read().unwrap().get(key).cloned()
+    /// Returns the cached conversion result, freshly deserialized from the stored bytes —
+    /// an owned `Value` with no cached tree to clone (see struct doc).
+    pub fn get(&self, key: &CrConversionCacheKey) -> Option<serde_json::Value> {
+        let bytes = self.inner.read().unwrap().map.get(key).cloned()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
-    pub fn insert(&self, key: CrConversionCacheKey, value: Arc<serde_json::Value>) {
-        self.inner.write().unwrap().insert(key, value);
+    pub fn insert(&self, key: CrConversionCacheKey, value: &serde_json::Value) {
+        self.insert_bytes(key, serde_json::to_vec(value).unwrap_or_default());
+    }
+
+    /// Insert already-serialized bytes and, if this pushed `map` over `capacity`, evict the
+    /// oldest-inserted entries until back at capacity. `order` is kept in exact sync with
+    /// `map` by every removal path, so `pop_front` here always names a key still present in
+    /// `map` — no stale-entry bookkeeping needed.
+    fn insert_bytes(&self, key: CrConversionCacheKey, bytes: Vec<u8>) {
+        let mut state = self.inner.write().unwrap();
+        if !state.map.contains_key(&key) {
+            state.order.push_back(key.clone());
+        }
+        state.map.insert(key, Arc::new(bytes));
+        while state.map.len() > self.capacity {
+            match state.order.pop_front() {
+                Some(oldest) => {
+                    state.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
     }
 
     pub fn invalidate(&self, key: &CrConversionCacheKey) {
-        self.inner.write().unwrap().remove(key);
+        let mut state = self.inner.write().unwrap();
+        state.map.remove(key);
+        state.order.retain(|k| k != key);
     }
 
     /// Attempt to become the single leader responsible for computing `key`. The
@@ -538,9 +610,9 @@ impl CrConversionCache {
     /// after this sees a hit; `None` (the leader's compute failed) releases the slot
     /// without caching anything, so every waiter wakes to a cache miss and must retry
     /// (re-`claim`) rather than block forever on a value that will never arrive.
-    pub fn resolve(&self, key: &CrConversionCacheKey, value: Option<Arc<serde_json::Value>>) {
+    pub fn resolve(&self, key: &CrConversionCacheKey, value: Option<&serde_json::Value>) {
         if let Some(v) = value {
-            self.inner.write().unwrap().insert(key.clone(), v);
+            self.insert_bytes(key.clone(), serde_json::to_vec(v).unwrap_or_default());
         }
         if let Some(notify) = self.in_flight.lock().unwrap().remove(key) {
             notify.notify_waiters();
@@ -551,27 +623,32 @@ impl CrConversionCache {
     /// bearing that resourceVersion is hard-deleted, since the never-reused rv means none
     /// of its entries can ever be looked up again. Memory hygiene only.
     pub fn invalidate_by_rv(&self, rv: &str) {
-        self.inner.write().unwrap().retain(|key, _| key.0 != rv);
+        let mut state = self.inner.write().unwrap();
+        state.map.retain(|key, _| key.0 != rv);
+        state.order.retain(|key| key.0 != rv);
     }
 
     /// Remove every entry whose target apiVersion is in `target_api_versions` — called
     /// after a CRD is deleted, since none of its served versions can ever be requested
     /// again. Memory hygiene only, same rationale as `invalidate_by_rv`.
     pub fn invalidate_by_target_api_versions(&self, target_api_versions: &HashSet<String>) {
-        self.inner
-            .write()
-            .unwrap()
+        let mut state = self.inner.write().unwrap();
+        state
+            .map
             .retain(|key, _| !target_api_versions.contains(&key.1));
+        state
+            .order
+            .retain(|key| !target_api_versions.contains(&key.1));
     }
 
     #[cfg(test)]
     pub(crate) fn contains(&self, key: &CrConversionCacheKey) -> bool {
-        self.inner.read().unwrap().contains_key(key)
+        self.inner.read().unwrap().map.contains_key(key)
     }
 
     #[cfg(test)]
     pub(crate) fn entry_count(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.read().unwrap().map.len()
     }
 
     #[cfg(test)]
@@ -1739,6 +1816,46 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression test for the other half of the CrConversionCache memory-growth bug (the
+    // namespace-cascade eviction gap has its own regression test in handlers/namespaces.rs):
+    // even with every eviction call site wired correctly, a cluster whose CRs are converted
+    // but never deleted/updated (or whose deletes lag behind churn) had no ceiling at all —
+    // the map grew with live-CR-count times served-target-versions forever. Without a
+    // capacity bound, this test's per-insert assertion would fail the moment entry_count
+    // exceeds the configured cap.
+    #[test]
+    fn cr_conversion_cache_entry_count_never_exceeds_configured_capacity_under_churn() {
+        let cache = CrConversionCache::new_with_capacity(2);
+        let v = serde_json::json!({"apiVersion": "example.io/v1"});
+
+        cache.insert(("1".to_string(), "example.io/v1".to_string()), &v);
+        cache.insert(("2".to_string(), "example.io/v1".to_string()), &v);
+        assert_eq!(
+            cache.entry_count(),
+            2,
+            "cache at capacity must hold both entries"
+        );
+
+        for i in 3..1000 {
+            cache.insert((i.to_string(), "example.io/v1".to_string()), &v);
+            assert!(
+                cache.entry_count() <= 2,
+                "cache must never grow past its configured capacity, even under sustained \
+                 CR-write churn — otherwise the cap is decorative and the unbounded-growth \
+                 bug this cache exists to fix is still reachable"
+            );
+        }
+
+        assert!(
+            !cache.contains(&("1".to_string(), "example.io/v1".to_string())),
+            "the oldest-inserted key must be the one evicted once capacity is exceeded"
+        );
+        assert!(
+            cache.contains(&("999".to_string(), "example.io/v1".to_string())),
+            "the most-recently-inserted key must survive its own insert"
+        );
+    }
 
     // A permanently-orphaned map entry for a deleted namespace isn't just a memory leak:
     // if a namespace of the same name is ever recreated, its quota-admission lock would
