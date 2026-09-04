@@ -100,3 +100,69 @@ jobs:
           focus: "RollingUpdateDeployment should delete old pods and create new ones|Kubectl logs logs should be able to retrieve and filter logs|Job should adopt matching orphans and release non-matching pods|ConfigMap should be consumable in multiple volumes in the same pod"
           expected_specs: "4"
           run_label: e2e-focus
+
+  # Guards known-recurring-regression files (.githooks/sensitive-conformance-focus.yaml)
+  # on CI instead of the local Lima pre-push hook -- the runner has no Lima
+  # usernet gateway, the failure class that made the local gate flaky. The job
+  # ALWAYS runs and ALWAYS reports (quick-succeeds when the diff touches no
+  # registered file), so it is safe to make a required check with no
+  # merge-queue skip deadlock.
+  sensitive-e2e-guard:
+    needs: build
+    runs-on: ubuntu-latest
+    # Same fail-fast budget as e2e-focus; the composite action bounds the
+    # sonobuoy step itself at 5 min.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        k8s: ["1.34.11", "1.35.8", "1.36.4"]
+    name: sensitive-e2e-guard ${{ matrix.k8s }}
+    steps:
+      # Full history so the detect step can diff the push/PR/merge-group range.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Detect sensitive-file diff
+        id: detect
+        # SHAs passed via env, never interpolated into the script body, so an
+        # attacker-controlled ref name can't inject shell.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request) RANGE="${PR_BASE}...${PR_HEAD}" ;;
+            merge_group)  RANGE="${MG_BASE}...${MG_HEAD}" ;;
+            push)
+              RANGE="${PUSH_BEFORE}..${PUSH_AFTER}"
+              # First push of a branch reports an all-zero "before" SHA.
+              case "$PUSH_BEFORE" in 0000000*) RANGE="HEAD^..HEAD" ;; esac
+              ;;
+            *) RANGE="HEAD^..HEAD" ;;
+          esac
+          echo "event=$EVENT_NAME range=$RANGE"
+          CHANGED=$(mktemp)
+          git diff --name-only "$RANGE" > "$CHANGED"
+          echo "--- changed files ---"
+          cat "$CHANGED"
+          echo "--- detector output ---"
+          scripts/sensitive-focus-for-diff.sh "$CHANGED" .githooks/sensitive-conformance-focus.yaml | tee -a "$GITHUB_OUTPUT"
+      - name: No sensitive file touched -- skipping sonobuoy
+        if: steps.detect.outputs.sensitive != 'true'
+        run: echo "No registered sensitive file in this diff; sensitive-e2e-guard passes without a sonobuoy run."
+      - name: Run sensitive-conformance focus
+        if: steps.detect.outputs.sensitive == 'true'
+        uses: ./.github/actions/e2e-focus-run
+        with:
+          k8s_version: ${{ matrix.k8s }}
+          focus: ${{ steps.detect.outputs.focus }}
+          expected_specs: ${{ steps.detect.outputs.expected_specs }}
+          run_label: sensitive-e2e-guard

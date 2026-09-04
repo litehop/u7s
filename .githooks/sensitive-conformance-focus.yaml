@@ -21,10 +21,16 @@
 #                does not parse or match on this field>
 #     focus: <sonobuoy --focus regex (ginkgo alternation syntax) that must
 #             PASS before a push touching `file` is allowed>
+#     specs: <exact number of specs `focus` runs -- asserted against ginkgo's
+#             "Ran N of" line so a typo or over-match in `focus` fails loud
+#             instead of silently guarding nothing. Declared explicitly (not
+#             inferred from `focus`'s alternation count) because one focus
+#             alternation may intentionally match several specs.>
 #
 # To register a newly-discovered recurring-regression function, copy an
-# entry below and fill in the three fields -- no code change required.
+# entry below and fill in the four fields -- no code change required.
 
 - file: crates/apiserver/src/handlers/pods.rs
   function: validate_pod_spec_immutable
   focus: "ReplicationController should release no longer matching pods|Job should adopt matching orphans and release non-matching pods"
+  specs: 2
