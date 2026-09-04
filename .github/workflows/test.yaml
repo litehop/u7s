@@ -156,6 +156,101 @@ jobs:
         working-directory: crates/servicelb
         run: cargo build --release
 
+  # Promoted from a throwaway zz-ebpf-ci-spike workflow (run 33882862825,
+  # 2026-09-04) that proved the whole Tier-1 smoke fixture -- load, verifier
+  # accept, attach, one real client->VIP->backend round trip -- runs natively
+  # on ubuntu-latest (amd64, no Lima/cross-build) in ~70s. Own job, not
+  # folded into ebpf-build above, since it exercises the loaded runtime
+  # (verifier + dataplane + eBPF map memory) rather than just compilation.
+  # Asserts total bytes_memlock across the servicelb maps stays under a
+  # gross-regression ceiling (measured today: ~21.5 KiB, ~45x headroom) --
+  # not a tight bound, just a tripwire for an accidental max_entries blow-up.
+  ebpf-memory-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+        with:
+          components: rust-src
+      # save-if: only main writes the shared cache; branches restore it read-only.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: crates/servicelb
+
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: bpf-linker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ubuntu-latest ships no bpftool; hash-verified prebuilt from
+      # libbpf/bpftool's own GitHub release (same trust pattern as
+      # taiki-e/install-action's own bpf-linker fetch above).
+      - name: Install bpftool
+        run: |
+          set -euo pipefail
+          cd /tmp
+          curl -sSLO https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz
+          curl -sSLO https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz.sha256sum
+          sha256sum -c bpftool-v7.7.0-amd64.tar.gz.sha256sum
+          sudo tar -xzf bpftool-v7.7.0-amd64.tar.gz -C /usr/local/bin bpftool
+          sudo chmod +x /usr/local/bin/bpftool
+          bpftool version
+
+      - name: Install netcat (round-trip backend responder)
+        run: sudo apt-get update -y && sudo apt-get install -y netcat-openbsd
+
+      - name: Build servicelb-ebpf + u7s-servicelb
+        working-directory: crates/servicelb
+        run: cargo build --release
+
+      - name: Run smoke fixture (loads real programs, drives one round trip, samples eBPF map memory + loader RSS)
+        run: |
+          sudo install -m 0755 crates/servicelb/target/release/u7s-servicelb /tmp/u7s-servicelb-smoke
+          sudo bash scripts/servicelb/smoke-remote.sh run
+
+      - name: Assert total eBPF map memory stays under the gross-regression ceiling
+        run: |
+          set -euo pipefail
+          csv=/tmp/servicelb-ebpf-memory/ebpf-map-memory.csv
+          [ -f "$csv" ] || { echo "FAIL: $csv not produced by smoke-remote.sh" >&2; exit 1; }
+          # Sum only the most recent tick's rows, not the whole file --
+          # smoke-remote.sh's `run` writes two ticks (before/after the round
+          # trip, often the same wall-clock second since the whole fixture
+          # completes in under one), so grouping by ts would double-count a
+          # same-second pair. Each tick emits exactly one row per unioned
+          # map id, and the map id set is stable for the run's one fixture
+          # load, so "how many unique map ids appear anywhere in the file"
+          # is exactly one tick's row count -- take that many rows off the
+          # end.
+          total=$(awk -F, '
+            NR>1 {
+              if (!($2 in ids)) { ids[$2]=1; n++ }
+              rows[NR]=$0; last=NR
+            }
+            END {
+              if (n=="" || n==0) { exit 1 }
+              sum=0
+              for (i=last-n+1; i<=last; i++) {
+                split(rows[i], f, ",")
+                sum += f[6]
+              }
+              print sum+0
+            }
+          ' "$csv")
+          echo "total bytes_memlock across the unioned map ids (latest tick): $total"
+          [ "$total" -gt 0 ] || { echo "FAIL: total bytes_memlock is 0 -- map discovery broken?" >&2; exit 1; }
+          limit=$((1024*1024))
+          [ "$total" -lt "$limit" ] || { echo "FAIL: total bytes_memlock ($total) >= 1 MiB gross-regression ceiling" >&2; exit 1; }
+
+      - name: Cleanup
+        if: always()
+        run: sudo bash scripts/servicelb/smoke-remote.sh cleanup
+
   # runs the whole suite _and_ checks coverage too
   test-coverage:
     runs-on: ubuntu-latest
