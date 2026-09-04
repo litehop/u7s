@@ -691,7 +691,7 @@ pub(crate) async fn create_pod<S: Store>(
     // set (a static/pre-scheduled pod) — most pods get their nodeName later, via bind_pod.
     state.node_graph.apply_pod(ns.as_str(), &name, &obj.body);
 
-    crate::quota::update_quota_status(&state, ns.as_str()).await;
+    crate::quota::record_pod_created(&state, ns.as_str(), &obj.body).await;
 
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
@@ -923,6 +923,14 @@ pub(crate) async fn replace_pod<S: Store>(
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
         state.node_graph.remove_pod(ns.as_str(), &name);
+        // Same per-namespace lock the create path holds across its check-then-write —
+        // without it here, this decrement can interleave with a concurrent
+        // create/delete/resize's read-modify-write of the same quota's status.used and lose
+        // an update. Dropped before maybe_finalize_terminating_namespace below, which may
+        // itself need this same namespace's lock while purging remaining pods.
+        let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
+        crate::quota::record_pod_removed(&state, ns.as_str(), &obj.body).await;
+        drop(_quota_lock);
         super::namespaces::maybe_finalize_terminating_namespace(&state, ns.as_str()).await;
         return Ok(Json(obj.body));
     }
@@ -1165,6 +1173,11 @@ pub(crate) async fn delete_collection_pods<S: Store>(
 
     for obj in resp.items {
         let mut soft_deleted = false;
+        // Captured only on the hard-delete branch below, so the incremental quota counter
+        // (record_pod_removed) can be adjusted for this pod once it's actually gone from the
+        // store — DeleteCollection previously never adjusted it at all, silently drifting
+        // status.used for every namespace-wide pod purge (e.g. OrderedNamespaceDeletion).
+        let mut hard_delete_pod: Option<serde_json::Value> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
             if let Some(ref pairs) = label_pairs {
                 let kept = super::generic::apply_label_selector(vec![parsed.clone()], pairs);
@@ -1236,6 +1249,8 @@ pub(crate) async fn delete_collection_pods<S: Store>(
                         .await;
                 }
                 soft_deleted = true;
+            } else {
+                hard_delete_pod = Some(parsed);
             }
         }
         if soft_deleted {
@@ -1249,6 +1264,15 @@ pub(crate) async fn delete_collection_pods<S: Store>(
         let _ = state.store.delete(&obj.key, None).await;
         if let Some(pod_name) = obj.key.rsplit('/').next() {
             state.node_graph.remove_pod(ns.as_str(), pod_name);
+        }
+        if let Some(pod) = hard_delete_pod {
+            // Same per-namespace lock the create path holds across its check-then-write —
+            // without it here, this decrement can interleave with a concurrent
+            // create/delete/resize's read-modify-write of the same quota's status.used and
+            // lose an update. Held per-pod rather than across the whole loop so a concurrent
+            // create in this namespace isn't blocked for the entire DeleteCollection.
+            let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
+            crate::quota::record_pod_removed(&state, ns.as_str(), &pod).await;
         }
     }
 
@@ -1369,7 +1393,12 @@ pub(crate) async fn delete_pod<S: Store>(
                 .map_err(|e| store_err_to_status(e, &name))?;
             state.node_graph.remove_pod(ns.as_str(), &name);
 
-            crate::quota::update_quota_status(&state, ns.as_str()).await;
+            // Same per-namespace lock the create path holds across its check-then-write —
+            // without it here, this decrement can interleave with a concurrent
+            // create/delete/resize's read-modify-write of the same quota's status.used and
+            // lose an update.
+            let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
+            crate::quota::record_pod_removed(&state, ns.as_str(), &obj.body).await;
 
             return Ok(Json(serde_json::json!({
                 "kind": "Status",
@@ -1565,6 +1594,14 @@ pub(crate) async fn patch_pod<S: Store>(
                 .await
                 .map_err(|e| store_err_to_status(e, &name))?;
             state.node_graph.remove_pod(ns.as_str(), &name);
+            // Same per-namespace lock the create path holds across its check-then-write —
+            // without it here, this decrement can interleave with a concurrent
+            // create/delete/resize's read-modify-write of the same quota's status.used and
+            // lose an update. Dropped before maybe_finalize_terminating_namespace below, which
+            // may itself need this same namespace's lock while purging remaining pods.
+            let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
+            crate::quota::record_pod_removed(&state, ns.as_str(), &current_obj.body).await;
+            drop(_quota_lock);
             // After hard-deleting a pod, check if its namespace is ready to complete deletion.
             // This handles OrderedNamespaceDeletion: once all finalizer'd pods are cleared,
             // the Terminating namespace hard-deletes.
@@ -1673,6 +1710,12 @@ pub(crate) async fn evict_pod<S: Store>(
                 .await
                 .map_err(|e| store_err_to_status(e, &name))?;
             state.node_graph.remove_pod(ns.as_str(), &name);
+            // Same per-namespace lock the create path holds across its check-then-write —
+            // without it here, this decrement can interleave with a concurrent
+            // create/delete/resize's read-modify-write of the same quota's status.used and
+            // lose an update.
+            let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
+            crate::quota::record_pod_removed(&state, ns.as_str(), &obj.body).await;
         }
     } else if !already_terminating {
         check_pdb_allows_eviction(&state, ns.as_str(), &obj.body, dry_run).await?;
@@ -3797,6 +3840,15 @@ pub(crate) async fn patch_pod_resize<S: Store>(
         .map_err(|e| store_err_to_status(e, &name))?;
 
     current_obj.set_resource_version(new_rv);
+
+    // ResourceQuota: a resize changes a pod's resource requests without creating or
+    // destroying it, so the incremental counter needs its own adjustment distinct from
+    // record_pod_created/record_pod_removed — see record_pod_resized's doc for why skipping
+    // this permanently leaks the pre/post delta. Same per-namespace lock the create and
+    // delete paths use, so this can never interleave with a concurrent create/delete/resize's
+    // read-modify-write of the same quota's status.used.
+    let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
+    crate::quota::record_pod_resized(&state, ns.as_str(), &spec_before, &current_obj.body).await;
 
     Ok(Json(current_obj.body))
 }
@@ -17919,6 +17971,109 @@ mod handler_tests {
         );
     }
 
+    /// PATCH /resize must adjust ResourceQuota's `status.used.requests.cpu` by the resize
+    /// delta — not just leave it at whatever the pod's create-time request was.
+    ///
+    /// The incremental quota counter only ever gets touched by `record_pod_created` (adds the
+    /// pod's request at create) and `record_pod_removed` (subtracts it at delete). If resize
+    /// is never wired to a third adjustment, the eventual delete subtracts the pod's
+    /// POST-resize amount while create only added the PRE-resize amount, permanently leaking
+    /// the difference: here, a pod created at 100m and resized to 500m must leave
+    /// `status.used.requests.cpu` at 500m — a namespace whose usage claims only 100m for a
+    /// pod that has actually reserved 500m can wrongly admit a sibling create that a fresh
+    /// recount would reject, oversubscribing the node.
+    #[tokio::test]
+    async fn patch_pod_resize_adjusts_resource_quota_usage() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let pod_key = "/registry/pods/default/resize-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "resize-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {
+                        "limits": {"cpu": "100m"},
+                        "requests": {"cpu": "100m"}
+                    }
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(
+                pod_key,
+                Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // status.used.requests.cpu = 100m mirrors what record_pod_created would have written
+        // for this pod's original (pre-resize) request — the incremental counter's baseline.
+        let quota_key = "/registry/resourcequotas/default/cpu-quota";
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": {"name": "cpu-quota", "namespace": "default"},
+            "spec": {"hard": {"requests.cpu": "1"}},
+            "status": {"used": {"requests.cpu": "100m"}}
+        });
+        store
+            .put(
+                quota_key,
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                patch(patch_pod_resize).put(patch_pod_resize),
+            )
+            .with_state(state);
+
+        let resize_body = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "500m"},
+                        "requests": {"cpu": "500m"}
+                    }
+                }]
+            }
+        });
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/resize-pod/resize")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&resize_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "resize PATCH must succeed");
+
+        let stored_quota = store
+            .get(quota_key)
+            .await
+            .unwrap()
+            .expect("quota must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            v["status"]["used"]["requests.cpu"], "500m",
+            "resizing a pod from 100m to 500m must move status.used.requests.cpu to 500m — \
+             leaving it at 100m means the eventual delete (which subtracts the post-resize \
+             500m) will permanently leak 400m out of this quota's usage"
+        );
+    }
+
     /// `PATCH /resize?dryRun=All` must return the would-be resized pod but leave the stored
     /// pod's resources untouched. Before this fix, patch_pod_resize had no dry-run check.
     #[tokio::test]
@@ -21036,6 +21191,403 @@ mod admission_tests {
             "the store must contain exactly 2 pods — a quota is a hard limit, not \
              advisory, regardless of how many creates race for it"
         );
+    }
+
+    async fn quota_used_pods(store: &Arc<SqliteStore>, quota_name: &str) -> Option<String> {
+        let stored = store
+            .get(&format!("/registry/resourcequotas/default/{quota_name}"))
+            .await
+            .unwrap()
+            .expect("quota must exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        v["status"]["used"]["pods"].as_str().map(|s| s.to_string())
+    }
+
+    /// `write_quota_used_updates` is a plain get-then-put with no CAS: only the create path
+    /// (via `quota_admission_locks`) serializes its own check-then-write around it. If a
+    /// delete-side call site of `record_pod_removed` ever stops holding that same
+    /// per-namespace lock, two concurrent hard-deletes in one namespace can each read the
+    /// same pre-decrement `status.used.pods`, both compute "one less", and the loser's
+    /// decrement is silently lost — permanently overcounting usage and wedging the quota
+    /// "full" forever even with free slots, wrongly rejecting every later create in that
+    /// namespace. This deletes two distinct pods concurrently and asserts the counter lands
+    /// at exactly base-2, which fails if the delete path's lock is ever removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_pod_deletes_never_lose_a_quota_decrement() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+
+        // Baseline of 5 stands in for pods this test never materializes in the store — the
+        // incremental counter trusts status.used as its O(1) source of truth and never
+        // re-validates it against a full scan on the fast path, so an arbitrary starting
+        // value here exercises exactly that trust.
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "pod-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } },
+            "status": { "used": { "pods": "5" } }
+        });
+        store
+            .put(
+                "/registry/resourcequotas/default/pod-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        for name in ["pod-a", "pod-b"] {
+            let pod = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            });
+            store
+                .put(
+                    &format!("/registry/pods/default/{name}"),
+                    Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let headers = {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            h
+        };
+        let force_body = || Bytes::from(serde_json::json!({"gracePeriodSeconds": 0}).to_string());
+
+        let (r1, r2) = tokio::join!(
+            delete_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(), "pod-a".to_string())),
+                test_user(),
+                axum::extract::Query(GracePeriodQuery {
+                    grace_period_seconds: None
+                }),
+                headers.clone(),
+                force_body(),
+            ),
+            delete_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(), "pod-b".to_string())),
+                test_user(),
+                axum::extract::Query(GracePeriodQuery {
+                    grace_period_seconds: None
+                }),
+                headers.clone(),
+                force_body(),
+            ),
+        );
+        r1.expect("first concurrent delete must succeed");
+        r2.expect("second concurrent delete must succeed");
+
+        assert_eq!(
+            quota_used_pods(&store, "pod-quota").await,
+            Some("3".to_string()),
+            "two concurrent hard-deletes must decrement status.used.pods by exactly 2 \
+             (5 -> 3) — a lost decrement here permanently overcounts usage and wedges the \
+             quota full forever even after pods are actually gone"
+        );
+    }
+
+    /// `check_resource_quota` now reads `status.used` as an incrementally-maintained O(1)
+    /// baseline instead of re-scanning every pod in the namespace on each admission (see
+    /// quota.rs module docs). A counter that drifts from the true pod count is a correctness
+    /// and multi-tenancy-safety bug either direction: too high silently wedges the quota
+    /// rejecting forever with room to spare, too low lets tenants burst past their hard limit.
+    /// This walks create -> create -> reject -> delete -> re-admit and asserts the persisted
+    /// counter is exactly right at every step, which fails if `record_pod_created`/
+    /// `record_pod_removed` are ever unwired from a create/delete call site or miscompute the
+    /// delta.
+    #[tokio::test]
+    async fn resource_quota_pod_count_rejects_at_limit_then_readmits_after_delete() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "pod-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "2" } }
+        });
+        store
+            .put(
+                "/registry/resourcequotas/default/pod-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let make_body = |name: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"name": name, "namespace": "default"},
+                    "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+                })
+                .to_string(),
+            )
+        };
+        let headers = {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            h
+        };
+
+        create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            headers.clone(),
+            make_body("pod-a"),
+        )
+        .await
+        .expect("first create must be admitted (0 of 2 used)");
+
+        create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            headers.clone(),
+            make_body("pod-b"),
+        )
+        .await
+        .expect("second create must be admitted (1 of 2 used)");
+
+        assert_eq!(
+            quota_used_pods(&store, "pod-quota").await,
+            Some("2".to_string()),
+            "status.used.pods must read exactly 2 after two admitted creates — this is the \
+             same value check_resource_quota's next call trusts as its O(1) baseline"
+        );
+
+        let third = create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            headers.clone(),
+            make_body("pod-c"),
+        )
+        .await;
+        assert!(
+            third.is_err(),
+            "a third create against a pods=2 quota already at 2 must be rejected — an \
+             under-counting incremental counter would wrongly admit this"
+        );
+
+        // Hard-delete pod-a (force, grace period 0) so record_pod_removed fires.
+        delete_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(), "pod-a".to_string())),
+            test_user(),
+            axum::extract::Query(GracePeriodQuery {
+                grace_period_seconds: None,
+            }),
+            headers.clone(),
+            Bytes::from(serde_json::json!({"gracePeriodSeconds": 0}).to_string()),
+        )
+        .await
+        .expect("delete must succeed");
+
+        assert_eq!(
+            quota_used_pods(&store, "pod-quota").await,
+            Some("1".to_string()),
+            "deleting one of two pods must decrement status.used.pods to exactly 1 — a \
+             missed decrement here is what would wedge the quota at 'full' forever even \
+             with a free slot"
+        );
+
+        create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            headers.clone(),
+            make_body("pod-c"),
+        )
+        .await
+        .expect(
+            "after freeing one slot, a create must be re-admitted — a drifted \
+             (never-decremented) counter would wrongly keep rejecting this forever",
+        );
+
+        assert_eq!(
+            quota_used_pods(&store, "pod-quota").await,
+            Some("2".to_string()),
+            "status.used.pods must be back to exactly 2 after re-admitting"
+        );
+    }
+
+    /// A scopeSelector-scoped quota's incremental counter must only track pods that actually
+    /// match the selector: a non-matching pod must never block on it, and must never be
+    /// counted toward it either. If the incremental counter ever counted a non-matching pod,
+    /// an unrelated priority class's traffic would silently starve this quota's real tenant;
+    /// if it ever skipped decrementing a matching pod's delete, the quota would wedge full
+    /// forever even with real turnover.
+    #[tokio::test]
+    async fn resource_quota_scope_selector_tracks_only_matching_pods_through_create_and_delete() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+
+        for (name, value) in [("high", 1000), ("low", 0)] {
+            let pc = serde_json::json!({
+                "apiVersion": "scheduling.k8s.io/v1",
+                "kind": "PriorityClass",
+                "metadata": {"name": name},
+                "value": value
+            });
+            store
+                .put(
+                    &format!("/registry/scheduling.k8s.io/priorityclasses/{name}"),
+                    Bytes::from(serde_json::to_vec(&pc).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "high-prio-quota", "namespace": "default" },
+            "spec": {
+                "hard": { "pods": "1" },
+                "scopeSelector": {
+                    "matchExpressions": [
+                        {"scopeName": "PriorityClass", "operator": "In", "values": ["high"]}
+                    ]
+                }
+            }
+        });
+        store
+            .put(
+                "/registry/resourcequotas/default/high-prio-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let make_body = |name: &str, priority_class: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"name": name, "namespace": "default"},
+                    "spec": {
+                        "priorityClassName": priority_class,
+                        "containers": [{"name": "app", "image": "nginx"}]
+                    }
+                })
+                .to_string(),
+            )
+        };
+        let headers = {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            h
+        };
+
+        create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            headers.clone(),
+            make_body("high-a", "high"),
+        )
+        .await
+        .expect("first high-priority pod must be admitted (0 of 1 used)");
+
+        let rejected = create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            headers.clone(),
+            make_body("high-b", "high"),
+        )
+        .await;
+        assert!(
+            rejected.is_err(),
+            "a second high-priority pod must be rejected — the scoped quota is already at \
+             1 of 1"
+        );
+
+        create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            headers.clone(),
+            make_body("low-a", "low"),
+        )
+        .await
+        .expect(
+            "a low-priority pod must never be blocked by a quota scoped to \
+             PriorityClass=high — it doesn't match the scope selector at all",
+        );
+
+        assert_eq!(
+            quota_used_pods(&store, "high-prio-quota").await,
+            Some("1".to_string()),
+            "the low-priority pod must NOT be counted toward the high-priority-scoped \
+             quota's usage"
+        );
+
+        delete_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(), "high-a".to_string())),
+            test_user(),
+            axum::extract::Query(GracePeriodQuery {
+                grace_period_seconds: None,
+            }),
+            headers.clone(),
+            Bytes::from(serde_json::json!({"gracePeriodSeconds": 0}).to_string()),
+        )
+        .await
+        .expect("delete of the matching high-priority pod must succeed");
+
+        assert_eq!(
+            quota_used_pods(&store, "high-prio-quota").await,
+            Some("0".to_string()),
+            "deleting the one pod that matched the scope selector must decrement its \
+             quota's usage back to 0 — a missed decrement here would wedge the quota full \
+             forever despite having no matching pods left"
+        );
+
+        create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            headers.clone(),
+            make_body("high-b", "high"),
+        )
+        .await
+        .expect("with the slot freed, a second high-priority pod must now be admitted");
     }
 }
 

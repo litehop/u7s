@@ -6,7 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use std::collections::HashSet;
-use u7s_store::{ListOptions, Store, StoreError};
+use u7s_store::{ListOptions, Store, StoreError, StoreObject};
 
 use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
@@ -1134,39 +1134,59 @@ pub(crate) async fn maybe_finalize_terminating_namespace<S: Store>(
     }
     // No remaining finalizer'd objects — hard-delete remaining objects and the namespace.
     for obj in objects {
-        if state.store.delete(&obj.key, None).await.is_ok() {
-            // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a
-            // RoleBinding/Role hard-deleted here must lose its RbacIndex entry immediately,
-            // or its grant survives until process restart and can resurrect verbatim if the
-            // namespace name is reused. Only once the delete actually landed — a failed
-            // delete leaves the object (and its grant) exactly as it was.
-            if let Some(rbac_key) = rbac_namespaced_index_key(namespace, &obj.key) {
-                state.rbac_index.remove_object(&rbac_key);
-            }
-            // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a CR
-            // hard-deleted here must lose its cr_conversion_cache entries immediately, or it
-            // stays resident forever since its resourceVersion can never be looked up again.
-            // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a CR
-            // hard-deleted here must lose its cr_conversion_cache entries immediately, or it
-            // stays resident forever since its resourceVersion can never be looked up again.
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
-                if let Some(rv) = val["metadata"]["resourceVersion"].as_str() {
-                    state.cr_conversion_cache.invalidate_by_rv(rv);
-                }
-            }
-            // Same rationale for pods: a pod hard-deleted here must lose its
-            // node-authorization graph edges immediately.
-            if let Some(pod_name) = obj
-                .key
-                .strip_prefix(&format!("/registry/pods/{namespace}/"))
-            {
-                state.node_graph.remove_pod(namespace, pod_name);
-            }
-        }
+        purge_namespace_object(state, namespace, &obj).await;
     }
     delete_namespace_scoped_crds(state, namespace).await;
     let _ = state.store.delete(&ns_key, None).await;
     state.quota_admission_locks.evict(namespace);
+}
+
+/// Hard-delete one object as part of `maybe_finalize_terminating_namespace`'s bulk purge,
+/// applying every cascade side effect a hard-delete anywhere else in the apiserver applies:
+/// RbacIndex removal, cr_conversion_cache invalidation, node-authorization-graph removal, and
+/// (for pods) the incremental ResourceQuota usage decrement via `record_pod_removed` — this
+/// purge is itself one of the pod hard-delete call sites `record_pod_removed`'s own doc
+/// requires call it, not an exception. Skipping it here is currently unobservable only
+/// because this same sweep also hard-deletes the namespace's ResourceQuota objects, so
+/// `write_quota_used_updates` finds nothing left to update; that coincidence must not stand
+/// in for actually calling it, or a future change that reorders the purge (or a ResourceQuota
+/// that outlives it) silently drifts status.used. Extracted from the purge loop so this
+/// per-object cascade — and specifically the quota decrement — can be exercised in isolation,
+/// independent of the ResourceQuota's own fate in the same sweep.
+async fn purge_namespace_object<S: Store>(state: &AppState<S>, namespace: &str, obj: &StoreObject) {
+    if state.store.delete(&obj.key, None).await.is_err() {
+        return;
+    }
+    // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a
+    // RoleBinding/Role hard-deleted here must lose its RbacIndex entry immediately, or its
+    // grant survives until process restart and can resurrect verbatim if the namespace name
+    // is reused. Only once the delete actually landed — a failed delete leaves the object
+    // (and its grant) exactly as it was.
+    if let Some(rbac_key) = rbac_namespaced_index_key(namespace, &obj.key) {
+        state.rbac_index.remove_object(&rbac_key);
+    }
+    // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a CR
+    // hard-deleted here must lose its cr_conversion_cache entries immediately, or it stays
+    // resident forever since its resourceVersion can never be looked up again.
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+        if let Some(rv) = val["metadata"]["resourceVersion"].as_str() {
+            state.cr_conversion_cache.invalidate_by_rv(rv);
+        }
+    }
+    // Same rationale for pods: a pod hard-deleted here must lose its node-authorization graph
+    // edges immediately, and must decrement the incremental ResourceQuota counter. Locked so
+    // this can never interleave with a concurrent create/delete/resize's read-modify-write of
+    // the same quota's status.used in this namespace.
+    if let Some(pod_name) = obj
+        .key
+        .strip_prefix(&format!("/registry/pods/{namespace}/"))
+    {
+        state.node_graph.remove_pod(namespace, pod_name);
+        if let Ok(pod) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+            let _quota_lock = state.quota_admission_locks.lock(namespace).await;
+            crate::quota::record_pod_removed(state, namespace, &pod).await;
+        }
+    }
 }
 
 /// Delete all CRDs whose `spec.group` contains `namespace_name` as a substring.
@@ -4284,6 +4304,89 @@ mod tests {
              path an ordinary (non-bootstrap) namespace deletion actually takes via KCM's \
              namespace controller, so a regression here would leave every real namespace \
              deletion granting stale node access until the apiserver restarts"
+        );
+    }
+
+    /// The namespace-drain bulk purge (`maybe_finalize_terminating_namespace`'s hard-delete
+    /// loop) hard-deletes a drained pod without going through `delete_pod`/`patch_pod`/etc.,
+    /// so it must independently call `record_pod_removed` exactly like every other pod
+    /// hard-delete call site does — otherwise every pod purged by a namespace deletion leaks
+    /// its ResourceQuota usage forever. This exercises the extracted per-object purge helper
+    /// directly (rather than the whole-namespace sweep) specifically so the ResourceQuota can
+    /// be inspected afterward — the whole-sweep path also hard-deletes the ResourceQuota
+    /// object in the same pass, which is exactly why this gap was invisible until now.
+    #[tokio::test]
+    async fn purge_namespace_object_decrements_resource_quota_for_a_purged_pod() {
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        let pod_key = crate::keys::object_key("pods", "drained-quota-ns", "purged-pod");
+        let pod_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "purged-pod", "namespace": "drained-quota-ns" },
+            "spec": { "containers": [{"name": "c", "image": "nginx"}] }
+        });
+        state
+            .store
+            .put(&pod_key, bytes::Bytes::from(pod_body.to_string()), Some(0))
+            .await
+            .expect("pod write must succeed");
+
+        // status.used.pods = 1 mirrors what record_pod_created would have written when this
+        // pod was originally admitted — the incremental counter's baseline.
+        let quota_key =
+            crate::keys::group_object_key("", "resourcequotas", Some("drained-quota-ns"), "rq");
+        let quota_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "rq", "namespace": "drained-quota-ns" },
+            "spec": { "hard": { "pods": "5" } },
+            "status": { "used": { "pods": "1" } }
+        });
+        state
+            .store
+            .put(
+                &quota_key,
+                bytes::Bytes::from(quota_body.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("quota write must succeed");
+
+        let stored_pod = state
+            .store
+            .get(&pod_key)
+            .await
+            .expect("get must not error")
+            .expect("pod must exist");
+        purge_namespace_object(&state, "drained-quota-ns", &stored_pod).await;
+
+        assert!(
+            state
+                .store
+                .get(&pod_key)
+                .await
+                .expect("get must not error")
+                .is_none(),
+            "test precondition: the pod must actually be hard-deleted by the purge helper"
+        );
+
+        let stored_quota = state
+            .store
+            .get(&quota_key)
+            .await
+            .expect("get must not error")
+            .expect("quota must still exist — only the pod was purged in this test");
+        let v: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            v["status"]["used"]["pods"], "0",
+            "purging a pod via the namespace-drain bulk purge must decrement \
+             status.used.pods exactly like delete_pod/patch_pod/DeleteCollection do — \
+             skipping this leaks 1 unit of quota usage for every pod a namespace deletion \
+             purges, permanently understating free capacity in any ResourceQuota that \
+             survives the same sweep"
         );
     }
 
