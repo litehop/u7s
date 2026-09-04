@@ -1,36 +1,31 @@
 # Dashboard
-**2026-09-04 04:37Z — ⏸ WRAPPING (operator switching networks — API calls may drop).** main @ `ecab3a48` (#1555 queued). Resume: `bd prime` → this file.
-
-**⚠️ WRAP DIRECTIVE (until operator says otherwise):** do NOT dispatch new workers. Let the 3 in-flight workers land; for each PR: review → merge if LGTM, or reopen-the-bead-and-record on needs-changes (do NOT start a fix round — that leaves a worker at risk during the network switch). Wrap is done when: no active workers, git state clean/pushed, dashboard current. Then it's safe to switch.
+**2026-09-05 — ✅ SESSION WRAPPED.** main @ `db3c7ba7` (+3 servicelb PRs). #1567 (pa0ze Phase-3 keying, 4 review rounds) + #1568 (tk4ku memory sampler) MERGED; **#1569** (tk4ku ceiling recalibration 1→4 MiB) QUEUED — first action next session: confirm #1569 merged + close `mayor-tk4ku`. Resume: `bd prime` → this file.
 
 **Stance:** pre-alpha/greenfield, break freely, correctness > security > perf > features, merge-on-green via native queue, `--admin` never.
 
-⚠️ **lima-node MCP failed** this session (`-32000`); workers use `limactl shell` fallback. VMs: node-4=6dj51.5 fix, node-2=17nj7.4 fix; free node-3/5/smoke.
+## ✅ Merged this session
+- **#1567** pa0ze eBPF Phase-3 conntrack keying (4 review rounds; occupant identity = `(front, client_port)`, sufficient because REV_FLOW key pins client_ip) · **#1568** tk4ku eBPF map-memory + loader-RSS sampler + CI gate. **#1569** ceiling 1→4 MiB queued.
+- Prev sessions: #1561/#1566/#1563/#1565/#1564 (+ #1560/#1555/#1557/#1558/#1559/#1554).
 
-## 🔎 Needs next session
-- **#1556** (17nj7.4, DRAFT) — ⚠️ **3rd rejection; REOPENED, NOT re-dispatched (wrap).** The childless-root fix reintroduced UNBOUNDED growth (fold-target insert at sqlite.rs:308-331 has no cap re-check → map never shrinks). Needs a **design rethink**, not another patch — full root-cause in bead notes. Branch durable on origin.
-- Review follow-up beads filed: **d5skc** (6dj51.5/#1555 nits), + one for 17nj7.3/#1560 (delete_namespace_scoped_crds evict gap).
+## ⏭ Next / follow-ups
+- **#1569** (tk4ku ceiling 1→4 MiB) QUEUED — confirm merged, then `bd close mayor-tk4ku`.
+- **`de18e` now URGENT (bump from P3):** `ebpf-memory-smoke`/`ebpf-build` are NOT required checks — the queue merged #1568 with `ebpf-memory-smoke` RED (stale ceiling on real Phase-3 numbers). #1569 turns it green; de18e must make it *gating* so a red eBPF gate can't merge again.
+- **`d9o3d`** (P3, from #1567 review): backend src-port remap re-derives every packet → LRU-eviction mid-connection port reassignment; deferred to Phase-4/`lrbvo` churn testing.
+- **`j43cj`** (P3): pre-commit hook misses nested `crates/servicelb` fmt (root cause of the pa0ze round-2→3 red).
+- **aie31.5** (L2-header) + **aie31.7** (tier-1 WireGuard) — downstream of #1567 (now merged), dispatchable. **aie31.3** doc-fix (map type + footprint → ~1.82 MiB).
+- Bugs: `reset.sh --host-only` over-kills shared Lima net daemon (P2, `fbfi9`); #1561 RQ-scope-change no recount (P3); 17nj7 quota follow-ups (P3).
 
-## ▶ IN PROGRESS (1 perf) — LAST of the wrap set
-- **17nj7.5** (a0284, node-3) — incremental ResourceQuota counter, end per-admission O(n²) namespace rescan. quota.rs + resource.rs.
-- **swg4h** — operator-owned: reruns Conformance + csi-hostpath e2e at session wrap.
-- Held (NOT dispatched, wrapping): **17nj7.8** (find_crd), pa0ze, scheduler .6/.18, etc.
+## 🚧 Operator decisions pending — eBPF Phase-4 (lrbvo)
+- Tier-1 (2-Lima-over-WireGuard, local, `aie31.7`) is now dev work, NOT op-blocked. Only **tier 2/3 (real public-IP / IPv6-only fleet)** need provisioning. IPv6-only DESCOPED from MVP.
+- Registry for the Phase-5 DaemonSet (`9gr0n`): GHCR OUT (IPv4-only); verify Docker Hub's IPv6-pull or self-host `zot`.
 
-## ✅ Merged this session (6)
-- **#1560** 17nj7.3 CrConversionCache leak+bound · **#1555** 6dj51.5 scheduler CSI race · **#1557** g7jh2 eBPF Phase 2 (unblocks pa0ze) · **#1558** 17nj7.2 RBAC ns-purge (sec) · **#1559** 17nj7.1 metric-DoS (sec) · **#1554** cleanup.
-
-## 📋 Next up (opportunistic, once main advances / VMs free)
-- **perf 17nj7** (opportunistic backlog per operator): clean+ready now → `.5` (quota recount, quota.rs), `.8` (find_crd, crd handler). After #1558 → `.3` (CrConversionCache, ns cascade). After #1555 → scheduler `.6`/`.18`. `.7` folded into 6dj51.5. `.12` (94 clone sites) solo in a quiet window.
-- **eBPF L3** after #1557 merges (unblocks Phase 3): pa0ze; also g3lag, bguco.
-- standalone: **2t1g1**, **xiovg**. **dq1gf** (VM rename) P3 no-auto-dispatch.
-
-## 🟢 Deferred / gated
-- decision-gated: sm91b.6, 0qjgc, 90qvg. epics: aie31 (Ph1-2 landing), sm91b, 8qcaw, s82zr. release-coupled (1.37): 1n9eu, 9xsn3. held: ujqtt, tnzdi, bhih0, 1y0h6, 44jyu, hm02b, t8ucq, r871h. elmno DEFERRED.
+## 📋 Backlog (apiserver perf 17nj7)
+- .9 (matching_shards), .10/.11 (watch), .12 (94 clone sites); hmv26 (ns-cascade). Keep disjoint from quota.rs/store.
 
 ## 📌 Standing decisions
-- **17nj7 = opportunistic backlog, NOT deferred** (operator) — dispatch by priority + scope + conflict-risk.
-- Merge via native queue only (bare `gh pr merge`); never `--admin`.
-- Phase 4 (lrbvo) deploys eBPF via the MANUAL Phase-1 loader, NOT the Phase-5 DaemonSet (clarified in lrbvo/aie31 notes).
+- 17nj7 = opportunistic backlog (operator). Merge via native queue only; never `--admin`.
+- eBPF CI = FULL-feasible on GH Actions (spike; de18e can gate the full harness). conntrack maps = LRU_HASH (shared, NOT PERCPU); **real Phase-3 per-node footprint ~1.82 MiB** (preallocated for 8192-entry FWD/REV_FLOW; the old ~21.5 KiB was the Phase-2 fixture).
+- Phase 4 (lrbvo) deploys via the MANUAL Phase-1 loader, not the Phase-5 DaemonSet.
 
 ## 🔁 Cron loops
 <!-- BEGIN AUTO: cron-loops -->
@@ -38,12 +33,11 @@
 <!-- END AUTO: cron-loops -->
 ## Repo state
 <!-- BEGIN AUTO: repo-state -->
-As of 2026-09-04T08:35:41Z (last tick) — Branch `main` @ `02ea37d6`, dirty, up to date with origin/main.
+As of 2026-09-04T15:35:14Z (last tick) — Branch `main` @ `6f1900e6`, dirty, up to date with origin/main.
 <!-- END AUTO: repo-state -->
 ## 🔎 Open PRs
 <!-- BEGIN AUTO: open-prs -->
-- #1561 perf(apiserver): incremental ResourceQuota usage counter to end the per-admission O(n) namespace rescan (mayor-17nj7.5) (`worker/agent-a0284015530e21610`, BLOCKED)
-- #1556 fix(store): bound reclaimed_horizons and de-linearize watch-open horizon lookup without horizon-eviction regression (mayor-17nj7.4) (`worker/agent-a2f40b04fb9d1c092`, BLOCKED)
+- #1567 feat(servicelb): Phase 3 conntrack full-tuple keying + backend src-port remap on conflict (mayor-pa0ze) (`worker/agent-accf25c8d059bab89`, UNSTABLE)
 <!-- END AUTO: open-prs -->
 ## 📋 Review queue
 <!-- BEGIN AUTO: review-queue -->
@@ -52,6 +46,8 @@ As of 2026-09-04T08:35:41Z (last tick) — Branch `main` @ `02ea37d6`, dirty, up
 
 ## 🌲 Worktrees / hygiene
 <!-- BEGIN AUTO: worktrees -->
-- `/Users/balint.erdos/u7s/ai/worktrees/agent-a0284015530e21610` (`worker/agent-a0284015530e21610`)
-- `/Users/balint.erdos/u7s/ai/worktrees/agent-a2f40b04fb9d1c092` (`worker/agent-a2f40b04fb9d1c092`)
+- `/Users/balint.erdos/u7s/ai/worktrees/agent-a4c1c8c1e57f056b2` (`worker/agent-a4c1c8c1e57f056b2`)
+- `/Users/balint.erdos/u7s/ai/worktrees/agent-a69ad9d12880b2d17` (`worker/agent-a69ad9d12880b2d17`)
+- `/Users/balint.erdos/u7s/ai/worktrees/agent-accf25c8d059bab89` (`worker/agent-accf25c8d059bab89`)
+- `/Users/balint.erdos/u7s/ai/worktrees/agent-ae39ad21ff54d555c` (`worker/agent-ae39ad21ff54d555c`)
 <!-- END AUTO: worktrees -->
