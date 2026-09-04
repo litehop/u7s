@@ -11,12 +11,12 @@ use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     handlers::{
-        generic::{apply_delete_policy, parse_field_selector},
+        generic::{apply_delete_policy, parse_field_selector, RBAC_GROUP},
         json_patch::{
             apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchQuery,
             PatchType,
         },
-        resource::{do_patch, PatchConfig},
+        resource::{do_patch, rbac_namespaced_key, PatchConfig},
     },
     keys::{cluster_list_prefix, cluster_object_key},
     proto,
@@ -911,6 +911,7 @@ async fn cascade_delete_namespace_resources<S: Store>(
         let has_finalizers = val["metadata"]["finalizers"]
             .as_array()
             .is_some_and(|f| !f.is_empty());
+        let rbac_key = rbac_namespaced_index_key(namespace, &obj_stored.key);
         if has_finalizers {
             // Soft-delete: stamp deletionTimestamp so the controller observes deletion.
             // Use an unconditional put (None) — we just read this object; a race
@@ -929,25 +930,63 @@ async fn cascade_delete_namespace_resources<S: Store>(
                 );
             } else {
                 any_soft_deleted = true;
+                // Evict from RBAC index immediately — mirrors resource.rs's single-object
+                // soft-delete: permissions must not outlast the deletion request even while
+                // finalizers are still draining.
+                if let Some(ref rbac_key) = rbac_key {
+                    state.rbac_index.remove_object(rbac_key);
+                }
             }
         } else if let Err(e) = state.store.delete(&obj_stored.key, None).await {
             tracing::warn!(
                 "namespace {namespace}: hard-delete {} failed: {e}",
                 obj_stored.key
             );
-        } else if let Some(pod_name) = obj_stored
-            .key
-            .strip_prefix(&format!("/registry/pods/{namespace}/"))
-        {
-            // A pod hard-deleted by the namespace cascade must lose its node-authorization
-            // graph edges immediately, exactly like every hard-delete site in handlers/pods.rs
-            // and handlers/resource.rs — otherwise the node it was scheduled on stays
-            // authorized to read the pod's secrets/mint its ServiceAccount's token until the
-            // apiserver restarts and rebuilds the graph from scratch.
-            state.node_graph.remove_pod(namespace, pod_name);
+        } else {
+            // A RoleBinding/Role hard-deleted by the namespace cascade must lose its grant
+            // immediately — otherwise the cascade leaks an RbacIndex entry per delete cycle
+            // AND leaves a stale grant live until process restart; if the namespace name is
+            // ever reused (CI reuses namespace names constantly), the same RbacIndex object
+            // key resurrects the old binding's permissions on the very first apply_object
+            // for the new one, silently re-granting access an operator explicitly revoked.
+            if let Some(ref rbac_key) = rbac_key {
+                state.rbac_index.remove_object(rbac_key);
+            }
+            if let Some(pod_name) = obj_stored
+                .key
+                .strip_prefix(&format!("/registry/pods/{namespace}/"))
+            {
+                // A pod hard-deleted by the namespace cascade must lose its node-authorization
+                // graph edges immediately, exactly like every hard-delete site in
+                // handlers/pods.rs and handlers/resource.rs — otherwise the node it was
+                // scheduled on stays authorized to read the pod's secrets/mint its
+                // ServiceAccount's token until the apiserver restarts and rebuilds the graph
+                // from scratch.
+                state.node_graph.remove_pod(namespace, pod_name);
+            }
         }
     }
     any_soft_deleted
+}
+
+/// Translates a namespaced RBAC object's store key
+/// (`/registry/rbac.authorization.k8s.io/{roles,rolebindings}/<namespace>/<name>`) into the
+/// api-style key `RbacIndex::apply_object`/`remove_object` index entries under
+/// (`/apis/rbac.authorization.k8s.io/v1/namespaces/<namespace>/{roles,rolebindings}/<name>`),
+/// mirroring the store-key -> api-key translation `AppState::init` uses to seed the index at
+/// boot. `RbacIndex::remove_object` matches on the exact key string a role/binding was
+/// indexed under, so evicting with the wrong key format silently no-ops instead of erroring.
+/// Returns `None` for any other object (nothing to evict).
+fn rbac_namespaced_index_key(namespace: &str, store_key: &str) -> Option<String> {
+    for plural in ["roles", "rolebindings"] {
+        let prefix = format!("/registry/{RBAC_GROUP}/{plural}/{namespace}/");
+        if let Some(name) = store_key.strip_prefix(&prefix) {
+            return Some(rbac_namespaced_key(
+                RBAC_GROUP, "v1", namespace, plural, name,
+            ));
+        }
+    }
+    None
 }
 
 /// Cascade-delete a namespace's resources, re-verifying emptiness before letting the
@@ -1077,9 +1116,15 @@ pub(crate) async fn maybe_finalize_terminating_namespace<S: Store>(
     for obj in objects {
         if state.store.delete(&obj.key, None).await.is_ok() {
             // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a
-            // pod hard-deleted here must lose its node-authorization graph edges
-            // immediately, but only once the delete actually landed — a failed delete
-            // leaves the pod (and its edges) exactly as they were.
+            // RoleBinding/Role hard-deleted here must lose its RbacIndex entry immediately,
+            // or its grant survives until process restart and can resurrect verbatim if the
+            // namespace name is reused. Only once the delete actually landed — a failed
+            // delete leaves the object (and its grant) exactly as it was.
+            if let Some(rbac_key) = rbac_namespaced_index_key(namespace, &obj.key) {
+                state.rbac_index.remove_object(&rbac_key);
+            }
+            // Same rationale for pods: a pod hard-deleted here must lose its
+            // node-authorization graph edges immediately.
             if let Some(pod_name) = obj
                 .key
                 .strip_prefix(&format!("/registry/pods/{namespace}/"))
@@ -3807,6 +3852,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_namespace_hard_delete_purges_rbac_index_so_a_deleted_rolebinding_stops_granting_access(
+    ) {
+        // Regression test: cascade_delete_namespace_resources hard-deletes a RoleBinding's
+        // store object but, before this fix, never called rbac_index.remove_object — so the
+        // binding kept granting its permissions to its subject forever (until process
+        // restart), and the stale entry stays keyed to the namespace name. If the SAME
+        // namespace name is later recreated (CI reuses namespace names constantly), the old
+        // grant re-applies to the new namespace with zero new RBAC objects created — a
+        // privilege escalation that survives namespace teardown.
+        use crate::rbac::AuthzRequest;
+        use axum::extract::{Path, State};
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        // Namespace WITHOUT spec.finalizers so delete_namespace takes the hard-delete cascade
+        // path (cascade_delete_namespace_resources), matching the other cascade tests above.
+        let ns_key = crate::keys::cluster_object_key("namespaces", "rbac-recycle");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "rbac-recycle", "uid": "00000000-0000-0000-0000-0000000000bb" },
+            "status": { "phase": "Active" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("namespace write must succeed");
+
+        // Seed a Role + RoleBinding exactly like create_namespaced_resource would: persist to
+        // the store (so the cascade's list_namespace_objects finds and deletes it) AND index
+        // into RbacIndex (so a leaked entry is observable via is_allowed).
+        let role_key = crate::keys::group_object_key(
+            "rbac.authorization.k8s.io",
+            "roles",
+            Some("rbac-recycle"),
+            "pod-reader",
+        );
+        let role_body = serde_json::json!({
+            "metadata": { "name": "pod-reader", "namespace": "rbac-recycle" },
+            "rules": [{ "apiGroups": [""], "resources": ["pods"], "verbs": ["get"] }]
+        });
+        state
+            .store
+            .put(
+                &role_key,
+                bytes::Bytes::from(role_body.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("role write must succeed");
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/rbac-recycle/roles/pod-reader",
+            &role_body,
+        );
+
+        let binding_key = crate::keys::group_object_key(
+            "rbac.authorization.k8s.io",
+            "rolebindings",
+            Some("rbac-recycle"),
+            "read-pods",
+        );
+        let binding_body = serde_json::json!({
+            "metadata": {
+                "name": "read-pods",
+                "namespace": "rbac-recycle",
+                "resourceVersion": "10"
+            },
+            "subjects": [{ "kind": "User", "name": "pod-reader-sa" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": "pod-reader"
+            }
+        });
+        state
+            .store
+            .put(
+                &binding_key,
+                bytes::Bytes::from(binding_body.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("rolebinding write must succeed");
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/rbac-recycle/rolebindings/read-pods",
+            &binding_body,
+        );
+
+        let groups: Vec<String> = vec![];
+        let get_pods_req = AuthzRequest {
+            username: "pod-reader-sa",
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "pods",
+            subresource: "",
+            namespace: Some("rbac-recycle"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&get_pods_req),
+            "test precondition: the RoleBinding must actually grant access before the \
+             namespace is deleted"
+        );
+
+        // Hard-delete the namespace — cascades to the Role/RoleBinding via
+        // cascade_delete_namespace_resources.
+        delete_namespace(
+            State(state.clone()),
+            Path("rbac-recycle".to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("namespace delete must succeed");
+
+        assert!(
+            !state.rbac_index.is_allowed(&get_pods_req),
+            "a RoleBinding deleted by namespace teardown must stop granting access \
+             immediately — otherwise the subject keeps its permissions until the apiserver \
+             restarts, a privilege escalation that survives namespace deletion"
+        );
+
+        // Recreate the SAME namespace name (CI reuses namespace names constantly) with no new
+        // RBAC objects at all. If the cascade had only deleted the store object without
+        // purging the RbacIndex entry, the stale entry (still keyed to namespace
+        // "rbac-recycle" by name) would silently re-grant pod-reader-sa's old access to the
+        // new namespace the moment it exists — a resurrection with zero new writes.
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("namespace re-create must succeed");
+
+        assert!(
+            !state.rbac_index.is_allowed(&get_pods_req),
+            "recreating a namespace under the same name must NOT resurrect a RoleBinding's \
+             grant that was deleted along with the old namespace — pod-reader-sa must stay \
+             unauthorized until a new RoleBinding is actually created"
+        );
+    }
+
+    #[tokio::test]
     async fn maybe_finalize_terminating_namespace_revokes_node_graph_edges_for_drained_pods() {
         // Regression test for the OTHER (and more common) namespace-deletion path: a
         // real user namespace always carries spec.finalizers=["kubernetes"] at creation, so
@@ -3889,6 +4081,114 @@ mod tests {
              path an ordinary (non-bootstrap) namespace deletion actually takes via KCM's \
              namespace controller, so a regression here would leave every real namespace \
              deletion granting stale node access until the apiserver restarts"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_finalize_terminating_namespace_purges_rbac_index_for_drained_rolebindings() {
+        // Companion to the drained-pods test above, for the same "more common" real-namespace
+        // path: maybe_finalize_terminating_namespace hard-deletes a drained RoleBinding's
+        // store object but, before this fix, never purged its RbacIndex entry — leaving the
+        // grant live until the apiserver restarts, and resurrectable if the namespace name is
+        // ever reused.
+        use crate::rbac::AuthzRequest;
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        let ns_key = crate::keys::cluster_object_key("namespaces", "drained-rbac-ns");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "drained-rbac-ns",
+                "uid": "00000000-0000-0000-0000-0000000000cc",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": [] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("namespace write must succeed");
+
+        let binding_key = crate::keys::group_object_key(
+            "rbac.authorization.k8s.io",
+            "rolebindings",
+            Some("drained-rbac-ns"),
+            "read-secrets",
+        );
+        let binding_body = serde_json::json!({
+            "metadata": {
+                "name": "read-secrets",
+                "namespace": "drained-rbac-ns",
+                "resourceVersion": "20"
+            },
+            "subjects": [{ "kind": "User", "name": "drained-sa" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "secret-reader"
+            }
+        });
+        state
+            .store
+            .put(
+                &binding_key,
+                bytes::Bytes::from(binding_body.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("rolebinding write must succeed");
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/drained-rbac-ns/rolebindings/read-secrets",
+            &binding_body,
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/secret-reader",
+            &serde_json::json!({
+                "rules": [{ "apiGroups": [""], "resources": ["secrets"], "verbs": ["get"] }]
+            }),
+        );
+
+        let groups: Vec<String> = vec![];
+        let get_secrets_req = AuthzRequest {
+            username: "drained-sa",
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "secrets",
+            subresource: "",
+            namespace: Some("drained-rbac-ns"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&get_secrets_req),
+            "test precondition: the RoleBinding must actually grant access before drain"
+        );
+
+        maybe_finalize_terminating_namespace(&state, "drained-rbac-ns").await;
+
+        assert!(
+            state
+                .store
+                .get(&binding_key)
+                .await
+                .expect("get must not error")
+                .is_none(),
+            "test precondition: the RoleBinding must actually be hard-deleted by the \
+             finalize-drain path"
+        );
+        assert!(
+            !state.rbac_index.is_allowed(&get_secrets_req),
+            "a RoleBinding drained by maybe_finalize_terminating_namespace — the path an \
+             ordinary (non-bootstrap) namespace deletion actually takes via KCM's namespace \
+             controller — must stop granting access immediately, or a regression here leaves \
+             every real namespace deletion re-granting stale RBAC access until the apiserver \
+             restarts"
         );
     }
 
