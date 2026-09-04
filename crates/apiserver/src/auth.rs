@@ -25,8 +25,9 @@ use crate::metrics::record_request_total;
 use crate::node_authz::{self, NodeGraph};
 use crate::rbac::{AuthzRequest, RbacIndex};
 use crate::sa_sig_cache::{self, SigCache};
-use crate::state::FlowControlCache;
+use crate::state::{DiscoveryCache, FlowControlCache};
 use crate::status::Status;
+use crate::types::{ResourceKey, ResourceMeta};
 use crate::util::{rfc3339_to_unix_secs, validate_cli_path};
 
 /// Grace period after `metadata.deletionTimestamp` during which a token bound to that object
@@ -929,6 +930,67 @@ fn unknown_path() -> ParsedPath {
     }
 }
 
+/// Bounds `apiserver_request_total`'s group/version/resource labels to the finite set of
+/// registered resources. `parse_path` copies raw URL segments verbatim, so without this an
+/// unauthenticated request to an arbitrary path like `/apis/$RANDOM/$RANDOM/$RANDOM` mints a
+/// brand-new, permanent Prometheus series per distinct path — ~1 GiB of process memory every
+/// ~16 minutes at 1,000 req/s, with no credential required. Anything not found in the static
+/// built-in registry or the live CRD set collapses to the single literal `"other"` label so
+/// cardinality stays proportional to actually-registered resources, not to attacker input.
+///
+/// Only ever changes the *metric* labels — `parsed`'s raw fields still drive RBAC/routing
+/// unchanged, and non-resource URLs (which `parse_path` already reduces to a fixed empty
+/// triple via `unknown_path`) are left alone by the `non_resource_url` guard at the call site.
+fn metric_resource_labels<'a>(
+    parsed: &'a ParsedPath,
+    resource_registry: &HashMap<ResourceKey, ResourceMeta>,
+    discovery_cache: &DiscoveryCache,
+) -> (&'a str, &'a str, &'a str) {
+    let key = ResourceKey {
+        group: parsed.api_group.clone(),
+        version: parsed.version.clone(),
+        plural: parsed.resource.clone(),
+    };
+    let known = resource_registry.contains_key(&key)
+        || is_known_crd_resource(
+            discovery_cache,
+            &parsed.api_group,
+            &parsed.version,
+            &parsed.resource,
+        );
+    if known {
+        (&parsed.api_group, &parsed.version, &parsed.resource)
+    } else {
+        ("other", "other", "other")
+    }
+}
+
+/// Best-effort, allocation-free check of the live CRD set: does `discovery_cache` (already
+/// kept warm write-through by every CRD create/replace/patch/delete — see
+/// `handlers::discovery::refresh_discovery_cache`) know a served `(group, version, resource)`
+/// matching this triple? A cold cache (nothing has warmed it yet, e.g. moments after boot)
+/// answers `false` rather than reaching into the store — the whole point of this check is to
+/// keep `apiserver_request_total`'s label validation off the store round-trip path, since that
+/// would trade one unauthenticated-DoS vector for another (a store LIST driven by every
+/// unrecognized request).
+fn is_known_crd_resource(
+    discovery_cache: &DiscoveryCache,
+    group: &str,
+    version: &str,
+    resource: &str,
+) -> bool {
+    let groups = discovery_cache.groups.read().unwrap();
+    let Some(groups) = groups.as_ref() else {
+        return false;
+    };
+    groups.iter().any(|g| {
+        g.name == group
+            && g.versions
+                .iter()
+                .any(|v| v.version == version && v.resources.iter().any(|r| r.resource == resource))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Status response helpers
 // ---------------------------------------------------------------------------
@@ -1025,9 +1087,12 @@ pub struct AuthLayer {
     sig_cache: Arc<SigCache>,
     flowcontrol_cache: Arc<FlowControlCache>,
     node_graph: Arc<NodeGraph>,
+    resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
+    discovery_cache: Arc<DiscoveryCache>,
 }
 
 impl AuthLayer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rbac_index: Arc<RbacIndex>,
         token_map: HashMap<String, UserInfo>,
@@ -1036,6 +1101,8 @@ impl AuthLayer {
         sig_cache: Arc<SigCache>,
         flowcontrol_cache: Arc<FlowControlCache>,
         node_graph: Arc<NodeGraph>,
+        resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
+        discovery_cache: Arc<DiscoveryCache>,
     ) -> Self {
         AuthLayer {
             rbac_index,
@@ -1045,6 +1112,8 @@ impl AuthLayer {
             sig_cache,
             flowcontrol_cache,
             node_graph,
+            resource_registry,
+            discovery_cache,
         }
     }
 }
@@ -1062,6 +1131,8 @@ impl<S> Layer<S> for AuthLayer {
             sig_cache: Arc::clone(&self.sig_cache),
             flowcontrol_cache: Arc::clone(&self.flowcontrol_cache),
             node_graph: Arc::clone(&self.node_graph),
+            resource_registry: Arc::clone(&self.resource_registry),
+            discovery_cache: Arc::clone(&self.discovery_cache),
         }
     }
 }
@@ -1080,6 +1151,8 @@ pub struct AuthService<S> {
     sig_cache: Arc<SigCache>,
     flowcontrol_cache: Arc<FlowControlCache>,
     node_graph: Arc<NodeGraph>,
+    resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
+    discovery_cache: Arc<DiscoveryCache>,
 }
 
 /// Classify an already-authorized request against the cached FlowSchemas/
@@ -1159,6 +1232,8 @@ where
         let store = Arc::clone(&self.store);
         let flowcontrol_cache = Arc::clone(&self.flowcontrol_cache);
         let sig_cache = Arc::clone(&self.sig_cache);
+        let resource_registry = Arc::clone(&self.resource_registry);
+        let discovery_cache = Arc::clone(&self.discovery_cache);
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -1468,12 +1543,27 @@ where
                 node_authz::authorize(&authz_req, req.uri().query(), &node_graph, &rbac_index)
                     || rbac_index.is_allowed(&authz_req);
 
+            // Cardinality-bounded labels for apiserver_request_total only — RBAC/routing
+            // above always used the raw `parsed` fields. Non-resource URLs are left alone:
+            // parse_path already reduces them to a fixed empty triple via unknown_path,
+            // which is a single bounded combination already, not attacker-controlled
+            // variance. See metric_resource_labels's doc.
+            let (metric_group, metric_version, metric_resource) = if non_resource_url.is_none() {
+                metric_resource_labels(&parsed, &resource_registry, &discovery_cache)
+            } else {
+                (
+                    parsed.api_group.as_str(),
+                    parsed.version.as_str(),
+                    parsed.resource.as_str(),
+                )
+            };
+
             if !allowed {
                 record_request_total(
                     verb,
-                    &parsed.api_group,
-                    &parsed.version,
-                    &parsed.resource,
+                    metric_group,
+                    metric_version,
+                    metric_resource,
                     scope,
                     "403",
                 );
@@ -1514,9 +1604,9 @@ where
                 };
                 record_request_total(
                     verb,
-                    &parsed.api_group,
-                    &parsed.version,
-                    &parsed.resource,
+                    metric_group,
+                    metric_version,
+                    metric_resource,
                     scope,
                     &code,
                 );
@@ -1586,6 +1676,35 @@ mod tests {
     /// execution order, matching `make_test_store`'s per-test isolation.
     fn make_test_sig_cache() -> SigCache {
         SigCache::new_with_capacity(sa_sig_cache::DEFAULT_CAPACITY)
+    }
+
+    /// A resource registry containing exactly one entry, for tests that assert an exact
+    /// `apiserver_request_total` resource label survives `metric_resource_labels`'s
+    /// cardinality-bounding validation. Without registering the test's made-up resource name
+    /// here, AuthLayer would collapse it to the shared "other" bucket, colliding with every
+    /// other test doing the same and breaking the before/after counter isolation these tests
+    /// rely on to run safely in parallel.
+    fn resource_registry_with(
+        group: &str,
+        version: &str,
+        plural: &str,
+    ) -> Arc<HashMap<ResourceKey, ResourceMeta>> {
+        let mut registry = HashMap::new();
+        registry.insert(
+            ResourceKey {
+                group: group.to_owned(),
+                version: version.to_owned(),
+                plural: plural.to_owned(),
+            },
+            ResourceMeta {
+                kind: plural.to_owned(),
+                #[cfg(test)]
+                namespaced: true,
+                has_status_subresource: false,
+                create_or_update: false,
+            },
+        );
+        Arc::new(registry)
     }
 
     /// Seed a ServiceAccount object so a minted token's bound-object liveness check
@@ -2111,6 +2230,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         // POST (not GET): the 401 short-circuit records to apiserver_request_total under a
@@ -3728,6 +3849,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         // Request as alice, impersonating bob.
@@ -3791,6 +3914,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -3845,6 +3970,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -3940,6 +4067,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -4011,6 +4140,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -4155,6 +4286,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -4230,6 +4363,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -4360,6 +4495,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -4426,6 +4563,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -4479,6 +4618,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -4697,6 +4838,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         // Exactly the request client-go's ConfigMap informer issues: a LIST (not watch)
@@ -4777,6 +4920,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -4851,6 +4996,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
         let req_allowed = Request::builder()
             .method("GET")
@@ -4899,6 +5046,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
         let req_denied = Request::builder()
             .method("GET")
@@ -4999,6 +5148,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                resource_registry_with("", "v1", RESOURCE),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let cases: [(&str, &str, &str); 3] = [
@@ -5116,6 +5267,8 @@ mod tests {
             Arc::new(make_test_sig_cache()),
             Arc::new(FlowControlCache::new()),
             Arc::new(NodeGraph::new()),
+            Arc::new(HashMap::new()),
+            Arc::new(DiscoveryCache::new()),
         )
         .layer(ChunkedWatchService);
 
@@ -5203,6 +5356,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                resource_registry_with("", "v1", RESOURCE),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         // (verb, uri) — LIST mirrors a tombstoned-CRD-group or expired-continue-token
@@ -5277,6 +5432,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let before_401 = REQUEST_TOTAL
@@ -5332,6 +5489,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                resource_registry_with("", "v1", RESOURCE),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let before_403 = REQUEST_TOTAL
@@ -5362,6 +5521,79 @@ mod tests {
              scope and code=403 — otherwise a caller retrying a forbidden call repeatedly is \
              invisible in apiserver_request_total"
         );
+    }
+
+    /// `curl -k https://apiserver/apis/$RANDOM/$RANDOM/$RANDOM` with no credential at all
+    /// authenticates as `system:anonymous` and — before this fix —
+    /// minted a brand-new, permanent `apiserver_request_total` series keyed by the raw
+    /// attacker-chosen path segments. At 1,000 req/s of such requests that is ~1 GiB of
+    /// process memory every ~16 minutes, with zero authentication required. Every
+    /// unrecognized group/version/resource combination must instead collapse into the single,
+    /// bounded `"other"` label — this test fails on revert because the pre-fix code records
+    /// `parsed.resource` (a distinct value per URL) instead of the shared `"other"` bucket, so
+    /// the "other" counter would never move.
+    #[tokio::test]
+    async fn unauthenticated_request_to_unregistered_path_collapses_metric_labels_to_other() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        use crate::metrics::REQUEST_TOTAL;
+
+        // Zero RBAC grants: system:anonymous (no credential presented) is denied, exercising
+        // the exact same label-validation call site a 200 response would.
+        let idx = Arc::new(RbacIndex::new());
+        let app = Router::new()
+            .route(
+                "/apis/{group}/{version}/{resource}",
+                get(|| async { "unreachable: RBAC denies before the handler runs" }),
+            )
+            .layer(AuthLayer::new(
+                idx,
+                HashMap::new(),
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
+            ));
+
+        // Two distinct attacker-controlled paths, as if generated by a `$RANDOM`-driven curl
+        // loop — every one of them must land in the SAME "other" series, not a new one each.
+        for path in [
+            "/apis/totallymadeupgroup1/v7fakeversion/bogusresourceone",
+            "/apis/totallymadeupgroup2/v9fakeversion/bogusresourcetwo",
+        ] {
+            let before_other = REQUEST_TOTAL
+                .with_label_values(&["list", "other", "other", "other", "cluster", "403"])
+                .get();
+
+            let req = Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::FORBIDDEN,
+                "precondition: an anonymous caller with zero RBAC grants must be denied \
+                 before the label-collapsing assertion below is meaningful"
+            );
+
+            let after_other = REQUEST_TOTAL
+                .with_label_values(&["list", "other", "other", "other", "cluster", "403"])
+                .get();
+            assert_eq!(
+                after_other,
+                before_other + 1,
+                "an unrecognized group/version/resource must be recorded under the single \
+                 bounded \"other\" label, not the raw attacker-chosen path segments \
+                 ({path}) — otherwise an unauthenticated caller can mint one permanent \
+                 Prometheus series per distinct URL it invents, exhausting apiserver memory"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -5449,6 +5681,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 make_warm_flowcontrol_cache("noxu"),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -5510,6 +5744,8 @@ mod tests {
                 // match it and must fall through to the catch-all pair.
                 make_warm_flowcontrol_cache("noxu"),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -5569,6 +5805,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
@@ -5633,6 +5871,8 @@ mod tests {
                 Arc::new(make_test_sig_cache()),
                 Arc::new(FlowControlCache::new()),
                 Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
             ));
 
         let req = Request::builder()
