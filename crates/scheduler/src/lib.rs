@@ -1287,17 +1287,22 @@ struct PodListItemStatus {
 /// count (against `status.allocatable.pods`), summed cpu/memory/
 /// ephemeral-storage requests (against `status.allocatable.{cpu,memory,ephemeral-storage}`),
 /// every hostPort already claimed by those pods (the NodePorts predicate's
-/// conflict-detection dimension), and every PVC `pvc_key(namespace, name)`
+/// conflict-detection dimension), every PVC `pvc_key(namespace, name)`
 /// key they reference (the VolumeRestrictions/ReadWriteOncePod predicate's
 /// exclusivity dimension) — namespace-qualified because these pods may span
 /// multiple namespaces, and a bare name can collide with an unrelated PVC
-/// elsewhere in the cluster. Computed by `NodeTally::usage_by_node`.
+/// elsewhere in the cluster — and their already-attached CSI volumes per
+/// driver (the CSILimits predicate's dimension), resolved from assumed AND
+/// bound pods alike via `NodeTally`'s watch-maintained PVC/PV/StorageClass
+/// caches — see `csi_attached_counts`'s own doc comment for why this must
+/// come from the tally, not a live GET. Computed by `NodeTally::usage_by_node`.
 #[derive(Debug, Default, Clone)]
 pub struct NodeUsage {
     pub pod_count: u32,
     pub requests: ResourceRequests,
     pub host_ports: Vec<HostPortClaim>,
     pub pvc_names: Vec<String>,
+    pub csi_attached_counts: std::collections::BTreeMap<String, i64>,
 }
 
 /// A pod already on a node, as needed by preemption victim selection: its
@@ -1348,6 +1353,15 @@ struct TalliedPod {
     namespace: String,
     labels: std::collections::HashMap<String, String>,
     priority: i32,
+    /// `referenced_pvc_names`'s BARE output (unlike `pvc_names` below, never
+    /// `pvc_key`-qualified) — `NodeTally::csi_volume_counts_for` resolves
+    /// these against its watch-maintained PVC cache to compute this pod's
+    /// CSI-driver volume counts fresh, at read time, mirroring upstream's
+    /// CSILimits Filter resolving live from listers rather than baking a
+    /// resolved count in at event-ingestion time (see that method's doc
+    /// comment for why: resolution must tolerate the PVC/PV cache converging
+    /// after this pod's own ADDED event already landed).
+    bare_pvc_names: Vec<String>,
     requests: ResourceRequests,
     host_ports: Vec<HostPortClaim>,
     pvc_names: Vec<String>,
@@ -1466,6 +1480,27 @@ pub struct NodeTally {
     /// Preemption plans deferred until their victims are confirmed
     /// physically gone — see `PreemptionWaiters`.
     waiters: PreemptionWaiters,
+    /// "namespace/name" -> (bound PV name, StorageClass name) — watch-
+    /// maintained by `apply_pvc_event`, mirroring upstream's PVC lister.
+    pvcs: std::collections::HashMap<String, PvcVolumeInfo>,
+    /// PV name -> CSI driver (`spec.csi.driver`) — watch-maintained by
+    /// `apply_pv_event`, mirroring upstream's PV lister.
+    pv_csi_drivers: std::collections::HashMap<String, String>,
+    /// StorageClass name -> provisioner — watch-maintained by
+    /// `apply_storage_class_event`, mirroring upstream's StorageClass lister.
+    sc_provisioners: std::collections::HashMap<String, String>,
+    /// Node name -> per-driver `CSINode.spec.drivers[].allocatable.count` —
+    /// watch-maintained by `apply_csi_node_event`, mirroring upstream's
+    /// CSINode lister.
+    csi_node_limits: std::collections::HashMap<String, std::collections::BTreeMap<String, i64>>,
+}
+
+/// A PVC's fields needed to resolve its backing CSI driver — see
+/// `NodeTally::resolve_csi_driver`.
+#[derive(Debug, Clone, Default)]
+struct PvcVolumeInfo {
+    volume_name: String,
+    storage_class_name: Option<String>,
 }
 
 impl NodeTally {
@@ -1512,13 +1547,14 @@ impl NodeTally {
         let priority = watch_event.object.spec.priority.unwrap_or(0);
         let requests = pod_total_requests(&watch_event.object.spec);
         let host_ports = container_host_ports(&watch_event.object.spec.containers);
-        let pvc_names: Vec<String> = referenced_pvc_names(
+        let bare_pvc_names = referenced_pvc_names(
             &name,
             watch_event.object.spec.volumes.as_deref().unwrap_or(&[]),
-        )
-        .into_iter()
-        .map(|n| pvc_key(&namespace, &n))
-        .collect();
+        );
+        let pvc_names: Vec<String> = bare_pvc_names
+            .iter()
+            .map(|n| pvc_key(&namespace, n))
+            .collect();
         let node_name = watch_event.object.spec.node_name.filter(|n| !n.is_empty());
         match node_name {
             Some(node_name) if !terminal => {
@@ -1529,6 +1565,7 @@ impl NodeTally {
                         namespace,
                         labels,
                         priority,
+                        bare_pvc_names,
                         requests,
                         host_ports,
                         pvc_names,
@@ -1598,6 +1635,7 @@ impl NodeTally {
         labels: std::collections::HashMap<String, String>,
         pvc_names: Vec<String>,
     ) {
+        let bare_pvc_names = pvc_names.clone();
         let pvc_names = pvc_names
             .into_iter()
             .map(|n| pvc_key(namespace, &n))
@@ -1609,6 +1647,7 @@ impl NodeTally {
                 namespace: namespace.to_owned(),
                 labels,
                 priority,
+                bare_pvc_names,
                 requests,
                 host_ports,
                 pvc_names,
@@ -1697,8 +1736,9 @@ impl NodeTally {
     }
 
     /// Non-terminal pod count, summed resource requests, claimed hostPorts,
-    /// and referenced PVC names per node — the shape
-    /// `select_node_with_capacity` consumes in place of a live GET.
+    /// referenced PVC names, and already-attached CSI volume counts per
+    /// node — the shape `select_node_with_capacity` consumes in place of a
+    /// live GET.
     pub fn usage_by_node(&self) -> std::collections::HashMap<String, NodeUsage> {
         let mut usage: std::collections::HashMap<String, NodeUsage> =
             std::collections::HashMap::new();
@@ -1708,8 +1748,239 @@ impl NodeTally {
             entry.requests = entry.requests.clone() + pod.requests.clone();
             entry.host_ports.extend(pod.host_ports.iter().cloned());
             entry.pvc_names.extend(pod.pvc_names.iter().cloned());
+            for (driver, count) in self.csi_volume_counts_for(&pod.namespace, &pod.bare_pvc_names)
+            {
+                *entry.csi_attached_counts.entry(driver).or_insert(0) += count;
+            }
         }
         usage
+    }
+
+    /// Resolve the CSI driver backing `pvc_name` (in `namespace`) from the
+    /// watch-maintained PVC/PV/StorageClass caches: prefer its already-bound
+    /// PV's `spec.csi.driver`, falling back to its StorageClass's
+    /// `provisioner` when unbound — mirrors the async `resolve_csi_driver`
+    /// this replaced, but zero I/O, so it is safe to call while holding
+    /// `NodeTally`'s own lock. A PVC absent from the cache (not yet
+    /// observed by `apply_pvc_event`, or genuinely gone) resolves to `None`
+    /// exactly like a 404 did for the old live-GET version — such a volume
+    /// is simply not counted, never fail-closed.
+    fn resolve_csi_driver(&self, namespace: &str, pvc_name: &str) -> Option<String> {
+        let pvc = self.pvcs.get(&pvc_key(namespace, pvc_name))?;
+        if !pvc.volume_name.is_empty() {
+            if let Some(driver) = self.pv_csi_drivers.get(&pvc.volume_name) {
+                return Some(driver.clone());
+            }
+        }
+        let sc_name = pvc.storage_class_name.as_deref()?;
+        self.sc_provisioners.get(sc_name).cloned()
+    }
+
+    /// Count how many CSI volumes `pvc_names` (deduplicated — the same PVC
+    /// mounted twice by one pod is one volume) resolve to, grouped by driver
+    /// name — the CSILimits predicate's per-driver volume count, resolved
+    /// fresh from the watch-maintained caches every call (mirroring
+    /// upstream's CSILimits Filter resolving live from listers at filter
+    /// time, rather than baking a resolved count into `TalliedPod` at
+    /// event-ingestion time — the PVC/PV cache may still converge after a
+    /// referencing pod's own ADDED event lands, and re-resolving here means
+    /// that catches up automatically instead of leaving a permanent
+    /// undercount). Called both by `usage_by_node` (already-attached counts,
+    /// assumed AND bound pods alike) and by `main.rs`'s scheduling flow (the
+    /// PENDING pod's own counts, via `csi_volume_counts_for`'s `pub`
+    /// re-export below).
+    fn count_csi_volumes(
+        &self,
+        namespace: &str,
+        pvc_names: &[String],
+    ) -> std::collections::BTreeMap<String, i64> {
+        let mut counts = std::collections::BTreeMap::new();
+        let mut seen = std::collections::HashSet::new();
+        for pvc_name in pvc_names {
+            if !seen.insert(pvc_name.clone()) {
+                continue;
+            }
+            if let Some(driver) = self.resolve_csi_driver(namespace, pvc_name) {
+                *counts.entry(driver).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    /// `count_csi_volumes`, `pub` so `main.rs` can resolve a PENDING pod's
+    /// own CSI volume counts (`PendingPod::csi_volume_counts`) the same way
+    /// `usage_by_node` resolves already-attached ones — see that function's
+    /// doc comment for why both must share one resolution path instead of
+    /// this one reading the watch cache and another still issuing a live
+    /// PVC/PV/StorageClass GET chain.
+    pub fn csi_volume_counts_for(
+        &self,
+        namespace: &str,
+        pvc_names: &[String],
+    ) -> std::collections::BTreeMap<String, i64> {
+        self.count_csi_volumes(namespace, pvc_names)
+    }
+
+    /// Already-attached CSI volume counts per driver for every tallied
+    /// (assumed AND bound) pod on `node_name` — `find_preemption_candidate`'s
+    /// counterpart to `usage_by_node`'s per-node fold, needed separately
+    /// because that search reads `pods_on` per candidate node rather than a
+    /// single upfront `usage_by_node` snapshot.
+    pub fn csi_attached_counts(&self, node_name: &str) -> std::collections::BTreeMap<String, i64> {
+        let mut counts = std::collections::BTreeMap::new();
+        for pod in self.pods.values().filter(|p| p.node_name == node_name) {
+            for (driver, count) in self.count_csi_volumes(&pod.namespace, &pod.bare_pvc_names) {
+                *counts.entry(driver).or_insert(0) += count;
+            }
+        }
+        counts
+    }
+
+    /// Every node's advertised per-driver CSI attach limit
+    /// (`CSINode.spec.drivers[].allocatable.count`), watch-maintained by
+    /// `apply_csi_node_event` — the static half of the CSILimits fit check;
+    /// `select_and_reserve_node`/`find_preemption_plan` net this against
+    /// `usage_by_node`/`csi_attached_counts`'s dynamic, tally-derived count
+    /// under the SAME lock acquisition, closing the read-after-write race a
+    /// separate pre-lock live GET reopened (see this struct's own doc
+    /// comment).
+    pub fn csi_driver_limits_by_node(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::BTreeMap<String, i64>> {
+        self.csi_node_limits.clone()
+    }
+
+    /// Update the PVC cache from one raw PVC watch event — see `pvcs`'s doc
+    /// comment. A malformed event, or one with no name, is silently ignored
+    /// exactly like `apply_event`'s pod handling (a bookmark event has no
+    /// usable object, not a real change to react to).
+    pub fn apply_pvc_event(&mut self, event: &Value) {
+        let Ok(watch_event) = WatchEvent::<PvcObject>::deserialize(event) else {
+            return;
+        };
+        let name = watch_event.object.metadata.name.clone().unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+        let namespace = watch_event
+            .object
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_owned());
+        let key = pvc_key(&namespace, &name);
+        if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+            self.pvcs.remove(&key);
+            return;
+        }
+        self.pvcs.insert(
+            key,
+            PvcVolumeInfo {
+                volume_name: watch_event.object.spec.volume_name,
+                storage_class_name: watch_event.object.spec.storage_class_name,
+            },
+        );
+    }
+
+    /// Update the PV cache from one raw PersistentVolume watch event — see
+    /// `pv_csi_drivers`'s doc comment.
+    pub fn apply_pv_event(&mut self, event: &Value) {
+        let Ok(watch_event) = WatchEvent::<PvObject>::deserialize(event) else {
+            return;
+        };
+        let name = watch_event.object.metadata.name.unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+        if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+            self.pv_csi_drivers.remove(&name);
+            return;
+        }
+        match watch_event
+            .object
+            .spec
+            .csi
+            .map(|c| c.driver)
+            .filter(|d| !d.is_empty())
+        {
+            Some(driver) => {
+                self.pv_csi_drivers.insert(name, driver);
+            }
+            None => {
+                self.pv_csi_drivers.remove(&name);
+            }
+        }
+    }
+
+    /// Update the StorageClass cache from one raw StorageClass watch event —
+    /// see `sc_provisioners`'s doc comment.
+    pub fn apply_storage_class_event(&mut self, event: &Value) {
+        let Ok(watch_event) = WatchEvent::<StorageClassObject>::deserialize(event) else {
+            return;
+        };
+        let name = watch_event.object.metadata.name.unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+        if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+            self.sc_provisioners.remove(&name);
+            return;
+        }
+        if watch_event.object.provisioner.is_empty() {
+            self.sc_provisioners.remove(&name);
+        } else {
+            self.sc_provisioners.insert(name, watch_event.object.provisioner);
+        }
+    }
+
+    /// Update the CSINode cache from one raw CSINode watch event — see
+    /// `csi_node_limits`'s doc comment.
+    pub fn apply_csi_node_event(&mut self, event: &Value) {
+        let Ok(watch_event) = WatchEvent::<CsiNodeItem>::deserialize(event) else {
+            return;
+        };
+        let name = watch_event.object.metadata.name;
+        if name.is_empty() {
+            return;
+        }
+        if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+            self.csi_node_limits.remove(&name);
+            return;
+        }
+        let limits: std::collections::BTreeMap<String, i64> = watch_event
+            .object
+            .spec
+            .drivers
+            .into_iter()
+            .filter_map(|d| d.allocatable.and_then(|a| a.count).map(|c| (d.name, c)))
+            .collect();
+        self.csi_node_limits.insert(name, limits);
+    }
+
+    /// Drop the PVC cache — called on that watch's own reconnect, for the
+    /// same reason `clear` drops `pods` on the pod watch's reconnect: a PVC
+    /// deleted while this watch was disconnected would otherwise leave a
+    /// phantom entry the fresh `sendInitialEvents=true` relist never
+    /// corrects (it only re-adds what still exists). Scoped to just this
+    /// cache — a PVC watch reconnect says nothing about whether the PV/
+    /// StorageClass/CSINode watches (independent connections) also dropped.
+    pub fn clear_pvc_cache(&mut self) {
+        self.pvcs.clear();
+    }
+
+    /// Drop the PV cache — see `clear_pvc_cache`'s doc comment.
+    pub fn clear_pv_cache(&mut self) {
+        self.pv_csi_drivers.clear();
+    }
+
+    /// Drop the StorageClass cache — see `clear_pvc_cache`'s doc comment.
+    pub fn clear_storage_class_cache(&mut self) {
+        self.sc_provisioners.clear();
+    }
+
+    /// Drop the CSINode cache — see `clear_pvc_cache`'s doc comment.
+    pub fn clear_csi_node_cache(&mut self) {
+        self.csi_node_limits.clear();
     }
 
     /// Every tallied pod currently on `node_name`, for preemption victim
@@ -3608,6 +3879,14 @@ struct PvcObject {
 
 #[derive(Debug, Default, Deserialize)]
 struct PvcMetadata {
+    /// Only populated when this struct backs a watch event (`WatchEvent<PvcObject>`
+    /// in `NodeTally::apply_pvc_event`) — a single-PVC-by-name GET already
+    /// knows its own name/namespace from the request URL, so those call
+    /// sites never read these two fields.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
     #[serde(default)]
     annotations: std::collections::HashMap<String, String>,
 }
@@ -3627,6 +3906,9 @@ struct PvcSpecView {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StorageClassObject {
+    /// See `PvObject::metadata`'s doc comment — same reuse, same reason.
+    #[serde(default)]
+    metadata: ClusterScopedMetadata,
     volume_binding_mode: Option<String>,
     #[serde(default)]
     provisioner: String,
@@ -3901,8 +4183,24 @@ fn pv_path(name: &str) -> String {
 
 #[derive(Debug, Default, Deserialize)]
 struct PvObject {
+    /// Only populated when this struct backs a watch event
+    /// (`WatchEvent<PvObject>` in `NodeTally::apply_pv_event`) — a
+    /// single-PV-by-name GET already knows its own name from the request
+    /// URL and never reads this.
+    #[serde(default)]
+    metadata: ClusterScopedMetadata,
     #[serde(default)]
     spec: PvSpecView,
+}
+
+/// A cluster-scoped object's name, as carried by a watch event's `object`
+/// (a single-object-by-name GET already knows the name from its own request
+/// URL) — shared by `PvObject` and `StorageClassObject`, both cluster-scoped
+/// resources `NodeTally` watches for CSI-driver resolution.
+#[derive(Debug, Default, Deserialize)]
+struct ClusterScopedMetadata {
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
