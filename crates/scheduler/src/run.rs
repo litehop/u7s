@@ -1076,6 +1076,40 @@ mod tests {
         );
     }
 
+    /// The 4 secondary cache-maintenance watch paths (PVC/PV/StorageClass/
+    /// CSINode) need the exact same two query params as `POD_WATCH_PATH`,
+    /// for the exact same reasons (see its own two tests above):
+    /// `allowWatchBookmarks=true` avoids a spurious reconnect every 5 min on
+    /// an idle cluster, and `sendInitialEvents=true` makes every (re)connect
+    /// relist CURRENT state instead of replaying stale ring-buffer history —
+    /// without it, `NodeTally::apply_pvc_event`/etc. would see each PVC/PV/
+    /// StorageClass/CSINode's original creation event on every ~30-min
+    /// forced reconnect, which is harmless here (these events are idempotent
+    /// upserts, unlike the pod watch's bind-reissue bug) but still wastes
+    /// apiserver load for no reason.
+    #[test]
+    fn secondary_cache_watch_paths_request_bookmarks_and_initial_events() {
+        for path in [
+            PVC_WATCH_PATH,
+            PV_WATCH_PATH,
+            STORAGE_CLASS_WATCH_PATH,
+            CSI_NODE_WATCH_PATH,
+        ] {
+            assert!(
+                path.contains("allowWatchBookmarks=true"),
+                "cache watch path must request allowWatchBookmarks=true to \
+                 avoid spurious idle-timeout reconnects on a quiet cluster; \
+                 got: {path}"
+            );
+            assert!(
+                path.contains("sendInitialEvents=true"),
+                "cache watch path must request sendInitialEvents=true so a \
+                 reconnect relists CURRENT state instead of replaying stale \
+                 historical events; got: {path}"
+            );
+        }
+    }
+
     /// Poll `cond` up to a 2s budget, yielding to the runtime between checks
     /// so the spawned tasks `handle_pod_event` fires off actually get to run
     /// on this test's single-threaded executor. Panics with `what` if the
