@@ -5,6 +5,7 @@ use axum::{
     Extension, Json,
 };
 use bytes::Bytes;
+use std::collections::HashSet;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
@@ -952,6 +953,25 @@ async fn cascade_delete_namespace_resources<S: Store>(
             if let Some(ref rbac_key) = rbac_key {
                 state.rbac_index.remove_object(rbac_key);
             }
+            // A CR hard-deleted by the namespace cascade must lose its cr_conversion_cache
+            // entries immediately, exactly like every other CR hard-delete site
+            // (`evict_cr_conversion_cache` in handlers/cr.rs) — otherwise every CR destroyed
+            // by a namespace delete leaves its converted body resident in the cache forever,
+            // since a deleted object's resourceVersion can never be looked up again. Calling
+            // this unconditionally for every hard-deleted object (not just CRs) is safe and
+            // cheap: only a CR's own rv was ever inserted into this cache, so it's a no-op
+            // retain for every other resource type.
+            // A CR hard-deleted by the namespace cascade must lose its cr_conversion_cache
+            // entries immediately, exactly like every other CR hard-delete site
+            // (`evict_cr_conversion_cache` in handlers/cr.rs) — otherwise every CR destroyed
+            // by a namespace delete leaves its converted body resident in the cache forever,
+            // since a deleted object's resourceVersion can never be looked up again. Calling
+            // this unconditionally for every hard-deleted object (not just CRs) is safe and
+            // cheap: only a CR's own rv was ever inserted into this cache, so it's a no-op
+            // retain for every other resource type.
+            if let Some(rv) = val["metadata"]["resourceVersion"].as_str() {
+                state.cr_conversion_cache.invalidate_by_rv(rv);
+            }
             if let Some(pod_name) = obj_stored
                 .key
                 .strip_prefix(&format!("/registry/pods/{namespace}/"))
@@ -1123,6 +1143,17 @@ pub(crate) async fn maybe_finalize_terminating_namespace<S: Store>(
             if let Some(rbac_key) = rbac_namespaced_index_key(namespace, &obj.key) {
                 state.rbac_index.remove_object(&rbac_key);
             }
+            // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a CR
+            // hard-deleted here must lose its cr_conversion_cache entries immediately, or it
+            // stays resident forever since its resourceVersion can never be looked up again.
+            // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a CR
+            // hard-deleted here must lose its cr_conversion_cache entries immediately, or it
+            // stays resident forever since its resourceVersion can never be looked up again.
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+                if let Some(rv) = val["metadata"]["resourceVersion"].as_str() {
+                    state.cr_conversion_cache.invalidate_by_rv(rv);
+                }
+            }
             // Same rationale for pods: a pod hard-deleted here must lose its
             // node-authorization graph edges immediately.
             if let Some(pod_name) = obj
@@ -1177,9 +1208,26 @@ async fn delete_namespace_scoped_crds<S: Store>(state: &AppState<S>, namespace_n
             tracing::warn!("cascade-delete CRD {crd_name} for namespace {namespace_name}: {e}");
             continue;
         }
-        let tombstone_key = crate::handlers::crd::deleted_group_tombstone_key(group);
+
+        // This is a direct store write on the CRD key, not a call into crd::delete_crd — so it
+        // must run the exact same cache eviction crd::delete_crd runs after its own delete, or
+        // find_crd (cr.rs) keeps serving the pre-delete CrContext/schema forever (its cache
+        // check has no tombstone/404 fallback to fall through to).
+        let (group, versions, plural, resource_version) =
+            crate::handlers::crd::crd_cache_identity(&crd);
+        crate::handlers::crd::evict_cr_schema_cache(state, &group, &versions, &resource_version);
+        crate::handlers::crd::evict_cr_context_cache(state, &group, &plural, &versions);
+        if !versions.is_empty() {
+            let target_api_versions: HashSet<String> =
+                versions.iter().map(|v| format!("{group}/{v}")).collect();
+            state
+                .cr_conversion_cache
+                .invalidate_by_target_api_versions(&target_api_versions);
+        }
+
+        let tombstone_key = crate::handlers::crd::deleted_group_tombstone_key(&group);
         let tombstone_val =
-            serde_json::to_vec(&serde_json::json!({ "group": group })).unwrap_or_default();
+            serde_json::to_vec(&serde_json::json!({ "group": &group })).unwrap_or_default();
         let _ = state
             .store
             .put(&tombstone_key, bytes::Bytes::from(tombstone_val), None)
@@ -3999,6 +4047,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_namespace_hard_delete_evicts_cr_conversion_cache_so_converted_bodies_do_not_leak(
+    ) {
+        // Regression test: cascade_delete_namespace_resources hard-deletes a CR's store
+        // object but, before this fix, never called cr_conversion_cache.invalidate_by_rv —
+        // so a webhook-converted body cached for that CR's resourceVersion (by any LIST or
+        // watcher that observed it at a non-storage served version) stayed resident in the
+        // cache forever, since a deleted object's resourceVersion can never be looked up
+        // again. Every namespace delete containing conversion-webhook CRs would leak one
+        // entry per (write, watched target version) for the life of the process.
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        let ns_key = crate::keys::cluster_object_key("namespaces", "cr-cache-ns");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "cr-cache-ns", "uid": "00000000-0000-0000-0000-0000000000dd" },
+            "status": { "phase": "Active" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("namespace write must succeed");
+
+        // A CR whose current write has a webhook-converted body cached under its own
+        // resourceVersion, exactly what a watcher/LIST at a different served version would
+        // have produced.
+        let cr_key =
+            crate::keys::group_object_key("example.io", "widgets", Some("cr-cache-ns"), "gadget");
+        let cr_body = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "gadget", "namespace": "cr-cache-ns" }
+        });
+        state
+            .store
+            .put(&cr_key, bytes::Bytes::from(cr_body.to_string()), Some(0))
+            .await
+            .expect("CR write must succeed");
+        // The store stamps its own global, never-reused resourceVersion on every write
+        // (`stamp_resource_version`) — the cache key must use that actual stamped value,
+        // not whatever (if anything) the caller wrote into the body.
+        let stored_cr = state
+            .store
+            .get(&cr_key)
+            .await
+            .expect("get must not error")
+            .expect("CR must exist after put");
+        let stored_cr_val: serde_json::Value = serde_json::from_slice(&stored_cr.value).unwrap();
+        let cr_rv = stored_cr_val["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("store must stamp resourceVersion")
+            .to_string();
+
+        let cache_key = (cr_rv, "example.io/v2".to_string());
+        state.cr_conversion_cache.insert(
+            cache_key.clone(),
+            &serde_json::json!({
+                "apiVersion": "example.io/v2",
+                "kind": "Widget",
+                "metadata": { "name": "gadget", "namespace": "cr-cache-ns", "resourceVersion": "77" }
+            }),
+        );
+        assert!(
+            state.cr_conversion_cache.contains(&cache_key),
+            "test precondition: the converted body must actually be cached before deletion"
+        );
+
+        delete_namespace(
+            State(state.clone()),
+            Path("cr-cache-ns".to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("namespace delete must succeed");
+
+        assert!(
+            !state.cr_conversion_cache.contains(&cache_key),
+            "hard-deleting a namespace's CR must evict its cr_conversion_cache entries \
+             immediately — otherwise every CR destroyed by a namespace delete leaves its \
+             converted body resident in the cache forever, an unbounded leak on any cluster \
+             using conversion webhooks"
+        );
+    }
+
+    // HIGH-severity regression: delete_namespace_scoped_crds deletes a namespace-scoped CRD via
+    // a direct store write, not crd::delete_crd — so unlike that handler it must run the exact
+    // same cache eviction itself, or find_crd's cache check (which runs BEFORE any
+    // tombstone/404 fallback) keeps resolving CR requests against a CRD that no longer exists,
+    // indefinitely, silently mis-validating every CR write against a deleted schema.
+    #[tokio::test]
+    async fn delete_namespace_scoped_crds_evicts_cr_context_cache_so_find_crd_does_not_serve_a_deleted_crd(
+    ) {
+        use crate::handlers::{cr::find_crd, crd};
+
+        let state = make_state();
+        let group = "stable.nscrd-test.example.com";
+
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": { "name": format!("crontabs.{group}") },
+                        "spec": {
+                            "group": group,
+                            "names": {
+                                "plural": "crontabs",
+                                "singular": "crontab",
+                                "kind": "CronTab",
+                                "listKind": "CronTabList"
+                            },
+                            "scope": "Namespaced",
+                            "versions": [{ "name": "v1", "served": true, "storage": true }]
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .is_ok(),
+            "install namespace-scoped CRD whose group embeds the namespace name"
+        );
+
+        find_crd(&state, group, "v1", "crontabs")
+            .await
+            .expect("CRD must be found right after installing it, warming cr_context_cache");
+
+        delete_namespace_scoped_crds(&state, "nscrd-test").await;
+
+        let err = match find_crd(&state, group, "v1", "crontabs").await {
+            Ok(_) => panic!(
+                "find_crd must error once delete_namespace_scoped_crds removed the CRD — a \
+                 stale cached CrContext would keep validating CR writes against a schema for a \
+                 CRD that no longer exists"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GONE,
+            "must be 410 Gone (delete_namespace_scoped_crds writes a group tombstone) rather \
+             than a stale Ok(ctx) or an uncached 404"
+        );
+    }
+
+    #[tokio::test]
     async fn maybe_finalize_terminating_namespace_revokes_node_graph_edges_for_drained_pods() {
         // Regression test for the OTHER (and more common) namespace-deletion path: a
         // real user namespace always carries spec.finalizers=["kubernetes"] at creation, so
@@ -4189,6 +4392,104 @@ mod tests {
              controller — must stop granting access immediately, or a regression here leaves \
              every real namespace deletion re-granting stale RBAC access until the apiserver \
              restarts"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_finalize_terminating_namespace_evicts_cr_conversion_cache_for_drained_crs() {
+        // Companion to the delete_namespace test above, for the "more common" real-namespace
+        // path: maybe_finalize_terminating_namespace hard-deletes a drained CR's store object
+        // but, before this fix, never evicted its cr_conversion_cache entries — leaving a
+        // webhook-converted body resident forever since a deleted object's resourceVersion
+        // can never be looked up again.
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        let ns_key = crate::keys::cluster_object_key("namespaces", "drained-cr-ns");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "drained-cr-ns",
+                "uid": "00000000-0000-0000-0000-0000000000ee",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": [] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("namespace write must succeed");
+
+        let cr_key = crate::keys::group_object_key(
+            "example.io",
+            "widgets",
+            Some("drained-cr-ns"),
+            "gadget2",
+        );
+        let cr_body = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "gadget2", "namespace": "drained-cr-ns" }
+        });
+        state
+            .store
+            .put(&cr_key, bytes::Bytes::from(cr_body.to_string()), Some(0))
+            .await
+            .expect("CR write must succeed");
+        // The store stamps its own global, never-reused resourceVersion on every write
+        // (`stamp_resource_version`) — the cache key must use that actual stamped value.
+        let stored_cr = state
+            .store
+            .get(&cr_key)
+            .await
+            .expect("get must not error")
+            .expect("CR must exist after put");
+        let stored_cr_val: serde_json::Value = serde_json::from_slice(&stored_cr.value).unwrap();
+        let cr_rv = stored_cr_val["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("store must stamp resourceVersion")
+            .to_string();
+
+        let cache_key = (cr_rv, "example.io/v2".to_string());
+        state.cr_conversion_cache.insert(
+            cache_key.clone(),
+            &serde_json::json!({
+                "apiVersion": "example.io/v2",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "gadget2",
+                    "namespace": "drained-cr-ns",
+                    "resourceVersion": "88"
+                }
+            }),
+        );
+        assert!(
+            state.cr_conversion_cache.contains(&cache_key),
+            "test precondition: the converted body must actually be cached before drain"
+        );
+
+        maybe_finalize_terminating_namespace(&state, "drained-cr-ns").await;
+
+        assert!(
+            state
+                .store
+                .get(&cr_key)
+                .await
+                .expect("get must not error")
+                .is_none(),
+            "test precondition: the CR must actually be hard-deleted by the finalize-drain path"
+        );
+        assert!(
+            !state.cr_conversion_cache.contains(&cache_key),
+            "a CR drained by maybe_finalize_terminating_namespace — the path an ordinary \
+             (non-bootstrap) namespace deletion actually takes via KCM's namespace controller \
+             — must evict its cr_conversion_cache entries immediately, or a regression here \
+             leaks a converted body per (write, watched target version) on every real \
+             namespace deletion involving conversion webhooks"
         );
     }
 

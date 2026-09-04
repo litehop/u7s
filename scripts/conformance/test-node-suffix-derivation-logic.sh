@@ -113,7 +113,7 @@ assert_true "'lima-node' primary and 'lima-node-smoke' never collide (non-number
   test "$(node_suffix_for lima-node)" != "$(node_suffix_for lima-node-smoke)"
 
 # ---------------------------------------------------------------------------
-# Standard 2-node pairing (dispatch-prompt-template.md's documented "most
+# Standard 2-node pairing (mayor-dispatch-template.md's documented "most
 # commonly joined via --extra-node" case): a lima-start.sh primary on
 # lima-node-2 alongside an add-node.sh join of lima-node-3. Both sides must
 # independently land on the SAME suffix a bare `--vm lima-node-N` invocation
@@ -128,7 +128,7 @@ assert_true "standard pairing: lima-node-2 primary + lima-node-3 join never coll
   test "$PRIMARY_SUFFIX" != "$JOINED_SUFFIX"
 
 # Higher numbered slots (lima-node-4/-5, also listed as --extra-node-joinable
-# in dispatch-prompt-template.md's Lima VM protocol table) must be just as
+# in mayor-dispatch-template.md's Lima VM protocol table) must be just as
 # collision-free as the -2/-3 pair above -- the derivation is a general
 # VM_NAME->suffix rule, not special-cased to slots 2/3 only.
 assert_true "lima-node-4 primary + lima-node-5 join never collide" \

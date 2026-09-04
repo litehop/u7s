@@ -34,7 +34,7 @@ A Kubernetes-compatible control plane implementation in Rust, targeting severely
 
 Settled component decisions (state store, container runtime, scheduler, CRD validation, networking, TLS) live in `roadmap.md`'s Architecture summary table, each linking to its own doc under `docs/decisions/`. Not duplicated here — see that table for the current list and rationale.
 
-## Worker preamble addendum (append to the common preamble in docs/the-mayor-method/dispatch-prompt-template.md)
+## Worker preamble addendum (append to the common preamble in ai/prompts/mayor-dispatch-template.md)
 
 ```
 Domain: Kubernetes-compatible control plane in Rust.

@@ -1,6 +1,6 @@
 ---
 name: north-star
-description: u7s's durable north star, decision framework, and guiding principles. Changes here need explicit operator sign-off. Current status, measurements, and priorities live in roadmap.md; broader founding/technical context lives in project-context.md; mayor/worker operating process (dispatch preamble, tooling rules, VM protocol) lives in docs/the-mayor-method/dispatch-prompt-template.md; project stance and policy are tracked as bd memories (see `bd memories "project stance"`).
+description: u7s's durable north star, decision framework, and guiding principles. Changes here need explicit operator sign-off. Current status, measurements, and priorities live in roadmap.md; broader founding/technical context lives in project-context.md; mayor/worker operating process (dispatch preamble, tooling rules, VM protocol) lives in ai/prompts/mayor-dispatch-template.md; project stance and policy are tracked as bd memories (see `bd memories "project stance"`).
 metadata:
   type: project
 as_of: 2026-08-13

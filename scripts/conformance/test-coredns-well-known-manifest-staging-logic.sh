@@ -7,7 +7,8 @@
 # `include_bytes!` bundle onto bootstrap_apply::apply_well_known_manifest_dir
 # only taught scripts/install.sh (production) to copy manifests/*.yaml into
 # --manifest-dir. scripts/u7s-start.sh (local dev-loop + every
-# scripts/conformance/*.sh flow) and .github/workflows/e2e-focus.yaml (CI) both
+# scripts/conformance/*.sh flow) and the e2e-focus CI composite action
+# (.github/actions/e2e-focus-run) both
 # start u7s-apiserver directly and never staged anything into their own
 # --manifest-dir, so apply_well_known_manifest_dir found an empty (or
 # nonexistent) directory and CoreDNS silently stopped being applied everywhere
@@ -35,7 +36,7 @@ assert() {
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 U7S_START="$REPO/scripts/u7s-start.sh"
-E2E_FOCUS_WORKFLOW="$REPO/.github/workflows/e2e-focus.yaml"
+E2E_FOCUS_ACTION="$REPO/.github/actions/e2e-focus-run/action.yml"
 
 assert "manifests/coredns.yaml exists in the repo (the file every harness below must stage)" \
   "$([ -f "$REPO/manifests/coredns.yaml" ] && echo 1 || echo 0)"
@@ -62,15 +63,15 @@ assert "the staging sequence leaves a non-empty coredns.yaml in the manifest dir
   "$([ -s "$SCRATCH_MANIFEST_DIR/coredns.yaml" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# .github/workflows/e2e-focus.yaml: structural check that CI stages the same
-# file AND actually points u7s-apiserver's --manifest-dir at it -- staging
-# alone is not enough if the flag pointing the scanner there is missing.
+# .github/actions/e2e-focus-run: structural check that the CI composite action
+# stages the same file AND actually points u7s-apiserver's --manifest-dir at it
+# -- staging alone is not enough if the flag pointing the scanner there is missing.
 # ---------------------------------------------------------------------------
-assert "e2e-focus.yaml stages manifests/coredns.yaml into its apiserver's manifest dir" \
-  "$(grep -qF 'cp manifests/coredns.yaml "$WORKDIR/manifests/"' "$E2E_FOCUS_WORKFLOW" && echo 1 || echo 0)"
+assert "the e2e-focus composite action stages manifests/coredns.yaml into its apiserver's manifest dir" \
+  "$(grep -qF 'cp manifests/coredns.yaml "$WORKDIR/manifests/"' "$E2E_FOCUS_ACTION" && echo 1 || echo 0)"
 
-assert "e2e-focus.yaml passes --manifest-dir to u7s-apiserver so the staged file is scanned" \
-  "$(grep -qF -- '--manifest-dir "$WORKDIR/manifests"' "$E2E_FOCUS_WORKFLOW" && echo 1 || echo 0)"
+assert "the e2e-focus composite action passes --manifest-dir to u7s-apiserver so the staged file is scanned" \
+  "$(grep -qF -- '--manifest-dir "$WORKDIR/manifests"' "$E2E_FOCUS_ACTION" && echo 1 || echo 0)"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"

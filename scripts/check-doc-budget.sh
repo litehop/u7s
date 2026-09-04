@@ -9,7 +9,7 @@
 # (60 chars/line), so a 45-line budget would have passed the longer document
 # and failed the shorter one. `wc -w` is invariant under reflow, line joining,
 # indentation and blank lines. It is also the unit the rest of the project
-# already uses (dispatch-prompt-template.md caps returns at 300/400 words),
+# already uses (mayor-dispatch-template.md caps returns at 300/400 words),
 # and at ~1.3 tokens/word it tracks the cost this gate exists to control.
 #
 # RATCHET, not ceiling: a file over budget may shrink or hold, never grow.
@@ -37,7 +37,7 @@ BASE=$(git merge-base "$BASE_REF" HEAD)
 # of ADRs that work (crio 225, webhook 235, sqlite 263, rust-api 282,
 # custom-bin 306), not to the corpus mean — 400 is ~30% above that cluster.
 #
-# ai/dashboard.md also carries a ~40-line ceiling in bootstrap.md. That rule
+# ai/dashboard.md also carries a ~40-line ceiling in mayor-bootstrap.md. That rule
 # is about fitting one screen so a returning operator re-orients fast; this
 # one is about content volume. They are complementary — a dashboard reflowed
 # to 20 long lines would satisfy the line rule and still be bloated.
