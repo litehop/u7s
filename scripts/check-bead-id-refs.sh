@@ -43,10 +43,20 @@
 #     from "real bead ID that will rot" -- only an exact-token allowlist
 #     can. MAYOR_TICK_ALLOWED_TOKENS below re-scans just these two files
 #     and only tolerates the specific known-safe tokens (the "mayor-tick"
-#     self-reference, the prose adjective "mayor-owned", and this test
-#     file's synthetic bead-ID-shaped fixtures -- same rationale as
-#     test-critical-reviewer-hook.sh's fixture above); anything else still
-#     fails the guard.
+#     self-reference, the prose adjective "mayor-owned", this test file's
+#     synthetic bead-ID-shaped fixtures -- same rationale as
+#     test-critical-reviewer-hook.sh's fixture above -- and "mayor-boots",
+#     the same doc-filename false positive as MAYOR_DOC_FILENAME_ALLOWED_TOKENS
+#     below); anything else still fails the guard.
+#   scripts/check-doc-budget.sh, scripts/conformance/lima-start.sh,
+#     scripts/conformance/test-node-suffix-derivation-logic.sh,
+#     scripts/test-worktree-hygiene-logic.sh -- these comment on the
+#     `ai/prompts/mayor-bootstrap.md` / `ai/prompts/mayor-dispatch-template.md`
+#     docs by filename, and "mayor-boots"/"mayor-dispa" match the regex by
+#     coincidence, same false-positive class as CONTRIBUTING.md's
+#     "mayor-metho" above. MAYOR_DOC_FILENAME_ALLOWED_TOKENS re-scans these
+#     files match-by-match (not a whole-file skip, for the same reason as
+#     mayor-tick.sh above) and only tolerates those two filename fragments.
 #
 # Bead IDs are `mayor-` + a 3-5 char alphanumeric suffix (bd's ID generator;
 # see .beads/issues.jsonl for the observed range), optionally followed by a
@@ -62,6 +72,9 @@ matches=$(git grep -n -E 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- . \
   ':!scripts/test-check-bead-id-refs-logic.sh' \
   ':!scripts/check-bead-id-refs.sh' \
   ':!scripts/mayor-tick.sh' ':!scripts/test-mayor-tick-logic.sh' \
+  ':!scripts/check-doc-budget.sh' ':!scripts/conformance/lima-start.sh' \
+  ':!scripts/conformance/test-node-suffix-derivation-logic.sh' \
+  ':!scripts/test-worktree-hygiene-logic.sh' \
   ':!.gitignore' \
   2>/dev/null || true)
 
@@ -70,13 +83,31 @@ matches=$(git grep -n -E 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- . \
 # swallow a real bead-ID reference landing in their body content -- see
 # the exclusion-list comment above. Re-scan the two files match-by-match
 # (not whole-file) and only tolerate the exact known-safe tokens.
-MAYOR_TICK_ALLOWED_TOKENS='mayor-(tick|owned|abcd|efgh|aaaa|bbbb|cccc|dddd|abc[1-4])$'
+MAYOR_TICK_ALLOWED_TOKENS='mayor-(tick|owned|abcd|efgh|aaaa|bbbb|cccc|dddd|abc[1-4]|boots)$'
 mayor_tick_matches=$(git grep -n -oE 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- \
   scripts/mayor-tick.sh scripts/test-mayor-tick-logic.sh 2>/dev/null \
   | grep -vE ":${MAYOR_TICK_ALLOWED_TOKENS}" || true)
 if [ -n "$mayor_tick_matches" ]; then
   matches="${matches:+$matches
 }$mayor_tick_matches"
+fi
+
+# scripts/check-doc-budget.sh, scripts/conformance/lima-start.sh,
+# scripts/conformance/test-node-suffix-derivation-logic.sh, and
+# scripts/test-worktree-hygiene-logic.sh are skipped above (they cite the
+# ai/prompts/mayor-*.md doc filenames), but the same
+# whole-file-skip-can't-tell-fixture-from-rot flaw as mayor-tick.sh applies --
+# see the exclusion-list comment above. Re-scan match-by-match and only
+# tolerate the two known doc-filename fragments.
+MAYOR_DOC_FILENAME_ALLOWED_TOKENS='mayor-(dispa|boots)$'
+mayor_doc_filename_matches=$(git grep -n -oE 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- \
+  scripts/check-doc-budget.sh scripts/conformance/lima-start.sh \
+  scripts/conformance/test-node-suffix-derivation-logic.sh \
+  scripts/test-worktree-hygiene-logic.sh 2>/dev/null \
+  | grep -vE ":${MAYOR_DOC_FILENAME_ALLOWED_TOKENS}" || true)
+if [ -n "$mayor_doc_filename_matches" ]; then
+  matches="${matches:+$matches
+}$mayor_doc_filename_matches"
 fi
 
 # scripts/test-critical-reviewer-hook.sh is skipped above (its "mayor-abc12"
