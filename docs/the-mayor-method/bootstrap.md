@@ -33,27 +33,20 @@ block (paste verbatim into every editing dispatch), and the Lima VM protocol. Th
 resume command, then "what needs the operator now" (decisions, blockers, files
 they are editing), then in-flight work, open PRs, recent merges. Short enough
 that a returning operator re-orients in 30 seconds. Update on every signal —
-don't batch. No need to push dashboard update commits (waste of CI time).
+don't batch. Don't push dashboard-only commits (waste of CI time).
 
-The dashboard is a live SNAPSHOT, not an append-only log — REPLACE stale content,
-never accumulate it. Each update must leave a document a fresh reader could
-consume in 30 seconds, so:
-- **Rewrite in place.** When a worker finishes, its `▶ IN PROGRESS` block becomes
-  a one-line entry in a single `✅ merged this session` list — do not leave the
-  full in-progress block behind. When a decision is made, DELETE the
-  `🎯 DECISION POINT` block (capture the outcome in a bead/PR, not the dashboard).
-- **One of each section, always current.** Exactly one in-progress section, one
-  decision-point section, one session-merge list — supersede, don't stack a second
-  copy. If you're adding a block whose header duplicates an existing one, you're
-  warping it: merge them instead.
-- **Hard ceiling ~40 lines / one screen.** If an update pushes past that, it's the
-  signal to compress: collapse finished work to one line each, drop superseded
-  detail (it lives in beads/PRs/memories), and cut resolved decision points.
-- **Detail lives elsewhere.** Root-cause writeups, verification evidence, and
-  lessons go in bead notes, PR bodies, and `bd remember` — the dashboard only
-  POINTS to them. A paragraph of narrative on the dashboard is a smell.
-Full rewrites with the `Write` tool are expected and cheaper than a warped log; do
-not fear replacing the whole file when it has drifted.
+It is a live SNAPSHOT, not an append-only log — REPLACE stale content, never
+accumulate it:
+- **Rewrite in place.** A finished worker's `▶ IN PROGRESS` block collapses to a
+  one-line entry in the single `✅ merged this session` list; a resolved
+  `🎯 DECISION POINT` block is DELETED (its outcome lives in a bead/PR).
+- **One of each section, always current.** Supersede, don't stack a second copy.
+  If you're adding a block whose header duplicates an existing one, merge them.
+- **Hard ceiling ~40 lines / one screen.** Past that, compress: collapse finished
+  work to one line each, drop superseded detail, cut resolved decision points.
+- **Detail lives elsewhere** — bead notes, PR bodies, `bd remember`. The dashboard
+  only POINTS to them. Full `Write`-tool rewrites are expected and cheaper than a
+  warped log.
 
 **Findings vs extended-context.** `ai/findings/` is git-tracked exploratory
 work (audits, drafts, alternatives) scoped to one bead's lifetime — committed
@@ -109,55 +102,42 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 - 60m — reread this file + siblings; reassert posture to operator
 - 60m — worktree hygiene (worker worktrees, origin orphan branches, stale tracking refs, orphaned host processes — see body below)
 - 15m — mayor tick: run `scripts/mayor-tick.sh`, then act on its exit code
-  and `.claude/mayor-tick-state.json` — see body below. Replaces the prior
-  5m merge-PR / 10m dashboard-refresh / 15m bead-dispatch / 30m
-  cluster-review loops (mayor-zhwjg): that mechanical work is now
-  deterministic script output, and this one loop only wakes the mayor for
-  what the exit code says still needs judgment.
+  and `.claude/mayor-tick-state.json` — see body below. This one loop only
+  wakes the mayor for what the exit code says still needs judgment.
 
-The canonical loop bodies live in `dispatch-prompt-template.md` and prior
-session output; paste verbatim or adapt as needed.
+The canonical loop bodies live in `dispatch-prompt-template.md`; paste verbatim
+or adapt as needed.
 
-**Mayor tick loop body (mayor-zhwjg) — GitHub Merge Queue is active on
-this repo.** The main-branch ruleset (18156794) requires 5 status checks
-(lint, test-coverage, fmt, e2e-focus 1.36.4, script-tests), enforced.
-`strict_required_status_checks_policy` is deliberately `false` — the
-project moved to a GitHub org specifically to get merge queues and escape
-the up-to-date-branch treadmill, and the queue is why that requirement is
-UNNECESSARY, not why it's satisfied: it builds a synthetic merge commit
-against the latest base and tests THAT, so also requiring the PR branch
-itself to be current would just cost a redundant CI cycle per PR (MERGE
-method, all-green grouping, min 1 / max 5, `allow_auto_merge=true`,
-verified end-to-end since PR #1347).
+**Mayor tick loop body — GitHub Merge Queue is active on this repo.** The
+main-branch ruleset (18156794) requires these status checks, enforced: lint,
+test-coverage, fmt, e2e-focus 1.36.4, sensitive-e2e-guard 1.36.4, script-tests.
+Queue config: MERGE method, all-green grouping, min 1 / max 5,
+`allow_auto_merge=true`. `strict_required_status_checks_policy` is deliberately
+`false`: the queue builds a synthetic merge commit against the latest base and
+tests THAT, so also requiring the PR branch itself to be current would only cost
+a redundant CI cycle per PR.
 
-1. Run `scripts/mayor-tick.sh`. It drains `pr`-type review-queue entries
-   (removes a queue file once it confirms the deliverable's review
-   actually posted — `rm`, not `mv` to an archive dir: the audit trail is
-   git history plus the review itself on the PR, both durable,
-   mayor-hkhq0), gates every open `worker/agent-*` PR that's CLEAN or
-   BEHIND (a BEHIND PR is the merge queue's job to rebase, not the
-   mayor's, so it's queued the same way, never silently skipped) on the
-   LATEST (by `submittedAt`, never by mere header presence — an older
-   superseded LGTM must not mask a newer needs-changes) critical-reviewer
-   verdict, issues a bare `gh pr merge <N>` for anything qualifying
-   LGTM/LGTM-with-suggestions, runs post-merge `git pull --ff-only` +
-   `git remote prune origin` + worktree/branch cleanup for PRs it confirms
-   merged, refreshes `ai/dashboard.md`'s deterministic sections, and
-   writes `.claude/mayor-tick-state.json`. `operator/*` branches are
-   exempt from the gate — they never trigger the SubagentStop hook that
+1. Run `scripts/mayor-tick.sh`. It drains `pr`-type review-queue entries,
+   gates every open `worker/agent-*` PR that's CLEAN or BEHIND (a BEHIND PR is
+   the merge queue's job to rebase, not the mayor's, so it's queued the same
+   way, never silently skipped) on the LATEST (by `submittedAt`, never by mere
+   header presence — an older superseded LGTM must not mask a newer
+   needs-changes) critical-reviewer verdict, issues a bare `gh pr merge <N>`
+   for anything qualifying LGTM/LGTM-with-suggestions, runs post-merge
+   `git pull --ff-only` + `git remote prune origin` + worktree/branch cleanup
+   for PRs it confirms merged, refreshes `ai/dashboard.md`'s deterministic
+   sections, and writes `.claude/mayor-tick-state.json`. `operator/*` branches
+   are exempt from the gate — they never trigger the SubagentStop hook that
    feeds the review queue, so no review is ever queued for them.
    `findings`/`bead-close`/`bead-supersede`-type queue entries are never
-   auto-drained (they post to bd notes, not a PR, and bd exposes no
-   per-note timestamp to confirm against) — they always surface in
+   auto-drained (they post to bd notes, not a PR, and bd exposes no per-note
+   timestamp to confirm against) — they always surface in
    `pending_non_pr_reviews` for the mayor to dispatch and confirm by hand.
-   It then self-heals any open `worker/agent-*` PR the SubagentStop hook
-   never queued at all (mayor-9syl7 — compensates for a push landing on a
-   non-`worker/agent-*` head, upstream anthropics/claude-code#27755, or the
-   hook exiting with an error): a PR with no active queue file naming its
-   URL and no critical-reviewer review yet gets synthesized straight into
-   `pending_reviews`, logged with a `mayor-tick reconcile:` prefix so an
-   audit can tell it apart from a hook-queued entry; a PR already covered
-   by either signal is left alone.
+   It then self-heals any open `worker/agent-*` PR the SubagentStop hook never
+   queued at all: a PR with no active queue file naming its URL and no
+   critical-reviewer review yet gets synthesized straight into
+   `pending_reviews`, logged with a `mayor-tick reconcile:` prefix; a PR
+   already covered by either signal is left alone.
 2. Read the state file and act on the script's exit code (non-zero codes
    are OR-able; the highest fires if more than one condition matched):
    - **0** — noop, nothing for this tick.
@@ -180,8 +160,8 @@ verified end-to-end since PR #1347).
      needs-changes/needs-discussion verdict on record) — do not merge it
      yourself without resolving that first; for each `queue_warnings`
      entry, investigate the queue file — either a broken/missing
-     `queued_at` or an unrecognized `deliverable_type` (mayor-s7nn6), both
-     of which never auto-drain until fixed or removed by hand.
+     `queued_at` or an unrecognized `deliverable_type`, both of which
+     never auto-drain until fixed or removed by hand.
    - **30** — `worktree_anomalies` lists a worker branch with no PR at
      all; investigate whether that dispatch stalled or crashed.
 3. If you ever merge a PR by hand instead of letting the script queue it
@@ -217,36 +197,6 @@ as the same OS user — the threat model here is accidental exposure (logs,
 transcripts, env dumps), not process isolation between an operator and
 their own subagents.
 
-**Inline sync after every task-notification — transport-conditional (mayor-t79kb).**
-Standing cron loops fire reliably on the terminal CLI (Claude Code invoked as
-`claude` from the shell) and the compensating pattern below is NOT required
-there — rely on the loops registered above. The pattern IS required in
-stream-json transport clients (Claude Code VS Code extension, Claude desktop
-app), where the cron feature does NOT fire while a background worker is alive
-— anthropics/claude-code#86015 (open). In those clients ticks queue at priority
-`later` and drain only on the next externally-driven operator turn, so
-dashboard drift, CLEAN PRs sitting unmerged, and missed hygiene sweeps result —
-exactly during sessions with the most worker traffic.
-
-Compensating pattern (REQUIRED in VS Code extension / desktop app; skip on the
-CLI, though cheap enough as belt-and-suspenders if uncertain which transport
-this session is on): after EVERY task-notification received while 1+ workers
-are still active, inline the following before either dispatching the next
-worker or ending the turn:
-1. Run `scripts/mayor-tick.sh` — same script, same exit-code/state-file
-   contract as the mayor tick loop body above, just triggered by a
-   notification instead of a timer.
-2. Act on its exit code per the mayor tick loop body above.
-3. Verify the returning worker's worktree is cleaned up and its bead is
-   closed (close it if the worker didn't) — the script only cleans up
-   worktrees for PRs it has itself confirmed merged.
-
-Cost when the pattern applies: ~1-3 additional tool calls per notification
-(down from the pre-mayor-tick.sh inline gh/dashboard/prune sequence, now
-one script call). If you don't know which transport you're on, run the
-pattern anyway — cheap on the CLI, load-bearing in the extension. See bd
-memory `claude-code-cron-loops-blocked-by-background-workers-in-stream-json-transport`.
-
 **Worktree hygiene loop body.** The mechanical body — killing orphaned
 host-side `u7s-apiserver`/`u7s-scheduler`/`konnectivity-server` processes
 (STEP A), `git worktree prune` (STEP B), and stale worker/non-worker branch
@@ -254,20 +204,15 @@ cleanup (STEPs C–D) — lives in `scripts/worktree-hygiene.sh`; the cron loop
 runs that script directly. See the script for the STEP A–D implementation
 and its design rationale.
 
-Auto-kill/auto-delete with no approval gate (operator decision, mayor-yfvxn)
-— the script logs loudly instead of asking. Exit 0 means a clean tick;
-non-zero means an anomaly for the mayor to investigate (currently: a killed
-process that didn't actually die, surfaced by the script's own verify step).
+Auto-kill/auto-delete with no approval gate (operator decision) — the script
+logs loudly instead of asking. Exit 0 means a clean tick; non-zero means an
+anomaly for the mayor to investigate (currently: a killed process that didn't
+actually die, surfaced by the script's own verify step).
 
-This loop is the drift backstop, not the primary defense: workers are
-required to run `scripts/conformance/reset.sh --host-only` as their own
-final step before ending a session (see `dispatch-prompt-template.md`'s
-Common preamble), so in the normal case the loop finds nothing to do. The
-branch-cleanup steps were added after a concrete incident: a 3-worker
-dispatch batch skipped `isolation="worktree"` on 2 of 3 workers and
-polluted the mayor checkout, and separately 25+ stale `worker/agent-*`
-branches had accumulated from prior sessions with no auto-pruning — this
-loop body now closes both gaps at the automation layer.
+This loop is the drift backstop, not the primary defense: workers are required
+to run `scripts/conformance/reset.sh --host-only` as their own final step before
+ending a session (see `dispatch-prompt-template.md`'s Common preamble), so in the
+normal case the loop finds nothing to do.
 
 **Establish the stance (first session only).** Every project has a stance
 (pre-alpha, production-stable, refactor-only, greenfield, perf-critical,

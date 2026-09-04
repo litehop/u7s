@@ -18,13 +18,10 @@
 # ignored in favor of whatever the enclosing hook invocation's environment
 # happens to point at.
 #
-# Also sourced by scripts/sensitive-conformance-gate.sh and its test harness
-# scripts/test-sensitive-conformance-gate-logic.sh (PR #1408 predates this
-# shared file and originally kept its own inline copy of the identical
-# wrapper; consolidated here once this file existed). See
-# crates/junit-reuse-check/src/lib.rs's git_command() doc comment for the
-# full per-variable rationale, including why HOME/XDG_CONFIG_HOME are
-# deliberately NOT in this list.
+# Also sourced by other sandbox-repo test harnesses under scripts/ --
+# test-check-bead-id-refs-logic.sh and test-check-doc-budget-logic.sh. The
+# per-variable rationale (including why HOME/XDG_CONFIG_HOME are deliberately
+# NOT in the strip list) is inline at the stripping call below.
 run_git() {
   env -u GIT_DIR -u GIT_WORK_TREE -u GIT_NAMESPACE -u GIT_INDEX_FILE \
     -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
