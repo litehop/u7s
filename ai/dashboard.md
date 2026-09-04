@@ -1,57 +1,57 @@
 # Dashboard
-2026-08-29T14:55Z — Resume: `bd prime` → this file. **Session wrapped after 32 PRs merged (#1443 → #1474).**
+**2026-09-04 04:37Z — ⏸ WRAPPING (operator switching networks — API calls may drop).** main @ `ecab3a48` (#1555 queued). Resume: `bd prime` → this file.
 
-**Stance:** pre-alpha/greenfield, break freely, merge-on-green via native queue, Rule 17 answer-first, `--admin` never. Discipline banked this session: dashboard non-auto sections update on every signal.
+**⚠️ WRAP DIRECTIVE (until operator says otherwise):** do NOT dispatch new workers. Let the 3 in-flight workers land; for each PR: review → merge if LGTM, or reopen-the-bead-and-record on needs-changes (do NOT start a fix round — that leaves a worker at risk during the network switch). Wrap is done when: no active workers, git state clean/pushed, dashboard current. Then it's safe to switch.
 
-## 🏁 What this session accomplished
+**Stance:** pre-alpha/greenfield, break freely, correctness > security > perf > features, merge-on-green via native queue, `--admin` never.
 
-- **Wordpress-workload validation chain complete end-to-end** on `v0.2.1-snapshot.2` — fresh Ubuntu Lima QEMU-x86_64 VM → u7s install → csi-hostpath → MariaDB → WordPress + nginx sidecar → `curl` returns rendered HTML with DB write→read round-trip proven. 7m11s wall-clock.
-- **11 code fixes shipped** across auth, RBAC, install path, and API-contract handling. `4ggk0`(SA-JWT-cache P0), `vamg1`+`nly97`(kubelet certDir), `u1g6k`(system:node PVC/PV/VolumeAttachment P0), `ilu9b`(test-only, main already fixed), `e78se`(SSA-create rbac_index P0), `l9oo0`(Secret stringData), `m7fxk`(system:node delete pods), `324jm`(SSA escalation + bootstrap-installer escalate).
-- **Fix-and-reverify loop proven end-to-end.** mayor-nly97 catch (Phase 3 caught vamg1's silent no-op → filed → fixed → Phase 4 reverified with the identical repro recipe) — strongest evidence the process actually works.
-- **Red-team + workload validation = complementary bug-finding.** Audit produced 2 P0s + 9 surface deep-dives; workload validation surfaced 5 more u7s bugs live that no test caught.
+⚠️ **lima-node MCP failed** this session (`-32000`); workers use `limactl shell` fallback. VMs: node-4=6dj51.5 fix, node-2=17nj7.4 fix; free node-3/5/smoke.
 
-## 🎯 Next session — top of queue
+## 🔎 Needs next session
+- **#1556** (17nj7.4, DRAFT) — ⚠️ **3rd rejection; REOPENED, NOT re-dispatched (wrap).** The childless-root fix reintroduced UNBOUNDED growth (fold-target insert at sqlite.rs:308-331 has no cap re-check → map never shrinks). Needs a **design rethink**, not another patch — full root-cause in bead notes. Branch durable on origin.
+- Review follow-up beads filed: **d5skc** (6dj51.5/#1555 nits), + one for 17nj7.3/#1560 (delete_namespace_scoped_crds evict gap).
 
-1. **`mayor-tkv6j`** (P0, deferred all session) — `system:node` bound cluster-wide with no Node authorizer. Needs architectural approach (NodeRestriction admission / per-node subjects / doc-only). Related: shared admission bypass for bootstrap-labeled RBAC vs per-identity `escalate` grants (3 recurrences in `seed_rbac`). Both threads best solved together.
-2. **`mayor-m6daz`** — release-tarball CI cache-restore fix. Root cause investigated + docs-verified this session: cache key includes `github.job`; no other workflow uses `build-and-publish`, so no main-branch cache exists under that key. Fix: `push: branches: [main]` trigger with `paths:` filter.
-3. **RBAC-hardening follow-ons:** `x1x2u` (audit 4 unverified "Matches upstream" claims), `8tcqr` (SSA race-fallback tests), `gq4ip` (SSA ClusterRole/RoleBinding escalation tests), `5y8iz` (system:node create pods for mirror pods).
-4. **`mayor-khb1z`** (P3) — kubectl get pvc/pv missing standard printer columns. Cosmetic.
-5. **9 security-audit surface deep-dives** from mayor-s851y: livvs / ergg5 / qlgws / usjqk / zdaw8 / 0qjgc / vtq5n / lzd66 / c6njm.
-6. **Wordpress untested territory** (Phase 4 flag): pod restart/rescheduling, node loss, multi-node Service routing.
+## ▶ IN PROGRESS (1 perf) — LAST of the wrap set
+- **17nj7.5** (a0284, node-3) — incremental ResourceQuota counter, end per-admission O(n²) namespace rescan. quota.rs + resource.rs.
+- **swg4h** — operator-owned: reruns Conformance + csi-hostpath e2e at session wrap.
+- Held (NOT dispatched, wrapping): **17nj7.8** (find_crd), pa0ze, scheduler .6/.18, etc.
+
+## ✅ Merged this session (6)
+- **#1560** 17nj7.3 CrConversionCache leak+bound · **#1555** 6dj51.5 scheduler CSI race · **#1557** g7jh2 eBPF Phase 2 (unblocks pa0ze) · **#1558** 17nj7.2 RBAC ns-purge (sec) · **#1559** 17nj7.1 metric-DoS (sec) · **#1554** cleanup.
+
+## 📋 Next up (opportunistic, once main advances / VMs free)
+- **perf 17nj7** (opportunistic backlog per operator): clean+ready now → `.5` (quota recount, quota.rs), `.8` (find_crd, crd handler). After #1558 → `.3` (CrConversionCache, ns cascade). After #1555 → scheduler `.6`/`.18`. `.7` folded into 6dj51.5. `.12` (94 clone sites) solo in a quiet window.
+- **eBPF L3** after #1557 merges (unblocks Phase 3): pa0ze; also g3lag, bguco.
+- standalone: **2t1g1**, **xiovg**. **dq1gf** (VM rename) P3 no-auto-dispatch.
+
+## 🟢 Deferred / gated
+- decision-gated: sm91b.6, 0qjgc, 90qvg. epics: aie31 (Ph1-2 landing), sm91b, 8qcaw, s82zr. release-coupled (1.37): 1n9eu, 9xsn3. held: ujqtt, tnzdi, bhih0, 1y0h6, 44jyu, hm02b, t8ucq, r871h. elmno DEFERRED.
 
 ## 📌 Standing decisions
-- 9bwrc: `strict_required_status_checks_policy=false` deliberate.
-- pwwql: reviewers answer "does this test the behaviour" by READING.
-- v9jk0: tuning-first, Round-2 done — likely ceiling for this lever generation.
+- **17nj7 = opportunistic backlog, NOT deferred** (operator) — dispatch by priority + scope + conflict-risk.
+- Merge via native queue only (bare `gh pr merge`); never `--admin`.
+- Phase 4 (lrbvo) deploys eBPF via the MANUAL Phase-1 loader, NOT the Phase-5 DaemonSet (clarified in lrbvo/aie31 notes).
 
-## 🧊 Longer queue (deferred, no-active-driver)
-Legacy triage: 44jyu, xiovg (173 files). DEFER-with-trigger: sm91b.6, 1y0h6, 90qvg, ujqtt, tnzdi, t8ucq, 9xsn3, hm02b, bqncp, dry3v, nj2it, 2z1no, 8368x, c6njm. Golden-clone: gfcz9 (unblocked, not-this-focus).
-
-## 🧠 Fresh bd memories from this session
-- `snapshot-release-tarball-for-linux-testing-not-local-cross-compile` — use CI tarball, not local cross-compile.
-- `macos-bash-3-2-case-inside-command-substitution-silent-truncation` — parameter expansion instead of case-in-substitution in shell test scripts.
-- `mayor-discipline-update-dashboard-non-auto-sections-on-every-signal` — dashboard is source-of-truth; if not there, operator misses it.
-- `kubelet-configuration-yaml-not-superset-of-cli-flags-silent-noop` — kubelet ignores unknown yaml keys silently; some settings are CLI-flag-only.
-- `gh-app-review-payload-must-pipe-jq-directly-not-echo` — reviewer scripting pattern.
-
-## 🔎 Open PRs
-<!-- BEGIN AUTO: open-prs -->
-None open.
-<!-- END AUTO: open-prs -->
-## 🌲 Worktrees
-<!-- BEGIN AUTO: worktrees -->
-None (no active worker worktrees).
-<!-- END AUTO: worktrees -->
 ## 🔁 Cron loops
 <!-- BEGIN AUTO: cron-loops -->
 15m mayor tick (`scripts/mayor-tick.sh`) · 60m reread posture · 60m worktree hygiene
 <!-- END AUTO: cron-loops -->
 ## Repo state
 <!-- BEGIN AUTO: repo-state -->
-Branch `main` @ `29d78205`, dirty, up to date with origin/main.
+As of 2026-09-04T08:35:41Z (last tick) — Branch `main` @ `02ea37d6`, dirty, up to date with origin/main.
 <!-- END AUTO: repo-state -->
-
+## 🔎 Open PRs
+<!-- BEGIN AUTO: open-prs -->
+- #1561 perf(apiserver): incremental ResourceQuota usage counter to end the per-admission O(n) namespace rescan (mayor-17nj7.5) (`worker/agent-a0284015530e21610`, BLOCKED)
+- #1556 fix(store): bound reclaimed_horizons and de-linearize watch-open horizon lookup without horizon-eviction regression (mayor-17nj7.4) (`worker/agent-a2f40b04fb9d1c092`, BLOCKED)
+<!-- END AUTO: open-prs -->
 ## 📋 Review queue
 <!-- BEGIN AUTO: review-queue -->
 0 pending review-queue entries.
 <!-- END AUTO: review-queue -->
+
+## 🌲 Worktrees / hygiene
+<!-- BEGIN AUTO: worktrees -->
+- `/Users/balint.erdos/u7s/ai/worktrees/agent-a0284015530e21610` (`worker/agent-a0284015530e21610`)
+- `/Users/balint.erdos/u7s/ai/worktrees/agent-a2f40b04fb9d1c092` (`worker/agent-a2f40b04fb9d1c092`)
+<!-- END AUTO: worktrees -->

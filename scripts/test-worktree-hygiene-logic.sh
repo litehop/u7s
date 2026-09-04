@@ -7,7 +7,7 @@
 # process-line parsing, branch-guard logic, or patch-id check would keep
 # passing even if the real logic regressed.
 #
-# Covers the four areas the extraction from bootstrap.md is load-bearing
+# Covers the four areas the extraction from mayor-bootstrap.md is load-bearing
 # for:
 #   1. STEP A orphan detection (find_orphans / proc_type_from_psline /
 #      extract_worktree_path_from_psline / kill_pattern_for) against
@@ -161,7 +161,7 @@ WORKTREE_HYGIENE_REPO_ROOT="$S" call is_unmerged_by_patch_id worker/agent-ff-mer
 assert "a branch whose commits are already an ancestor of origin/main is NOT flagged unmerged (safe to delete)" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
-# The squash-merge case bootstrap.md's design specifically calls out:
+# The squash-merge case mayor-bootstrap.md's design specifically calls out:
 # origin/main gains a NEW commit with the same net patch as the branch's
 # commit (a different SHA, as a real squash-merge produces) --
 # `git branch --merged` would call this branch unmerged (its commit SHA
@@ -180,7 +180,7 @@ git -C "$S" commit -q -am 'squash payload (squash-merged onto main under a new S
 git -C "$S" push -q origin main
 RC=0
 WORKTREE_HYGIENE_REPO_ROOT="$S" call is_unmerged_by_patch_id worker/agent-squashed >/dev/null 2>&1 || RC=$?
-assert "a squash-merged branch (same patch, different SHA) still produces cherry output and is guarded, matching bootstrap.md's literal 'any output -> skip' rule" \
+assert "a squash-merged branch (same patch, different SHA) still produces cherry output and is guarded, matching mayor-bootstrap.md's literal 'any output -> skip' rule" \
   "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------

@@ -91,9 +91,9 @@ VM_NAME="${U7S_VM_NAME:-lima-node}"
 # daemons reduces that shared contention. lima-node keeps its own Phase-A
 # isolated network (PR #1194); lima-node-2/3/4 and lima-node-5/-smoke split
 # 3-2 across the two worker networks rather than 1-4, since -2/-3 are the pair
-# most commonly joined via --extra-node for 2-node topologies (dispatch-prompt-
+# most commonly joined via --extra-node for 2-node topologies (mayor-dispatch-
 # template.md) and a 3-way network still covers that pairing. Mirrors the
-# Network column in the dispatch-prompt-template.md doc's Lima VM protocol
+# Network column in the mayor-dispatch-template.md doc's Lima VM protocol
 # table -- keep both in sync. Any VM name outside this known set (a one-off
 # scratch VM) falls back to the original flat "user-v2" default.
 case "$VM_NAME" in

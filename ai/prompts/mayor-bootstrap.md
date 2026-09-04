@@ -22,7 +22,7 @@ PR's body — the PR body is the durable git-history record. `bd prime`'s memory
 section is index-only (pull-on-demand via `bd recall <key>`) — see CLAUDE.md
 "Memory access pattern".
 
-**REQUIRED before your first dispatch:** Read `docs/the-mayor-method/dispatch-prompt-template.md`
+**REQUIRED before your first dispatch:** Read `ai/prompts/mayor-dispatch-template.md`
 in full — do not dispatch any worker until you have done this. It defines the worktree
 dispatch pattern (`isolation="worktree"` in the Agent call is REQUIRED — it creates the
 worktree and pins the subagent CWD to its root automatically), the worktree-boundary
@@ -71,10 +71,10 @@ as `verified-duplicate of #NNNN` instead of dispatching. Exit 2
 script's pattern extraction) — fall back to a manual grep.
 For any bead that touches RBAC, auth, collection delete, namespace drain, or any
 handler the sonobuoy smoke test exercises: inject the Lima VM protocol block from
-`dispatch-prompt-template.md` and require sonobuoy smoke verification in the
+`mayor-dispatch-template.md` and require sonobuoy smoke verification in the
 worker's return. Cargo tests alone are not sufficient for these beads.
 Each such worker gets its own assigned VM name, port, and kubelet port (run `limactl list`
-to find a free slot; up to 6 in parallel; see the port table in `dispatch-prompt-template.md`).
+to find a free slot; up to 6 in parallel; see the port table in `mayor-dispatch-template.md`).
 Workers must never hard-code `lima-node`, port `6443`, or kubelet port `10250`.
 
 **PRs.** Workers open; mayor reviews and merges on green. NEVER use `--admin` to
@@ -105,7 +105,7 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
   and `.claude/mayor-tick-state.json` — see body below. This one loop only
   wakes the mayor for what the exit code says still needs judgment.
 
-The canonical loop bodies live in `dispatch-prompt-template.md`; paste verbatim
+The canonical loop bodies live in `mayor-dispatch-template.md`; paste verbatim
 or adapt as needed.
 
 **Mayor tick loop body — GitHub Merge Queue is active on this repo.** The
@@ -211,7 +211,7 @@ actually die, surfaced by the script's own verify step).
 
 This loop is the drift backstop, not the primary defense: workers are required
 to run `scripts/conformance/reset.sh --host-only` as their own final step before
-ending a session (see `dispatch-prompt-template.md`'s Common preamble), so in the
+ending a session (see `mayor-dispatch-template.md`'s Common preamble), so in the
 normal case the loop finds nothing to do.
 
 **Establish the stance (first session only).** Every project has a stance

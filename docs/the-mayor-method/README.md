@@ -235,12 +235,12 @@ Different lenses find different issues.
 ## Standing prompts
 
 The cron prompts I register with the scheduler are defined in
-[`bootstrap.md`](./bootstrap.md) — a single flat pasteable prompt, not
+[`mayor-bootstrap.md`](../../ai/prompts/mayor-bootstrap.md) — a single flat pasteable prompt, not
 separate documents. It sets up six cadences (reread the posture, worktree
 hygiene, cluster review, PR merge, bead dispatch, dashboard refresh) and
 inlines one loop body directly (the worktree-hygiene sweep for orphaned
 host processes); the rest point to their canonical bodies in
-[`dispatch-prompt-template.md`](./dispatch-prompt-template.md). Register
+[`mayor-dispatch-template.md`](../../ai/prompts/mayor-dispatch-template.md). Register
 the prompt once with your local scheduler; let the cadence carry the loop.
 
 
@@ -248,7 +248,7 @@ the prompt once with your local scheduler; let the cadence carry the loop.
 ## Ready to run it
 
 If you've read this far and want to actually try the method, the
-pasteable prompt is [`bootstrap.md`](./bootstrap.md). It's terse —
+pasteable prompt is [`mayor-bootstrap.md`](../../ai/prompts/mayor-bootstrap.md). It's terse —
 deliberately — and it expects you've absorbed the philosophy above
 first. Paste it into a fresh AI session as your opening message;
 the mayor takes it from there.
@@ -256,11 +256,11 @@ the mayor takes it from there.
 Two siblings carry the operational detail you'll need once the mayor
 is running:
 
-- [`dispatch-prompt-template.md`](./dispatch-prompt-template.md) — the
+- [`mayor-dispatch-template.md`](../../ai/prompts/mayor-dispatch-template.md) — the
   canonical worker-prompt shapes (solo / cluster / audit /
   cluster-reviewer / CI-fix) and the worktree-boundary block that must
   go into every editing dispatch verbatim.
-- [`bootstrap.md`](./bootstrap.md) — re-read on cadence; it carries
+- [`mayor-bootstrap.md`](../../ai/prompts/mayor-bootstrap.md) — re-read on cadence; it carries
   the five `/loop` blocks the mayor registers with its scheduler,
   each with its own inline operating manual.
 

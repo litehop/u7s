@@ -588,7 +588,7 @@ process_review_queue() {
         # An unrecognized (or missing) deliverable_type: never auto-drained,
         # so it must surface here -- not silently leave all four
         # newly-documented state fields empty while still forcing exit 20
-        # via queue_files. See bootstrap.md's queue_warnings bullet.
+        # via queue_files. See mayor-bootstrap.md's queue_warnings bullet.
         QUEUE_WARNINGS+=("$payload")
         ;;
     esac
