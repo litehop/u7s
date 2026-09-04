@@ -606,6 +606,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Arc::clone(&state.sa_sig_cache),
             Arc::clone(&state.flowcontrol_cache),
             Arc::clone(&state.node_graph),
+            Arc::clone(&state.resource_registry),
+            Arc::clone(&state.discovery_cache),
         ))
         .layer(InflightLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
@@ -8517,6 +8519,8 @@ mod tests {
             std::sync::Arc::clone(&state.sa_sig_cache),
             std::sync::Arc::clone(&state.flowcontrol_cache),
             std::sync::Arc::clone(&state.node_graph),
+            std::sync::Arc::clone(&state.resource_registry),
+            std::sync::Arc::clone(&state.discovery_cache),
         ));
 
         for path in ["/openapi/v2", "/openapi/v3"] {
