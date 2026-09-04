@@ -166,8 +166,10 @@ jobs:
   # (catches partial-discovery regressions a byte-sum-only check would miss:
   # e.g. finding only 4 of 5 maps still sums to a smaller, still-passing
   # total) and that their summed bytes_memlock stays under a gross-regression
-  # ceiling (measured today: ~21.5 KiB, ~45x headroom) -- not a tight bound,
-  # just a tripwire for an accidental max_entries blow-up.
+  # ceiling (measured with pa0ze's Phase-3 8192-entry LRU_HASH conntrack maps,
+  # #1567: ~1.82 MiB preallocated and constant regardless of flow count,
+  # ~2.1x headroom under the 4 MiB ceiling) -- not a tight bound, just a
+  # tripwire for an accidental max_entries blow-up.
   ebpf-memory-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 10
