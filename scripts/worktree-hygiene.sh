@@ -5,19 +5,22 @@
 # extracted out of that doc so a routine hygiene tick no longer costs an
 # orchestrator model turn parsing `ps`/`git` output by hand.
 #
-# STEP A: kill host-side `u7s-apiserver`/`u7s-scheduler`/`konnectivity-server`
-#   processes left running after their worktree was removed. `git worktree
-#   remove` does not touch these -- all three are plain backgrounded (or
-#   disowned) host processes that outlive their worktree, keep squatting on
-#   that VM slot's ports, and serve a stale CA-signed cert that breaks the
-#   next dispatch to that slot with a cert-verification error instead of a
-#   clean port-bind error. `kubelet`/`kube-controller-manager` need no
-#   host-side handling -- they run guest-side inside the Lima VM and die
-#   with it. Binary-path matching doesn't work here: every worker's binary
-#   builds into the same shared `target/` path, so processes are matched on
-#   the worktree-specific argument instead (the `.../temp/u7s/kubeconfig`
-#   path for apiserver/scheduler, the `.../temp/u7s` workdir path for
-#   konnectivity-server).
+# STEP A: kill host-side `u7s-apiserver`/`u7s-scheduler`/`konnectivity-server`/
+#   `sample-run-metrics.sh` processes left running after their worktree was
+#   removed. `git worktree remove` does not touch these -- all four are plain
+#   backgrounded (or disowned) host processes that outlive their worktree.
+#   apiserver/scheduler/konnectivity-server keep squatting on that VM slot's
+#   ports and serve a stale CA-signed cert that breaks the next dispatch to
+#   that slot with a cert-verification error instead of a clean port-bind
+#   error; an orphaned sample-run-metrics.sh instead keeps polling that VM's
+#   RSS/free-memory metrics indefinitely, invisible resource use on a slot
+#   that then looks free to the next dispatch. `kubelet`/`kube-controller-manager`
+#   need no host-side handling -- they run guest-side inside the Lima VM and
+#   die with it. Binary-path matching doesn't work here: every worker's
+#   binary builds into the same shared `target/` path, so processes are
+#   matched on the worktree-specific argument instead (the
+#   `.../temp/u7s/kubeconfig` path for apiserver/scheduler, the `.../temp/u7s`
+#   workdir path for konnectivity-server and sample-run-metrics.sh).
 # STEP B: `git worktree prune -v` -- safe by definition, only removes
 #   metadata for worktrees whose directories are already gone.
 # STEP C: delete stale `worker/agent-*` branches, guarded so an in-flight
@@ -70,13 +73,14 @@ run_cmd() {
 # STEP A -- orphaned host processes.
 # ---------------------------------------------------------------------------
 
-# Which of the three tracked process types (if any) a `ps aux` line
+# Which of the four tracked process types (if any) a `ps aux` line
 # belongs to.
 proc_type_from_psline() {
   case "$1" in
     *u7s-apiserver*) printf 'apiserver' ;;
     *u7s-scheduler*) printf 'scheduler' ;;
     *konnectivity-server*) printf 'konnectivity-server' ;;
+    *sample-run-metrics.sh*) printf 'sample-run-metrics' ;;
     *) printf '' ;;
   esac
 }
@@ -89,7 +93,7 @@ proc_type_from_psline() {
 # path from leaking the `--server-cert=` prefix into the result for that
 # second style -- both contain `/temp/u7s` as a substring with the
 # worktree root immediately before it, so one extraction covers both
-# argument styles and all three process types.
+# argument styles and all four process types.
 extract_worktree_path_from_psline() {
   printf '%s' "$1" | grep -oE '[^ =]*/temp/u7s' | head -1 | sed -E 's#/temp/u7s$##'
 }
@@ -129,6 +133,7 @@ kill_pattern_for() {
     apiserver) printf 'u7s-apiserver.*%s/temp/u7s/kubeconfig' "$wpath" ;;
     scheduler) printf 'u7s-scheduler.*%s/temp/u7s/kubeconfig' "$wpath" ;;
     konnectivity-server) printf 'konnectivity-server.*%s/temp/u7s' "$wpath" ;;
+    sample-run-metrics) printf 'sample-run-metrics.sh.*%s/temp/u7s' "$wpath" ;;
   esac
 }
 
@@ -137,7 +142,7 @@ step_a_orphaned_processes() {
   local orphans=() still_alive=()
 
   live=$(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
-  ps_out=$(ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server' | grep -v grep) || true
+  ps_out=$(ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server|sample-run-metrics.sh' | grep -v grep) || true
   [ -z "$ps_out" ] && return 0
 
   while IFS= read -r line; do
@@ -160,7 +165,7 @@ step_a_orphaned_processes() {
   # failure -- surface it instead of silently retrying (a process that
   # survives one kill may be zombied/reparented and needs manual
   # investigation).
-  ps_out=$(ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server' | grep -v grep) || true
+  ps_out=$(ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server|sample-run-metrics.sh' | grep -v grep) || true
   while IFS= read -r line; do
     [ -n "$line" ] && still_alive+=("$line")
   done < <(find_orphans "$ps_out" "$live")
