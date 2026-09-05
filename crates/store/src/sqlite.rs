@@ -407,7 +407,7 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn new(db_path: &str) -> Result<Self> {
-        let write_conn = open_conn(db_path)?;
+        let write_conn = open_conn(db_path, WRITE_CACHE_SIZE_KIB)?;
 
         // Run migrations on the write connection.
         write_conn.execute_batch(
@@ -444,7 +444,7 @@ impl SqliteStore {
         let read_conn = if db_path == ":memory:" {
             Arc::clone(&write_conn)
         } else {
-            Arc::new(Mutex::new(open_conn(db_path)?))
+            Arc::new(Mutex::new(open_conn(db_path, READ_CACHE_SIZE_KIB)?))
         };
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -726,8 +726,11 @@ fn push_into_shard(
 
             // Tier 2: evict outright once the whole log exceeds a larger cap. `by_revision`
             // keeps revision -> key sorted, so this is O(log n) via pop_first() instead of
-            // an O(n) linear scan over `by_key`.
-            const STRIPPED_TIER_CAP: usize = 8 * RING_CAPACITY;
+            // an O(n) linear scan over `by_key`. 2x (not 8x) RING_CAPACITY: a full conformance
+            // run's busiest shard peaked at 870 live tombstones, comfortably under this cap,
+            // while the old 8x bought ~875KB of pure Stripped-tier index overhead per
+            // saturated shard that no observed traffic ever needed.
+            const STRIPPED_TIER_CAP: usize = 2 * RING_CAPACITY;
             if guard.by_key.len() > STRIPPED_TIER_CAP {
                 if let Some((oldest_revision, oldest_key)) = guard.by_revision.pop_first() {
                     guard.by_key.remove(&oldest_key);
@@ -1062,13 +1065,26 @@ fn find_reclaimed_horizon(reclaimed_horizons: &ReclaimedHorizons, prefix: &str) 
     reclaimed_horizons.overflow.load(Ordering::Relaxed)
 }
 
-fn open_conn(path: &str) -> Result<Connection> {
+/// `PRAGMA cache_size` for the write connection: SQLite's own historical default (`-2000` is
+/// ~1.95 MiB — negative means kibibytes, not pages). The write connection only ever serves a
+/// single writer at a time (behind `write_conn`'s mutex), so it has far less to gain from a
+/// large page cache than the read connection, which backs every concurrent LIST scan — see
+/// `READ_CACHE_SIZE_KIB`'s doc for why the cut is made here rather than there.
+const WRITE_CACHE_SIZE_KIB: i64 = -2000;
+/// `PRAGMA cache_size` for the read connection (and the single shared connection `:memory:`
+/// databases use for both roles — see `SqliteStore::new`): kept at SQLite's pre-existing
+/// `-8000` (~7.8 MiB) rather than cut like the write connection's, since this is the connection
+/// LIST scans and most other reads run against, and is therefore the one most likely to thrash
+/// on a smaller cache.
+const READ_CACHE_SIZE_KIB: i64 = -8000;
+
+fn open_conn(path: &str, cache_size_kib: i64) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous  = NORMAL;
-        PRAGMA cache_size   = -8000;
+        PRAGMA cache_size   = {cache_size_kib};
         PRAGMA busy_timeout = 5000;
         -- Keep the WAL file small so read connections do not fall far behind write connections.
         -- At 1000 (the SQLite default), the WAL can hold 1000 pages before checkpointing.
@@ -1078,8 +1094,8 @@ fn open_conn(path: &str) -> Result<Connection> {
         -- and requeue in a tight loop for up to 15 minutes.  At 100, checkpoints are more
         -- frequent so the read connection stays within ~100 pages of the write head.
         PRAGMA wal_autocheckpoint = 100;
-    ",
-    )?;
+    "
+    ))?;
     Ok(conn)
 }
 
@@ -2254,11 +2270,18 @@ impl Store for SqliteStore {
                 return;
             }
 
-            // Replay historical events from ring buffer.
+            // Replay historical events from ring buffer. Consumed BY VALUE (not `&replayed`):
+            // `async_stream::stream!` expands to `async move`, so `replayed` is captured into
+            // this generator's own state regardless; iterating by reference only borrows it,
+            // leaving the owning Vec (and every Arc<InternalEvent> in it) alive as a named
+            // local for the generator's ENTIRE remaining lifetime — up to the 30-minute
+            // `stream_timeout_secs` default — instead of being dropped once this loop exits.
+            // Moving each event out as it's yielded means the for loop's own (much smaller)
+            // scope owns them instead, so they're released the moment this loop is done.
             let mut last_replayed = from_revision;
-            for event in &replayed {
+            for event in replayed {
                 last_replayed = last_replayed.max(event.revision);
-                yield internal_to_watch(event);
+                yield internal_to_watch(&event);
             }
 
             // Tracks the highest revision seen from global bookmarks. Used only for emitting
@@ -2588,6 +2611,149 @@ mod tests {
             name = name,
             rv = rv
         ))
+    }
+
+    /// A file-backed store's write and read connections must use DIFFERENT `cache_size`
+    /// budgets — the write connection cut down to SQLite's own historical default, the read
+    /// connection left at the larger, pre-existing size.
+    ///
+    /// Why it matters: before this split, both connections opened at the larger size, so a
+    /// single running apiserver paid ~15.6 MiB of malloc'd, dhat-invisible C-side page cache
+    /// for two connections where only one (the read connection, serving concurrent LIST
+    /// scans) actually benefits from a large cache — the write connection is serialized
+    /// behind `write_conn`'s mutex and never has more than one query in flight. A regression
+    /// back to a shared, uncut size would silently re-inflate that footprint without ever
+    /// showing up in the project's dhat-based heap profiling, which cannot see SQLite's own
+    /// malloc'd pages.
+    #[tokio::test]
+    async fn file_backed_store_cuts_the_write_connections_cache_but_not_the_reads() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let tid = std::thread::current().id();
+        let db_path =
+            std::env::temp_dir().join(format!("u7s-sqlite-cache-size-test-{nanos}-{tid:?}.db"));
+        let db_path_str = db_path
+            .to_str()
+            .expect("temp path must be valid UTF-8")
+            .to_string();
+
+        let store = SqliteStore::new(&db_path_str).expect("file-backed store");
+
+        let write_cache: i64 = store
+            .write_conn
+            .lock()
+            .await
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("read write connection's cache_size");
+        let read_cache: i64 = store
+            .read_conn
+            .lock()
+            .await
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("read read connection's cache_size");
+
+        assert_eq!(
+            write_cache, WRITE_CACHE_SIZE_KIB,
+            "the write connection must use the smaller cache_size — a regression back to the \
+             larger shared size would cost several extra MiB of C-side page cache per open \
+             store on a connection that only ever serves one writer at a time"
+        );
+        assert_eq!(
+            read_cache, READ_CACHE_SIZE_KIB,
+            "the read connection must keep the larger cache_size — it backs every LIST scan \
+             and is the connection most likely to thrash if cut as aggressively as the write \
+             connection's"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&db_path_str);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    /// The ring's replay snapshot (`replayed` in `watch()`) must be released once its events
+    /// are yielded, not retained for the whole stream's lifetime.
+    ///
+    /// Why it matters: `async_stream::stream!` expands to `async move`, so `replayed` (built
+    /// and cloned from the ring BEFORE the generator is constructed) is captured into the
+    /// generator's own state regardless of how the replay loop iterates it. If that loop only
+    /// borrows (`for event in &replayed`), the owning Vec — and every `Arc<InternalEvent>` in
+    /// it — stays alive as a named local for the generator's ENTIRE remaining life, i.e. the
+    /// whole stream, up to the 30-minute `stream_timeout_secs` default. Across many concurrent
+    /// watchers that all replayed a deep backlog, that is retained memory that scales with
+    /// concurrent-watcher count instead of with `RING_CAPACITY` alone.
+    ///
+    /// Fails on revert to `for event in &replayed`: this test pushes exactly one tracked event,
+    /// opens a watch (snapshotting it into `replayed`, one extra `Arc` clone), drains the one
+    /// historical event, then drives the generator ONE poll further (past the replay loop's own
+    /// exit, into the live-forwarding select — which blocks on an empty broadcast receiver and
+    /// returns `Pending`, since nothing was pushed after the watch opened). A borrow-based loop
+    /// never drops `replayed`, so `Arc::strong_count` would stay elevated at 3 instead of
+    /// falling to 2 once the loop's own (much smaller) scope has closed.
+    #[tokio::test]
+    async fn watch_replay_snapshot_is_released_once_yielded_not_pinned_for_stream_lifetime() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/watch-replay-lifetime-test/";
+        let key = format!("{prefix}obj-1");
+
+        let tracked = Arc::new(InternalEvent {
+            key: key.clone(),
+            revision: 1,
+            value: Some(Bytes::from(
+                r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"obj-1"}}"#,
+            )),
+            is_create: true,
+            deleted_body: None,
+        });
+        // One clone lands in the shard's ring (push_into_shard). `tx.send`'s own clone is
+        // dropped right back out: with zero subscribers at this point (watch() hasn't run
+        // yet), tokio's broadcast channel returns the value inside its `Err`, which
+        // `push_event_locked`'s `let _ = tx.send(event);` immediately discards. So this is 2
+        // total (tracked + the ring's copy), not 3.
+        store.push_event(Arc::clone(&tracked), None);
+
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        // watch() snapshots the ring into `replayed` (one more clone) before returning the
+        // stream — this is the count the rest of the test must see drop by exactly one.
+        assert_eq!(
+            Arc::strong_count(&tracked),
+            3,
+            "watch() must have snapshotted the ring into `replayed` at open time; without that \
+             baseline this test cannot distinguish a released snapshot from one never taken"
+        );
+
+        match stream.next().await {
+            Some(WatchEvent::Added(obj)) => assert_eq!(obj.key, key, "replayed the wrong object"),
+            other => panic!("expected the historical Added event first, got {other:?}"),
+        }
+
+        // One more poll: nothing was pushed since watch() subscribed, so the live-forwarding
+        // select has nothing to deliver and must return Pending — but reaching that point
+        // requires the generator to first run past the replay loop's exit.
+        let next_fut = stream.next();
+        futures_util::pin_mut!(next_fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(
+            matches!(
+                std::future::Future::poll(next_fut, &mut cx),
+                std::task::Poll::Pending
+            ),
+            "second poll should have nothing to deliver (no live events were pushed since watch \
+             opened), not another item"
+        );
+
+        assert_eq!(
+            Arc::strong_count(&tracked),
+            2,
+            "the replay snapshot must be released once its one event is yielded — a count \
+             stuck at 3 means the ring's replay Vec is being retained for the stream's entire \
+             lifetime instead of being dropped right after the historical-replay loop exits"
+        );
     }
 
     /// Verify that a global bookmark carrying a higher revision (from a concurrent write that
@@ -3871,7 +4037,7 @@ mod tests {
     async fn deletion_log_eviction_evicts_lowest_revision_not_insertion_order() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
 
-        const STRIPPED_TIER_CAP: usize = 8 * RING_CAPACITY;
+        const STRIPPED_TIER_CAP: usize = 2 * RING_CAPACITY;
         let victim_key = "/registry/core/namespaces/victim".to_string();
 
         // Insert STRIPPED_TIER_CAP + 1 tombstones so the cap is exceeded exactly once, on
@@ -3908,6 +4074,45 @@ mod tests {
             "eviction must remove the globally lowest-revision tombstone (revision=0, planted \
              mid-sequence); if eviction instead used insertion order or a desynced index, a \
              different (wrong) tombstone would be evicted and this one would incorrectly survive"
+        );
+    }
+
+    /// STRIPPED_TIER_CAP must stay at 2x RING_CAPACITY, not the old 8x: a full conformance
+    /// run's busiest shard peaked at 870 live tombstones, so the extra 6x of cap bought
+    /// ~656KB of pure index overhead per saturated shard that no real cluster traffic used.
+    ///
+    /// This test pushes exactly `2 * RING_CAPACITY + 1` tombstones — enough to trigger one
+    /// eviction under the current (2x) cap, but nowhere near a reverted 8x cap. It fails on
+    /// that revert: with an 8x cap, none of these inserts would evict anything, so the log
+    /// would still hold all 1025 entries instead of having shrunk back to 1024.
+    #[tokio::test]
+    async fn deletion_log_stripped_tier_cap_is_bounded_at_two_times_ring_capacity() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key_prefix = "/registry/core/pods/";
+
+        for i in 0..=(2 * RING_CAPACITY) {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("{key_prefix}pod-{i}"),
+                    revision: i as u64,
+                    value: None,
+                    is_create: false,
+                    deleted_body: None,
+                }),
+                None,
+            );
+        }
+
+        let shard = store.shard_for_test(&format!("{key_prefix}pod-0"), None);
+        let guard = shard.deletion_log.read().expect("deletion_log poisoned");
+        assert_eq!(
+            guard.by_key.len(),
+            2 * RING_CAPACITY,
+            "deletion_log must have evicted its oldest entry once it crossed 2x RING_CAPACITY \
+             (={}); a length of {} instead means STRIPPED_TIER_CAP regressed back toward the \
+             old, memory-wasteful 8x sizing that no measured shard's traffic ever needed",
+            2 * RING_CAPACITY,
+            2 * RING_CAPACITY + 1
         );
     }
 
@@ -3958,7 +4163,7 @@ mod tests {
         // stale revision=0 left behind by step 1 if the index were desynced. The lowest
         // revision among this fresh batch (revision=2, key "ns-0") is what a correctly
         // synced index must evict when the cap is exceeded on the final insert.
-        const STRIPPED_TIER_CAP: usize = 8 * RING_CAPACITY;
+        const STRIPPED_TIER_CAP: usize = 2 * RING_CAPACITY;
         let true_victim = "/registry/core/namespaces/ns-0".to_string();
         for i in 0..=STRIPPED_TIER_CAP {
             store.push_event(
