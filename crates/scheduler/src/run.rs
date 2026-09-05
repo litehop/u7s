@@ -407,6 +407,20 @@ async fn attempt_deferred_bind(
 /// its own retry-triggering event never arrives.
 const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Path the periodic resync GETs on every `RESYNC_INTERVAL` tick.
+///
+/// Deliberately NOT `fieldSelector=spec.nodeName=`: the store's fast-path
+/// field-selector match compares against SQL `json_extract`, which yields
+/// SQL-NULL (never equal to anything, including `''`) for a pod whose
+/// `spec.nodeName` key is entirely absent — and an unscheduled pod's
+/// `nodeName` is always absent, never present-and-empty, because it's an
+/// `Option<String>` with `skip_serializing_if` on the wire. A `nodeName=`
+/// selector therefore matches zero pods in a real cluster, silently
+/// disabling this resync's stranded-pod safety net. Every pod is listed
+/// here and filtered in-process by `pods_needing_resync` instead, which
+/// already handles the absent-vs-empty distinction correctly.
+const RESYNC_PODS_PATH: &str = "/api/v1/pods";
+
 /// Path for the scheduler's cluster-wide pod watch. `allowWatchBookmarks=true`
 /// requests the apiserver's 60s bookmark heartbeat so `watch_stream`'s 5-min
 /// per-frame idle timeout (`WATCH_IDLE_TIMEOUT` in `kubeconfig::lib`) never
@@ -471,13 +485,14 @@ const NODE_WATCH_PATH: &str =
 /// fresh `sendInitialEvents=true` relist never corrects (it only re-adds
 /// what still exists).
 ///
-/// `ready`, when given, is notified the first time this watch's initial
+/// `ready`, when given, is set to `true` the first time this watch's initial
 /// `sendInitialEvents=true` relist completes (the apiserver's
 /// `k8s.io/initial-events-end` BOOKMARK — see `is_initial_events_end_bookmark`)
-/// — the readiness barrier `run_scheduler` awaits on the node cache before
-/// serving any scheduling decision, so a restart with a pending-pod backlog
-/// never fail-safes every decision for lack of cached nodes (see that await
-/// site's own comment for the full story).
+/// — the readiness signal `run_scheduler`'s primary pod watch and periodic
+/// resync loop both await before serving any scheduling decision, so a
+/// restart with a pending-pod backlog never fail-safes every decision for
+/// lack of cached nodes (see those await sites' own comments for the full
+/// story).
 async fn run_cache_watch_loop(
     connector: TlsConnector,
     server: String,
@@ -485,7 +500,7 @@ async fn run_cache_watch_loop(
     path: &'static str,
     apply: fn(&mut NodeTally, &serde_json::Value),
     clear: fn(&mut NodeTally),
-    ready: Option<Arc<tokio::sync::Notify>>,
+    ready: Option<tokio::sync::watch::Sender<bool>>,
 ) {
     loop {
         info!("starting cache watch on {path}");
@@ -496,7 +511,7 @@ async fn run_cache_watch_loop(
             if !synced && is_initial_events_end_bookmark(&event) {
                 synced = true;
                 if let Some(ready) = &ready {
-                    ready.notify_one();
+                    let _ = ready.send(true);
                 }
             }
             apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event);
@@ -518,6 +533,64 @@ async fn run_cache_watch_loop(
 fn is_initial_events_end_bookmark(event: &serde_json::Value) -> bool {
     event["type"] == "BOOKMARK"
         && event["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"] == "true"
+}
+
+/// Periodic re-sync, independent of the primary pod watch: every
+/// `RESYNC_INTERVAL`, re-list every still-unscheduled pod and feed it back
+/// through `handle_pod_event`, exactly as a live watch event would. This is
+/// what eventually retries a pod stranded by a failed scheduling attempt
+/// (see `RESYNC_INTERVAL`'s doc comment for why the watch alone cannot be
+/// relied on to do that).
+///
+/// `node_cache_synced_rx` gates the very first tick on the same node-cache
+/// readiness signal `run_scheduler`'s primary pod watch awaits, for the same
+/// reason: a tick that fired before the node cache's initial sync landed
+/// would fail-safe every decision for lack of cached nodes, reproducing the
+/// primary watch's own restart-backlog gap via this independent 30s timer
+/// instead of a fresh connect. A function of its own (not inlined in
+/// `run_scheduler`) so this gating can be exercised directly in a test
+/// without also standing up the primary pod watch and every secondary cache
+/// watch.
+///
+/// `interval` is always `RESYNC_INTERVAL` in production; a parameter only so
+/// a test can shrink it to a few milliseconds instead of waiting out the
+/// real 30s cadence to prove the gate holds across several ticks.
+async fn run_resync_loop(
+    connector: TlsConnector,
+    server: String,
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    tally: Arc<Mutex<NodeTally>>,
+    mut node_cache_synced_rx: tokio::sync::watch::Receiver<bool>,
+    interval: std::time::Duration,
+) {
+    if !*node_cache_synced_rx.borrow() {
+        let _ = node_cache_synced_rx.changed().await;
+    }
+    loop {
+        tokio::time::sleep(interval).await;
+        let (status, body) = match http_get(&connector, &server, RESYNC_PODS_PATH).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("resync: GET {RESYNC_PODS_PATH} failed: {e}");
+                continue;
+            }
+        };
+        if !status.is_success() {
+            error!("resync: GET {RESYNC_PODS_PATH} returned {status}");
+            continue;
+        }
+        let list: PodList = match serde_json::from_str(&body) {
+            Ok(list) => list,
+            Err(e) => {
+                error!("resync: failed to parse pod list: {e}");
+                continue;
+            }
+        };
+        let in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
+        for event in pods_needing_resync(&list.items, &in_flight_snapshot) {
+            handle_pod_event(event, &connector, &server, &in_flight, &tally);
+        }
+    }
 }
 
 /// Handle one pod watch event — a real one from the live watch, or a
@@ -946,45 +1019,28 @@ pub async fn run_scheduler(
     // replays the full history the store still holds.
     let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
 
-    // Periodic re-sync, independent of the watch stream below: every
-    // RESYNC_INTERVAL, re-list every pod and feed anything still unscheduled
-    // back through handle_pod_event, exactly as a live watch event would.
-    // This is what eventually retries a pod stranded by a failed scheduling
-    // attempt (see RESYNC_INTERVAL's doc comment for why the watch alone
-    // cannot be relied on to do that).
-    {
-        let connector = connector.clone();
-        let server = server.clone();
-        let in_flight = in_flight.clone();
-        let tally = tally.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(RESYNC_INTERVAL).await;
-                let (status, body) = match http_get(&connector, &server, "/api/v1/pods").await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        error!("resync: GET /api/v1/pods failed: {e}");
-                        continue;
-                    }
-                };
-                if !status.is_success() {
-                    error!("resync: GET /api/v1/pods returned {status}");
-                    continue;
-                }
-                let list: PodList = match serde_json::from_str(&body) {
-                    Ok(list) => list,
-                    Err(e) => {
-                        error!("resync: failed to parse pod list: {e}");
-                        continue;
-                    }
-                };
-                let in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
-                for event in pods_needing_resync(&list.items, &in_flight_snapshot) {
-                    handle_pod_event(event, &connector, &server, &in_flight, &tally);
-                }
-            }
-        });
-    }
+    // `node_cache_synced` is the node watch's readiness barrier — see the
+    // primary pod watch's own await on it further down for the full story on
+    // why a scheduling decision must never be served before this fires. A
+    // `watch` channel, not a `Notify`: both the resync loop below and that
+    // later await are independent consumers of the same one-time transition
+    // to "synced", and a `Notify::notify_one()` wakes at most one of them —
+    // whichever happened to be waiting first would starve the other forever.
+    // `watch` instead retains the current value, so each consumer's own
+    // cloned receiver observes it correctly regardless of arrival order.
+    let (node_cache_synced_tx, mut node_cache_synced_rx) = tokio::sync::watch::channel(false);
+
+    // Periodic re-sync, independent of the watch stream below — see
+    // `run_resync_loop`'s doc comment for what it does and why it is gated
+    // on `node_cache_synced_rx` the same way the primary pod watch is.
+    tokio::spawn(run_resync_loop(
+        connector.clone(),
+        server.clone(),
+        in_flight.clone(),
+        tally.clone(),
+        node_cache_synced_rx.clone(),
+        RESYNC_INTERVAL,
+    ));
 
     // Secondary caches NodeTally maintains alongside the primary pod tally —
     // CSI-driver resolution (PVC/PV/StorageClass/CSINode) plus the node
@@ -993,9 +1049,9 @@ pub async fn run_scheduler(
     // — each watched independently so one's reconnect never blocks the
     // others or the primary pod watch.
     //
-    // `node_cache_synced` is the node watch's readiness barrier, awaited
-    // below before the pod watch starts serving scheduling decisions.
-    let node_cache_synced = Arc::new(tokio::sync::Notify::new());
+    // `node_cache_synced_tx` (declared above, alongside the resync loop that
+    // shares it) is notified below once, on the node watch's first
+    // sendInitialEvents relist.
     for (path, apply, clear, ready) in [
         (
             PVC_WATCH_PATH,
@@ -1025,7 +1081,7 @@ pub async fn run_scheduler(
             NODE_WATCH_PATH,
             NodeTally::apply_node_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_node_cache as fn(&mut NodeTally),
-            Some(node_cache_synced.clone()),
+            Some(node_cache_synced_tx.clone()),
         ),
     ] {
         tokio::spawn(run_cache_watch_loop(
@@ -1050,7 +1106,9 @@ pub async fn run_scheduler(
     // before the bookmark arrives, run_cache_watch_loop's own 5s-backoff
     // reconnect keeps retrying underneath it.
     info!("waiting for node cache initial sync before serving scheduling decisions");
-    node_cache_synced.notified().await;
+    if !*node_cache_synced_rx.borrow() {
+        let _ = node_cache_synced_rx.changed().await;
+    }
     info!("node cache synced — starting pod watch");
 
     // Watch loop — reconnect on error with a short backoff.
@@ -1099,6 +1157,24 @@ mod tests {
     use super::*;
     use crate::ResourceRequests;
     use serde_json::json;
+
+    #[test]
+    fn resync_pods_path_has_no_field_selector() {
+        // A `fieldSelector=spec.nodeName=` here would ask the store to match
+        // pods whose nodeName is SQL-equal to the empty string — but a real
+        // unscheduled pod's nodeName key is entirely ABSENT (Option<String>
+        // + skip_serializing_if), which the store's json_extract path reads
+        // back as SQL NULL, never equal to anything. That selector matched
+        // zero real pods, silently disabling this resync's stranded-pod
+        // safety net. Every pod must be listed here and filtered in-process
+        // instead (see `pods_needing_resync`).
+        assert!(
+            !RESYNC_PODS_PATH.contains("fieldSelector"),
+            "resync must list the full pod collection, not filter server-side \
+             on a selector the store cannot match against an absent field; \
+             got: {RESYNC_PODS_PATH}"
+        );
+    }
 
     #[test]
     fn pod_watch_path_requests_allow_watch_bookmarks() {
@@ -1411,6 +1487,95 @@ mod tests {
         .await;
 
         let _ = std::fs::remove_file(&kubeconfig_path);
+    }
+
+    /// Regression for the resync loop's OWN readiness gate (see
+    /// `run_resync_loop`'s doc comment): a revert that removed the gate from
+    /// just this call site — while leaving the primary pod watch's identical
+    /// barrier above untouched — would pass every test of the primary watch
+    /// alone, so this drives `run_resync_loop` directly against a
+    /// `watch::Receiver` this test controls, without the rest of
+    /// `run_scheduler`'s watches involved at all.
+    ///
+    /// Runs with a millisecond-scale `interval` (see `run_resync_loop`'s
+    /// `interval` parameter) instead of the real 30s `RESYNC_INTERVAL`, so a
+    /// reverted (ungated) loop would fire several ticks — and dial the mock
+    /// listener — well within this test's short real-time budget, instead of
+    /// needing a genuine 30-second wait to prove the difference.
+    #[tokio::test]
+    async fn resync_loop_gates_on_node_cache_synced() {
+        use rcgen::{CertificateParams, KeyPair};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        {
+            let connect_count = connect_count.clone();
+            tokio::spawn(async move {
+                // Each accepted connection is dropped immediately (out of
+                // scope at the end of this block) — run_resync_loop's
+                // http_get will fail the TLS handshake and log+continue,
+                // exactly like any other transient resync error. All this
+                // test needs is proof a connection was ever attempted.
+                while let Ok((_tcp, _)) = listener.accept().await {
+                    connect_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+
+        // build_tls_connector requires SOME client cert/key (mTLS) and CA
+        // cert, even though nothing here ever completes a handshake — any
+        // self-signed pair satisfies rustls's config builder.
+        let key = KeyPair::generate().expect("generate key");
+        let cert = CertificateParams::default()
+            .self_signed(&key)
+            .expect("self-sign cert");
+        let creds = u7s_kubeconfig::ClientCreds {
+            server: format!("https://{addr}"),
+            ca_cert: cert.der().clone(),
+            client_cert: cert.der().clone(),
+            client_key: PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        };
+        let connector = build_tls_connector(&creds).expect("build connector");
+
+        let (node_cache_synced_tx, node_cache_synced_rx) = tokio::sync::watch::channel(false);
+        let in_flight = Arc::new(Mutex::new(HashSet::new()));
+        let tally = Arc::new(Mutex::new(NodeTally::default()));
+        tokio::spawn(run_resync_loop(
+            connector,
+            creds.server,
+            in_flight,
+            tally,
+            node_cache_synced_rx,
+            std::time::Duration::from_millis(10),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            connect_count.load(Ordering::SeqCst),
+            0,
+            "the resync loop must not attempt its GET before the node cache's \
+             initial sync completes — with a 10ms tick interval, 200ms is ample \
+             time for a reverted (ungated) loop to have dialed out already; this \
+             is the same fail-safe-every-decision gap the primary pod watch's \
+             barrier closes, just reached via this independent timer instead of \
+             a fresh connect"
+        );
+
+        node_cache_synced_tx
+            .send(true)
+            .expect("receiver still alive");
+        wait_until(
+            || connect_count.load(Ordering::SeqCst) > 0,
+            "the resync loop to attempt its GET promptly once the node cache's \
+             initial sync completes",
+        )
+        .await;
     }
 
     /// Regression for the exact race live-reproduced against
