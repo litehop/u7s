@@ -63,15 +63,49 @@ fn runtime_worker_threads() -> usize {
         .max(2)
 }
 
+/// Cap on the tokio runtime's blocking-thread pool, replacing tokio's default
+/// of 512.
+///
+/// Every store call is `spawn_blocking`, and the sqlite connection mutex is
+/// acquired INSIDE that closure (see sqlite.rs) -- there is exactly one read
+/// and one write connection, so at most 2 blocking threads ever do useful
+/// work at a time; every other in-flight request just parks an OS thread on
+/// a mutex. The real concurrency ceiling is `MAX_INFLIGHT` (inflight.rs), not
+/// tokio's default pool size, so raising the cap above it buys nothing:
+/// throughput is unchanged (2 usable connections either way) while virtual
+/// memory drops from about 260 MiB to about 12 MiB and blocking-pool RSS
+/// from about 3.2 MB to about 0.4 MB. Requests beyond the cap queue in
+/// tokio's blocking-task queue instead of holding a parked OS thread, which
+/// is strictly cheaper, not slower.
+const MAX_BLOCKING_THREADS: usize = 24;
+
+// Compile-time guard, not a `#[test]`: a wrong value here defeats the whole
+// point of the cap before any test even runs, so catch it at build time
+// instead of relying on someone remembering to run the test suite.
+const _: () = assert!(
+    MAX_BLOCKING_THREADS <= 32,
+    "MAX_BLOCKING_THREADS grew back toward tokio's 512 default, eating back \
+     into the virtual-memory and thread-count budget this cap exists to bound"
+);
+
+/// Builds the apiserver's tokio runtime with the footprint-bounding tunables
+/// shared by both the `dhat` and default `main` entry points, so the two
+/// binaries can't drift apart on `worker_threads`, `max_blocking_threads` or
+/// stack size.
+fn configure_runtime() -> tokio::runtime::Builder {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .worker_threads(runtime_worker_threads())
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .thread_stack_size(512 * 1024)
+        .enable_all();
+    builder
+}
+
 #[cfg(feature = "dhat")]
 fn main() -> anyhow::Result<()> {
     bound_glibc_malloc_arenas();
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(runtime_worker_threads())
-        .thread_stack_size(512 * 1024)
-        .enable_all()
-        .build()?
-        .block_on(dhat_main())
+    configure_runtime().build()?.block_on(dhat_main())
 }
 
 #[cfg(feature = "dhat")]
@@ -110,20 +144,17 @@ async fn dhat_main() -> anyhow::Result<()> {
 #[cfg(not(feature = "dhat"))]
 fn main() -> anyhow::Result<()> {
     bound_glibc_malloc_arenas();
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(runtime_worker_threads())
-        .thread_stack_size(512 * 1024)
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let args = Args::parse();
-            run(args).await
-        })
+    configure_runtime().build()?.block_on(async {
+        let args = Args::parse();
+        run(args).await
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bound_glibc_malloc_arenas, runtime_worker_threads};
+    use super::{
+        bound_glibc_malloc_arenas, configure_runtime, runtime_worker_threads, MAX_BLOCKING_THREADS,
+    };
 
     /// Guards against the apiserver reverting to an unbounded glibc process:
     /// without `MALLOC_ARENA_MAX` pinned, ptmalloc2 can grow to `8 * ncores`
@@ -138,6 +169,23 @@ mod tests {
             Ok("2"),
             "MALLOC_ARENA_MAX must be pinned to 2 before the tokio runtime spawns \
              any thread, or glibc is free to grow one arena per contending thread"
+        );
+    }
+
+    /// Guards against tokio's default `max_blocking_threads` of 512 coming
+    /// back: every store call blocks on the sqlite connection mutex from
+    /// inside `spawn_blocking` (see sqlite.rs), and there are only 2 usable
+    /// connections, so any thread above the real concurrency ceiling
+    /// (`MAX_INFLIGHT` in inflight.rs) just parks an OS thread on a mutex for
+    /// no throughput gain while still counting as another glibc
+    /// arena-creation candidate.
+    #[test]
+    fn configure_runtime_caps_blocking_pool_well_below_tokios_default_of_512() {
+        let debug = format!("{:?}", configure_runtime());
+        assert!(
+            debug.contains(&format!("max_blocking_threads: {MAX_BLOCKING_THREADS}")),
+            "configure_runtime() must actually apply MAX_BLOCKING_THREADS to the \
+             tokio Builder, not just declare the constant -- got: {debug}"
         );
     }
 
