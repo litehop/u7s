@@ -631,16 +631,7 @@ struct ListMeta {
     remaining_item_count: Option<u64>,
 }
 
-/// Wire shape of every LIST response: `{kind, apiVersion, metadata, items}`.
-#[derive(Serialize)]
-struct ListResponse {
-    kind: String,
-    #[serde(rename = "apiVersion")]
-    api_version: String,
-    metadata: ListMeta,
-    items: Vec<serde_json::Value>,
-}
-
+/// Builds the wire shape of every LIST response: `{kind, apiVersion, metadata, items}`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_list_response(
     kind: &str,
@@ -661,17 +652,30 @@ pub(crate) fn build_list_response(
     // (which decodes the token to build its own response) reports an identical
     // resourceVersion — required by chunking conformance (see decode_continue doc).
     let continue_token = continue_key.map(|key| encode_continue(&key, revision, signing_key));
-    let response = ListResponse {
-        kind: format!("{}List", kind),
-        api_version,
-        metadata: ListMeta {
-            resource_version: revision.to_string(),
-            continue_token,
-            remaining_item_count: remaining_count,
-        },
-        items,
+    let metadata = ListMeta {
+        resource_version: revision.to_string(),
+        continue_token,
+        remaining_item_count: remaining_count,
     };
-    serde_json::to_value(response).expect("ListResponse is always serializable")
+    // Serialize only the small ListMeta via to_value and move `items` straight into
+    // Value::Array. Deriving Serialize over the whole ListResponse (as before) makes
+    // serde_json::to_value walk every already-`Value` item again to rebuild an
+    // identical tree, doubling peak memory for LIST responses with many items.
+    let mut map = serde_json::Map::with_capacity(4);
+    map.insert(
+        "kind".to_string(),
+        serde_json::Value::String(format!("{}List", kind)),
+    );
+    map.insert(
+        "apiVersion".to_string(),
+        serde_json::Value::String(api_version),
+    );
+    map.insert(
+        "metadata".to_string(),
+        serde_json::to_value(metadata).expect("ListMeta is always serializable"),
+    );
+    map.insert("items".to_string(), serde_json::Value::Array(items));
+    serde_json::Value::Object(map)
 }
 
 /// Check finalizers for delete: if non-empty, set deletionTimestamp and return modified object.
@@ -1179,6 +1183,125 @@ mod tests {
             "the LIST envelope shape (kind/apiVersion/metadata.resourceVersion/items) must \
              match exactly what client-go's List decoder expects — an extra, missing, or \
              renamed key breaks every `kubectl get` and every controller's informer LIST"
+        );
+    }
+
+    /// Reproduces the pre-optimization envelope construction — `to_value` over a struct that
+    /// derives `Serialize` and owns `items: Vec<Value>` — so the tests below can assert the
+    /// hand-built `Value::Object` in `build_list_response` is byte-for-byte what the old,
+    /// slower path emitted. A structural `Value` comparison alone wouldn't catch a subtle
+    /// drift (e.g. a stray field or a different number representation) introduced while
+    /// replacing the derive with manual `Map` inserts.
+    #[derive(Serialize)]
+    struct LegacyListResponse {
+        kind: String,
+        #[serde(rename = "apiVersion")]
+        api_version: String,
+        metadata: ListMeta,
+        items: Vec<serde_json::Value>,
+    }
+
+    fn legacy_build_list_response(
+        kind: &str,
+        group: &str,
+        version: &str,
+        revision: u64,
+        items: Vec<serde_json::Value>,
+        continue_token: Option<String>,
+        remaining_count: Option<u64>,
+    ) -> serde_json::Value {
+        let api_version = if group.is_empty() {
+            version.to_string()
+        } else {
+            format!("{}/{}", group, version)
+        };
+        let response = LegacyListResponse {
+            kind: format!("{}List", kind),
+            api_version,
+            metadata: ListMeta {
+                resource_version: revision.to_string(),
+                continue_token,
+                remaining_item_count: remaining_count,
+            },
+            items,
+        };
+        serde_json::to_value(response).expect("LegacyListResponse is always serializable")
+    }
+
+    /// A malformed empty LIST (the shape every namespace-scoped watch establishment starts
+    /// from) breaks every client's initial informer sync, so this pins its exact wire bytes
+    /// against the pre-optimization construction path.
+    #[test]
+    fn build_list_response_empty_items_matches_legacy_bytes() {
+        let body = build_list_response("Namespace", "", "v1", 0, vec![], None, None, TEST_KEY);
+        let legacy = legacy_build_list_response("Namespace", "", "v1", 0, vec![], None, None);
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            serde_json::to_string(&legacy).unwrap(),
+            "an empty LIST envelope's wire bytes must not change when the derive-based \
+             to_value call is replaced with manual Map inserts"
+        );
+    }
+
+    /// Multiple items is the common case this optimization targets (peak memory scales with
+    /// item count); this pins that the moved-in `items` array still serializes identically
+    /// to re-deriving Serialize over every item.
+    #[test]
+    fn build_list_response_multi_item_matches_legacy_bytes() {
+        let items = vec![
+            serde_json::json!({"metadata": {"name": "a"}, "spec": {"replicas": 1}}),
+            serde_json::json!({"metadata": {"name": "b"}, "spec": {"replicas": 2}}),
+            serde_json::json!({"metadata": {"name": "c"}}),
+        ];
+        let body = build_list_response(
+            "Deployment",
+            "apps",
+            "v1",
+            42,
+            items.clone(),
+            None,
+            None,
+            TEST_KEY,
+        );
+        let legacy = legacy_build_list_response("Deployment", "apps", "v1", 42, items, None, None);
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            serde_json::to_string(&legacy).unwrap(),
+            "a multi-item LIST envelope's wire bytes must not change; a single dropped or \
+             reordered item corrupts every client's view of the collection"
+        );
+    }
+
+    /// Chunked LIST pagination (the `continue`/`remainingItemCount` fields) is the path most
+    /// likely to regress from a manual reimplementation, since those two fields are the only
+    /// ones with `skip_serializing_if`. This pins their exact placement and presence.
+    #[test]
+    fn build_list_response_with_continue_and_remaining_matches_legacy_bytes() {
+        let items = vec![serde_json::json!({"metadata": {"name": "a"}})];
+        let body = build_list_response(
+            "Pod",
+            "",
+            "v1",
+            7,
+            items.clone(),
+            Some("/registry/pods/default/a".to_string()),
+            Some(3),
+            TEST_KEY,
+        );
+        // The real continue token embeds a timestamp, so re-encoding it in the legacy path
+        // would flake; reuse the token the function under test already produced and assert
+        // only that the envelope built around it is byte-identical.
+        let token = body["metadata"]["continue"]
+            .as_str()
+            .expect("continue field must be present when continue_key is Some")
+            .to_string();
+        let legacy = legacy_build_list_response("Pod", "", "v1", 7, items, Some(token), Some(3));
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            serde_json::to_string(&legacy).unwrap(),
+            "a LIST envelope carrying a continue token and remainingItemCount must serialize \
+             identically to the pre-optimization path, or chunked `kubectl get --chunk-size` \
+             pagination silently breaks"
         );
     }
 
