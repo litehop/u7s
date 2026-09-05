@@ -1227,13 +1227,17 @@ async fn delete_namespace_scoped_crds<S: Store>(state: &AppState<S>, namespace_n
         }
 
         // This is a direct store write on the CRD key, not a call into crd::delete_crd — so it
-        // must run the exact same cache eviction crd::delete_crd runs after its own delete, or
-        // find_crd (cr.rs) keeps serving the pre-delete CrContext/schema forever (its cache
-        // check has no tombstone/404 fallback to fall through to).
+        // must run the exact same cache eviction and discovery refresh crd::delete_crd runs
+        // after its own delete, or (a) find_crd (cr.rs) keeps serving the pre-delete
+        // CrContext/schema forever (its cache check has no tombstone/404 fallback to fall
+        // through to), and (b) /apis keeps advertising the deleted group forever, so KCM's
+        // namespace-controller re-discovers it on every resync, hits the tombstone's 410, and
+        // requeues the namespace drain forever.
         let (group, versions, plural, resource_version) =
             crate::handlers::crd::crd_cache_identity(&crd);
         crate::handlers::crd::evict_cr_schema_cache(state, &group, &versions, &resource_version);
         crate::handlers::crd::evict_cr_context_cache(state, &group, &plural, &versions);
+        crate::handlers::discovery::refresh_discovery_cache(state).await;
         if !versions.is_empty() {
             let target_api_versions: HashSet<String> =
                 versions.iter().map(|v| format!("{group}/{v}")).collect();
@@ -4342,6 +4346,89 @@ mod tests {
              again, so a missed eviction here leaks one entry per (write, target version) for \
              the life of the process, the same class of leak already fixed for CR hard-deletes \
              but on the CRD-delete path"
+        );
+    }
+
+    // HIGH-severity regression: unlike find_crd's cache (checked above), aggregated /apis
+    // discovery is served from DiscoveryCache (state.rs), which has no TTL and is refreshed
+    // only by an explicit write-through call. delete_namespace_scoped_crds hard-deletes the
+    // CRD's store object directly, not via crd::delete_crd, so it must also call
+    // discovery::refresh_discovery_cache itself — otherwise /apis keeps advertising the
+    // deleted group forever, and KCM's namespace-controller (which discovers resources via
+    // this exact endpoint) keeps re-listing the tombstoned group on every resync, hits the
+    // group's 410 Gone tombstone, and requeues the namespace drain forever: the namespace
+    // never leaves Terminating.
+    //
+    // Falsifiable: comment out the `refresh_discovery_cache` call added to
+    // delete_namespace_scoped_crds and this test fails, because the cache still holds the
+    // pre-delete snapshot.
+    #[tokio::test]
+    async fn delete_namespace_scoped_crds_refreshes_discovery_so_kcm_stops_finding_the_deleted_group(
+    ) {
+        use crate::handlers::crd;
+
+        let state = make_state();
+        let group = "stable.nscrd-discovery-test.example.com";
+
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": { "name": format!("crontabs.{group}") },
+                        "spec": {
+                            "group": group,
+                            "names": {
+                                "plural": "crontabs",
+                                "singular": "crontab",
+                                "kind": "CronTab",
+                                "listKind": "CronTabList"
+                            },
+                            "scope": "Namespaced",
+                            "versions": [{ "name": "v1", "served": true, "storage": true }]
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .is_ok(),
+            "install namespace-scoped CRD whose group embeds the namespace name"
+        );
+
+        let before = crate::handlers::discovery::build_aggregated_discovery(
+            &state,
+            "v2beta1",
+            false,
+            &crate::auth::UserInfo::default(),
+            "/apis",
+        )
+        .await;
+        assert!(
+            before.items.iter().any(|g| g.metadata.name == group),
+            "the CRD's group must be visible in discovery right after creation"
+        );
+
+        delete_namespace_scoped_crds(&state, "nscrd-discovery-test").await;
+
+        let after = crate::handlers::discovery::build_aggregated_discovery(
+            &state,
+            "v2beta1",
+            false,
+            &crate::auth::UserInfo::default(),
+            "/apis",
+        )
+        .await;
+        assert!(
+            !after.items.iter().any(|g| g.metadata.name == group),
+            "the CRD's group must be gone from discovery immediately after \
+             delete_namespace_scoped_crds -- a stale DiscoveryCache entry here is exactly what \
+             makes KCM's namespace-controller keep rediscovering the tombstoned group and \
+             requeue the namespace drain forever"
         );
     }
 
