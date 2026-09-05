@@ -168,7 +168,7 @@ impl RingShard {
 /// it) goes away. That is the one signal this whole lifecycle needs: "is anyone still reading
 /// this stream," which nothing else in `watch()`'s own body observes.
 struct ShardWatcherGuard {
-    shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    shards: Arc<RwLock<BTreeMap<String, Arc<RingShard>>>>,
     reclaimed_horizons: Arc<RwLock<ReclaimedHorizons>>,
     key: String,
     shard: Arc<RingShard>,
@@ -176,7 +176,7 @@ struct ShardWatcherGuard {
 
 impl ShardWatcherGuard {
     fn attach(
-        shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+        shards: Arc<RwLock<BTreeMap<String, Arc<RingShard>>>>,
         reclaimed_horizons: Arc<RwLock<ReclaimedHorizons>>,
         key: String,
         shard: Arc<RingShard>,
@@ -216,7 +216,7 @@ impl Drop for ShardWatcherGuard {
 /// "zero watchers as of just now," or a written-but-never-watched resource type's shard would
 /// live for the rest of the process's life).
 fn schedule_idle_gc(
-    shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    shards: Arc<RwLock<BTreeMap<String, Arc<RingShard>>>>,
     reclaimed_horizons: Arc<RwLock<ReclaimedHorizons>>,
     key: String,
     shard: Arc<RingShard>,
@@ -372,7 +372,7 @@ pub struct SqliteStore {
     /// so pre-populating every possible shard up front would waste memory on types nobody ever
     /// writes. See `shard_key` for how a write's shard is derived, and `RingShard`'s doc for why
     /// sharding this way matters.
-    shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    shards: Arc<RwLock<BTreeMap<String, Arc<RingShard>>>>,
     /// Compaction floor preserved for a resource-type prefix whose shard has been torn down
     /// (idle-GC today; CRD-delete eager teardown later). Once a shard can be reclaimed, its
     /// absence from `shards` stops meaning "this resource type was never written" and starts
@@ -448,7 +448,7 @@ impl SqliteStore {
         };
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let shards = Arc::new(RwLock::new(HashMap::new()));
+        let shards = Arc::new(RwLock::new(BTreeMap::new()));
         let reclaimed_horizons = Arc::new(RwLock::new(ReclaimedHorizons::default()));
         let compaction_horizon = Arc::new(AtomicU64::new(0));
         let last_written_revision = Arc::new(AtomicU64::new(0));
@@ -779,7 +779,7 @@ fn push_into_shard(
 #[allow(clippy::too_many_arguments)]
 fn push_event_locked(
     tx: &broadcast::Sender<Arc<InternalEvent>>,
-    shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    shards: &Arc<RwLock<BTreeMap<String, Arc<RingShard>>>>,
     reclaimed_horizons: &Arc<RwLock<ReclaimedHorizons>>,
     shard_key: &str,
     ns: Option<&str>,
@@ -878,7 +878,7 @@ fn push_event_locked(
 /// live shard's own `horizon` field, the side entry no longer carries information the live shard
 /// doesn't already have.
 fn get_or_create_shard(
-    shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    shards: &Arc<RwLock<BTreeMap<String, Arc<RingShard>>>>,
     reclaimed_horizons: &Arc<RwLock<ReclaimedHorizons>>,
     shard: &str,
 ) -> Arc<RingShard> {
@@ -924,7 +924,7 @@ fn get_or_create_shard(
 /// `evict_resource_type`'s CRD-delete eager teardown removes a shard because its resource TYPE
 /// no longer exists, which is unconditionally correct regardless of `watchers`.
 pub(crate) fn tear_down_shard(
-    shards: &RwLock<HashMap<String, Arc<RingShard>>>,
+    shards: &RwLock<BTreeMap<String, Arc<RingShard>>>,
     reclaimed_horizons: &RwLock<ReclaimedHorizons>,
     key: &str,
 ) -> Option<Arc<RingShard>> {
@@ -951,12 +951,13 @@ pub(crate) fn tear_down_shard(
 /// namespace segment — rather than scanning every live shard with a `starts_with` check. This
 /// relies on the same invariant `find_shard`/`find_shard_key` already document and depend on: a
 /// watch's own prefix, and therefore every key that can ever live in `shards`, is always EXACTLY
-/// one of those two shapes for a given resource type (see `group_list_prefix` in the apiserver
-/// crate, which is the only place a watch prefix is ever built), so no other shard key could ever
-/// be a prefix of this write's key. Two `HashMap::get` calls replace what used to be an
-/// O(shard-count) `.iter().filter(starts_with)` scan run on every single write.
+/// one of those two shapes for a given resource type (see `group_list_prefix` and `cr_list_prefix`
+/// in the apiserver crate, and crd.rs's own `list_prefix` — the independent places a watch prefix
+/// gets built, all producing one of these two shapes), so no other shard key could ever be a
+/// prefix of this write's key. Two `BTreeMap::get` calls replace what used to be an O(shard-count)
+/// `.iter().filter(starts_with)` scan run on every single write.
 fn matching_shards(
-    shards: &HashMap<String, Arc<RingShard>>,
+    shards: &BTreeMap<String, Arc<RingShard>>,
     root: &str,
     ns: Option<&str>,
 ) -> Vec<(String, Arc<RingShard>)> {
@@ -1005,12 +1006,19 @@ fn shard_key(key: &str, ns: Option<&str>) -> String {
 /// specific (e.g. prefers an existing namespace-scoped shard over a broader all-namespaces one
 /// if both happen to exist). `None` means no shard currently covers this resource type at all —
 /// `SqliteStore::watch` creates one keyed to `prefix` itself in that case.
-fn find_shard(shards: &HashMap<String, Arc<RingShard>>, prefix: &str) -> Option<Arc<RingShard>> {
-    shards
-        .iter()
-        .filter(|(shard, _)| prefix.starts_with(shard.as_str()))
-        .max_by_key(|(shard, _)| shard.len())
-        .map(|(_, shard)| Arc::clone(shard))
+///
+/// Checks at most two exact keys rather than scanning every live shard, for the same reason
+/// `matching_shards` does: `prefix` is itself always one of the two shapes that doc establishes,
+/// so the only candidates that could ever be a prefix of `prefix` are `prefix` itself (the
+/// longest possible match, since every other candidate is strictly shorter) and, if that misses,
+/// `parent_prefix(prefix)` (the one-level-up root a namespace-scoped `prefix` falls back to) —
+/// no other live key could ever qualify. Mirrors `find_reclaimed_horizon`'s exact/parent chain.
+fn find_shard(shards: &BTreeMap<String, Arc<RingShard>>, prefix: &str) -> Option<Arc<RingShard>> {
+    if let Some(shard) = shards.get(prefix) {
+        return Some(Arc::clone(shard));
+    }
+    let parent = parent_prefix(prefix)?;
+    shards.get(&parent).map(Arc::clone)
 }
 
 /// Like `find_shard`, but also returns the exact map key the match lives under — `watch()` needs
@@ -1018,14 +1026,14 @@ fn find_shard(shards: &HashMap<String, Arc<RingShard>>, prefix: &str) -> Option<
 /// idle-GC teardown can later remove the SAME entry again, even when it differs from this watch's
 /// own `prefix` (a reused, more broadly-scoped shard created by an earlier, different watch).
 fn find_shard_key(
-    shards: &HashMap<String, Arc<RingShard>>,
+    shards: &BTreeMap<String, Arc<RingShard>>,
     prefix: &str,
 ) -> Option<(String, Arc<RingShard>)> {
-    shards
-        .iter()
-        .filter(|(shard, _)| prefix.starts_with(shard.as_str()))
-        .max_by_key(|(shard, _)| shard.len())
-        .map(|(shard, ring)| (shard.clone(), Arc::clone(ring)))
+    if let Some(shard) = shards.get(prefix) {
+        return Some((prefix.to_string(), Arc::clone(shard)));
+    }
+    let parent = parent_prefix(prefix)?;
+    shards.get(&parent).map(|shard| (parent, Arc::clone(shard)))
 }
 
 /// The fallback `compaction_horizon_for` consults when no LIVE shard matches `prefix`, and the
@@ -2501,16 +2509,26 @@ impl Store for SqliteStore {
         // Every shard rooted at `prefix` — the reverse direction from `matching_shards` (which
         // finds shards that are a prefix of a WRITE's key): here `prefix` is the shorter,
         // caller-supplied resource-type root, and we want every shard key that EXTENDS it (the
-        // exact cluster-scoped root itself, plus any namespace-scoped shard for the same
-        // resource type). Collected before removing so `tear_down_shard`'s own write-lock
-        // acquisition per key never nests inside this read lock.
+        // exact cluster-scoped root itself, plus a namespace-scoped shard for EACH namespace
+        // that ever had its own watch on this type — unlike `find_shard`/`find_shard_key`, this
+        // count has no fixed bound, since nothing stops distinct watches on different namespaces
+        // of the same CRD from each getting their own shard entry, so a fixed two-key check
+        // would silently leave other namespaces' shards live after a CRD delete).
+        //
+        // `shards` is a `BTreeMap`, so every key sharing `prefix` as a byte-prefix sorts
+        // contiguously starting at `prefix` itself (lexicographic order agrees with string-prefix
+        // order) — `range(prefix..)` seeks there directly and `take_while` stops at the first key
+        // that no longer matches, visiting exactly this root's shards (plus at most one
+        // non-matching key) instead of every shard for every OTHER resource type in the store.
+        // Collected before removing so `tear_down_shard`'s own write-lock acquisition per key
+        // never nests inside this read lock.
         let rooted: Vec<String> = self
             .shards
             .read()
             .expect("shards poisoned")
-            .keys()
-            .filter(|shard| shard.starts_with(prefix))
-            .cloned()
+            .range(prefix.to_string()..)
+            .take_while(|(shard, _)| shard.starts_with(prefix))
+            .map(|(shard, _)| shard.clone())
             .collect();
         for shard_key in rooted {
             tear_down_shard(&self.shards, &self.reclaimed_horizons, &shard_key);
@@ -2849,7 +2867,7 @@ mod tests {
             write_conn,
             read_conn,
             tx,
-            shards: Arc::new(RwLock::new(HashMap::new())),
+            shards: Arc::new(RwLock::new(BTreeMap::new())),
             reclaimed_horizons: Arc::new(RwLock::new(ReclaimedHorizons::default())),
             compaction_horizon: Arc::new(AtomicU64::new(0)),
             last_written_revision: last_written,
@@ -3132,7 +3150,7 @@ mod tests {
     /// never sees an update it was owed.
     #[test]
     fn matching_shards_write_reaches_every_prefix_match_and_nothing_else() {
-        let mut shards: HashMap<String, Arc<RingShard>> = HashMap::new();
+        let mut shards: BTreeMap<String, Arc<RingShard>> = BTreeMap::new();
         shards.insert("/registry/pods/".into(), Arc::new(RingShard::new()));
         shards.insert("/registry/pods/default/".into(), Arc::new(RingShard::new()));
         // A different namespace's shard — must never match a "default" write.
@@ -3168,7 +3186,7 @@ mod tests {
     /// silently reintroducing the memory idle-GC was supposed to reclaim.
     #[test]
     fn matching_shards_reflects_shard_added_then_removed_between_writes() {
-        let mut shards: HashMap<String, Arc<RingShard>> = HashMap::new();
+        let mut shards: BTreeMap<String, Arc<RingShard>> = BTreeMap::new();
         shards.insert("/registry/pods/".into(), Arc::new(RingShard::new()));
         let root = "/registry/pods/";
 
@@ -3230,7 +3248,7 @@ mod tests {
         const DECOY_SHARDS: usize = 20_000;
         const WRITES: usize = 5_000;
 
-        let mut shards: HashMap<String, Arc<RingShard>> = HashMap::new();
+        let mut shards: BTreeMap<String, Arc<RingShard>> = BTreeMap::new();
         for i in 0..DECOY_SHARDS {
             shards.insert(format!("/registry/decoy-{i}/"), Arc::new(RingShard::new()));
         }
@@ -3255,6 +3273,206 @@ mod tests {
              {elapsed:?}; an O(1) prefix lookup should complete this in low single-digit \
              milliseconds — this budget is only reachable by a linear starts_with scan if that \
              O(shard-count) cost has been reintroduced"
+        );
+    }
+
+    /// `find_shard`/`find_shard_key` must resolve to the exact shard a watch's own prefix already
+    /// has, fall back to the broader resource-type root only when it doesn't, and stop resolving
+    /// to a shard the instant it is torn down.
+    ///
+    /// Why it matters: `SqliteStore::watch` uses these to decide whether to reuse an existing
+    /// shard's retained history or start a brand-new (empty) one — a mis-resolve either throws
+    /// away real history a watch should have inherited, or hands back a torn-down shard's stale
+    /// `Arc` that no live watcher can see events through.
+    #[test]
+    fn find_shard_resolves_exact_then_falls_back_to_parent_across_add_and_remove() {
+        let mut shards: BTreeMap<String, Arc<RingShard>> = BTreeMap::new();
+        let root_prefix = "/registry/pods/";
+        let ns_prefix = "/registry/pods/default/";
+
+        assert!(
+            find_shard(&shards, root_prefix).is_none(),
+            "no shard exists yet — must not conjure one"
+        );
+        assert!(find_shard(&shards, ns_prefix).is_none());
+
+        // An all-namespaces watch opens first, creating the root shard.
+        let root_shard = Arc::new(RingShard::new());
+        shards.insert(root_prefix.to_string(), Arc::clone(&root_shard));
+
+        // A namespace-scoped watch on "default" has no shard of its own yet, so it must fall
+        // back to the broader root shard rather than reporting "nothing exists".
+        let (key, shard) =
+            find_shard_key(&shards, ns_prefix).expect("root shard must be reused as fallback");
+        assert_eq!(
+            key, root_prefix,
+            "the fallback's own key must be reported, not ns_prefix"
+        );
+        assert!(Arc::ptr_eq(&shard, &root_shard));
+
+        // Its own, more specific shard is created afterward and must now take priority over the
+        // broader root — reusing the root here would wrongly seed the ns watch off the root's
+        // history instead of its own namespace-scoped shard.
+        let ns_shard = Arc::new(RingShard::new());
+        shards.insert(ns_prefix.to_string(), Arc::clone(&ns_shard));
+        let (key, shard) = find_shard_key(&shards, ns_prefix).expect("ns shard now exists");
+        assert_eq!(
+            key, ns_prefix,
+            "the exact ns match must win over the shorter root match"
+        );
+        assert!(Arc::ptr_eq(&shard, &ns_shard));
+
+        // Tearing the ns shard down again must fall back to the root, not vanish or resurrect a
+        // stale Arc for the removed entry.
+        shards.remove(ns_prefix);
+        assert!(
+            Arc::ptr_eq(
+                &find_shard(&shards, ns_prefix).expect("must fall back to root after removal"),
+                &root_shard
+            ),
+            "once the ns shard is torn down, a later lookup must fall back to the root again — \
+             continuing to resolve the removed key would be a use-after-teardown bug"
+        );
+    }
+
+    /// `find_shard` must stay fast regardless of how many unrelated shards exist store-wide —
+    /// every open watch calls it, so a real conformance run's dozens of live shards must not
+    /// turn watch-open into a linear scan.
+    ///
+    /// Fails on revert: without the exact/parent two-key lookup, this reverts to the
+    /// `.iter().filter(starts_with).max_by_key` scan `find_shard` used to run, whose cost scales
+    /// with total shard count regardless of which resource type is being looked up.
+    #[test]
+    fn find_shard_stays_fast_with_many_unrelated_shards() {
+        const DECOY_SHARDS: usize = 20_000;
+        const LOOKUPS: usize = 5_000;
+
+        let mut shards: BTreeMap<String, Arc<RingShard>> = BTreeMap::new();
+        for i in 0..DECOY_SHARDS {
+            shards.insert(format!("/registry/decoy-{i}/"), Arc::new(RingShard::new()));
+        }
+        shards.insert("/registry/pods/".into(), Arc::new(RingShard::new()));
+
+        let ns_prefix = "/registry/pods/default/";
+        let started = std::time::Instant::now();
+        for _ in 0..LOOKUPS {
+            assert!(
+                find_shard(&shards, ns_prefix).is_some(),
+                "sanity: must still find the root as a fallback match"
+            );
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "{LOOKUPS} find_shard calls against {DECOY_SHARDS} unrelated shards took {elapsed:?}; \
+             an O(1) lookup should complete this in low single-digit milliseconds — this budget \
+             is only reachable by a linear starts_with scan if that O(shard-count) cost has been \
+             reintroduced"
+        );
+    }
+
+    /// `evict_resource_type` must tear down EVERY shard rooted at a resource type, however many
+    /// distinct namespaces happen to have their own shard for it — not just the first one, or a
+    /// fixed small number.
+    ///
+    /// Why it matters: nothing stops separate watches on different namespaces of the same CRD
+    /// from each getting their own shard entry (see `SqliteStore::watch`'s create-on-first-watch
+    /// path). A CRD-delete eviction that only checked a fixed, small set of candidate keys — the
+    /// same trick `find_shard`/`find_shard_key` use, which works there only because THEY are
+    /// given one already-known namespace to check — would silently leave every namespace past
+    /// the first one live: a deleted resource type's watch history would keep pinning ring
+    /// memory forever, and a reconnecting watch on one of those stray shards would wrongly
+    /// replay instead of getting the 410 Gone a deleted type must always return.
+    #[tokio::test]
+    async fn evict_resource_type_removes_every_namespace_scoped_shard_not_just_one() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let root = "/registry/widgets.example.com/widgets/";
+
+        for ns in ["default", "kube-system", "tenant-a"] {
+            let prefix = format!("{root}{ns}/");
+            drop(
+                store
+                    .watch(&prefix, 0)
+                    .await
+                    .expect("namespace watch must succeed"),
+            );
+        }
+        drop(
+            store
+                .watch(root, 0)
+                .await
+                .expect("cluster-scoped watch must succeed"),
+        );
+
+        assert_eq!(
+            store.shards.read().expect("shards poisoned").len(),
+            4,
+            "sanity check on test setup: four distinct shards (root + 3 namespaces) must exist \
+             before eviction runs"
+        );
+
+        store.evict_resource_type(root);
+
+        assert!(
+            store.shards.read().expect("shards poisoned").is_empty(),
+            "every shard for this resource type — the root and all three namespace variants — \
+             must be gone after eviction; any left behind pin ring memory forever and let a \
+             reconnecting watcher on that stray shard replay instead of getting 410 Gone"
+        );
+    }
+
+    /// `evict_resource_type` must stay fast regardless of how many OTHER resource types have
+    /// live shards — a CRD delete must not pay for every other type's shard in the store just to
+    /// find the handful (or one) that actually belong to the type being deleted.
+    ///
+    /// Fails on revert: without the `BTreeMap::range` prefix-seek, this reverts to the
+    /// `.keys().filter(starts_with)` scan `evict_resource_type` used to run over the WHOLE
+    /// `shards` map, whose cost scales with total shard count across every resource type in the
+    /// store, not just the one being deleted.
+    #[tokio::test]
+    async fn evict_resource_type_stays_fast_with_many_unrelated_shards() {
+        const DECOY_SHARDS: usize = 20_000;
+        const EVICTIONS: usize = 5_000;
+
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        {
+            let mut guard = store.shards.write().expect("shards poisoned");
+            for i in 0..DECOY_SHARDS {
+                guard.insert(format!("/registry/decoy-{i}/"), Arc::new(RingShard::new()));
+            }
+        }
+        let root = "/registry/widgets.example.com/widgets/";
+
+        // Re-inserted before each call (evict_resource_type removes it every time) so the loop
+        // amplifies the per-call scan cost the same way the matching_shards perf test amplifies
+        // its own O(1)-vs-O(shard-count) lookup, instead of measuring a single call whose cost
+        // is too small in absolute terms to distinguish O(1) from O(shard-count) reliably.
+        let started = std::time::Instant::now();
+        for _ in 0..EVICTIONS {
+            store
+                .shards
+                .write()
+                .expect("shards poisoned")
+                .insert(root.to_string(), Arc::new(RingShard::new()));
+            store.evict_resource_type(root);
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            !store
+                .shards
+                .read()
+                .expect("shards poisoned")
+                .contains_key(root),
+            "sanity: the targeted shard must actually be gone after the final eviction"
+        );
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "{EVICTIONS} evict_resource_type calls against {DECOY_SHARDS} unrelated shards took \
+             {elapsed:?}; a BTreeMap range-seek should complete this in low single-digit \
+             milliseconds — this budget is only reachable by a linear starts_with scan over \
+             every shard in the store if that O(shard-count) cost has been reintroduced"
         );
     }
 
