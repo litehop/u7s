@@ -151,6 +151,110 @@ pub fn prepare_live_event(
     ))
 }
 
+/// Mirrors `defaults::apply_defaults`'s dispatch conditions closely enough to answer "could
+/// this resource type ever be mutated by apply_defaults" without a parsed `Value` to check
+/// against. MUST stay in sync with `apply_defaults`: a type added there without a matching arm
+/// here would silently drop its defaulting on every plain (no-selector) live watch event —
+/// `defaults_may_mutate_matches_apply_defaults_reaches_this_watch_regression` below pins the
+/// two together for the field this project has already hit a real bug on (Service
+/// ipFamilyPolicy).
+fn defaults_may_mutate(group: &str, plural: &str) -> bool {
+    super::defaults::is_workload_resource(group, plural)
+        || super::defaults::is_endpointslice(group, plural)
+        || matches!(
+            (group, plural),
+            ("apps", "deployments")
+                | ("apps", "replicasets")
+                | ("apps", "statefulsets")
+                | ("apps", "daemonsets")
+                | ("batch", "jobs")
+                | ("batch", "cronjobs")
+                | ("", "services")
+                | ("", "endpoints")
+                | ("", "persistentvolumeclaims")
+                | ("", "persistentvolumes")
+                | ("", "secrets")
+                | ("storage.k8s.io", "csidrivers")
+                | ("storage.k8s.io", "storageclasses")
+                | ("", "namespaces")
+                | ("coordination.k8s.io", "leases")
+                | ("", "replicationcontrollers")
+                | ("autoscaling", "horizontalpodautoscalers")
+                | ("networking.k8s.io", "networkpolicies")
+                | ("resource.k8s.io", "resourceclaims")
+                | ("resource.k8s.io", "resourceclaimtemplates")
+        )
+        || (plural == "events" && (group.is_empty() || group == "events.k8s.io"))
+        || (group == "rbac.authorization.k8s.io"
+            && (plural == "rolebindings" || plural == "clusterrolebindings"))
+}
+
+/// Cheap projection used only to decide whether the stored bytes already carry the exact
+/// apiVersion/kind this watch is serving — deserializes just those two fields (serde skips
+/// everything else without building a `Value` for it), so checking is far cheaper than a full
+/// parse while still being exact, unlike a raw substring scan (which can false-match a nested
+/// ownerReference or embedded object carrying the same apiVersion/kind pair).
+fn type_meta_already_canonical(object_json: &str, api_version: &str, kind: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct TypeMetaProjection<'a> {
+        #[serde(rename = "apiVersion", default)]
+        api_version: Option<&'a str>,
+        #[serde(default)]
+        kind: Option<&'a str>,
+    }
+    match serde_json::from_str::<TypeMetaProjection>(object_json) {
+        Ok(tm) => tm.api_version == Some(api_version) && tm.kind == Some(kind),
+        Err(_) => false,
+    }
+}
+
+/// Serialize a live ADDED/MODIFIED event for the no-selector fast path, using the zero-parse
+/// raw path (`ndjson_event_raw`) whenever it's provably safe — no PartialObjectMetadata
+/// wrapping to build, this resource type has nothing `apply_defaults` could still add, and the
+/// stored bytes already carry the requested apiVersion/kind — and falling back to
+/// `prepare_live_event`'s full parse+apply_defaults+reserialize otherwise. Returns `None` only
+/// for invalid UTF-8/JSON (corrupt store entry — caller logs and skips), matching
+/// `prepare_live_event`.
+fn prepare_fast_live_event(
+    raw: &[u8],
+    event_type: &str,
+    group: &str,
+    plural: &str,
+    api_version: &str,
+    kind: &str,
+    as_partial_object_metadata: bool,
+) -> Option<Bytes> {
+    if as_partial_object_metadata || defaults_may_mutate(group, plural) {
+        return prepare_live_event(
+            raw,
+            event_type,
+            group,
+            plural,
+            api_version,
+            kind,
+            as_partial_object_metadata,
+            "",
+            "",
+        );
+    }
+    let object_json = std::str::from_utf8(raw).ok()?;
+    if type_meta_already_canonical(object_json, api_version, kind) {
+        Some(ndjson_event_raw(event_type, object_json))
+    } else {
+        prepare_live_event(
+            raw,
+            event_type,
+            group,
+            plural,
+            api_version,
+            kind,
+            false,
+            "",
+            "",
+        )
+    }
+}
+
 /// The `PartialObjectMetadata` envelope GC watches and PartialObjectMetadata LIST/GET responses
 /// consume. `metadata` stays an opaque `Value` — this projection never reasons about individual
 /// metadata fields (ownerReferences, finalizers, ...), only about which top-level object keys
@@ -1038,7 +1142,7 @@ async fn watch_generic_impl<S: Store>(
                                     } else {
                                         "ADDED"
                                     };
-                                    match prepare_live_event(
+                                    match prepare_fast_live_event(
                                         &obj.value,
                                         event_type,
                                         &group,
@@ -1046,8 +1150,6 @@ async fn watch_generic_impl<S: Store>(
                                         &api_version,
                                         &kind,
                                         as_partial_object_metadata,
-                                        "",
-                                        "",
                                     ) {
                                         Some(bytes) => {
                                             record_watch_event();
@@ -1872,6 +1974,89 @@ mod tests {
         );
     }
 
+    /// prepare_fast_live_event's zero-parse branch must produce bytes byte-identical to the
+    /// format! equivalent of its input, and must skip (not emit a garbled line for) invalid
+    /// UTF-8. This is the function watch_generic_impl's no-selector fast path calls directly on
+    /// stored bytes, so a broken implementation here silently ships malformed events to every
+    /// plain (no label/field selector, no defaulting needed) watch — the highest-volume case in
+    /// any cluster.
+    #[test]
+    fn prepare_fast_live_event_matches_format_equivalent_and_skips_invalid_utf8() {
+        let obj_json = r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm","namespace":"default","resourceVersion":"42"}}"#;
+        let expected = format!("{{\"type\":\"MODIFIED\",\"object\":{obj_json}}}\n");
+
+        let got = prepare_fast_live_event(
+            obj_json.as_bytes(),
+            "MODIFIED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            false,
+        )
+        .expect("valid UTF-8 JSON with already-canonical type meta must produce a chunk");
+        assert_eq!(
+            got.as_ref(),
+            expected.as_bytes(),
+            "prepare_fast_live_event must produce byte-identical output to the format! \
+             equivalent; an informer that decodes a re-encoded or malformed line desyncs its \
+             cache from the server's actual state"
+        );
+
+        let corrupt = prepare_fast_live_event(
+            &[0xFF, 0xFE],
+            "ADDED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            false,
+        );
+        assert!(
+            corrupt.is_none(),
+            "prepare_fast_live_event must skip (return None) for invalid UTF-8 rather than \
+             embedding raw garbage bytes into the NDJSON stream, which would break every client \
+             parsing the watch response"
+        );
+    }
+
+    /// Regression pin for the exact bug this project already hit once: apply_defaults sets
+    /// Service.spec.ipFamilyPolicy, so a Service watched with no selector must NOT take the
+    /// zero-parse raw path (which never runs apply_defaults) — it must fall back to
+    /// prepare_live_event. If defaults_may_mutate is ever missing an arm apply_defaults has,
+    /// a client watching that resource type silently stops seeing server-side defaults on
+    /// live events (see watch_generic_service_added_event_has_ip_family_defaults, which reaches
+    /// this same gate through the full watch_generic_impl stream).
+    #[test]
+    fn defaults_may_mutate_matches_apply_defaults_reaches_this_watch_regression() {
+        assert!(
+            defaults_may_mutate("", "services"),
+            "apply_defaults has a Service arm (default_service sets ipFamilyPolicy); \
+             defaults_may_mutate must say so or the watch fast path skips it silently"
+        );
+        assert!(
+            !defaults_may_mutate("", "configmaps"),
+            "apply_defaults has no ConfigMap arm; defaults_may_mutate returning true here would \
+             just cost performance (forces the slow path), not correctness, but pins the \
+             expected fast-path-eligible case this whole optimization targets"
+        );
+    }
+
+    /// type_meta_already_canonical must reject a false match from a nested value that happens
+    /// to carry the same apiVersion/kind pair as an unrelated top-level field — e.g. an
+    /// ownerReference — proving the projection reads the *top-level* apiVersion/kind fields,
+    /// not any substring match against the raw bytes.
+    #[test]
+    fn type_meta_already_canonical_checks_top_level_fields_only() {
+        let with_owner_ref = r#"{"metadata":{"name":"rs","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"d","uid":"1"}]}}"#;
+        assert!(
+            !type_meta_already_canonical(with_owner_ref, "apps/v1", "Deployment"),
+            "the object's own top-level apiVersion/kind are absent even though an \
+             ownerReference embeds the same pair; treating that as canonical would skip the \
+             type-meta fix-up this object actually needs"
+        );
+    }
+
     // -- per-line emission: single-allocation NDJSON helpers (p2i8) --
 
     /// ndjson_event_raw must produce bytes byte-identical to the format! equivalent.
@@ -2527,6 +2712,92 @@ mod tests {
         text.lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
+    }
+
+    /// The no-selector ADDED fast path in `watch_generic_impl` must emit bytes byte-for-byte
+    /// identical to the stored object, not just semantically-equal JSON. An informer decodes
+    /// each NDJSON line directly into its typed object cache; if the fast path's raw
+    /// passthrough ever regresses (wrong event type, dropped/garbled bytes, missing trailing
+    /// newline), the informer either fails to decode the line at all or applies a subtly wrong
+    /// object to its cache — desyncing it from server state without any visible error.
+    #[tokio::test]
+    async fn watch_generic_no_selector_fast_path_emits_byte_correct_added_event() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-fast", "namespace": "default" },
+            "data": { "k": "v" }
+        });
+        let revision = store
+            .put(
+                "/registry/configmaps/default/cm-fast",
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        // store.put() stamps resourceVersion into the persisted bytes; mirror that here so the
+        // expected line matches exactly what a watcher must receive.
+        obj["metadata"]["resourceVersion"] = serde_json::Value::String(revision.to_string());
+        let expected_line = format!(
+            "{{\"type\":\"ADDED\",\"object\":{}}}\n",
+            serde_json::to_string(&obj).unwrap()
+        );
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // No label/field selector, as_partial_object_metadata=false, and ConfigMaps have no
+        // apply_defaults arm: this is exactly the condition prepare_fast_live_event routes
+        // through its zero-parse ndjson_event_raw branch instead of prepare_live_event.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed for fast-path byte-correctness test"));
+
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("stream must close within timeout")
+        .expect("body read must succeed");
+        let text = std::str::from_utf8(&bytes).expect("watch body must be valid UTF-8");
+
+        assert_eq!(
+            text, expected_line,
+            "fast-path ADDED event must be byte-identical to the stored object wrapped in the \
+             NDJSON envelope; any deviation (re-encoded formatting, dropped field, wrong event \
+             type) is exactly the class of bug that desyncs an informer's cache from the \
+             server without a visible decode error"
+        );
     }
 
     /// A watch with a matching label selector must emit the ADDED event for a matching object.
