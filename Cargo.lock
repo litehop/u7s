@@ -3724,6 +3724,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "libc",
  "prometheus",
  "prost",
  "prost-types",
