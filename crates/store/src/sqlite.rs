@@ -407,7 +407,7 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn new(db_path: &str) -> Result<Self> {
-        let write_conn = open_conn(db_path)?;
+        let write_conn = open_conn(db_path, WRITE_CACHE_SIZE_KIB)?;
 
         // Run migrations on the write connection.
         write_conn.execute_batch(
@@ -444,7 +444,7 @@ impl SqliteStore {
         let read_conn = if db_path == ":memory:" {
             Arc::clone(&write_conn)
         } else {
-            Arc::new(Mutex::new(open_conn(db_path)?))
+            Arc::new(Mutex::new(open_conn(db_path, READ_CACHE_SIZE_KIB)?))
         };
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -1062,13 +1062,26 @@ fn find_reclaimed_horizon(reclaimed_horizons: &ReclaimedHorizons, prefix: &str) 
     reclaimed_horizons.overflow.load(Ordering::Relaxed)
 }
 
-fn open_conn(path: &str) -> Result<Connection> {
+/// `PRAGMA cache_size` for the write connection: SQLite's own historical default (`-2000` is
+/// ~1.95 MiB — negative means kibibytes, not pages). The write connection only ever serves a
+/// single writer at a time (behind `write_conn`'s mutex), so it has far less to gain from a
+/// large page cache than the read connection, which backs every concurrent LIST scan — see
+/// `READ_CACHE_SIZE_KIB`'s doc for why the cut is made here rather than there.
+const WRITE_CACHE_SIZE_KIB: i64 = -2000;
+/// `PRAGMA cache_size` for the read connection (and the single shared connection `:memory:`
+/// databases use for both roles — see `SqliteStore::new`): kept at SQLite's pre-existing
+/// `-8000` (~7.8 MiB) rather than cut like the write connection's, since this is the connection
+/// LIST scans and most other reads run against, and is therefore the one most likely to thrash
+/// on a smaller cache.
+const READ_CACHE_SIZE_KIB: i64 = -8000;
+
+fn open_conn(path: &str, cache_size_kib: i64) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous  = NORMAL;
-        PRAGMA cache_size   = -8000;
+        PRAGMA cache_size   = {cache_size_kib};
         PRAGMA busy_timeout = 5000;
         -- Keep the WAL file small so read connections do not fall far behind write connections.
         -- At 1000 (the SQLite default), the WAL can hold 1000 pages before checkpointing.
@@ -1078,8 +1091,8 @@ fn open_conn(path: &str) -> Result<Connection> {
         -- and requeue in a tight loop for up to 15 minutes.  At 100, checkpoints are more
         -- frequent so the read connection stays within ~100 pages of the write head.
         PRAGMA wal_autocheckpoint = 100;
-    ",
-    )?;
+    "
+    ))?;
     Ok(conn)
 }
 
@@ -2588,6 +2601,66 @@ mod tests {
             name = name,
             rv = rv
         ))
+    }
+
+    /// A file-backed store's write and read connections must use DIFFERENT `cache_size`
+    /// budgets — the write connection cut down to SQLite's own historical default, the read
+    /// connection left at the larger, pre-existing size.
+    ///
+    /// Why it matters: before this split, both connections opened at the larger size, so a
+    /// single running apiserver paid ~15.6 MiB of malloc'd, dhat-invisible C-side page cache
+    /// for two connections where only one (the read connection, serving concurrent LIST
+    /// scans) actually benefits from a large cache — the write connection is serialized
+    /// behind `write_conn`'s mutex and never has more than one query in flight. A regression
+    /// back to a shared, uncut size would silently re-inflate that footprint without ever
+    /// showing up in the project's dhat-based heap profiling, which cannot see SQLite's own
+    /// malloc'd pages.
+    #[tokio::test]
+    async fn file_backed_store_cuts_the_write_connections_cache_but_not_the_reads() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let tid = std::thread::current().id();
+        let db_path =
+            std::env::temp_dir().join(format!("u7s-sqlite-cache-size-test-{nanos}-{tid:?}.db"));
+        let db_path_str = db_path
+            .to_str()
+            .expect("temp path must be valid UTF-8")
+            .to_string();
+
+        let store = SqliteStore::new(&db_path_str).expect("file-backed store");
+
+        let write_cache: i64 = store
+            .write_conn
+            .lock()
+            .await
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("read write connection's cache_size");
+        let read_cache: i64 = store
+            .read_conn
+            .lock()
+            .await
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("read read connection's cache_size");
+
+        assert_eq!(
+            write_cache, WRITE_CACHE_SIZE_KIB,
+            "the write connection must use the smaller cache_size — a regression back to the \
+             larger shared size would cost several extra MiB of C-side page cache per open \
+             store on a connection that only ever serves one writer at a time"
+        );
+        assert_eq!(
+            read_cache, READ_CACHE_SIZE_KIB,
+            "the read connection must keep the larger cache_size — it backs every LIST scan \
+             and is the connection most likely to thrash if cut as aggressively as the write \
+             connection's"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&db_path_str);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
     }
 
     /// Verify that a global bookmark carrying a higher revision (from a concurrent write that
