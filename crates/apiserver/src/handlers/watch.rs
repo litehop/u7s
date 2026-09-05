@@ -857,6 +857,15 @@ fn should_emit_synthetic_delete(is_modified: bool, now_matches: bool, ever_match
     is_modified && !now_matches && ever_matched
 }
 
+/// Whether a watch needs to record which objects it has delivered as matching.
+/// `should_emit_synthetic_delete` only fires when `now_matches` goes false, which
+/// `label_selector_matches`/`field_selector_matches_parts`/`cr_matches_field_selector` all make
+/// impossible once both selector strings are empty (each short-circuits `""` to "always
+/// matches") — so a no-selector watch's `ever_matched` entries can never be read back.
+fn watch_tracks_ever_matched(label_selector: &str, field_selector: &str) -> bool {
+    !(label_selector.is_empty() && field_selector.is_empty())
+}
+
 /// Derive the RBAC/metrics `version` label from a watch's wire-format `apiVersion`
 /// ("v1" for core, "apps/v1" for grouped resources) — the last `/`-separated segment.
 ///
@@ -1129,10 +1138,12 @@ async fn watch_generic_impl<S: Store>(
                 {
                     continue;
                 }
-                ever_matched.insert((
-                    item["metadata"]["namespace"].as_str().unwrap_or("").to_string(),
-                    item["metadata"]["name"].as_str().unwrap_or("").to_string(),
-                ));
+                if watch_tracks_ever_matched(&label_selector, &field_selector) {
+                    ever_matched.insert((
+                        item["metadata"]["namespace"].as_str().unwrap_or("").to_string(),
+                        item["metadata"]["name"].as_str().unwrap_or("").to_string(),
+                    ));
+                }
                 let emit = if as_partial_object_metadata {
                     to_partial_object_metadata(&item)
                 } else {
@@ -3447,6 +3458,135 @@ mod tests {
             !should_emit_synthetic_delete(true, true, true),
             "an object that still matches the selector must not receive a synthetic \
              DELETE just because it was modified"
+        );
+    }
+
+    // -- watch_tracks_ever_matched --
+
+    /// A no-selector watch must not record `ever_matched` entries: `should_emit_synthetic_delete`
+    /// can never read them back (see `watch_tracks_ever_matched`'s doc), so every entry a
+    /// no-selector watch's sendInitialEvents phase would otherwise insert sits in the map,
+    /// unread, for the whole stream lifetime.
+    #[test]
+    fn watch_tracks_ever_matched_false_with_no_selector() {
+        assert!(
+            !watch_tracks_ever_matched("", ""),
+            "a watch with no label or field selector can never take the branch that reads \
+             ever_matched back, so recording entries for it is pure wasted memory"
+        );
+    }
+
+    /// A watch with either selector set is exactly the case `ever_matched` exists for — this
+    /// must stay true, or a selector-filtered watch silently loses its synthetic-DELETE
+    /// bookkeeping instead of just skipping unread inserts.
+    #[test]
+    fn watch_tracks_ever_matched_true_with_either_selector_set() {
+        assert!(
+            watch_tracks_ever_matched("app=frontend", ""),
+            "a label-selector watch must keep tracking ever_matched"
+        );
+        assert!(
+            watch_tracks_ever_matched("", "metadata.name=foo"),
+            "a field-selector watch must keep tracking ever_matched"
+        );
+    }
+
+    /// End-to-end guard for the sendInitialEvents gate: a selector-filtered watch must still
+    /// record the objects sendInitialEvents delivers as matching, so a later live MODIFIED that
+    /// loses the match still gets a synthetic DELETED. Fails on revert to a gate that skips the
+    /// insert whenever a selector IS set (e.g. an inverted condition) — the DELETED would go
+    /// missing and informers would keep a stale cache entry for an object that left scope.
+    #[tokio::test]
+    async fn watch_generic_send_initial_events_item_losing_selector_match_emits_synthetic_deleted()
+    {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let obj_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-initial-scope-exit",
+                "namespace": "default",
+                "labels": { "app": "frontend" }
+            }
+        });
+        let rv1 = store
+            .put(
+                "/registry/configmaps/default/cm-initial-scope-exit",
+                bytes::Bytes::from(serde_json::to_vec(&obj_v1).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // sendInitialEvents delivers cm-initial-scope-exit as ADDED (it matches "app=frontend"
+        // at list time) — this is the insert `watch_tracks_ever_matched` must not skip.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: rv1,
+                initial_items: Some((vec![obj_v1], rv1)),
+                label_selector: Some("app=frontend".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
+
+        // Update the object, removing the matching label — a live MODIFIED that leaves scope.
+        let obj_v2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-initial-scope-exit",
+                "namespace": "default",
+                "labels": { "app": "backend" }
+            }
+        });
+        store
+            .put(
+                "/registry/configmaps/default/cm-initial-scope-exit",
+                bytes::Bytes::from(serde_json::to_vec(&obj_v2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+
+        let lines = read_watch_body_with_timeout(resp).await;
+
+        let added_count = lines.iter().filter(|v| v["type"] == "ADDED").count();
+        assert_eq!(
+            added_count, 1,
+            "sendInitialEvents must deliver the matching object as ADDED; got {:?}",
+            lines
+        );
+        let deleted_count = lines.iter().filter(|v| v["type"] == "DELETED").count();
+        assert_eq!(
+            deleted_count, 1,
+            "an object delivered via sendInitialEvents that later loses the selector match \
+             must still get a synthetic DELETED — otherwise the informer keeps a stale cache \
+             entry for it; got {:?}",
+            lines
         );
     }
 
