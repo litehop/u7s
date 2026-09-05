@@ -646,6 +646,16 @@ pub(crate) fn cr_list_prefix(group: &str, plural: &str, namespace: Option<&str>)
     }
 }
 
+/// True iff `key` is a CR's own store key, as opposed to a built-in resource's — even one in a
+/// non-core group like `apps` or `rbac.authorization.k8s.io`, which use `group_object_key`'s
+/// `/registry/<group>/<plural>/...` layout, never this `/registry/cr/...` one. `pub(crate)` so
+/// the namespace-delete cascade (`handlers::namespaces`) can gate `cr_conversion_cache`
+/// eviction to only the objects that were ever inserted into it, instead of paying an
+/// O(capacity) scan for every hard-deleted namespace object regardless of type.
+pub(crate) fn is_cr_store_key(key: &str) -> bool {
+    key.starts_with("/registry/cr/")
+}
+
 // ---------------------------------------------------------------------------
 // Metadata stamping on create
 // ---------------------------------------------------------------------------
@@ -15622,6 +15632,35 @@ mod tests {
         assert_eq!(
             prefix, "/registry/cr/example.io/widgets/",
             "cluster-scoped prefix must end with plural and slash"
+        );
+    }
+
+    // is_cr_store_key gates the namespace-delete cascade's cr_conversion_cache eviction
+    // (handlers::namespaces) to real CR keys only — a false positive on a built-in resource's
+    // key would silently make that eviction a no-op scan on every hard-delete again, exactly
+    // the O(capacity) cost the gate exists to remove.
+    #[test]
+    fn is_cr_store_key_true_for_an_actual_cr_key() {
+        let key = cr_store_key("example.io", "widgets", Some("default"), "my-widget");
+        assert!(
+            is_cr_store_key(&key),
+            "cr_store_key's own output must be recognized as a CR key: {key}"
+        );
+    }
+
+    // A false negative here would make the namespace-cascade gate skip real CRs, resurrecting
+    // the exact leak this whole change is meant to fix.
+    #[test]
+    fn is_cr_store_key_false_for_a_built_in_non_core_group_key() {
+        let key = crate::keys::group_object_key(
+            "rbac.authorization.k8s.io",
+            "rolebindings",
+            Some("default"),
+            "my-binding",
+        );
+        assert!(
+            !is_cr_store_key(&key),
+            "a built-in non-core-group resource's key must not be mistaken for a CR key: {key}"
         );
     }
 

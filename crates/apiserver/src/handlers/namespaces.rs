@@ -957,20 +957,14 @@ async fn cascade_delete_namespace_resources<S: Store>(
             // entries immediately, exactly like every other CR hard-delete site
             // (`evict_cr_conversion_cache` in handlers/cr.rs) — otherwise every CR destroyed
             // by a namespace delete leaves its converted body resident in the cache forever,
-            // since a deleted object's resourceVersion can never be looked up again. Calling
-            // this unconditionally for every hard-deleted object (not just CRs) is safe and
-            // cheap: only a CR's own rv was ever inserted into this cache, so it's a no-op
-            // retain for every other resource type.
-            // A CR hard-deleted by the namespace cascade must lose its cr_conversion_cache
-            // entries immediately, exactly like every other CR hard-delete site
-            // (`evict_cr_conversion_cache` in handlers/cr.rs) — otherwise every CR destroyed
-            // by a namespace delete leaves its converted body resident in the cache forever,
-            // since a deleted object's resourceVersion can never be looked up again. Calling
-            // this unconditionally for every hard-deleted object (not just CRs) is safe and
-            // cheap: only a CR's own rv was ever inserted into this cache, so it's a no-op
-            // retain for every other resource type.
-            if let Some(rv) = val["metadata"]["resourceVersion"].as_str() {
-                state.cr_conversion_cache.invalidate_by_rv(rv);
+            // since a deleted object's resourceVersion can never be looked up again. Gated on
+            // `is_cr_store_key` — only a CR's own rv was ever inserted into this cache, so
+            // scanning it for every other hard-deleted resource type (Pod, ConfigMap, RBAC,
+            // ...) would be a guaranteed-miss O(capacity) scan on every namespace delete.
+            if crate::handlers::cr::is_cr_store_key(&obj_stored.key) {
+                if let Some(rv) = val["metadata"]["resourceVersion"].as_str() {
+                    state.cr_conversion_cache.invalidate_by_rv(rv);
+                }
             }
             if let Some(pod_name) = obj_stored
                 .key
@@ -1167,10 +1161,13 @@ async fn purge_namespace_object<S: Store>(state: &AppState<S>, namespace: &str, 
     }
     // Same rationale as cascade_delete_namespace_resources' hard-delete branch: a CR
     // hard-deleted here must lose its cr_conversion_cache entries immediately, or it stays
-    // resident forever since its resourceVersion can never be looked up again.
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
-        if let Some(rv) = val["metadata"]["resourceVersion"].as_str() {
-            state.cr_conversion_cache.invalidate_by_rv(rv);
+    // resident forever since its resourceVersion can never be looked up again. Gated on
+    // `is_cr_store_key` for the same reason: every other resource type is a guaranteed miss.
+    if crate::handlers::cr::is_cr_store_key(&obj.key) {
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+            if let Some(rv) = val["metadata"]["resourceVersion"].as_str() {
+                state.cr_conversion_cache.invalidate_by_rv(rv);
+            }
         }
     }
     // Same rationale for pods: a pod hard-deleted here must lose its node-authorization graph
@@ -4095,9 +4092,11 @@ mod tests {
 
         // A CR whose current write has a webhook-converted body cached under its own
         // resourceVersion, exactly what a watcher/LIST at a different served version would
-        // have produced.
-        let cr_key =
-            crate::keys::group_object_key("example.io", "widgets", Some("cr-cache-ns"), "gadget");
+        // have produced. Written under the real `/registry/cr/...` key CRs actually live at
+        // (cr.rs's `cr_store_key`) — not `group_object_key`'s built-in layout — so this
+        // exercises the same `is_cr_store_key` gate the production hard-delete path uses to
+        // decide whether an object could possibly have a cr_conversion_cache entry at all.
+        let cr_key = "/registry/cr/example.io/widgets/cr-cache-ns/gadget".to_string();
         let cr_body = serde_json::json!({
             "apiVersion": "example.io/v1",
             "kind": "Widget",
@@ -4153,6 +4152,62 @@ mod tests {
              immediately — otherwise every CR destroyed by a namespace delete leaves its \
              converted body resident in the cache forever, an unbounded leak on any cluster \
              using conversion webhooks"
+        );
+    }
+
+    // PERF regression: invalidate_by_rv scans the entire CrConversionCache (O(capacity)), but
+    // only a CR's own resourceVersion is ever inserted into it — so calling it unconditionally
+    // for every hard-deleted namespace object (Pods, ConfigMaps, RBAC, ...) turns every
+    // namespace delete into an O(capacity) guaranteed-miss scan per non-CR object it contains.
+    // Forces an rv collision (impossible in production — the store's revision counter is
+    // global and never reused) between a hard-deleted ConfigMap and a cache entry purely to
+    // observe whether invalidate_by_rv was invoked for a non-CR key: if the is_cr_store_key
+    // gate is reverted, the call becomes unconditional again and wrongly evicts the entry.
+    #[tokio::test]
+    async fn cascade_delete_namespace_resources_does_not_invoke_invalidate_by_rv_for_non_cr_objects(
+    ) {
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        let cm_key = crate::keys::object_key("configmaps", "non-cr-ns", "cm1");
+        let cm_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm1", "namespace": "non-cr-ns" },
+            "data": {}
+        });
+        state
+            .store
+            .put(&cm_key, bytes::Bytes::from(cm_body.to_string()), Some(0))
+            .await
+            .expect("configmap write must succeed");
+        let stored_cm = state
+            .store
+            .get(&cm_key)
+            .await
+            .expect("get must not error")
+            .expect("configmap must exist after put");
+        let stored_cm_val: serde_json::Value = serde_json::from_slice(&stored_cm.value).unwrap();
+        let cm_rv = stored_cm_val["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("store must stamp resourceVersion")
+            .to_string();
+
+        let cache_key = (cm_rv, "example.io/v1".to_string());
+        state.cr_conversion_cache.insert(
+            cache_key.clone(),
+            &serde_json::json!({ "apiVersion": "example.io/v1", "kind": "Widget" }),
+        );
+
+        cascade_delete_namespace_resources(&state, "non-cr-ns").await;
+
+        assert!(
+            state.cr_conversion_cache.contains(&cache_key),
+            "a ConfigMap hard-delete must never call invalidate_by_rv — only real CR store \
+             keys (/registry/cr/...) can ever have a cr_conversion_cache entry, so scanning \
+             the cache for every other hard-deleted object type wastes an O(capacity) pass on \
+             a guaranteed miss for every namespace delete"
         );
     }
 
@@ -4218,6 +4273,75 @@ mod tests {
             axum::http::StatusCode::GONE,
             "must be 410 Gone (delete_namespace_scoped_crds writes a group tombstone) rather \
              than a stale Ok(ctx) or an uncached 404"
+        );
+    }
+
+    // Pins delete_namespace_scoped_crds's CrConversionCache eviction directly against the
+    // cache, rather than only via the find_crd-must-410 check above: a cache entry can outlive
+    // the CrContext eviction above it — a stale CrContext getting evicted does not by itself
+    // prove the conversion cache did too. Without this call, a deleted CRD's
+    // cr_conversion_cache entries stay resident forever (their target apiVersion can never be
+    // requested again), growing unbounded over CRD churn.
+    #[tokio::test]
+    async fn delete_namespace_scoped_crds_evicts_cr_conversion_cache_entries_for_its_target_api_versions(
+    ) {
+        use crate::handlers::crd;
+
+        let state = make_state();
+        let group = "stable.nscrd-conv-test.example.com";
+
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": { "name": format!("crontabs.{group}") },
+                        "spec": {
+                            "group": group,
+                            "names": {
+                                "plural": "crontabs",
+                                "singular": "crontab",
+                                "kind": "CronTab",
+                                "listKind": "CronTabList"
+                            },
+                            "scope": "Namespaced",
+                            "versions": [{ "name": "v1", "served": true, "storage": true }]
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .is_ok(),
+            "install namespace-scoped CRD whose group embeds the namespace name"
+        );
+
+        // Simulates a converted body a watcher/LIST at this target apiVersion would have
+        // cached for some live CR's write — eviction here keys purely on the CRD's own
+        // (group, served version), not any particular object's resourceVersion.
+        let cache_key = ("42".to_string(), format!("{group}/v1"));
+        state.cr_conversion_cache.insert(
+            cache_key.clone(),
+            &serde_json::json!({ "apiVersion": format!("{group}/v1"), "kind": "CronTab" }),
+        );
+        assert!(
+            state.cr_conversion_cache.contains(&cache_key),
+            "test precondition: the converted body must actually be cached before the CRD delete"
+        );
+
+        delete_namespace_scoped_crds(&state, "nscrd-conv-test").await;
+
+        assert!(
+            !state.cr_conversion_cache.contains(&cache_key),
+            "deleting a namespace-scoped CRD must evict every cr_conversion_cache entry \
+             targeting its served versions — a deleted CRD's versions can never be requested \
+             again, so a missed eviction here leaks one entry per (write, target version) for \
+             the life of the process, the same class of leak already fixed for CR hard-deletes \
+             but on the CRD-delete path"
         );
     }
 
@@ -4390,6 +4514,60 @@ mod tests {
         );
     }
 
+    // Companion to cascade_delete_namespace_resources_does_not_invoke_invalidate_by_rv_for_non_cr_objects
+    // above, for purge_namespace_object — the OTHER hard-delete call site
+    // maybe_finalize_terminating_namespace's bulk purge uses, which needs its own
+    // is_cr_store_key gate since it is not routed through cascade_delete_namespace_resources.
+    #[tokio::test]
+    async fn purge_namespace_object_does_not_invoke_invalidate_by_rv_for_non_cr_objects() {
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        let cm_key = crate::keys::object_key("configmaps", "non-cr-purge-ns", "cm1");
+        let cm_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm1", "namespace": "non-cr-purge-ns" },
+            "data": {}
+        });
+        state
+            .store
+            .put(&cm_key, bytes::Bytes::from(cm_body.to_string()), Some(0))
+            .await
+            .expect("configmap write must succeed");
+        let stored_cm = state
+            .store
+            .get(&cm_key)
+            .await
+            .expect("get must not error")
+            .expect("configmap must exist after put");
+        let stored_cm_val: serde_json::Value = serde_json::from_slice(&stored_cm.value).unwrap();
+        let cm_rv = stored_cm_val["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("store must stamp resourceVersion")
+            .to_string();
+
+        // A collision that can never occur in production (rvs are never reused across
+        // objects) — forced here purely to observe whether invalidate_by_rv was invoked for
+        // this ConfigMap's purge.
+        let cache_key = (cm_rv, "example.io/v1".to_string());
+        state.cr_conversion_cache.insert(
+            cache_key.clone(),
+            &serde_json::json!({ "apiVersion": "example.io/v1", "kind": "Widget" }),
+        );
+
+        purge_namespace_object(&state, "non-cr-purge-ns", &stored_cm).await;
+
+        assert!(
+            state.cr_conversion_cache.contains(&cache_key),
+            "purging a ConfigMap must never call invalidate_by_rv — only real CR store keys \
+             (/registry/cr/...) can ever have a cr_conversion_cache entry, so scanning the \
+             cache for every other purged object type wastes an O(capacity) pass on a \
+             guaranteed miss for every namespace-drain purge"
+        );
+    }
+
     #[tokio::test]
     async fn maybe_finalize_terminating_namespace_purges_rbac_index_for_drained_rolebindings() {
         // Companion to the drained-pods test above, for the same "more common" real-namespace
@@ -4527,12 +4705,11 @@ mod tests {
             .await
             .expect("namespace write must succeed");
 
-        let cr_key = crate::keys::group_object_key(
-            "example.io",
-            "widgets",
-            Some("drained-cr-ns"),
-            "gadget2",
-        );
+        // Real `/registry/cr/...` key CRs actually live at (cr.rs's `cr_store_key`) — not
+        // `group_object_key`'s built-in layout — so this exercises the `is_cr_store_key` gate
+        // the production hard-delete path uses to decide whether an object could possibly
+        // have a cr_conversion_cache entry at all.
+        let cr_key = "/registry/cr/example.io/widgets/drained-cr-ns/gadget2".to_string();
         let cr_body = serde_json::json!({
             "apiVersion": "example.io/v1",
             "kind": "Widget",
