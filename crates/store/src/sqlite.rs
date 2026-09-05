@@ -2270,11 +2270,18 @@ impl Store for SqliteStore {
                 return;
             }
 
-            // Replay historical events from ring buffer.
+            // Replay historical events from ring buffer. Consumed BY VALUE (not `&replayed`):
+            // `async_stream::stream!` expands to `async move`, so `replayed` is captured into
+            // this generator's own state regardless; iterating by reference only borrows it,
+            // leaving the owning Vec (and every Arc<InternalEvent> in it) alive as a named
+            // local for the generator's ENTIRE remaining lifetime — up to the 30-minute
+            // `stream_timeout_secs` default — instead of being dropped once this loop exits.
+            // Moving each event out as it's yielded means the for loop's own (much smaller)
+            // scope owns them instead, so they're released the moment this loop is done.
             let mut last_replayed = from_revision;
-            for event in &replayed {
+            for event in replayed {
                 last_replayed = last_replayed.max(event.revision);
-                yield internal_to_watch(event);
+                yield internal_to_watch(&event);
             }
 
             // Tracks the highest revision seen from global bookmarks. Used only for emitting
@@ -2664,6 +2671,89 @@ mod tests {
         let _ = std::fs::remove_file(&db_path_str);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    /// The ring's replay snapshot (`replayed` in `watch()`) must be released once its events
+    /// are yielded, not retained for the whole stream's lifetime.
+    ///
+    /// Why it matters: `async_stream::stream!` expands to `async move`, so `replayed` (built
+    /// and cloned from the ring BEFORE the generator is constructed) is captured into the
+    /// generator's own state regardless of how the replay loop iterates it. If that loop only
+    /// borrows (`for event in &replayed`), the owning Vec — and every `Arc<InternalEvent>` in
+    /// it — stays alive as a named local for the generator's ENTIRE remaining life, i.e. the
+    /// whole stream, up to the 30-minute `stream_timeout_secs` default. Across many concurrent
+    /// watchers that all replayed a deep backlog, that is retained memory that scales with
+    /// concurrent-watcher count instead of with `RING_CAPACITY` alone.
+    ///
+    /// Fails on revert to `for event in &replayed`: this test pushes exactly one tracked event,
+    /// opens a watch (snapshotting it into `replayed`, one extra `Arc` clone), drains the one
+    /// historical event, then drives the generator ONE poll further (past the replay loop's own
+    /// exit, into the live-forwarding select — which blocks on an empty broadcast receiver and
+    /// returns `Pending`, since nothing was pushed after the watch opened). A borrow-based loop
+    /// never drops `replayed`, so `Arc::strong_count` would stay elevated at 3 instead of
+    /// falling to 2 once the loop's own (much smaller) scope has closed.
+    #[tokio::test]
+    async fn watch_replay_snapshot_is_released_once_yielded_not_pinned_for_stream_lifetime() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/watch-replay-lifetime-test/";
+        let key = format!("{prefix}obj-1");
+
+        let tracked = Arc::new(InternalEvent {
+            key: key.clone(),
+            revision: 1,
+            value: Some(Bytes::from(
+                r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"obj-1"}}"#,
+            )),
+            is_create: true,
+            deleted_body: None,
+        });
+        // One clone lands in the shard's ring (push_into_shard). `tx.send`'s own clone is
+        // dropped right back out: with zero subscribers at this point (watch() hasn't run
+        // yet), tokio's broadcast channel returns the value inside its `Err`, which
+        // `push_event_locked`'s `let _ = tx.send(event);` immediately discards. So this is 2
+        // total (tracked + the ring's copy), not 3.
+        store.push_event(Arc::clone(&tracked), None);
+
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        // watch() snapshots the ring into `replayed` (one more clone) before returning the
+        // stream — this is the count the rest of the test must see drop by exactly one.
+        assert_eq!(
+            Arc::strong_count(&tracked),
+            3,
+            "watch() must have snapshotted the ring into `replayed` at open time; without that \
+             baseline this test cannot distinguish a released snapshot from one never taken"
+        );
+
+        match stream.next().await {
+            Some(WatchEvent::Added(obj)) => assert_eq!(obj.key, key, "replayed the wrong object"),
+            other => panic!("expected the historical Added event first, got {other:?}"),
+        }
+
+        // One more poll: nothing was pushed since watch() subscribed, so the live-forwarding
+        // select has nothing to deliver and must return Pending — but reaching that point
+        // requires the generator to first run past the replay loop's exit.
+        let next_fut = stream.next();
+        futures_util::pin_mut!(next_fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(
+            matches!(
+                std::future::Future::poll(next_fut, &mut cx),
+                std::task::Poll::Pending
+            ),
+            "second poll should have nothing to deliver (no live events were pushed since watch \
+             opened), not another item"
+        );
+
+        assert_eq!(
+            Arc::strong_count(&tracked),
+            2,
+            "the replay snapshot must be released once its one event is yielded — a count \
+             stuck at 3 means the ring's replay Vec is being retained for the stream's entire \
+             lifetime instead of being dropped right after the historical-replay loop exits"
+        );
     }
 
     /// Verify that a global bookmark carrying a higher revision (from a concurrent write that
