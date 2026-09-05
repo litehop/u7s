@@ -50,11 +50,16 @@ fn bound_glibc_malloc_arenas() {
     // `MALLOC_ARENA_MAX` env var it replaces, which would race with a
     // concurrent `getenv` from another thread).
     let ok = unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) };
-    assert_eq!(
-        ok, 1,
-        "mallopt(M_ARENA_MAX, 2) returned failure -- glibc rejected the arena \
-         cap, so ptmalloc2 is free to grow one arena per contending thread"
-    );
+    if ok != 1 {
+        // Not fatal: this runs before logging/tracing init, and an odd libc
+        // rejecting the cap should degrade to uncapped arena growth (a
+        // footprint regression), not crash startup outright.
+        eprintln!(
+            "warning: mallopt(M_ARENA_MAX, 2) returned failure -- glibc rejected \
+             the arena cap, so ptmalloc2 is free to grow one arena per \
+             contending thread"
+        );
+    }
 }
 
 /// No-op on non-glibc-Linux targets: `libc::mallopt`/`M_ARENA_MAX` are glibc
@@ -210,9 +215,59 @@ mod tests {
     /// that silently fails to take effect fails this test. Measured directly
     /// (16 contending threads, x86_64 Linux glibc): uncapped grows to 17
     /// arenas, capped stays at 2.
+    ///
+    /// The actual check runs in a re-exec'd child process, not inline:
+    /// `malloc_info`'s arena count is PROCESS-GLOBAL, and libtest's default
+    /// multi-threaded harness runs this file's other tests concurrently in
+    /// the SAME process. If one of their threads makes its first allocation
+    /// before this test's `mallopt` call has taken effect, ptmalloc2 hands it
+    /// a secondary arena that the cap can never retroactively undo, inflating
+    /// the count this test reads regardless of whether the cap itself works
+    /// (observed directly: harness-scheduling races inflated the reported
+    /// arena count past 2 in a fraction of runs even with a correct cap).
+    /// Re-exec'ing the test binary filtered down to exactly this one test
+    /// gives it a process where the only threads that will ever exist are
+    /// the ones this check spawns itself.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn bound_glibc_malloc_arenas_caps_actual_arena_count_under_thread_contention() {
+        const ISOLATED_CHILD_ENV: &str = "U7S_ARENA_CAP_TEST_ISOLATED_CHILD";
+        const TEST_NAME: &str =
+            "tests::bound_glibc_malloc_arenas_caps_actual_arena_count_under_thread_contention";
+
+        if std::env::var_os(ISOLATED_CHILD_ENV).is_some() {
+            // Running inside the re-exec'd child: no sibling test's threads
+            // exist in this process, so the arena count read below is
+            // attributable entirely to this check.
+            arena_cap_holds_under_thread_contention();
+            return;
+        }
+
+        let exe = std::env::current_exe()
+            .expect("test binary must know its own path to re-exec for process isolation");
+        let output = std::process::Command::new(exe)
+            .args([TEST_NAME, "--exact", "--test-threads=1"])
+            .env(ISOLATED_CHILD_ENV, "1")
+            .output()
+            .expect("failed to spawn isolated child process for the arena-cap check");
+        assert!(
+            output.status.success(),
+            "isolated arena-cap check failed in the child process -- stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "the --exact filter matched zero tests in the child process (a \
+             silent pass proving nothing, not a real check) -- child stdout:\n{stdout}"
+        );
+    }
+
+    /// The actual arena-contention check; see the caller's doc comment for
+    /// why this only runs meaningfully inside an isolated child process.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn arena_cap_holds_under_thread_contention() {
         super::bound_glibc_malloc_arenas();
 
         // More contending threads than the cap, all allocating at once (a
