@@ -1164,23 +1164,25 @@ fn pod_matches_quota_scope(quota: &Value, pod: &Value) -> bool {
     true
 }
 
-/// Adjust every ResourceQuota's `status.used` in `namespace` for a pod whose PATCH just
+/// Adjust every ResourceQuota's `status.used` in `namespace` for a pod whose write just
 /// changed a scope-determining spec field — currently only `activeDeadlineSeconds`, which
 /// toggles Terminating/NotTerminating scope membership (see `pod_is_terminating`); every other
 /// scope-relevant field (`priorityClassName`, container resources, cross-namespace affinity on
 /// an already-scheduled pod) is frozen post-creation by `validate_pod_spec_immutable`, so this
 /// is written generically against ALL scopes rather than hardcoding Terminating, in case that
-/// immutability set ever widens. Call exactly once, strictly after the patch's store write
-/// succeeds, from the single point in the pod PATCH handler every patch content-type
-/// (strategic-merge, merge, JSON Patch) folds into before that write — so one call site here
-/// covers all three, with no per-content-type wiring needed.
+/// immutability set ever widens. Called (via `record_scope_change_if_spec_changed` in
+/// handlers/pods.rs) from both `patch_pod`'s (PATCH — strategic-merge, merge, JSON Patch, and
+/// SSA all fold into one body before that call) and `replace_pod`'s (PUT) store-write success
+/// arm, since `validate_pod_spec_immutable` permits this same activeDeadlineSeconds transition
+/// on either write path — a fix wired into only one of them leaves the other free to drift
+/// quota usage right back out of sync.
 ///
-/// Without this, a running pod PATCHed to newly match (or stop matching) a scoped quota keeps
-/// counting against its OLD scope forever: the quota that should now cover the pod never sees
-/// it, and the quota that used to cover it never releases it. `status.used` — the O(1) baseline
-/// `check_resource_quota` trusts — permanently drifts from true membership, wrongly admitting
-/// pods against the scope that under-counts and wrongly rejecting them against the one that
-/// over-counts.
+/// Without this, a running pod whose write newly matches (or stops matching) a scoped quota
+/// keeps counting against its OLD scope forever: the quota that should now cover the pod never
+/// sees it, and the quota that used to cover it never releases it. `status.used` — the O(1)
+/// baseline `check_resource_quota` trusts — permanently drifts from true membership, wrongly
+/// admitting pods against the scope that under-counts and wrongly rejecting them against the
+/// one that over-counts.
 ///
 /// A quota with no scopes at all is skipped entirely: its usage is a flat count/sum over every
 /// pod in the namespace, so no per-pod scope match can ever change it.
