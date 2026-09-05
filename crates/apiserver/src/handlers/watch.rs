@@ -6,9 +6,13 @@ use u7s_store::{ListOptions, Store, WatchEvent};
 use crate::{state::AppState, status::Status, types::ObjectMeta};
 
 /// Serialize `{"type":"<event_type>","object":<value>}\n` into a single heap allocation.
+/// Generic over `object`'s type so a `Serialize` envelope (e.g. `PartialObjectMetadataEnvelopeOwned`)
+/// can be written straight to the output buffer without first materializing it as a
+/// `serde_json::Value` — every existing caller passes `&serde_json::Value`, which also
+/// implements `Serialize`, so this widening is a no-op for them.
 ///
 /// Watch clients parse these bytes; any format change breaks every informer.
-fn ndjson_event_value(event_type: &str, object: &serde_json::Value) -> Bytes {
+fn ndjson_event_value<T: Serialize>(event_type: &str, object: &T) -> Bytes {
     let mut buf = Vec::with_capacity(128);
     buf.extend_from_slice(b"{\"type\":\"");
     buf.extend_from_slice(event_type.as_bytes());
@@ -95,13 +99,13 @@ fn finish_live_event(
     as_partial_object_metadata: bool,
 ) -> Bytes {
     super::defaults::apply_defaults(group, plural, &mut parsed);
-    let emit = if as_partial_object_metadata {
-        to_partial_object_metadata(&parsed)
+    if as_partial_object_metadata {
+        let envelope = take_partial_object_metadata(parsed);
+        ndjson_event_value(event_type, &envelope)
     } else {
         stamp_type_meta_if_changed(&mut parsed, api_version, kind);
-        parsed
-    };
-    ndjson_event_value(event_type, &emit)
+        ndjson_event_value(event_type, &parsed)
+    }
 }
 
 /// Deserialize, filter, default, and re-serialize one Added/Modified watch event.
@@ -275,6 +279,12 @@ struct PartialObjectMetadataEnvelope<'a> {
 
 /// Transform a full CR JSON object into a PartialObjectMetadata object.
 /// The GC only needs metadata (ownerReferences, finalizers, etc.) — spec/status are omitted.
+///
+/// Takes `obj` by reference because resource.rs/core.rs's LIST handlers hold their `items` by
+/// shared reference across both the PartialObjectMetadata and full-object response branches.
+/// Every watch event in this file owns the object it projects and discards it immediately after
+/// — see `take_partial_object_metadata` below for that path, which moves `metadata` out instead
+/// of paying for this function's copy.
 pub(crate) fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
     let null = serde_json::Value::Null;
     let envelope = PartialObjectMetadataEnvelope {
@@ -284,6 +294,30 @@ pub(crate) fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json:
     };
     serde_json::to_value(envelope)
         .expect("PartialObjectMetadataEnvelope always serializes to a JSON object")
+}
+
+/// Owned counterpart to `PartialObjectMetadataEnvelope`, serialized directly by the generic
+/// `ndjson_event_value` — skipping the intermediate `serde_json::Value` `to_partial_object_metadata`
+/// must build for its borrowed callers.
+#[derive(Serialize)]
+struct PartialObjectMetadataEnvelopeOwned {
+    #[serde(rename = "apiVersion")]
+    api_version: &'static str,
+    kind: &'static str,
+    metadata: serde_json::Value,
+}
+
+/// Move `obj`'s metadata into a PartialObjectMetadata envelope and drop the rest of `obj` (spec,
+/// status, everything else) immediately, so a watch event never holds the full object and its
+/// metadata-only projection in memory at once.
+fn take_partial_object_metadata(mut obj: serde_json::Value) -> PartialObjectMetadataEnvelopeOwned {
+    let metadata = obj["metadata"].take();
+    drop(obj);
+    PartialObjectMetadataEnvelopeOwned {
+        api_version: "meta.k8s.io/v1",
+        kind: "PartialObjectMetadata",
+        metadata,
+    }
 }
 
 /// Stamp resourceVersion and apiVersion/kind onto an already-parsed DELETED tombstone body
@@ -349,8 +383,8 @@ pub(crate) fn encode_watch_event(
             if as_partial_object_metadata {
                 let full: serde_json::Value =
                     serde_json::from_str(object_json).unwrap_or(serde_json::Value::Null);
-                let pom = to_partial_object_metadata(&full);
-                Some(ndjson_event_value("ADDED", &pom))
+                let envelope = take_partial_object_metadata(full);
+                Some(ndjson_event_value("ADDED", &envelope))
             } else {
                 Some(ndjson_event_raw("ADDED", object_json))
             }
@@ -366,8 +400,8 @@ pub(crate) fn encode_watch_event(
             if as_partial_object_metadata {
                 let full: serde_json::Value =
                     serde_json::from_str(object_json).unwrap_or(serde_json::Value::Null);
-                let pom = to_partial_object_metadata(&full);
-                Some(ndjson_event_value("MODIFIED", &pom))
+                let envelope = take_partial_object_metadata(full);
+                Some(ndjson_event_value("MODIFIED", &envelope))
             } else {
                 Some(ndjson_event_raw("MODIFIED", object_json))
             }
@@ -1144,15 +1178,16 @@ async fn watch_generic_impl<S: Store>(
                         item["metadata"]["name"].as_str().unwrap_or("").to_string(),
                     ));
                 }
-                let emit = if as_partial_object_metadata {
-                    to_partial_object_metadata(&item)
+                if as_partial_object_metadata {
+                    let envelope = take_partial_object_metadata(item);
+                    record_watch_event();
+                    yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &envelope));
                 } else {
                     let mut v = item;
                     stamp_type_meta_if_changed(&mut v, &api_version, &kind);
-                    v
-                };
-                record_watch_event();
-                yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &emit));
+                    record_watch_event();
+                    yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &v));
+                }
             }
             record_watch_event();
             yield Ok::<Bytes, axum::BoxError>(ndjson_initial_events_bookmark(&api_version, &kind, last_rv));
@@ -2019,6 +2054,44 @@ mod tests {
             pom["metadata"]["deletionGracePeriodSeconds"], 30,
             "deletionGracePeriodSeconds must survive the PartialObjectMetadata projection \
              unchanged — it is set during graceful termination and read by controllers/kubelet"
+        );
+    }
+
+    /// The owned fast path every watch event uses (`take_partial_object_metadata` + the generic
+    /// `ndjson_event_value`) must serialize to exactly the same bytes as the borrowed path
+    /// resource.rs/core.rs's LIST/GET handlers still use (`to_partial_object_metadata` +
+    /// `serde_json::to_value`) — the only thing allowed to change between the two is how many
+    /// times the metadata subtree gets copied, never what ends up on the wire.
+    ///
+    /// Fails on revert to a `take_partial_object_metadata` that reorders fields, drops one, or
+    /// otherwise diverges from `PartialObjectMetadataEnvelope`'s wire shape — every watch client
+    /// parses these bytes and any divergence breaks every informer.
+    #[test]
+    fn take_partial_object_metadata_matches_borrowed_variant_byte_for_byte() {
+        let full_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "nginx",
+                "namespace": "default",
+                "uid": "abc-123",
+                "resourceVersion": "42",
+                "labels": { "app": "nginx" }
+            },
+            "spec": { "containers": [{"name": "nginx", "image": "nginx:latest"}] },
+            "status": { "phase": "Running" }
+        });
+
+        let expected = ndjson_event_value("ADDED", &to_partial_object_metadata(&full_pod));
+        let got = ndjson_event_value("ADDED", &take_partial_object_metadata(full_pod));
+
+        assert_eq!(
+            got.as_ref(),
+            expected.as_ref(),
+            "the owned PartialObjectMetadata path every watch event takes must produce \
+             byte-identical NDJSON to the borrowed path LIST/GET still use; got {:?} want {:?}",
+            got,
+            expected
         );
     }
 
