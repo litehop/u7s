@@ -66,9 +66,16 @@ trap 'rm -rf "$SANDBOX_ROOT"' EXIT
 # konnectivity-server case below deliberately uses an `=`-joined flag
 # (`--server-cert=<path>`, that binary's real style) to prove extraction
 # doesn't leak the `--server-cert=` prefix into the matched worktree path.
+# The sample-run-metrics.sh line matches its real launch shape (run-all.sh's
+# `bash sample-run-metrics.sh start --workdir <path>/temp/u7s ...`, backgrounded
+# via `sampler_loop &` so the surviving process keeps this exact argv) -- an
+# orphan of this type is invisible resource use (RSS/vm-free polling against a
+# VM slot that then looks free to the next dispatch), not a port bind, so it
+# must be caught by the same pattern the other three types are.
 PS_OUTPUT='alice  1111   0.0  0.1  123456  1234 s001  S+   10:00AM   0:00.05 target/release/u7s-apiserver --kubeconfig /Users/alice/worktrees/dead-worktree/temp/u7s/kubeconfig --port 6443
 alice  1112   0.0  0.1  123456  1234 s001  S+   10:00AM   0:00.05 target/release/u7s-scheduler --kubeconfig /Users/alice/worktrees/live-worktree/temp/u7s/kubeconfig
-alice  1113   0.0  0.1  123456  1234 s001  S+   10:00AM   0:00.05 konnectivity-server --logtostderr=true --server-cert=/Users/alice/worktrees/dead-worktree-2/temp/u7s/konnectivity-server.crt'
+alice  1113   0.0  0.1  123456  1234 s001  S+   10:00AM   0:00.05 konnectivity-server --logtostderr=true --server-cert=/Users/alice/worktrees/dead-worktree-2/temp/u7s/konnectivity-server.crt
+alice  1114   0.0  0.1  123456  1234 s001  S+   10:00AM   0:00.05 bash scripts/conformance/sample-run-metrics.sh start --workdir /Users/alice/worktrees/dead-worktree-3/temp/u7s --port 6443 --vm lima-node-2'
 LIVE_WORKTREES='/Users/alice/worktrees/live-worktree
 /Users/alice/orchestrator-checkout'
 
@@ -78,10 +85,12 @@ assert "an apiserver process whose worktree is gone is flagged as an orphan" \
   "$(printf '%s\n' "$ORPHANS" | grep -qF '1111|apiserver|/Users/alice/worktrees/dead-worktree' && echo 1 || echo 0)"
 assert "a konnectivity-server process whose worktree is gone is flagged as an orphan (its --flag=path style must not leak the '--server-cert=' prefix into the matched path)" \
   "$(printf '%s\n' "$ORPHANS" | grep -qF '1113|konnectivity-server|/Users/alice/worktrees/dead-worktree-2' && echo 1 || echo 0)"
+assert "a sample-run-metrics.sh process whose worktree is gone is flagged as an orphan (regression: this type was dropped from STEP A's grep, letting it squat undetected)" \
+  "$(printf '%s\n' "$ORPHANS" | grep -qF '1114|sample-run-metrics|/Users/alice/worktrees/dead-worktree-3' && echo 1 || echo 0)"
 assert "a scheduler process whose worktree is still live is NOT flagged (must not kill a live worker's process)" \
   "$(! printf '%s\n' "$ORPHANS" | grep -q '^1112|' && echo 1 || echo 0)"
-assert "exactly two orphans are found, not more (no false positives from the live-worktree line)" \
-  "$([ "$(printf '%s\n' "$ORPHANS" | grep -c '|')" = "2" ] && echo 1 || echo 0)"
+assert "exactly three orphans are found, not more (no false positives from the live-worktree line)" \
+  "$([ "$(printf '%s\n' "$ORPHANS" | grep -c '|')" = "3" ] && echo 1 || echo 0)"
 
 assert "an empty ps scan (no matching processes at all) yields no orphans" \
   "$([ -z "$(call find_orphans '' "$LIVE_WORKTREES")" ] && echo 1 || echo 0)"
@@ -92,6 +101,11 @@ assert "kill_pattern_for builds the scheduler pattern anchored on the dead workt
   "$([ "$(call kill_pattern_for scheduler /dead)" = 'u7s-scheduler.*/dead/temp/u7s/kubeconfig' ] && echo 1 || echo 0)"
 assert "kill_pattern_for builds the konnectivity-server pattern anchored on the dead worktree's workdir (no /kubeconfig suffix)" \
   "$([ "$(call kill_pattern_for konnectivity-server /dead)" = 'konnectivity-server.*/dead/temp/u7s' ] && echo 1 || echo 0)"
+assert "kill_pattern_for builds the sample-run-metrics.sh pattern anchored on the dead worktree's workdir (no /kubeconfig suffix -- it has no cert to serve, just polls the VM)" \
+  "$([ "$(call kill_pattern_for sample-run-metrics /dead)" = 'sample-run-metrics.sh.*/dead/temp/u7s' ] && echo 1 || echo 0)"
+
+assert "proc_type_from_psline classifies a sample-run-metrics.sh line as its own type (must not be silently ignored as an unmatched process)" \
+  "$([ "$(call proc_type_from_psline 'bash scripts/conformance/sample-run-metrics.sh start --workdir /x/temp/u7s')" = 'sample-run-metrics' ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 2. STEP C -- in-flight guard.
