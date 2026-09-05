@@ -61,6 +61,7 @@ chrono-tz       = "0.10"
 dhat            = { version = "0.3", optional = true }
 rlimit          = "0.11"
 socket2         = "0.6"
+libc            = "0.2"
 
 [features]
 dhat = ["dep:dhat"]
