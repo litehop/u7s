@@ -174,7 +174,7 @@ async fn preempt_and_pick_node(
 ) -> Result<(), PreemptionFailure> {
     let mut last_err: Option<PreemptionFailure> = None;
     for _ in 0..MAX_PREEMPTION_ATTEMPTS {
-        let plan = match find_preemption_plan(connector, server, pending, tally).await {
+        let plan = match find_preemption_plan(pending, tally) {
             Ok(plan) => plan,
             Err(e) => {
                 last_err = Some(if should_retry_after_preemption_plan_error(&e) {
@@ -330,9 +330,9 @@ async fn attempt_deferred_bind(
 ) {
     let key = format!("{}/{}", pending.namespace, pending.pod_name);
     async {
-        let node = match fetch_node(connector, server, &node_name).await {
-            Ok(Some(node)) => node,
-            Ok(None) => {
+        let node = match fetch_node(tally, &node_name) {
+            Some(node) => node,
+            None => {
                 info!(
                     "deferred bind for {key}: node {node_name} no longer exists — \
                      leaving pod Pending for the periodic resync to re-plan"
@@ -341,13 +341,6 @@ async fn attempt_deferred_bind(
                     .lock()
                     .expect("tally lock poisoned")
                     .remove(&pending.namespace, &pending.pod_name);
-                return;
-            }
-            Err(e) => {
-                error!(
-                    "deferred bind for {key}: failed to re-fetch node {node_name}: {e} — \
-                     leaving pod Pending for the periodic resync to re-plan"
-                );
                 return;
             }
         };
@@ -454,6 +447,16 @@ const STORAGE_CLASS_WATCH_PATH: &str = "/apis/storage.k8s.io/v1/storageclasses?w
 const CSI_NODE_WATCH_PATH: &str =
     "/apis/storage.k8s.io/v1/csinodes?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
 
+/// Watch path feeding `NodeTally`'s node cache (`NodeTally::apply_node_event`)
+/// — the same query params as `POD_WATCH_PATH`, for the same reason: this
+/// replaces the live GET /api/v1/nodes `pick_node`/`find_preemption_plan`/
+/// `fetch_node` used to issue once per scheduling decision, so it needs the
+/// same "current state, not raw history" (`sendInitialEvents=true`) and
+/// idle-reconnect (`allowWatchBookmarks=true`) guarantees that GET's
+/// replacement now depends on.
+const NODE_WATCH_PATH: &str =
+    "/api/v1/nodes?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
+
 /// Run one of the scheduler's secondary cache-maintenance watches (PVC/PV/
 /// StorageClass/CSINode). Unlike the primary pod watch, these never trigger
 /// scheduling directly — they only keep `NodeTally`'s CSI-driver-resolution
@@ -467,6 +470,14 @@ const CSI_NODE_WATCH_PATH: &str =
 /// missed while disconnected would otherwise leave a phantom cache entry the
 /// fresh `sendInitialEvents=true` relist never corrects (it only re-adds
 /// what still exists).
+///
+/// `ready`, when given, is notified the first time this watch's initial
+/// `sendInitialEvents=true` relist completes (the apiserver's
+/// `k8s.io/initial-events-end` BOOKMARK — see `is_initial_events_end_bookmark`)
+/// — the readiness barrier `run_scheduler` awaits on the node cache before
+/// serving any scheduling decision, so a restart with a pending-pod backlog
+/// never fail-safes every decision for lack of cached nodes (see that await
+/// site's own comment for the full story).
 async fn run_cache_watch_loop(
     connector: TlsConnector,
     server: String,
@@ -474,12 +485,20 @@ async fn run_cache_watch_loop(
     path: &'static str,
     apply: fn(&mut NodeTally, &serde_json::Value),
     clear: fn(&mut NodeTally),
+    ready: Option<Arc<tokio::sync::Notify>>,
 ) {
     loop {
         info!("starting cache watch on {path}");
         clear(&mut tally.lock().expect("tally lock poisoned"));
         let tally_ref = &tally;
+        let mut synced = false;
         let result = stream_watch_events(&connector, &server, path, |event| {
+            if !synced && is_initial_events_end_bookmark(&event) {
+                synced = true;
+                if let Some(ready) = &ready {
+                    ready.notify_one();
+                }
+            }
             apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event);
         })
         .await;
@@ -488,6 +507,17 @@ async fn run_cache_watch_loop(
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
+}
+
+/// True for the single synthetic BOOKMARK the apiserver sends to mark the end
+/// of a `sendInitialEvents=true` relist (Kubernetes 1.27+ informer protocol —
+/// see `crates/apiserver/src/handlers/watch.rs`). Distinct from an ordinary
+/// watch bookmark (a bare resourceVersion heartbeat, no annotation): only
+/// THIS one means "you have now seen every object that existed at connect
+/// time," which is the signal `run_cache_watch_loop`'s `ready` barrier needs.
+fn is_initial_events_end_bookmark(event: &serde_json::Value) -> bool {
+    event["type"] == "BOOKMARK"
+        && event["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"] == "true"
 }
 
 /// Handle one pod watch event — a real one from the live watch, or a
@@ -707,7 +737,7 @@ fn handle_pod_event(
         // `kubectl describe pod` and the SchedulerPredicates e2e suite's
         // observeEventAfterAction watch never see a Scheduled/FailedScheduling
         // event and the watch times out.
-        let first_pick = pick_node(&connector_clone, &server_clone, &pending, &tally_clone).await;
+        let first_pick = pick_node(&pending, &tally_clone);
         if let Err(e) = &first_pick {
             if should_retry_without_preempting(e) {
                 // A GET /api/v1/nodes failure (or an unparseable
@@ -956,29 +986,46 @@ pub async fn run_scheduler(
         });
     }
 
-    // Secondary caches feeding NodeTally's CSI-driver resolution (see
-    // `run_cache_watch_loop`'s doc comment) — each watched independently so
-    // one's reconnect never blocks the others or the primary pod watch.
-    for (path, apply, clear) in [
+    // Secondary caches NodeTally maintains alongside the primary pod tally —
+    // CSI-driver resolution (PVC/PV/StorageClass/CSINode) plus the node
+    // informer cache pick_node/find_preemption_plan/fetch_node read instead
+    // of a live GET /api/v1/nodes (see `run_cache_watch_loop`'s doc comment)
+    // — each watched independently so one's reconnect never blocks the
+    // others or the primary pod watch.
+    //
+    // `node_cache_synced` is the node watch's readiness barrier, awaited
+    // below before the pod watch starts serving scheduling decisions.
+    let node_cache_synced = Arc::new(tokio::sync::Notify::new());
+    for (path, apply, clear, ready) in [
         (
             PVC_WATCH_PATH,
             NodeTally::apply_pvc_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_pvc_cache as fn(&mut NodeTally),
+            None,
         ),
         (
             PV_WATCH_PATH,
             NodeTally::apply_pv_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_pv_cache as fn(&mut NodeTally),
+            None,
         ),
         (
             STORAGE_CLASS_WATCH_PATH,
             NodeTally::apply_storage_class_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_storage_class_cache as fn(&mut NodeTally),
+            None,
         ),
         (
             CSI_NODE_WATCH_PATH,
             NodeTally::apply_csi_node_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_csi_node_cache as fn(&mut NodeTally),
+            None,
+        ),
+        (
+            NODE_WATCH_PATH,
+            NodeTally::apply_node_event as fn(&mut NodeTally, &serde_json::Value),
+            NodeTally::clear_node_cache as fn(&mut NodeTally),
+            Some(node_cache_synced.clone()),
         ),
     ] {
         tokio::spawn(run_cache_watch_loop(
@@ -988,8 +1035,23 @@ pub async fn run_scheduler(
             path,
             apply,
             clear,
+            ready,
         ));
     }
+
+    // Readiness barrier: block starting the pod watch (and therefore every
+    // scheduling decision) until the node cache's initial sendInitialEvents
+    // relist has landed. Without this, a scheduler restart with a pending-pod
+    // backlog sees an empty node cache and pick_node fail-safes EVERY
+    // decision — no wrong bind, but no progress either — until the node
+    // watch's own reconnect loop eventually lands the list or the 30s
+    // RESYNC_INTERVAL retries, whichever comes first. This wait is normally a
+    // single network round-trip, not an indefinite stall: on any watch error
+    // before the bookmark arrives, run_cache_watch_loop's own 5s-backoff
+    // reconnect keeps retrying underneath it.
+    info!("waiting for node cache initial sync before serving scheduling decisions");
+    node_cache_synced.notified().await;
+    info!("node cache synced — starting pod watch");
 
     // Watch loop — reconnect on error with a short backoff.
     loop {
@@ -1076,17 +1138,17 @@ mod tests {
         );
     }
 
-    /// The 4 secondary cache-maintenance watch paths (PVC/PV/StorageClass/
-    /// CSINode) need the exact same two query params as `POD_WATCH_PATH`,
-    /// for the exact same reasons (see its own two tests above):
-    /// `allowWatchBookmarks=true` avoids a spurious reconnect every 5 min on
-    /// an idle cluster, and `sendInitialEvents=true` makes every (re)connect
-    /// relist CURRENT state instead of replaying stale ring-buffer history —
-    /// without it, `NodeTally::apply_pvc_event`/etc. would see each PVC/PV/
-    /// StorageClass/CSINode's original creation event on every ~30-min
-    /// forced reconnect, which is harmless here (these events are idempotent
-    /// upserts, unlike the pod watch's bind-reissue bug) but still wastes
-    /// apiserver load for no reason.
+    /// The 5 secondary cache-maintenance watch paths (PVC/PV/StorageClass/
+    /// CSINode/Node) need the exact same two query params as
+    /// `POD_WATCH_PATH`, for the exact same reasons (see its own two tests
+    /// above): `allowWatchBookmarks=true` avoids a spurious reconnect every 5
+    /// min on an idle cluster, and `sendInitialEvents=true` makes every
+    /// (re)connect relist CURRENT state instead of replaying stale
+    /// ring-buffer history — without it, `NodeTally::apply_pvc_event`/etc.
+    /// would see each PVC/PV/StorageClass/CSINode/Node's original creation
+    /// event on every ~30-min forced reconnect, which is harmless here
+    /// (these events are idempotent upserts, unlike the pod watch's
+    /// bind-reissue bug) but still wastes apiserver load for no reason.
     #[test]
     fn secondary_cache_watch_paths_request_bookmarks_and_initial_events() {
         for path in [
@@ -1094,6 +1156,7 @@ mod tests {
             PV_WATCH_PATH,
             STORAGE_CLASS_WATCH_PATH,
             CSI_NODE_WATCH_PATH,
+            NODE_WATCH_PATH,
         ] {
             assert!(
                 path.contains("allowWatchBookmarks=true"),
@@ -1123,6 +1186,231 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("timed out waiting for: {what}");
+    }
+
+    /// Regression for the node-cache readiness barrier in `run_scheduler`:
+    /// without it, the pod watch loop starts in parallel with the node
+    /// watch's own initial `sendInitialEvents=true` relist, so a restart
+    /// with a pending-pod backlog can see the pod watch's ADDED events
+    /// before a single node is cached — `pick_node` then fail-safes every
+    /// one of them (no wrong bind, but no progress either) until the node
+    /// watch's own reconnect eventually lands the list or the 30s
+    /// RESYNC_INTERVAL retries. This test withholds the node watch's
+    /// initial-events-end BOOKMARK (the sync signal) past when the pod
+    /// watch would otherwise already be connected, and asserts the pod
+    /// watch endpoint is never even DIALED until that BOOKMARK is released.
+    /// Revert the `node_cache_synced.notified().await` barrier in
+    /// `run_scheduler` and this test fails: the pod watch connects
+    /// immediately, well before the release.
+    #[tokio::test]
+    async fn run_scheduler_defers_pod_watch_until_node_cache_initial_sync() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+        use tokio_rustls::TlsAcceptor;
+
+        fn pem_encode(label: &str, der: &[u8]) -> String {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+            let mut out = format!("-----BEGIN {label}-----\n");
+            for chunk in b64.as_bytes().chunks(64) {
+                out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+                out.push('\n');
+            }
+            out.push_str(&format!("-----END {label}-----\n"));
+            out
+        }
+
+        fn initial_events_end_bookmark(kind: &str) -> serde_json::Value {
+            json!({
+                "type": "BOOKMARK",
+                "object": {
+                    "apiVersion": "v1",
+                    "kind": kind,
+                    "metadata": {
+                        "resourceVersion": "1",
+                        "annotations": {"k8s.io/initial-events-end": "true"}
+                    }
+                }
+            })
+        }
+
+        async fn send_chunk(
+            tls: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+            event: &serde_json::Value,
+        ) {
+            let mut line = event.to_string();
+            line.push('\n');
+            let chunk = format!("{:x}\r\n{line}\r\n", line.len());
+            let _ = tls.write_all(chunk.as_bytes()).await;
+            let _ = tls.flush().await;
+        }
+
+        // Server identity: self-signed, added directly to the client's trust
+        // root below (mirroring every other mock server in this file) — no
+        // separate CA needed since nothing here validates a chain, just this
+        // exact leaf.
+        let server_key = KeyPair::generate().expect("generate server key");
+        let mut server_params = CertificateParams::default();
+        server_params.subject_alt_names =
+            vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let server_cert = server_params
+            .self_signed(&server_key)
+            .expect("self-sign server cert");
+        let server_cert_der = server_cert.der().clone();
+        let server_key_der = PrivateKeyDer::Pkcs8(server_key.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert_der.clone()], server_key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        // build_tls_connector requires SOME client cert/key (mTLS), even
+        // though the server above never asks for one (with_no_client_auth) —
+        // any self-signed pair satisfies rustls's config builder.
+        let client_key = KeyPair::generate().expect("generate client key");
+        let client_cert = CertificateParams::default()
+            .self_signed(&client_key)
+            .expect("self-sign client cert");
+
+        let kubeconfig_yaml = format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             clusters:\n\
+             - cluster:\n\
+             \x20   server: https://127.0.0.1:{port}\n\
+             \x20   certificate-authority-data: {}\n\
+             \x20 name: u7s\n\
+             users:\n\
+             - name: admin\n\
+             \x20 user:\n\
+             \x20   client-certificate-data: {}\n\
+             \x20   client-key-data: {}\n",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                pem_encode("CERTIFICATE", &server_cert_der)
+            ),
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                pem_encode("CERTIFICATE", client_cert.der())
+            ),
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                client_key.serialize_pem()
+            ),
+        );
+        let kubeconfig_path = std::env::temp_dir().join(format!(
+            "u7s-scheduler-readiness-barrier-test-{}.yaml",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&kubeconfig_path, &kubeconfig_yaml).expect("write temp kubeconfig");
+
+        let pod_watch_connected = Arc::new(AtomicBool::new(false));
+        let release_node_bookmark = Arc::new(Notify::new());
+
+        {
+            let pod_watch_connected = pod_watch_connected.clone();
+            let release_node_bookmark = release_node_bookmark.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let acceptor = acceptor.clone();
+                    let pod_watch_connected = pod_watch_connected.clone();
+                    let release_node_bookmark = release_node_bookmark.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut tls) = acceptor.accept(tcp).await else {
+                            return;
+                        };
+                        let mut buf = vec![0u8; 8192];
+                        let mut total = 0usize;
+                        loop {
+                            let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            total += n;
+                            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let request = String::from_utf8_lossy(&buf[..total]);
+                        let request_line = request.lines().next().unwrap_or("");
+                        let path = request_line.split_whitespace().nth(1).unwrap_or("");
+
+                        // Watch responses are unbounded streams — chunked
+                        // transfer-encoding, exactly as the real apiserver's
+                        // own hyper server picks for a body of unknown
+                        // length (see crates/apiserver/src/handlers/watch.rs).
+                        let _ = tls
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                            )
+                            .await;
+                        let _ = tls.flush().await;
+
+                        if path == POD_WATCH_PATH {
+                            // Set BEFORE writing anything further: the
+                            // property under test is whether this endpoint
+                            // was ever dialed at all, not whether its relist
+                            // round-trip completed.
+                            pod_watch_connected.store(true, Ordering::SeqCst);
+                            send_chunk(&mut tls, &initial_events_end_bookmark("Pod")).await;
+                        } else if path == NODE_WATCH_PATH {
+                            // Held back until the test releases it — this is
+                            // what the readiness barrier is waiting on.
+                            release_node_bookmark.notified().await;
+                            send_chunk(&mut tls, &initial_events_end_bookmark("Node")).await;
+                        } else {
+                            // PVC/PV/StorageClass/CSINode: irrelevant to this
+                            // test, synced immediately so their loops don't
+                            // spam reconnects for the test's duration.
+                            send_chunk(&mut tls, &initial_events_end_bookmark("Unrelated")).await;
+                        }
+                    });
+                }
+            });
+        }
+
+        let kubeconfig_path_string = kubeconfig_path.to_string_lossy().into_owned();
+        tokio::spawn(async move {
+            let _ = run_scheduler(&kubeconfig_path_string, None).await;
+        });
+
+        // Give every watch loop ample time to dial in and, for the four
+        // paths that sync immediately, complete their relist — if the
+        // barrier were missing, the pod watch would already be among them.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !pod_watch_connected.load(Ordering::SeqCst),
+            "the pod watch must not connect before the node cache's initial sync completes — \
+             connecting this early means a restart's pending-pod backlog can be fail-safed by \
+             pick_node for lack of any cached node, exactly the regression this barrier exists \
+             to prevent"
+        );
+
+        release_node_bookmark.notify_one();
+
+        wait_until(
+            || pod_watch_connected.load(Ordering::SeqCst),
+            "the pod watch to connect promptly once the node cache's initial sync completes",
+        )
+        .await;
+
+        let _ = std::fs::remove_file(&kubeconfig_path);
     }
 
     /// Regression for the exact race live-reproduced against
@@ -1177,14 +1465,6 @@ mod tests {
         // Two single-victim-capacity nodes: "worker-0" hosts the legitimate
         // preemption victim, "worker-1" hosts an unrelated bystander that
         // must NEVER be touched if the second tick is correctly deduped.
-        let node_list_body = json!({
-            "items": [
-                {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}},
-                {"metadata": {"name": "worker-1"}, "status": {"allocatable": {"cpu": "1000m"}}},
-            ]
-        })
-        .to_string();
-
         let delete_victim_count = Arc::new(AtomicUsize::new(0));
         let delete_bystander_count = Arc::new(AtomicUsize::new(0));
         let bind_count = Arc::new(AtomicUsize::new(0));
@@ -1198,7 +1478,6 @@ mod tests {
                     break;
                 };
                 let acceptor = acceptor.clone();
-                let node_list_body = node_list_body.clone();
                 let delete_victim_count = delete_victim_count_srv.clone();
                 let delete_bystander_count = delete_bystander_count_srv.clone();
                 let bind_count = bind_count_srv.clone();
@@ -1224,11 +1503,7 @@ mod tests {
                     let method = parts.next().unwrap_or("");
                     let path = parts.next().unwrap_or("");
 
-                    let body = if method == "GET" && path == "/api/v1/nodes" {
-                        node_list_body
-                    } else {
-                        r#"{"kind":"Status","status":"Success"}"#.to_owned()
-                    };
+                    let body = r#"{"kind":"Status","status":"Success"}"#.to_owned();
                     if method == "DELETE" && path == "/api/v1/namespaces/default/pods/victim" {
                         delete_victim_count.fetch_add(1, Ordering::SeqCst);
                     } else if method == "DELETE"
@@ -1262,6 +1537,17 @@ mod tests {
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
         {
             let mut guard = tally.lock().expect("tally lock poisoned");
+            // pick_node/find_preemption_plan read the node cache, not a live
+            // GET — the mock server above serves no /api/v1/nodes route, so
+            // seed it directly the way the node watch would.
+            guard.apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+            guard.apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-1"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
             guard.assume(
                 "default",
                 "victim",
@@ -1410,12 +1696,13 @@ mod tests {
     }
 
     /// Spin up an in-process TLS mock server for the two bind-outcome tests
-    /// below: serves a single-node `/api/v1/nodes` list with `worker-0`
-    /// always having room, answers every `POST .../binding` with
-    /// `(bind_status, bind_body)`, and answers every other request with a
-    /// bare 200 OK — while recording how many `POST .../binding`,
-    /// `PATCH .../status`, and `POST .../events` calls it saw in the
-    /// returned `BindOutcomeCounts`, which is what each test asserts on.
+    /// below: answers every `POST .../binding` with `(bind_status,
+    /// bind_body)`, and answers every other request with a bare 200 OK —
+    /// while recording how many `POST .../binding`, `PATCH .../status`, and
+    /// `POST .../events` calls it saw in the returned `BindOutcomeCounts`,
+    /// which is what each test asserts on. Node candidates come from the
+    /// caller seeding `NodeTally` directly (`pick_node` reads the node
+    /// cache, not a live GET), not from anything this server serves.
     async fn spawn_bind_outcome_mock_server(
         bind_status: u16,
         bind_body: &'static str,
@@ -1445,13 +1732,6 @@ mod tests {
             .expect("bind listener");
         let port = listener.local_addr().unwrap().port();
 
-        let node_list_body = json!({
-            "items": [
-                {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}},
-            ]
-        })
-        .to_string();
-
         let counts = Arc::new(BindOutcomeCounts::default());
         let counts_srv = counts.clone();
 
@@ -1461,7 +1741,6 @@ mod tests {
                     break;
                 };
                 let acceptor = acceptor.clone();
-                let node_list_body = node_list_body.clone();
                 let counts = counts_srv.clone();
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(tcp).await else {
@@ -1486,9 +1765,7 @@ mod tests {
                     let path = parts.next().unwrap_or("");
 
                     let (status_line, body): (String, String) =
-                        if method == "GET" && path == "/api/v1/nodes" {
-                            ("200 OK".to_owned(), node_list_body)
-                        } else if method == "POST" && path.ends_with("/binding") {
+                        if method == "POST" && path.ends_with("/binding") {
                             counts.bind.fetch_add(1, Ordering::SeqCst);
                             (format!("{bind_status} bind-response"), bind_body.to_owned())
                         } else if method == "PATCH" && path.ends_with("/status") {
@@ -1561,6 +1838,16 @@ mod tests {
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        // pick_node reads the node cache, not a live GET — seed it directly
+        // with a single node, or pick_node would see zero candidates and
+        // never even attempt the bind this test means to exercise.
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
 
         handle_pod_event(
             bind_outcome_test_pod_event(),
@@ -1624,6 +1911,16 @@ mod tests {
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        // pick_node reads the node cache, not a live GET — seed it directly
+        // with a single node, or pick_node would see zero candidates and
+        // never even attempt the bind this test means to exercise.
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
 
         handle_pod_event(
             bind_outcome_test_pod_event(),
@@ -1678,14 +1975,16 @@ mod tests {
         bind_count: std::sync::atomic::AtomicUsize,
     }
 
-    /// Spin up an in-process TLS mock server serving: a single-node
-    /// `/api/v1/nodes` list (`worker-0`, always room); two unbound PVCs,
+    /// Spin up an in-process TLS mock server serving: two unbound PVCs,
     /// `data-pvc` (StorageClass `wfc-class`, WaitForFirstConsumer) and
     /// `cache-pvc` (StorageClass `immediate-class`, Immediate); those two
     /// StorageClasses' `volumeBindingMode`; and `POST .../binding` (counted,
     /// always 201 Created). Every PATCH is recorded (path + body) into the
     /// returned `VolumeBindingRecorder` rather than reasoned about here —
     /// the test itself decides which PATCHes should or should not exist.
+    /// Node candidates come from the caller seeding `NodeTally` directly
+    /// (`pick_node` reads the node cache, not a live GET), not from anything
+    /// this server serves.
     async fn spawn_volume_binding_mock_server() -> (TlsConnector, String, Arc<VolumeBindingRecorder>)
     {
         use rcgen::{CertificateParams, KeyPair, SanType};
@@ -1713,13 +2012,6 @@ mod tests {
             .expect("bind listener");
         let port = listener.local_addr().unwrap().port();
 
-        let node_list_body = json!({
-            "items": [
-                {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}},
-            ]
-        })
-        .to_string();
-
         let recorder = Arc::new(VolumeBindingRecorder::default());
         let recorder_srv = recorder.clone();
 
@@ -1729,7 +2021,6 @@ mod tests {
                     break;
                 };
                 let acceptor = acceptor.clone();
-                let node_list_body = node_list_body.clone();
                 let recorder = recorder_srv.clone();
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(tcp).await else {
@@ -1776,10 +2067,6 @@ mod tests {
                         String::from_utf8_lossy(&buf[header_end..body_end]).to_string();
 
                     let (status_line, resp_body): (String, String) = if method == "GET"
-                        && path == "/api/v1/nodes"
-                    {
-                        ("200 OK".to_owned(), node_list_body)
-                    } else if method == "GET"
                         && path == "/api/v1/namespaces/default/persistentvolumeclaims/data-pvc"
                     {
                         (
@@ -1859,6 +2146,16 @@ mod tests {
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        // pick_node reads the node cache, not a live GET — seed it directly
+        // with a single node, or pick_node would see zero candidates and
+        // never bind this pod at all.
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
 
         // web-0 references two PVCs directly: one whose StorageClass is
         // WaitForFirstConsumer (must be stamped once bound to worker-0), one
