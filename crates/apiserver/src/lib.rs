@@ -12346,8 +12346,9 @@ mod tests {
 
     /// Creates a Node with enough allocatable CPU to fit `create_unschedulable_pod`'s request,
     /// then an unscheduled Pod referencing it — the minimal fixture the embedded scheduler
-    /// needs to have anywhere to place the pod (`pick_node` GETs `/api/v1/nodes` and skips any
-    /// node whose allocatable cpu doesn't fit, same as the standalone scheduler).
+    /// needs to have anywhere to place the pod (`pick_node` reads the node cache populated by
+    /// watching `/api/v1/nodes` and skips any node whose allocatable cpu doesn't fit, same as
+    /// the standalone scheduler).
     async fn create_node_and_unschedulable_pod(
         client: &reqwest::Client,
         server: &str,

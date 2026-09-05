@@ -1552,10 +1552,19 @@ impl NodeTally {
     /// only path that may remove from `pods`'s map slot for `key` (see
     /// `insert_pod`'s doc comment for why direct `self.pods.remove` calls
     /// elsewhere are forbidden).
+    ///
+    /// Prunes the outer `by_node` entry once its pod set empties — otherwise
+    /// every distinct node name ever observed for the life of the process
+    /// leaves behind an empty `HashSet`, growing `by_node` unbounded across
+    /// node churn (e.g. autoscaling nodes coming and going) even though the
+    /// last pod on that node is long gone.
     fn remove_pod(&mut self, key: &str) -> Option<TalliedPod> {
         let removed = self.pods.remove(key)?;
         if let Some(set) = self.by_node.get_mut(&removed.node_name) {
             set.remove(key);
+            if set.is_empty() {
+                self.by_node.remove(&removed.node_name);
+            }
         }
         Some(removed)
     }
@@ -8925,6 +8934,45 @@ mod tests {
             tally.pods_on("worker-3").is_empty(),
             "clear() must drop by_node along with pods — otherwise a node's \
              index entry outlives every pod it once tracked"
+        );
+    }
+
+    /// `assert_by_node_index_matches_pods` only checks that every key
+    /// PRESENT in `by_node` agrees with `pods` — it says nothing about an
+    /// emptied-but-not-removed outer entry, since an empty `HashSet` has no
+    /// keys to disagree about. This test catches that leak directly: without
+    /// pruning, `by_node` retains one empty entry per distinct node name ever
+    /// observed for the life of the process, growing unbounded across node
+    /// churn (e.g. an autoscaler cycling through thousands of differently
+    /// named nodes over the scheduler's lifetime).
+    #[test]
+    fn node_tally_remove_prunes_emptied_by_node_entry() {
+        let mut tally = NodeTally::default();
+
+        tally.assume(
+            "default",
+            "e",
+            "worker-9",
+            0,
+            requests(500, 0, 0),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            tally.by_node.len(),
+            1,
+            "sanity check: assume must have tallied the pod under worker-9"
+        );
+
+        tally.remove("default", "e");
+
+        assert!(
+            !tally.by_node.contains_key("worker-9"),
+            "removing the last pod on a node must prune worker-9's outer \
+             by_node entry, not just empty its pod set — a leaked empty \
+             entry here is invisible to assert_by_node_index_matches_pods \
+             and accumulates one per node name for the process's lifetime"
         );
     }
 
