@@ -758,6 +758,27 @@ pub(crate) async fn get_pod<S: Store>(
         .into_response())
 }
 
+/// Shared post-write guard for both `replace_pod` (PUT) and `patch_pod` (PATCH, all
+/// content types including SSA): a write that changed `spec.activeDeadlineSeconds` may
+/// have flipped the pod's Terminating/NotTerminating scope membership (see
+/// `record_pod_scope_changed`'s doc). Skips entirely when the spec didn't change — the
+/// overwhelming majority of both PUT and PATCH calls — and otherwise takes the same
+/// per-namespace lock the create/delete/resize paths hold across their own read-modify-
+/// write of `status.used`. Both write paths call this one function from their own
+/// store.put success arm so the recount cannot cover one and silently miss the other.
+async fn record_scope_change_if_spec_changed<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    spec_before: &serde_json::Value,
+    new_pod: &serde_json::Value,
+) {
+    if spec_before == &new_pod["spec"] {
+        return;
+    }
+    let _quota_lock = state.quota_admission_locks.lock(ns).await;
+    crate::quota::record_pod_scope_changed(state, ns, spec_before, new_pod).await;
+}
+
 pub(crate) async fn replace_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
@@ -942,6 +963,8 @@ pub(crate) async fn replace_pod<S: Store>(
         .map_err(|e| store_err_to_status(e, &name))?;
 
     obj.set_resource_version(new_rv);
+
+    record_scope_change_if_spec_changed(&state, ns.as_str(), &spec_before, &obj.body).await;
 
     Ok(Json(obj.body))
 }
@@ -1618,6 +1641,17 @@ pub(crate) async fn patch_pod<S: Store>(
         {
             Ok(new_rv) => {
                 current_obj.set_resource_version(new_rv);
+                // Every patch content-type (strategic-merge, merge, JSON Patch, SSA) has
+                // already folded into current_obj.body above, so this one call —
+                // record_scope_change_if_spec_changed, shared with replace_pod's PUT path —
+                // covers all of them.
+                record_scope_change_if_spec_changed(
+                    &state,
+                    ns.as_str(),
+                    &spec_before,
+                    &current_obj.body,
+                )
+                .await;
                 return Ok(Json(current_obj.body));
             }
             Err(StoreError::RevisionMismatch { .. }) => {
@@ -21201,6 +21235,240 @@ mod admission_tests {
             .expect("quota must exist");
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         v["status"]["used"]["pods"].as_str().map(|s| s.to_string())
+    }
+
+    /// A plain pod PATCH that sets `spec.activeDeadlineSeconds` retroactively moves the pod
+    /// into the `Terminating` scope. `record_pod_created`/`record_pod_removed` only run at
+    /// create/delete time, so without a dedicated scope-change recount a Terminating-scoped
+    /// quota's `status.used.pods` stays wherever it was at pod creation (0, since the pod was
+    /// NotTerminating then) forever — even though the pod now genuinely belongs to that scope.
+    /// That silently lets a second Terminating pod past a hard limit that is already exhausted.
+    #[tokio::test]
+    async fn patch_pod_setting_active_deadline_seconds_recounts_terminating_scope_quota() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "term-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+        });
+        store
+            .put(
+                "/registry/pods/default/term-pod",
+                Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // status.used.pods = "0" mirrors what record_pod_created would have written when
+        // term-pod was created: it was NotTerminating at the time, so it never counted
+        // toward this Terminating-scoped quota.
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": {"name": "term-quota", "namespace": "default"},
+            "spec": {"hard": {"pods": "1"}, "scopes": ["Terminating"]},
+            "status": {"used": {"pods": "0"}}
+        });
+        store
+            .put(
+                "/registry/resourcequotas/default/term-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = serde_json::json!({"spec": {"activeDeadlineSeconds": 30}});
+
+        patch_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(), "term-pod".to_string())),
+            axum::extract::Query(crate::handlers::json_patch::PatchQuery::default()),
+            headers,
+            Bytes::from(patch_body.to_string()),
+        )
+        .await
+        .expect("PATCH setting activeDeadlineSeconds must succeed");
+
+        assert_eq!(
+            quota_used_pods(&store, "term-quota").await,
+            Some("1".to_string()),
+            "PATCHing activeDeadlineSeconds moves term-pod into the Terminating scope — \
+             status.used.pods on the Terminating-scoped quota must recount to 1, or the quota \
+             never learns this pod now belongs to it"
+        );
+
+        // Consequence: a second Terminating pod must now be rejected — the quota's hard limit
+        // of 1 is genuinely exhausted. Without the recount above, status.used.pods would still
+        // read 0 and this create would be wrongly admitted, oversubscribing the scope.
+        let second_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "term-pod-2", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}],
+                "activeDeadlineSeconds": 30
+            }
+        });
+        let mut create_headers = axum::http::HeaderMap::new();
+        create_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let create_result = create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            create_headers,
+            Bytes::from(second_pod.to_string()),
+        )
+        .await;
+        assert!(
+            create_result.is_err(),
+            "a second Terminating-scoped pod must be rejected once the recounted quota sits at \
+             its hard limit of 1 — an under-counted quota (stuck at 0) would wrongly admit it"
+        );
+    }
+
+    /// A `kubectl replace` (GET-modify-PUT) that sets `spec.activeDeadlineSeconds` moves the
+    /// pod into the `Terminating` scope exactly like the PATCH case above —
+    /// `validate_pod_spec_immutable` permits this same unset-to-set transition on a PUT, not
+    /// just a PATCH. `record_pod_created`/`record_pod_removed` only run at create/delete time,
+    /// so without `replace_pod`'s own store-write success arm also recounting scoped quotas, a
+    /// Terminating-scoped quota's `status.used.pods` stays wherever it was at pod creation
+    /// forever — silently letting a second Terminating pod past an already-exhausted hard
+    /// limit even though the PATCH path was already fixed.
+    #[tokio::test]
+    async fn replace_pod_setting_active_deadline_seconds_recounts_terminating_scope_quota() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "term-pod-put", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+        });
+        store
+            .put(
+                "/registry/pods/default/term-pod-put",
+                Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let stored_rv = store
+            .get("/registry/pods/default/term-pod-put")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        // status.used.pods = "0" mirrors what record_pod_created would have written when
+        // term-pod-put was created: it was NotTerminating at the time, so it never counted
+        // toward this Terminating-scoped quota.
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": {"name": "term-quota-put", "namespace": "default"},
+            "spec": {"hard": {"pods": "1"}, "scopes": ["Terminating"]},
+            "status": {"used": {"pods": "0"}}
+        });
+        store
+            .put(
+                "/registry/resourcequotas/default/term-quota-put",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A GET-modify-PUT: the client reads the pod, adds activeDeadlineSeconds, and PUTs
+        // the whole object back — exactly what `kubectl replace` does.
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "term-pod-put",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}],
+                "activeDeadlineSeconds": 30
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        replace_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(), "term-pod-put".to_string())),
+            axum::extract::Query(crate::handlers::json_patch::ReplaceQuery::default()),
+            test_user(),
+            headers,
+            Bytes::from(put_body.to_string()),
+        )
+        .await
+        .expect("PUT setting activeDeadlineSeconds must succeed");
+
+        assert_eq!(
+            quota_used_pods(&store, "term-quota-put").await,
+            Some("1".to_string()),
+            "kubectl replace setting activeDeadlineSeconds moves term-pod-put into the \
+             Terminating scope — status.used.pods on the Terminating-scoped quota must recount \
+             to 1, or a GET-modify-PUT silently reproduces the exact quota drift the PATCH \
+             fix above already closed"
+        );
+
+        // Consequence: a second Terminating pod must now be rejected — the quota's hard limit
+        // of 1 is genuinely exhausted. Without the recount above, status.used.pods would still
+        // read 0 and this create would be wrongly admitted, oversubscribing the scope.
+        let second_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "term-pod-put-2", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}],
+                "activeDeadlineSeconds": 30
+            }
+        });
+        let mut create_headers = axum::http::HeaderMap::new();
+        create_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let create_result = create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            create_headers,
+            Bytes::from(second_pod.to_string()),
+        )
+        .await;
+        assert!(
+            create_result.is_err(),
+            "a second Terminating-scoped pod must be rejected once the recounted quota sits at \
+             its hard limit of 1 — an under-counted quota (stuck at 0, because the PUT path \
+             never recounted it) would wrongly admit it"
+        );
     }
 
     /// `write_quota_used_updates` is a plain get-then-put with no CAS: only the create path
