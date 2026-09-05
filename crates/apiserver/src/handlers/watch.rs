@@ -524,18 +524,19 @@ fn parse_set_values(s: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Test whether a JSON object matches a label selector string.
-/// Returns true if the selector is empty (pass-through) or all terms match
-/// `metadata.labels` in the object. Used to filter live watch events.
+/// Shared label-selector decision logic, parameterized over how to look up a label's value so
+/// `object_matches_label_selector` (full `Value`) and `SelectorProjection::matches` (the
+/// cheap pre-parse projection below) evaluate the exact same operators against the exact same
+/// data — a hand-duplicated second copy of this logic is exactly the kind of drift that would
+/// make a selector'd watch's projection-based pre-filter and its full-object filter disagree.
 ///
 /// Supported operators: `key=value` (Equality), `key!=value` (NotEquals),
 /// `!key` (DoesNotExist), bare `key` (Exists),
 /// `key in (v1,v2)` (In), `key notin (v1,v2)` (NotIn).
-pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &str) -> bool {
+fn label_selector_matches<'a>(selector: &str, label: impl Fn(&str) -> Option<&'a str>) -> bool {
     if selector.is_empty() {
         return true;
     }
-    let labels = &obj["metadata"]["labels"];
     for part in split_selector_terms(selector) {
         if part.is_empty() {
             continue;
@@ -545,7 +546,7 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
             if key.is_empty() {
                 continue;
             }
-            if labels.get(key).is_some() {
+            if label(key).is_some() {
                 return false;
             }
             continue;
@@ -556,8 +557,7 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
                 continue;
             }
             let values = parse_set_values(rest);
-            let label_val = labels.get(key).and_then(|v| v.as_str());
-            if label_val.is_some_and(|v| values.contains(&v)) {
+            if label(key).is_some_and(|v| values.contains(&v)) {
                 return false;
             }
             continue;
@@ -568,8 +568,7 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
                 continue;
             }
             let values = parse_set_values(rest);
-            let label_val = labels.get(key).and_then(|v| v.as_str());
-            if !label_val.is_some_and(|v| values.contains(&v)) {
+            if !label(key).is_some_and(|v| values.contains(&v)) {
                 return false;
             }
             continue;
@@ -580,7 +579,7 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
             if key.is_empty() {
                 continue;
             }
-            if labels.get(key).and_then(|v| v.as_str()) == Some(value) {
+            if label(key) == Some(value) {
                 return false;
             }
             continue;
@@ -591,7 +590,7 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
             if key.is_empty() {
                 continue;
             }
-            if labels.get(key).and_then(|v| v.as_str()) != Some(value) {
+            if label(key) != Some(value) {
                 return false;
             }
             continue;
@@ -600,23 +599,34 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
         if key.is_empty() {
             continue;
         }
-        if labels.get(key).is_none() {
+        if label(key).is_none() {
             return false;
         }
     }
     true
 }
 
-/// Test whether a JSON object matches a field selector string (`key=value,...` or `key!=value,...`).
+/// Test whether a JSON object matches a label selector string.
+/// Returns true if the selector is empty (pass-through) or all terms match
+/// `metadata.labels` in the object. Used to filter live watch events.
+pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &str) -> bool {
+    let labels = &obj["metadata"]["labels"];
+    label_selector_matches(selector, |key| labels.get(key).and_then(|v| v.as_str()))
+}
+
+/// Shared field-selector decision logic, parameterized over the three fields it ever reads —
+/// see `label_selector_matches`'s doc comment for why this is shared rather than duplicated
+/// between `object_matches_field_selector` and the projection-based pre-filter below.
+///
 /// Supports `metadata.name`, `metadata.namespace` (equality only), and `spec.nodeName`
 /// (equality and inequality). Returns true if the selector is empty (pass-through) or all
 /// terms match. Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
-///
-/// This is the matcher for built-in resources only. CR watches with a CRD-declared
-/// `selectableFields` go through `watch_generic_for_cr` instead, which consults
-/// `cr::cr_matches_field_selector` so a selector on a CRD-declared field (e.g. `host`) — which
-/// falls through the `_ => {}` catch-all below and is silently ignored — actually filters.
-pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &str) -> bool {
+fn field_selector_matches_parts(
+    selector: &str,
+    name: Option<&str>,
+    namespace: Option<&str>,
+    node_name: Option<&str>,
+) -> bool {
     if selector.is_empty() {
         return true;
     }
@@ -629,41 +639,110 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
         if let Some((field, value)) = part.split_once("!=") {
             let field = field.trim();
             let value = value.trim();
-            if field == "spec.nodeName" {
-                let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
-                if node_name == value {
-                    return false;
-                }
+            if field == "spec.nodeName" && node_name.unwrap_or("") == value {
+                return false;
             }
             // Unknown fields: ignore (conservative).
         } else if let Some((field, value)) = part.split_once('=') {
             let field = field.trim();
             let value = value.trim();
             match field {
-                "metadata.name" => {
-                    let name = obj["metadata"]["name"].as_str().unwrap_or("");
-                    if name != value {
-                        return false;
-                    }
-                }
-                "metadata.namespace" => {
-                    let ns = obj["metadata"]["namespace"].as_str().unwrap_or("");
-                    if ns != value {
-                        return false;
-                    }
-                }
-                "spec.nodeName" => {
-                    let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
-                    if node_name != value {
-                        return false;
-                    }
-                }
-                // Unknown fields: ignore (conservative).
+                "metadata.name" if name.unwrap_or("") != value => return false,
+                "metadata.namespace" if namespace.unwrap_or("") != value => return false,
+                "spec.nodeName" if node_name.unwrap_or("") != value => return false,
+                // Unknown fields (or a value that already matches): ignore (conservative).
                 _ => {}
             }
         }
     }
     true
+}
+
+/// Test whether a JSON object matches a field selector string (`key=value,...` or `key!=value,...`).
+///
+/// This is the matcher for built-in resources only. CR watches with a CRD-declared
+/// `selectableFields` go through `watch_generic_for_cr` instead, which consults
+/// `cr::cr_matches_field_selector` so a selector on a CRD-declared field (e.g. `host`) — which
+/// falls through the `_ => {}` catch-all above and is silently ignored — actually filters.
+pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &str) -> bool {
+    field_selector_matches_parts(
+        selector,
+        obj["metadata"]["name"].as_str(),
+        obj["metadata"]["namespace"].as_str(),
+        obj["spec"]["nodeName"].as_str(),
+    )
+}
+
+/// Minimal metadata/spec projection covering exactly the fields the selector matchers above
+/// read: `metadata.labels`, `metadata.name`, `metadata.namespace`, `spec.nodeName`. Serde skips
+/// every other key (spec.containers, status, ...) without ever building a `Value` for it, so a
+/// non-matching event can be identified far cheaper than the full parse this project's own
+/// measurements show gets paid today only to discard the result — e.g. a kubelet's
+/// `spec.nodeName=<node>` selector on a 100-node cluster is ~99% wasted parses per pod write.
+///
+/// MUST track every field `label_selector_matches`/`field_selector_matches_parts` read:
+/// `selector_projection_matches_agree_with_full_object_matchers` below cross-checks both against
+/// the same objects and selectors, so a matcher growing a field without a matching update here
+/// fails a test instead of silently mis-filtering a live selector'd watch.
+#[derive(serde::Deserialize, Default)]
+struct SelectorProjection<'a> {
+    #[serde(default, borrow)]
+    metadata: SelectorProjectionMetadata<'a>,
+    #[serde(default, borrow)]
+    spec: SelectorProjectionSpec<'a>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SelectorProjectionMetadata<'a> {
+    #[serde(default, borrow)]
+    name: Option<&'a str>,
+    #[serde(default, borrow)]
+    namespace: Option<&'a str>,
+    #[serde(default, borrow)]
+    labels: std::collections::BTreeMap<&'a str, &'a str>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SelectorProjectionSpec<'a> {
+    #[serde(default, rename = "nodeName", borrow)]
+    node_name: Option<&'a str>,
+}
+
+impl SelectorProjection<'_> {
+    fn matches(&self, label_selector: &str, field_selector: &str) -> bool {
+        label_selector_matches(label_selector, |key| self.metadata.labels.get(key).copied())
+            && field_selector_matches_parts(
+                field_selector,
+                self.metadata.name,
+                self.metadata.namespace,
+                self.spec.node_name,
+            )
+    }
+}
+
+/// Cheap pre-filter for a selector'd, non-CR watch event: if the stored bytes parse into
+/// `SelectorProjection` and definitively fail the selector, returns the object's name/namespace
+/// — all the caller needs for `ever_matched`/`locally_deleted` bookkeeping and a synthetic
+/// DELETED — without ever building the full `Value` or invoking CR conversion.
+///
+/// Returns `None` when the object might match (the caller needs the full path to build the
+/// emitted event) or the projection failed to parse (e.g. a non-string label value or invalid
+/// JSON) — the caller must treat `None` as "fall back to the full path", never as "does not
+/// match": this function only ever answers "definitely does not match" or "don't know".
+fn selector_projection_non_match(
+    raw: &[u8],
+    label_selector: &str,
+    field_selector: &str,
+) -> Option<(String, String)> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let projection: SelectorProjection = serde_json::from_str(s).ok()?;
+    if projection.matches(label_selector, field_selector) {
+        return None;
+    }
+    Some((
+        projection.metadata.name.unwrap_or("").to_string(),
+        projection.metadata.namespace.unwrap_or("").to_string(),
+    ))
 }
 
 /// Parameters for `watch_generic`.
@@ -1162,6 +1241,43 @@ async fn watch_generic_impl<S: Store>(
                                         }
                                     }
                                 } else if let Ok(s) = std::str::from_utf8(&obj.value) {
+                                    // Non-CR watches can decide "definitely doesn't match" from
+                                    // the cheap projection alone, skipping the full parse and
+                                    // CR-conversion no-op below entirely. CR watches must not
+                                    // take this shortcut: conversion can change field values the
+                                    // selector reads, so pre-filtering the unconverted body could
+                                    // wrongly drop an object that matches only after conversion.
+                                    if cr_fields.is_none() {
+                                        if let Some((name, ns)) = selector_projection_non_match(
+                                            &obj.value,
+                                            &label_selector,
+                                            &field_selector,
+                                        ) {
+                                            let was_matched =
+                                                ever_matched.remove(&(ns.clone(), name.clone()));
+                                            if !locally_deleted.contains(&obj.key)
+                                                && should_emit_synthetic_delete(
+                                                    is_modified,
+                                                    false,
+                                                    was_matched,
+                                                )
+                                            {
+                                                locally_deleted.insert(obj.key.clone());
+                                                let tombstone = build_tombstone_object(
+                                                    &name,
+                                                    &ns,
+                                                    obj.revision,
+                                                    &api_version,
+                                                    &kind,
+                                                );
+                                                record_watch_event();
+                                                yield Ok::<Bytes, axum::BoxError>(
+                                                    ndjson_event_value("DELETED", &tombstone),
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                    }
                                     let parsed: serde_json::Value =
                                         serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
                                     // Convert to the actually-requested version BEFORE the
@@ -2953,6 +3069,104 @@ mod tests {
         }
     }
 
+    /// A watch with BOTH a label selector and a field selector must skip a non-matching object
+    /// via the cheap `SelectorProjection` pre-filter (no full parse, no CR-conversion) and still
+    /// deliver a genuinely matching one through the normal path. If the pre-filter and the
+    /// full-object filter ever disagreed, a watcher would either miss an event a controller
+    /// needed to reconcile (stale state) or receive one it shouldn't (acting on an object
+    /// outside its watch scope) — both silent, since nothing here returns an error.
+    #[tokio::test]
+    async fn watch_generic_combined_selectors_skip_non_matching_and_deliver_matching() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Written BEFORE subscribing so both replay from the ring buffer.
+        let matching = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-both-match",
+                "namespace": "default",
+                "labels": { "app": "frontend" }
+            }
+        });
+        let non_matching_label = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-wrong-label",
+                "namespace": "default",
+                "labels": { "app": "backend" }
+            }
+        });
+        for (key, obj) in [
+            ("/registry/configmaps/default/cm-both-match", &matching),
+            (
+                "/registry/configmaps/default/cm-wrong-label",
+                &non_matching_label,
+            ),
+        ] {
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from(serde_json::to_vec(obj).unwrap()),
+                    Some(0),
+                )
+                .await
+                .unwrap();
+        }
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: Some("app=frontend".into()),
+                field_selector: Some("metadata.namespace=default".into()),
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed for combined-selector test"));
+
+        let lines = read_watch_body_with_timeout(resp).await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one ADDED event must reach the watcher (the matching object); a wrongly \
+             delivered non-matching event or a wrongly dropped matching event both got {:?}",
+            lines
+        );
+        assert_eq!(
+            lines[0]["type"], "ADDED",
+            "the sole delivered event must be ADDED for the matching object"
+        );
+        assert_eq!(
+            lines[0]["object"]["metadata"]["name"], "cm-both-match",
+            "the delivered event must be for the object that matches BOTH selectors, not the \
+             one filtered out by the label selector"
+        );
+    }
+
     /// DELETED events must be filtered by label selector when the body is available.
     /// An object whose last-known body does NOT match the watch selector was never
     /// delivered as ADDED to this watcher — so its DELETED must be suppressed too.
@@ -3815,6 +4029,91 @@ mod tests {
         let obj = serde_json::json!({"metadata": {"name": "pod-1"}});
         // Unknown field → ignore → still matches
         assert!(object_matches_field_selector(&obj, "status.phase=Running"));
+    }
+
+    // -- SelectorProjection: must agree with the full-object matchers it pre-filters for --
+
+    /// SelectorProjection::matches must return the exact same verdict as the full-object
+    /// matchers for every case exercised by the dedicated matcher tests above and below. If a
+    /// future change grows `label_selector_matches`/`field_selector_matches_parts` to read a
+    /// field `SelectorProjection` doesn't carry, this test — not a live cluster — is where that
+    /// drift shows up: a watcher would otherwise silently miss (or wrongly receive) events
+    /// whenever the fast pre-filter and the full-object filter disagree.
+    #[test]
+    fn selector_projection_matches_agree_with_full_object_matchers() {
+        let cases: &[(serde_json::Value, &str, &str)] = &[
+            (
+                serde_json::json!({"metadata": {"name": "pod-1", "namespace": "default", "labels": {"app": "frontend", "tier": "web"}}, "spec": {"nodeName": "node-a"}}),
+                "app=frontend,tier=web",
+                "spec.nodeName=node-a,metadata.namespace=default",
+            ),
+            (
+                serde_json::json!({"metadata": {"name": "pod-2", "namespace": "default", "labels": {"app": "backend"}}, "spec": {"nodeName": "node-a"}}),
+                "app=frontend",
+                "",
+            ),
+            (
+                serde_json::json!({"metadata": {"name": "pod-3", "labels": {"app": "frontend"}}, "spec": {"nodeName": "node-b"}}),
+                "app in (frontend, backend)",
+                "spec.nodeName!=node-a",
+            ),
+            (
+                serde_json::json!({"metadata": {"name": "pod-4", "labels": {"tier": "web"}}}),
+                "!app",
+                "metadata.name=pod-4",
+            ),
+            (serde_json::json!({"metadata": {"name": "pod-5"}}), "", ""),
+            // Label selector matches but the field selector alone fails: this case only fails
+            // if a broken projection stops evaluating the field selector at all.
+            (
+                serde_json::json!({"metadata": {"name": "pod-6", "labels": {"app": "frontend"}}, "spec": {"nodeName": "node-a"}}),
+                "app=frontend",
+                "spec.nodeName=node-b",
+            ),
+        ];
+
+        for (obj, label_selector, field_selector) in cases {
+            let expected = object_matches_label_selector(obj, label_selector)
+                && object_matches_field_selector(obj, field_selector);
+            let obj_json = serde_json::to_string(obj).expect("test object must serialize");
+            let projection: SelectorProjection =
+                serde_json::from_str(&obj_json).expect("test object must deserialize");
+            let got = projection.matches(label_selector, field_selector);
+            assert_eq!(
+                got, expected,
+                "SelectorProjection::matches disagreed with the full-object matchers for \
+                 {obj:?} with label_selector={label_selector:?} field_selector={field_selector:?}; \
+                 the watch fast pre-filter and the full-object filter must always agree or a \
+                 watcher silently drops or wrongly receives an event"
+            );
+        }
+    }
+
+    /// selector_projection_non_match must return None (defer to the full path) when the object
+    /// actually matches — the caller relies on None meaning "don't know / matches", never
+    /// "doesn't match", or a matching object could be wrongly treated as a non-match.
+    #[test]
+    fn selector_projection_non_match_returns_none_for_a_matching_object() {
+        let raw =
+            br#"{"metadata":{"name":"pod-1","namespace":"default","labels":{"app":"frontend"}}}"#;
+        assert!(
+            selector_projection_non_match(raw, "app=frontend", "").is_none(),
+            "a matching object must return None so the caller falls through to the full path \
+             that actually builds and emits the ADDED/MODIFIED event"
+        );
+    }
+
+    /// selector_projection_non_match must return the object's name/namespace for a genuine
+    /// non-match, since that's all the caller needs for ever_matched/locally_deleted
+    /// bookkeeping and a synthetic DELETED — proving the skip path never needs the full object.
+    #[test]
+    fn selector_projection_non_match_returns_name_and_namespace_for_a_non_matching_object() {
+        let raw =
+            br#"{"metadata":{"name":"pod-1","namespace":"default","labels":{"app":"backend"}}}"#;
+        let (name, ns) = selector_projection_non_match(raw, "app=frontend", "")
+            .expect("a non-matching object must return Some((name, namespace))");
+        assert_eq!(name, "pod-1");
+        assert_eq!(ns, "default");
     }
 
     /// Regression: a watch with a label selector must receive an ADDED event for an object
