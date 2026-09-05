@@ -9,6 +9,35 @@ use u7s_apiserver::{run, Args};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+/// Bounds glibc's per-thread malloc-arena growth before any other thread
+/// exists in the process.
+///
+/// The only `#[global_allocator]` in this binary is the `dhat` one above, and
+/// that's compiled in only behind `--features dhat` -- a default build uses
+/// the system allocator, which on the project's `x86_64-unknown-linux-gnu`
+/// production target is glibc's ptmalloc2. Without `MALLOC_ARENA_MAX`,
+/// ptmalloc2 lets contending threads create up to `8 * ncores` independent
+/// arenas, and this binary's tokio runtime alone puts dozens of threads in
+/// flight (worker threads plus blocking-pool threads). Each extra arena
+/// keeps its own free-list segments and rarely returns them to the OS (the
+/// interleaved small-allocation lifetimes typical of serde_json tree
+/// construction reliably prevent the top chunk from shrinking past
+/// `M_TRIM_THRESHOLD`), so arena count becomes a standing RSS multiplier
+/// that never shrinks back down. Capping it at `2` bounds that multiplier at
+/// the cost of some malloc lock contention on the request path. Setting the
+/// env var must happen before any other thread is spawned -- glibc reads it
+/// from a single-threaded context, and mutating the environment concurrently
+/// with another thread's `getenv` is a data race -- so this runs as the
+/// first statement in `main`, ahead of building the tokio runtime.
+fn bound_glibc_malloc_arenas() {
+    // SAFETY: called as the first statement of `main`, before any other
+    // thread in the process exists, so there is no concurrent env access to
+    // race with.
+    unsafe {
+        std::env::set_var("MALLOC_ARENA_MAX", "2");
+    }
+}
+
 /// Worker-thread count for the apiserver's tokio runtime.
 ///
 /// `ai/prompts/api-server.md`'s "Tokio worker threads" section deliberately pins this
@@ -36,6 +65,7 @@ fn runtime_worker_threads() -> usize {
 
 #[cfg(feature = "dhat")]
 fn main() -> anyhow::Result<()> {
+    bound_glibc_malloc_arenas();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_worker_threads())
         .thread_stack_size(512 * 1024)
@@ -79,6 +109,7 @@ async fn dhat_main() -> anyhow::Result<()> {
 
 #[cfg(not(feature = "dhat"))]
 fn main() -> anyhow::Result<()> {
+    bound_glibc_malloc_arenas();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_worker_threads())
         .thread_stack_size(512 * 1024)
@@ -92,7 +123,23 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::runtime_worker_threads;
+    use super::{bound_glibc_malloc_arenas, runtime_worker_threads};
+
+    /// Guards against the apiserver reverting to an unbounded glibc process:
+    /// without `MALLOC_ARENA_MAX` pinned, ptmalloc2 can grow to `8 * ncores`
+    /// independent arenas under this binary's many worker/blocking threads,
+    /// and each extra arena is a standing RSS multiplier that rarely shrinks
+    /// back down (see `bound_glibc_malloc_arenas`'s doc comment).
+    #[test]
+    fn bound_glibc_malloc_arenas_pins_arena_max_to_two() {
+        bound_glibc_malloc_arenas();
+        assert_eq!(
+            std::env::var("MALLOC_ARENA_MAX").as_deref(),
+            Ok("2"),
+            "MALLOC_ARENA_MAX must be pinned to 2 before the tokio runtime spawns \
+             any thread, or glibc is free to grow one arena per contending thread"
+        );
+    }
 
     /// Guards against re-introducing the hardcoded `worker_threads = 2` cap this
     /// function replaced. That cap silently limited the ENTIRE apiserver -- TCP
