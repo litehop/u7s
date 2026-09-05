@@ -726,8 +726,11 @@ fn push_into_shard(
 
             // Tier 2: evict outright once the whole log exceeds a larger cap. `by_revision`
             // keeps revision -> key sorted, so this is O(log n) via pop_first() instead of
-            // an O(n) linear scan over `by_key`.
-            const STRIPPED_TIER_CAP: usize = 8 * RING_CAPACITY;
+            // an O(n) linear scan over `by_key`. 2x (not 8x) RING_CAPACITY: a full conformance
+            // run's busiest shard peaked at 870 live tombstones, comfortably under this cap,
+            // while the old 8x bought ~875KB of pure Stripped-tier index overhead per
+            // saturated shard that no observed traffic ever needed.
+            const STRIPPED_TIER_CAP: usize = 2 * RING_CAPACITY;
             if guard.by_key.len() > STRIPPED_TIER_CAP {
                 if let Some((oldest_revision, oldest_key)) = guard.by_revision.pop_first() {
                     guard.by_key.remove(&oldest_key);
@@ -3944,7 +3947,7 @@ mod tests {
     async fn deletion_log_eviction_evicts_lowest_revision_not_insertion_order() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
 
-        const STRIPPED_TIER_CAP: usize = 8 * RING_CAPACITY;
+        const STRIPPED_TIER_CAP: usize = 2 * RING_CAPACITY;
         let victim_key = "/registry/core/namespaces/victim".to_string();
 
         // Insert STRIPPED_TIER_CAP + 1 tombstones so the cap is exceeded exactly once, on
@@ -3981,6 +3984,45 @@ mod tests {
             "eviction must remove the globally lowest-revision tombstone (revision=0, planted \
              mid-sequence); if eviction instead used insertion order or a desynced index, a \
              different (wrong) tombstone would be evicted and this one would incorrectly survive"
+        );
+    }
+
+    /// STRIPPED_TIER_CAP must stay at 2x RING_CAPACITY, not the old 8x: a full conformance
+    /// run's busiest shard peaked at 870 live tombstones, so the extra 6x of cap bought
+    /// ~656KB of pure index overhead per saturated shard that no real cluster traffic used.
+    ///
+    /// This test pushes exactly `2 * RING_CAPACITY + 1` tombstones — enough to trigger one
+    /// eviction under the current (2x) cap, but nowhere near a reverted 8x cap. It fails on
+    /// that revert: with an 8x cap, none of these inserts would evict anything, so the log
+    /// would still hold all 1025 entries instead of having shrunk back to 1024.
+    #[tokio::test]
+    async fn deletion_log_stripped_tier_cap_is_bounded_at_two_times_ring_capacity() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key_prefix = "/registry/core/pods/";
+
+        for i in 0..=(2 * RING_CAPACITY) {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("{key_prefix}pod-{i}"),
+                    revision: i as u64,
+                    value: None,
+                    is_create: false,
+                    deleted_body: None,
+                }),
+                None,
+            );
+        }
+
+        let shard = store.shard_for_test(&format!("{key_prefix}pod-0"), None);
+        let guard = shard.deletion_log.read().expect("deletion_log poisoned");
+        assert_eq!(
+            guard.by_key.len(),
+            2 * RING_CAPACITY,
+            "deletion_log must have evicted its oldest entry once it crossed 2x RING_CAPACITY \
+             (={}); a length of {} instead means STRIPPED_TIER_CAP regressed back toward the \
+             old, memory-wasteful 8x sizing that no measured shard's traffic ever needed",
+            2 * RING_CAPACITY,
+            2 * RING_CAPACITY + 1
         );
     }
 
@@ -4031,7 +4073,7 @@ mod tests {
         // stale revision=0 left behind by step 1 if the index were desynced. The lowest
         // revision among this fresh batch (revision=2, key "ns-0") is what a correctly
         // synced index must evict when the cap is exceeded on the final insert.
-        const STRIPPED_TIER_CAP: usize = 8 * RING_CAPACITY;
+        const STRIPPED_TIER_CAP: usize = 2 * RING_CAPACITY;
         let true_victim = "/registry/core/namespaces/ns-0".to_string();
         for i in 0..=STRIPPED_TIER_CAP {
             store.push_event(
