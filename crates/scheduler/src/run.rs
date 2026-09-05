@@ -408,13 +408,18 @@ async fn attempt_deferred_bind(
 const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Path the periodic resync GETs on every `RESYNC_INTERVAL` tick.
-/// `fieldSelector=spec.nodeName=` asks the apiserver to return only pods
-/// whose `nodeName` equals the empty string — i.e. not yet scheduled (see
-/// `pod_matches_field_selector` in `crates/apiserver/src/handlers/pods.rs`).
-/// Every already-scheduled pod (the large majority of a running cluster) is
-/// filtered out server-side instead of being listed, wire-transferred, and
-/// parsed by the scheduler just to be discarded by `pods_needing_resync`.
-const RESYNC_PODS_PATH: &str = "/api/v1/pods?fieldSelector=spec.nodeName=";
+///
+/// Deliberately NOT `fieldSelector=spec.nodeName=`: the store's fast-path
+/// field-selector match compares against SQL `json_extract`, which yields
+/// SQL-NULL (never equal to anything, including `''`) for a pod whose
+/// `spec.nodeName` key is entirely absent — and an unscheduled pod's
+/// `nodeName` is always absent, never present-and-empty, because it's an
+/// `Option<String>` with `skip_serializing_if` on the wire. A `nodeName=`
+/// selector therefore matches zero pods in a real cluster, silently
+/// disabling this resync's stranded-pod safety net. Every pod is listed
+/// here and filtered in-process by `pods_needing_resync` instead, which
+/// already handles the absent-vs-empty distinction correctly.
+const RESYNC_PODS_PATH: &str = "/api/v1/pods";
 
 /// Path for the scheduler's cluster-wide pod watch. `allowWatchBookmarks=true`
 /// requests the apiserver's 60s bookmark heartbeat so `watch_stream`'s 5-min
@@ -1152,6 +1157,24 @@ mod tests {
     use super::*;
     use crate::ResourceRequests;
     use serde_json::json;
+
+    #[test]
+    fn resync_pods_path_has_no_field_selector() {
+        // A `fieldSelector=spec.nodeName=` here would ask the store to match
+        // pods whose nodeName is SQL-equal to the empty string — but a real
+        // unscheduled pod's nodeName key is entirely ABSENT (Option<String>
+        // + skip_serializing_if), which the store's json_extract path reads
+        // back as SQL NULL, never equal to anything. That selector matched
+        // zero real pods, silently disabling this resync's stranded-pod
+        // safety net. Every pod must be listed here and filtered in-process
+        // instead (see `pods_needing_resync`).
+        assert!(
+            !RESYNC_PODS_PATH.contains("fieldSelector"),
+            "resync must list the full pod collection, not filter server-side \
+             on a selector the store cannot match against an absent field; \
+             got: {RESYNC_PODS_PATH}"
+        );
+    }
 
     #[test]
     fn pod_watch_path_requests_allow_watch_bookmarks() {

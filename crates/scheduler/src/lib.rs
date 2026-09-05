@@ -5492,6 +5492,36 @@ mod tests {
         assert_eq!(events[0]["object"]["metadata"]["name"], "stranded-pod");
     }
 
+    /// Regression for the resync GET's dropped `fieldSelector=spec.nodeName=`:
+    /// a real unscheduled pod never has `spec.nodeName` present-and-empty like
+    /// the test above — `nodeName` is an `Option<String>` with
+    /// `skip_serializing_if`, so an unscheduled pod's stored JSON has the key
+    /// entirely ABSENT. A `fieldSelector=spec.nodeName=` GET compares that
+    /// absence against SQL NULL, which matches nothing, so every real
+    /// unscheduled pod was silently dropped before it ever reached this
+    /// function — this test pins the exact on-the-wire shape that regression
+    /// missed, not the empty-string shape above.
+    #[test]
+    fn pods_needing_resync_includes_a_pod_with_nodename_key_entirely_absent() {
+        let items = vec![json!({
+            "metadata": { "name": "never-scheduled-pod", "namespace": "kube-system" },
+            "spec": {}
+        })];
+        let in_flight = std::collections::HashSet::new();
+        let events = pods_needing_resync(&items, &in_flight);
+        assert_eq!(
+            events.len(),
+            1,
+            "a pod whose spec.nodeName key is entirely absent (how every real \
+             unscheduled pod is actually persisted) must still be picked up by \
+             resync"
+        );
+        assert_eq!(
+            events[0]["object"]["metadata"]["name"],
+            "never-scheduled-pod"
+        );
+    }
+
     #[test]
     fn pods_needing_resync_excludes_an_already_scheduled_pod() {
         // A pod that already has a nodeName is done. Resync must not keep
