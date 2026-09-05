@@ -6,9 +6,13 @@ use u7s_store::{ListOptions, Store, WatchEvent};
 use crate::{state::AppState, status::Status, types::ObjectMeta};
 
 /// Serialize `{"type":"<event_type>","object":<value>}\n` into a single heap allocation.
+/// Generic over `object`'s type so a `Serialize` envelope (e.g. `PartialObjectMetadataEnvelopeOwned`)
+/// can be written straight to the output buffer without first materializing it as a
+/// `serde_json::Value` — every existing caller passes `&serde_json::Value`, which also
+/// implements `Serialize`, so this widening is a no-op for them.
 ///
 /// Watch clients parse these bytes; any format change breaks every informer.
-fn ndjson_event_value(event_type: &str, object: &serde_json::Value) -> Bytes {
+fn ndjson_event_value<T: Serialize>(event_type: &str, object: &T) -> Bytes {
     let mut buf = Vec::with_capacity(128);
     buf.extend_from_slice(b"{\"type\":\"");
     buf.extend_from_slice(event_type.as_bytes());
@@ -95,13 +99,13 @@ fn finish_live_event(
     as_partial_object_metadata: bool,
 ) -> Bytes {
     super::defaults::apply_defaults(group, plural, &mut parsed);
-    let emit = if as_partial_object_metadata {
-        to_partial_object_metadata(&parsed)
+    if as_partial_object_metadata {
+        let envelope = take_partial_object_metadata(parsed);
+        ndjson_event_value(event_type, &envelope)
     } else {
         stamp_type_meta_if_changed(&mut parsed, api_version, kind);
-        parsed
-    };
-    ndjson_event_value(event_type, &emit)
+        ndjson_event_value(event_type, &parsed)
+    }
 }
 
 /// Deserialize, filter, default, and re-serialize one Added/Modified watch event.
@@ -275,6 +279,12 @@ struct PartialObjectMetadataEnvelope<'a> {
 
 /// Transform a full CR JSON object into a PartialObjectMetadata object.
 /// The GC only needs metadata (ownerReferences, finalizers, etc.) — spec/status are omitted.
+///
+/// Takes `obj` by reference because resource.rs/core.rs's LIST handlers hold their `items` by
+/// shared reference across both the PartialObjectMetadata and full-object response branches.
+/// Every watch event in this file owns the object it projects and discards it immediately after
+/// — see `take_partial_object_metadata` below for that path, which moves `metadata` out instead
+/// of paying for this function's copy.
 pub(crate) fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
     let null = serde_json::Value::Null;
     let envelope = PartialObjectMetadataEnvelope {
@@ -284,6 +294,30 @@ pub(crate) fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json:
     };
     serde_json::to_value(envelope)
         .expect("PartialObjectMetadataEnvelope always serializes to a JSON object")
+}
+
+/// Owned counterpart to `PartialObjectMetadataEnvelope`, serialized directly by the generic
+/// `ndjson_event_value` — skipping the intermediate `serde_json::Value` `to_partial_object_metadata`
+/// must build for its borrowed callers.
+#[derive(Serialize)]
+struct PartialObjectMetadataEnvelopeOwned {
+    #[serde(rename = "apiVersion")]
+    api_version: &'static str,
+    kind: &'static str,
+    metadata: serde_json::Value,
+}
+
+/// Move `obj`'s metadata into a PartialObjectMetadata envelope and drop the rest of `obj` (spec,
+/// status, everything else) immediately, so a watch event never holds the full object and its
+/// metadata-only projection in memory at once.
+fn take_partial_object_metadata(mut obj: serde_json::Value) -> PartialObjectMetadataEnvelopeOwned {
+    let metadata = obj["metadata"].take();
+    drop(obj);
+    PartialObjectMetadataEnvelopeOwned {
+        api_version: "meta.k8s.io/v1",
+        kind: "PartialObjectMetadata",
+        metadata,
+    }
 }
 
 /// Stamp resourceVersion and apiVersion/kind onto an already-parsed DELETED tombstone body
@@ -349,8 +383,8 @@ pub(crate) fn encode_watch_event(
             if as_partial_object_metadata {
                 let full: serde_json::Value =
                     serde_json::from_str(object_json).unwrap_or(serde_json::Value::Null);
-                let pom = to_partial_object_metadata(&full);
-                Some(ndjson_event_value("ADDED", &pom))
+                let envelope = take_partial_object_metadata(full);
+                Some(ndjson_event_value("ADDED", &envelope))
             } else {
                 Some(ndjson_event_raw("ADDED", object_json))
             }
@@ -366,8 +400,8 @@ pub(crate) fn encode_watch_event(
             if as_partial_object_metadata {
                 let full: serde_json::Value =
                     serde_json::from_str(object_json).unwrap_or(serde_json::Value::Null);
-                let pom = to_partial_object_metadata(&full);
-                Some(ndjson_event_value("MODIFIED", &pom))
+                let envelope = take_partial_object_metadata(full);
+                Some(ndjson_event_value("MODIFIED", &envelope))
             } else {
                 Some(ndjson_event_raw("MODIFIED", object_json))
             }
@@ -857,6 +891,15 @@ fn should_emit_synthetic_delete(is_modified: bool, now_matches: bool, ever_match
     is_modified && !now_matches && ever_matched
 }
 
+/// Whether a watch needs to record which objects it has delivered as matching.
+/// `should_emit_synthetic_delete` only fires when `now_matches` goes false, which
+/// `label_selector_matches`/`field_selector_matches_parts`/`cr_matches_field_selector` all make
+/// impossible once both selector strings are empty (each short-circuits `""` to "always
+/// matches") — so a no-selector watch's `ever_matched` entries can never be read back.
+fn watch_tracks_ever_matched(label_selector: &str, field_selector: &str) -> bool {
+    !(label_selector.is_empty() && field_selector.is_empty())
+}
+
 /// Derive the RBAC/metrics `version` label from a watch's wire-format `apiVersion`
 /// ("v1" for core, "apps/v1" for grouped resources) — the last `/`-separated segment.
 ///
@@ -1129,19 +1172,22 @@ async fn watch_generic_impl<S: Store>(
                 {
                     continue;
                 }
-                ever_matched.insert((
-                    item["metadata"]["namespace"].as_str().unwrap_or("").to_string(),
-                    item["metadata"]["name"].as_str().unwrap_or("").to_string(),
-                ));
-                let emit = if as_partial_object_metadata {
-                    to_partial_object_metadata(&item)
+                if watch_tracks_ever_matched(&label_selector, &field_selector) {
+                    ever_matched.insert((
+                        item["metadata"]["namespace"].as_str().unwrap_or("").to_string(),
+                        item["metadata"]["name"].as_str().unwrap_or("").to_string(),
+                    ));
+                }
+                if as_partial_object_metadata {
+                    let envelope = take_partial_object_metadata(item);
+                    record_watch_event();
+                    yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &envelope));
                 } else {
                     let mut v = item;
                     stamp_type_meta_if_changed(&mut v, &api_version, &kind);
-                    v
-                };
-                record_watch_event();
-                yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &emit));
+                    record_watch_event();
+                    yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &v));
+                }
             }
             record_watch_event();
             yield Ok::<Bytes, axum::BoxError>(ndjson_initial_events_bookmark(&api_version, &kind, last_rv));
@@ -2008,6 +2054,44 @@ mod tests {
             pom["metadata"]["deletionGracePeriodSeconds"], 30,
             "deletionGracePeriodSeconds must survive the PartialObjectMetadata projection \
              unchanged — it is set during graceful termination and read by controllers/kubelet"
+        );
+    }
+
+    /// The owned fast path every watch event uses (`take_partial_object_metadata` + the generic
+    /// `ndjson_event_value`) must serialize to exactly the same bytes as the borrowed path
+    /// resource.rs/core.rs's LIST/GET handlers still use (`to_partial_object_metadata` +
+    /// `serde_json::to_value`) — the only thing allowed to change between the two is how many
+    /// times the metadata subtree gets copied, never what ends up on the wire.
+    ///
+    /// Fails on revert to a `take_partial_object_metadata` that reorders fields, drops one, or
+    /// otherwise diverges from `PartialObjectMetadataEnvelope`'s wire shape — every watch client
+    /// parses these bytes and any divergence breaks every informer.
+    #[test]
+    fn take_partial_object_metadata_matches_borrowed_variant_byte_for_byte() {
+        let full_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "nginx",
+                "namespace": "default",
+                "uid": "abc-123",
+                "resourceVersion": "42",
+                "labels": { "app": "nginx" }
+            },
+            "spec": { "containers": [{"name": "nginx", "image": "nginx:latest"}] },
+            "status": { "phase": "Running" }
+        });
+
+        let expected = ndjson_event_value("ADDED", &to_partial_object_metadata(&full_pod));
+        let got = ndjson_event_value("ADDED", &take_partial_object_metadata(full_pod));
+
+        assert_eq!(
+            got.as_ref(),
+            expected.as_ref(),
+            "the owned PartialObjectMetadata path every watch event takes must produce \
+             byte-identical NDJSON to the borrowed path LIST/GET still use; got {:?} want {:?}",
+            got,
+            expected
         );
     }
 
@@ -3447,6 +3531,135 @@ mod tests {
             !should_emit_synthetic_delete(true, true, true),
             "an object that still matches the selector must not receive a synthetic \
              DELETE just because it was modified"
+        );
+    }
+
+    // -- watch_tracks_ever_matched --
+
+    /// A no-selector watch must not record `ever_matched` entries: `should_emit_synthetic_delete`
+    /// can never read them back (see `watch_tracks_ever_matched`'s doc), so every entry a
+    /// no-selector watch's sendInitialEvents phase would otherwise insert sits in the map,
+    /// unread, for the whole stream lifetime.
+    #[test]
+    fn watch_tracks_ever_matched_false_with_no_selector() {
+        assert!(
+            !watch_tracks_ever_matched("", ""),
+            "a watch with no label or field selector can never take the branch that reads \
+             ever_matched back, so recording entries for it is pure wasted memory"
+        );
+    }
+
+    /// A watch with either selector set is exactly the case `ever_matched` exists for — this
+    /// must stay true, or a selector-filtered watch silently loses its synthetic-DELETE
+    /// bookkeeping instead of just skipping unread inserts.
+    #[test]
+    fn watch_tracks_ever_matched_true_with_either_selector_set() {
+        assert!(
+            watch_tracks_ever_matched("app=frontend", ""),
+            "a label-selector watch must keep tracking ever_matched"
+        );
+        assert!(
+            watch_tracks_ever_matched("", "metadata.name=foo"),
+            "a field-selector watch must keep tracking ever_matched"
+        );
+    }
+
+    /// End-to-end guard for the sendInitialEvents gate: a selector-filtered watch must still
+    /// record the objects sendInitialEvents delivers as matching, so a later live MODIFIED that
+    /// loses the match still gets a synthetic DELETED. Fails on revert to a gate that skips the
+    /// insert whenever a selector IS set (e.g. an inverted condition) — the DELETED would go
+    /// missing and informers would keep a stale cache entry for an object that left scope.
+    #[tokio::test]
+    async fn watch_generic_send_initial_events_item_losing_selector_match_emits_synthetic_deleted()
+    {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let obj_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-initial-scope-exit",
+                "namespace": "default",
+                "labels": { "app": "frontend" }
+            }
+        });
+        let rv1 = store
+            .put(
+                "/registry/configmaps/default/cm-initial-scope-exit",
+                bytes::Bytes::from(serde_json::to_vec(&obj_v1).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // sendInitialEvents delivers cm-initial-scope-exit as ADDED (it matches "app=frontend"
+        // at list time) — this is the insert `watch_tracks_ever_matched` must not skip.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: rv1,
+                initial_items: Some((vec![obj_v1], rv1)),
+                label_selector: Some("app=frontend".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
+
+        // Update the object, removing the matching label — a live MODIFIED that leaves scope.
+        let obj_v2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-initial-scope-exit",
+                "namespace": "default",
+                "labels": { "app": "backend" }
+            }
+        });
+        store
+            .put(
+                "/registry/configmaps/default/cm-initial-scope-exit",
+                bytes::Bytes::from(serde_json::to_vec(&obj_v2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+
+        let lines = read_watch_body_with_timeout(resp).await;
+
+        let added_count = lines.iter().filter(|v| v["type"] == "ADDED").count();
+        assert_eq!(
+            added_count, 1,
+            "sendInitialEvents must deliver the matching object as ADDED; got {:?}",
+            lines
+        );
+        let deleted_count = lines.iter().filter(|v| v["type"] == "DELETED").count();
+        assert_eq!(
+            deleted_count, 1,
+            "an object delivered via sendInitialEvents that later loses the selector match \
+             must still get a synthetic DELETED — otherwise the informer keeps a stale cache \
+             entry for it; got {:?}",
+            lines
         );
     }
 
