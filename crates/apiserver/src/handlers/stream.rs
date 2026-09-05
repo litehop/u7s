@@ -141,7 +141,7 @@ where
         use tokio_tungstenite::tungstenite::Message;
         loop {
             match self.0.next().await? {
-                Ok(Message::Binary(b)) => return Some(bytes::Bytes::from(b.to_vec())),
+                Ok(Message::Binary(b)) => return Some(b),
                 Ok(Message::Text(t)) => return Some(bytes::Bytes::copy_from_slice(t.as_bytes())),
                 // After split(), tungstenite does NOT auto-respond to Pings — the
                 // sink is in a separate struct (TungsteniteWsWriter) with no channel
@@ -169,7 +169,7 @@ where
         use futures_util::SinkExt as _;
         use tokio_tungstenite::tungstenite::Message;
         self.0
-            .send(Message::Binary(data.to_vec().into()))
+            .send(Message::Binary(data))
             .await
             .map_err(anyhow::Error::from)
     }
@@ -316,8 +316,11 @@ pub async fn splice<A: BiStream, B: BiStream>(a: A, b: B) {
     let (mut ar, mut aw) = a.split();
     let (mut br, mut bw) = b.split();
 
-    let (a_to_b_tx, mut a_to_b_rx) = mpsc::channel::<bytes::Bytes>(256);
-    let (b_to_a_tx, mut b_to_a_rx) = mpsc::channel::<bytes::Bytes>(256);
+    // 32 slots is 8x the typical 4 KiB SPDY port-forward frame, enough to absorb jitter
+    // between read/write tasks without letting a slow writer buffer unbounded memory —
+    // a shallower channel converts excess data into backpressure on the reader instead.
+    let (a_to_b_tx, mut a_to_b_rx) = mpsc::channel::<bytes::Bytes>(32);
+    let (b_to_a_tx, mut b_to_a_rx) = mpsc::channel::<bytes::Bytes>(32);
 
     // read_a: drain A into a_to_b channel.
     let read_a = tokio::spawn(async move {
@@ -777,6 +780,37 @@ mod tests {
         let _ = send.await;
     }
 
+    /// TungsteniteWsWriter::send must deliver the payload byte-for-byte to the peer.
+    ///
+    /// Guards the outbound leg's Bytes handling — a broken send here would corrupt
+    /// every byte written to kubelet during exec/attach/logs, not just drop frames.
+    #[tokio::test]
+    async fn tungstenite_send_delivers_binary_payload_unmodified() {
+        use futures_util::StreamExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (mut server_ws, client_ws) = make_ws_pair().await;
+
+        let ws = TungsteniteWs(client_ws);
+        let (_reader, mut writer) = ws.split();
+
+        let payload = bytes::Bytes::from_static(&[0u8, 1, 255, 254, 42]);
+        writer.send(payload.clone()).await.unwrap();
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), server_ws.next())
+            .await
+            .expect("server must receive the frame within 2 seconds")
+            .expect("stream must not end before the frame arrives")
+            .unwrap();
+
+        assert_eq!(
+            received,
+            Message::Binary(payload),
+            "send() must deliver the exact bytes handed to it — any copy/conversion bug \
+             here would corrupt exec/attach/logs output sent to the kubelet"
+        );
+    }
+
     /// Regression: splice must not deadlock when one direction has many more
     /// messages than the other (e.g. portforward tarball download).
     ///
@@ -818,6 +852,37 @@ mod tests {
         assert_eq!(
             a_received, b_msgs,
             "messages must arrive at A in order and unmodified"
+        );
+    }
+
+    /// splice's internal channel must deliver every frame, in order and unmodified,
+    /// even when a burst exceeds its capacity — a shallow channel converts excess
+    /// data into backpressure on the reader, not dropped or corrupted frames.
+    ///
+    /// Sends more messages than the channel holds at once, so this fails if the
+    /// buffer cap is ever paired with a non-blocking send that silently drops on full.
+    #[tokio::test]
+    async fn splice_delivers_all_frames_exceeding_channel_capacity() {
+        let a_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let a = MemStream::new(vec![], Arc::clone(&a_out));
+
+        let msgs: Vec<Bytes> = (0u32..50)
+            .map(|i| Bytes::from(i.to_be_bytes().to_vec()))
+            .collect();
+        let b = MemStream::new(msgs.clone(), Arc::clone(&b_out));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), splice(a, b))
+            .await
+            .expect("splice must not hang when a burst exceeds the channel's capacity");
+
+        let a_received = a_out.lock().unwrap().clone();
+        assert_eq!(
+            a_received, msgs,
+            "every frame must arrive at A, in order and unmodified, even though 50 \
+             messages exceed the splice channel's capacity — an exec/log stream must \
+             never silently drop or reorder data under load"
         );
     }
 

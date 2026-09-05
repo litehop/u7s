@@ -112,8 +112,7 @@ pub(crate) fn filter_pods_by_field_selector(
 }
 
 fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
-    let spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
-    let node_name = spec.node_name.as_deref().unwrap_or("");
+    let node_name = pod["spec"]["nodeName"].as_str().unwrap_or("");
     let phase = pod["status"]["phase"].as_str().unwrap_or("");
     let pod_ip = pod["status"]["podIP"].as_str().unwrap_or("");
     let restart_policy = pod["spec"]["restartPolicy"].as_str().unwrap_or("");
@@ -2498,6 +2497,25 @@ mod field_selector_tests {
         assert!(
             result.is_empty(),
             "unscheduled pods must not reach the kubelet"
+        );
+    }
+
+    /// spec.nodeName holding a non-string JSON value (malformed stored data) must be
+    /// treated the same as absent, matching the typed decode this replaced. If a borrowed
+    /// read ever coerced the value to a string instead of requiring one, a malformed pod
+    /// could match every nodeName selector value and get delivered to the wrong kubelet.
+    #[test]
+    fn eq_filter_treats_non_string_node_name_as_absent() {
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"nodeName": 1}
+        });
+        let result = filter_pods_by_field_selector(vec![pod], "spec.nodeName=worker-1");
+        assert!(
+            result.is_empty(),
+            "a pod with a malformed (non-string) nodeName must not match any nodeName selector"
         );
     }
 
