@@ -407,6 +407,15 @@ async fn attempt_deferred_bind(
 /// its own retry-triggering event never arrives.
 const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Path the periodic resync GETs on every `RESYNC_INTERVAL` tick.
+/// `fieldSelector=spec.nodeName=` asks the apiserver to return only pods
+/// whose `nodeName` equals the empty string — i.e. not yet scheduled (see
+/// `pod_matches_field_selector` in `crates/apiserver/src/handlers/pods.rs`).
+/// Every already-scheduled pod (the large majority of a running cluster) is
+/// filtered out server-side instead of being listed, wire-transferred, and
+/// parsed by the scheduler just to be discarded by `pods_needing_resync`.
+const RESYNC_PODS_PATH: &str = "/api/v1/pods?fieldSelector=spec.nodeName=";
+
 /// Path for the scheduler's cluster-wide pod watch. `allowWatchBookmarks=true`
 /// requests the apiserver's 60s bookmark heartbeat so `watch_stream`'s 5-min
 /// per-frame idle timeout (`WATCH_IDLE_TIMEOUT` in `kubeconfig::lib`) never
@@ -960,15 +969,15 @@ pub async fn run_scheduler(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(RESYNC_INTERVAL).await;
-                let (status, body) = match http_get(&connector, &server, "/api/v1/pods").await {
+                let (status, body) = match http_get(&connector, &server, RESYNC_PODS_PATH).await {
                     Ok(resp) => resp,
                     Err(e) => {
-                        error!("resync: GET /api/v1/pods failed: {e}");
+                        error!("resync: GET {RESYNC_PODS_PATH} failed: {e}");
                         continue;
                     }
                 };
                 if !status.is_success() {
-                    error!("resync: GET /api/v1/pods returned {status}");
+                    error!("resync: GET {RESYNC_PODS_PATH} returned {status}");
                     continue;
                 }
                 let list: PodList = match serde_json::from_str(&body) {

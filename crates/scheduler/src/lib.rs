@@ -608,20 +608,32 @@ pub struct PendingPod {
 /// Extracted as a pure function so the decision can be unit-tested without
 /// standing up an API server.
 pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
-    let watch_event: WatchEvent<PodObject> = WatchEvent::<PodObject>::deserialize(event)
-        .unwrap_or_else(|_| WatchEvent {
-            event_type: String::new(),
-            object: PodObject::default(),
-        });
-    if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+    if event_type != "ADDED" && event_type != "MODIFIED" {
         return None;
     }
-    let pod_name = watch_event.object.metadata.name.as_deref().unwrap_or("");
+    needs_scheduling_pod(event.get("object")?)
+}
+
+/// The pod-level half of `needs_scheduling`'s decision, taking the pod object
+/// itself rather than a `{"type": ..., "object": ...}` watch-event envelope.
+///
+/// Split out so `pods_needing_resync` can run this exact check against each
+/// raw `/api/v1/pods` list item directly — without first paying to fabricate
+/// a synthetic envelope Value around it just to satisfy `needs_scheduling`'s
+/// signature. That fabrication is a full recursive clone of the pod (`json!`
+/// wrapping a `Value` reference always deep-copies), so doing it for every
+/// listed pod before deciding which ones even need it was the resync loop's
+/// dominant allocation cost. Delegating both callers to this one function
+/// keeps the live-watch and resync paths from ever diverging on what "needs
+/// scheduling" means.
+fn needs_scheduling_pod(pod: &Value) -> Option<PendingPod> {
+    let object: PodObject = PodObject::deserialize(pod).unwrap_or_default();
+    let pod_name = object.metadata.name.as_deref().unwrap_or("");
     if pod_name.is_empty() {
         return None;
     }
-    let already_scheduled = watch_event
-        .object
+    let already_scheduled = object
         .spec
         .node_name
         .as_deref()
@@ -629,8 +641,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
     if already_scheduled {
         return None;
     }
-    let has_scheduling_gates = watch_event
-        .object
+    let has_scheduling_gates = object
         .spec
         .scheduling_gates
         .as_ref()
@@ -640,17 +651,16 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         // predicate failure (no FailedScheduling event), it's "not ready yet".
         return None;
     }
-    let namespace = watch_event
-        .object
+    let namespace = object
         .metadata
         .namespace
         .unwrap_or_else(|| "default".to_owned());
-    let labels = watch_event.object.metadata.labels;
-    let requests = pod_total_requests(&watch_event.object.spec);
-    let node_selector = watch_event.object.spec.node_selector.unwrap_or_default();
-    let priority = watch_event.object.spec.priority.unwrap_or(0);
-    let tolerations = watch_event.object.spec.tolerations.unwrap_or_default();
-    let affinity = watch_event.object.spec.affinity;
+    let labels = object.metadata.labels;
+    let requests = pod_total_requests(&object.spec);
+    let node_selector = object.spec.node_selector.unwrap_or_default();
+    let priority = object.spec.priority.unwrap_or(0);
+    let tolerations = object.spec.tolerations.unwrap_or_default();
+    let affinity = object.spec.affinity;
     let pod_affinity_terms = affinity
         .as_ref()
         .and_then(|a| a.pod_affinity.as_ref())
@@ -668,12 +678,9 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         })
         .unwrap_or_default();
     let node_affinity = affinity.and_then(|a| a.node_affinity);
-    let host_ports = container_host_ports(&watch_event.object.spec.containers);
-    let pvc_names = referenced_pvc_names(
-        pod_name,
-        watch_event.object.spec.volumes.as_deref().unwrap_or(&[]),
-    );
-    let topology_spread_constraints = watch_event.object.spec.topology_spread_constraints;
+    let host_ports = container_host_ports(&object.spec.containers);
+    let pvc_names = referenced_pvc_names(pod_name, object.spec.volumes.as_deref().unwrap_or(&[]));
+    let topology_spread_constraints = object.spec.topology_spread_constraints;
     Some(PendingPod {
         namespace,
         pod_name: pod_name.to_owned(),
@@ -970,26 +977,32 @@ pub struct PodList {
 /// manufacture that missing event from a fresh list, on a timer, independent
 /// of whatever the watch stream has or hasn't delivered.
 ///
-/// Delegates to `needs_scheduling`/`should_schedule` — the exact functions
-/// the watch path already uses — so this can never diverge from what a real
-/// watch event for the same pod would decide, and a pod already in
-/// `in_flight` (a bind already running, from the watch or an earlier resync
-/// tick) is excluded here exactly as it would be there. Pure so the
-/// resync's core decision — which stranded pods get retried this tick — is
-/// unit-testable without a live apiserver GET.
+/// Delegates to `needs_scheduling_pod`/`should_schedule` — the same pod-level
+/// check `needs_scheduling` uses for a live watch event — so this can never
+/// diverge from what a real watch event for the same pod would decide, and a
+/// pod already in `in_flight` (a bind already running, from the watch or an
+/// earlier resync tick) is excluded here exactly as it would be there. Pure
+/// so the resync's core decision — which stranded pods get retried this tick
+/// — is unit-testable without a live apiserver GET.
+///
+/// Filters each raw `item` BEFORE wrapping it into the envelope, not after:
+/// wrapping is the expensive step (a full recursive clone of the pod), and
+/// most cluster pods are already scheduled, so wrapping every item first and
+/// filtering second — the reverse order — would pay that clone for pods this
+/// function is about to discard anyway.
 pub fn pods_needing_resync(
     items: &[Value],
     in_flight: &std::collections::HashSet<String>,
 ) -> Vec<Value> {
     items
         .iter()
-        .map(|item| serde_json::json!({"type": "MODIFIED", "object": item}))
-        .filter(|event| {
-            needs_scheduling(event).is_some_and(|pending| {
+        .filter(|item| {
+            needs_scheduling_pod(item).is_some_and(|pending| {
                 let key = format!("{}/{}", pending.namespace, pending.pod_name);
                 should_schedule(in_flight, &key)
             })
         })
+        .map(|item| serde_json::json!({"type": "MODIFIED", "object": item}))
         .collect()
 }
 
@@ -5546,6 +5559,52 @@ mod tests {
              does not survive a restart or a watch reconnect"
         );
         assert_eq!(events[0]["object"]["metadata"]["name"], "preemptor-pod");
+    }
+
+    /// Regression for the resync loop's map/filter reorder: `pods_needing_resync`
+    /// now filters each raw list item BEFORE wrapping it into a watch-event
+    /// envelope (only survivors pay that clone), instead of wrapping every
+    /// item first and filtering second. A mixed batch exercising every
+    /// exclusion reason side by side — already-scheduled, scheduling-gated,
+    /// already in-flight — pinned against the exact set of names that must
+    /// survive catches a bug the single-scenario tests above could each miss
+    /// alone: a reorder that only happens to work when it's the sole
+    /// candidate in the list, e.g. an off-by-one in which items the raw
+    /// pre-filter inspects versus which ones get wrapped.
+    #[test]
+    fn pods_needing_resync_reordered_filter_matches_pre_reorder_exclusion_set() {
+        let items = vec![
+            json!({
+                "metadata": { "name": "stranded", "namespace": "default" },
+                "spec": { "nodeName": "" }
+            }),
+            json!({
+                "metadata": { "name": "bound", "namespace": "default" },
+                "spec": { "nodeName": "node-1" }
+            }),
+            json!({
+                "metadata": { "name": "gated", "namespace": "default" },
+                "spec": { "nodeName": "", "schedulingGates": [{"name": "example.com/gate"}] }
+            }),
+            json!({
+                "metadata": { "name": "in-flight", "namespace": "default" },
+                "spec": { "nodeName": "" }
+            }),
+        ];
+        let mut in_flight = std::collections::HashSet::new();
+        in_flight.insert("default/in-flight".to_owned());
+        let events = pods_needing_resync(&items, &in_flight);
+        let names: std::collections::BTreeSet<&str> = events
+            .iter()
+            .map(|e| e["object"]["metadata"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["stranded"]),
+            "reordering the filter ahead of the wrap must not change which pods \
+             get resynced — bound, gated, and in-flight pods must stay excluded \
+             exactly as they were when the wrap ran first"
+        );
     }
 
     // drain_watch_buffer is re-exported from kubeconfig where it is called by
