@@ -2,4 +2,5 @@
 set -e
 bash scripts/check-findings-bead-refs.sh
 cargo fmt --all -- --check
+(cd crates/servicelb && cargo fmt --check)
 bash scripts/check-bead-id-refs.sh
