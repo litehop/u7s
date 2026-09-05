@@ -24,7 +24,7 @@ use super::generic::{
     check_crb_escalation, check_rb_escalation, check_role_escalation, decode_continue,
     generate_suffix, lookup, parse_field_selector, parse_label_selector, resolve_name,
     stamp_metadata, store_err, validate_name, validate_name_for_group, wants_generate_name,
-    CollectionQuery, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
+    CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
@@ -43,6 +43,78 @@ use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 ///   application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
 fn wants_partial_object_metadata(accept: &str) -> bool {
     accept.contains("as=PartialObjectMetadata")
+}
+
+/// Builds a LIST response's raw JSON bytes by parsing, defaulting, and filtering one
+/// stored object at a time and serializing each survivor straight into the output
+/// buffer — never materializing a `Vec<serde_json::Value>` of every item. A LIST's peak
+/// memory is dominated by how many parsed `Value` trees are alive at once, not by the
+/// final byte count, so keeping that count at 1 instead of the full item count is what
+/// makes a large LIST (hundreds of Pods) cheap instead of the dominant allocator.
+///
+/// The envelope's shape (kind/apiVersion/metadata, including continue-token encoding) is
+/// delegated to `build_list_response` with an empty items array, then the streamed items
+/// array is spliced into the one place that placeholder appears — so this can never drift
+/// from that function's byte-for-byte-tested envelope output.
+#[allow(clippy::too_many_arguments)]
+fn stream_list_json(
+    kind: &str,
+    group: &str,
+    version: &str,
+    plural: &str,
+    revision: u64,
+    raw_items: &[u7s_store::StoreObject],
+    label_pairs: &[LabelSelectorTerm<'_>],
+    events_field_selector: &str,
+    continue_key: Option<String>,
+    remaining_count: Option<u64>,
+    signing_key: &[u8; 32],
+) -> Result<Vec<u8>, crate::status::StatusError> {
+    let envelope = build_list_response(
+        kind,
+        group,
+        version,
+        revision,
+        Vec::new(),
+        continue_key,
+        remaining_count,
+        signing_key,
+    );
+    let envelope_bytes =
+        serde_json::to_vec(&envelope).map_err(|e| Status::internal(e.to_string()))?;
+    let marker = b"\"items\":[]";
+    let marker_pos = envelope_bytes
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .expect("build_list_response always emits an empty items array for an empty items Vec");
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&envelope_bytes[..marker_pos]);
+    body.extend_from_slice(b"\"items\":[");
+    let mut wrote_item = false;
+    for obj in raw_items {
+        let mut item: serde_json::Value =
+            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+        super::defaults::apply_defaults(group, plural, &mut item);
+        item = match apply_label_selector(vec![item], label_pairs).pop() {
+            Some(v) => v,
+            None => continue,
+        };
+        item = match super::pods::filter_events_by_field_selector(vec![item], events_field_selector)
+            .pop()
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        if wrote_item {
+            body.push(b',');
+        }
+        wrote_item = true;
+        serde_json::to_writer(&mut body, &item).map_err(|e| Status::internal(e.to_string()))?;
+    }
+    body.push(b']');
+    body.extend_from_slice(&envelope_bytes[marker_pos + marker.len()..]);
+    Ok(body)
 }
 
 pub(crate) async fn list_resource<S: Store>(
@@ -159,6 +231,46 @@ pub(crate) async fn list_resource<S: Store>(
     // current (possibly-advanced) revision.
     let list_revision = continue_decoded.map(|(_, rv)| rv).unwrap_or(resp.revision);
 
+    let label_pairs: Vec<LabelSelectorTerm> = query
+        .label_selector
+        .as_deref()
+        .map(parse_label_selector)
+        .transpose()?
+        .unwrap_or_default();
+    let events_field_selector = if plural == "events" {
+        query.field_selector.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
+
+    // The common case (no PartialObjectMetadata/Table transform, no protobuf re-encode)
+    // never needs every item alive at once — stream straight to output bytes instead of
+    // materializing a Vec<Value> of every item below. PartialObjectMetadata/Table build
+    // their own projected shape from the full collection, and protobuf negotiation needs
+    // a real parsed Value tree to find its per-kind encoder, so both keep the
+    // materializing path.
+    if !pom && !table && !crate::content_type::wants_protobuf(accept) {
+        let body = stream_list_json(
+            &meta.kind,
+            &group,
+            &version,
+            &plural,
+            list_revision,
+            &resp.items,
+            &label_pairs,
+            events_field_selector,
+            resp.continue_key,
+            resp.remaining_count,
+            &state.continue_token_key,
+        )?;
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response());
+    }
+
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
         let mut v: serde_json::Value =
@@ -167,21 +279,11 @@ pub(crate) async fn list_resource<S: Store>(
         items.push(v);
     }
 
-    let items = if let Some(ref sel) = query.label_selector {
-        let pairs = parse_label_selector(sel)?;
-        apply_label_selector(items, &pairs)
-    } else {
+    let items = apply_label_selector(items, &label_pairs);
+    let items = if events_field_selector.is_empty() {
         items
-    };
-
-    let items = if plural == "events" {
-        if let Some(ref sel) = query.field_selector {
-            super::pods::filter_events_by_field_selector(items, sel)
-        } else {
-            items
-        }
     } else {
-        items
+        super::pods::filter_events_by_field_selector(items, events_field_selector)
     };
     tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
@@ -27453,5 +27555,221 @@ mod tests {
             state.store.get(&key).await.unwrap().is_none(),
             "the rejected SSA-create must not persist the Node object it just denied"
         );
+    }
+
+    // -- streaming LIST path must match the pre-optimization materializing path --
+    //
+    // list_resource takes the new streaming path (stream_list_json) whenever the request
+    // isn't PartialObjectMetadata/Table and doesn't negotiate protobuf; it falls back to the
+    // old materialize-then-filter-then-envelope path otherwise. Requesting a kind with no
+    // registered protobuf encoder (CSINode) under a protobuf Accept header exercises that old
+    // path end to end (negotiated_response still falls back to JSON) without touching
+    // content_type.rs, so these tests can compare the two paths' actual wire bytes.
+
+    async fn seed_csinodes(
+        names_and_labels: &[(&str, &str)],
+    ) -> std::sync::Arc<u7s_store::SqliteStore> {
+        let store =
+            std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        for (name, app) in names_and_labels {
+            let obj = serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "CSINode",
+                "metadata": { "name": name, "labels": { "app": app } },
+                "spec": { "drivers": [] }
+            });
+            store
+                .put(
+                    &format!("/registry/storage.k8s.io/csinodes/{name}"),
+                    bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                    Some(0),
+                )
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    fn csinode_query(
+        label_selector: Option<&str>,
+        limit: Option<u64>,
+        continue_token: Option<&str>,
+    ) -> CollectionQuery {
+        CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: label_selector.map(str::to_string),
+            field_selector: None,
+            limit,
+            continue_token: continue_token.map(str::to_string),
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        }
+    }
+
+    async fn list_csinodes(
+        state: crate::state::AppState,
+        accept: &str,
+        query: CollectionQuery,
+    ) -> (StatusCode, Option<String>, bytes::Bytes) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_str(accept).unwrap(),
+        );
+        let resp = list_resource(
+            State(state),
+            Path(("storage.k8s.io".into(), "v1".into(), "csinodes".into())),
+            Query(query),
+            headers,
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+                extra: Default::default(),
+            }),
+        )
+        .await
+        .expect("list_resource must not error")
+        .into_response();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, content_type, body)
+    }
+
+    /// A malformed empty LIST breaks every client's initial informer sync; this pins that
+    /// the streaming path (no items ever alive as parsed Values) and the materializing path
+    /// (falls back to protobuf-Accept's JSON path, since CSINode has no proto encoder) emit
+    /// byte-identical wire bytes for the zero-item case.
+    #[tokio::test]
+    async fn streaming_list_matches_materializing_path_for_empty_list() {
+        let store = seed_csinodes(&[]).await;
+        let state = crate::handlers::test_support::make_state_with_store(store);
+        let (streamed_status, streamed_ct, streamed) = list_csinodes(
+            state.clone(),
+            "application/json",
+            csinode_query(None, None, None),
+        )
+        .await;
+        let (materialized_status, materialized_ct, materialized) = list_csinodes(
+            state,
+            "application/vnd.kubernetes.protobuf",
+            csinode_query(None, None, None),
+        )
+        .await;
+        assert_eq!(streamed_status, materialized_status);
+        assert_eq!(streamed_ct, materialized_ct);
+        assert_eq!(
+            streamed, materialized,
+            "an empty LIST's wire bytes must not change based on which code path built \
+             them, or a client relying on one path's exact shape sees a different one"
+        );
+    }
+
+    /// The common case (many items, a label selector dropping some of them) is what the
+    /// streaming path targets for peak-memory reduction; this pins that per-item filtering
+    /// applied inline (streaming) drops exactly the same items, in the same order, as
+    /// filtering the fully materialized Vec (old path) — a single dropped or reordered item
+    /// corrupts every client's view of the collection.
+    #[tokio::test]
+    async fn streaming_list_matches_materializing_path_for_label_selected_multi_item_list() {
+        let store = seed_csinodes(&[
+            ("node-foo-1", "foo"),
+            ("node-bar", "bar"),
+            ("node-foo-2", "foo"),
+        ])
+        .await;
+        let state = crate::handlers::test_support::make_state_with_store(store);
+        let q = || csinode_query(Some("app=foo"), None, None);
+        let (streamed_status, streamed_ct, streamed) =
+            list_csinodes(state.clone(), "application/json", q()).await;
+        let (materialized_status, materialized_ct, materialized) =
+            list_csinodes(state, "application/vnd.kubernetes.protobuf", q()).await;
+        assert_eq!(streamed_status, materialized_status);
+        assert_eq!(streamed_ct, materialized_ct);
+        assert_eq!(
+            streamed, materialized,
+            "a label-selected multi-item LIST's wire bytes must not change based on which \
+             code path built them"
+        );
+    }
+
+    /// Chunked LIST pagination (`limit` + `continue`) is the path most likely to regress from
+    /// streaming, since the envelope's `continue`/`remainingItemCount` fields are computed
+    /// from the store response before any item is parsed. This pins the whole envelope
+    /// (kind/apiVersion/metadata/items) as identical between paths, and — because the
+    /// `continue` token embeds a wall-clock timestamp that can legitimately differ by a
+    /// second between two sequential calls — separately decodes both tokens' payloads and
+    /// asserts their store key and pinned resourceVersion match, so a real drift in the
+    /// pagination cursor itself (not just its timestamp) is still caught.
+    #[tokio::test]
+    async fn streaming_list_matches_materializing_path_for_paginated_list() {
+        let store = seed_csinodes(&[("a", "x"), ("b", "x"), ("c", "x")]).await;
+        let state = crate::handlers::test_support::make_state_with_store(store);
+        let q = || csinode_query(None, Some(2), None);
+        let (streamed_status, streamed_ct, streamed) =
+            list_csinodes(state.clone(), "application/json", q()).await;
+        let (materialized_status, materialized_ct, materialized) =
+            list_csinodes(state, "application/vnd.kubernetes.protobuf", q()).await;
+        assert_eq!(streamed_status, materialized_status);
+        assert_eq!(streamed_ct, materialized_ct);
+
+        let mut streamed_body: serde_json::Value = serde_json::from_slice(&streamed).unwrap();
+        let mut materialized_body: serde_json::Value =
+            serde_json::from_slice(&materialized).unwrap();
+        assert_eq!(
+            streamed_body["metadata"]["remainingItemCount"],
+            materialized_body["metadata"]["remainingItemCount"],
+            "remainingItemCount must be identical, or `kubectl get --chunk-size` reports the \
+             wrong number of items left to fetch"
+        );
+        let streamed_token = streamed_body["metadata"]["continue"]
+            .as_str()
+            .expect("first page of 3 items with limit=2 must set a continue token")
+            .to_string();
+        let materialized_token = materialized_body["metadata"]["continue"]
+            .as_str()
+            .expect("first page of 3 items with limit=2 must set a continue token")
+            .to_string();
+        assert_eq!(
+            decode_continue_payload(&streamed_token),
+            decode_continue_payload(&materialized_token),
+            "the continue token's store key and pinned resourceVersion (everything but its \
+             timestamp) must match, or the next page a client fetches skips or repeats items"
+        );
+        streamed_body["metadata"]["continue"] = serde_json::Value::Null;
+        materialized_body["metadata"]["continue"] = serde_json::Value::Null;
+        assert_eq!(
+            streamed_body, materialized_body,
+            "everything but the continue token's timestamp must be byte-for-byte identical \
+             between the streaming and materializing paths"
+        );
+    }
+
+    /// Decodes a continue token's base64url payload (before the HMAC signature) into its `k`
+    /// (store key) and `rv` (pinned resourceVersion) fields, ignoring `t` (issue timestamp) —
+    /// the one field that legitimately differs between two calls made a wall-clock second
+    /// apart.
+    fn decode_continue_payload(token: &str) -> (String, u64) {
+        use base64::Engine;
+        let payload_b64 = token
+            .split('.')
+            .next()
+            .expect("token has a payload segment");
+        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .expect("payload segment is valid base64url");
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        (
+            payload["k"].as_str().unwrap().to_string(),
+            payload["rv"].as_u64().unwrap(),
+        )
     }
 }
