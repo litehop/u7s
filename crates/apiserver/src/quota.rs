@@ -1143,6 +1143,104 @@ pub async fn record_pod_resized<S: Store>(
     }
 }
 
+/// Returns true if `pod` matches every scope constraint (`spec.scopes` AND
+/// `spec.scopeSelector`) declared on `quota`. A quota with no scope constraints at all
+/// matches unconditionally. Mirrors the identical gate duplicated inline in
+/// `check_resource_quota`, `adjust_pod_quota_usage`, and `record_pod_resized`.
+fn pod_matches_quota_scope(quota: &Value, pod: &Value) -> bool {
+    if let Some(scopes) = quota["spec"]["scopes"].as_array() {
+        let matches = scopes
+            .iter()
+            .filter_map(|s| s.as_str())
+            .all(|s| object_matches_scope(s, Some(pod)));
+        if !matches {
+            return false;
+        }
+    }
+    let scope_selector = &quota["spec"]["scopeSelector"];
+    if scope_selector.is_object() && !object_matches_scope_selector(scope_selector, Some(pod)) {
+        return false;
+    }
+    true
+}
+
+/// Adjust every ResourceQuota's `status.used` in `namespace` for a pod whose write just
+/// changed a scope-determining spec field — currently only `activeDeadlineSeconds`, which
+/// toggles Terminating/NotTerminating scope membership (see `pod_is_terminating`); every other
+/// scope-relevant field (`priorityClassName`, container resources, cross-namespace affinity on
+/// an already-scheduled pod) is frozen post-creation by `validate_pod_spec_immutable`, so this
+/// is written generically against ALL scopes rather than hardcoding Terminating, in case that
+/// immutability set ever widens. Called (via `record_scope_change_if_spec_changed` in
+/// handlers/pods.rs) from both `patch_pod`'s (PATCH — strategic-merge, merge, JSON Patch, and
+/// SSA all fold into one body before that call) and `replace_pod`'s (PUT) store-write success
+/// arm, since `validate_pod_spec_immutable` permits this same activeDeadlineSeconds transition
+/// on either write path — a fix wired into only one of them leaves the other free to drift
+/// quota usage right back out of sync.
+///
+/// Without this, a running pod whose write newly matches (or stops matching) a scoped quota
+/// keeps counting against its OLD scope forever: the quota that should now cover the pod never
+/// sees it, and the quota that used to cover it never releases it. `status.used` — the O(1)
+/// baseline `check_resource_quota` trusts — permanently drifts from true membership, wrongly
+/// admitting pods against the scope that under-counts and wrongly rejecting them against the
+/// one that over-counts.
+///
+/// A quota with no scopes at all is skipped entirely: its usage is a flat count/sum over every
+/// pod in the namespace, so no per-pod scope match can ever change it.
+pub async fn record_pod_scope_changed<S: Store>(
+    state: &AppState<S>,
+    namespace: &str,
+    old_spec: &Value,
+    new_pod: &Value,
+) {
+    let quotas = fetch_resource_quotas(state, namespace).await;
+    if quotas.is_empty() {
+        return;
+    }
+    let old_pod = serde_json::json!({ "spec": old_spec });
+
+    for quota in &quotas {
+        if !quota_has_pod_scopes(quota) {
+            continue;
+        }
+        let quota_name = match quota["metadata"]["name"].as_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let hard = match quota["spec"]["hard"].as_object() {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let matches_old = pod_matches_quota_scope(quota, &old_pod);
+        let matches_new = pod_matches_quota_scope(quota, new_pod);
+        if matches_old == matches_new {
+            // No membership change for this quota — nothing to adjust.
+            continue;
+        }
+        let sign: i64 = if matches_new { 1 } else { -1 };
+        let resource_pod: &Value = if matches_new { new_pod } else { &old_pod };
+
+        let mut updates: Vec<(String, String)> = Vec::new();
+        for (quota_resource, _) in hard {
+            if quota_resource_covers(quota_resource, "", "pods") {
+                let new_count =
+                    pod_count_new_value(state, namespace, quota, quota_resource, sign).await;
+                updates.push((quota_resource.clone(), new_count.to_string()));
+            }
+        }
+        updates.extend(
+            adjust_pod_resource_quota_usage(state, namespace, quota, hard, |field, key| {
+                sign * pod_resource_milli(Some(resource_pod), field, key)
+            })
+            .await,
+        );
+        if updates.is_empty() {
+            continue;
+        }
+        write_quota_used_updates(state, namespace, &quota_name, updates).await;
+    }
+}
+
 /// Check ResourceQuota constraints before a CREATE operation.
 ///
 /// Fetches all ResourceQuota objects in `namespace` and checks two quota types:

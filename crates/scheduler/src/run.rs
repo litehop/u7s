@@ -174,7 +174,7 @@ async fn preempt_and_pick_node(
 ) -> Result<(), PreemptionFailure> {
     let mut last_err: Option<PreemptionFailure> = None;
     for _ in 0..MAX_PREEMPTION_ATTEMPTS {
-        let plan = match find_preemption_plan(connector, server, pending, tally).await {
+        let plan = match find_preemption_plan(pending, tally) {
             Ok(plan) => plan,
             Err(e) => {
                 last_err = Some(if should_retry_after_preemption_plan_error(&e) {
@@ -330,9 +330,9 @@ async fn attempt_deferred_bind(
 ) {
     let key = format!("{}/{}", pending.namespace, pending.pod_name);
     async {
-        let node = match fetch_node(connector, server, &node_name).await {
-            Ok(Some(node)) => node,
-            Ok(None) => {
+        let node = match fetch_node(tally, &node_name) {
+            Some(node) => node,
+            None => {
                 info!(
                     "deferred bind for {key}: node {node_name} no longer exists — \
                      leaving pod Pending for the periodic resync to re-plan"
@@ -341,13 +341,6 @@ async fn attempt_deferred_bind(
                     .lock()
                     .expect("tally lock poisoned")
                     .remove(&pending.namespace, &pending.pod_name);
-                return;
-            }
-            Err(e) => {
-                error!(
-                    "deferred bind for {key}: failed to re-fetch node {node_name}: {e} — \
-                     leaving pod Pending for the periodic resync to re-plan"
-                );
                 return;
             }
         };
@@ -453,6 +446,16 @@ const PV_WATCH_PATH: &str =
 const STORAGE_CLASS_WATCH_PATH: &str = "/apis/storage.k8s.io/v1/storageclasses?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
 const CSI_NODE_WATCH_PATH: &str =
     "/apis/storage.k8s.io/v1/csinodes?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
+
+/// Watch path feeding `NodeTally`'s node cache (`NodeTally::apply_node_event`)
+/// — the same query params as `POD_WATCH_PATH`, for the same reason: this
+/// replaces the live GET /api/v1/nodes `pick_node`/`find_preemption_plan`/
+/// `fetch_node` used to issue once per scheduling decision, so it needs the
+/// same "current state, not raw history" (`sendInitialEvents=true`) and
+/// idle-reconnect (`allowWatchBookmarks=true`) guarantees that GET's
+/// replacement now depends on.
+const NODE_WATCH_PATH: &str =
+    "/api/v1/nodes?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
 
 /// Run one of the scheduler's secondary cache-maintenance watches (PVC/PV/
 /// StorageClass/CSINode). Unlike the primary pod watch, these never trigger
@@ -707,7 +710,7 @@ fn handle_pod_event(
         // `kubectl describe pod` and the SchedulerPredicates e2e suite's
         // observeEventAfterAction watch never see a Scheduled/FailedScheduling
         // event and the watch times out.
-        let first_pick = pick_node(&connector_clone, &server_clone, &pending, &tally_clone).await;
+        let first_pick = pick_node(&pending, &tally_clone);
         if let Err(e) = &first_pick {
             if should_retry_without_preempting(e) {
                 // A GET /api/v1/nodes failure (or an unparseable
@@ -956,9 +959,12 @@ pub async fn run_scheduler(
         });
     }
 
-    // Secondary caches feeding NodeTally's CSI-driver resolution (see
-    // `run_cache_watch_loop`'s doc comment) — each watched independently so
-    // one's reconnect never blocks the others or the primary pod watch.
+    // Secondary caches NodeTally maintains alongside the primary pod tally —
+    // CSI-driver resolution (PVC/PV/StorageClass/CSINode) plus the node
+    // informer cache pick_node/find_preemption_plan/fetch_node read instead
+    // of a live GET /api/v1/nodes (see `run_cache_watch_loop`'s doc comment)
+    // — each watched independently so one's reconnect never blocks the
+    // others or the primary pod watch.
     for (path, apply, clear) in [
         (
             PVC_WATCH_PATH,
@@ -979,6 +985,11 @@ pub async fn run_scheduler(
             CSI_NODE_WATCH_PATH,
             NodeTally::apply_csi_node_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_csi_node_cache as fn(&mut NodeTally),
+        ),
+        (
+            NODE_WATCH_PATH,
+            NodeTally::apply_node_event as fn(&mut NodeTally, &serde_json::Value),
+            NodeTally::clear_node_cache as fn(&mut NodeTally),
         ),
     ] {
         tokio::spawn(run_cache_watch_loop(
@@ -1076,17 +1087,17 @@ mod tests {
         );
     }
 
-    /// The 4 secondary cache-maintenance watch paths (PVC/PV/StorageClass/
-    /// CSINode) need the exact same two query params as `POD_WATCH_PATH`,
-    /// for the exact same reasons (see its own two tests above):
-    /// `allowWatchBookmarks=true` avoids a spurious reconnect every 5 min on
-    /// an idle cluster, and `sendInitialEvents=true` makes every (re)connect
-    /// relist CURRENT state instead of replaying stale ring-buffer history —
-    /// without it, `NodeTally::apply_pvc_event`/etc. would see each PVC/PV/
-    /// StorageClass/CSINode's original creation event on every ~30-min
-    /// forced reconnect, which is harmless here (these events are idempotent
-    /// upserts, unlike the pod watch's bind-reissue bug) but still wastes
-    /// apiserver load for no reason.
+    /// The 5 secondary cache-maintenance watch paths (PVC/PV/StorageClass/
+    /// CSINode/Node) need the exact same two query params as
+    /// `POD_WATCH_PATH`, for the exact same reasons (see its own two tests
+    /// above): `allowWatchBookmarks=true` avoids a spurious reconnect every 5
+    /// min on an idle cluster, and `sendInitialEvents=true` makes every
+    /// (re)connect relist CURRENT state instead of replaying stale
+    /// ring-buffer history — without it, `NodeTally::apply_pvc_event`/etc.
+    /// would see each PVC/PV/StorageClass/CSINode/Node's original creation
+    /// event on every ~30-min forced reconnect, which is harmless here
+    /// (these events are idempotent upserts, unlike the pod watch's
+    /// bind-reissue bug) but still wastes apiserver load for no reason.
     #[test]
     fn secondary_cache_watch_paths_request_bookmarks_and_initial_events() {
         for path in [
@@ -1094,6 +1105,7 @@ mod tests {
             PV_WATCH_PATH,
             STORAGE_CLASS_WATCH_PATH,
             CSI_NODE_WATCH_PATH,
+            NODE_WATCH_PATH,
         ] {
             assert!(
                 path.contains("allowWatchBookmarks=true"),
@@ -1262,6 +1274,17 @@ mod tests {
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
         {
             let mut guard = tally.lock().expect("tally lock poisoned");
+            // pick_node/find_preemption_plan now read the node cache instead
+            // of GETting /api/v1/nodes — seed it the way the node watch
+            // would, instead of relying on the mock server's node_list_body.
+            guard.apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+            guard.apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-1"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
             guard.assume(
                 "default",
                 "victim",
@@ -1561,6 +1584,18 @@ mod tests {
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        // pick_node now reads the node cache instead of GETting
+        // /api/v1/nodes — seed it with the same single node
+        // spawn_bind_outcome_mock_server's (now-unreachable) node_list_body
+        // used to serve, or pick_node would see zero candidates and never
+        // even attempt the bind this test means to exercise.
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
 
         handle_pod_event(
             bind_outcome_test_pod_event(),
@@ -1624,6 +1659,18 @@ mod tests {
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        // pick_node now reads the node cache instead of GETting
+        // /api/v1/nodes — seed it with the same single node
+        // spawn_bind_outcome_mock_server's (now-unreachable) node_list_body
+        // used to serve, or pick_node would see zero candidates and never
+        // even attempt the bind this test means to exercise.
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
 
         handle_pod_event(
             bind_outcome_test_pod_event(),
@@ -1859,6 +1906,18 @@ mod tests {
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        // pick_node now reads the node cache instead of GETting
+        // /api/v1/nodes — seed it with the same single node
+        // spawn_volume_binding_mock_server's (now-unreachable) node_list_body
+        // used to serve, or pick_node would see zero candidates and never
+        // bind this pod at all.
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
 
         // web-0 references two PVCs directly: one whose StorageClass is
         // WaitForFirstConsumer (must be stamped once bound to worker-0), one

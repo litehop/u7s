@@ -998,7 +998,7 @@ pub struct NodeList {
     pub items: Vec<NodeItem>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NodeItem {
     pub metadata: NodeMetadata,
     #[serde(default)]
@@ -1016,7 +1016,7 @@ pub struct NodeItem {
     pub csi_driver_headroom: std::collections::BTreeMap<String, i64>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct NodeSpec {
     #[serde(default)]
     pub taints: Vec<Taint>,
@@ -1042,7 +1042,7 @@ pub struct Taint {
     pub effect: String,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct NodeStatus {
     #[serde(default)]
     pub allocatable: NodeAllocatable,
@@ -1050,7 +1050,7 @@ pub struct NodeStatus {
     pub capacity: NodeAllocatable,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct NodeAllocatable {
     /// Maximum pods the node will accept (quantity string, e.g. "110").
     /// Zero means the field was absent — treat as unlimited for safety (no cap check).
@@ -1081,7 +1081,7 @@ pub struct NodeAllocatable {
     pub extended: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NodeMetadata {
     pub name: String,
     #[serde(default)]
@@ -1474,6 +1474,17 @@ impl PreemptionWaiters {
 #[derive(Debug, Default)]
 pub struct NodeTally {
     pods: std::collections::HashMap<String, TalliedPod>,
+    /// Node name -> "namespace/name" keys of every pod in `pods` currently on
+    /// that node — the secondary index `pods_on`/`csi_attached_counts` use in
+    /// place of a full scan of `pods`. Mirrors `node_authz`'s
+    /// `NodeGraphInner::by_node` shape. Maintained ONLY through
+    /// `insert_pod`/`remove_pod`/`clear` below; every other method must go
+    /// through those instead of touching `pods` directly, or this index can
+    /// diverge from `pods` — which silently mis-counts a node's capacity
+    /// (a phantom entry lets `pods_on` return a pod `usage_by_node` no
+    /// longer sees, or a missing entry hides one it still does) rather than
+    /// failing loudly.
+    by_node: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// "namespace/name" keys of pods already named as victims by a reserved-
     /// but-not-yet-evicted preemption plan — see `claim_victims`.
     reserved_victims: std::collections::HashSet<String>,
@@ -1493,6 +1504,17 @@ pub struct NodeTally {
     /// watch-maintained by `apply_csi_node_event`, mirroring upstream's
     /// CSINode lister.
     csi_node_limits: std::collections::HashMap<String, std::collections::BTreeMap<String, i64>>,
+    /// Node name -> node object, watch-maintained by `apply_node_event` —
+    /// `pick_node`/`fetch_node`/`find_preemption_plan` read this instead of a
+    /// live GET /api/v1/nodes per scheduling decision, mirroring the pod
+    /// watch's own informer-cache trade-off: a cordon/taint/capacity change
+    /// lags by one watch round-trip, exactly like a pod change does before
+    /// landing in `pods`. A `BTreeMap` (not `HashMap`) so `node_list`'s
+    /// iteration order is deterministic and, since node keys sort the same
+    /// way the store's own `ORDER BY key ASC` list scan does, matches what a
+    /// live GET would have returned — preserving `select_node_with_capacity`'s
+    /// list-order tie-break for nodes that score identically.
+    nodes: std::collections::BTreeMap<String, NodeItem>,
 }
 
 /// A PVC's fields needed to resolve its backing CSI driver — see
@@ -1504,6 +1526,40 @@ struct PvcVolumeInfo {
 }
 
 impl NodeTally {
+    /// Insert/overwrite `key`'s entry in `pods`, keeping `by_node` in lockstep.
+    /// The only path that may write into `pods`'s map slot for `key` — every
+    /// caller (`apply_event`, `assume`) must go through this rather than
+    /// calling `self.pods.insert` directly, or `by_node` silently falls out
+    /// of sync with `pods` (see `by_node`'s doc comment for the fallout).
+    ///
+    /// A real Pod's `spec.nodeName` never changes once set, so the
+    /// old-node/new-node mismatch branch below should never fire in
+    /// practice — handled anyway so the index cannot corrupt itself even if
+    /// that assumption is ever wrong.
+    fn insert_pod(&mut self, key: String, pod: TalliedPod) {
+        let node_name = pod.node_name.clone();
+        if let Some(old) = self.pods.insert(key.clone(), pod) {
+            if old.node_name != node_name {
+                if let Some(set) = self.by_node.get_mut(&old.node_name) {
+                    set.remove(&key);
+                }
+            }
+        }
+        self.by_node.entry(node_name).or_default().insert(key);
+    }
+
+    /// Remove `key`'s entry from `pods`, keeping `by_node` in lockstep — the
+    /// only path that may remove from `pods`'s map slot for `key` (see
+    /// `insert_pod`'s doc comment for why direct `self.pods.remove` calls
+    /// elsewhere are forbidden).
+    fn remove_pod(&mut self, key: &str) -> Option<TalliedPod> {
+        let removed = self.pods.remove(key)?;
+        if let Some(set) = self.by_node.get_mut(&removed.node_name) {
+            set.remove(key);
+        }
+        Some(removed)
+    }
+
     /// Update the tally from one raw pod watch event.
     ///
     /// A DELETED event, or an ADDED/MODIFIED event for a pod that is unbound
@@ -1537,7 +1593,7 @@ impl NodeTally {
         let key = format!("{namespace}/{name}");
 
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
-            self.pods.remove(&key);
+            self.remove_pod(&key);
             return self.waiters.resolve(&key);
         }
         let terminal = matches!(
@@ -1558,7 +1614,7 @@ impl NodeTally {
         let node_name = watch_event.object.spec.node_name.filter(|n| !n.is_empty());
         match node_name {
             Some(node_name) if !terminal => {
-                self.pods.insert(
+                self.insert_pod(
                     key,
                     TalliedPod {
                         node_name,
@@ -1580,7 +1636,7 @@ impl NodeTally {
                 // container(s) it was running have actually stopped, so a
                 // preemption victim that completes this way (rather than
                 // being hard-deleted first) must resolve waiters too.
-                self.pods.remove(&key);
+                self.remove_pod(&key);
                 self.waiters.resolve(&key)
             }
             None => {
@@ -1640,7 +1696,7 @@ impl NodeTally {
             .into_iter()
             .map(|n| pvc_key(namespace, &n))
             .collect();
-        self.pods.insert(
+        self.insert_pod(
             format!("{namespace}/{pod_name}"),
             TalliedPod {
                 node_name: node_name.to_owned(),
@@ -1660,7 +1716,7 @@ impl NodeTally {
     /// check that follows), or to roll back an `assume` when the bind it
     /// anticipated does not actually go through.
     pub fn remove(&mut self, namespace: &str, pod_name: &str) {
-        self.pods.remove(&format!("{namespace}/{pod_name}"));
+        self.remove_pod(&format!("{namespace}/{pod_name}"));
     }
 
     /// Drop all tallied state. Called on watch reconnect: `POD_WATCH_PATH`'s
@@ -1686,6 +1742,7 @@ impl NodeTally {
     #[must_use]
     pub fn clear(&mut self) -> Vec<String> {
         self.pods.clear();
+        self.by_node.clear();
         self.reserved_victims.clear();
         self.waiters.clear()
     }
@@ -1828,7 +1885,10 @@ impl NodeTally {
     /// a single upfront `usage_by_node` snapshot.
     pub fn csi_attached_counts(&self, node_name: &str) -> std::collections::BTreeMap<String, i64> {
         let mut counts = std::collections::BTreeMap::new();
-        for pod in self.pods.values().filter(|p| p.node_name == node_name) {
+        let Some(keys) = self.by_node.get(node_name) else {
+            return counts;
+        };
+        for pod in keys.iter().filter_map(|key| self.pods.get(key)) {
             for (driver, count) in self.count_csi_volumes(&pod.namespace, &pod.bare_pvc_names) {
                 *counts.entry(driver).or_insert(0) += count;
             }
@@ -1987,6 +2047,44 @@ impl NodeTally {
         self.csi_node_limits.clear();
     }
 
+    /// Update the node cache from one raw Node watch event — see `nodes`'s
+    /// doc comment.
+    pub fn apply_node_event(&mut self, event: &Value) {
+        let Ok(watch_event) = WatchEvent::<NodeItem>::deserialize(event) else {
+            return;
+        };
+        let name = watch_event.object.metadata.name.clone();
+        if name.is_empty() {
+            return;
+        }
+        if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+            self.nodes.remove(&name);
+            return;
+        }
+        self.nodes.insert(name, watch_event.object);
+    }
+
+    /// Drop the node cache — see `clear_pvc_cache`'s doc comment.
+    pub fn clear_node_cache(&mut self) {
+        self.nodes.clear();
+    }
+
+    /// One cached node by name — `fetch_node`'s direct O(1) lookup in place
+    /// of fetching every node just to find one by name.
+    pub fn node(&self, node_name: &str) -> Option<NodeItem> {
+        self.nodes.get(node_name).cloned()
+    }
+
+    /// Every cached node, as the same typed `NodeList` projection
+    /// `pick_node`/`find_preemption_plan` used to GET fresh per decision —
+    /// now served from this watch-maintained cache instead. Iteration order
+    /// matches `nodes`'s doc comment: same order a live GET would return.
+    pub fn node_list(&self) -> NodeList {
+        NodeList {
+            items: self.nodes.values().cloned().collect(),
+        }
+    }
+
     /// Every tallied pod currently on `node_name`, for preemption victim
     /// selection — in place of a live GET.
     ///
@@ -2000,14 +2098,18 @@ impl NodeTally {
     /// plan is exactly what let equal-priority preemptors independently
     /// converge on the same victim.
     pub fn pods_on(&self, node_name: &str) -> Vec<NodePod> {
-        self.pods
-            .iter()
-            .filter(|(key, p)| p.node_name == node_name && !self.reserved_victims.contains(*key))
-            .map(|(key, p)| NodePod {
-                key: key.clone(),
-                priority: p.priority,
-                requests: p.requests.clone(),
-                pvc_names: p.pvc_names.clone(),
+        let Some(keys) = self.by_node.get(node_name) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter(|key| !self.reserved_victims.contains(key.as_str()))
+            .filter_map(|key| {
+                self.pods.get(key).map(|p| NodePod {
+                    key: key.clone(),
+                    priority: p.priority,
+                    requests: p.requests.clone(),
+                    pvc_names: p.pvc_names.clone(),
+                })
             })
             .collect()
     }
@@ -3223,16 +3325,20 @@ pub enum PickNodeError {
 /// predicate). On success, atomically reserves `pod` on
 /// the chosen node in `tally` (see `NodeTally::assume`) before returning it.
 ///
-/// Fetches the node list from the API server; per-node usage comes from
-/// `tally` (see `NodeTally`) — an in-memory tally the scheduler's own pod
-/// watch keeps current, not a live GET. A prior version issued a GET
-/// /api/v1/pods?fieldSelector=spec.nodeName%3D<node> per qualifying candidate
-/// node on every scheduling decision; besides being O(qualifying nodes) per
-/// decision, that GET could read a just-committed bind's resource request as
-/// stale (a read-after-write race under concurrent scheduling load), letting
-/// a pod be bound onto a node that was actually already full. `tally` cannot
-/// observe that race: the scheduler updates it synchronously the moment it
-/// decides to bind, before the bind's HTTP call even completes.
+/// Reads the node list from `tally`'s watch-maintained node cache (see
+/// `NodeTally::node_list`) rather than a live GET — mirroring how per-node
+/// usage already comes from `tally` instead of a live GET fan-out. A prior
+/// version issued a GET /api/v1/pods?fieldSelector=spec.nodeName%3D<node> per
+/// qualifying candidate node on every scheduling decision; besides being
+/// O(qualifying nodes) per decision, that GET could read a just-committed
+/// bind's resource request as stale (a read-after-write race under
+/// concurrent scheduling load), letting a pod be bound onto a node that was
+/// actually already full. `tally` cannot observe that race: the scheduler
+/// updates it synchronously the moment it decides to bind, before the bind's
+/// HTTP call even completes. The node cache accepts the same staleness
+/// trade-off the pod tally already does — a cordon/taint/capacity change
+/// lags by one watch round-trip — since nothing here ever writes a node
+/// object, so there is no analogous read-after-write race to close for it.
 ///
 /// The reservation happens under the SAME lock acquisition as the fit check,
 /// not in a later, separate lock taken by the caller: two pods racing for the
@@ -3245,55 +3351,34 @@ pub enum PickNodeError {
 /// acquisitions (as a prior version did, calling `NodeTally::assume`
 /// separately after `pick_node` returned) reopens exactly the read-after-write
 /// race this tally exists to close, just between two scheduling decisions
-/// instead of between a GET and a bind.
+/// instead of between a GET and a bind. Reading the node list itself is a
+/// separate, earlier lock acquisition (see `NodeTally::node_list`'s doc
+/// comment) — safe, because nothing about node identity/spec/labels is part
+/// of that race.
 ///
 /// A node at or above its `status.allocatable.pods` limit, or that cannot fit
 /// `pod.requests` alongside what's already tallied, is skipped. Returns
 /// `Err(PickNodeError::NoCapacity)` when no suitable node exists so the
 /// caller can skip binding and leave the pod Pending (without
 /// this check, pods are bound to full nodes and the kubelet fails them
-/// OutOfpods/OutOfcpu/OutOfephemeral-storage). Returns
-/// `Err(PickNodeError::ApiError(_))` when the GET or its response body is
-/// itself unusable — see `PickNodeError` for why the caller must not treat
-/// that the same as `NoCapacity`.
-pub async fn pick_node(
-    connector: &TlsConnector,
-    server: &str,
+/// OutOfpods/OutOfcpu/OutOfephemeral-storage).
+pub fn pick_node(
     pod: &PendingPod,
     tally: &std::sync::Mutex<NodeTally>,
 ) -> Result<String, PickNodeError> {
-    let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
-    if !status.is_success() {
-        return Err(PickNodeError::ApiError(anyhow::anyhow!(
-            "GET /api/v1/nodes returned {status}: {body}"
-        )));
-    }
-    let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
+    let list = tally.lock().expect("tally lock poisoned").node_list();
     select_and_reserve_node(list, pod, tally)
 }
 
-/// Fetch a single node by name, for `main.rs`'s `attempt_deferred_bind` to
-/// re-verify fit against right before a deferred preemption bind. Fetches
-/// the full list (like `pick_node`/`find_preemption_plan` do) rather than
-/// assuming a single-resource GET path exists, so this makes no new
-/// assumption about the API surface beyond what the rest of the scheduler
-/// already relies on. `Ok(None)` means the node no longer exists (e.g.
-/// removed from the cluster while a bind was deferred) — the caller must
-/// treat that as "cannot bind here any more", not as an error.
-pub async fn fetch_node(
-    connector: &TlsConnector,
-    server: &str,
-    node_name: &str,
-) -> anyhow::Result<Option<NodeItem>> {
-    let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
-    if !status.is_success() {
-        bail!("GET /api/v1/nodes returned {status}: {body}");
-    }
-    let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
-    Ok(list
-        .items
-        .into_iter()
-        .find(|n| n.metadata.name == node_name))
+/// Look up a single node by name, for `main.rs`'s `attempt_deferred_bind` to
+/// re-verify fit against right before a deferred preemption bind. Reads
+/// `tally`'s node cache directly by key (`NodeTally::node`) rather than
+/// fetching every node just to find one by name. `None` means the node is
+/// not (or no longer) in the cache — e.g. removed from the cluster while a
+/// bind was deferred, or not yet observed by the node watch — the caller
+/// must treat that as "cannot bind here any more".
+pub fn fetch_node(tally: &std::sync::Mutex<NodeTally>, node_name: &str) -> Option<NodeItem> {
+    tally.lock().expect("tally lock poisoned").node(node_name)
 }
 
 /// The synchronous fit-check-and-reserve step behind `pick_node`, split out
@@ -3438,26 +3523,17 @@ pub fn should_retry_after_preemption_plan_error(err: &FindPreemptionPlanError) -
 }
 
 /// Among nodes where preemption would work, the node requiring the FEWEST
-/// victims is chosen (cheapest disruption); ties keep the API server's node-list
-/// order. Returns `Err(FindPreemptionPlanError::NoViablePlan)` when no
-/// candidate node — even after preempting every eligible lower-priority pod
-/// on it — could fit the pending pod. Returns
-/// `Err(FindPreemptionPlanError::ApiError(_))` when the GET or its response
-/// body is itself unusable — see `FindPreemptionPlanError` for why the
-/// caller must not treat that the same as `NoViablePlan`.
-pub async fn find_preemption_plan(
-    connector: &TlsConnector,
-    server: &str,
+/// victims is chosen (cheapest disruption); ties keep `tally`'s node-list
+/// order (see `NodeTally::node_list`'s doc comment for why that matches what
+/// a live GET would have returned). Returns
+/// `Err(FindPreemptionPlanError::NoViablePlan)` when no candidate node — even
+/// after preempting every eligible lower-priority pod on it — could fit the
+/// pending pod.
+pub fn find_preemption_plan(
     pod: &PendingPod,
     tally: &std::sync::Mutex<NodeTally>,
 ) -> Result<PreemptionPlan, FindPreemptionPlanError> {
-    let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
-    if !status.is_success() {
-        return Err(FindPreemptionPlanError::ApiError(anyhow::anyhow!(
-            "GET /api/v1/nodes returned {status}: {body}"
-        )));
-    }
-    let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
+    let list = tally.lock().expect("tally lock poisoned").node_list();
     let node_labels_by_name: std::collections::HashMap<
         String,
         std::collections::HashMap<String, String>,
@@ -8733,6 +8809,125 @@ mod tests {
         );
     }
 
+    /// Every key tallied under a node in `by_node` must resolve in `pods` to
+    /// that SAME node, and vice versa — used by
+    /// `node_tally_by_node_index_never_diverges_from_the_pods_map` after
+    /// every mutation, since a divergence here does not panic anywhere else:
+    /// it silently mis-counts one node's capacity instead.
+    fn assert_by_node_index_matches_pods(tally: &NodeTally) {
+        for (key, pod) in &tally.pods {
+            assert!(
+                tally
+                    .by_node
+                    .get(&pod.node_name)
+                    .is_some_and(|set| set.contains(key)),
+                "pods[{key}] is tallied on node {} but by_node has no matching \
+                 entry — pods_on/csi_attached_counts would silently miss this \
+                 pod and undercount that node's real occupancy",
+                pod.node_name
+            );
+        }
+        for (node_name, keys) in &tally.by_node {
+            for key in keys {
+                assert!(
+                    tally
+                        .pods
+                        .get(key)
+                        .is_some_and(|p| &p.node_name == node_name),
+                    "by_node[{node_name}] lists {key} but pods disagrees — \
+                     pods_on/csi_attached_counts would return a phantom pod \
+                     that isn't really occupying a slot on that node any more"
+                );
+            }
+        }
+    }
+
+    /// The `by_node` secondary index (added so `pods_on`/`csi_attached_counts`
+    /// need not scan every tallied pod cluster-wide) must never disagree with
+    /// the primary `pods` map, across every mutation path: `apply_event`'s
+    /// ADDED/MODIFIED/DELETED/terminal-phase branches, `assume`, `remove`,
+    /// and `clear`. A stale index here does not fail loudly — it silently
+    /// mis-counts a node's capacity (a phantom `by_node` entry offers up a
+    /// pod that `usage_by_node` no longer counts; a missing one hides a pod
+    /// `usage_by_node` still does), which is exactly the shape of bug that
+    /// lets the scheduler bind a pod onto a node with no real room left, or
+    /// wrongly reject one that would actually fit.
+    #[test]
+    fn node_tally_by_node_index_never_diverges_from_the_pods_map() {
+        let mut tally = NodeTally::default();
+
+        tally.apply_event(&bound_pod_added_event("a", "worker-0", "Running", "1"));
+        assert_by_node_index_matches_pods(&tally);
+
+        tally.apply_event(&bound_pod_added_event("b", "worker-1", "Running", "1"));
+        assert_by_node_index_matches_pods(&tally);
+
+        tally.assume(
+            "default",
+            "c",
+            "worker-0",
+            0,
+            requests(500, 0, 0),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+        );
+        assert_by_node_index_matches_pods(&tally);
+
+        // MODIFIED overwrite of an existing entry on the SAME node.
+        tally.apply_event(&bound_pod_added_event("a", "worker-0", "Pending", "1"));
+        assert_by_node_index_matches_pods(&tally);
+
+        // A real Pod's spec.nodeName never changes once bound, but the index
+        // must not corrupt itself even if it ever did — same key, new node.
+        tally.apply_event(&bound_pod_added_event("a", "worker-2", "Running", "1"));
+        assert_by_node_index_matches_pods(&tally);
+        assert!(
+            tally
+                .pods_on("worker-0")
+                .iter()
+                .all(|p| p.key != "default/a"),
+            "a's index entry must move with it — leaving its key behind under \
+             the OLD node would make pods_on(\"worker-0\") offer up a phantom \
+             preemption victim that isn't actually there any more"
+        );
+
+        // remove() rollback of an assume.
+        tally.remove("default", "c");
+        assert_by_node_index_matches_pods(&tally);
+
+        // DELETED watch event.
+        tally.apply_event(&json!({
+            "type": "DELETED",
+            "object": { "metadata": { "name": "b", "namespace": "default" } }
+        }));
+        assert_by_node_index_matches_pods(&tally);
+
+        // Terminal-phase MODIFIED event frees the slot the same way DELETED does.
+        tally.apply_event(&bound_pod_added_event("a", "worker-2", "Succeeded", "1"));
+        assert_by_node_index_matches_pods(&tally);
+
+        // clear() must wipe both maps together, or a stale by_node entry
+        // would outlive a watch reconnect and the pod it once pointed at.
+        tally.assume(
+            "default",
+            "d",
+            "worker-3",
+            0,
+            requests(500, 0, 0),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+        );
+        let _ = tally.clear();
+        assert_by_node_index_matches_pods(&tally);
+        assert!(
+            tally.pods_on("worker-3").is_empty(),
+            "clear() must drop by_node along with pods — otherwise a node's \
+             index entry outlives every pod it once tracked"
+        );
+    }
+
     /// A DELETED watch event must remove the pod from the tally — this is how
     /// a preemption victim's eviction becomes visible cluster-wide (not just
     /// via main.rs's own immediate `remove` call), and how any other actor's
@@ -9990,6 +10185,60 @@ mod tests {
             pending.priority, 0,
             "a pod with no priority set must default to 0, not be treated as \
              missing/unschedulable"
+        );
+    }
+
+    /// The node cache `pick_node`/`find_preemption_plan`/`fetch_node` read in
+    /// place of a live GET /api/v1/nodes must track ADDED/MODIFIED/DELETED
+    /// events and `clear` the same way the pod tally already does — a
+    /// phantom or missing node here would let the scheduler bind onto a node
+    /// that no longer exists, or never even consider one that does.
+    #[test]
+    fn node_tally_node_cache_tracks_added_modified_deleted_and_clear() {
+        let mut tally = NodeTally::default();
+        tally.apply_node_event(&json!({
+            "type": "ADDED",
+            "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "2"}}}
+        }));
+        assert_eq!(
+            tally.node("worker-0").map(|n| n.status.allocatable.cpu),
+            Some("2".to_owned()),
+            "an ADDED node event must be visible via node()/node_list() — this is what \
+             pick_node/find_preemption_plan/fetch_node read in place of a live GET"
+        );
+
+        tally.apply_node_event(&json!({
+            "type": "MODIFIED",
+            "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "4"}}}
+        }));
+        assert_eq!(
+            tally.node("worker-0").map(|n| n.status.allocatable.cpu),
+            Some("4".to_owned()),
+            "a MODIFIED event (e.g. a capacity change) must overwrite the cached node, \
+             not stack a second entry — a stale cpu figure here would mis-schedule pods \
+             against capacity the node no longer has (or now has)"
+        );
+
+        tally.apply_node_event(&json!({
+            "type": "DELETED",
+            "object": {"metadata": {"name": "worker-0"}}
+        }));
+        assert!(
+            tally.node("worker-0").is_none(),
+            "a DELETED node event must remove it from the cache — otherwise pick_node \
+             could still bind a pod onto a node that no longer exists in the cluster"
+        );
+
+        tally.apply_node_event(&json!({
+            "type": "ADDED",
+            "object": {"metadata": {"name": "worker-1"}, "status": {}}
+        }));
+        tally.clear_node_cache();
+        assert!(
+            tally.node_list().items.is_empty(),
+            "clear_node_cache must drop every cached node, the same way a pod watch \
+             reconnect clears the pod tally — otherwise a node removed while this watch \
+             was disconnected could survive here as a phantom entry forever"
         );
     }
 
