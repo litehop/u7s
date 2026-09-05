@@ -494,6 +494,7 @@ impl SqliteStore {
             &self.shards,
             &self.reclaimed_horizons,
             &shard,
+            ns,
             &self.compaction_horizon,
             now_secs,
             event,
@@ -775,11 +776,13 @@ fn push_into_shard(
 /// Deployment/ReplicaSet write on the same prefix with a higher revision raced ahead of it
 /// into the broadcast channel. Calling this while still holding the write lock makes
 /// broadcast order match revision-assignment order for every writer, closing the race.
+#[allow(clippy::too_many_arguments)]
 fn push_event_locked(
     tx: &broadcast::Sender<Arc<InternalEvent>>,
     shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
     reclaimed_horizons: &Arc<RwLock<ReclaimedHorizons>>,
     shard_key: &str,
+    ns: Option<&str>,
     compaction_horizon: &AtomicU64,
     now_secs: u32,
     event: Arc<InternalEvent>,
@@ -800,7 +803,7 @@ fn push_event_locked(
     // otherwise find nothing, and the delete would silently vanish. So a delete with no matching
     // shard creates one (idle-GC'd exactly like any other if nobody ever attaches a watcher —
     // see `get_or_create_shard`'s doc) instead of being dropped.
-    let matched = matching_shards(&shards.read().expect("shards poisoned"), &event.key);
+    let matched = matching_shards(&shards.read().expect("shards poisoned"), shard_key, ns);
 
     // `now_secs` is seconds since the store's epoch, taken by the caller (see `SqliteStore::epoch`)
     // rather than read here, for two reasons: it is used for BOTH this event's push stamp and the
@@ -932,25 +935,42 @@ pub(crate) fn tear_down_shard(
     removed
 }
 
-/// Every existing shard relevant to a write at `key` — i.e. every shard whose own key is a
-/// string-prefix of `key`, paired with that key (for per-shard metric labeling). Plural (unlike
-/// `find_shard`'s single best match) because a watch can create a shard keyed to ITS OWN prefix
-/// (see `SqliteStore::watch`), and a namespace-scoped watch's prefix (e.g.
+/// Every existing shard relevant to a write whose own resource-type root is `root` (as returned
+/// by `shard_key`) and whose object lives in namespace `ns` (`None` for cluster-scoped), paired
+/// with each shard's own key (for per-shard metric labeling). Plural (unlike `find_shard`'s
+/// single best match) because a watch can create a shard keyed to ITS OWN prefix (see
+/// `SqliteStore::watch`), and a namespace-scoped watch's prefix (e.g.
 /// `/registry/configmaps/default/`) is NOT derivable from a cluster-scoped or all-namespaces
 /// watch's shard root (e.g. `/registry/configmaps/`) or vice versa — both can exist
 /// simultaneously for the same resource type, and a single write can be relevant to both.
 /// Fanning out to every match (instead of picking one, as `find_shard` does for a watch
 /// resolving ITS OWN already-known shard) is what keeps every open watch's ring accurate
 /// regardless of how many different-granularity shards currently exist for its resource type.
+///
+/// Checks at most two exact keys — `root` itself, and (when `ns` is `Some`) `root` plus that one
+/// namespace segment — rather than scanning every live shard with a `starts_with` check. This
+/// relies on the same invariant `find_shard`/`find_shard_key` already document and depend on: a
+/// watch's own prefix, and therefore every key that can ever live in `shards`, is always EXACTLY
+/// one of those two shapes for a given resource type (see `group_list_prefix` in the apiserver
+/// crate, which is the only place a watch prefix is ever built), so no other shard key could ever
+/// be a prefix of this write's key. Two `HashMap::get` calls replace what used to be an
+/// O(shard-count) `.iter().filter(starts_with)` scan run on every single write.
 fn matching_shards(
     shards: &HashMap<String, Arc<RingShard>>,
-    key: &str,
+    root: &str,
+    ns: Option<&str>,
 ) -> Vec<(String, Arc<RingShard>)> {
-    shards
-        .iter()
-        .filter(|(shard, _)| key.starts_with(shard.as_str()))
-        .map(|(shard, ring)| (shard.clone(), Arc::clone(ring)))
-        .collect()
+    let mut matched = Vec::new();
+    if let Some(shard) = shards.get(root) {
+        matched.push((root.to_string(), Arc::clone(shard)));
+    }
+    if let Some(ns) = ns {
+        let ns_key = format!("{root}{ns}/");
+        if let Some(shard) = shards.get(&ns_key) {
+            matched.push((ns_key, Arc::clone(shard)));
+        }
+    }
+    matched
 }
 
 /// Derive the resource-type root prefix a write's ring/deletion_log entry belongs to (e.g.
@@ -1864,6 +1884,7 @@ impl Store for SqliteStore {
                     &shards,
                     &reclaimed_horizons,
                     &shard,
+                    ns.as_deref(),
                     &compaction_horizon,
                     epoch.elapsed().as_secs() as u32,
                     Arc::new(InternalEvent {
@@ -1926,6 +1947,7 @@ impl Store for SqliteStore {
                 &shards,
                 &reclaimed_horizons,
                 &shard,
+                ns.as_deref(),
                 &compaction_horizon,
                 epoch.elapsed().as_secs() as u32,
                 Arc::new(InternalEvent {
@@ -1967,6 +1989,7 @@ impl Store for SqliteStore {
                 &shards,
                 &reclaimed_horizons,
                 &shard,
+                ns.as_deref(),
                 &compaction_horizon,
                 epoch.elapsed().as_secs() as u32,
                 Arc::new(InternalEvent {
@@ -2041,6 +2064,7 @@ impl Store for SqliteStore {
                     &shards,
                     &reclaimed_horizons,
                     &shard,
+                    Some(&ns),
                     &compaction_horizon,
                     epoch.elapsed().as_secs() as u32,
                     Arc::new(InternalEvent {
@@ -3095,6 +3119,142 @@ mod tests {
              pushed into it (RING_CAPACITY is {RING_CAPACITY}); eager pre-allocation like this \
              commits dirty memory for every shard a conformance run creates, most of which \
              never come close to filling it"
+        );
+    }
+
+    /// A write must reach exactly the shards whose prefix matches it — never a shard for a
+    /// different namespace, and never a shard for a different resource type entirely.
+    ///
+    /// Why it matters: a mis-routed write means a watcher on the shard it should have reached
+    /// silently misses the event (it never appears in that shard's ring, so a reconnecting watch
+    /// never replays it), while a shard it should NOT have reached spuriously grows with events no
+    /// watch on it will ever need. Both failure modes are silent — no error, just a watcher that
+    /// never sees an update it was owed.
+    #[test]
+    fn matching_shards_write_reaches_every_prefix_match_and_nothing_else() {
+        let mut shards: HashMap<String, Arc<RingShard>> = HashMap::new();
+        shards.insert("/registry/pods/".into(), Arc::new(RingShard::new()));
+        shards.insert("/registry/pods/default/".into(), Arc::new(RingShard::new()));
+        // A different namespace's shard — must never match a "default" write.
+        shards.insert(
+            "/registry/pods/kube-system/".into(),
+            Arc::new(RingShard::new()),
+        );
+        // A different resource type's shard — must never match a pods write.
+        shards.insert("/registry/configmaps/".into(), Arc::new(RingShard::new()));
+
+        let root = shard_key("/registry/pods/default/pod-a", Some("default"));
+        let matched = matching_shards(&shards, &root, Some("default"));
+
+        let mut matched_keys: Vec<&str> = matched.iter().map(|(k, _)| k.as_str()).collect();
+        matched_keys.sort_unstable();
+        assert_eq!(
+            matched_keys,
+            ["/registry/pods/", "/registry/pods/default/"],
+            "a write to /registry/pods/default/pod-a must reach exactly the all-namespaces pods \
+             shard and its own namespace's pods shard — routing it to the kube-system namespace \
+             shard (wrong namespace) or the configmaps shard (wrong resource type), or dropping \
+             the default shard match entirely, means some watcher silently misses the event"
+        );
+    }
+
+    /// `matching_shards` must track the live shard set as watches open and close, not a snapshot
+    /// taken once: a write after a new namespace-scoped watch opens must reach that watch's shard
+    /// too, and a write after that shard is torn down (idle-GC) must stop reaching it.
+    ///
+    /// Why it matters: a mis-routed write here means either a newly-opened watch's ring never
+    /// sees writes that happened after it opened (its owner silently stalls waiting for an event
+    /// that already occurred), or a torn-down shard's Arc is kept alive and fed events forever,
+    /// silently reintroducing the memory idle-GC was supposed to reclaim.
+    #[test]
+    fn matching_shards_reflects_shard_added_then_removed_between_writes() {
+        let mut shards: HashMap<String, Arc<RingShard>> = HashMap::new();
+        shards.insert("/registry/pods/".into(), Arc::new(RingShard::new()));
+        let root = "/registry/pods/";
+
+        // Before any namespace-scoped watch exists, only the root shard matches.
+        let before: Vec<String> = matching_shards(&shards, root, Some("default"))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            before,
+            ["/registry/pods/"],
+            "with no namespace-scoped shard yet, a write must match only the root shard"
+        );
+
+        // A namespace-scoped watch on "default" opens, creating its own shard.
+        shards.insert("/registry/pods/default/".into(), Arc::new(RingShard::new()));
+        let mut during: Vec<String> = matching_shards(&shards, root, Some("default"))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        during.sort();
+        assert_eq!(
+            during,
+            ["/registry/pods/", "/registry/pods/default/"],
+            "a write after the namespace-scoped watch opens must reach BOTH shards, not just the \
+             one that existed before it — otherwise the new watch's ring never sees writes that \
+             happened after it opened"
+        );
+
+        // The namespace-scoped shard is torn down (idle-GC or CRD delete).
+        shards.remove("/registry/pods/default/");
+        let after: Vec<String> = matching_shards(&shards, root, Some("default"))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            after,
+            ["/registry/pods/"],
+            "once the namespace-scoped shard is torn down, a later write must stop routing to it \
+             — continuing to route to a removed shard would resurrect a stale Arc no live watch \
+             can see, silently undoing the memory idle-GC was supposed to reclaim"
+        );
+    }
+
+    /// `matching_shards` must stay fast regardless of how many unrelated shards exist store-wide
+    /// — a real conformance run holds dozens of shards, one per resource type ever watched.
+    ///
+    /// Why it matters: this is a regression test for the O(shard-count) `.iter().filter(starts_with)`
+    /// scan `matching_shards` used to run on every write. That scan's cost multiplies with both
+    /// write rate and shard count — a linear cost applied to every single put/delete in the store.
+    /// This asserts on wall-clock time rather than shard content because the whole point of the
+    /// fix is CPU cost, not a different answer: a reverted linear scan returns the same matches,
+    /// just after doing orders of magnitude more work to find them. Margins are generous (a
+    /// two-`HashMap::get` lookup should take low single-digit milliseconds total) so this does not
+    /// flake on a loaded CI runner, while still being far tighter than what a scan over tens of
+    /// thousands of shards, run thousands of times, could ever complete within.
+    #[test]
+    fn matching_shards_stays_fast_with_many_unrelated_shards() {
+        const DECOY_SHARDS: usize = 20_000;
+        const WRITES: usize = 5_000;
+
+        let mut shards: HashMap<String, Arc<RingShard>> = HashMap::new();
+        for i in 0..DECOY_SHARDS {
+            shards.insert(format!("/registry/decoy-{i}/"), Arc::new(RingShard::new()));
+        }
+        shards.insert("/registry/pods/".into(), Arc::new(RingShard::new()));
+        shards.insert("/registry/pods/default/".into(), Arc::new(RingShard::new()));
+
+        let root = "/registry/pods/";
+        let started = std::time::Instant::now();
+        for _ in 0..WRITES {
+            let matched = matching_shards(&shards, root, Some("default"));
+            assert_eq!(
+                matched.len(),
+                2,
+                "sanity: must still find both real matches"
+            );
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "{WRITES} matching_shards calls against {DECOY_SHARDS} unrelated shards took \
+             {elapsed:?}; an O(1) prefix lookup should complete this in low single-digit \
+             milliseconds — this budget is only reachable by a linear starts_with scan if that \
+             O(shard-count) cost has been reintroduced"
         );
     }
 
