@@ -60,6 +60,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "namespaces") = (group, plural) {
         default_namespace(obj);
     }
+    if let ("", "limitranges") = (group, plural) {
+        default_limitrange(obj);
+    }
     if let ("coordination.k8s.io", "leases") = (group, plural) {
         default_lease(obj);
     }
@@ -367,6 +370,84 @@ fn default_namespace(obj: &mut serde_json::Value) {
         status.phase = Some(crate::types::NamespacePhase::Active);
     }
     obj["status"] = serde_json::to_value(&status).expect("NamespaceStatus is always serializable");
+}
+
+/// Chain `default`/`defaultRequest` from `max`/`min` on each Container-type
+/// `spec.limits[]` item, mirroring upstream `SetDefaults_LimitRangeItem`
+/// (pkg/apis/core/v1/defaults.go):
+///   1. default[key]        <- max[key]        when default[key] is unset
+///   2. defaultRequest[key] <- default[key]    when defaultRequest[key] is unset (post step 1)
+///   3. defaultRequest[key] <- min[key]        when defaultRequest[key] is still unset
+///
+/// Without this, a LimitRange that only sets `max.cpu` (a common minimal-governance
+/// pattern) injects nothing into pods that omit resources — silently defeating the
+/// operator's intent to cap and default CPU usage in the namespace. Only "Container"
+/// type items are touched; Pod/PersistentVolumeClaim items have no default/defaultRequest
+/// fields upstream.
+///
+/// Quantity values are copied verbatim (not re-parsed) so the persisted object matches
+/// upstream's `DeepCopy` semantics exactly, byte-for-byte.
+fn default_limitrange(obj: &mut serde_json::Value) {
+    let Some(items) = obj["spec"]["limits"].as_array_mut() else {
+        return;
+    };
+    for item in items {
+        let Some(item_obj) = item.as_object_mut() else {
+            continue;
+        };
+        if item_obj.get("type").and_then(|v| v.as_str()) != Some("Container") {
+            continue;
+        }
+
+        let max = item_obj
+            .get("max")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let default_map = item_obj
+            .entry("default")
+            .or_insert_with(|| serde_json::json!({}));
+        if !default_map.is_object() {
+            *default_map = serde_json::json!({});
+        }
+        let default_obj = default_map.as_object_mut().expect("just ensured object");
+        for (key, value) in &max {
+            default_obj
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        let default_snapshot = default_obj.clone();
+
+        let default_request_map = item_obj
+            .entry("defaultRequest")
+            .or_insert_with(|| serde_json::json!({}));
+        if !default_request_map.is_object() {
+            *default_request_map = serde_json::json!({});
+        }
+        let default_request_obj = default_request_map
+            .as_object_mut()
+            .expect("just ensured object");
+        for (key, value) in &default_snapshot {
+            default_request_obj
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+
+        let min = item_obj
+            .get("min")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let default_request_obj = item_obj
+            .get_mut("defaultRequest")
+            .and_then(|v| v.as_object_mut())
+            .expect("defaultRequest ensured object above");
+        for (key, value) in &min {
+            default_request_obj
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
 }
 
 /// Default `spec.selector` and `spec.replicas` on a ReplicationController when absent.
@@ -5283,6 +5364,110 @@ mod tests {
             "caller-set stabilizationWindowSeconds must not be overwritten on a repeat \
              apply_defaults call (e.g. a subsequent update) — that would silently reset a \
              user's explicit scale-up stabilization window back to 0"
+        );
+    }
+
+    /// A LimitRange item that sets only `max.cpu` is a common minimal-governance pattern
+    /// (cap CPU without also restating a default). Upstream chains `default <- max` and
+    /// then `defaultRequest <- default`, so both a limit and a request get injected into
+    /// pods that omit resources. Without this chain, u7s injects nothing and silently
+    /// defeats the operator's governance intent.
+    #[test]
+    fn limitrange_only_max_chains_default_and_default_request() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "LimitRange",
+            "metadata": { "name": "cpu-cap", "namespace": "default" },
+            "spec": { "limits": [{ "type": "Container", "max": { "cpu": "1" } }] }
+        });
+
+        apply_defaults("", "limitranges", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["limits"][0]["default"]["cpu"],
+            serde_json::json!("1"),
+            "default.cpu must be backfilled from max.cpu when default is unset"
+        );
+        assert_eq!(
+            obj["spec"]["limits"][0]["defaultRequest"]["cpu"],
+            serde_json::json!("1"),
+            "defaultRequest.cpu must chain from the just-filled default.cpu"
+        );
+    }
+
+    /// A LimitRange item that sets only `min.memory` must backfill `defaultRequest.memory`
+    /// from `min` (request only — there is no `max` to derive a limit from). Confirms the
+    /// third step of the chain runs independently of the first two.
+    #[test]
+    fn limitrange_only_min_backfills_default_request_not_limit() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "LimitRange",
+            "metadata": { "name": "mem-floor", "namespace": "default" },
+            "spec": { "limits": [{ "type": "Container", "min": { "memory": "64Mi" } }] }
+        });
+
+        apply_defaults("", "limitranges", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["limits"][0]["defaultRequest"]["memory"],
+            serde_json::json!("64Mi"),
+            "defaultRequest.memory must be backfilled from min.memory when no default/max exists"
+        );
+        assert!(
+            obj["spec"]["limits"][0]["default"]
+                .as_object()
+                .is_some_and(|m| !m.contains_key("memory")),
+            "default.memory must NOT be set — min only floors requests, it never implies a limit"
+        );
+    }
+
+    /// Explicit `default`/`defaultRequest` values must never be overwritten by the max/min
+    /// chain — an operator who states both an explicit default and a max expects the
+    /// explicit default to win, matching upstream's `if _, exists := ...; !exists` guard.
+    #[test]
+    fn limitrange_explicit_default_not_overwritten_by_max() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "LimitRange",
+            "metadata": { "name": "explicit", "namespace": "default" },
+            "spec": { "limits": [{
+                "type": "Container",
+                "default": { "cpu": "200m" },
+                "max": { "cpu": "1" }
+            }] }
+        });
+
+        apply_defaults("", "limitranges", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["limits"][0]["default"]["cpu"],
+            serde_json::json!("200m"),
+            "explicit default.cpu must not be overwritten by max.cpu"
+        );
+        assert_eq!(
+            obj["spec"]["limits"][0]["defaultRequest"]["cpu"],
+            serde_json::json!("200m"),
+            "defaultRequest.cpu must chain from the explicit default (200m), not from max (1)"
+        );
+    }
+
+    /// Non-Container item types (e.g. Pod, PersistentVolumeClaim) have no
+    /// default/defaultRequest fields upstream — the chain must only touch Container items.
+    #[test]
+    fn limitrange_pod_type_item_untouched() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "LimitRange",
+            "metadata": { "name": "pod-max", "namespace": "default" },
+            "spec": { "limits": [{ "type": "Pod", "max": { "cpu": "2" } }] }
+        });
+
+        apply_defaults("", "limitranges", &mut obj);
+
+        assert!(
+            obj["spec"]["limits"][0]["default"].is_null(),
+            "Pod-type LimitRange items must not gain a default field — only Container items chain"
         );
     }
 }
