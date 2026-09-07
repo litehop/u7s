@@ -1243,7 +1243,17 @@ async fn complete_finalizer_drain<S: Store>(
     // The namespace check handles the OrderedNamespaceDeletion flow: after all
     // finalizer'd objects are cleared, the Terminating namespace hard-deletes.
     if let Some(namespace) = ns {
-        quota::update_quota_status(state, namespace).await;
+        // Locked so this full-recompute write of status.used can never interleave with a
+        // concurrent record_pod_created/record_pod_removed's incremental read-modify-write of
+        // the same quota in this namespace — both do an unconditional GET-then-PUT with no CAS,
+        // so without a shared lock whichever finishes last silently discards the other's
+        // update. Scoped to just this call (not the maybe_finalize_terminating_namespace call
+        // below, which can itself re-acquire this same per-namespace lock via
+        // purge_namespace_object) to avoid deadlocking on the non-reentrant semaphore.
+        {
+            let _quota_lock = state.quota_admission_locks.lock(namespace).await;
+            quota::update_quota_status(state, namespace).await;
+        }
         super::namespaces::maybe_finalize_terminating_namespace(state, namespace).await;
     }
     Ok(())
@@ -3030,6 +3040,10 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         propagate_rs_revision_to_deployment(&state, &rs_revision_info, &ns).await;
     }
 
+    // Unlike update_quota_status's other call sites, this one needs no separate lock: the
+    // check-then-write `_quota_lock` acquired above is still held here (dropped only at this
+    // function's return), so this full-recompute write is already serialized against any
+    // concurrent record_pod_created/record_pod_removed for the same namespace.
     quota::update_quota_status(&state, &ns).await;
 
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
@@ -3908,7 +3922,15 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
         remove_job_tracking_finalizer_from_pods(&state, &ns, &owner_uid).await;
     }
 
-    quota::update_quota_status(&state, &ns).await;
+    // Locked so this full-recompute write of status.used can never interleave with a
+    // concurrent record_pod_created/record_pod_removed's incremental read-modify-write of the
+    // same quota in this namespace — see complete_finalizer_drain's identical lock for why.
+    // Scoped to just this call, not the maybe_finalize_terminating_namespace call below, to
+    // avoid deadlocking on the non-reentrant per-namespace semaphore.
+    {
+        let _quota_lock = state.quota_admission_locks.lock(&ns).await;
+        quota::update_quota_status(&state, &ns).await;
+    }
 
     // This object's finalizers were already empty at DELETE time (no complete_finalizer_drain
     // call happens for a plain DELETE — that path only fires from a PATCH/PUT that itself
@@ -9807,6 +9829,240 @@ mod tests {
             Some("0"),
             "quota status.used must be refreshed when the finalizer-drain hard-delete \
              completes, not left at its stale pre-drain value"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // A `Store` wrapper whose `get()` intercepts exactly one call — the ResourceQuota key
+    // `update_quota_status` reads inside its own recompute — to record whether the
+    // per-namespace `quota_admission_locks` semaphore is held by someone else at that exact
+    // instant. This proves complete_finalizer_drain's update_quota_status call genuinely runs
+    // under its own namespace's lock, without needing a second real task or any timing-based
+    // assertion (compare `RaceWinnerAlreadyExistsStore` above, the established pattern in this
+    // file for forcing a race deterministically instead of relying on tokio::join! timing).
+    // ---------------------------------------------------------------------------
+
+    struct QuotaLockPeekStore {
+        inner: std::sync::Arc<u7s_store::SqliteStore>,
+        quota_key: String,
+        locks: crate::state::QuotaAdmissionLocks,
+        namespace: String,
+        observed_available_permits: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
+    }
+
+    impl u7s_store::Store for QuotaLockPeekStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key_s = key.to_string();
+            let is_target = key == self.quota_key;
+            let locks = self.locks.clone();
+            let ns = self.namespace.clone();
+            let observed = self.observed_available_permits.clone();
+            async move {
+                if is_target {
+                    let mut slot = observed.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(locks.available_permits(&ns));
+                    }
+                }
+                inner.get(&key_s).await
+            }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// `complete_finalizer_drain`'s `update_quota_status` call must run while holding the same
+    /// per-namespace `quota_admission_locks` permit `record_pod_created`/`record_pod_removed`
+    /// take for their own incremental writes — both do an unconditional GET-then-PUT on the
+    /// same ResourceQuota key with no CAS, so without a shared lock whichever finishes last
+    /// silently discards the other's update. Fails on revert: if the lock wrapping around
+    /// `quota::update_quota_status` in `complete_finalizer_drain` is removed, nothing has ever
+    /// contended this namespace's lock by the time the mock observes it, so
+    /// `available_permits` reads back the "never locked" value (1) instead of "held" (0).
+    #[tokio::test]
+    async fn complete_finalizer_drain_holds_quota_lock_across_update_quota_status() {
+        use std::sync::{Arc, Mutex};
+        use u7s_store::SqliteStore;
+
+        let ns = "lock-peek-ns";
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let quota_key = crate::keys::group_object_key("", "resourcequotas", Some(ns), "rq");
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "rq", "namespace": ns },
+            "spec": { "hard": { "pods": "10" } },
+            "status": { "hard": { "pods": "10" }, "used": { "pods": "1" } }
+        });
+        inner
+            .put(
+                &quota_key,
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed ResourceQuota");
+
+        // Seeded already in the post-orphan-delete state (soft-deleted, only the `orphan`
+        // finalizer pending) so the merge-patch below that clears it routes through
+        // complete_finalizer_drain's hard-delete-plus-quota-refresh branch, exactly like
+        // orphan_finalizer_drain_completion_hard_deletes_owner_and_refreshes_quota above.
+        let rc_key =
+            crate::keys::group_object_key("", "replicationcontrollers", Some(ns), "peek-rc");
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": {
+                "name": "peek-rc",
+                "namespace": ns,
+                "uid": "lock-peek-uid",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["orphan"]
+            },
+            "spec": { "replicas": 0, "selector": { "app": "peek-rc" } }
+        });
+        inner
+            .put(
+                &rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed draining RC");
+
+        let locks = crate::state::QuotaAdmissionLocks::new();
+        let observed = Arc::new(Mutex::new(None));
+        let store = Arc::new(QuotaLockPeekStore {
+            inner,
+            quota_key: quota_key.clone(),
+            locks: locks.clone(),
+            namespace: ns.to_string(),
+            observed_available_permits: observed.clone(),
+        });
+        let mut state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        // AppState::new always builds a fresh QuotaAdmissionLocks internally; overwrite it with
+        // the instance QuotaLockPeekStore already holds a clone of, so both sides observe the
+        // same underlying per-namespace semaphore map.
+        state.quota_admission_locks = locks;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({ "metadata": { "finalizers": [] } });
+        patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "peek-rc".into(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("finalizer-drain patch must succeed: {e:?}"));
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(0),
+            "test precondition: the mock must actually observe update_quota_status's own \
+             get() call for the quota key (Some(_)), and the lock must be held (0 permits \
+             available) at that instant — if this reads Some(1) instead, \
+             complete_finalizer_drain's update_quota_status call is no longer holding this \
+             namespace's quota_admission_locks permit, reopening the lost-update race against \
+             a concurrent record_pod_created/record_pod_removed"
         );
     }
 

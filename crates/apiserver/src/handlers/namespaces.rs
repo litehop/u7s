@@ -977,6 +977,13 @@ async fn cascade_delete_namespace_resources<S: Store>(
                 // ServiceAccount's token until the apiserver restarts and rebuilds the graph
                 // from scratch.
                 state.node_graph.remove_pod(namespace, pod_name);
+                // Same rationale as purge_namespace_object: a pod hard-deleted here must
+                // decrement the incremental ResourceQuota counter, or status.used leaks
+                // forever for any namespace whose finalizer-free pods take this fast path.
+                // Locked so this can never interleave with a concurrent create/delete/resize's
+                // read-modify-write of the same quota's status.used in this namespace.
+                let _quota_lock = state.quota_admission_locks.lock(namespace).await;
+                crate::quota::record_pod_removed(state, namespace, &val).await;
             }
         }
     }
@@ -4697,6 +4704,95 @@ mod tests {
              skipping this leaks 1 unit of quota usage for every pod a namespace deletion \
              purges, permanently understating free capacity in any ResourceQuota that \
              survives the same sweep"
+        );
+    }
+
+    /// `cascade_delete_namespace_resources`'s finalizer-free hard-delete branch (the fast path
+    /// most namespace deletes take) hard-deletes a pod directly via `store.delete`, bypassing
+    /// `delete_pod`/`patch_pod` — so, exactly like `purge_namespace_object`'s bulk-purge branch,
+    /// it must independently call `record_pod_removed` or every pod hard-deleted this way leaks
+    /// its ResourceQuota usage forever.
+    ///
+    /// The ResourceQuota's own `metadata.namespace` is deliberately set to a decoy value
+    /// distinct from its store-key namespace segment — impossible in production, where a
+    /// namespaced object's key and `metadata.namespace` always agree — purely so
+    /// `list_namespace_objects` (the `ns` column cascade iterates over) skips it while
+    /// `record_pod_removed`'s own quota lookup (a key-prefix scan, independent of that column)
+    /// still finds it. Without this the cascade's own single pass would also visit and
+    /// hard-delete the quota object itself, making its post-cascade `status.used` unobservable
+    /// — exactly the coincidence `purge_namespace_object`'s doc comment already warns about for
+    /// the other pod hard-delete call site.
+    #[tokio::test]
+    async fn cascade_delete_namespace_resources_decrements_resource_quota_for_a_hard_deleted_pod() {
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        // status.used.pods = 1 mirrors what record_pod_created would have written when this
+        // pod was originally admitted — the incremental counter's baseline.
+        let quota_key =
+            crate::keys::group_object_key("", "resourcequotas", Some("cascade-quota-ns"), "rq");
+        let quota_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "rq", "namespace": "cascade-quota-ns-decoy" },
+            "spec": { "hard": { "pods": "5" } },
+            "status": { "used": { "pods": "1" } }
+        });
+        state
+            .store
+            .put(
+                &quota_key,
+                bytes::Bytes::from(quota_body.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("quota write must succeed");
+
+        let pod_key = crate::keys::object_key("pods", "cascade-quota-ns", "no-fin-pod");
+        let pod_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "no-fin-pod", "namespace": "cascade-quota-ns" },
+            "spec": { "containers": [{"name": "c", "image": "nginx"}] }
+        });
+        state
+            .store
+            .put(&pod_key, bytes::Bytes::from(pod_body.to_string()), Some(0))
+            .await
+            .expect("pod write must succeed");
+
+        cascade_delete_namespace_resources(&state, "cascade-quota-ns").await;
+
+        assert!(
+            state
+                .store
+                .get(&pod_key)
+                .await
+                .expect("get must not error")
+                .is_none(),
+            "test precondition: the finalizer-free pod must actually be hard-deleted by the \
+             cascade"
+        );
+
+        let stored_quota = state
+            .store
+            .get(&quota_key)
+            .await
+            .expect("get must not error")
+            .expect(
+                "test precondition: the decoy-namespace quota must not be touched by cascading \
+                 the pod's real namespace — only its own namespace's cascade could ever delete \
+                 it",
+            );
+        let v: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            v["status"]["used"]["pods"], "0",
+            "cascade-deleting a finalizer-free pod during namespace deletion must decrement \
+             status.used.pods exactly like every other pod hard-delete site — skipping this \
+             leaks 1 unit of quota usage per pod for the common namespace-delete path (no \
+             finalizers), permanently understating free capacity in any ResourceQuota left \
+             behind after a namespace drain"
         );
     }
 
