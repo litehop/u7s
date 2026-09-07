@@ -682,9 +682,12 @@ fn push_into_shard(
     // 3. Outright eviction at STRIPPED_TIER_CAP: once the WHOLE log (both tiers) exceeds
     //    this larger cap, the lowest-revision entry is evicted via by_revision's
     //    pop_first() — always a Stripped one in practice, since (2) keeps the Full tier
-    //    bounded to FULL_TIER_CAP. In the same conformance run, the busiest shard (events)
-    //    accumulated 4,557 tombstones — comfortably exercising this eviction path, not just
-    //    the downgrade path — while most shards never got close to either cap.
+    //    bounded to FULL_TIER_CAP. Over a full conformance run, the busiest shard (events)
+    //    accumulated 4,557 tombstones IN TOTAL (cumulative inserts over the whole run, not
+    //    concurrently live at any one instant) — comfortably exercising this eviction path,
+    //    not just the downgrade path — while most shards never got close to either cap. See
+    //    STRIPPED_TIER_CAP's own comment below for the peak-concurrent-live count that
+    //    actually governs the cap's sizing.
     {
         let mut guard = shard.deletion_log.write().expect("deletion_log poisoned");
         if event.value.is_none() {
@@ -726,10 +729,17 @@ fn push_into_shard(
 
             // Tier 2: evict outright once the whole log exceeds a larger cap. `by_revision`
             // keeps revision -> key sorted, so this is O(log n) via pop_first() instead of
-            // an O(n) linear scan over `by_key`. 2x (not 8x) RING_CAPACITY: a full conformance
-            // run's busiest shard peaked at 870 live tombstones, comfortably under this cap,
-            // while the old 8x bought ~875KB of pure Stripped-tier index overhead per
-            // saturated shard that no observed traffic ever needed.
+            // an O(n) linear scan over `by_key`. 2x (not 8x) RING_CAPACITY: full conformance
+            // runs measured this shard's PEAK-CONCURRENT-LIVE count (`by_key.len()` at a
+            // point in time — distinct from the 4,557 CUMULATIVE inserts noted above) at 870
+            // for pods, and up to ~1,024 for the busiest shards (events,
+            // rbac.clusterrolebindings) — so those two shards have thin headroom under this
+            // cap and can hit it under sustained load. That's not a correctness risk:
+            // exceeding the cap only evicts the lowest-revision Stripped tombstone, which
+            // forces a watcher resuming from before that revision into a safe
+            // WatchEvent::Compacted relist, never a silently missed DELETE. The old 8x bought
+            // ~875KB of pure Stripped-tier index overhead per saturated shard that no
+            // observed traffic ever needed.
             const STRIPPED_TIER_CAP: usize = 2 * RING_CAPACITY;
             if guard.by_key.len() > STRIPPED_TIER_CAP {
                 if let Some((oldest_revision, oldest_key)) = guard.by_revision.pop_first() {
@@ -4369,6 +4379,115 @@ mod tests {
         assert!(
             !guard.by_key.contains_key(&recreated_key),
             "the recreated key must never re-appear as a tombstone in deletion_log; it is live"
+        );
+    }
+
+    /// Once deletion_log's own STRIPPED_TIER_CAP is exceeded, the outright-evicted tombstone
+    /// must never cause a reconnecting watcher to silently miss that DELETE — it must instead
+    /// be forced into a `WatchEvent::Compacted` relist.
+    ///
+    /// Why it matters: this is the safety net PR 1586's cap reduction (8x -> 2x RING_CAPACITY)
+    /// relies on. STRIPPED_TIER_CAP (2x RING_CAPACITY) is always strictly larger than
+    /// RING_CAPACITY itself, so by the time Tier 3 evicts a tombstone, the shard's OWN ring
+    /// buffer (the smaller cap) has already evicted that same low-revision entry and advanced
+    /// `shard.horizon` past it — meaning any watch resuming from below it is already caught by
+    /// the connect-time `from_revision < horizon` check, before deletion_log replay is ever
+    /// consulted for completeness. If a future change decoupled deletion_log eviction from the
+    /// ring's horizon (e.g. a bigger STRIPPED_TIER_CAP than 2x, or a horizon computed some other
+    /// way), a watcher below the evicted revision could instead get a replay that just silently
+    /// omits the missing tombstone and never learns it needs to relist — reintroducing the
+    /// deadlock deletion_log exists to prevent. This test fails on that regression: it drives
+    /// deletion_log past STRIPPED_TIER_CAP, confirms the victim's tombstone really is gone from
+    /// `by_key`, then asserts a watch from below the victim's revision is forced into
+    /// `Compacted` rather than reaching end-of-stream (or timing out) without ever seeing it.
+    #[tokio::test]
+    async fn deletion_log_cap_exceeded_eviction_forces_compacted_relist_not_silent_delete_miss() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/core/ymx9m-cap-evict/";
+        const BASE: u64 = 100;
+        const STRIPPED_TIER_CAP: usize = 2 * RING_CAPACITY;
+        let victim_key = format!("{prefix}victim");
+
+        // The victim's tombstone, at the lowest revision in this shard — pop_first() on
+        // by_revision always evicts the globally lowest-revision entry, so this is what Tier 3
+        // eviction removes once the cap is exceeded below.
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: victim_key.clone(),
+                revision: BASE,
+                value: None,
+                is_create: false,
+                deleted_body: None,
+            }),
+            None,
+        );
+
+        // Push STRIPPED_TIER_CAP more deletions at higher revisions so the log exceeds its cap
+        // exactly once, evicting the victim. This also overflows the ring (RING_CAPACITY <
+        // STRIPPED_TIER_CAP), advancing shard.horizon well past the victim's own revision —
+        // the property this test exists to confirm holds.
+        for i in 0..STRIPPED_TIER_CAP {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("{prefix}obj-{i}"),
+                    revision: BASE + 1 + i as u64,
+                    value: None,
+                    is_create: false,
+                    deleted_body: None,
+                }),
+                None,
+            );
+        }
+
+        let shard = store.shard_for_test(&victim_key, None);
+        {
+            let guard = shard.deletion_log.read().expect("deletion_log poisoned");
+            assert!(
+                !guard.by_key.contains_key(&victim_key),
+                "test setup broken: the victim's tombstone must be outright-evicted by Tier 3 \
+                 (STRIPPED_TIER_CAP) for this test to exercise the path under test"
+            );
+        }
+
+        // A watcher resuming from just below the victim's (now-evicted) revision genuinely
+        // needed that DELETE. Its own deletion_log tombstone is gone, so the ONLY thing that can
+        // save this watcher from silently missing it is the ring-horizon check below firing.
+        let stream = store
+            .watch(prefix, BASE - 1)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        // Every surviving tombstone with revision > from_revision replays before Compacted (see
+        // watch()'s connect-time branch), so this drains through all of them first — none of
+        // which may be the victim's own, since it was evicted.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_compacted = false;
+        for _ in 0..=STRIPPED_TIER_CAP {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Deleted { key, .. })) => assert_ne!(
+                    key, victim_key,
+                    "the victim's tombstone was evicted from deletion_log and must never be \
+                     replayed — if it were, this test would no longer be exercising eviction"
+                ),
+                Ok(Some(WatchEvent::Compacted { .. })) => {
+                    saw_compacted = true;
+                    break;
+                }
+                Ok(Some(other)) => panic!("unexpected event before Compacted: {other:?}"),
+                Ok(None) => panic!(
+                    "stream ended without ever yielding Compacted — a watcher resuming below \
+                     the deletion_log-evicted victim's revision would silently believe it saw \
+                     complete history, missing that DELETE forever"
+                ),
+                Err(_) => panic!("timed out waiting for Compacted"),
+            }
+        }
+        assert!(
+            saw_compacted,
+            "watch must yield Compacted within STRIPPED_TIER_CAP+1 events — if it never does, \
+             the ring-horizon safety net that makes cap-exceeded deletion_log eviction safe has \
+             regressed, and a resuming watcher can silently miss a DELETE"
         );
     }
 
