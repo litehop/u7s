@@ -5292,6 +5292,36 @@ pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
         }
     }
 
+    // hostPort: when spec.hostNetwork is true, backfill each container and
+    // initContainer port's hostPort from containerPort wherever hostPort is
+    // absent or zero, mirroring upstream's unconditional defaultHostNetworkPorts
+    // (pkg/apis/core/v1/defaults.go:206-209,398-406 @ release-1.36 — containers
+    // and initContainers only; ephemeralContainers are excluded there too). The
+    // scheduler's NodePorts predicate (container_host_ports) derives a
+    // HostPortClaim only from a container port's hostPort field, never from
+    // containerPort — without this default, two hostNetwork pods that share a
+    // containerPort but leave hostPort unset both compute no host-port claim
+    // and silently co-schedule onto the same node, where one then fails to
+    // start with "address already in use".
+    if pod["spec"]["hostNetwork"].as_bool().unwrap_or(false) {
+        for containers_key in &["containers", "initContainers"] {
+            if let Some(containers) = pod["spec"][containers_key].as_array_mut() {
+                for container in containers {
+                    if let Some(ports) = container["ports"].as_array_mut() {
+                        for port in ports {
+                            let host_port_unset = port["hostPort"].as_i64().unwrap_or(0) == 0;
+                            if host_port_unset {
+                                if let Some(container_port) = port["containerPort"].as_i64() {
+                                    port["hostPort"] = serde_json::json!(container_port);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Default fieldRef.apiVersion to "v1" and port protocol to "TCP" for all containers
     // (including initContainers). Real kube-apiserver stamps both fields before storing.
     // Absent fieldRef.apiVersion causes kubelet "unsupported pod version: <empty>".
@@ -7056,6 +7086,73 @@ mod create_defaults_tests {
             pod["spec"]["ephemeralContainers"][0]["resources"]["requests"].is_null(),
             "ephemeralContainers must not get requests defaulted from limits — upstream \
              excludes them from this pass"
+        );
+    }
+
+    /// A hostNetwork pod's container and initContainer ports must have hostPort
+    /// backfilled from containerPort when hostPort is absent, mirroring upstream's
+    /// unconditional defaultHostNetworkPorts (pkg/apis/core/v1/defaults.go:206-209).
+    ///
+    /// Why this matters: the scheduler's NodePorts predicate only derives a
+    /// host-port conflict claim from a container's `hostPort` field, never from
+    /// `containerPort`. Without this default, two hostNetwork pods that both set
+    /// `containerPort: 80` and leave `hostPort` unset would each compute zero
+    /// host-port claims and silently co-schedule onto the same node, where one
+    /// then fails to start with "address already in use".
+    #[test]
+    fn host_network_pod_backfills_host_port_from_container_port() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "hostNetwork": true,
+                "initContainers": [{
+                    "name": "init",
+                    "image": "busybox",
+                    "ports": [{"containerPort": 8080}]
+                }],
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox",
+                    "ports": [{"containerPort": 80}]
+                }]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["containers"][0]["ports"][0]["hostPort"], 80,
+            "a hostNetwork container port with no explicit hostPort must be \
+             backfilled from containerPort, or the scheduler's NodePorts predicate \
+             never sees the claim and lets two such pods collide on the same node"
+        );
+        assert_eq!(
+            pod["spec"]["initContainers"][0]["ports"][0]["hostPort"], 8080,
+            "initContainers get the same hostPort<-containerPort backfill as regular \
+             containers, matching upstream's separate defaultHostNetworkPorts call \
+             over Spec.InitContainers"
+        );
+    }
+
+    /// Without hostNetwork, a container port's hostPort must stay unset — upstream
+    /// only backfills hostPort under `spec.hostNetwork == true`
+    /// (`if obj.Spec.HostNetwork { defaultHostNetworkPorts(...) }`). Applying the
+    /// default unconditionally would fabricate a host-port claim for ordinary pods
+    /// that never asked to bind a port on the node, causing spurious NodePorts
+    /// scheduling conflicts.
+    #[test]
+    fn non_host_network_pod_does_not_get_host_port_defaulted() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox",
+                    "ports": [{"containerPort": 80}]
+                }]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert!(
+            pod["spec"]["containers"][0]["ports"][0]["hostPort"].is_null(),
+            "hostPort must not be defaulted from containerPort for a non-hostNetwork \
+             pod — doing so would fabricate a host-port claim the pod never requested"
         );
     }
 
