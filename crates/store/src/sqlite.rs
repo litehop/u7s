@@ -4386,9 +4386,9 @@ mod tests {
     /// must never cause a reconnecting watcher to silently miss that DELETE — it must instead
     /// be forced into a `WatchEvent::Compacted` relist.
     ///
-    /// Why it matters: this is the safety net PR 1586's cap reduction (8x -> 2x RING_CAPACITY)
-    /// relies on. STRIPPED_TIER_CAP (2x RING_CAPACITY) is always strictly larger than
-    /// RING_CAPACITY itself, so by the time Tier 3 evicts a tombstone, the shard's OWN ring
+    /// Why it matters: this is the safety net the STRIPPED_TIER_CAP tightening from 8x to 2x
+    /// RING_CAPACITY relies on. STRIPPED_TIER_CAP (2x RING_CAPACITY) is always strictly larger
+    /// than RING_CAPACITY itself, so by the time Tier 3 evicts a tombstone, the shard's OWN ring
     /// buffer (the smaller cap) has already evicted that same low-revision entry and advanced
     /// `shard.horizon` past it — meaning any watch resuming from below it is already caught by
     /// the connect-time `from_revision < horizon` check, before deletion_log replay is ever
