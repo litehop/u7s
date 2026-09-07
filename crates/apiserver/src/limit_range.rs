@@ -884,4 +884,112 @@ mod tests {
             "LimitRange default.cpu (500m) must be injected as the limit"
         );
     }
+
+    // -- end-to-end: LimitRangeItem chaining (default/defaultRequest <- max/min) --
+    //
+    // These mirror the real request path: a LimitRange is passed through
+    // `apply_defaults` (as handlers/resource.rs does at create/update time) before
+    // being stored, so the chained default/defaultRequest values are what a pod
+    // admission actually reads back from the store.
+
+    /// A LimitRange specifying only `max.cpu` is a common minimal-governance pattern
+    /// (cap CPU without restating a default). Without the create-time chain
+    /// (default <- max, then defaultRequest <- default), a pod with no resources would
+    /// get nothing injected — silently defeating the operator's intent to cap AND
+    /// default CPU in the namespace.
+    #[tokio::test]
+    async fn only_max_chains_into_pod_limit_and_request() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut lr = json!({
+            "apiVersion": "v1",
+            "kind": "LimitRange",
+            "metadata": { "name": "cpu-cap", "namespace": "default" },
+            "spec": { "limits": [{ "type": "Container", "max": { "cpu": "1" } }] }
+        });
+        crate::handlers::defaults::apply_defaults("", "limitranges", &mut lr);
+        store
+            .put(
+                "/registry/limitranges/default/cpu-cap",
+                bytes::Bytes::from(serde_json::to_vec(&lr).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod = json!({
+            "spec": { "containers": [{ "name": "app", "resources": {} }] }
+        });
+        let result = apply_limit_ranges(&state, pod, "default", "pods")
+            .await
+            .expect("a container within max must not be rejected");
+
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["limits"]["cpu"],
+            json!("1"),
+            "limit.cpu must be injected from max.cpu via the chained default — \
+             a LimitRange with only 'max' set must still cap AND default CPU usage"
+        );
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["requests"]["cpu"],
+            json!("1"),
+            "request.cpu must chain from the just-filled default.cpu — \
+             upstream chains defaultRequest <- default when defaultRequest is unset"
+        );
+    }
+
+    /// A LimitRange specifying only `min.memory` must backfill `defaultRequest.memory`
+    /// (a request floor) without inventing a limit — there is no `max` to derive one from.
+    #[tokio::test]
+    async fn only_min_chains_into_pod_request_only() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut lr = json!({
+            "apiVersion": "v1",
+            "kind": "LimitRange",
+            "metadata": { "name": "mem-floor", "namespace": "default" },
+            "spec": { "limits": [{ "type": "Container", "min": { "memory": "64Mi" } }] }
+        });
+        crate::handlers::defaults::apply_defaults("", "limitranges", &mut lr);
+        store
+            .put(
+                "/registry/limitranges/default/mem-floor",
+                bytes::Bytes::from(serde_json::to_vec(&lr).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod = json!({
+            "spec": { "containers": [{ "name": "app", "resources": {} }] }
+        });
+        let result = apply_limit_ranges(&state, pod, "default", "pods")
+            .await
+            .expect("a container with no resources must not be rejected by a min-only LimitRange");
+
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["requests"]["memory"],
+            json!("64Mi"),
+            "request.memory must be backfilled from min.memory via the chained defaultRequest"
+        );
+        assert!(
+            result["spec"]["containers"][0]["resources"]["limits"]["memory"].is_null(),
+            "limit.memory must NOT be injected — a min-only LimitRange floors requests, \
+             it never implies a limit"
+        );
+    }
 }
