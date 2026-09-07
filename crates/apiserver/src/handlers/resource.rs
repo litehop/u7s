@@ -27879,4 +27879,55 @@ mod tests {
             "the decoded NodeList item must be the real seeded Node, not a placeholder"
         );
     }
+
+    /// The test above only proves an ENCODER kind still materializes — it passes whether or
+    /// not the guard actually checks `has_encoder`, since `wants_protobuf(accept)` alone was
+    /// already enough to route Node/NodeList to materializing regardless. The bug this guard
+    /// fixes is the opposite case: a NON-encoder kind (CSINode) under the same combined
+    /// `Accept: .../protobuf, .../json` header real clients (kubelet/client-go) always send,
+    /// which a `wants_protobuf`-only guard also forces onto materializing even though it falls
+    /// back to JSON either way. Since the two paths' JSON output is byte-identical for a
+    /// non-encoder kind (see the streaming-vs-materializing tests above), only internal
+    /// instrumentation can prove which path ran — this captures the `list: filtered` debug
+    /// log, which only the materializing branch emits.
+    #[tokio::test]
+    async fn list_resource_streams_non_encoder_kind_under_combined_protobuf_accept() {
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
+
+        let store = seed_csinodes(&[("node-a", "x")]).await;
+        let state = crate::handlers::test_support::make_state_with_store(store);
+        let (status, content_type, body) = list_csinodes(
+            state,
+            "application/vnd.kubernetes.protobuf, application/json",
+            csinode_query(None, None, None),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/json"),
+            "CSINode has no registered encoder, so a combined protobuf+json Accept must still \
+             fall back to JSON — the same output a real client-go typed clientset gets today"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+
+        let log = captured_log(&buf);
+        assert!(
+            log.contains("list: query completed"),
+            "sanity check: the LIST must actually run for this assertion to mean anything"
+        );
+        assert!(
+            !log.contains("list: filtered"),
+            "a non-encoder kind under a combined protobuf+json Accept header (what kubelet/ \
+             client-go always send) must take the streaming path, not the materializing path \
+             `list: filtered` only logs from — dropping the has_encoder check from the \
+             routing guard would force this LIST back onto materializing for every \
+             non-encoder kind, defeating the streaming path's memory win for almost all real \
+             LIST traffic"
+        );
+    }
 }
