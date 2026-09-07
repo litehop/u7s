@@ -1177,16 +1177,13 @@ fn put_sync(
     // value to compare against, and the optimistic concurrency check needs the revision.
     // SQLite stores integers as i64; cast to u64 (revisions fit in i63 range).
     let stored: Option<(u64, Vec<u8>)> = conn
-        .query_row(
-            "SELECT revision, value FROM objects WHERE key = ?1",
-            params![key],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0).map(|v| v as u64)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                ))
-            },
-        )
+        .prepare_cached("SELECT revision, value FROM objects WHERE key = ?1")?
+        .query_row(params![key], |r| {
+            Ok((
+                r.get::<_, i64>(0).map(|v| v as u64)?,
+                r.get::<_, Vec<u8>>(1)?,
+            ))
+        })
         .optional()?;
 
     let is_create = stored.is_none();
@@ -1242,35 +1239,33 @@ fn put_sync(
     }
 
     // 4. Increment global revision counter.
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
-        [],
-    )?;
+    )?
+    .execute([])?;
 
     // 5. Read the new revision.
-    let new_revision: u64 = conn.query_row(
-        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
-        [],
-        |r| r.get::<_, i64>(0).map(|v| v as u64),
-    )?;
+    let new_revision: u64 = conn
+        .prepare_cached("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'")?
+        .query_row([], |r| r.get::<_, i64>(0).map(|v| v as u64))?;
 
     // 6. Stamp metadata.resourceVersion in the JSON value and extract indexed columns
     //    from the single parse, avoiding a second deserialization of the stamped bytes.
     let (stamped_value, ns, obj_name) = stamp_resource_version(&value, new_revision)?;
 
     // 7. Upsert the object.
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO objects (key, value, revision, ns, obj_name) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, revision = excluded.revision,
          ns = excluded.ns, obj_name = excluded.obj_name",
-        params![
-            key,
-            stamped_value.as_ref(),
-            new_revision as i64,
-            ns,
-            obj_name
-        ],
-    )?;
+    )?
+    .execute(params![
+        key,
+        stamped_value.as_ref(),
+        new_revision as i64,
+        ns,
+        obj_name
+    ])?;
 
     tx.commit()?;
     // Update last_written_revision immediately after COMMIT on this blocking thread.
@@ -1297,17 +1292,14 @@ fn delete_sync(
     let conn: &Connection = &tx;
 
     let stored: Option<(u64, Vec<u8>, Option<String>)> = conn
-        .query_row(
-            "SELECT revision, value, ns FROM objects WHERE key = ?1",
-            params![key],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0).map(|v| v as u64)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )
+        .prepare_cached("SELECT revision, value, ns FROM objects WHERE key = ?1")?
+        .query_row(params![key], |r| {
+            Ok((
+                r.get::<_, i64>(0).map(|v| v as u64)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
         .optional()?;
 
     // Optimistic concurrency check (same logic as put).
@@ -1334,17 +1326,16 @@ fn delete_sync(
     let (_, value_bytes, ns) = stored.unwrap();
     let last_value = Bytes::from(value_bytes);
 
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
-        [],
-    )?;
-    let new_revision: u64 = conn.query_row(
-        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
-        [],
-        |r| r.get::<_, i64>(0).map(|v| v as u64),
-    )?;
+    )?
+    .execute([])?;
+    let new_revision: u64 = conn
+        .prepare_cached("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'")?
+        .query_row([], |r| r.get::<_, i64>(0).map(|v| v as u64))?;
 
-    conn.execute("DELETE FROM objects WHERE key = ?1", params![key])?;
+    conn.prepare_cached("DELETE FROM objects WHERE key = ?1")?
+        .execute(params![key])?;
     tx.commit()?;
     // Same rationale as put_sync: update last_written_revision on the blocking thread
     // immediately after COMMIT so the list guard sees it before any reader can observe
@@ -1376,11 +1367,8 @@ fn create_if_namespace_active_sync(
 
     if let Some(ns_key) = ns_key {
         let ns_value: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT value FROM objects WHERE key = ?1",
-                params![ns_key],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT value FROM objects WHERE key = ?1")?
+            .query_row(params![ns_key], |r| r.get(0))
             .optional()?;
         if let Some(ns_bytes) = ns_value {
             if let Ok(ns_json) = serde_json::from_slice::<serde_json::Value>(&ns_bytes) {
@@ -1392,9 +1380,8 @@ fn create_if_namespace_active_sync(
     }
 
     let exists: bool = conn
-        .query_row("SELECT 1 FROM objects WHERE key = ?1", params![key], |_| {
-            Ok(true)
-        })
+        .prepare_cached("SELECT 1 FROM objects WHERE key = ?1")?
+        .query_row(params![key], |_| Ok(true))
         .optional()?
         .unwrap_or(false);
     if exists {
@@ -1403,27 +1390,25 @@ fn create_if_namespace_active_sync(
         }));
     }
 
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
-        [],
-    )?;
-    let new_revision: u64 = conn.query_row(
-        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
-        [],
-        |r| r.get::<_, i64>(0).map(|v| v as u64),
-    )?;
+    )?
+    .execute([])?;
+    let new_revision: u64 = conn
+        .prepare_cached("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'")?
+        .query_row([], |r| r.get::<_, i64>(0).map(|v| v as u64))?;
 
     let (stamped_value, ns, obj_name) = stamp_resource_version(&value, new_revision)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO objects (key, value, revision, ns, obj_name) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            key,
-            stamped_value.as_ref(),
-            new_revision as i64,
-            ns,
-            obj_name
-        ],
-    )?;
+    )?
+    .execute(params![
+        key,
+        stamped_value.as_ref(),
+        new_revision as i64,
+        ns,
+        obj_name
+    ])?;
 
     tx.commit()?;
     last_written.fetch_max(new_revision, Ordering::Release);
@@ -1493,17 +1478,14 @@ fn delete_namespace_sync(
 
 fn get_sync(conn: &Connection, key: &str) -> Result<Option<StoreObject>> {
     let result = conn
-        .query_row(
-            "SELECT key, value, revision FROM objects WHERE key = ?1",
-            params![key],
-            |r| {
-                Ok(StoreObject {
-                    key: r.get::<_, String>(0)?,
-                    value: Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                    revision: r.get::<_, i64>(2).map(|v| v as u64)?,
-                })
-            },
-        )
+        .prepare_cached("SELECT key, value, revision FROM objects WHERE key = ?1")?
+        .query_row(params![key], |r| {
+            Ok(StoreObject {
+                key: r.get::<_, String>(0)?,
+                value: Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                revision: r.get::<_, i64>(2).map(|v| v as u64)?,
+            })
+        })
         .optional()?;
     Ok(result)
 }
@@ -5554,6 +5536,112 @@ mod tests {
              statement cache with a Run count of {LIST_CALLS} (one per list_namespace_objects \
              call above); got {run_count} — this means list_namespace_objects is re-parsing \
              its SQL from scratch on every call instead of reusing a cached statement"
+        );
+    }
+
+    /// `put_sync`, `delete_sync`, `create_if_namespace_active_sync`, and `get_sync` are the
+    /// write path's hottest statements — the write connection is serialized behind
+    /// `write_conn`'s mutex, so per-call SQL re-parsing there directly gates cluster-wide
+    /// write throughput on the 1-shared-vCPU target. Each must reuse a cached prepared
+    /// statement across calls instead of re-parsing from scratch every time — same failure
+    /// mode and same verification technique as `list_namespace_objects_reuses_cached_prepared_statement`
+    /// above (a `Run` status counter of 0 on re-fetch means the call sites never left
+    /// anything in `write_conn`'s statement cache, i.e. they're still calling plain
+    /// `execute`/`query_row`).
+    ///
+    /// Also checks that the revision-bump `UPDATE`/`SELECT` pair — textually identical across
+    /// all three write functions — lands in the SAME cache entry: its Run count must equal
+    /// the total write count across put+create+delete, not just one function's share.
+    #[tokio::test]
+    async fn write_and_read_hot_paths_reuse_cached_prepared_statements() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/pods/default/reused-stmt-pod";
+
+        // 3 genuinely different writes to the same key (never a no-op) exercise put_sync's
+        // fetch-existing-value SELECT and the shared revision-bump statements 3 times.
+        const PUT_CALLS: i32 = 3;
+        let phases = ["Pending", "Running", "Succeeded"];
+        let mut rv = 0;
+        for phase in phases {
+            rv = store
+                .put(
+                    key,
+                    Bytes::from(format!(
+                        r#"{{"apiVersion":"v1","kind":"Pod","metadata":{{"name":"reused-stmt-pod","namespace":"default"}},"status":{{"phase":"{phase}"}}}}"#
+                    )),
+                    if rv == 0 { None } else { Some(rv) },
+                )
+                .await
+                .expect("put must succeed");
+        }
+
+        // 2 gets exercise get_sync's SELECT.
+        const GET_CALLS: i32 = 2;
+        for _ in 0..GET_CALLS {
+            store.get(key).await.expect("get must succeed");
+        }
+
+        // 1 create (cluster-scoped: no ns_key check) exercises create_if_namespace_active_sync's
+        // exists-check SELECT and the shared revision-bump statements once more.
+        const CREATE_CALLS: i32 = 1;
+        let created_key = "/registry/core/namespaces/reused-stmt-ns";
+        store
+            .create_if_namespace_active(
+                None,
+                created_key,
+                Bytes::from(r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"reused-stmt-ns"}}"#),
+            )
+            .await
+            .expect("create must succeed");
+
+        // 1 delete exercises delete_sync's DELETE and the shared revision-bump statements
+        // a final time.
+        const DELETE_CALLS: i32 = 1;
+        store
+            .delete(created_key, None)
+            .await
+            .expect("delete must succeed");
+
+        let conn = store.write_conn.lock().await;
+        let run_count = |sql: &str| {
+            conn.prepare_cached(sql)
+                .expect("prepare_cached probe")
+                .get_status(rusqlite::StatementStatus::Run)
+        };
+
+        assert_eq!(
+            run_count("SELECT revision, value FROM objects WHERE key = ?1"),
+            PUT_CALLS,
+            "put_sync's fetch-existing-value SELECT must still be in write_conn's cache with \
+             one Run per put() call — a plain `query_row` here would leave nothing cached"
+        );
+        assert_eq!(
+            run_count("SELECT key, value, revision FROM objects WHERE key = ?1"),
+            GET_CALLS,
+            "get_sync's SELECT must still be in write_conn's cache with one Run per get() \
+             call — a plain `query_row` here would leave nothing cached"
+        );
+        assert_eq!(
+            run_count("SELECT 1 FROM objects WHERE key = ?1"),
+            CREATE_CALLS,
+            "create_if_namespace_active_sync's exists-check SELECT must still be in \
+             write_conn's cache with one Run per create call"
+        );
+        assert_eq!(
+            run_count("DELETE FROM objects WHERE key = ?1"),
+            DELETE_CALLS,
+            "delete_sync's DELETE must still be in write_conn's cache with one Run per \
+             delete() call"
+        );
+        assert_eq!(
+            run_count(
+                "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'"
+            ),
+            PUT_CALLS + CREATE_CALLS + DELETE_CALLS,
+            "the revision-bump UPDATE is textually identical across put_sync, delete_sync, \
+             and create_if_namespace_active_sync, so all three must share ONE cached \
+             statement whose Run count is the sum of every write across all three — a \
+             mismatch means at least one of them fell back to re-parsing its own copy"
         );
     }
 
