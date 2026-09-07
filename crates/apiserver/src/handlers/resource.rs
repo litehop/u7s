@@ -56,8 +56,14 @@ fn wants_partial_object_metadata(accept: &str) -> bool {
 /// delegated to `build_list_response` with an empty items array, then the streamed items
 /// array is spliced into the one place that placeholder appears — so this can never drift
 /// from that function's byte-for-byte-tested envelope output.
+///
+/// `field_filter` is the handler's post-store field-selector filter (e.g.
+/// `filter_events_by_field_selector` for Events, `filter_pods_by_field_selector` for Pods) —
+/// shared here across every LIST handler rather than forked per-caller. `on_item`, if set, runs
+/// once per surviving item (e.g. list_pods' per-pod lifecycle debug log) so that diagnostic
+/// hook still fires on the streaming path, not just the materializing one.
 #[allow(clippy::too_many_arguments)]
-fn stream_list_json(
+pub(crate) fn stream_list_json(
     kind: &str,
     group: &str,
     version: &str,
@@ -65,7 +71,9 @@ fn stream_list_json(
     revision: u64,
     raw_items: &[u7s_store::StoreObject],
     label_pairs: &[LabelSelectorTerm<'_>],
-    events_field_selector: &str,
+    field_selector: &str,
+    field_filter: fn(Vec<serde_json::Value>, &str) -> Vec<serde_json::Value>,
+    on_item: Option<fn(&serde_json::Value)>,
     continue_key: Option<String>,
     remaining_count: Option<u64>,
     signing_key: &[u8; 32],
@@ -100,12 +108,13 @@ fn stream_list_json(
             Some(v) => v,
             None => continue,
         };
-        item = match super::pods::filter_events_by_field_selector(vec![item], events_field_selector)
-            .pop()
-        {
+        item = match field_filter(vec![item], field_selector).pop() {
             Some(v) => v,
             None => continue,
         };
+        if let Some(f) = on_item {
+            f(&item);
+        }
         if wrote_item {
             body.push(b',');
         }
@@ -272,6 +281,8 @@ pub(crate) async fn list_resource<S: Store>(
             &resp.items,
             &label_pairs,
             events_field_selector,
+            super::pods::filter_events_by_field_selector,
+            None,
             resp.continue_key,
             resp.remaining_count,
             &state.continue_token_key,
@@ -2596,6 +2607,7 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         .map(|t| decode_continue(t, state.store.current_revision(), &state.continue_token_key))
         .transpose()?;
     let continue_key = continue_decoded.as_ref().map(|(k, _)| k.clone());
+    let list_start = std::time::Instant::now();
     let resp = state
         .store
         .list(
@@ -2608,10 +2620,62 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+    tracing::debug!(
+        prefix = %prefix,
+        item_count = resp.items.len(),
+        elapsed_ms = list_start.elapsed().as_millis() as u64,
+        "list: query completed"
+    );
     // First page (no continue token yet): the fresh store revision becomes the pin for
     // subsequent pages. Continuation page: reuse the pin decoded above, not the store's
     // current (possibly-advanced) revision.
     let list_revision = continue_decoded.map(|(_, rv)| rv).unwrap_or(resp.revision);
+
+    let label_pairs: Vec<LabelSelectorTerm> = query
+        .label_selector
+        .as_deref()
+        .map(parse_label_selector)
+        .transpose()?
+        .unwrap_or_default();
+    let events_field_selector = if plural == "events" {
+        query.field_selector.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
+
+    // See list_resource's identically-shaped guard above for why this checks has_encoder
+    // rather than wants_protobuf alone.
+    let list_api_version = if group.is_empty() {
+        version.clone()
+    } else {
+        format!("{}/{}", group, version)
+    };
+    let list_kind = format!("{}List", meta.kind);
+    let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
+        && crate::content_type::has_encoder(&list_api_version, &list_kind);
+    if !pom && !table && !wants_real_protobuf {
+        let body = stream_list_json(
+            &meta.kind,
+            &group,
+            &version,
+            &plural,
+            list_revision,
+            &resp.items,
+            &label_pairs,
+            events_field_selector,
+            super::pods::filter_events_by_field_selector,
+            None,
+            resp.continue_key,
+            resp.remaining_count,
+            &state.continue_token_key,
+        )?;
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response());
+    }
 
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
@@ -2621,22 +2685,13 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         items.push(v);
     }
 
-    let items = if let Some(ref sel) = query.label_selector {
-        let pairs = parse_label_selector(sel)?;
-        apply_label_selector(items, &pairs)
-    } else {
+    let items = apply_label_selector(items, &label_pairs);
+    let items = if events_field_selector.is_empty() {
         items
-    };
-
-    let items = if plural == "events" {
-        if let Some(ref sel) = query.field_selector {
-            super::pods::filter_events_by_field_selector(items, sel)
-        } else {
-            items
-        }
     } else {
-        items
+        super::pods::filter_events_by_field_selector(items, events_field_selector)
     };
+    tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
     if pom {
         let pom_items: Vec<serde_json::Value> = items
@@ -27928,6 +27983,190 @@ mod tests {
              routing guard would force this LIST back onto materializing for every \
              non-encoder kind, defeating the streaming path's memory win for almost all real \
              LIST traffic"
+        );
+    }
+
+    /// list_namespaced_resource (ConfigMaps, Secrets, Deployments, Services, PodTemplates,
+    /// pods... anything namespaced) serves the overwhelming majority of real LIST traffic, but
+    /// before this fix it had no streaming branch at all — unlike its cluster-scoped sibling
+    /// list_resource, it always materialized every item into a `Vec<serde_json::Value>`
+    /// regardless of Accept. ConfigMap has no registered protobuf encoder, so a real client's
+    /// combined `Accept: .../protobuf, .../json` header (what kubelet/client-go always send)
+    /// falls back to JSON either way; this pins that the LIST takes the streaming path for that
+    /// header — `list: filtered`, which only the materializing branch logs, must be absent.
+    /// Reverting the guard to always-materialize (or omitting it) makes this assertion fail.
+    #[tokio::test]
+    async fn list_namespaced_resource_streams_non_encoder_kind_under_combined_protobuf_accept() {
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
+
+        let store =
+            std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-a", "namespace": "default" },
+            "data": { "key": "value" },
+        });
+        store
+            .put(
+                &crate::keys::group_object_key("", "configmaps", Some("default"), "cm-a"),
+                bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::handlers::test_support::make_state_with_store(store);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/vnd.kubernetes.protobuf, application/json",
+            ),
+        );
+
+        let resp = list_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            headers,
+            test_user(),
+        )
+        .await
+        .expect("list must not error");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json",
+            "ConfigMap has no registered encoder, so a combined protobuf+json Accept must \
+             still fall back to JSON"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert_eq!(v["items"][0]["metadata"]["name"], "cm-a");
+
+        let log = captured_log(&buf);
+        assert!(
+            log.contains("list: query completed"),
+            "sanity check: the LIST must actually run for this assertion to mean anything"
+        );
+        assert!(
+            !log.contains("list: filtered"),
+            "list_namespaced_resource must take the streaming path for a non-encoder \
+             namespaced kind under a combined protobuf+json Accept — before this fix it had no \
+             streaming branch at all and always took the materializing path (which logs \
+             `list: filtered`), defeating the streaming path's memory win for almost all real \
+             LIST traffic"
+        );
+    }
+
+    /// The test above only proves a non-encoder kind streams — it says nothing about a
+    /// namespaced kind WITH a registered encoder (Service), which must still take the
+    /// materializing path and get real protobuf bytes, not be swept into the JSON streaming
+    /// path by a guard that ignores encoder registration.
+    #[tokio::test]
+    async fn list_namespaced_resource_with_protobuf_accept_and_registered_encoder_returns_real_protobuf(
+    ) {
+        use prost::Message;
+
+        let store =
+            std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "svc-a", "namespace": "default" },
+            "spec": { "ports": [] },
+        });
+        store
+            .put(
+                &crate::keys::group_object_key("", "services", Some("default"), "svc-a"),
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::handlers::test_support::make_state_with_store(store);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/vnd.kubernetes.protobuf, application/json",
+            ),
+        );
+
+        let resp = list_namespaced_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            headers,
+            test_user(),
+        )
+        .await
+        .expect("list must not error");
+
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/vnd.kubernetes.protobuf",
+            "ServiceList has a registered encoder — the routing guard must still send it \
+             through the materializing path"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "body must start with the k8s protobuf magic prefix"
+        );
+        let envelope = crate::proto::decode_k8s_proto_envelope(&body)
+            .expect("response body must decode as a k8s protobuf envelope");
+        assert_eq!(envelope.kind, "ServiceList");
+        let decoded =
+            crate::apps_gen::k8s::io::api::core::v1::ServiceList::decode(envelope.raw.as_slice())
+                .expect("envelope raw field must decode as a real ServiceList protobuf message");
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(
+            decoded.items[0]
+                .metadata
+                .as_ref()
+                .and_then(|m| m.name.as_deref()),
+            Some("svc-a"),
+            "the decoded ServiceList item must be the real seeded Service, not a placeholder"
         );
     }
 }

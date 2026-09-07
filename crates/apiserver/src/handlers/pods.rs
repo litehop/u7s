@@ -85,6 +85,23 @@ fn pod_container_images(pod: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
+/// Per-pod lifecycle visibility for `list_pods`: enable with
+/// `u7s::apiserver::pod_lifecycle=debug`. Emitted per item (not one aggregate log line) so an
+/// operator can grep/filter by pod name without capturing full PodList response bodies for
+/// every request. Shared between `list_pods`' materializing and streaming paths (via
+/// `stream_list_json`'s `on_item` hook) so this diagnostic still fires regardless of Accept.
+fn log_pod_list_entry(pod: &serde_json::Value) {
+    tracing::debug!(
+        target: "u7s::apiserver::pod_lifecycle",
+        namespace = %pod["metadata"]["namespace"].as_str().unwrap_or(""),
+        name = %pod["metadata"]["name"].as_str().unwrap_or(""),
+        phase = %pod["status"]["phase"].as_str().unwrap_or(""),
+        deletion_timestamp = ?pod["metadata"]["deletionTimestamp"].as_str(),
+        image = %pod_container_images(pod),
+        "pod list entry"
+    );
+}
+
 /// Parse a `fieldSelector` query string and test a pod JSON value against it.
 ///
 /// Supported selectors (comma-separated), matching upstream's SelectableFields
@@ -302,6 +319,7 @@ pub(crate) async fn list_pods<S: Store>(
     // silently returns empty PodMetrics for every labelSelector-filtered query, which is
     // exactly what the HPA controller always issues).
     let pom = super::generic::wants_partial_object_metadata(accept);
+    let table = super::table::wants_table(accept);
 
     if query.watch == Some(true) {
         let (watch_api_version, watch_kind) = if pom {
@@ -389,6 +407,43 @@ pub(crate) async fn list_pods<S: Store>(
         "list: query completed"
     );
 
+    let label_pairs: Vec<super::generic::LabelSelectorTerm> = query
+        .label_selector
+        .as_deref()
+        .map(super::generic::parse_label_selector)
+        .transpose()?
+        .unwrap_or_default();
+    let pod_field_selector = query.field_selector.as_deref().unwrap_or("");
+
+    // See resource.rs's list_resource for why this checks has_encoder rather than
+    // wants_protobuf alone; Pod/PodList has a registered encoder, so this only takes the
+    // streaming path when the client isn't going to get real protobuf anyway.
+    let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
+        && crate::content_type::has_encoder("v1", "PodList");
+    if !pom && !table && !wants_real_protobuf {
+        let body = super::resource::stream_list_json(
+            "Pod",
+            "",
+            "v1",
+            "pods",
+            resp.revision,
+            &resp.items,
+            &label_pairs,
+            pod_field_selector,
+            filter_pods_by_field_selector,
+            Some(log_pod_list_entry),
+            resp.continue_key,
+            resp.remaining_count,
+            &state.continue_token_key,
+        )?;
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response());
+    }
+
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
         let parsed: serde_json::Value =
@@ -396,33 +451,12 @@ pub(crate) async fn list_pods<S: Store>(
         items.push(parsed);
     }
 
-    let items = if let Some(ref sel) = query.field_selector {
-        filter_pods_by_field_selector(items, sel)
-    } else {
-        items
-    };
-
-    let items = if let Some(ref sel) = query.label_selector {
-        let pairs = super::generic::parse_label_selector(sel)?;
-        super::generic::apply_label_selector(items, &pairs)
-    } else {
-        items
-    };
+    let items = filter_pods_by_field_selector(items, pod_field_selector);
+    let items = super::generic::apply_label_selector(items, &label_pairs);
     tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
-    // Per-pod lifecycle visibility: enable with `u7s::apiserver::pod_lifecycle=debug`. Emitted
-    // per item (not one aggregate log line) so an operator can grep/filter by pod name without
-    // capturing full PodList response bodies for every request.
     for pod in &items {
-        tracing::debug!(
-            target: "u7s::apiserver::pod_lifecycle",
-            namespace = %pod["metadata"]["namespace"].as_str().unwrap_or(""),
-            name = %pod["metadata"]["name"].as_str().unwrap_or(""),
-            phase = %pod["status"]["phase"].as_str().unwrap_or(""),
-            deletion_timestamp = ?pod["metadata"]["deletionTimestamp"].as_str(),
-            image = %pod_container_images(pod),
-            "pod list entry"
-        );
+        log_pod_list_entry(pod);
     }
 
     if pom {
@@ -440,7 +474,7 @@ pub(crate) async fn list_pods<S: Store>(
     }
 
     // Return Table format when as=Table;v=v1 is requested (v1beta1 was rejected above).
-    if super::table::wants_table(accept) {
+    if table {
         return Ok(Json(super::table::build_table("", "pods", items)).into_response());
     }
 
@@ -19199,6 +19233,120 @@ mod handler_tests {
             "the concurrent status write must survive the retried delete — a delete that \
              retries by clobbering with stale data instead of re-reading the fresh object \
              would silently revert the kubelet's status update"
+        );
+    }
+
+    /// list_pods had no streaming branch at all before this fix — every per-namespace pod LIST
+    /// always materialized into a `Vec<serde_json::Value>` regardless of Accept, even a plain
+    /// `application/json` request (kubectl's default). This pins that a plain JSON Accept now
+    /// takes the streaming path — `list: filtered`, which only the materializing branch logs,
+    /// must be absent. Reverting the guard back to always-materialize makes this assertion
+    /// fail.
+    #[tokio::test]
+    async fn list_pods_with_plain_accept_streams() {
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "pod-a", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", get(list_pods))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+
+        let log = captured_log(&buf);
+        assert!(
+            log.contains("list: query completed"),
+            "sanity check: the LIST must actually run for this assertion to mean anything"
+        );
+        assert!(
+            !log.contains("list: filtered"),
+            "list_pods must take the streaming path under a plain JSON Accept — before this \
+             fix it had no streaming branch at all and always materialized (which logs \
+             `list: filtered`), defeating the streaming path's memory win for almost all real \
+             LIST traffic"
+        );
+    }
+
+    /// list_pods already called negotiated_response before this fix, but adding the streaming
+    /// branch reworked how the field/label selectors and the per-pod lifecycle debug log are
+    /// computed — this pins that a combined protobuf+json Accept (what kubelet/client-go
+    /// always send) still takes the materializing path and returns real protobuf, since
+    /// Pod/PodList has a registered encoder.
+    #[tokio::test]
+    async fn list_pods_with_protobuf_accept_and_registered_encoder_returns_real_protobuf() {
+        use prost::Message;
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "pod-a", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", get(list_pods))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(
+                header::ACCEPT,
+                "application/vnd.kubernetes.protobuf, application/json",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/vnd.kubernetes.protobuf",
+            "PodList has a registered encoder — the routing guard must still send it through \
+             the materializing path, or a real client-go typed PodList decoder is silently \
+             handed JSON it cannot parse"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "body must start with the k8s protobuf magic prefix"
+        );
+        let envelope = crate::proto::decode_k8s_proto_envelope(&body)
+            .expect("response body must decode as a k8s protobuf envelope");
+        assert_eq!(envelope.kind, "PodList");
+        let decoded =
+            crate::apps_gen::k8s::io::api::core::v1::PodList::decode(envelope.raw.as_slice())
+                .expect("envelope raw field must decode as a real PodList protobuf message");
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(
+            decoded.items[0]
+                .metadata
+                .as_ref()
+                .and_then(|m| m.name.as_deref()),
+            Some("pod-a"),
+            "the decoded PodList item must be the real seeded Pod, not a placeholder"
         );
     }
 }

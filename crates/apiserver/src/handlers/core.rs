@@ -62,6 +62,7 @@ pub(crate) async fn core_list_resource<S: Store>(
         // silently returns empty PodMetrics for every labelSelector-filtered query, which is
         // exactly what the HPA controller always issues).
         let pom = super::generic::wants_partial_object_metadata(accept);
+        let table = super::table::wants_table(accept);
 
         let prefix = crate::keys::cluster_list_prefix("pods");
         if query.watch == Some(true) {
@@ -163,23 +164,52 @@ pub(crate) async fn core_list_resource<S: Store>(
             "list: query completed"
         );
         let list_revision = continue_decoded.map(|(_, rv)| rv).unwrap_or(resp.revision);
+
+        let label_pairs: Vec<super::generic::LabelSelectorTerm> = query
+            .label_selector
+            .as_deref()
+            .map(parse_label_selector)
+            .transpose()?
+            .unwrap_or_default();
+        let pod_field_selector = query.field_selector.as_deref().unwrap_or("");
+
+        // See list_resource's identically-shaped guard for why this checks has_encoder rather
+        // than wants_protobuf alone; Pod/PodList has a registered encoder, so this only takes
+        // the streaming path when the client isn't going to get real protobuf anyway.
+        let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
+            && crate::content_type::has_encoder("v1", "PodList");
+        if !pom && !table && !wants_real_protobuf {
+            let body = super::resource::stream_list_json(
+                "Pod",
+                "",
+                "v1",
+                "pods",
+                list_revision,
+                &resp.items,
+                &label_pairs,
+                pod_field_selector,
+                filter_pods_by_field_selector,
+                None,
+                resp.continue_key,
+                resp.remaining_count,
+                &state.continue_token_key,
+            )?;
+            return Ok((
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response());
+        }
+
         let mut items = Vec::with_capacity(resp.items.len());
         for obj in &resp.items {
             let v: serde_json::Value =
                 serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
             items.push(v);
         }
-        let items = if let Some(ref sel) = query.field_selector {
-            filter_pods_by_field_selector(items, sel)
-        } else {
-            items
-        };
-        let items = if let Some(ref sel) = query.label_selector {
-            let pairs = parse_label_selector(sel)?;
-            apply_label_selector(items, &pairs)
-        } else {
-            items
-        };
+        let items = filter_pods_by_field_selector(items, pod_field_selector);
+        let items = apply_label_selector(items, &label_pairs);
         tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
         if pom {
@@ -200,7 +230,7 @@ pub(crate) async fn core_list_resource<S: Store>(
         // as `kubectl get pods -n <ns>` (list_pods, which already handles this). Without this,
         // kubectl can't decode the response and falls back to printing only NAME/AGE instead of
         // the usual READY/STATUS/RESTARTS/AGE columns.
-        if super::table::wants_table(accept) {
+        if table {
             return Ok(Json(super::table::build_table("", "pods", items)).into_response());
         }
 
@@ -214,7 +244,7 @@ pub(crate) async fn core_list_resource<S: Store>(
             resp.remaining_count,
             &state.continue_token_key,
         );
-        return Ok(Json(body).into_response());
+        return Ok(crate::content_type::negotiated_response(accept, body).into_response());
     }
 
     list_resource(
@@ -1233,6 +1263,183 @@ mod tests {
             "core_get_namespaced_resource must forward the real Accept header down to \
              get_namespaced_resource — without it, `kubectl get service <name>` never gets \
              Table output no matter what get_namespaced_resource itself does"
+        );
+    }
+
+    fn captured_log(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+    }
+
+    /// core_list_resource's cross-namespace "pods" branch (GET /api/v1/pods) had no streaming
+    /// branch at all before this fix — every LIST always materialized into a
+    /// `Vec<serde_json::Value>` regardless of Accept, even a plain `application/json` request.
+    /// This pins that a plain JSON Accept now takes the streaming path — `list: filtered`,
+    /// which only the materializing branch logs, must be absent. Reverting the guard back to
+    /// always-materialize makes this assertion fail.
+    #[tokio::test]
+    async fn core_list_resource_cross_namespace_pods_with_plain_accept_streams() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pod-a", "namespace": "ns-a"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(
+                "/registry/pods/ns-a/pod-a",
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create pod-a");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let user = crate::auth::UserInfo {
+            username: "test-user".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let app = Router::new()
+            .route("/api/v1/{resource}", get(super::core_list_resource))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/pods")
+            .header("accept", "application/json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+
+        let log = captured_log(&buf);
+        assert!(
+            log.contains("list: query completed"),
+            "sanity check: the LIST must actually run for this assertion to mean anything"
+        );
+        assert!(
+            !log.contains("list: filtered"),
+            "core_list_resource's cross-namespace pods LIST must take the streaming path under \
+             a plain JSON Accept — before this fix it had no streaming branch at all and \
+             always materialized (which logs `list: filtered`), defeating the streaming path's \
+             memory win for almost all real LIST traffic"
+        );
+    }
+
+    /// Before this fix, core_list_resource's cross-namespace pods branch always returned
+    /// `Ok(Json(body))` regardless of Accept, bypassing content negotiation entirely — a real
+    /// client-go typed clientset (e.g. kube-controller-manager's cluster-wide Pod informer)
+    /// sending a combined `Accept: .../protobuf, .../json` header for `GET /api/v1/pods` got
+    /// JSON back, which its typed PodList decoder cannot parse. This pins that it now returns
+    /// real protobuf bytes for that Accept header.
+    #[tokio::test]
+    async fn core_list_resource_cross_namespace_pods_with_protobuf_accept_returns_real_protobuf() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use prost::Message;
+        use tower::ServiceExt;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pod-a", "namespace": "ns-a"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(
+                "/registry/pods/ns-a/pod-a",
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create pod-a");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let user = crate::auth::UserInfo {
+            username: "test-user".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let app = Router::new()
+            .route("/api/v1/{resource}", get(super::core_list_resource))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/pods")
+            .header(
+                "accept",
+                "application/vnd.kubernetes.protobuf, application/json",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/vnd.kubernetes.protobuf",
+            "a combined protobuf+json Accept for a cross-namespace Pod LIST must return real \
+             protobuf, not JSON silently substituted in its place"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "body must start with the k8s protobuf magic prefix"
+        );
+        let envelope = crate::proto::decode_k8s_proto_envelope(&body)
+            .expect("response body must decode as a k8s protobuf envelope");
+        assert_eq!(envelope.kind, "PodList");
+        let decoded =
+            crate::apps_gen::k8s::io::api::core::v1::PodList::decode(envelope.raw.as_slice())
+                .expect("envelope raw field must decode as a real PodList protobuf message");
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(
+            decoded.items[0]
+                .metadata
+                .as_ref()
+                .and_then(|m| m.name.as_deref()),
+            Some("pod-a"),
+            "the decoded PodList item must be the real seeded Pod, not a placeholder"
         );
     }
 }
