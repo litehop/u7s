@@ -1233,13 +1233,11 @@ fn put_sync(
             // No write happened: let `tx` drop below without committing, which rolls back
             // the (empty) transaction instead of leaving it open.
             tracing::debug!(key, existing_revision, "put_sync: no-op write suppressed");
-            return Ok((
-                *existing_revision,
-                Bytes::from(existing_value.clone()),
-                false,
-                true,
-                None,
-            ));
+            // Every caller (put()'s broadcast-skip below, and the tests) discards this body
+            // when is_noop is true, so returning the full stored object here would be a pure
+            // memcpy of the busiest write path in a running cluster for nothing — kubelet
+            // re-PATCHes unchanged pod status ~every 10s per pod.
+            return Ok((*existing_revision, Bytes::new(), false, true, None));
         }
     }
 
@@ -4723,6 +4721,53 @@ mod tests {
             "no watch event may be emitted for a no-op write — a watcher observing an event \
              here (even just a Bookmark) means the flood this fix exists to prevent is still \
              happening"
+        );
+    }
+
+    /// A no-op `put_sync` must return an EMPTY body, not a clone of the existing stored value.
+    ///
+    /// Why it matters: every caller of `put_sync` (`put()`'s broadcast-skip, and this test)
+    /// discards the returned body when `is_noop` is true, so cloning the full stored object
+    /// here is pure churn on the highest-frequency write in a running cluster — kubelet
+    /// re-PATCHes unchanged pod status ~every 10s per pod. If `Bytes::from(existing_value
+    /// .clone())` is reintroduced, this test's `body.is_empty()` assertion catches it even
+    /// though the existing no-op-suppression test above only checks the revision.
+    #[tokio::test]
+    async fn put_sync_no_op_returns_empty_body_not_a_clone_of_existing_value() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/pods/default/steady-pod";
+        let value = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"steady-pod","namespace":"default"},"status":{"phase":"Running"}}"#,
+        );
+        let rv1 = store
+            .put(key, value.clone(), None)
+            .await
+            .expect("create must succeed");
+
+        let conn = store.write_conn.lock().await;
+        let (rv2, body, is_create, is_noop, ns) =
+            put_sync(&conn, key, value, Some(rv1), &store.last_written_revision)
+                .expect("a no-op put must still report success, not error");
+
+        assert!(
+            is_noop,
+            "a semantically-identical rewrite must be detected as a no-op, or this test isn't \
+             exercising the path it's meant to guard"
+        );
+        assert!(!is_create, "an update of an existing key is never a create");
+        assert_eq!(
+            ns, None,
+            "no-op returns are `None` — callers skip sharding a suppressed write"
+        );
+        assert_eq!(
+            rv2, rv1,
+            "a no-op must return the EXISTING revision unchanged"
+        );
+        assert!(
+            body.is_empty(),
+            "a no-op put_sync must return an EMPTY body — returning a clone of the existing \
+             value here (as it used to) means every one of kubelet's routine, unchanged \
+             status re-PATCHes pays a full-object memcpy that no caller ever reads"
         );
     }
 
