@@ -2710,7 +2710,17 @@ async fn complete_cr_finalizer_drain<S: Store>(
         .await
         .map_err(|e| store_err_cr(e, name, kind))?;
     if let Some(namespace) = ns {
-        crate::quota::update_quota_status(state, namespace).await;
+        // Locked so this full-recompute write of status.used can never interleave with a
+        // concurrent record_pod_created/record_pod_removed's incremental read-modify-write of
+        // the same quota in this namespace — both do an unconditional GET-then-PUT with no CAS,
+        // so without a shared lock whichever finishes last silently discards the other's
+        // update. Scoped to just this call (not the maybe_finalize_terminating_namespace call
+        // below, which can itself re-acquire this same per-namespace lock via
+        // purge_namespace_object) to avoid deadlocking on the non-reentrant semaphore.
+        {
+            let _quota_lock = state.quota_admission_locks.lock(namespace).await;
+            crate::quota::update_quota_status(state, namespace).await;
+        }
         crate::handlers::namespaces::maybe_finalize_terminating_namespace(state, namespace).await;
     }
     Ok(())

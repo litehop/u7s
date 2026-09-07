@@ -182,6 +182,21 @@ impl QuotaAdmissionLocks {
             );
         }
     }
+
+    /// Non-blocking peek at whether `namespace`'s lock is currently held by anyone (0 available
+    /// permits) versus free (1) or never yet contended (no entry). Production code has no
+    /// legitimate use for a racy point-in-time read of lock state — this exists solely so a
+    /// test can confirm, from inside a mocked store call, that the calling task is genuinely
+    /// holding this namespace's lock at that exact point, without needing a second real thread
+    /// or timing-based assertion.
+    #[cfg(test)]
+    pub(crate) fn available_permits(&self, namespace: &str) -> usize {
+        let map = self.inner.lock().unwrap();
+        match map.get(namespace) {
+            Some(sem) => sem.available_permits(),
+            None => 1,
+        }
+    }
 }
 
 /// In-memory cache for the 5 admission configuration object sets.
