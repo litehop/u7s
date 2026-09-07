@@ -450,7 +450,8 @@ fn default_limitrange(obj: &mut serde_json::Value) {
     }
 }
 
-/// Default `spec.selector` and `spec.replicas` on a ReplicationController when absent.
+/// Default `spec.selector`, `spec.replicas`, and top-level `metadata.labels` on a
+/// ReplicationController when absent.
 ///
 /// Upstream kube-apiserver defaults RC's `spec.selector` from `spec.template.metadata.labels`
 /// at create time when the caller omits it. The conformance helper `newRC` (test/e2e/apps/rc.go)
@@ -465,6 +466,13 @@ fn default_limitrange(obj: &mut serde_json::Value) {
 /// selector and would re-introduce the empty-match runaway.
 ///
 /// Idempotent: an existing non-null selector is never overwritten.
+///
+/// Upstream `SetDefaults_ReplicationController` (pkg/apis/core/v1/defaults.go) also backfills
+/// the RC's own top-level `metadata.labels` from the template labels when the RC has none.
+/// Without this an RC created with only `spec.template.metadata.labels` set is stored with
+/// empty top-level labels, breaking RC self-introspection (`kubectl get rc --show-labels`) and
+/// label-selector queries against the RC object itself (e.g. a Service or NetworkPolicy
+/// selecting by the RC's own labels).
 fn default_replicationcontroller(obj: &mut serde_json::Value) {
     let mut spec: ReplicationControllerSpec =
         serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
@@ -474,7 +482,7 @@ fn default_replicationcontroller(obj: &mut serde_json::Value) {
     // Default spec.selector from template labels when absent.
     // RC selector is a flat map<string,string> — NOT wrapped in matchLabels.
     if spec.selector.is_none() {
-        if let Some(labels) = template_labels.metadata.labels {
+        if let Some(labels) = template_labels.metadata.labels.clone() {
             spec.selector = Some(labels);
         }
     }
@@ -486,6 +494,19 @@ fn default_replicationcontroller(obj: &mut serde_json::Value) {
 
     obj["spec"] =
         serde_json::to_value(&spec).expect("ReplicationControllerSpec is always serializable");
+
+    // Default the RC's own metadata.labels from the template labels when absent or empty,
+    // mirroring upstream's `if len(obj.Labels) == 0 { obj.Labels = labels }`. An existing
+    // non-empty label map is never overwritten.
+    let has_labels = obj["metadata"]["labels"]
+        .as_object()
+        .is_some_and(|m| !m.is_empty());
+    if !has_labels {
+        if let Some(labels) = template_labels.metadata.labels {
+            obj["metadata"]["labels"] =
+                serde_json::to_value(labels).expect("label map is always serializable");
+        }
+    }
 }
 
 /// Default `spec.leaseTransitions` to `0` on a Lease when absent.
@@ -2553,6 +2574,70 @@ mod tests {
             serde_json::json!({ "app": "my-explicit-selector" }),
             "existing RC spec.selector must not be overwritten — \
              changing it would cause the RC controller to orphan owned pods"
+        );
+    }
+
+    /// An RC with no top-level metadata.labels must have them backfilled from the template
+    /// labels, matching upstream `SetDefaults_ReplicationController`'s `obj.Labels = labels`.
+    ///
+    /// Without this, `kubectl get rc --show-labels` and any Service or NetworkPolicy
+    /// selecting the RC object itself by label find nothing, even though real
+    /// kube-apiserver would have populated the labels.
+    #[test]
+    fn rc_metadata_labels_defaults_from_template_labels() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "name": "my-hostname-basic" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("", "replicationcontrollers", &mut obj);
+
+        assert_eq!(
+            obj["metadata"]["labels"],
+            serde_json::json!({ "name": "my-hostname-basic" }),
+            "RC's own metadata.labels must be backfilled from template labels — \
+             otherwise `kubectl get rc --show-labels` and label-selector queries \
+             against the RC object itself find nothing"
+        );
+    }
+
+    /// An RC with explicit top-level metadata.labels must not have them overwritten by the
+    /// template labels, matching upstream's `if len(obj.Labels) == 0` guard.
+    ///
+    /// Clobbering user-supplied labels would break any Service or NetworkPolicy already
+    /// selecting the RC by those labels.
+    #[test]
+    fn rc_existing_metadata_labels_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": {
+                "name": "test",
+                "namespace": "default",
+                "labels": { "app": "my-explicit-label" }
+            },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "name": "my-hostname-basic" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("", "replicationcontrollers", &mut obj);
+
+        assert_eq!(
+            obj["metadata"]["labels"],
+            serde_json::json!({ "app": "my-explicit-label" }),
+            "existing RC metadata.labels must not be overwritten — \
+             clobbering them would break selectors already matching the RC by its labels"
         );
     }
 
