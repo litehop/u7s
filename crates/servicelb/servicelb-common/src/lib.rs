@@ -153,6 +153,39 @@ pub fn return_authorization(in_main: bool, in_pending: bool) -> ReturnAuthorizat
     }
 }
 
+/// Inbound Geneve-decap membership gate (`servicelb-ebpf`'s
+/// `try_geneve_decap_forward`, step 4). Each node's userspace
+/// controller converges on the same EndpointSlice event at a different
+/// wall-clock time, so a lagging ingress node can stamp a departed pod's IP
+/// into the forward Geneve option; if that IP is reused by a new, unrelated
+/// pod on this node before the lagging ingress notices, DNATing on the
+/// packet's own claim alone would misdeliver to the new pod instead of
+/// dropping. This node's own current record of who serves a front (never
+/// lagged relative to itself) is the only trustworthy source, so the
+/// Geneve-stamped `pod_ip` must match it exactly before delivery proceeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InboundPodGate {
+    /// `pod_ip` matches this node's current record for the front -- proceed
+    /// with DNAT and delivery.
+    Deliver,
+    /// `pod_ip` does not match (or this node has no current record at all
+    /// for the front) -- drop rather than deliver to a pod that may no
+    /// longer be part of this Service.
+    Shot,
+}
+
+/// `packet_pod_ip`: the pod IP the ingress node stamped into the Geneve
+/// option. `current_serving_pod_ip`: this node's own current belief of which
+/// pod serves the front the packet still carries at decap time (`None` if
+/// this node has no record at all -- fails closed, same as a mismatch).
+pub fn gate_inbound_pod(packet_pod_ip: u32, current_serving_pod_ip: Option<u32>) -> InboundPodGate {
+    if current_serving_pod_ip == Some(packet_pod_ip) {
+        InboundPodGate::Deliver
+    } else {
+        InboundPodGate::Shot
+    }
+}
+
 /// Backend source-port remap, on-conflict-only (Decision 3,
 /// `ai/extended-context/ebpf-lb-dataplane.md`). The backend's naive
 /// reverse-flow key `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
@@ -830,6 +863,55 @@ mod tests {
             "MAIN must contain exactly the one flow that was actually promoted via a real \
              return leg -- a flood of {} forward-only tuples must never have written MAIN",
             pending.len()
+        );
+    }
+
+    // Inbound Geneve-decap membership gate: a lagging ingress node replaying
+    // a stale forward pin must degrade to a bounded drop on this node, never
+    // a misdelivery to a live, unrelated pod.
+
+    #[test]
+    fn still_serving_pod_is_delivered() {
+        // The common case a regression here would break first: a live flow
+        // to a pod that is still genuinely serving the front must never be
+        // dropped by this gate.
+        let pod_ip = 0x0a00_a8c0;
+        assert_eq!(
+            gate_inbound_pod(pod_ip, Some(pod_ip)),
+            InboundPodGate::Deliver
+        );
+    }
+
+    #[test]
+    fn departed_pods_ip_reused_by_a_new_pod_is_shot_not_delivered() {
+        // The exact cross-node drift scenario this gate exists to close: a
+        // lagging ingress node stamps a departed pod's IP into the forward
+        // Geneve option, and that IP has since been reused by a new,
+        // unrelated pod this node now believes serves the front instead.
+        // Reverting this gate collapses the check to "delivery always
+        // proceeds", which turns this into a cross-pod packet leak instead
+        // of the required bounded drop.
+        let departed_pod_ip = 0x0a00_a8c0; // stale claim on the packet
+        let new_unrelated_pod_ip = 0x0b00_a8c0; // this node's current record
+        assert_eq!(
+            gate_inbound_pod(departed_pod_ip, Some(new_unrelated_pod_ip)),
+            InboundPodGate::Shot,
+            "a packet claiming a pod_ip this node no longer believes serves the front must be \
+             shot, not delivered to whatever unrelated pod now holds that reused IP"
+        );
+    }
+
+    #[test]
+    fn no_local_record_for_the_front_fails_closed() {
+        // A node with no current record at all for the front (e.g. it never
+        // served it, or its own state has already moved on) must reject
+        // rather than deliver on the packet's unverified claim alone --
+        // `None` is not a wildcard pass.
+        assert_eq!(
+            gate_inbound_pod(0x0a00_a8c0, None),
+            InboundPodGate::Shot,
+            "absence of a local serving record must fail closed, not be treated as an \
+             automatic pass"
         );
     }
 }

@@ -49,9 +49,9 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use u7s_servicelb_common::{
-    encode_tcp_flow_key, forward_admission, ipv4_mapped_v6, occupant_conflicts,
+    encode_tcp_flow_key, forward_admission, gate_inbound_pod, ipv4_mapped_v6, occupant_conflicts,
     resolve_backend_src_port, return_authorization, BackendPortDecision, ForwardAdmission,
-    ReturnAuthorization, TcpFlowKey,
+    InboundPodGate, ReturnAuthorization, TcpFlowKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -101,10 +101,13 @@ const TCP_CSUM: usize = L4_OFF + 16;
 const UDP_CSUM: usize = L4_OFF + 6;
 
 /// One static VIP:PORT -> backend mapping (fixture, populated once by the
-/// userspace loader). Same `VipKey` shape as `TARGET_PORTS` below, but a
-/// separate map -- the two never interact, just key on the same front tuple
-/// for the two different roles that need it (ingress backend selection here,
-/// backend target-port selection there).
+/// userspace loader). Same `VipKey` shape as `TARGET_PORTS` below. Two roles
+/// read it: ingress backend selection (`try_uplink_ingress`) and the
+/// backend/delivery node's own inbound membership gate
+/// (`try_geneve_decap_forward`) -- this node's own copy is the only
+/// lag-free-for-itself record of which pod it currently believes serves a
+/// front, so it doubles as the authoritative check against a Geneve-stamped
+/// `pod_ip` a (possibly cross-node-lagging) ingress node claimed.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VipKey {
@@ -394,18 +397,29 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     let client_port: u16 = ctx.load(L4_SPORT).ok()?;
     let vip_ip: u32 = ctx.load(IP_DST).ok()?; // captured before rewrite
     let vip_port: u16 = ctx.load(L4_DPORT).ok()?; // captured before rewrite
+    let front_key = VipKey {
+        vip_ip,
+        vip_port,
+        proto,
+        _pad: 0,
+    };
+
+    // Cross-node convergence gate: trust THIS node's own
+    // current record of who serves the front, never the ingress node's
+    // Geneve-stamped claim alone -- a lagging ingress can replay a stale pin
+    // carrying a departed pod's IP, and if that IP has been reused by a new,
+    // unrelated pod this node now serves, DNATing on the claim alone would
+    // misdeliver to it instead of dropping (`gate_inbound_pod`'s doc
+    // comment).
+    let current_serving_pod_ip = unsafe { VIP_MAP.get(front_key) }.map(|b| b.pod_ip);
+    if gate_inbound_pod(pod_ip, current_serving_pod_ip) == InboundPodGate::Shot {
+        return Some(TC_ACT_SHOT);
+    }
 
     // Re-keyed off the front the packet still carries at decap time, not the
     // Geneve option's pod IP: the pod IP alone can't tell 80->8080 apart from
     // 443->8443 on the same pod (`TARGET_PORTS`' doc comment).
-    let target_port = *unsafe {
-        TARGET_PORTS.get(VipKey {
-            vip_ip,
-            vip_port,
-            proto,
-            _pad: 0,
-        })
-    }?;
+    let target_port = *unsafe { TARGET_PORTS.get(front_key) }?;
 
     let client_ip_v6 = ipv4_mapped_v6(client_ip);
     let pod_ip_v6 = ipv4_mapped_v6(pod_ip);
