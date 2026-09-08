@@ -50,7 +50,7 @@ use aya_ebpf::{
 };
 use u7s_servicelb_common::{
     encode_tcp_flow_key, forward_admission, ipv4_mapped_v6, occupant_conflicts,
-    resolve_backend_src_port, return_authorization, BackendPortDecision, ForwardAdmission,
+    resolve_backend_src_port_for_flow, return_authorization, BackendPortDecision, ForwardAdmission,
     ReturnAuthorization, TcpFlowKey,
 };
 
@@ -217,6 +217,15 @@ pub struct RevFlowValue {
     pub vip_ip: u32,
     pub vip_port: u16,
     pub original_client_port: u16,
+    /// This flow's committed backend-facing source port (Decision 3) --
+    /// `original_client_port` unchanged when never remapped. Written under
+    /// BOTH the wire key above and this flow's own stable `(VIP, client)`
+    /// key (see `try_geneve_decap_forward`'s `front_key`) so a later packet
+    /// can read the decision back directly instead of re-deriving it via
+    /// `resolve_backend_src_port`'s probe -- re-deriving every packet let an
+    /// LRU eviction of an UNRELATED occupant at an earlier probe index
+    /// commit a different port mid-connection, breaking the reverse path.
+    pub backend_src_port: u16,
 }
 
 #[map]
@@ -432,6 +441,30 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
 
     let client_ip_v6 = ipv4_mapped_v6(client_ip);
     let pod_ip_v6 = ipv4_mapped_v6(pod_ip);
+    let new_front = (ipv4_mapped_v6(vip_ip), vip_port);
+
+    // This real connection's OWN stable identity -- (VIP, client) can never
+    // collide the way the Pod-keyed reverse key below can (Decision 3), so
+    // once this flow has committed a `backend_src_port`, reading it back
+    // here lets every later packet reuse it directly instead of
+    // re-deriving through `resolve_backend_src_port`'s occupancy probe.
+    // Re-deriving every packet was the bug: an unrelated flow's LRU
+    // eviction could free an earlier-probe-index slot between two packets
+    // of THIS flow, and the probe would commit a different port
+    // mid-connection, breaking the reverse path.
+    //
+    // VIP first, client second -- the REVERSE of `try_uplink_ingress`'s and
+    // `try_geneve_decap_return`'s own (client, VIP) `FWD_MAIN`/`FWD_PENDING`
+    // key. Confirmed empirically on this dataplane's own single-VM smoke
+    // fixture: writing this entry into REV_FLOW with the (client, VIP)
+    // field order broke every round trip (the reply never made it back to
+    // the client); swapping the order is enough to make the round trip
+    // pass again with everything else unchanged. Both orderings identify
+    // the same real flow equally well, so this dataplane deliberately never
+    // reuses the (client, VIP) byte layout for a REV_FLOW key.
+    let front_key = encode_tcp_flow_key(new_front.0, new_front.1, client_ip_v6, client_port, proto);
+    let persisted = unsafe { REV_FLOW.get(front_key) }.map(|v| v.backend_src_port);
+
     let natural_rev_key =
         encode_tcp_flow_key(client_ip_v6, client_port, pod_ip_v6, target_port, proto);
 
@@ -451,7 +484,6 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
             v.original_client_port,
         )
     });
-    let new_front = (ipv4_mapped_v6(vip_ip), vip_port);
     // The probe's occupancy check: REV_FLOW itself is the source of truth
     // for which candidate ports are actually free, not a derived guess --
     // a single low-entropy hash of the front address only guaranteed
@@ -473,7 +505,8 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
         });
         occupant_conflicts(occupant, new_front, client_port)
     };
-    let (rev_key, backend_src_port) = match resolve_backend_src_port(
+    let (rev_key, backend_src_port) = match resolve_backend_src_port_for_flow(
+        persisted,
         existing_occupant,
         new_front,
         client_port,
@@ -495,8 +528,13 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
         vip_ip,
         vip_port,
         original_client_port: client_port,
+        backend_src_port,
     };
     REV_FLOW.insert(rev_key, rev_value, 0).ok()?;
+    // Persist the decision under this flow's own stable key too (see
+    // `front_key` above) so the NEXT packet reads it back instead of
+    // re-deriving it -- the fix for the LRU-eviction-reprobe bug.
+    REV_FLOW.insert(front_key, rev_value, 0).ok()?;
 
     // Remap only touches the backend<->Pod segment: the client's real src
     // port is restored by the egress classifier before the packet re-enters

@@ -254,6 +254,42 @@ pub fn resolve_backend_src_port(
     BackendPortDecision::Exhausted
 }
 
+/// Resolves the backend-facing source port for one packet of a flow that
+/// may already have a port committed from an earlier packet (`persisted` --
+/// read back from the flow's own persisted decision, e.g. `servicelb-ebpf`'s
+/// `RevFlowValue::backend_src_port`). `Some` short-circuits straight to that
+/// port with NO probe at all: re-deriving via `resolve_backend_src_port` on
+/// every packet was the bug this closes -- `REV_FLOW` is LRU-evicting, so if
+/// an UNRELATED occupant sitting at an earlier probe index gets evicted
+/// between two packets of this SAME flow, a fresh derive finds that earlier
+/// slot free and commits a DIFFERENT port mid-connection, breaking the
+/// reverse path. Reading the persisted decision back is idempotent by
+/// construction: as long as this flow's own persisted entry survives,
+/// eviction pressure elsewhere can never change its outcome. `None` (first
+/// packet, nothing persisted yet) falls through to `resolve_backend_src_port`
+/// unchanged.
+pub fn resolve_backend_src_port_for_flow(
+    persisted: Option<u16>,
+    existing_occupant: Option<(([u8; 16], u16), u16)>,
+    new_front: ([u8; 16], u16),
+    original_port: u16,
+    is_reverse_key_taken: impl Fn(u16) -> bool,
+) -> BackendPortDecision {
+    if let Some(port) = persisted {
+        return if port == original_port {
+            BackendPortDecision::NoRemap
+        } else {
+            BackendPortDecision::Remap(port)
+        };
+    }
+    resolve_backend_src_port(
+        existing_occupant,
+        new_front,
+        original_port,
+        is_reverse_key_taken,
+    )
+}
+
 /// Whether an occupant already sitting on a candidate reverse key should
 /// count as taken for `resolve_backend_src_port`'s probe (also used for the
 /// natural-key check above it). Identity is `(front, original_client_port)`,
@@ -681,6 +717,104 @@ mod tests {
             port_1, port_b,
             "a distinct conflicting front must not be handed the same synthetic port as an \
              unrelated flow's own committed remap"
+        );
+    }
+
+    #[test]
+    fn persisted_backend_src_port_survives_an_unrelated_lru_eviction_mid_connection() {
+        // The exact bug this fix closes: without a persisted decision,
+        // `resolve_backend_src_port` re-derives from scratch on every
+        // packet by probing REV_FLOW occupancy. If an LRU eviction frees an
+        // UNRELATED occupant sitting at an earlier probe index between two
+        // packets of the SAME flow, that re-derive finds the earlier slot
+        // free and returns a DIFFERENT port -- return traffic for the flow's
+        // ORIGINAL port is then unroutable mid-connection.
+        // `resolve_backend_src_port_for_flow` must ignore probe state
+        // entirely once a decision is persisted, so this scenario can never
+        // change its answer.
+        use std::collections::HashMap;
+
+        let client_src_port = 0x9999u16;
+        let first_writer = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 1])), 6000u16);
+        let front_a = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 30])), 31000u16);
+
+        let seed = synthetic_port_seed(front_a.0, front_a.1);
+        let candidate_at =
+            |i: u16| REMAP_PORT_BASE.wrapping_add(seed.wrapping_add(i) % REMAP_PORT_RANGE);
+        // An unrelated flow's own committed remap, occupying the very FIRST
+        // slot `front_a`'s probe would try.
+        let blocked_port = candidate_at(0);
+        let unrelated_front = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 200])), 7000u16);
+
+        let mut rev_flow: HashMap<u16, (([u8; 16], u16), u16)> = HashMap::new();
+        rev_flow.insert(client_src_port, (first_writer, client_src_port));
+        rev_flow.insert(blocked_port, (unrelated_front, 0x1234));
+
+        // Packet 1: front_a conflicts with first_writer at the natural key;
+        // index 0 is occupied by the unrelated flow, so the probe skips it
+        // and commits a later index, port_x.
+        let decision_1 = resolve_backend_src_port_for_flow(
+            None,
+            Some((first_writer, client_src_port)),
+            front_a,
+            client_src_port,
+            |candidate| {
+                occupant_conflicts(rev_flow.get(&candidate).copied(), front_a, client_src_port)
+            },
+        );
+        let BackendPortDecision::Remap(port_x) = decision_1 else {
+            panic!("expected a remap on front-address conflict, got {decision_1:?}");
+        };
+        assert_ne!(
+            port_x, blocked_port,
+            "fixture invariant broken: port_x must land AFTER the blocked index-0 slot, or \
+             freeing that slot later can't demonstrate the eviction-reprobe bug"
+        );
+        rev_flow.insert(port_x, (front_a, client_src_port));
+
+        // LRU eviction: some unrelated pressure frees the index-0 occupant.
+        // This flow never touched that entry -- it belongs to a completely
+        // different flow.
+        rev_flow.remove(&blocked_port);
+
+        // Sanity check the fixture actually reproduces the reported bug:
+        // re-deriving from scratch against today's REV_FLOW state now lands
+        // back on the newly-freed index-0 slot, NOT port_x.
+        let re_derived = resolve_backend_src_port(
+            Some((first_writer, client_src_port)),
+            front_a,
+            client_src_port,
+            |candidate| {
+                occupant_conflicts(rev_flow.get(&candidate).copied(), front_a, client_src_port)
+            },
+        );
+        assert_eq!(
+            re_derived,
+            BackendPortDecision::Remap(blocked_port),
+            "fixture invariant broken: the freed slot must be the fresh derivation's new answer, \
+             or this test doesn't actually exercise the eviction-reprobe bug"
+        );
+
+        // Packet 2 of the SAME flow, with the persisted decision passed
+        // through (as `servicelb-ebpf` reads back from
+        // `RevFlowValue::backend_src_port`): must still resolve to port_x,
+        // not the freed earlier slot. This is the assertion that fails if
+        // the fix is reverted to always calling `resolve_backend_src_port`.
+        let decision_2 = resolve_backend_src_port_for_flow(
+            Some(port_x),
+            Some((first_writer, client_src_port)),
+            front_a,
+            client_src_port,
+            |candidate| {
+                occupant_conflicts(rev_flow.get(&candidate).copied(), front_a, client_src_port)
+            },
+        );
+        assert_eq!(
+            decision_2,
+            BackendPortDecision::Remap(port_x),
+            "an unrelated LRU eviction changed this flow's resolved port mid-connection -- \
+             reverse-path traffic for the ORIGINAL port_x is now unroutable because the \
+             persisted decision was ignored and the port was re-derived from scratch"
         );
     }
 
