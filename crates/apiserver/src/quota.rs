@@ -58,6 +58,18 @@ fn quota_resource_to_group_plural(resource: &str) -> Option<(&'static str, &'sta
     }
 }
 
+/// Parse a `count/<plural>.<group>` quota resource name that ISN'T one of the static
+/// built-ins above — a CRD-backed resource (e.g. `count/widgets.example.com`) or any other
+/// unregistered `count/*` entry. Splits on the FIRST dot after the `count/` prefix, not the
+/// last, since CRD groups are domain-like and may contain their own dots (`example.com`,
+/// `resource.k8s.io`) while a plural resource name never does — see `resource_group_matches`
+/// for the matching-direction analog of this same asymmetry.
+fn generic_count_group_plural(resource_name: &str) -> Option<(&str, &str)> {
+    let suffix = resource_name.strip_prefix("count/")?;
+    let (plural, group) = suffix.split_once('.')?;
+    Some((group, plural))
+}
+
 /// Parse a resource quantity string as a whole integer count.
 /// Quota hard limits for object counts are always plain integers.
 fn parse_count(s: &str) -> Option<u64> {
@@ -427,14 +439,9 @@ async fn sum_service_quota_units<S: Store>(store: &S, namespace: &str, resource:
 /// is never both, so this is safe — without the fallback, a `count/<crd>.<group>` quota's
 /// admission check always saw 0 existing CRs (the built-in prefix is structurally never
 /// populated for CRD-backed resources), so the hard limit could never trigger.
-async fn count_objects<S: Store>(
-    state: &AppState<S>,
-    namespace: &str,
-    group: &str,
-    plural: &str,
-) -> u64 {
+async fn count_objects<S: Store>(store: &S, namespace: &str, group: &str, plural: &str) -> u64 {
     let prefix = group_list_prefix(group, plural, Some(namespace));
-    let count = match state.store.list(&prefix, ListOptions::default()).await {
+    let count = match store.list(&prefix, ListOptions::default()).await {
         Ok(resp) => resp.items.len() as u64,
         Err(e) => {
             tracing::warn!("quota: failed to count {plural} in {namespace}: {e}");
@@ -445,7 +452,7 @@ async fn count_objects<S: Store>(
         return count;
     }
     let cr_prefix = crate::handlers::cr::cr_list_prefix(group, plural, Some(namespace));
-    match state.store.list(&cr_prefix, ListOptions::default()).await {
+    match store.list(&cr_prefix, ListOptions::default()).await {
         Ok(resp) => resp.items.len() as u64,
         Err(e) => {
             tracing::warn!("quota: failed to count CR {plural} in {namespace}: {e}");
@@ -698,7 +705,7 @@ async fn pod_count_baseline<S: Store>(
     if quota_has_pod_scopes(quota) {
         count_scope_filtered_pods(&*state.store, namespace, quota).await
     } else {
-        count_objects(state, namespace, "", "pods").await
+        count_objects(&*state.store, namespace, "", "pods").await
     }
 }
 
@@ -753,7 +760,7 @@ async fn pod_count_new_value<S: Store>(
             if quota_has_pod_scopes(quota) {
                 count_scope_filtered_pods(&*state.store, namespace, quota).await
             } else {
-                count_objects(state, namespace, "", "pods").await
+                count_objects(&*state.store, namespace, "", "pods").await
             }
         }
     }
@@ -783,9 +790,11 @@ async fn pod_resource_milli_new_value<S: Store>(
 
 /// Compute live usage counts for all hard-limit entries in a single ResourceQuota object.
 ///
-/// Returns a map from quota resource name (e.g. `"pods"`, `"count/deployments.apps"`) to
-/// a string count (e.g. `"3"`). Only entries whose resource name is known to
-/// `quota_resource_to_group_plural` are counted; unknown entries are omitted.
+/// Returns a map from quota resource name (e.g. `"pods"`, `"count/deployments.apps"`,
+/// `"count/widgets.example.com"`) to a string count (e.g. `"3"`). Entries known to
+/// `quota_resource_to_group_plural` use that mapping; any other `count/<plural>.<group>`
+/// entry (CRD-backed resources) falls back to `generic_count_group_plural`. Anything else
+/// is omitted.
 ///
 /// Pod resources are scope-filtered using `quota["spec"]["scopes"]` so that a
 /// Terminating-scoped quota does not count non-terminating pods (and vice versa).
@@ -826,6 +835,14 @@ pub async fn count_quota_usage<S: Store>(
                     }
                 }
             };
+            used.insert(resource_name.clone(), count.to_string());
+        } else if let Some((group, plural)) = generic_count_group_plural(resource_name) {
+            // CRD-backed (or otherwise unregistered) count/* entry: quota_resource_to_group_plural
+            // has no static mapping for it, but the resource name itself carries the (plural,
+            // group) pair. Without this branch, `used` never gets an entry for it at all — a
+            // ResourceQuota watching a CRD-backed resource sticks at status.used == {} forever,
+            // no matter how many custom resources are created against it.
+            let count = count_objects(store, namespace, group, plural).await;
             used.insert(resource_name.clone(), count.to_string());
         } else if let Some((field, resource_key)) = quota_to_pod_resource(resource_name) {
             let format = quantity_format_type(resource_name);
@@ -1350,7 +1367,7 @@ pub async fn check_resource_quota<S: Store>(
                     let current = if count_group.is_empty() && count_plural == "pods" {
                         pod_count_baseline(state, namespace, quota, quota_resource).await
                     } else {
-                        count_objects(state, namespace, count_group, count_plural).await
+                        count_objects(&*state.store, namespace, count_group, count_plural).await
                     };
                     if current >= hard_limit {
                         tracing::debug!(
@@ -2696,6 +2713,69 @@ mod tests {
             Some("0"),
             "status.used.pods must decrement to 0 after the pod is hard-deleted — \
              stale counts prevent new pods from being created when the quota is tight"
+        );
+    }
+
+    /// `count/<crd>.<group>` isn't in `quota_resource_to_group_plural`'s static table — without
+    /// `generic_count_group_plural`'s fallback, `count_quota_usage` silently omits this key from
+    /// `used` entirely (not even "0"), so `update_quota_status` never writes status.used for a
+    /// CRD-backed quota no matter how many custom resources exist. Reproduces upstream's "should
+    /// create a ResourceQuota and capture the life of a custom resource": the quota's status
+    /// never advances past its initial empty state.
+    #[tokio::test]
+    async fn update_quota_status_reflects_crd_count_quota_via_generic_fallback() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "crd-quota", "namespace": "default" },
+            "spec": { "hard": { "count/widgets.example.com": "10" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/crd-quota", quota).await;
+
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/crd-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["count/widgets.example.com"].as_str(),
+            Some("0"),
+            "status.used must have an explicit 0 entry for a CRD-backed count quota with no \
+             custom resources yet — an absent entry means the generic count/<crd>.<group> \
+             fallback was never reached"
+        );
+
+        // Seed a CR under the CR keyspace (not the built-in one — see count_objects) →
+        // used must become "1".
+        seed(
+            &state,
+            "/registry/cr/example.com/widgets/default/widget-1",
+            json!({
+                "apiVersion": "example.com/v1",
+                "kind": "Widget",
+                "metadata": { "name": "widget-1", "namespace": "default" }
+            }),
+        )
+        .await;
+
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/crd-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["count/widgets.example.com"].as_str(),
+            Some("1"),
+            "status.used must count a custom resource stored in the CR keyspace — this is the \
+             field the e2e spec 'capture the life of a custom resource' polls"
         );
     }
 

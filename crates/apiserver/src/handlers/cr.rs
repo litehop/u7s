@@ -3472,6 +3472,17 @@ pub async fn create_cr_namespaced<S: Store>(
         }
     };
 
+    // ResourceQuota: refresh status.used so a `count/<crd>.<group>` quota's usage reflects
+    // this create. check_resource_quota above only *admits* the request against the
+    // pre-create count — without this, a quota watching a CRD-backed resource never
+    // advances past 0 no matter how many CRs are created, and a subsequent create that
+    // should be denied at the hard limit is wrongly admitted instead.
+    // Unlike update_quota_status's other call sites, this one needs no separate lock: the
+    // check-then-write `_quota_lock` acquired above is still held here (dropped only at this
+    // function's return), so this full-recompute write is already serialized against any
+    // concurrent record_pod_created/record_pod_removed for the same namespace.
+    crate::quota::update_quota_status(&state, &ns).await;
+
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.resource_version = Some(rv.to_string());
@@ -3746,6 +3757,19 @@ pub async fn delete_cr_namespaced<S: Store>(
     // KCM's GC controller + patch_cr_namespaced's finalizer-drain-complete check.
     if !owner_uid.is_empty() {
         cascade_delete_cr_dependents(&state, &owner_uid).await;
+    }
+
+    // ResourceQuota: refresh status.used so a `count/<crd>.<group>` quota's usage reflects
+    // this delete (and any cascaded dependents, which the recompute above already covers
+    // since they were removed from the store before this runs). Without this, a quota
+    // watching a CRD-backed resource sticks at its old count forever once a CR is deleted,
+    // permanently blocking new creates once the hard limit was ever reached. Locked so this
+    // full-recompute write can never interleave with a concurrent record_pod_created/
+    // record_pod_removed's incremental read-modify-write of the same quota — see
+    // complete_finalizer_drain's identical lock (resource.rs) for why.
+    {
+        let _quota_lock = state.quota_admission_locks.lock(&ns).await;
+        crate::quota::update_quota_status(&state, &ns).await;
     }
 
     Ok(Json(serde_json::json!({
@@ -22041,6 +22065,89 @@ mod tests {
             "dryRun=All in the DeleteOptions body must NOT delete the CR — if this fails, \
              delete_cr_namespaced's dry-run guard was removed and the CR was actually deleted \
              from the store"
+        );
+    }
+
+    /// A ResourceQuota watching a CRD-backed resource via `count/<crd>.<group>` must track
+    /// the full create -> delete lifecycle of a custom resource — this is exactly what the
+    /// upstream e2e spec "should create a ResourceQuota and capture the life of a custom
+    /// resource" polls for. Before this fix, create_cr_namespaced/delete_cr_namespaced never
+    /// called update_quota_status at all, so status.used never advanced past whatever it was
+    /// (usually unset) regardless of how many custom resources were created or deleted.
+    #[tokio::test]
+    async fn cr_create_and_delete_updates_count_quota_status_used() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let quota_key = "/registry/resourcequotas/argocd/cr-quota";
+        state
+            .store
+            .put(
+                quota_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ResourceQuota",
+                        "metadata": { "name": "cr-quota", "namespace": "argocd" },
+                        "spec": { "hard": { "count/applications.argoproj.io": "1" } }
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "quota-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed under the quota's hard limit of 1"
+        );
+
+        let stored = state.store.get(quota_key).await.unwrap().unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["count/applications.argoproj.io"].as_str(),
+            Some("1"),
+            "status.used must reflect the just-created custom resource — if \
+             create_cr_namespaced stops calling update_quota_status, this stays unset/stale \
+             and the e2e spec's poll for 'used: 1' times out"
+        );
+
+        assert!(
+            delete_cr_namespaced(
+                State(state.clone()),
+                Path((group, version, ns, plural, name)),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await
+            .is_ok(),
+            "delete must succeed"
+        );
+
+        let stored = state.store.get(quota_key).await.unwrap().unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["count/applications.argoproj.io"].as_str(),
+            Some("0"),
+            "status.used must decrement back to 0 after the custom resource is deleted — if \
+             delete_cr_namespaced stops calling update_quota_status, the quota sticks at 1 \
+             forever, permanently blocking any future create once the hard limit was ever hit"
         );
     }
 }
