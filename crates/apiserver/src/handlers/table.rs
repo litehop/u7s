@@ -154,8 +154,8 @@ fn pod_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let status: PodStatusView = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
-    let spec: PodSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let status: PodStatusView = PodStatusView::deserialize(&obj["status"]).unwrap_or_default();
+    let spec: PodSpecView = PodSpecView::deserialize(&obj["spec"]).unwrap_or_default();
 
     let phase = status.phase.as_deref().unwrap_or("Unknown");
 
@@ -303,8 +303,8 @@ fn node_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let status: NodeStatusView = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
-    let spec: NodeSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let status: NodeStatusView = NodeStatusView::deserialize(&obj["status"]).unwrap_or_default();
+    let spec: NodeSpecView = NodeSpecView::deserialize(&obj["spec"]).unwrap_or_default();
 
     // STATUS
     let ready_condition = status
@@ -483,9 +483,9 @@ fn deployment_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let spec: WorkloadSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let spec: WorkloadSpecView = WorkloadSpecView::deserialize(&obj["spec"]).unwrap_or_default();
     let status: ReplicaStatusView =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+        ReplicaStatusView::deserialize(&obj["status"]).unwrap_or_default();
 
     let desired = spec.replicas.unwrap_or(0);
     let ready = status.ready_replicas.unwrap_or(0);
@@ -572,9 +572,9 @@ fn service_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let spec: ServiceSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let spec: ServiceSpecView = ServiceSpecView::deserialize(&obj["spec"]).unwrap_or_default();
     let status: ServiceStatusView =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+        ServiceStatusView::deserialize(&obj["status"]).unwrap_or_default();
 
     let svc_type = spec.type_.unwrap_or_else(|| "<none>".to_string());
     let cluster_ip = spec.cluster_ip.unwrap_or_else(|| "<none>".to_string());
@@ -649,9 +649,9 @@ fn replicaset_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let spec: WorkloadSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let spec: WorkloadSpecView = WorkloadSpecView::deserialize(&obj["spec"]).unwrap_or_default();
     let status: ReplicaStatusView =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+        ReplicaStatusView::deserialize(&obj["status"]).unwrap_or_default();
 
     let desired = spec.replicas.unwrap_or(0);
     let current = status.replicas.unwrap_or(0);
@@ -691,9 +691,9 @@ fn statefulset_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let spec: WorkloadSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let spec: WorkloadSpecView = WorkloadSpecView::deserialize(&obj["spec"]).unwrap_or_default();
     let status: ReplicaStatusView =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+        ReplicaStatusView::deserialize(&obj["status"]).unwrap_or_default();
 
     let desired = spec.replicas.unwrap_or(0);
     let ready = status.ready_replicas.unwrap_or(0);
@@ -757,8 +757,8 @@ fn daemonset_row(obj: serde_json::Value) -> serde_json::Value {
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
     let status: DaemonSetStatusView =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
-    let spec: DaemonSetSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+        DaemonSetStatusView::deserialize(&obj["status"]).unwrap_or_default();
+    let spec: DaemonSetSpecView = DaemonSetSpecView::deserialize(&obj["spec"]).unwrap_or_default();
     let node_selector = label_map_to_string(spec.template.spec.node_selector.as_ref());
 
     let object_ref = make_object_ref(&obj, "DaemonSet");
@@ -804,7 +804,7 @@ fn namespace_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
     let status: NamespaceStatusView =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+        NamespaceStatusView::deserialize(&obj["status"]).unwrap_or_default();
     let status = status.phase.unwrap_or_else(|| "<none>".to_string());
     let object_ref = make_object_ref(&obj, "Namespace");
     serde_json::json!({
@@ -843,7 +843,7 @@ fn configmap_row(obj: serde_json::Value) -> serde_json::Value {
     let meta = parse_metadata(&obj);
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
-    let fields: ConfigMapDataView = serde_json::from_value(obj.clone()).unwrap_or_default();
+    let fields: ConfigMapDataView = ConfigMapDataView::deserialize(&obj).unwrap_or_default();
     let data_count = fields.data.map(|m| m.len()).unwrap_or(0)
         + fields.binary_data.map(|m| m.len()).unwrap_or(0);
     let object_ref = make_object_ref(&obj, "ConfigMap");
@@ -883,7 +883,7 @@ fn secret_row(obj: serde_json::Value) -> serde_json::Value {
     let meta = parse_metadata(&obj);
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
-    let fields: SecretDataView = serde_json::from_value(obj.clone()).unwrap_or_default();
+    let fields: SecretDataView = SecretDataView::deserialize(&obj).unwrap_or_default();
     let secret_type = fields.type_.unwrap_or_else(|| "<none>".to_string());
     let data_count = fields.data.map(|m| m.len()).unwrap_or(0);
     let object_ref = make_object_ref(&obj, "Secret");
@@ -921,7 +921,7 @@ fn serviceaccount_row(obj: serde_json::Value) -> serde_json::Value {
     let meta = parse_metadata(&obj);
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
-    let fields: ServiceAccountView = serde_json::from_value(obj.clone()).unwrap_or_default();
+    let fields: ServiceAccountView = ServiceAccountView::deserialize(&obj).unwrap_or_default();
     let object_ref = make_object_ref(&obj, "ServiceAccount");
     serde_json::json!({
         "cells": [name, fields.secrets.len() as i64, age],
@@ -969,9 +969,8 @@ fn job_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let job_status: JobStatusView =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
-    let job_spec: JobSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let job_status: JobStatusView = JobStatusView::deserialize(&obj["status"]).unwrap_or_default();
+    let job_spec: JobSpecView = JobSpecView::deserialize(&obj["spec"]).unwrap_or_default();
 
     let completion_time = job_status.completion_time.as_deref();
     let start_time = job_status.start_time.as_deref();
@@ -1064,9 +1063,9 @@ fn cronjob_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let spec: CronJobSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let spec: CronJobSpecView = CronJobSpecView::deserialize(&obj["spec"]).unwrap_or_default();
     let status: CronJobStatusView =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+        CronJobStatusView::deserialize(&obj["status"]).unwrap_or_default();
 
     let schedule = spec.schedule.unwrap_or_else(|| "<none>".to_string());
     let timezone = spec.time_zone.unwrap_or_else(|| "<none>".to_string());
@@ -1145,8 +1144,8 @@ fn pvc_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let spec: PvcSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
-    let status: PvcStatusView = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let spec: PvcSpecView = PvcSpecView::deserialize(&obj["spec"]).unwrap_or_default();
+    let status: PvcStatusView = PvcStatusView::deserialize(&obj["status"]).unwrap_or_default();
 
     // Upstream only reports the bound volume's actual capacity/access modes once
     // spec.volumeName is set; before binding it must stay blank, not the request size.
@@ -1274,8 +1273,8 @@ fn pv_row(obj: serde_json::Value) -> serde_json::Value {
     let name = meta.name.clone().unwrap_or_default();
     let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let spec: PvSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
-    let status: PvStatusView = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let spec: PvSpecView = PvSpecView::deserialize(&obj["spec"]).unwrap_or_default();
+    let status: PvStatusView = PvStatusView::deserialize(&obj["status"]).unwrap_or_default();
 
     let capacity = spec
         .capacity
@@ -1382,7 +1381,7 @@ fn generic_row(obj: serde_json::Value) -> serde_json::Value {
 /// Deserialize `obj.metadata` once per row via the shared `ObjectMeta` type instead of
 /// every kind repeating its own raw `obj["metadata"]["name"]`/`["creationTimestamp"]` walk.
 fn parse_metadata(obj: &serde_json::Value) -> ObjectMeta {
-    serde_json::from_value(obj["metadata"].clone()).unwrap_or_default()
+    ObjectMeta::deserialize(&obj["metadata"]).unwrap_or_default()
 }
 
 fn label_map_to_string(labels: Option<&BTreeMap<String, String>>) -> String {

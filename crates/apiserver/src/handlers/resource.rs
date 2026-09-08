@@ -5,6 +5,7 @@ use axum::{
     Extension, Json,
 };
 use bytes::Bytes;
+use serde::Deserialize;
 use u7s_store::{CreateNamespacedError, ListOptions, Store, StoreError};
 
 use crate::admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext};
@@ -1170,7 +1171,7 @@ pub(crate) async fn delete_resource<S: Store>(
 /// handler that applies that update must notice this and hard-delete instead of storing the
 /// update, or the object stays stuck Terminating forever.
 pub(crate) fn finalizer_drain_complete(body: &serde_json::Value) -> bool {
-    let meta: ObjectMeta = serde_json::from_value(body["metadata"].clone()).unwrap_or_default();
+    let meta: ObjectMeta = ObjectMeta::deserialize(&body["metadata"]).unwrap_or_default();
     let deletion_ts_set = meta.deletion_timestamp.is_some();
     let finalizers_empty = meta
         .finalizers
@@ -1330,7 +1331,7 @@ pub(crate) async fn do_patch<S: Store>(
         // Strip any managedFields the client sent — we don't track field ownership.
         strip_managed_fields(&mut obj.body);
         let mut obj_meta: ObjectMeta =
-            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+            ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         obj_meta.name = Some(name.to_string());
         if let Some(namespace) = ns {
             obj_meta.namespace = Some(namespace.to_string());
@@ -1904,7 +1905,7 @@ pub(crate) async fn do_patch<S: Store>(
         // skips any Endpoints that carry it, blocking EndpointSliceMirroring.
         if plural == "endpoints" {
             let mut patch_meta: ObjectMeta =
-                serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
+                ObjectMeta::deserialize(&current.body["metadata"]).unwrap_or_default();
             if let Some(ref mut annotations) = patch_meta.annotations {
                 annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
             }
@@ -2888,7 +2889,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         };
 
     let mut ns_meta: ObjectMeta =
-        serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
     ns_meta.namespace = Some(ns.clone());
     obj.body["metadata"] =
         serde_json::to_value(ns_meta).map_err(|e| Status::internal(e.to_string()))?;
@@ -3633,7 +3634,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // this annotation, so leaving it causes EndpointSliceMirroring to produce no slice.
     if plural == "endpoints" {
         let mut put_meta: ObjectMeta =
-            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+            ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         if let Some(ref mut annotations) = put_meta.annotations {
             annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
         }
@@ -4795,7 +4796,7 @@ async fn strip_or_delete_dependent<S: Store>(
                 return false;
             }
         };
-        let meta: ObjectMeta = match serde_json::from_value(obj["metadata"].clone()) {
+        let meta: ObjectMeta = match ObjectMeta::deserialize(&obj["metadata"]) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("cascade-delete {label}: corrupt metadata: {e}");

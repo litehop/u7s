@@ -1146,7 +1146,7 @@ pub(crate) async fn prepare_webhook_call<S: Store>(
     client_config: &serde_json::Value,
     webhook_name: &str,
 ) -> Result<(String, reqwest::Client), String> {
-    let config: WebhookClientConfig = serde_json::from_value(client_config.clone())
+    let config: WebhookClientConfig = WebhookClientConfig::deserialize(client_config)
         .map_err(|e| format!("invalid clientConfig: {e}"))?;
     let target = webhook_url(state, &config, webhook_name).await?;
     let (effective_proxy, effective_identity) = match &target {
@@ -3338,10 +3338,8 @@ pub async fn run_cel_mutating_policies<S: Store>(
             ["namespaceSelector"]
             .as_object()
             .and_then(|_| {
-                serde_json::from_value(
-                    binding["spec"]["matchResources"]["namespaceSelector"].clone(),
-                )
-                .ok()
+                LabelSelector::deserialize(&binding["spec"]["matchResources"]["namespaceSelector"])
+                    .ok()
             });
         if binding_ns_selector.is_some() {
             match ctx.namespace {
@@ -3683,10 +3681,8 @@ async fn run_validating_admission_policies<S: Store>(
             ["namespaceSelector"]
             .as_object()
             .and_then(|_| {
-                serde_json::from_value(
-                    binding["spec"]["matchResources"]["namespaceSelector"].clone(),
-                )
-                .ok()
+                LabelSelector::deserialize(&binding["spec"]["matchResources"]["namespaceSelector"])
+                    .ok()
             });
         if binding_ns_selector.is_some() {
             match ctx.namespace {

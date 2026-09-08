@@ -21,6 +21,7 @@ use axum::{
     Extension,
 };
 use bytes::Bytes;
+use serde::Deserialize;
 use x509_cert::der::{asn1::Any, Decode as _, Tag, Tagged as _};
 
 use u7s_store::Store;
@@ -57,7 +58,7 @@ const MAX_TRUST_BUNDLE_SIZE: usize = 1024 * 1024;
 pub(crate) fn validate_cluster_trust_bundle_spec(
     body: &serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
-    let spec: ClusterTrustBundleSpec = serde_json::from_value(body["spec"].clone())
+    let spec: ClusterTrustBundleSpec = ClusterTrustBundleSpec::deserialize(&body["spec"])
         .map_err(|e| {
             Status::unprocessable_entity(format!(
                 "spec.trustBundle is required and must be a PEM bundle of X.509 CA certificates: {e}"
@@ -230,8 +231,8 @@ pub(crate) async fn delete_collection_cluster_trust_bundles<S: Store>(
 pub(crate) fn validate_pod_certificate_request_spec(
     body: &serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
-    let spec: PodCertificateRequestSpec =
-        serde_json::from_value(body["spec"].clone()).map_err(|e| {
+    let spec: PodCertificateRequestSpec = PodCertificateRequestSpec::deserialize(&body["spec"])
+        .map_err(|e| {
             Status::unprocessable_entity(format!(
                 "spec.signerName, spec.podName, spec.podUID, spec.serviceAccountName, \
                  spec.serviceAccountUID, spec.nodeName, and spec.nodeUID are all required: {e}"

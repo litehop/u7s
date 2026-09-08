@@ -729,7 +729,8 @@ fn resolve_cr_metadata(
     kind: &str,
 ) -> Result<(), crate::status::StatusError> {
     let stored_meta: crate::types::ObjectMeta =
-        serde_json::from_value(stored["metadata"].clone()).unwrap_or_default();
+        <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&stored["metadata"])
+            .unwrap_or_default();
     let mut incoming_meta: crate::types::ObjectMeta =
         serde_json::from_value(incoming["metadata"].take()).unwrap_or_default();
     let incoming_uid_blank = incoming_meta
@@ -2496,7 +2497,8 @@ pub async fn replace_cr<S: Store>(
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let obj_meta: crate::types::ObjectMeta =
-        serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&obj["metadata"])
+            .unwrap_or_default();
     let obj_name = obj_meta.name.as_deref().unwrap_or("").to_string();
     if obj_name != name {
         return Err(Status::bad_request(format!(
@@ -3516,7 +3518,8 @@ pub async fn replace_cr_namespaced<S: Store>(
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let obj_meta: crate::types::ObjectMeta =
-        serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&obj["metadata"])
+            .unwrap_or_default();
     let obj_name = obj_meta.name.as_deref().unwrap_or("").to_string();
     if obj_name != name {
         return Err(Status::bad_request(format!(
@@ -4497,7 +4500,8 @@ pub async fn put_cr_status<S: Store>(
     }
 
     let incoming_meta: crate::types::ObjectMeta =
-        serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();
+        <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&incoming["metadata"])
+            .unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
