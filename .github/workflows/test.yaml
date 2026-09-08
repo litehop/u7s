@@ -144,6 +144,17 @@ jobs:
         working-directory: crates/servicelb
         run: cargo clippy --tests -- -D warnings
 
+      # Neither `cargo test --workspace` (root) nor the fmt/clippy steps above
+      # run servicelb-common's host unit/regression tests -- the root
+      # workspace excludes crates/servicelb entirely, and clippy only lints.
+      # A bare `cargo test` here also wouldn't reach it: crates/servicelb's
+      # workspace_default_members is only u7s-servicelb, so servicelb-common
+      # needs an explicit -p. Without this step, a servicelb-common
+      # regression test can be broken or reverted with nothing in CI to catch it.
+      - name: Test (servicelb-common)
+        working-directory: crates/servicelb
+        run: cargo test -p u7s-servicelb-common
+
       # servicelb-ebpf is #![no_std] and only builds for bpfel-unknown-none;
       # clippy needs the same target + build-std the real build uses, run
       # separately from its own directory (u7s-servicelb's own clippy run
@@ -162,9 +173,9 @@ jobs:
   # on ubuntu-latest (amd64, no Lima/cross-build) in ~70s. Own job, not
   # folded into ebpf-build above, since it exercises the loaded runtime
   # (verifier + dataplane + eBPF map memory) rather than just compilation.
-  # Asserts the discovered map set is EXACTLY the 6 known servicelb maps
+  # Asserts the discovered map set is EXACTLY the 8 known servicelb maps
   # (catches partial-discovery regressions a byte-sum-only check would miss:
-  # e.g. finding only 5 of 6 maps still sums to a smaller, still-passing
+  # e.g. finding only 7 of 8 maps still sums to a smaller, still-passing
   # total) and that their summed bytes_memlock stays under a gross-regression
   # ceiling (measured with pa0ze's Phase-3 8192-entry LRU_HASH conntrack maps,
   # #1567: ~1.82 MiB preallocated and constant regardless of flow count for
@@ -238,7 +249,7 @@ jobs:
             --pin-dir /sys/fs/bpf/servicelb-smoke \
             --out-dir /tmp/servicelb-ebpf-memory-assert
 
-      - name: Assert the discovered map set is exactly the 6 known servicelb maps, under the gross-regression byte ceiling
+      - name: Assert the discovered map set is exactly the 8 known servicelb maps, under the gross-regression byte ceiling
         run: bash scripts/servicelb/assert-ebpf-map-memory.sh /tmp/servicelb-ebpf-memory-assert/ebpf-map-memory.csv
 
       - name: Cleanup
