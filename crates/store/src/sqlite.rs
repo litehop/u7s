@@ -1530,9 +1530,15 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
     let upper = prefix_upper_bound(prefix);
     let ck = opts.continue_key.as_deref().unwrap_or("");
 
-    // When limit is set with no field selector, use SQL-level pagination (fetch limit+1).
-    // When a field selector is present, collect all matching rows then paginate in memory,
-    // because in-memory filtering may discard rows between the cursor and the limit boundary.
+    // When limit is set, push SQL-level pagination (fetch limit+1) for every branch whose
+    // predicate SQLite can evaluate directly against an index (no selector, metadata.name,
+    // metadata.namespace, spec.nodeName-on-pods). The generic dot-path field-selector branch
+    // still collects all matching rows before paginating in memory, because it filters in
+    // Rust (json_path_equals) after the query and SQL cannot know how many rows will survive
+    // the predicate.
+    let limit = clamp_list_limit(opts.limit);
+    let fetch_limit = limit.map(|l| (l + 1) as i64);
+
     let (items, continue_key) = match &opts.field_selector {
         // SQL index fast-path: metadata.name=<value> — uses idx_name index.
         Some(FieldSelector {
@@ -1541,37 +1547,62 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
             negated: false,
         }) if field == "metadata.name" => {
             let raw = if upper.is_empty() {
-                if ck.is_empty() {
-                    query_all(
+                match (ck.is_empty(), fetch_limit) {
+                    (true, None) => query_all(
                         conn,
                         "SELECT key, value, revision FROM objects \
                          WHERE key >= ?1 AND obj_name = ?2 ORDER BY key ASC",
                         &[&prefix, value as &dyn rusqlite::ToSql],
-                    )?
-                } else {
-                    query_all(
+                    )?,
+                    (true, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND obj_name = ?2 ORDER BY key ASC LIMIT ?3",
+                        &[&prefix, value as &dyn rusqlite::ToSql, &lim],
+                    )?,
+                    (false, None) => query_all(
                         conn,
                         "SELECT key, value, revision FROM objects \
                          WHERE key >= ?1 AND obj_name = ?2 AND key > ?3 ORDER BY key ASC",
                         &[&prefix, value as &dyn rusqlite::ToSql, &ck],
-                    )?
+                    )?,
+                    (false, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND obj_name = ?2 AND key > ?3 ORDER BY key ASC LIMIT ?4",
+                        &[&prefix, value as &dyn rusqlite::ToSql, &ck, &lim],
+                    )?,
                 }
-            } else if ck.is_empty() {
-                query_all(
-                    conn,
-                    "SELECT key, value, revision FROM objects \
-                     WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 ORDER BY key ASC",
-                    &[&prefix, &upper, value as &dyn rusqlite::ToSql],
-                )?
             } else {
-                query_all(
-                    conn,
-                    "SELECT key, value, revision FROM objects \
-                     WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 AND key > ?4 ORDER BY key ASC",
-                    &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck],
-                )?
+                match (ck.is_empty(), fetch_limit) {
+                    (true, None) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 ORDER BY key ASC",
+                        &[&prefix, &upper, value as &dyn rusqlite::ToSql],
+                    )?,
+                    (true, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 ORDER BY key ASC LIMIT ?4",
+                        &[&prefix, &upper, value as &dyn rusqlite::ToSql, &lim],
+                    )?,
+                    (false, None) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 AND key > ?4 ORDER BY key ASC",
+                        &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck],
+                    )?,
+                    (false, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 AND key > ?4 ORDER BY key ASC \
+                         LIMIT ?5",
+                        &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck, &lim],
+                    )?,
+                }
             };
-            paginate_in_memory(raw, opts.limit)
+            paginate_in_memory(raw, limit)
         }
 
         // SQL index fast-path: metadata.namespace=<value> — uses idx_ns index.
@@ -1588,40 +1619,68 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
             negated: false,
         }) if field == "metadata.namespace" => {
             let raw = if upper.is_empty() {
-                if ck.is_empty() {
-                    query_all(
+                match (ck.is_empty(), fetch_limit) {
+                    (true, None) => query_all(
                         conn,
                         "SELECT key, value, revision FROM objects \
                          WHERE key >= ?1 AND (ns = ?2 OR (?2 = '' AND ns IS NULL)) ORDER BY key ASC",
                         &[&prefix, value as &dyn rusqlite::ToSql],
-                    )?
-                } else {
-                    query_all(
+                    )?,
+                    (true, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND (ns = ?2 OR (?2 = '' AND ns IS NULL)) ORDER BY key ASC \
+                         LIMIT ?3",
+                        &[&prefix, value as &dyn rusqlite::ToSql, &lim],
+                    )?,
+                    (false, None) => query_all(
                         conn,
                         "SELECT key, value, revision FROM objects \
                          WHERE key >= ?1 AND (ns = ?2 OR (?2 = '' AND ns IS NULL)) AND key > ?3 \
                          ORDER BY key ASC",
                         &[&prefix, value as &dyn rusqlite::ToSql, &ck],
-                    )?
+                    )?,
+                    (false, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND (ns = ?2 OR (?2 = '' AND ns IS NULL)) AND key > ?3 \
+                         ORDER BY key ASC LIMIT ?4",
+                        &[&prefix, value as &dyn rusqlite::ToSql, &ck, &lim],
+                    )?,
                 }
-            } else if ck.is_empty() {
-                query_all(
-                    conn,
-                    "SELECT key, value, revision FROM objects \
-                     WHERE key >= ?1 AND key < ?2 AND (ns = ?3 OR (?3 = '' AND ns IS NULL)) \
-                     ORDER BY key ASC",
-                    &[&prefix, &upper, value as &dyn rusqlite::ToSql],
-                )?
             } else {
-                query_all(
-                    conn,
-                    "SELECT key, value, revision FROM objects \
-                     WHERE key >= ?1 AND key < ?2 AND (ns = ?3 OR (?3 = '' AND ns IS NULL)) \
-                     AND key > ?4 ORDER BY key ASC",
-                    &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck],
-                )?
+                match (ck.is_empty(), fetch_limit) {
+                    (true, None) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND (ns = ?3 OR (?3 = '' AND ns IS NULL)) \
+                         ORDER BY key ASC",
+                        &[&prefix, &upper, value as &dyn rusqlite::ToSql],
+                    )?,
+                    (true, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND (ns = ?3 OR (?3 = '' AND ns IS NULL)) \
+                         ORDER BY key ASC LIMIT ?4",
+                        &[&prefix, &upper, value as &dyn rusqlite::ToSql, &lim],
+                    )?,
+                    (false, None) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND (ns = ?3 OR (?3 = '' AND ns IS NULL)) \
+                         AND key > ?4 ORDER BY key ASC",
+                        &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck],
+                    )?,
+                    (false, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND (ns = ?3 OR (?3 = '' AND ns IS NULL)) \
+                         AND key > ?4 ORDER BY key ASC LIMIT ?5",
+                        &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck, &lim],
+                    )?,
+                }
             };
-            paginate_in_memory(raw, opts.limit)
+            paginate_in_memory(raw, limit)
         }
 
         // Indexed fast-path: spec.nodeName on pods — uses the partial index.
@@ -1636,26 +1695,41 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
             negated: false,
         }) if field == "spec.nodeName" && prefix.starts_with("/registry/pods/") => {
             let like_prefix = format!("{}%", prefix);
-            let raw = if ck.is_empty() {
-                query_all(
+            let raw = match (ck.is_empty(), fetch_limit) {
+                (true, None) => query_all(
                     conn,
                     "SELECT key, value, revision FROM objects \
                      WHERE key LIKE ?1 AND (json_extract(value, '$.spec.nodeName') = ?2 \
                      OR (?2 = '' AND json_extract(value, '$.spec.nodeName') IS NULL)) \
                      ORDER BY key ASC",
                     &[&like_prefix, value as &dyn rusqlite::ToSql],
-                )?
-            } else {
-                query_all(
+                )?,
+                (true, Some(lim)) => query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key LIKE ?1 AND (json_extract(value, '$.spec.nodeName') = ?2 \
+                     OR (?2 = '' AND json_extract(value, '$.spec.nodeName') IS NULL)) \
+                     ORDER BY key ASC LIMIT ?3",
+                    &[&like_prefix, value as &dyn rusqlite::ToSql, &lim],
+                )?,
+                (false, None) => query_all(
                     conn,
                     "SELECT key, value, revision FROM objects \
                      WHERE key LIKE ?1 AND (json_extract(value, '$.spec.nodeName') = ?2 \
                      OR (?2 = '' AND json_extract(value, '$.spec.nodeName') IS NULL)) \
                      AND key > ?3 ORDER BY key ASC",
                     &[&like_prefix, value as &dyn rusqlite::ToSql, &ck],
-                )?
+                )?,
+                (false, Some(lim)) => query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key LIKE ?1 AND (json_extract(value, '$.spec.nodeName') = ?2 \
+                     OR (?2 = '' AND json_extract(value, '$.spec.nodeName') IS NULL)) \
+                     AND key > ?3 ORDER BY key ASC LIMIT ?4",
+                    &[&like_prefix, value as &dyn rusqlite::ToSql, &ck, &lim],
+                )?,
             };
-            paginate_in_memory(raw, opts.limit)
+            paginate_in_memory(raw, limit)
         }
 
         // Generic field selector: full scan + in-memory filter + in-memory pagination.
@@ -1709,8 +1783,6 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
 
         // No field selector: SQL-level pagination when limit is set (fetch limit+1 rows).
         None => {
-            let limit = clamp_list_limit(opts.limit);
-            let fetch_limit = limit.map(|l| (l + 1) as i64);
             let raw = if upper.is_empty() {
                 match (ck.is_empty(), fetch_limit) {
                     (true, None)       => query_all(conn,
@@ -3440,6 +3512,283 @@ mod tests {
             "a client sending limit=u64::MAX (a hostile-but-plausible 'give me everything' \
              value) must get the seeded object back; before the fix the SQL fast-path's \
              `limit + 1` wraps to 0, producing `LIMIT 0` and an empty page forever"
+        );
+    }
+
+    fn conn_with_objects_schema() -> Connection {
+        let conn = Connection::open_in_memory().expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, \
+             revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID; \
+             CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL); \
+             INSERT INTO meta (key, value) VALUES ('revision', '1');",
+        )
+        .expect("schema");
+        conn
+    }
+
+    fn insert_pod(conn: &Connection, key: &str, ns: &str, obj_name: &str, node_name: Option<&str>) {
+        let value = match node_name {
+            Some(n) => format!(
+                r#"{{"metadata":{{"name":"{obj_name}","namespace":"{ns}"}},"spec":{{"nodeName":"{n}"}}}}"#
+            ),
+            None => format!(r#"{{"metadata":{{"name":"{obj_name}","namespace":"{ns}"}}}}"#),
+        };
+        conn.execute(
+            "INSERT INTO objects (key, value, revision, ns, obj_name) VALUES (?1, ?2, 1, ?3, ?4)",
+            params![key, value.as_bytes(), ns, obj_name],
+        )
+        .expect("seed row");
+    }
+
+    thread_local! {
+        // Counts SQLITE_TRACE_ROW events for the main `objects` list SELECT only (identified by
+        // its `ORDER BY key ASC` clause, which the remaining-count `COUNT(*)` query lacks) —
+        // i.e. exactly how many rows SQLite actually stepped through for that statement.
+        static TRACED_OBJECT_LIST_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn count_object_list_rows(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Row(stmt) = event {
+            let sql = stmt.sql();
+            if sql.contains("FROM objects") && sql.contains("ORDER BY key ASC") {
+                TRACED_OBJECT_LIST_ROWS.with(|c| c.set(c.get() + 1));
+            }
+        }
+    }
+
+    /// The `metadata.name` field-selector fast-path must push `LIMIT` to SQL, not fetch every
+    /// matching row under the prefix and truncate in Rust.
+    ///
+    /// Why it matters: before the fix, this branch called `query_all` with no `LIMIT` and then
+    /// `paginate_in_memory` — the *returned* page was already correctly truncated to `limit`, so
+    /// only the number of rows SQLite actually stepped through (traced here) distinguishes the
+    /// bug from the fix. 20 pods share `metadata.name=web` across different namespaces; a
+    /// `limit=3` LIST must scan only `limit+1=4` rows via SQL `LIMIT`, not all 20 — the
+    /// difference between O(limit) and O(objects-under-prefix) memory/I/O per request.
+    #[test]
+    fn metadata_name_field_selector_pushes_sql_limit_not_a_full_scan() {
+        let conn = conn_with_objects_schema();
+        for i in 0..20 {
+            insert_pod(
+                &conn,
+                &format!("/registry/pods/ns-{i:02}/web"),
+                "web",
+                "web",
+                None,
+            );
+        }
+
+        TRACED_OBJECT_LIST_ROWS.with(|c| c.set(0));
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
+            Some(count_object_list_rows),
+        );
+        let resp = list_sync(
+            &conn,
+            "/registry/pods/",
+            &ListOptions {
+                field_selector: Some(FieldSelector {
+                    field: "metadata.name".to_string(),
+                    value: "web".to_string(),
+                    negated: false,
+                }),
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("list by metadata.name with limit must not error");
+        let scanned = TRACED_OBJECT_LIST_ROWS.with(|c| c.get());
+
+        assert_eq!(
+            resp.items.len(),
+            3,
+            "a limit=3 LIST must return exactly 3 items regardless of how many rows matched"
+        );
+        assert!(
+            resp.continue_key.is_some(),
+            "20 matching rows with limit=3 must report more pages remain"
+        );
+        assert_eq!(
+            scanned, 4,
+            "metadata.name field-selector LIST with limit=3 must fetch only limit+1=4 rows via \
+             SQL LIMIT, not all 20 matching rows under the prefix; reverting to the unbounded \
+             query_all()+paginate_in_memory() pattern would scan all 20 rows for a single small \
+             page"
+        );
+    }
+
+    /// The `metadata.namespace` field-selector fast-path — the hot path behind `kubectl get -n
+    /// <ns>` — must push `LIMIT` to SQL instead of fetching every object in the namespace.
+    ///
+    /// Why it matters: same distinguishing signal as the metadata.name test above (returned page
+    /// size is identical bug-or-fixed; only the SQL row count differs). 20 pods live in namespace
+    /// `prod`; a `limit=3` LIST must scan only 4 rows, not all 20 — for a namespace with 10k pods
+    /// this is the difference between ~2 MB and ~40 MB read per page.
+    #[test]
+    fn metadata_namespace_field_selector_pushes_sql_limit_not_a_full_scan() {
+        let conn = conn_with_objects_schema();
+        for i in 0..20 {
+            insert_pod(
+                &conn,
+                &format!("/registry/pods/prod/pod-{i:02}"),
+                "prod",
+                "web",
+                None,
+            );
+        }
+
+        TRACED_OBJECT_LIST_ROWS.with(|c| c.set(0));
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
+            Some(count_object_list_rows),
+        );
+        let resp = list_sync(
+            &conn,
+            "/registry/pods/",
+            &ListOptions {
+                field_selector: Some(FieldSelector {
+                    field: "metadata.namespace".to_string(),
+                    value: "prod".to_string(),
+                    negated: false,
+                }),
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("list by metadata.namespace with limit must not error");
+        let scanned = TRACED_OBJECT_LIST_ROWS.with(|c| c.get());
+
+        assert_eq!(
+            resp.items.len(),
+            3,
+            "a limit=3 LIST must return exactly 3 items regardless of namespace size"
+        );
+        assert!(
+            resp.continue_key.is_some(),
+            "20 pods in the namespace with limit=3 must report more pages remain"
+        );
+        assert_eq!(
+            scanned, 4,
+            "metadata.namespace field-selector LIST with limit=3 must fetch only limit+1=4 rows \
+             via SQL LIMIT, not all 20 pods in the namespace; this is the kubelet/kubectl -n <ns> \
+             hot path, so an unbounded scan here scales list memory with namespace size instead \
+             of the client's requested page size"
+        );
+    }
+
+    /// The `spec.nodeName` field-selector fast-path — the kubelet's pod-list query — must push
+    /// `LIMIT` to SQL instead of fetching every pod scheduled to the node.
+    ///
+    /// Why it matters: same distinguishing signal as the tests above. 20 pods are scheduled to
+    /// `node-1`; a `limit=3` LIST must scan only 4 rows, not all 20 — every kubelet's per-sync
+    /// pod list would otherwise cost O(pods-on-node) instead of O(limit).
+    #[test]
+    fn nodename_field_selector_pushes_sql_limit_not_a_full_scan() {
+        let conn = conn_with_objects_schema();
+        for i in 0..20 {
+            insert_pod(
+                &conn,
+                &format!("/registry/pods/default/pod-{i:02}"),
+                "default",
+                "web",
+                Some("node-1"),
+            );
+        }
+
+        TRACED_OBJECT_LIST_ROWS.with(|c| c.set(0));
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
+            Some(count_object_list_rows),
+        );
+        let resp = list_sync(
+            &conn,
+            "/registry/pods/",
+            &ListOptions {
+                field_selector: Some(FieldSelector {
+                    field: "spec.nodeName".to_string(),
+                    value: "node-1".to_string(),
+                    negated: false,
+                }),
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("list by spec.nodeName with limit must not error");
+        let scanned = TRACED_OBJECT_LIST_ROWS.with(|c| c.get());
+
+        assert_eq!(
+            resp.items.len(),
+            3,
+            "a limit=3 LIST must return exactly 3 items regardless of how many pods are on the node"
+        );
+        assert!(
+            resp.continue_key.is_some(),
+            "20 pods on the node with limit=3 must report more pages remain"
+        );
+        assert_eq!(
+            scanned, 4,
+            "spec.nodeName field-selector LIST with limit=3 must fetch only limit+1=4 rows via \
+             SQL LIMIT, not all 20 pods scheduled to the node; reverting to the unbounded \
+             query_all()+paginate_in_memory() pattern would scale kubelet list memory with pods \
+             per node instead of the requested page size"
+        );
+    }
+
+    /// Continue-token pagination under the `metadata.namespace` SQL `LIMIT` fast-path must cover
+    /// the exact same set of keys as an unpaginated list, in the same order, with no gaps or
+    /// duplicates — identical to the no-field-selector (`None`) branch's keyset semantics.
+    ///
+    /// Why it matters: pushing `LIMIT` into SQL only replaces *where* truncation happens; if the
+    /// keyset cursor (`key > last_returned_key`) were computed against the wrong row (e.g. the
+    /// probe row instead of the last kept row) a page boundary could skip or repeat an object —
+    /// a controller `LIST`ing a namespace in pages would silently miss or double-process pods.
+    #[test]
+    fn metadata_namespace_continue_token_round_trip_covers_prefix_with_no_gaps_or_dupes() {
+        let conn = conn_with_objects_schema();
+        // Decoy in a different namespace, sorting before the matching keys, to prove the
+        // predicate — not just the key range — bounds each page.
+        insert_pod(&conn, "/registry/pods/decoy/other", "decoy", "other", None);
+
+        let mut expected_keys = Vec::new();
+        for i in 0..7 {
+            let key = format!("/registry/pods/ns-a/pod-{i}");
+            insert_pod(&conn, &key, "ns-a", &format!("pod-{i}"), None);
+            expected_keys.push(key);
+        }
+
+        let mut collected = Vec::new();
+        let mut continue_key: Option<String> = None;
+        for _ in 0..10 {
+            let resp = list_sync(
+                &conn,
+                "/registry/pods/",
+                &ListOptions {
+                    field_selector: Some(FieldSelector {
+                        field: "metadata.namespace".to_string(),
+                        value: "ns-a".to_string(),
+                        negated: false,
+                    }),
+                    limit: Some(3),
+                    continue_key: continue_key.clone(),
+                },
+            )
+            .expect("paginated list by namespace must not error");
+
+            collected.extend(resp.items.iter().map(|o| o.key.clone()));
+            continue_key = resp.continue_key;
+            if continue_key.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            collected, expected_keys,
+            "keyset pagination under the SQL LIMIT fast-path must return every namespace-matching \
+             key exactly once, in ascending key order, with no gaps or duplicates — identical to \
+             the no-selector (None) branch's continue-token semantics; a mismatch means a \
+             controller paging through a namespace with `--chunk-size` would miss or double-count \
+             pods"
         );
     }
 
