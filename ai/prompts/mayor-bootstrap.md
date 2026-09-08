@@ -118,7 +118,16 @@ Queue config: MERGE method, all-green grouping, min 1 / max 5,
 tests THAT, so also requiring the PR branch itself to be current would only cost
 a redundant CI cycle per PR.
 
-1. Run `scripts/mayor-tick.sh`. It drains `pr`-type review-queue entries,
+1. Call `ListAgents`, extract the `worker/agent-*` ids of currently running
+   subagents, and run `scripts/mayor-tick.sh --live-agents <comma-separated
+   ids>` (omit the flag if none are running). This is the only reliable
+   liveness signal for an in-process worker sub-agent — a sub-agent cannot
+   call `ListAgents` on itself, and `claude agents --json` doesn't
+   enumerate in-process subagents. A worker/agent-* branch with no PR yet
+   whose id IS in that set reports as `no-pr-for-branch-in-flight`
+   (informational only); one whose id is NOT reports as `no-pr-for-branch`
+   (escalates the exit code to 30). The script drains `pr`-type
+   review-queue entries,
    gates every open `worker/agent-*` PR that's CLEAN or BEHIND (a BEHIND PR is
    the merge queue's job to rebase, not the mayor's, so it's queued the same
    way, never silently skipped) on the LATEST (by `submittedAt`, never by mere
@@ -202,8 +211,15 @@ their own subagents.
 host-side `u7s-apiserver`/`u7s-scheduler`/`konnectivity-server` processes
 (STEP A), `git worktree prune` (STEP B), and stale worker/non-worker branch
 cleanup (STEPs C–D) — lives in `scripts/worktree-hygiene.sh`; the cron loop
-runs that script directly. See the script for the STEP A–D implementation
-and its design rationale.
+runs that script directly. Before running it, call `ListAgents`, extract
+the `worker/agent-*` ids of currently running subagents, and pass them as
+`--live-agents <comma-separated ids>` — the script REFUSES to run at all
+(non-destructively, exit 2) without this flag, since STEP A/C/D are
+destructive and dir-existence/merge-state alone cannot tell a live
+worker's branch/worktree apart from a stale one. A worktree/branch whose
+agent-id is in that set is protected from every destructive step
+unconditionally, regardless of dir existence or merge state. See the
+script for the STEP A–D implementation and its design rationale.
 
 Auto-kill/auto-delete with no approval gate (operator decision) — the script
 logs loudly instead of asking. Exit 0 means a clean tick; non-zero means an

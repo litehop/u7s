@@ -29,6 +29,14 @@
 #        dispatches critical-reviewer.
 #   30 = a worker worktree/branch with no PR at all -- mayor investigates.
 #
+# --live-agents <comma-separated-agent-ids>: the mayor's own ListAgents-
+# derived set of currently running worker/agent-* subagents, fed in so
+# check_worktree_anomalies (exit 30) can tell a genuinely stalled dispatch
+# apart from one that's still actively running (see is_live_agent_branch).
+# If omitted, LIVE_AGENTS stays empty and every no-PR worker branch reports
+# as stale -- conservative-by-default for a NON-destructive reporting
+# script, unlike worktree-hygiene.sh's hard fail-safe refusal.
+#
 # State file: .claude/mayor-tick-state.json (path overridable via
 # MAYOR_TICK_STATE_FILE for tests). Written on every run; this is what the
 # mayor reads to decide follow-up action without re-deriving any of it.
@@ -160,31 +168,47 @@ queue_entry_dispatch_suppressed() {
   [ $(( now_epoch - marker_epoch )) -lt "$QUEUE_DISPATCH_MARKER_MAX_AGE_SECONDS" ]
 }
 
-# A healthy worker's diagnose-edit-test window is observed at 10-40
-# minutes with no PR open yet -- 45m (~3 tick cycles) gives headroom above
-# that so a routine dispatch never trips exit 30, while a dispatch stalled
-# well past its own working window still does.
-WORKTREE_ANOMALY_MAX_AGE_SECONDS=$((45 * 60))
+# Comma-separated worker/agent-<id> ids the mayor's own ListAgents call
+# reports as currently running, fed in via --live-agents (see main()) --
+# THE only reliable liveness signal for an in-process worker sub-agent: a
+# sub-agent cannot call ListAgents on itself, and `claude agents --json`
+# doesn't enumerate in-process subagents (both confirmed directly). This
+# replaces a prior wall-clock/commit-epoch window entirely -- for a worker
+# that hasn't committed yet, "age since last commit" measured the BASE
+# commit's time, not the worker's own dispatch time, so age was the wrong
+# signal at any window size. Empty (the flag omitted) means "no live agents
+# known" -- see is_live_agent_branch's fail-toward-surfacing default.
+LIVE_AGENTS=""
 
-# True (exit 0) iff a worker worktree with no PR yet is still within its
-# plausible working window and must be reported informationally without
-# escalating the tick's exit code -- exit 30 firing on every routine
-# dispatch trains the mayor to ignore it, so a genuinely stalled dispatch
-# goes unnoticed.
-worktree_dispatch_in_flight() {
-  local age_seconds="$1"
-  [ "$age_seconds" -lt "$WORKTREE_ANOMALY_MAX_AGE_SECONDS" ]
+# True (exit 0) iff `agent_id` is present in the comma-separated
+# --live-agents set. Empty `live_agents` never matches anything -- an
+# unknown liveness state must never be read as "assume live", which is
+# exactly the failure mode that let the old wall-clock window misclassify a
+# genuinely live worker as stale well within its own working window.
+agent_id_is_live() {
+  local agent_id="$1" live_agents="$2"
+  [ -n "$agent_id" ] || return 1
+  [ -n "$live_agents" ] || return 1
+  case ",${live_agents}," in
+    *",${agent_id},"*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-# Epoch seconds of a worktree path's last commit, or epoch 0 (maximally
-# OLD, not "just now") if the git lookup itself fails. Fails toward
-# SURFACING a worktree anomaly, never toward silently hiding one: for this
-# script a false positive is noisy but visible, while a false negative
-# (a lookup failure misread as "brand new, still in-flight") is silent --
-# the wrong polarity for a check whose whole purpose is not missing a
-# genuinely stalled dispatch.
-worktree_commit_epoch() {
-  git -C "$1" log -1 --format=%ct 2>/dev/null || printf '0'
+# True (exit 0) iff `branch` is a worker/agent-<id> branch whose <id> is
+# live per agent_id_is_live -- a worker worktree with no PR yet whose agent
+# is confirmed still running must be reported informationally without
+# escalating the tick's exit code (exit 30 firing on every routine dispatch
+# trains the mayor to ignore it, so a genuinely stalled dispatch goes
+# unnoticed). A non-worker/agent-* branch name never matches, even if it
+# coincidentally equals a --live-agents entry -- the same "name-shape gate
+# before value comparison" discipline worktree-hygiene.sh's
+# has_live_worktree_dir already uses for its own agent-id extraction.
+is_live_agent_branch() {
+  local branch="$1" live_agents="$2"
+  local agent_id="${branch#worker/agent-}"
+  [ "$agent_id" != "$branch" ] || return 1
+  agent_id_is_live "$agent_id" "$live_agents"
 }
 
 # Extracts the value after "**Verdict**:" from a critical-reviewer findings
@@ -685,13 +709,16 @@ check_bd_ready() {
 # the (operator-kept, not scriptified here) 60m worktree-hygiene loop. This
 # only flags a live worker worktree/branch with NO PR at all, which that
 # loop's checks don't cover: it means a dispatch stalled before ever
-# opening one -- UNLESS the branch is still within its plausible working
-# window (worktree_dispatch_in_flight), in which case it's reported here
-# for visibility but excluded from WORKTREE_STALE_COUNT, so it never
-# escalates the tick's exit code.
+# opening one -- UNLESS the branch's agent-id is in --live-agents
+# (is_live_agent_branch), in which case it's reported here for visibility
+# but excluded from WORKTREE_STALE_COUNT, so it never escalates the tick's
+# exit code. If --live-agents was never passed, LIVE_AGENTS is empty and
+# every no-PR branch reports as genuinely stale (no-pr-for-branch) --
+# conservative-by-default, matching this script's existing
+# fail-toward-surfacing bias elsewhere (e.g. is_valid_queued_at), rather
+# than silently assuming an unknown worker is fine.
 check_worktree_anomalies() {
-  local path branch count now commit_epoch age_seconds
-  now=$(date -u +%s)
+  local path branch count
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     [ "$path" = "$REPO_ROOT" ] && continue
@@ -702,9 +729,7 @@ check_worktree_anomalies() {
     esac
     count=$(gh pr list --head "$branch" --state all --json number --jq 'length' 2>/dev/null || echo 0)
     if [ "${count:-0}" -eq 0 ]; then
-      commit_epoch=$(worktree_commit_epoch "$path")
-      age_seconds=$(( now - commit_epoch ))
-      if worktree_dispatch_in_flight "$age_seconds"; then
+      if is_live_agent_branch "$branch" "$LIVE_AGENTS"; then
         WORKTREE_ANOMALIES+=("$(jq -nc --arg path "$path" --arg branch "$branch" '{path:$path, branch:$branch, reason:"no-pr-for-branch-in-flight"}')")
       else
         WORKTREE_ANOMALIES+=("$(jq -nc --arg path "$path" --arg branch "$branch" '{path:$path, branch:$branch, reason:"no-pr-for-branch"}')")
@@ -824,6 +849,18 @@ reconcile_missing_queue_entries() {
 }
 
 main() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --live-agents)
+        LIVE_AGENTS="${2:-}"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
   process_review_queue
   reconcile_missing_queue_entries
   gate_and_merge_prs
