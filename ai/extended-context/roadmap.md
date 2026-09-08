@@ -252,7 +252,7 @@ Long-running arcs tracked in bd, not tied to a single gate.
 | EPIC | Priority | Status | Trigger / un-defer condition |
 |---|---|---|---|
 | `mayor-u6ju` | P3 | DEFERRED | Gate 5's representative-workload probes (Argo CD or otherwise) demonstrate a real Server-Side Apply requirement — deliberately not pursued speculatively, given SSA's scope |
-| `mayor-8qcaw` | P4 | DEFERRED | Backlog otherwise clears OR DRA conformance failure traces to claim allocation |
+| `mayor-8qcaw` | P2 | OPEN | DRA structured-parameter allocation; active per scout verdict |
 
 Closed since last revision: `mayor-axi12` (superseded 2026-08-13 by `mayor-c6rml`/`mayor-c0b1u`, both closed — see KCM matrix row) and `mayor-0bd14` (100% of 10 children closed, no work remaining — closed 2026-08-14).
 
