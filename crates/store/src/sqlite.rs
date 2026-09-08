@@ -1731,52 +1731,112 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
             paginate_in_memory(raw, limit)
         }
 
-        // Generic field selector: full scan + in-memory filter + in-memory pagination.
+        // Generic field selector: the predicate can't be pushed into SQL (it walks an
+        // arbitrary JSON path in Rust), so this is the fallback for every selector that isn't
+        // one of the indexed fast-paths above -- notably every *negated* selector (e.g. the
+        // scheduler's canonical `status.phase!=Succeeded`).
+        //
+        // When a limit is set, fetch `limit+1`-row chunks with keyset continuation (same
+        // key-range machinery as the indexed branches above) and evaluate the predicate per
+        // chunk, stopping as soon as enough rows survive to fill the page or the key range
+        // under the prefix is exhausted. This bounds SQL rows fetched by the number of chunks
+        // needed to find `limit` matches instead of materializing every object under the
+        // prefix up front -- mirrors upstream etcd3 storage's numFetched/numEvald loop. An
+        // unset limit still needs every matching object regardless of chunking, so it stays a
+        // single unbounded scan.
         Some(FieldSelector {
             field,
             value,
             negated,
         }) => {
-            let raw = if upper.is_empty() {
-                if ck.is_empty() {
-                    query_all(
+            let fetch_chunk = |cursor: &str,
+                               chunk_limit: Option<i64>|
+             -> Result<Vec<StoreObject>> {
+                match (upper.is_empty(), cursor.is_empty(), chunk_limit) {
+                    (true, true, None) => query_all(
                         conn,
                         "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
                         &[&prefix],
-                    )?
-                } else {
-                    query_all(conn,
+                    ),
+                    (true, true, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC LIMIT ?2",
+                        &[&prefix, &lim],
+                    ),
+                    (true, false, None) => query_all(
+                        conn,
                         "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key > ?2 ORDER BY key ASC",
-                        &[&prefix, &ck],
-                    )?
+                        &[&prefix, &cursor],
+                    ),
+                    (true, false, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key > ?2 \
+                         ORDER BY key ASC LIMIT ?3",
+                        &[&prefix, &cursor, &lim],
+                    ),
+                    (false, true, None) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC",
+                        &[&prefix, &upper],
+                    ),
+                    (false, true, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 \
+                         ORDER BY key ASC LIMIT ?3",
+                        &[&prefix, &upper, &lim],
+                    ),
+                    (false, false, None) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC",
+                        &[&prefix, &upper, &cursor],
+                    ),
+                    (false, false, Some(lim)) => query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC LIMIT ?4",
+                        &[&prefix, &upper, &cursor, &lim],
+                    ),
                 }
-            } else if ck.is_empty() {
-                query_all(conn,
-                    "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC",
-                    &[&prefix, &upper],
-                )?
-            } else {
-                query_all(conn,
-                    "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC",
-                    &[&prefix, &upper, &ck],
-                )?
             };
 
             // Walk the dot-separated path in the parsed JSON and compare to expected value.
-            let filtered: Vec<StoreObject> = raw
-                .into_iter()
-                .filter(|obj| {
-                    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
-                        return false;
-                    };
-                    let matches = crate::json_path_equals(&parsed, field, value);
-                    if *negated {
-                        !matches
-                    } else {
-                        matches
+            let matches_selector = |obj: &StoreObject| -> bool {
+                let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
+                    return false;
+                };
+                let matches = crate::json_path_equals(&parsed, field, value);
+                if *negated {
+                    !matches
+                } else {
+                    matches
+                }
+            };
+
+            let filtered: Vec<StoreObject> = match limit {
+                None => fetch_chunk(ck, None)?
+                    .into_iter()
+                    .filter(matches_selector)
+                    .collect(),
+                Some(page_limit) => {
+                    let chunk_size = (page_limit + 1) as i64;
+                    let mut survivors: Vec<StoreObject> = Vec::new();
+                    let mut cursor = ck.to_string();
+                    loop {
+                        let chunk = fetch_chunk(&cursor, Some(chunk_size))?;
+                        let chunk_len = chunk.len();
+                        if let Some(last_key) = chunk.last().map(|o| o.key.clone()) {
+                            cursor = last_key;
+                        }
+                        survivors.extend(chunk.into_iter().filter(matches_selector));
+                        let exhausted = (chunk_len as i64) < chunk_size;
+                        if exhausted || survivors.len() as u64 > page_limit {
+                            break;
+                        }
                     }
-                })
-                .collect();
+                    survivors
+                }
+            };
             paginate_in_memory(filtered, opts.limit)
         }
 
@@ -3538,6 +3598,17 @@ mod tests {
         .expect("seed row");
     }
 
+    fn insert_pod_with_phase(conn: &Connection, key: &str, ns: &str, obj_name: &str, phase: &str) {
+        let value = format!(
+            r#"{{"metadata":{{"name":"{obj_name}","namespace":"{ns}"}},"status":{{"phase":"{phase}"}}}}"#
+        );
+        conn.execute(
+            "INSERT INTO objects (key, value, revision, ns, obj_name) VALUES (?1, ?2, 1, ?3, ?4)",
+            params![key, value.as_bytes(), ns, obj_name],
+        )
+        .expect("seed row");
+    }
+
     thread_local! {
         // Counts SQLITE_TRACE_ROW events for the main `objects` list SELECT only (identified by
         // its `ORDER BY key ASC` clause, which the remaining-count `COUNT(*)` query lacks) —
@@ -3560,7 +3631,8 @@ mod tests {
     /// Why it matters: before the fix, this branch called `query_all` with no `LIMIT` and then
     /// `paginate_in_memory` — the *returned* page was already correctly truncated to `limit`, so
     /// only the number of rows SQLite actually stepped through (traced here) distinguishes the
-    /// bug from the fix. 20 pods share `metadata.name=web` across different namespaces; a
+    /// bug from the fix. 20 pods share `metadata.name=web` under distinct key paths (the `ns`
+    /// column is a constant here, irrelevant to this metadata.name selector); a
     /// `limit=3` LIST must scan only `limit+1=4` rows via SQL `LIMIT`, not all 20 — the
     /// difference between O(limit) and O(objects-under-prefix) memory/I/O per request.
     #[test]
@@ -3729,6 +3801,75 @@ mod tests {
              SQL LIMIT, not all 20 pods scheduled to the node; reverting to the unbounded \
              query_all()+paginate_in_memory() pattern would scale kubelet list memory with pods \
              per node instead of the requested page size"
+        );
+    }
+
+    /// The generic dot-path field-selector branch (the fallback for every selector that isn't
+    /// one of the SQL-indexed fast-paths above, notably every *negated* selector such as the
+    /// scheduler's canonical `status.phase!=Succeeded`) must fetch in bounded chunks and stop
+    /// once enough rows survive the in-memory predicate, not materialize every object under
+    /// the prefix before filtering.
+    ///
+    /// Why it matters: unlike the indexed fast-paths, this branch can't push the predicate into
+    /// SQL, so the *only* way to bound its I/O is chunked fetch-and-evaluate with early
+    /// termination. 20 pods alternate `status.phase` Succeeded/Running; only the 10 Running
+    /// pods survive `status.phase!=Succeeded`. With `limit=3` and a chunk size of `limit+1=4`,
+    /// the first two 4-row chunks (8 rows, indices 0-7) already yield 4 survivors — enough to
+    /// fill the page — so a correct batched loop scans exactly 8 rows, never touching the
+    /// remaining 12. If the loop reverted to a single unbounded `query_all`, this test would see
+    /// all 20 rows scanned regardless of `limit`.
+    #[test]
+    fn generic_field_selector_batches_fetch_and_stops_once_page_is_filled() {
+        let conn = conn_with_objects_schema();
+        for i in 0..20 {
+            let phase = if i % 2 == 0 { "Succeeded" } else { "Running" };
+            insert_pod_with_phase(
+                &conn,
+                &format!("/registry/pods/default/pod-{i:02}"),
+                "default",
+                &format!("pod-{i:02}"),
+                phase,
+            );
+        }
+
+        TRACED_OBJECT_LIST_ROWS.with(|c| c.set(0));
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
+            Some(count_object_list_rows),
+        );
+        let resp = list_sync(
+            &conn,
+            "/registry/pods/",
+            &ListOptions {
+                field_selector: Some(FieldSelector {
+                    field: "status.phase".to_string(),
+                    value: "Succeeded".to_string(),
+                    negated: true,
+                }),
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("list by negated status.phase with limit must not error");
+        let scanned = TRACED_OBJECT_LIST_ROWS.with(|c| c.get());
+
+        assert_eq!(
+            resp.items.len(),
+            3,
+            "a limit=3 LIST must return exactly 3 of the 10 Running pods regardless of how many \
+             non-matching Succeeded pods sort before them"
+        );
+        assert!(
+            resp.continue_key.is_some(),
+            "10 matching Running pods with limit=3 must report more pages remain"
+        );
+        assert_eq!(
+            scanned, 8,
+            "the batched-fetch loop must scan exactly two limit+1=4-row chunks (8 rows) to \
+             collect 4 survivors and fill the page, not the full 20 objects under the prefix; \
+             reverting to unbounded query_all()+in-memory-filter would scan all 20 rows for a \
+             single small page, and every NEGATED field selector (the scheduler's pod-list \
+             query included) falls through this exact branch"
         );
     }
 
