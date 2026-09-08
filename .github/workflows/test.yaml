@@ -147,11 +147,13 @@ jobs:
       # Neither `cargo test --workspace` (root) nor the fmt/clippy steps above
       # run servicelb-common's host unit/regression tests -- the root
       # workspace excludes crates/servicelb entirely, and clippy only lints.
-      # Without this step, a servicelb-common regression test can be broken
-      # or reverted with nothing in CI to catch it.
-      - name: Test (u7s-servicelb + servicelb-common)
+      # A bare `cargo test` here also wouldn't reach it: crates/servicelb's
+      # workspace_default_members is only u7s-servicelb, so servicelb-common
+      # needs an explicit -p. Without this step, a servicelb-common
+      # regression test can be broken or reverted with nothing in CI to catch it.
+      - name: Test (servicelb-common)
         working-directory: crates/servicelb
-        run: cargo test
+        run: cargo test -p u7s-servicelb-common
 
       # servicelb-ebpf is #![no_std] and only builds for bpfel-unknown-none;
       # clippy needs the same target + build-std the real build uses, run

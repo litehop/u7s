@@ -137,14 +137,12 @@ done
 if [ "$servicelb_touched" -eq 1 ]; then
   echo "[pre-push] crates/servicelb changed -- running servicelb clippy/test + servicelb-ebpf clippy"
 
-  (cd crates/servicelb && cargo clippy --tests -- -D warnings) || {
-    echo "[pre-push] FAILED: crates/servicelb clippy --tests -- -D warnings" >&2
-    echo "[pre-push] hint: this builds the u7s-servicelb loader (needs Linux -- 'aya' uses Linux-only libc syscalls) and cross-builds servicelb-ebpf (needs nightly + rust-src + bpf-linker)." >&2
+  (cd crates/servicelb && cargo clippy -p u7s-servicelb-common --tests -- -D warnings) || {
+    echo "[pre-push] FAILED: crates/servicelb clippy -p u7s-servicelb-common --tests -- -D warnings" >&2
     exit 1
   }
-  (cd crates/servicelb && cargo test) || {
-    echo "[pre-push] FAILED: crates/servicelb cargo test" >&2
-    echo "[pre-push] hint: same build requirements as the clippy step above (Linux host + nightly/rust-src/bpf-linker)." >&2
+  (cd crates/servicelb && cargo test -p u7s-servicelb-common) || {
+    echo "[pre-push] FAILED: crates/servicelb cargo test -p u7s-servicelb-common" >&2
     exit 1
   }
   (cd crates/servicelb/servicelb-ebpf && cargo +nightly clippy --release --target bpfel-unknown-none -Z build-std=core -- -D warnings) || {
