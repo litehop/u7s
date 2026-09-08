@@ -1456,15 +1456,13 @@ fn delete_namespace_sync(
     // All deletes are in the same transaction so the namespace delete remains atomic on storage.
     let mut result: Vec<(String, Bytes, u64)> = Vec::with_capacity(pairs.len());
     for (key, body) in pairs {
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
-            [],
-        )?;
-        let rev: u64 = conn.query_row(
-            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
-            [],
-            |r| r.get::<_, i64>(0).map(|v| v as u64),
-        )?;
+        )?
+        .execute([])?;
+        let rev: u64 = conn
+            .prepare_cached("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'")?
+            .query_row([], |r| r.get::<_, i64>(0).map(|v| v as u64))?;
         conn.execute("DELETE FROM objects WHERE key = ?1", params![key])?;
         result.push((key, body, rev));
     }
