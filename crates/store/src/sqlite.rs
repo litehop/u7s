@@ -1463,7 +1463,8 @@ fn delete_namespace_sync(
         let rev: u64 = conn
             .prepare_cached("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'")?
             .query_row([], |r| r.get::<_, i64>(0).map(|v| v as u64))?;
-        conn.execute("DELETE FROM objects WHERE key = ?1", params![key])?;
+        conn.prepare_cached("DELETE FROM objects WHERE key = ?1")?
+            .execute(params![key])?;
         result.push((key, body, rev));
     }
 
@@ -1829,11 +1830,9 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         }
     };
 
-    let snapshot_revision: u64 = conn.query_row(
-        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
-        [],
-        |r| r.get::<_, i64>(0).map(|v| v as u64),
-    )?;
+    let snapshot_revision: u64 = conn
+        .prepare_cached("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'")?
+        .query_row([], |r| r.get::<_, i64>(0).map(|v| v as u64))?;
 
     // When there are more pages, count the remaining items so callers can populate
     // metadata.remainingItemCount in list responses (required by chunking conformance).
@@ -1842,17 +1841,17 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         Some(cursor) => {
             let upper = prefix_upper_bound(prefix);
             let count: u64 = if upper.is_empty() {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM objects WHERE key >= ?1 AND key > ?2",
-                    params![prefix, cursor],
-                    |r| r.get::<_, i64>(0).map(|v| v as u64),
-                )?
+                conn.prepare_cached("SELECT COUNT(*) FROM objects WHERE key >= ?1 AND key > ?2")?
+                    .query_row(params![prefix, cursor], |r| {
+                        r.get::<_, i64>(0).map(|v| v as u64)
+                    })?
             } else {
-                conn.query_row(
+                conn.prepare_cached(
                     "SELECT COUNT(*) FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3",
-                    params![prefix, &upper, cursor],
-                    |r| r.get::<_, i64>(0).map(|v| v as u64),
                 )?
+                .query_row(params![prefix, &upper, cursor], |r| {
+                    r.get::<_, i64>(0).map(|v| v as u64)
+                })?
             };
             Some(count)
         }
