@@ -21,6 +21,7 @@ use axum::{
     Json,
 };
 use bytes::Bytes;
+use serde::Deserialize;
 
 use crate::{
     handlers::generic::{store_err, validate_name},
@@ -134,13 +135,13 @@ pub async fn patch_approval<S: Store>(
     // different spec.request/spec.signerName past approval.
     let spec_before = current.body["spec"].clone();
     let status_before: CertificateSigningRequestStatus =
-        serde_json::from_value(current.body["status"].clone()).unwrap_or_else(|_| {
-            CertificateSigningRequestStatus {
+        CertificateSigningRequestStatus::deserialize(&current.body["status"]).unwrap_or_else(
+            |_| CertificateSigningRequestStatus {
                 certificate: None,
                 conditions: None,
                 rest: serde_json::Value::Object(Default::default()),
-            }
-        });
+            },
+        );
 
     match patch_type {
         PatchType::Json => {
@@ -156,7 +157,7 @@ pub async fn patch_approval<S: Store>(
             // Deserialize the patch status to get typed conditions.
             let patch_status: Option<CertificateSigningRequestStatus> = patch
                 .get("status")
-                .and_then(|s| serde_json::from_value(s.clone()).ok());
+                .and_then(|s| CertificateSigningRequestStatus::deserialize(s).ok());
             if let Some(ps) = patch_status {
                 if let Some(conditions) = ps.conditions {
                     current.body["status"]["conditions"] =
@@ -263,7 +264,7 @@ pub(crate) fn validate_approval_json_patch_paths(
 pub(crate) fn merge_approval_conditions(current: &mut Object, incoming: &Object) {
     // Deserialize the incoming status to get typed conditions.
     let incoming_status: Option<CertificateSigningRequestStatus> =
-        serde_json::from_value(incoming.body["status"].clone()).ok();
+        CertificateSigningRequestStatus::deserialize(&incoming.body["status"]).ok();
 
     if let Some(status) = incoming_status {
         if let Some(conditions) = status.conditions {

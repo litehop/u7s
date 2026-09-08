@@ -4,6 +4,7 @@ use crate::types::{
     ReplicationControllerSpec, RoleRefFields, ServiceSpec, StatefulSetSpec, StorageClassFields,
     TemplateLabelsPeek,
 };
+use serde::Deserialize;
 
 /// Apply upstream-compatible field defaults to a stored object.
 ///
@@ -226,9 +227,9 @@ pub fn increment_endpointslice_generation_if_changed(
 /// Idempotent: if a field is already set it is not overwritten.
 fn default_pvc(obj: &mut serde_json::Value) {
     let mut status: PersistentVolumeStatusFields =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+        PersistentVolumeStatusFields::deserialize(&obj["status"]).unwrap_or_default();
     let mut spec: PersistentVolumeSpecFields =
-        serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+        PersistentVolumeSpecFields::deserialize(&obj["spec"]).unwrap_or_default();
     default_volume_status_and_mode(&mut status, &mut spec);
     obj["status"] =
         serde_json::to_value(&status).expect("PersistentVolumeStatusFields is always serializable");
@@ -264,9 +265,9 @@ fn default_volume_status_and_mode(
 /// Idempotent: if a field is already set it is not overwritten.
 fn default_pv(obj: &mut serde_json::Value) {
     let mut status: PersistentVolumeStatusFields =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+        PersistentVolumeStatusFields::deserialize(&obj["status"]).unwrap_or_default();
     let mut spec: PersistentVolumeSpecFields =
-        serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+        PersistentVolumeSpecFields::deserialize(&obj["spec"]).unwrap_or_default();
     default_volume_status_and_mode(&mut status, &mut spec);
     obj["status"] =
         serde_json::to_value(&status).expect("PersistentVolumeStatusFields is always serializable");
@@ -294,7 +295,7 @@ fn default_pv(obj: &mut serde_json::Value) {
 /// sets them when their alpha/beta feature gates are enabled, which this codebase does
 /// not model.
 fn default_csidriver(obj: &mut serde_json::Value) {
-    let mut spec: CsiDriverSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let mut spec: CsiDriverSpec = CsiDriverSpec::deserialize(&obj["spec"]).unwrap_or_default();
     default_csidriver_spec(&mut spec);
     obj["spec"] = serde_json::to_value(&spec).expect("CsiDriverSpec is always serializable");
 }
@@ -341,7 +342,7 @@ fn default_csidriver_spec(spec: &mut CsiDriverSpec) {
 ///
 /// Idempotent: if a field is already set it is not overwritten.
 fn default_storageclass(obj: &mut serde_json::Value) {
-    let mut fields: StorageClassFields = serde_json::from_value(obj.clone()).unwrap_or_default();
+    let mut fields: StorageClassFields = StorageClassFields::deserialize(&*obj).unwrap_or_default();
     if fields.reclaim_policy.is_none() {
         fields.reclaim_policy = Some("Delete".to_string());
     }
@@ -365,7 +366,7 @@ fn default_storageclass(obj: &mut serde_json::Value) {
 /// never overwritten.
 fn default_namespace(obj: &mut serde_json::Value) {
     let mut status: crate::types::NamespaceStatus =
-        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+        crate::types::NamespaceStatus::deserialize(&obj["status"]).unwrap_or_default();
     if status.phase.is_none() {
         status.phase = Some(crate::types::NamespacePhase::Active);
     }
@@ -475,9 +476,9 @@ fn default_limitrange(obj: &mut serde_json::Value) {
 /// selecting by the RC's own labels).
 fn default_replicationcontroller(obj: &mut serde_json::Value) {
     let mut spec: ReplicationControllerSpec =
-        serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+        ReplicationControllerSpec::deserialize(&obj["spec"]).unwrap_or_default();
     let template_labels: TemplateLabelsPeek =
-        serde_json::from_value(obj["spec"]["template"].clone()).unwrap_or_default();
+        TemplateLabelsPeek::deserialize(&obj["spec"]["template"]).unwrap_or_default();
 
     // Default spec.selector from template labels when absent.
     // RC selector is a flat map<string,string> — NOT wrapped in matchLabels.
@@ -516,7 +517,7 @@ fn default_replicationcontroller(obj: &mut serde_json::Value) {
 /// test reads it back and expects `0`. Without this default, the field stays null
 /// and the test fails with "unexpected leaseTransitions: <nil>".
 fn default_lease(obj: &mut serde_json::Value) {
-    let mut spec: LeaseSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let mut spec: LeaseSpec = LeaseSpec::deserialize(&obj["spec"]).unwrap_or_default();
     if spec.lease_transitions.is_none() {
         spec.lease_transitions = Some(0);
     }
@@ -538,7 +539,7 @@ fn default_lease(obj: &mut serde_json::Value) {
 /// API server conformance test.
 fn default_role_ref_api_group(obj: &mut serde_json::Value) {
     let mut role_ref: RoleRefFields =
-        serde_json::from_value(obj["roleRef"].clone()).unwrap_or_default();
+        RoleRefFields::deserialize(&obj["roleRef"]).unwrap_or_default();
     if role_ref.api_group.as_deref().is_none_or(str::is_empty) {
         role_ref.api_group = Some("rbac.authorization.k8s.io".to_string());
     }
@@ -613,7 +614,7 @@ fn default_endpoints(obj: &mut serde_json::Value) {
 /// 4. Skip ClusterIP-family defaults for ExternalName — ExternalName services must not
 ///    have ipFamilies/ipFamilyPolicy/clusterIPs set (they have no cluster IP at all).
 fn default_service(obj: &mut serde_json::Value) {
-    let mut spec: ServiceSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let mut spec: ServiceSpec = ServiceSpec::deserialize(&obj["spec"]).unwrap_or_default();
     default_service_spec(&mut spec);
     obj["spec"] = serde_json::to_value(&spec).expect("ServiceSpec is always serializable");
 }
@@ -813,7 +814,7 @@ fn alias_event_field(obj: &mut serde_json::Value, core_field: &str, events_v1_fi
 ///
 /// Must NOT be called for ExternalName services (they have no ClusterIP family).
 pub fn default_service_ip_fields(obj: &mut serde_json::Value) {
-    let mut spec: ServiceSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let mut spec: ServiceSpec = ServiceSpec::deserialize(&obj["spec"]).unwrap_or_default();
     default_service_ip_fields_spec(&mut spec);
     obj["spec"] = serde_json::to_value(&spec).expect("ServiceSpec is always serializable");
 }
@@ -1163,7 +1164,8 @@ fn default_selector_from_template_labels(
     template: &serde_json::Value,
 ) {
     if selector.is_none() {
-        let peek: TemplateLabelsPeek = serde_json::from_value(template.clone()).unwrap_or_default();
+        let peek: TemplateLabelsPeek =
+            TemplateLabelsPeek::deserialize(template).unwrap_or_default();
         if let Some(labels) = peek.metadata.labels {
             *selector = Some(serde_json::json!({ "matchLabels": labels }));
         }
@@ -1171,7 +1173,7 @@ fn default_selector_from_template_labels(
 }
 
 fn default_replicaset(obj: &mut serde_json::Value) {
-    let mut spec: ReplicaSetSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let mut spec: ReplicaSetSpec = ReplicaSetSpec::deserialize(&obj["spec"]).unwrap_or_default();
     // spec.selector defaults to matchLabels from spec.template.metadata.labels.
     // Real kube-apiserver rejects ReplicaSets without spec.selector. Without
     // defaulting, validate_resource rejects objects that omit selector when
@@ -1185,7 +1187,7 @@ fn default_replicaset(obj: &mut serde_json::Value) {
 }
 
 fn default_statefulset(obj: &mut serde_json::Value) {
-    let mut spec: StatefulSetSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let mut spec: StatefulSetSpec = StatefulSetSpec::deserialize(&obj["spec"]).unwrap_or_default();
     // spec.selector defaults to matchLabels from spec.template.metadata.labels.
     // Real kube-apiserver rejects StatefulSets without spec.selector. Without
     // defaulting, validate_resource rejects objects that omit selector when
@@ -1215,7 +1217,7 @@ fn default_statefulset(obj: &mut serde_json::Value) {
 }
 
 fn default_daemonset(obj: &mut serde_json::Value) {
-    let mut spec: DaemonSetSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let mut spec: DaemonSetSpec = DaemonSetSpec::deserialize(&obj["spec"]).unwrap_or_default();
     let strategy = spec.update_strategy.get_or_insert_with(Default::default);
     if strategy.r#type.is_none() {
         strategy.r#type = Some("RollingUpdate".to_string());
@@ -1254,7 +1256,7 @@ fn strip_null_template_metadata(obj: &mut serde_json::Value) {
 
 fn default_pod_template(template: &mut serde_json::Value) {
     let mut typed: DefaultingPodTemplate =
-        serde_json::from_value(template.clone()).unwrap_or_default();
+        DefaultingPodTemplate::deserialize(&*template).unwrap_or_default();
     default_pod_template_fields(&mut typed);
     *template = serde_json::to_value(&typed).expect("DefaultingPodTemplate is always serializable");
 }
@@ -1272,10 +1274,10 @@ fn default_pod_template_fields(template: &mut DefaultingPodTemplate) {
 }
 
 fn default_job(obj: &mut serde_json::Value) {
-    let mut spec: JobSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let mut spec: JobSpec = JobSpec::deserialize(&obj["spec"]).unwrap_or_default();
 
     let mut template: DefaultingPodTemplate =
-        serde_json::from_value(spec.rest["template"].clone()).unwrap_or_default();
+        DefaultingPodTemplate::deserialize(&spec.rest["template"]).unwrap_or_default();
     default_pod_template_fields(&mut template);
 
     if spec.backoff_limit.is_none() {
@@ -1344,7 +1346,7 @@ fn strip_null_cronjob_template_metadata(obj: &mut serde_json::Value) {
 }
 
 fn default_deployment(obj: &mut serde_json::Value) {
-    let mut spec: DeploymentSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let mut spec: DeploymentSpec = DeploymentSpec::deserialize(&obj["spec"]).unwrap_or_default();
 
     // spec.selector defaults to matchLabels from spec.template.metadata.labels.
     // Upstream kube-apiserver rejects Deployments without spec.selector; u7s stores
@@ -1413,7 +1415,7 @@ fn default_hpa(obj: &mut serde_json::Value) {
     }
 
     let mut behavior: HpaBehavior =
-        serde_json::from_value(obj["spec"]["behavior"].clone()).unwrap_or_default();
+        HpaBehavior::deserialize(&obj["spec"]["behavior"]).unwrap_or_default();
     default_hpa_behavior(&mut behavior);
     obj["spec"]["behavior"] =
         serde_json::to_value(&behavior).expect("HpaBehavior is always serializable");
