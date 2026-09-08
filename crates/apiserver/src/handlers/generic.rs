@@ -205,7 +205,7 @@ pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::St
         Some(n) => Ok(n.to_string()),
         None => {
             let meta: ObjectMeta =
-                serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+                ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
             let gen = meta.generate_name.as_deref().unwrap_or("");
             if gen.is_empty() {
                 return Err(Status::bad_request(
@@ -685,12 +685,10 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
 
     // Namespace finalizers live in spec.finalizers; all other resources use metadata.finalizers.
     let has_finalizers = if is_namespace {
-        let spec: NamespaceSpec =
-            serde_json::from_value(obj.body["spec"].clone()).unwrap_or_default();
+        let spec: NamespaceSpec = NamespaceSpec::deserialize(&obj.body["spec"]).unwrap_or_default();
         spec.finalizers.as_ref().is_some_and(|f| !f.is_empty())
     } else {
-        let meta: ObjectMeta =
-            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         meta.finalizers.as_ref().is_some_and(|f| !f.is_empty())
     };
 
@@ -738,7 +736,7 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
 /// defeating controllers' "same name, different uid means a different object"
 /// recreate-detection.
 pub(crate) fn stamp_metadata(obj: &mut Object) {
-    let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+    let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
     obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
     if meta
         .creation_timestamp
@@ -774,7 +772,7 @@ pub(crate) fn check_crb_escalation<S: Store>(
     if group != RBAC_GROUP || plural != CLUSTER_ROLE_BINDINGS {
         return Ok(());
     }
-    let role_ref_name = serde_json::from_value::<crate::rbac::RbacBinding>(body.clone())
+    let role_ref_name = crate::rbac::RbacBinding::deserialize(body)
         .map(|b| b.role_ref.name)
         .unwrap_or_default();
     let role_rules = state.rbac_index.cluster_role_rules(&role_ref_name);
@@ -841,7 +839,7 @@ pub(crate) fn check_clusterrole_escalation<S: Store>(
     if group != RBAC_GROUP || plural != CLUSTER_ROLES {
         return Ok(());
     }
-    let role_rules = serde_json::from_value::<crate::rbac::RbacRole>(body.clone())
+    let role_rules = crate::rbac::RbacRole::deserialize(body)
         .map(|r| r.rules)
         .unwrap_or_default();
     if role_rules.is_empty() {
@@ -885,7 +883,7 @@ pub(crate) fn check_role_escalation<S: Store>(
     if group != RBAC_GROUP || plural != ROLES {
         return Ok(());
     }
-    let role_rules = serde_json::from_value::<crate::rbac::RbacRole>(body.clone())
+    let role_rules = crate::rbac::RbacRole::deserialize(body)
         .map(|r| r.rules)
         .unwrap_or_default();
     if role_rules.is_empty() {
@@ -937,7 +935,7 @@ pub(crate) fn check_rb_escalation<S: Store>(
     if group != RBAC_GROUP || plural != ROLE_BINDINGS {
         return Ok(());
     }
-    let binding = match serde_json::from_value::<crate::rbac::RbacBinding>(body.clone()) {
+    let binding = match crate::rbac::RbacBinding::deserialize(body) {
         Ok(b) => b,
         Err(_) => return Ok(()),
     };

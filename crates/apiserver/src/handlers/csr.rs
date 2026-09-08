@@ -22,6 +22,7 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
+use serde::Deserialize;
 use x509_cert::der::DecodePem as _;
 use x509_cert::request::CertReq;
 
@@ -58,8 +59,8 @@ pub(crate) fn validate_csr_spec(
     body: &serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
     // Deserialize spec into a typed struct so field access is compiler-checked.
-    let spec: CertificateSigningRequestSpec = serde_json::from_value(body["spec"].clone())
-        .map_err(|e| {
+    let spec: CertificateSigningRequestSpec =
+        CertificateSigningRequestSpec::deserialize(&body["spec"]).map_err(|e| {
             Status::unprocessable_entity(format!(
                 "spec.request is required and must be a non-empty base64-encoded string: {e}"
             ))

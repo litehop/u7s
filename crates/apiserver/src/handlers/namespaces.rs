@@ -5,6 +5,7 @@ use axum::{
     Extension, Json,
 };
 use bytes::Bytes;
+use serde::Deserialize;
 use std::collections::HashSet;
 use u7s_store::{ListOptions, Store, StoreError, StoreObject};
 
@@ -184,7 +185,7 @@ pub(crate) async fn create_namespace<S: Store>(
             Some(n) => n.to_string(),
             None => {
                 let meta: ObjectMeta =
-                    serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+                    ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
                 let gen = meta.generate_name.as_deref().unwrap_or("");
                 if gen.is_empty() {
                     return Err(Status::bad_request(
@@ -220,7 +221,7 @@ pub(crate) async fn create_namespace<S: Store>(
     // through the drain lifecycle even if the controller is behind.
     {
         let mut spec: NamespaceSpec =
-            serde_json::from_value(obj.body["spec"].clone()).unwrap_or_default();
+            NamespaceSpec::deserialize(&obj.body["spec"]).unwrap_or_default();
         let has_k8s = spec
             .finalizers
             .as_deref()
@@ -238,8 +239,7 @@ pub(crate) async fn create_namespace<S: Store>(
 
     // Assign a UID if none provided — required for owner references and garbage collection.
     {
-        let meta: ObjectMeta =
-            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
             obj.body["metadata"]["uid"] =
                 serde_json::Value::String(uuid::Uuid::new_v4().to_string());
@@ -247,8 +247,7 @@ pub(crate) async fn create_namespace<S: Store>(
     }
 
     {
-        let meta: ObjectMeta =
-            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         if meta.creation_timestamp.is_none() {
             obj.body["metadata"]["creationTimestamp"] =
                 serde_json::Value::String(utc_now_rfc3339());
@@ -444,10 +443,10 @@ pub(crate) async fn replace_namespace<S: Store>(
 
     // Post-replace: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let replace_meta: ObjectMeta =
-        serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
     let deletion_ts_set = replace_meta.deletion_timestamp.is_some();
     let replace_spec: NamespaceSpec =
-        serde_json::from_value(obj.body["spec"].clone()).unwrap_or_default();
+        NamespaceSpec::deserialize(&obj.body["spec"]).unwrap_or_default();
     let finalizers_empty = replace_spec
         .finalizers
         .as_deref()
@@ -581,10 +580,10 @@ pub(crate) async fn patch_namespace<S: Store>(
 
     // Post-patch: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let current_meta: ObjectMeta =
-        serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
+        ObjectMeta::deserialize(&current.body["metadata"]).unwrap_or_default();
     let deletion_ts_set = current_meta.deletion_timestamp.is_some();
     let patch_spec: NamespaceSpec =
-        serde_json::from_value(current.body["spec"].clone()).unwrap_or_default();
+        NamespaceSpec::deserialize(&current.body["spec"]).unwrap_or_default();
     let finalizers_empty = patch_spec
         .finalizers
         .as_deref()
@@ -647,9 +646,9 @@ pub(crate) async fn finalize_namespace<S: Store>(
     // KCM writes spec.finalizers; fall back to metadata.finalizers.
     let new_finalizers: Option<Vec<String>> =
         if !req["spec"]["finalizers"].is_null() && req["spec"].get("finalizers").is_some() {
-            serde_json::from_value(req["spec"]["finalizers"].clone()).unwrap_or_default()
+            Option::deserialize(&req["spec"]["finalizers"]).unwrap_or_default()
         } else {
-            serde_json::from_value(req["metadata"]["finalizers"].clone()).unwrap_or_default()
+            Option::deserialize(&req["metadata"]["finalizers"]).unwrap_or_default()
         };
 
     // Fetch the current namespace from the store.
@@ -666,17 +665,17 @@ pub(crate) async fn finalize_namespace<S: Store>(
 
     // Namespace finalizers live in spec.finalizers (not metadata.finalizers).
     let mut spec: NamespaceSpec =
-        serde_json::from_value(current.body["spec"].clone()).unwrap_or_default();
+        NamespaceSpec::deserialize(&current.body["spec"]).unwrap_or_default();
     spec.finalizers = new_finalizers;
     current.body["spec"] = serde_json::to_value(&spec)
         .map_err(|e| Status::internal(format!("failed to serialize NamespaceSpec: {e}")))?;
 
     // Check: if deletionTimestamp is set and spec.finalizers are now empty → hard-delete.
     let current_meta: ObjectMeta =
-        serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
+        ObjectMeta::deserialize(&current.body["metadata"]).unwrap_or_default();
     let deletion_ts_set = current_meta.deletion_timestamp.is_some();
     let current_spec: NamespaceSpec =
-        serde_json::from_value(current.body["spec"].clone()).unwrap_or_default();
+        NamespaceSpec::deserialize(&current.body["spec"]).unwrap_or_default();
     let finalizers_empty = current_spec
         .finalizers
         .as_deref()
@@ -693,8 +692,7 @@ pub(crate) async fn finalize_namespace<S: Store>(
     // CAS on the INCOMING request's resourceVersion, not the stored object's: /finalize is
     // a replace subresource, so a client holding a stale snapshot must get 409 and retry
     // rather than clobber a concurrent write. Absent rv stays unconditional (returns None).
-    let incoming_meta: ObjectMeta =
-        serde_json::from_value(req["metadata"].clone()).unwrap_or_default();
+    let incoming_meta: ObjectMeta = ObjectMeta::deserialize(&req["metadata"]).unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let new_rv = state
         .store
@@ -758,7 +756,7 @@ pub(crate) async fn put_namespace_status<S: Store>(
             current.body.as_object_mut().map(|m| m.remove("status"));
         }
         v => {
-            let status: NamespaceStatus = serde_json::from_value(v.clone()).unwrap_or_default();
+            let status: NamespaceStatus = NamespaceStatus::deserialize(v).unwrap_or_default();
             current.body["status"] = serde_json::to_value(&status).map_err(|e| {
                 Status::internal(format!("failed to serialize NamespaceStatus: {e}"))
             })?;
@@ -1101,12 +1099,11 @@ pub(crate) async fn maybe_finalize_terminating_namespace<S: Store>(
         Ok(v) => v,
         Err(_) => return,
     };
-    let ns_meta: ObjectMeta =
-        serde_json::from_value(ns_val["metadata"].clone()).unwrap_or_default();
+    let ns_meta: ObjectMeta = ObjectMeta::deserialize(&ns_val["metadata"]).unwrap_or_default();
     if ns_meta.deletion_timestamp.is_none() {
         return;
     }
-    let ns_spec: NamespaceSpec = serde_json::from_value(ns_val["spec"].clone()).unwrap_or_default();
+    let ns_spec: NamespaceSpec = NamespaceSpec::deserialize(&ns_val["spec"]).unwrap_or_default();
     let spec_finalizers_empty = ns_spec
         .finalizers
         .as_deref()

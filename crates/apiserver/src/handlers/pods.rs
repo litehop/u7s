@@ -1250,8 +1250,7 @@ pub(crate) async fn delete_collection_pods<S: Store>(
             // KCM namespace-controller drains pods via exactly this endpoint (DeleteCollection)
             // during OrderedNamespaceDeletion — unconditionally hard-deleting here would silently
             // bypass every pod's finalizers.
-            let meta: ObjectMeta =
-                serde_json::from_value(parsed["metadata"].clone()).unwrap_or_default();
+            let meta: ObjectMeta = ObjectMeta::deserialize(&parsed["metadata"]).unwrap_or_default();
             let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
             let already_terminating = meta.deletion_timestamp.is_some();
             let force_requested = requested_grace == Some(0);
@@ -1403,8 +1402,7 @@ pub(crate) async fn delete_pod<S: Store>(
         };
         run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
-        let meta: ObjectMeta =
-            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
         let already_terminating = meta.deletion_timestamp.is_some();
         // `kubectl delete --grace-period=0 --force` sends an explicit gracePeriodSeconds=0 —
@@ -1622,7 +1620,7 @@ pub(crate) async fn patch_pod<S: Store>(
 
         // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
         let post_patch_meta: ObjectMeta =
-            serde_json::from_value(current_obj.body["metadata"].clone()).unwrap_or_default();
+            ObjectMeta::deserialize(&current_obj.body["metadata"]).unwrap_or_default();
         let deletion_ts_set = post_patch_meta.deletion_timestamp.is_some();
         let finalizers_empty = post_patch_meta
             .finalizers
@@ -1729,7 +1727,7 @@ pub(crate) async fn evict_pod<S: Store>(
     // which is what kubectl's generic `create --dry-run=server` path uses for POST-based
     // subresources like Eviction) — accept either.
     let delete_opts: DeleteOptions =
-        serde_json::from_value(eviction["deleteOptions"].clone()).unwrap_or_default();
+        DeleteOptions::deserialize(&eviction["deleteOptions"]).unwrap_or_default();
     let dry_run = delete_opts.is_dry_run() || super::json_patch::is_dry_run_header(&headers);
 
     let stored = state
@@ -1763,7 +1761,7 @@ pub(crate) async fn evict_pod<S: Store>(
     };
     run_validating_webhooks(&state, &eviction, None, &admission_ctx).await?;
 
-    let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+    let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
     let already_terminating = meta.deletion_timestamp.is_some();
     let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
 
@@ -1951,7 +1949,7 @@ async fn check_pdb_allows_eviction<S: Store>(
                 return false;
             }
             let selector: LabelSelector =
-                serde_json::from_value(selector_value.clone()).unwrap_or_default();
+                LabelSelector::deserialize(selector_value).unwrap_or_default();
             label_selector_matches(Some(&selector), &pod_labels)
         })
         .collect();
@@ -3167,7 +3165,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
     // holding a stale snapshot must get 409 and retry, not silently clobber a concurrent
     // write. Absent rv stays unconditional (parse_resource_version returns None).
     let incoming_meta: ObjectMeta =
-        serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();
+        ObjectMeta::deserialize(&incoming["metadata"]).unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let new_rv = state
         .store
@@ -3917,7 +3915,7 @@ pub(crate) async fn patch_pod_resize<S: Store>(
     // a PUT client sends its rv and must get 409 on a stale write; a PATCH omits rv, so
     // parse_resource_version returns None and the write stays unconditional.
     let incoming_meta: ObjectMeta =
-        serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();
+        ObjectMeta::deserialize(&incoming["metadata"]).unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let new_rv = state
         .store
@@ -4120,7 +4118,7 @@ pub(crate) async fn put_ephemeral_containers<S: Store>(
     // CAS on the INCOMING body's resourceVersion, not the stored object's, so a stale
     // PUT is rejected with 409. Absent rv stays unconditional (returns None).
     let incoming_meta: ObjectMeta =
-        serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();
+        ObjectMeta::deserialize(&incoming["metadata"]).unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let new_rv = state
         .store
@@ -5106,7 +5104,7 @@ fn parse_image_tag(image: &str) -> &str {
 /// to "Pending" / "Unschedulable" by a no-op replace or patch.
 pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
     // Deserialize spec into typed form once; all typed-field accesses are compile-checked.
-    let mut spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
+    let mut spec: PodSpec = PodSpec::deserialize(&pod["spec"]).unwrap_or_default();
 
     // enableServiceLinks: PodSpec deserializes this with default_true, so
     // spec.enable_service_links is true when the field was absent. Write it
@@ -8669,7 +8667,7 @@ mod generation_tests {
 pub(crate) fn extract_binding_node_name(
     binding: &serde_json::Value,
 ) -> Result<String, crate::status::StatusError> {
-    let parsed: Binding = serde_json::from_value(binding.clone())
+    let parsed: Binding = Binding::deserialize(binding)
         .map_err(|_| Status::bad_request("target.name is required".into()))?;
     if parsed.target.name.is_empty() {
         return Err(Status::bad_request("target.name is required".into()));
