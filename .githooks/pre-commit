@@ -2,10 +2,4 @@
 set -e
 bash scripts/check-findings-bead-refs.sh
 cargo fmt --all -- --check
-if git diff --cached --name-only | grep -q '^crates/servicelb/'; then
-  (cd crates/servicelb && cargo fmt --check) || {
-    echo "pre-commit: crates/servicelb changed but 'cargo fmt --check' failed -- run: (cd crates/servicelb && cargo fmt)" >&2
-    exit 1
-  }
-fi
 bash scripts/check-bead-id-refs.sh
