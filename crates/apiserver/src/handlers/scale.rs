@@ -344,7 +344,7 @@ pub fn label_selector_to_string(selector: &serde_json::Value) -> String {
 
 /// Extract spec.replicas from a stored workload object (default 0).
 pub fn extract_replicas(obj: &serde_json::Value) -> i64 {
-    let spec: ScaleSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let spec: ScaleSpec = ScaleSpec::deserialize(&obj["spec"]).unwrap_or_default();
     spec.replicas.unwrap_or(0) as i64
 }
 
@@ -354,7 +354,7 @@ pub fn extract_replicas(obj: &serde_json::Value) -> i64 {
 /// `spec.replicas` when the status field has not yet been written (e.g. immediately
 /// after creation before the first controller reconciliation).
 pub fn extract_status_replicas(obj: &serde_json::Value) -> i64 {
-    let status: ScaleStatus = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let status: ScaleStatus = ScaleStatus::deserialize(&obj["status"]).unwrap_or_default();
     match status.replicas {
         Some(n) => n as i64,
         // Status not yet written by controller — treat as equal to spec.
@@ -430,7 +430,7 @@ fn write_scale_replicas(
     // generation/observedGeneration to detect spec drift and trigger reconciliation.
     if new_replicas as i64 != old_replicas {
         let mut meta: ObjectMeta =
-            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+            ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         meta.generation = Some(meta.generation.unwrap_or(1) + 1);
         obj.body["metadata"] =
             serde_json::to_value(meta).map_err(|e| Status::internal(e.to_string()))?;
@@ -529,7 +529,7 @@ async fn scale_patch_impl<S: Store>(
             return Err(Status::bad_request(format!("invalid JSON: {e}")));
         };
     let patch_scale_spec: ScaleSpec =
-        serde_json::from_value(patch_body["spec"].clone()).unwrap_or_default();
+        ScaleSpec::deserialize(&patch_body["spec"]).unwrap_or_default();
 
     let key = group_object_key(group, resource, Some(ns), name);
     let stored = state
