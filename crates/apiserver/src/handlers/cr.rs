@@ -4229,6 +4229,14 @@ pub async fn patch_cr_namespaced<S: Store>(
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
+        // ResourceQuota: an SSA apply-create is a create just like create_cr_namespaced, so
+        // it must be checked against a `count/<plural>.<group>` (or compute) quota too —
+        // otherwise `kubectl apply --server-side` on a not-yet-existing CR name bypasses
+        // ResourceQuota entirely. Held across check-then-write like create_cr_namespaced's
+        // own lock, for the same lost-update-race reason.
+        let _quota_lock = state.quota_admission_locks.lock(&ns).await;
+        crate::quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj)).await?;
+
         // Dry-run: validation and admission passed; return the would-be created object
         // without persisting — mirrors create_cr_namespaced's dry-run early-return.
         if is_dry_run_header(&headers) {
@@ -15920,6 +15928,90 @@ mod tests {
         assert!(
             state.store.get(&key).await.unwrap().is_none(),
             "the CR must not have been created in the store"
+        );
+    }
+
+    // patch_cr_namespaced's SSA-upsert branch (is_ssa && stored_opt.is_none()) never called
+    // quota::check_resource_quota, unlike create_cr_namespaced — so `kubectl apply
+    // --server-side` on a not-yet-existing CR name could create a CR past a
+    // `count/<plural>.<group>` ResourceQuota's hard limit, a total bypass of quota
+    // enforcement for CRs created via server-side apply.
+    //
+    // Fails on revert: without the check, this SSA apply-create past count/1 returns 201
+    // instead of being denied.
+    #[tokio::test]
+    async fn patch_cr_namespaced_ssa_create_denies_second_cr_when_count_quota_at_limit() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "crd-quota", "namespace": "argocd" },
+            "spec": { "hard": { "count/applications.argoproj.io": "1" } }
+        });
+        state
+            .store
+            .put(
+                "/registry/resourcequotas/argocd/crd-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        // The first CR is created via ordinary POST, claiming the quota's only slot.
+        let first = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body("app-1", "argocd"),
+        )
+        .await;
+        assert!(
+            first.is_ok(),
+            "first CR must be admitted (quota not yet at limit)"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        // The second CR is created via `kubectl apply --server-side` (SSA apply-create of a
+        // not-yet-existing name) instead of POST.
+        let second = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+                "app-2".to_string(),
+            )),
+            test_user(),
+            headers,
+            app_body("app-2", "argocd"),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "SSA apply-create must be denied once count/applications.argoproj.io=1 is already \
+             claimed — without ResourceQuota admission wired into patch_cr_namespaced's SSA-create \
+             branch, `kubectl apply --server-side` bypasses CR quota enforcement entirely"
+        );
+
+        let key = cr_store_key("argoproj.io", "applications", Some("argocd"), "app-2");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "the over-quota CR must not have been created in the store"
         );
     }
 

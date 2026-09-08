@@ -1378,6 +1378,18 @@ pub(crate) async fn do_patch<S: Store>(
             )
             .map_err(Status::forbidden)?;
         }
+        // ResourceQuota: an SSA apply-create is a create just like create_resource /
+        // create_namespaced_resource, so it must be checked against count/* and compute
+        // quotas too — otherwise `kubectl apply --server-side` on a not-yet-existing name
+        // bypasses ResourceQuota entirely. Held across check-then-write like the plain-POST
+        // create path, for the same lost-update-race reason (see create_namespaced_resource).
+        let _quota_lock = if let Some(namespace) = ns {
+            let lock = state.quota_admission_locks.lock(namespace).await;
+            quota::check_resource_quota(state, namespace, group, plural, Some(&obj.body)).await?;
+            Some(lock)
+        } else {
+            None
+        };
         if dry_run {
             // Dry-run: validation passed; return the would-be created object without persisting.
             if let Some(fm) = field_manager {
@@ -6863,6 +6875,106 @@ mod tests {
         .into_response();
 
         assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+    }
+
+    /// `do_patch`'s SSA-upsert branch (is_ssa && stored_opt.is_none()) never called
+    /// `quota::check_resource_quota`, unlike `create_namespaced_resource` — so `kubectl apply
+    /// --server-side` on a not-yet-existing built-in resource name could create it past a
+    /// `count/<resource>` ResourceQuota's hard limit, a total bypass of quota enforcement for
+    /// built-ins created via server-side apply.
+    ///
+    /// Fails on revert: without the check, this SSA apply-create past count/configmaps=1
+    /// returns 201 instead of being denied.
+    #[tokio::test]
+    async fn patch_namespaced_resource_ssa_create_denies_second_configmap_when_count_quota_at_limit(
+    ) {
+        let state = make_state();
+        let ns = "default";
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "cm-quota", "namespace": ns },
+            "spec": { "hard": { "count/configmaps": "1" } }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key("", "resourcequotas", Some(ns), "cm-quota"),
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        // The first ConfigMap is created via ordinary POST, claiming the quota's only slot.
+        let cm1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-1", "namespace": ns },
+            "data": { "k": "v" }
+        });
+        let first = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm1).unwrap()),
+        )
+        .await;
+        assert!(
+            first.is_ok(),
+            "first ConfigMap must be admitted (quota not yet at limit)"
+        );
+
+        let cm2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-2", "namespace": ns },
+            "data": { "k": "v" }
+        });
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        // The second ConfigMap is created via `kubectl apply --server-side` (SSA apply-create
+        // of a not-yet-existing name) instead of POST.
+        let second = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+                "cm-2".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&cm2).unwrap()),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "SSA apply-create must be denied once count/configmaps=1 is already claimed — \
+             without ResourceQuota admission wired into do_patch's SSA-create branch, \
+             `kubectl apply --server-side` bypasses built-in resource quota enforcement \
+             entirely"
+        );
+
+        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "cm-2");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "the over-quota ConfigMap must not have been created in the store"
+        );
     }
 
     /// do_patch's patch-into-EXISTING-object branch (as opposed to the SSA create-on-missing
