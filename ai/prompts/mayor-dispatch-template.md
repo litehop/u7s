@@ -687,6 +687,29 @@ Critical learnings:
 
 ---
 
+## Shape 7 — Review-fix round on an existing PR
+
+A review left findings on an already-open PR; the fix needs to land as new
+commits on that branch. Dispatch a FRESH worker (`isolation="worktree"`)
+that checks out the EXISTING PR branch — mirrors Shape 5's worktree
+convention — rather than a `SendMessage`-resume of the worker that opened
+the PR. Sections: worktree at `<WORKTREE_ROOT>/<branch-name>-fix` checking
+out the existing branch; boundary block; a TIGHT brief listing exact
+`file:line` sites from the review, with "mirror the adjacent pattern,
+LSP-jump don't full-read"; quality gates; push to the existing branch, not
+main; return under 200 words with sites fixed + verification.
+
+**Why fresh, not resume:** resuming a completed large-context worker
+re-ingests its entire prior transcript COLD — the prompt cache expires
+after ~5 min — so a small fix balloons to 650k+ cumulative tokens dominated
+by inherited bloat. A fresh worker on a tight brief pays only for the fix.
+
+**Exception:** `SendMessage`-resume is fine for a small continuation still
+inside the ~5-minute cache-warm window. The rule targets cold
+re-ingestion, not resume itself.
+
+---
+
 ## Lima VM protocol
 
 ### Multi-VM model
