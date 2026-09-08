@@ -18,6 +18,16 @@ cargo clippy --workspace --tests --quiet --no-deps -- -D warnings
 ZERO_OID=0000000000000000000000000000000000000000
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
+# crates/servicelb is a nested workspace excluded from the root workspace
+# (see root Cargo.toml's `exclude`), so `cargo test --workspace`/`cargo
+# clippy --workspace` above never touch it. Gated on path, not run for
+# every push: `cargo test` there cross-builds servicelb-ebpf via build.rs,
+# needing a nightly toolchain + rust-src + bpf-linker, and its own
+# `cargo test`/`clippy --tests` also builds the u7s-servicelb loader, which
+# depends on Linux-only libc syscalls via `aya` -- forcing that cost (and a
+# hard requirement on Linux) onto every unrelated push would be wrong.
+servicelb_touched=0
+
 # Prints a prominent, NON-BLOCKING summary of test-file changes in diff range
 # $1. Scope: files under tests/ or matching *_test.rs are reported whole-file;
 # for any other changed .rs file, only hunks whose git-computed enclosing
@@ -118,4 +128,28 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   fi
 
   print_test_change_summary "$range"
+
+  if git diff --name-only "$range" -- crates/servicelb 2>/dev/null | grep -q .; then
+    servicelb_touched=1
+  fi
 done
+
+if [ "$servicelb_touched" -eq 1 ]; then
+  echo "[pre-push] crates/servicelb changed -- running servicelb clippy/test + servicelb-ebpf clippy"
+
+  (cd crates/servicelb && cargo clippy --tests -- -D warnings) || {
+    echo "[pre-push] FAILED: crates/servicelb clippy --tests -- -D warnings" >&2
+    echo "[pre-push] hint: this builds the u7s-servicelb loader (needs Linux -- 'aya' uses Linux-only libc syscalls) and cross-builds servicelb-ebpf (needs nightly + rust-src + bpf-linker)." >&2
+    exit 1
+  }
+  (cd crates/servicelb && cargo test) || {
+    echo "[pre-push] FAILED: crates/servicelb cargo test" >&2
+    echo "[pre-push] hint: same build requirements as the clippy step above (Linux host + nightly/rust-src/bpf-linker)." >&2
+    exit 1
+  }
+  (cd crates/servicelb/servicelb-ebpf && cargo +nightly clippy --release --target bpfel-unknown-none -Z build-std=core -- -D warnings) || {
+    echo "[pre-push] FAILED: servicelb-ebpf clippy --release --target bpfel-unknown-none -Z build-std=core" >&2
+    echo "[pre-push] hint: -Z build-std needs a nightly toolchain with rust-src (rustup toolchain install nightly --component rust-src) and bpf-linker on PATH (cargo install bpf-linker)." >&2
+    exit 1
+  }
+fi
