@@ -190,8 +190,7 @@ pub async fn create_token<S: Store>(
     let uid = serde_json::from_slice::<serde_json::Value>(&sa.value)
         .ok()
         .and_then(|v| {
-            let meta: ObjectMeta =
-                serde_json::from_value(v["metadata"].clone()).unwrap_or_default();
+            let meta: ObjectMeta = ObjectMeta::deserialize(&v["metadata"]).unwrap_or_default();
             meta.uid
         })
         .unwrap_or_default();

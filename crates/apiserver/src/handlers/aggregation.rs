@@ -129,7 +129,7 @@ pub async fn find_apiservice<S: Store>(
 fn backend_base_url(apiservice: &serde_json::Value) -> Result<Option<String>, String> {
     let spec: ApiServiceSpec = apiservice
         .get("spec")
-        .and_then(|s| serde_json::from_value(s.clone()).ok())
+        .and_then(|s| ApiServiceSpec::deserialize(s).ok())
         .unwrap_or_default();
     let Some(svc) = spec.service else {
         return Ok(None);
@@ -755,13 +755,11 @@ fn upsert_available_condition(
     message: &str,
     now: &str,
 ) -> bool {
-    let existing_conditions = apiservice
+    let mut conditions: Vec<Condition> = apiservice
         .get("status")
         .and_then(|s| s.get("conditions"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Array(Vec::new()));
-    let mut conditions: Vec<Condition> =
-        serde_json::from_value(existing_conditions).unwrap_or_default();
+        .and_then(|c| Vec::deserialize(c).ok())
+        .unwrap_or_default();
 
     if let Some(existing) = conditions.iter_mut().find(|c| c.type_ == "Available") {
         let status_changed = existing.status != status_str;
