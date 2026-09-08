@@ -297,6 +297,35 @@ call is_live_agent_branch 'main' 'main' || RC=$?
 assert "a non-worker/agent-* branch name never matches, even if it coincidentally equals a --live-agents entry" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
+# ---------------------------------------------------------------------------
+# 3e. Whitespace-tolerant --live-agents membership match. A comma-space-
+#    joined list (e.g. "a, b, c") must protect EVERY id, not just the
+#    first -- without normalization, the naive ",${live_agents}," substring
+#    match leaves a leading space on every id after the first, so only the
+#    first id in the list ever matches and every subsequent live worker is
+#    left unprotected/reapable.
+# ---------------------------------------------------------------------------
+
+RC=0
+call agent_id_is_live 'abc123' 'abc123, def456, ghi789' || RC=$?
+assert "sanity: a comma-space-joined --live-agents list protects the FIRST id" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call agent_id_is_live 'def456' 'abc123, def456, ghi789' || RC=$?
+assert "...and it protects the MIDDLE id too -- fails without normalization, since \", \" leaves the id as \" def456\", which never equals the bare \"def456\" the substring match searches for" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call agent_id_is_live 'ghi789' 'abc123, def456, ghi789' || RC=$?
+assert "...and it protects the LAST id too, proving every id in a comma-space-joined list is protected, not just the first" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call is_live_agent_branch 'worker/agent-def456' 'abc123, def456, ghi789' || RC=$?
+assert "the same whitespace tolerance holds at the STEP C/D branch-guard level (is_live_agent_branch) -- this is what actually protects a live worker's branch from force-delete" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
 # End-to-end: a worker branch that is ALREADY MERGED (ff-mergeable, so
 # is_unmerged_by_patch_id says false), has no open PR, and no live worktree
 # directory -- by every OTHER STEP C guard this branch is indistinguishable
@@ -539,6 +568,27 @@ assert "...and the refusal is explained on stderr naming the missing flag, not a
   "$(printf '%s' "$FAILSAFE_OUT" | grep -q -- '--live-agents' && echo 1 || echo 0)"
 assert "...and no destructive-step log output appears at all -- STEP A/B/C/D/E never even started" \
   "$(! printf '%s' "$FAILSAFE_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
+
+# Same fail-safe, but for a PRESENT --live-agents flag whose VALUE is empty
+# or whitespace-only -- the flag TOKEN appearing in argv is not enough on
+# its own; without checking the value too, `--live-agents ""` (e.g. a
+# ListAgents call that returned zero running agents, mis-joined into an
+# empty string instead of omitting the flag) would sail past a
+# presence-only check and run the destructive steps with an effectively
+# empty live set, reaping any genuinely live worker.
+FAILSAFE_EMPTY_RC=0
+FAILSAFE_EMPTY_OUT=$(bash "$SCRIPT" --live-agents "" 2>&1) || FAILSAFE_EMPTY_RC=$?
+assert "worktree-hygiene refuses to run when --live-agents is present but its value is the empty string, exiting non-zero rather than treating it as a valid (if empty) live set" \
+  "$([ "$FAILSAFE_EMPTY_RC" -eq 2 ] && echo 1 || echo 0)"
+assert "...and no destructive-step log output appears at all for the empty-value case either" \
+  "$(! printf '%s' "$FAILSAFE_EMPTY_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
+
+FAILSAFE_WS_RC=0
+FAILSAFE_WS_OUT=$(bash "$SCRIPT" --live-agents "   " 2>&1) || FAILSAFE_WS_RC=$?
+assert "worktree-hygiene also refuses to run when --live-agents is whitespace-only -- a value that is non-empty as a raw string but carries no actual agent id must not bypass the fail-safe" \
+  "$([ "$FAILSAFE_WS_RC" -eq 2 ] && echo 1 || echo 0)"
+assert "...and no destructive-step log output appears at all for the whitespace-only case either" \
+  "$(! printf '%s' "$FAILSAFE_WS_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

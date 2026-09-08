@@ -105,11 +105,32 @@ run_cmd() {
 # main()'s fail-safe refusal below.
 LIVE_AGENTS="${LIVE_AGENTS:-}"
 
+# Strips whitespace around each comma-separated token (and drops empty
+# tokens from e.g. a trailing comma or a whitespace-only input), so
+# "a, b, c" / "a,b,c" / " a ,b, c " all normalize to the same "a,b,c" --
+# without this, a comma-space-joined --live-agents value leaves a leading
+# space on every id after the first, which then never matches the exact
+# ",${agent_id}," substring check below and under-protects every live
+# worker but the first in the list.
+normalize_live_agents() {
+  local live_agents="$1"
+  local out="" tok
+  while IFS= read -r tok; do
+    tok="${tok#"${tok%%[![:space:]]*}"}"
+    tok="${tok%"${tok##*[![:space:]]}"}"
+    [ -n "$tok" ] || continue
+    out="${out:+${out},}${tok}"
+  done <<< "$(printf '%s' "$live_agents" | tr ',' '\n')"
+  printf '%s' "$out"
+}
+
 # True (exit 0) iff `agent_id` is present in the comma-separated
-# --live-agents set. Empty `live_agents` never matches anything.
+# --live-agents set. Empty `live_agents` (including whitespace-only, once
+# normalized) never matches anything.
 agent_id_is_live() {
   local agent_id="$1" live_agents="$2"
   [ -n "$agent_id" ] || return 1
+  live_agents="$(normalize_live_agents "$live_agents")"
   [ -n "$live_agents" ] || return 1
   case ",${live_agents}," in
     *",${agent_id},"*) return 0 ;;
@@ -479,8 +500,13 @@ main() {
   # rather than guessing "assume none are live" or "assume all are live"
   # -- permanently forecloses the reap-a-live-worker bug class via
   # mis-invocation, at the cost of a no-op tick until the caller is fixed.
-  if [ "$live_agents_provided" -ne 1 ]; then
-    echo "worktree-hygiene: refusing to run -- --live-agents <comma-separated-agent-ids> is required (the mayor's own ListAgents-derived live set). Without it there is no way to tell a live worker's branch/worktree apart from a stale one, and STEP A/C/D are destructive." >&2
+  # Checking normalize_live_agents' output (not just the raw flag/argv
+  # presence) also closes an empty/whitespace-only value -- `--live-agents
+  # ""` or `--live-agents "   "` -- which would otherwise sail past a
+  # presence-only check and run the destructive steps with an effectively
+  # empty live set.
+  if [ "$live_agents_provided" -ne 1 ] || [ -z "$(normalize_live_agents "$LIVE_AGENTS")" ]; then
+    echo "worktree-hygiene: refusing to run -- --live-agents <comma-separated-agent-ids> is required (the mayor's own ListAgents-derived live set) and must be non-empty after trimming whitespace. Without it there is no way to tell a live worker's branch/worktree apart from a stale one, and STEP A/C/D are destructive." >&2
     exit 2
   fi
 

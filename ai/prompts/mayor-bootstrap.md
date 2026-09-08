@@ -106,8 +106,9 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
   and `.claude/mayor-tick-state.json` — see body below. This one loop only
   wakes the mayor for what the exit code says still needs judgment.
 
-The canonical loop bodies live in `mayor-dispatch-template.md`; paste verbatim
-or adapt as needed.
+The canonical loop bodies are the "Mayor tick loop body" and "Worktree
+hygiene loop body" sections below, in this file; paste verbatim or adapt
+as needed.
 
 **Mayor tick loop body — GitHub Merge Queue is active on this repo.** The
 main-branch ruleset (18156794) requires these status checks, enforced: lint,

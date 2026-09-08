@@ -180,14 +180,35 @@ queue_entry_dispatch_suppressed() {
 # known" -- see is_live_agent_branch's fail-toward-surfacing default.
 LIVE_AGENTS=""
 
+# Strips whitespace around each comma-separated token (and drops empty
+# tokens from e.g. a trailing comma or a whitespace-only input), so
+# "a, b, c" / "a,b,c" / " a ,b, c " all normalize to the same "a,b,c" --
+# without this, a comma-space-joined --live-agents value leaves a leading
+# space on every id after the first, which then never matches the exact
+# ",${agent_id}," substring check below and under-protects every live
+# worker but the first in the list.
+normalize_live_agents() {
+  local live_agents="$1"
+  local out="" tok
+  while IFS= read -r tok; do
+    tok="${tok#"${tok%%[![:space:]]*}"}"
+    tok="${tok%"${tok##*[![:space:]]}"}"
+    [ -n "$tok" ] || continue
+    out="${out:+${out},}${tok}"
+  done <<< "$(printf '%s' "$live_agents" | tr ',' '\n')"
+  printf '%s' "$out"
+}
+
 # True (exit 0) iff `agent_id` is present in the comma-separated
-# --live-agents set. Empty `live_agents` never matches anything -- an
-# unknown liveness state must never be read as "assume live", which is
-# exactly the failure mode that let the old wall-clock window misclassify a
-# genuinely live worker as stale well within its own working window.
+# --live-agents set. Empty `live_agents` (including whitespace-only, once
+# normalized) never matches anything -- an unknown liveness state must
+# never be read as "assume live", which is exactly the failure mode that
+# let the old wall-clock window misclassify a genuinely live worker as
+# stale well within its own working window.
 agent_id_is_live() {
   local agent_id="$1" live_agents="$2"
   [ -n "$agent_id" ] || return 1
+  live_agents="$(normalize_live_agents "$live_agents")"
   [ -n "$live_agents" ] || return 1
   case ",${live_agents}," in
     *",${agent_id},"*) return 0 ;;
