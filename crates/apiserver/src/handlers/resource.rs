@@ -1542,6 +1542,16 @@ pub(crate) async fn do_patch<S: Store>(
             let now = crate::util::utc_now_rfc3339();
             inject_managed_fields(&mut obj.body, fm, &api_ver, &now);
         }
+        // ResourceQuota: refresh status.used so a count/* quota's usage reflects this
+        // SSA-create, matching create_namespaced_resource's own update_quota_status call.
+        // check_resource_quota above only *admits* the request against the pre-create
+        // count — without this, status.used never advances for objects created via
+        // `kubectl apply --server-side`. Unlike update_quota_status's other call sites, this
+        // one needs no separate lock: the check-then-write `_quota_lock` acquired above is
+        // still held here (dropped only at this function's return).
+        if let Some(namespace) = ns {
+            quota::update_quota_status(state, namespace).await;
+        }
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
@@ -3328,6 +3338,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         eps_before_replace,
         stored_deletion_timestamp,
         stored_deletion_grace,
+        object_existed,
     ) = if needs_stored_read {
         let parsed = state
             .store
@@ -3449,9 +3460,10 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             eps_before,
             deletion_timestamp,
             deletion_grace,
+            parsed.is_some(),
         )
     } else {
-        (None, None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None, None, false)
     };
 
     // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
@@ -3656,6 +3668,22 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
         return Ok(Json(obj.body).into_response());
     }
+
+    // ResourceQuota: when the target doesn't exist, this PUT is a create just like
+    // create_namespaced_resource / do_patch's SSA-create branch — Store::put's
+    // unconditional-write-on-missing-key semantics (`expected_revision: None` → create or
+    // overwrite) mean a blind `kubectl replace` or kubelet's Lease-heartbeat PUT would
+    // otherwise create a namespaced object over a count/* quota with no admission check at
+    // all. Held across check-then-write for the same lost-update-race reason as the sibling
+    // create paths. The UPDATE case (object_existed) adds no new quota consumption, so it
+    // intentionally skips this check.
+    let _quota_lock = if !object_existed {
+        let lock = state.quota_admission_locks.lock(&ns).await;
+        quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj.body)).await?;
+        Some(lock)
+    } else {
+        None
+    };
 
     let put_start = std::time::Instant::now();
     let put_result = state
@@ -6974,6 +7002,182 @@ mod tests {
         assert!(
             state.store.get(&key).await.unwrap().is_none(),
             "the over-quota ConfigMap must not have been created in the store"
+        );
+    }
+
+    /// `replace_namespaced_resource`'s CREATE-on-missing branch (a PUT whose target doesn't
+    /// exist yet — e.g. `kubectl replace` or kubelet's Lease heartbeat, see
+    /// `lease_put_without_resource_version_creates_lease`) never called
+    /// `quota::check_resource_quota`. `Store::put`'s unconditional create-or-overwrite
+    /// semantics for `expected_revision: None` meant a blind PUT could create a namespaced
+    /// object past a `count/<resource>` ResourceQuota's hard limit, bypassing quota
+    /// enforcement entirely for this create path (built-ins only have a PUT-create path —
+    /// the CR PUT analog 404s on missing instead of creating).
+    ///
+    /// Fails on revert: without the check, the second PUT-create below (past
+    /// count/configmaps=1) returns 200 instead of being denied. The first PUT-create must
+    /// still succeed, proving the fix gates on "object didn't already exist" rather than
+    /// blanket-denying every PUT.
+    #[tokio::test]
+    async fn replace_namespaced_resource_put_create_denies_second_configmap_when_count_quota_at_limit(
+    ) {
+        let state = make_state();
+        let ns = "default";
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "cm-quota", "namespace": ns },
+            "spec": { "hard": { "count/configmaps": "1" } }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key("", "resourcequotas", Some(ns), "cm-quota"),
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        let cm1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-1", "namespace": ns },
+            "data": { "k": "v" }
+        });
+        let first = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+                "cm-1".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm1).unwrap()),
+        )
+        .await;
+        assert!(
+            first.is_ok(),
+            "an in-limit PUT-create must still succeed — the fix must gate on whether the \
+             object already existed, not blanket-deny every PUT: {:?}",
+            first.err()
+        );
+
+        let cm2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-2", "namespace": ns },
+            "data": { "k": "v" }
+        });
+        let second = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+                "cm-2".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm2).unwrap()),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "PUT create-on-missing must be denied once count/configmaps=1 is already \
+             claimed — without ResourceQuota admission wired into \
+             replace_namespaced_resource's create-on-missing branch, `kubectl replace` (or \
+             any PUT resolving to a create) bypasses built-in resource quota enforcement \
+             entirely"
+        );
+
+        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "cm-2");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "the over-quota ConfigMap must not have been created in the store"
+        );
+    }
+
+    /// `do_patch`'s SSA-create branch admits against `quota::check_resource_quota` (a prior
+    /// fix) but never called `quota::update_quota_status` afterward, unlike
+    /// `create_namespaced_resource` — so `ResourceQuota.status.used` never advanced for a
+    /// built-in created via `kubectl apply --server-side`, even though the object itself was
+    /// correctly admitted and persisted. Conformance and `kubectl describe resourcequota`
+    /// both read `status.used` directly, so a stale value here is user-visible even though
+    /// admission itself is unaffected (check_resource_quota live-recounts).
+    ///
+    /// Fails on revert: without the update_quota_status call, status.used stays absent/stale
+    /// instead of reflecting the newly SSA-created ConfigMap.
+    #[tokio::test]
+    async fn patch_namespaced_resource_ssa_create_updates_quota_status_used() {
+        let state = make_state();
+        let ns = "default";
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "cm-quota", "namespace": ns },
+            "spec": { "hard": { "count/configmaps": "5" } }
+        });
+        let quota_key = crate::keys::group_object_key("", "resourcequotas", Some(ns), "cm-quota");
+        state
+            .store
+            .put(
+                &quota_key,
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-ssa", "namespace": ns },
+            "data": { "k": "v" }
+        });
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+                "cm-ssa".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "SSA-create within quota must succeed: {:?}",
+            result.err()
+        );
+
+        let stored_quota = state.store.get(&quota_key).await.unwrap().unwrap();
+        let quota_val: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            quota_val["status"]["used"]["count/configmaps"].as_str(),
+            Some("1"),
+            "status.used must reflect the ConfigMap created via SSA apply-create — without \
+             do_patch's SSA-create branch calling update_quota_status, this stays \
+             unset/stale even though the object itself was correctly admitted and persisted"
         );
     }
 

@@ -4268,6 +4268,17 @@ pub async fn patch_cr_namespaced<S: Store>(
                 return Err(store_err_cr(e, &name, &ctx.kind))
             }
         };
+
+        // ResourceQuota: refresh status.used so a count/<crd>.<group> quota's usage
+        // reflects this SSA-create, matching create_cr_namespaced's own
+        // update_quota_status call. check_resource_quota above only *admits* the request
+        // against the pre-create count — without this, status.used never advances for
+        // CRs created via `kubectl apply --server-side`. Unlike update_quota_status's
+        // other call sites, this one needs no separate lock: the check-then-write
+        // `_quota_lock` acquired above is still held here (dropped only at this
+        // function's return).
+        crate::quota::update_quota_status(&state, &ns).await;
+
         let mut meta: crate::types::ObjectMeta =
             serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
         meta.resource_version = Some(rv.to_string());
@@ -16012,6 +16023,75 @@ mod tests {
         assert!(
             state.store.get(&key).await.unwrap().is_none(),
             "the over-quota CR must not have been created in the store"
+        );
+    }
+
+    // patch_cr_namespaced's SSA-create branch admits against quota::check_resource_quota (a
+    // prior fix) but never called quota::update_quota_status afterward, unlike
+    // create_cr_namespaced — so ResourceQuota.status.used never advanced for a CR created via
+    // `kubectl apply --server-side`, even though the object itself was correctly admitted and
+    // persisted. `kubectl describe resourcequota` reads status.used directly, so a stale value
+    // here is user-visible even though admission itself is unaffected (check_resource_quota
+    // live-recounts).
+    //
+    // Fails on revert: without the update_quota_status call, status.used stays absent/stale
+    // instead of reflecting the newly SSA-created CR.
+    #[tokio::test]
+    async fn patch_cr_namespaced_ssa_create_updates_quota_status_used() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "crd-quota", "namespace": "argocd" },
+            "spec": { "hard": { "count/applications.argoproj.io": "5" } }
+        });
+        let quota_key = "/registry/resourcequotas/argocd/crd-quota";
+        state
+            .store
+            .put(
+                quota_key,
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+                "app-ssa".to_string(),
+            )),
+            test_user(),
+            headers,
+            app_body("app-ssa", "argocd"),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "SSA-create within quota must succeed: {:?}",
+            result.err()
+        );
+
+        let stored_quota = state.store.get(quota_key).await.unwrap().unwrap();
+        let quota_val: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            quota_val["status"]["used"]["count/applications.argoproj.io"].as_str(),
+            Some("1"),
+            "status.used must reflect the CR created via SSA apply-create — without \
+             patch_cr_namespaced's SSA-create branch calling update_quota_status, this stays \
+             unset/stale even though the object itself was correctly admitted and persisted"
         );
     }
 
