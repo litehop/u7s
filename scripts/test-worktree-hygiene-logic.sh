@@ -108,6 +108,32 @@ assert "proc_type_from_psline classifies a sample-run-metrics.sh line as its own
   "$([ "$(call proc_type_from_psline 'bash scripts/conformance/sample-run-metrics.sh start --workdir /x/temp/u7s')" = 'sample-run-metrics' ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 1b. STEP A -- --live-agents protection. A worker whose worktree DIRECTORY
+#     is already gone (the routine orphan case above) but whose agent-id
+#     the mayor's ListAgents call still reports as running must never have
+#     its host process killed -- path-existence alone is exactly the signal
+#     that misclassified a genuinely live worker before this fix.
+# ---------------------------------------------------------------------------
+
+assert "agent_id_from_worktree_path extracts the trailing agent-<id> path component" \
+  "$([ "$(call agent_id_from_worktree_path '/repo/ai/worktrees/agent-liveid123')" = "liveid123" ] && echo 1 || echo 0)"
+assert "agent_id_from_worktree_path returns empty for a path with no ai/worktrees/agent-<id> suffix (e.g. the mayor's own checkout) -- never a candidate for the live-agents guard" \
+  "$([ -z "$(call agent_id_from_worktree_path '/repo')" ] && echo 1 || echo 0)"
+
+PS_OUTPUT_LIVE_AGENT='alice  2222   0.0  0.1  123456  1234 s001  S+   10:00AM   0:00.05 target/release/u7s-apiserver --kubeconfig /repo/ai/worktrees/agent-liveid123/temp/u7s/kubeconfig --port 6444'
+RAW_ORPHAN_LIVE_AGENT=$(call find_orphans "$PS_OUTPUT_LIVE_AGENT" '')
+assert "sanity: without the live-agents filter, this process is classified an orphan by path alone (its worktree isn't in the live-worktree-path list)" \
+  "$(printf '%s\n' "$RAW_ORPHAN_LIVE_AGENT" | grep -qF '2222|apiserver|/repo/ai/worktrees/agent-liveid123' && echo 1 || echo 0)"
+
+FILTERED_PROTECTED=$(call filter_orphans_by_live_agents "$RAW_ORPHAN_LIVE_AGENT" "liveid123")
+assert "an orphan process whose embedded worktree belongs to an agent-id IN --live-agents is filtered out -- its host process must never be killed just because path-existence alone looks orphaned (the original bug: a ListAgents-confirmed-live worker's worktree/branch was reaped anyway)" \
+  "$([ -z "$FILTERED_PROTECTED" ] && echo 1 || echo 0)"
+
+FILTERED_STALE=$(call filter_orphans_by_live_agents "$RAW_ORPHAN_LIVE_AGENT" "some-other-agent")
+assert "the SAME orphan record, with a --live-agents set that does NOT include its agent-id, survives filtering and remains a genuine kill target" \
+  "$(printf '%s\n' "$FILTERED_STALE" | grep -qF '2222|apiserver|/repo/ai/worktrees/agent-liveid123' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 2. STEP C -- in-flight guard.
 # ---------------------------------------------------------------------------
 
@@ -243,6 +269,106 @@ assert "a non-worker/agent-* branch name (e.g. main) never matches this check, e
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 3d. STEP C -- --live-agents guard. THE only reliable liveness signal for
+#    an in-process worker sub-agent (a sub-agent cannot call ListAgents on
+#    itself, and `claude agents --json` doesn't enumerate in-process
+#    subagents -- both confirmed directly). Fires FIRST and unconditionally,
+#    ahead of every other STEP C guard, since it's the only one that isn't
+#    itself derivable from stale git/filesystem state.
+# ---------------------------------------------------------------------------
+
+RC=0
+call is_live_agent_branch 'worker/agent-abc123' 'xyz999,abc123,def456' || RC=$?
+assert "a worker/agent-<id> branch whose id is ANY entry in a comma-separated --live-agents list is protected" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call is_live_agent_branch 'worker/agent-gone999' 'abc123,def456' || RC=$?
+assert "a worker/agent-<id> branch whose id is NOT in --live-agents is not protected by this guard -- a genuinely stale branch must still be reapable" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call is_live_agent_branch 'worker/agent-abc123' '' || RC=$?
+assert "an empty --live-agents set protects nothing -- an unknown agent must never be assumed live" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call is_live_agent_branch 'main' 'main' || RC=$?
+assert "a non-worker/agent-* branch name never matches, even if it coincidentally equals a --live-agents entry" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 3e. Whitespace-tolerant --live-agents membership match. A comma-space-
+#    joined list (e.g. "a, b, c") must protect EVERY id, not just the
+#    first -- without normalization, the naive ",${live_agents}," substring
+#    match leaves a leading space on every id after the first, so only the
+#    first id in the list ever matches and every subsequent live worker is
+#    left unprotected/reapable.
+# ---------------------------------------------------------------------------
+
+RC=0
+call agent_id_is_live 'abc123' 'abc123, def456, ghi789' || RC=$?
+assert "sanity: a comma-space-joined --live-agents list protects the FIRST id" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call agent_id_is_live 'def456' 'abc123, def456, ghi789' || RC=$?
+assert "...and it protects the MIDDLE id too -- fails without normalization, since \", \" leaves the id as \" def456\", which never equals the bare \"def456\" the substring match searches for" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call agent_id_is_live 'ghi789' 'abc123, def456, ghi789' || RC=$?
+assert "...and it protects the LAST id too, proving every id in a comma-space-joined list is protected, not just the first" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call is_live_agent_branch 'worker/agent-def456' 'abc123, def456, ghi789' || RC=$?
+assert "the same whitespace tolerance holds at the STEP C/D branch-guard level (is_live_agent_branch) -- this is what actually protects a live worker's branch from force-delete" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+# End-to-end: a worker branch that is ALREADY MERGED (ff-mergeable, so
+# is_unmerged_by_patch_id says false), has no open PR, and no live worktree
+# directory -- by every OTHER STEP C guard this branch is indistinguishable
+# from a genuinely stale, safe-to-delete one. Only --live-agents membership
+# can save it, proving the guard fires "unconditionally, regardless of dir
+# existence or merge state" (the exact original bug: a ListAgents-confirmed-
+# live worker's branch was force-deleted anyway because every OTHER signal
+# said "safe").
+BARE_LIVE="$SANDBOX_ROOT/origin-live.git"
+git init -q --bare "$BARE_LIVE"
+
+L="$SANDBOX_ROOT/step-c-live-agent-repo"
+new_sandbox "$L"
+printf 'line one\n' > "$L/file.txt"
+git -C "$L" add -A
+git -C "$L" commit -q -m initial
+git -C "$L" remote add origin "$BARE_LIVE"
+git -C "$L" push -q origin main
+
+git -C "$L" branch worker/agent-liveagent456 main
+printf 'line one\nmore work on main\n' > "$L/file.txt"
+git -C "$L" commit -q -am 'advance main'
+git -C "$L" push -q origin main
+
+STUB_GH_NO_OPEN_PRS="$SANDBOX_ROOT/stub-gh-no-open-prs"
+mkdir -p "$STUB_GH_NO_OPEN_PRS"
+cat > "$STUB_GH_NO_OPEN_PRS/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$STUB_GH_NO_OPEN_PRS/gh"
+
+LIVE_AGENTS="liveagent456" WORKTREE_HYGIENE_REPO_ROOT="$L" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
+  call step_c_stale_worker_branches >/dev/null 2>&1
+assert "STEP C protects a worker/agent-<id> branch whose id IS in --live-agents even though it's already merged, has no open PR, and no live worktree directory -- every other guard alone would have called it safe to delete" \
+  "$(git -C "$L" branch --list worker/agent-liveagent456 | grep -q worker/agent-liveagent456 && echo 1 || echo 0)"
+
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$L" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
+  call step_c_stale_worker_branches >/dev/null 2>&1
+assert "...the SAME branch, with no matching --live-agents entry, is force-deleted -- proving the guard (not some accident of the other checks) is what protected it above" \
+  "$(! git -C "$L" branch --list worker/agent-liveagent456 | grep -q worker/agent-liveagent456 && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 4. STEP D -- gone-upstream match.
 # ---------------------------------------------------------------------------
 
@@ -301,6 +427,38 @@ assert "STEP D does not abort the whole hygiene tick (skipping STEP E) when a go
   "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
 assert "...and the branch itself survives -- skipped for the tick's reap, not force-deleted out from under the live worktree" \
   "$(git -C "$D" branch --list worker/agent-gone | grep -q worker/agent-gone && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 4c. STEP D -- --live-agents guard, exercised end-to-end against a
+#    gone-upstream branch that is NOT checked out anywhere (unlike 4b
+#    above, which covers the is_checked_out guard specifically) -- by
+#    STEP D's only OTHER guard this branch is fully reapable via `-d`.
+#    Only --live-agents membership can save it.
+# ---------------------------------------------------------------------------
+
+BARE_D2="$SANDBOX_ROOT/origin-d2.git"
+git init -q --bare "$BARE_D2"
+
+D2="$SANDBOX_ROOT/step-d-live-agent-repo"
+new_sandbox "$D2"
+printf 'line one\n' > "$D2/file.txt"
+git -C "$D2" add -A
+git -C "$D2" commit -q -m initial
+git -C "$D2" remote add origin "$BARE_D2"
+git -C "$D2" push -q origin main
+
+git -C "$D2" branch worker/agent-liveagent789 main
+git -C "$D2" push -q -u origin worker/agent-liveagent789
+git -C "$D2" push -q origin --delete worker/agent-liveagent789
+git -C "$D2" fetch -q --prune origin
+
+LIVE_AGENTS="liveagent789" WORKTREE_HYGIENE_REPO_ROOT="$D2" call step_d_gone_upstream_branches >/dev/null 2>&1
+assert "STEP D protects a gone-upstream worker/agent-<id> branch whose id IS in --live-agents, even though it's not checked out anywhere (STEP D's only other guard)" \
+  "$(git -C "$D2" branch --list worker/agent-liveagent789 | grep -q worker/agent-liveagent789 && echo 1 || echo 0)"
+
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$D2" call step_d_gone_upstream_branches >/dev/null 2>&1
+assert "...the SAME branch, with no matching --live-agents entry, is deleted -- proving the guard is what saved it above" \
+  "$(! git -C "$D2" branch --list worker/agent-liveagent789 | grep -q worker/agent-liveagent789 && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 5. run_cmd dry-run gate -- the mechanism that keeps THIS test suite (and
@@ -388,6 +546,49 @@ RC=0
 call is_stale_bead_status "in_progress" || RC=$?
 assert "is_stale_bead_status does NOT flag an in_progress bead" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 7. main()'s fail-safe refusal without --live-agents. STEP A/C/D are
+#    destructive (process kill, branch delete); dir-existence and
+#    merge-state checks alone already proved insufficient to tell a live
+#    worker apart from a stale one, so a missing flag must abort the whole
+#    run rather than guess "assume none live" or "assume all live". This
+#    permanently forecloses the reap-a-live-worker bug class via
+#    mis-invocation. Invokes the real script directly (not via __call,
+#    which bypasses main()'s own argv parsing and this exact gate) with no
+#    args at all -- safe because the refusal fires before any step runs, so
+#    no real `ps aux`/git state is ever touched.
+# ---------------------------------------------------------------------------
+
+FAILSAFE_RC=0
+FAILSAFE_OUT=$(bash "$SCRIPT" 2>&1) || FAILSAFE_RC=$?
+assert "worktree-hygiene refuses to run at all when --live-agents is omitted, exiting non-zero instead of silently defaulting" \
+  "$([ "$FAILSAFE_RC" -eq 2 ] && echo 1 || echo 0)"
+assert "...and the refusal is explained on stderr naming the missing flag, not a silent no-op" \
+  "$(printf '%s' "$FAILSAFE_OUT" | grep -q -- '--live-agents' && echo 1 || echo 0)"
+assert "...and no destructive-step log output appears at all -- STEP A/B/C/D/E never even started" \
+  "$(! printf '%s' "$FAILSAFE_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
+
+# Same fail-safe, but for a PRESENT --live-agents flag whose VALUE is empty
+# or whitespace-only -- the flag TOKEN appearing in argv is not enough on
+# its own; without checking the value too, `--live-agents ""` (e.g. a
+# ListAgents call that returned zero running agents, mis-joined into an
+# empty string instead of omitting the flag) would sail past a
+# presence-only check and run the destructive steps with an effectively
+# empty live set, reaping any genuinely live worker.
+FAILSAFE_EMPTY_RC=0
+FAILSAFE_EMPTY_OUT=$(bash "$SCRIPT" --live-agents "" 2>&1) || FAILSAFE_EMPTY_RC=$?
+assert "worktree-hygiene refuses to run when --live-agents is present but its value is the empty string, exiting non-zero rather than treating it as a valid (if empty) live set" \
+  "$([ "$FAILSAFE_EMPTY_RC" -eq 2 ] && echo 1 || echo 0)"
+assert "...and no destructive-step log output appears at all for the empty-value case either" \
+  "$(! printf '%s' "$FAILSAFE_EMPTY_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
+
+FAILSAFE_WS_RC=0
+FAILSAFE_WS_OUT=$(bash "$SCRIPT" --live-agents "   " 2>&1) || FAILSAFE_WS_RC=$?
+assert "worktree-hygiene also refuses to run when --live-agents is whitespace-only -- a value that is non-empty as a raw string but carries no actual agent id must not bypass the fail-safe" \
+  "$([ "$FAILSAFE_WS_RC" -eq 2 ] && echo 1 || echo 0)"
+assert "...and no destructive-step log output appears at all for the whitespace-only case either" \
+  "$(! printf '%s' "$FAILSAFE_WS_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

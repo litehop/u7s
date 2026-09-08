@@ -62,12 +62,12 @@ file_mtime() {  # portable GNU/BSD stat, matches the idiom used elsewhere in scr
 # run_full_tick (below) so a caller can invoke main() more than once
 # against the SAME repo/queue dir -- needed to observe cross-tick state
 # (e.g. a dispatch marker) that a fresh scratch dir per call can't. $1, if
-# given, is a number of seconds; a second worktree on branch
-# worker/agent-worktree-age-test is added with its HEAD commit backdated
-# that far, so check_worktree_anomalies has a real branch/commit-age pair
-# to evaluate. Sets SCRATCH_REPO for the caller.
+# given, is a worker agent-id; a second worktree on branch
+# worker/agent-<id> is added, so check_worktree_anomalies has a real
+# worker/agent-* branch to evaluate against --live-agents. Sets
+# SCRATCH_REPO for the caller.
 build_scratch_repo() {
-  local worker_age_seconds="${1:-}"
+  local worker_agent_id="${1:-}"
   local scratch="$WORKDIR/tick-$RANDOM$RANDOM"
   SCRATCH_REPO="$scratch/repo"
   mkdir -p "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/.claude/review-queue"
@@ -76,12 +76,10 @@ build_scratch_repo() {
   git -C "$SCRATCH_REPO" config user.email test@example.com
   git -C "$SCRATCH_REPO" config user.name "Test"
   git -C "$SCRATCH_REPO" commit -q --allow-empty -m init
-  if [ -n "$worker_age_seconds" ]; then
-    local wpath="$scratch/worker-worktree" commit_epoch
-    commit_epoch=$(( $(date -u +%s) - worker_age_seconds ))
-    git -C "$SCRATCH_REPO" worktree add -q -b worker/agent-worktree-age-test "$wpath"
-    GIT_AUTHOR_DATE="@${commit_epoch} +0000" GIT_COMMITTER_DATE="@${commit_epoch} +0000" \
-      git -C "$wpath" commit -q --allow-empty -m "worker commit"
+  if [ -n "$worker_agent_id" ]; then
+    local wpath="$scratch/worker-worktree"
+    git -C "$SCRATCH_REPO" worktree add -q -b "worker/agent-$worker_agent_id" "$wpath"
+    git -C "$wpath" commit -q --allow-empty -m "worker commit"
   fi
 }
 
@@ -94,30 +92,36 @@ build_scratch_repo() {
 # ticks). $4=state file path override (default: derived from $2, one level
 # up) -- lets a caller invoking this more than once against the same repo
 # capture a separate snapshot per tick instead of each call clobbering the
-# last. Sets TICK_RC/TICK_OUT/TICK_STATE for the caller to assert on.
+# last. $5=--live-agents value (comma-separated agent ids), omitted
+# entirely (not passed as an empty flag) when unset -- mirrors how the
+# mayor invokes the real script. Sets TICK_RC/TICK_OUT/TICK_STATE for the
+# caller to assert on.
 invoke_tick() {
-  local stub_bin="$1" repo="$2" dry_run="${3:-1}" state_file="${4:-}"
+  local stub_bin="$1" repo="$2" dry_run="${3:-1}" state_file="${4:-}" live_agents="${5:-}"
   TICK_STATE="${state_file:-$(dirname "$repo")/state.json}"
   TICK_RC=0
+  local extra_args=()
+  [ -n "$live_agents" ] && extra_args=(--live-agents "$live_agents")
   TICK_OUT=$(PATH="$stub_bin:$PATH" \
     MAYOR_TICK_QUEUE_DIR="$repo/.claude/review-queue" \
     MAYOR_TICK_STATE_FILE="$TICK_STATE" \
     MAYOR_TICK_DASHBOARD_FILE="$repo/no-such-dashboard.md" \
     MAYOR_TICK_DRY_RUN="$dry_run" \
-    bash "$repo/scripts/mayor-tick.sh" __call main 2>&1) || TICK_RC=$?
+    bash "$repo/scripts/mayor-tick.sh" __call main "${extra_args[@]+"${extra_args[@]}"}" 2>&1) || TICK_RC=$?
 }
 
 # One-shot convenience: build a fresh isolated repo, seed it from $2 (a
 # directory of .md queue fixtures, or empty/omitted), and run a single
-# dry-run tick against it. $3, see build_scratch_repo. Sets
-# TICK_RC/TICK_OUT/TICK_STATE for the caller to assert on.
+# dry-run tick against it. $3, see build_scratch_repo. $4=--live-agents
+# value, see invoke_tick. Sets TICK_RC/TICK_OUT/TICK_STATE for the caller
+# to assert on.
 run_full_tick() {
-  local stub_bin="$1" queue_seed="${2:-}" worker_age_seconds="${3:-}"
-  build_scratch_repo "$worker_age_seconds"
+  local stub_bin="$1" queue_seed="${2:-}" worker_agent_id="${3:-}" live_agents="${4:-}"
+  build_scratch_repo "$worker_agent_id"
   if [ -n "$queue_seed" ]; then
     cp "$queue_seed"/*.md "$SCRATCH_REPO/.claude/review-queue/" 2>/dev/null || true
   fi
-  invoke_tick "$stub_bin" "$SCRATCH_REPO" 1
+  invoke_tick "$stub_bin" "$SCRATCH_REPO" 1 "" "$live_agents"
 }
 
 WORKDIR=$(mktemp -d)
@@ -860,35 +864,64 @@ call queue_entry_dispatch_suppressed "$(( NOW_EPOCH - 1200 ))" "$NOW_EPOCH" || R
 assert "a dispatch marker older than the backstop no longer suppresses -- a marked-but-dead dispatch must not hide the PR forever" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
-# worktree_dispatch_in_flight: age IS the right signal here (unchanged
-# design) -- a dispatch 6 minutes old is well within the observed 10-40m
-# diagnose-edit-test window, exit 30 firing here is exactly the
-# alarm-fatigue bug this fix closes.
+# is_live_agent_branch / agent_id_is_live: the ONLY reliable liveness
+# signal for an in-process worker sub-agent -- a sub-agent cannot call
+# ListAgents on itself, and `claude agents --json` doesn't enumerate
+# in-process subagents (both confirmed directly). This replaces the old
+# wall-clock/commit-epoch window entirely: for a worker that hasn't
+# committed yet, "age since last commit" measured the BASE commit's time,
+# not the worker's own dispatch time, so a live worker could flip to
+# "stale" while genuinely still running, regardless of window size.
 RC=0
-call worktree_dispatch_in_flight 360 || RC=$?
-assert "a 6-minute-old worker dispatch with no PR yet is still in-flight -- a healthy dispatch must not trip exit 30" \
+call is_live_agent_branch 'worker/agent-abc123' 'abc123' || RC=$?
+assert "a worker/agent-<id> branch whose id is the sole entry in --live-agents is classified in-flight -- a healthy dispatch must not trip exit 30" \
   "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
 
-# A dispatch 50 minutes old has outlived even the high end of the observed
-# working window (plus headroom) -- a genuinely stalled/crashed dispatch
-# must still surface.
 RC=0
-call worktree_dispatch_in_flight 3000 || RC=$?
-assert "a 50-minute-old worker dispatch with no PR yet is past the working window -- a genuinely stalled dispatch must still surface" \
+call is_live_agent_branch 'worker/agent-abc123' 'xyz999,abc123,def456' || RC=$?
+assert "a worker/agent-<id> branch whose id is ANY entry in a comma-separated --live-agents list is classified in-flight, not just when it's the sole entry" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call is_live_agent_branch 'worker/agent-gone999' 'abc123,def456' || RC=$?
+assert "a worker/agent-<id> branch whose id is NOT in --live-agents is classified stale/reapable -- a genuinely stalled or crashed dispatch must still surface" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
-# worktree_commit_epoch: a git-log lookup failure must fail toward
-# SURFACING an anomaly (epoch 0, maximally old), never toward silently
-# hiding one. The old inline fallback (`|| echo "$now"`) treated a lookup
-# failure as "brand new, still in-flight" -- a false negative that's silent
-# and exactly the failure mode this whole check exists to avoid, whereas a
-# false positive here is merely noisy but visible. A plain non-git
-# directory reliably fails `git log` on any platform, no repo corruption
-# needed to exercise this.
-NOT_A_GIT_REPO="$WORKDIR/not-a-git-repo"
-mkdir -p "$NOT_A_GIT_REPO"
-assert "a git-log lookup failure resolves to epoch 0 (maximally old), not 'now' -- the wrong polarity here would silently hide a real anomaly" \
-  "$([ "$(call worktree_commit_epoch "$NOT_A_GIT_REPO")" = "0" ] && echo 1 || echo 0)"
+RC=0
+call is_live_agent_branch 'worker/agent-abc123' '' || RC=$?
+assert "an empty --live-agents set (the flag omitted) never classifies any branch as in-flight -- fail-toward-surfacing default, since an unknown agent must never be assumed live" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+call is_live_agent_branch 'main' 'main' || RC=$?
+assert "a non-worker/agent-* branch name never matches, even if it coincidentally equals a --live-agents entry" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# Whitespace-tolerant --live-agents membership match. A comma-space-joined
+# list (e.g. "a, b, c") must protect EVERY id, not just the first --
+# without normalization, the naive ",${live_agents}," substring match
+# leaves a leading space on every id after the first, so only the first id
+# ever matches and every subsequent live worker's branch would misreport
+# as stale/reapable (exit 30) even though its agent is confirmed running.
+RC=0
+call agent_id_is_live 'abc123' 'abc123, def456, ghi789' || RC=$?
+assert "sanity: a comma-space-joined --live-agents list protects the FIRST id" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call agent_id_is_live 'def456' 'abc123, def456, ghi789' || RC=$?
+assert "...and it protects the MIDDLE id too -- fails without normalization, since \", \" leaves the id as \" def456\", which never equals the bare \"def456\" the substring match searches for" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call agent_id_is_live 'ghi789' 'abc123, def456, ghi789' || RC=$?
+assert "...and it protects the LAST id too, proving every id in a comma-space-joined list is protected, not just the first" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+RC=0
+call is_live_agent_branch 'worker/agent-def456' 'abc123, def456, ghi789' || RC=$?
+assert "the same whitespace tolerance holds at the worktree-anomaly branch-guard level (is_live_agent_branch) -- this is what actually keeps a live worker's branch from tripping exit 30" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 14. pending_reviews dispatch-marker lifecycle, end-to-end through the
@@ -942,21 +975,36 @@ assert "a queue entry with an old queued_at but no dispatch marker yet still sur
   "$([ "$(jq -r '.pending_reviews | index(5002) != null' "$TICK_STATE")" = "true" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 15. Worktree-anomaly in-flight suppression, end-to-end through the REAL
-#     main() pipeline against a real second git worktree with a controlled
-#     commit age -- proves check_worktree_anomalies' age check (not just
-#     the section-13 pure function) actually gates the tick's exit code.
+# 15. Worktree-anomaly liveness classification, end-to-end through the REAL
+#     main() pipeline against a real second git worktree on a
+#     worker/agent-<id> branch -- proves check_worktree_anomalies keys
+#     in-flight/stale purely off --live-agents membership (the mayor's
+#     ListAgents-derived set), not commit age. The old wall-clock-window
+#     design measured a no-commit worker's BASE commit time, not its
+#     dispatch time -- reverting to that could flip a genuinely live
+#     worker to "stale" well within its own working window, exactly the
+#     bug this fix closes.
 # ---------------------------------------------------------------------------
 
-run_full_tick "$STUB_EMPTY_BIN" "" 360
-assert "a tick during a 6-minute-old healthy in-flight worker does not return exit 30 -- alarm fatigue trains the mayor to ignore an exit code that fires on every routine dispatch" \
+run_full_tick "$STUB_EMPTY_BIN" "" "live-test-agent" "live-test-agent"
+assert "a worker/agent-<id> branch with no PR, whose id IS in --live-agents, does not return exit 30 -- it's a confirmed-live dispatch, not a stalled one" \
   "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
-assert "...the in-flight worktree still appears in worktree_anomalies for visibility (not silently dropped), just not escalated" \
-  "$([ "$(jq -r '[.worktree_anomalies[] | select(.branch == "worker/agent-worktree-age-test")] | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
+assert "...and it still appears in worktree_anomalies for visibility (not silently dropped), tagged in-flight" \
+  "$([ "$(jq -r '[.worktree_anomalies[] | select(.branch == "worker/agent-live-test-agent" and .reason == "no-pr-for-branch-in-flight")] | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
 
-run_full_tick "$STUB_EMPTY_BIN" "" 3000
-assert "a tick against a genuinely abandoned 50-minute-old worker branch with no PR still returns exit 30" \
+run_full_tick "$STUB_EMPTY_BIN" "" "stale-test-agent" ""
+assert "a worker/agent-<id> branch with no PR, whose id is NOT in --live-agents, returns exit 30 -- this is the fail-toward-surfacing default that replaces the old 45-minute grace window entirely" \
   "$([ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
+assert "...and it's tagged genuinely stale (no-pr-for-branch), not in-flight -- what worktree-hygiene.sh's destructive steps ultimately act on" \
+  "$([ "$(jq -r '[.worktree_anomalies[] | select(.branch == "worker/agent-stale-test-agent" and .reason == "no-pr-for-branch")] | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
+
+run_full_tick "$STUB_EMPTY_BIN" "" "agent-two" "agent-one,agent-two,agent-three"
+assert "a --live-agents value with multiple comma-separated ids correctly matches the worker's id even when it isn't first or last in the list" \
+  "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
+
+run_full_tick "$STUB_EMPTY_BIN" "" "agent-two" "agent-one, agent-two, agent-three"
+assert "the SAME multi-id match still succeeds through the full main() pipeline when the mayor's --live-agents value is comma-SPACE joined -- a live worker in the middle of the list must not misreport exit 30 (stale) just because of list formatting" \
+  "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 16. Stale-blocking-verdict reconcile -- pure-function building blocks.
