@@ -34,7 +34,7 @@ State: **NATIVE** (u7s Rust) · **UPSTREAM** (real binary) · **HYBRID**
 | **Kubelet** | UPSTREAM | Yes | MEASURED | Runs on every node. Confirmed the **single largest** component — more than double KCM. Round-2 config-tuning (feature-gate audit + cAdvisor trim) landed (`mayor-9dk3n`, PR #1456); remaining behavior-changing levers (`--max-pods`, change-detection strategy) stay deferred. Native rewrite stays off the table until kubelet+CRI-O+kube-proxy Gate-4 math resolves (`mayor-v9jk0`). |
 | **CRI-O + crun** | UPSTREAM | Yes | KEEP | Container runtime. No plan to rewrite; measured for completeness only. |
 | **kube-proxy** | UPSTREAM | Yes | MEASURED | East-west `ClusterIP`/`NodePort` only — north-south `LoadBalancer` split off to eBPF ServiceLB (next row). Native rewrite of remaining scope still open, data-first. |
-| **ServiceLB (eBPF dataplane)** | NATIVE | Yes | KEEP | Per-node eBPF (tc-bpf, `aya`) LB for north-south `type=LoadBalancer`: consistent-hash to a backend, Geneve-encapsulate cross-node, symmetric return — chosen over klipper-lb-alike and other options (ADRs below). Epic unparked 2026-09-07 (`mayor-aie31`); flow-admission hardening landed since (POD_TARGETS membership gate + REV_FLOW-miss unencap-leak drop, PR #1624). Still pre-production, Phase 4 real-fleet go/no-go gates open. |
+| **ServiceLB (eBPF dataplane)** | NATIVE | Yes | KEEP | Per-node eBPF (tc-bpf, `aya`) LB for north-south `type=LoadBalancer`: consistent-hash to a backend, Geneve-encapsulate cross-node, symmetric return — chosen over klipper-lb-alike and other options (ADRs below). Migrated to its own repo (`litehop/beep`) 2026-09-08 with full history; retained here as an architecture-of-record entry only. Still pre-production, Phase 4 real-fleet go/no-go gates open — tracked in beep. |
 | **konnectivity-server** | HYBRID | Yes | KEEP-as-dev-tool, skipped in production | Bridges apiserver↔kubelet across Lima's NAT boundary — a dev-topology artifact. Same-network production dials `kubelet:10250` directly, no tunnel. |
 | **CoreDNS** | UPSTREAM | Yes | KEEP | In-cluster DNS. No plan to rewrite. |
 | **metrics-server** | UPSTREAM | Yes | KEEP | Standard component; no rewrite plan. |
@@ -187,7 +187,7 @@ minor P4 follow-ons `mayor-90qvg`/`mayor-1y0h6` still open).
 | CRD validation | boon crate (full openAPIV3Schema) | `boon-for-crd-schema-validation.md` |
 | Networking | WebSocket-only exec/attach/portforward (no SPDY) | operator confirmed 2026-05-28; k8s 1.34+ dropped SPDY |
 | TLS | aws-lc-rs (P-256 ECDSA) — arm64/Lima compat issue, use CI | memory: `local-lima-arm64-environment` |
-| Service LoadBalancer | Per-node eBPF (aya) + Geneve | `servicelb-ebpf-geneve-dataplane.md` |
+| Service LoadBalancer | Per-node eBPF (aya) + Geneve | `litehop/beep` (`docs/decisions/`) |
 
 (`project-context.md` used to duplicate this table; `mayor-sks59` linked
 it here instead, 2026-08-13.)
