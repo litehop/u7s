@@ -31,10 +31,11 @@ use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use crate::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
     failed_scheduling_status_patch, fetch_bound_pv_node_affinities, fetch_csi_volume_counts,
-    fetch_node, fetch_read_write_once_pod_pvc_names, fetch_unbound_csi_pvc_drivers,
-    find_preemption_plan, http_get, is_bind_already_assigned, needs_scheduling,
-    nominated_node_name_patch, patch_pod_status, pick_node, pods_needing_resync,
-    preemption_reservation_still_fits, scheduling_gate_status_patch, scheduling_gate_status_reset,
+    fetch_node, fetch_pv_info_batch, fetch_pvc_binding_info_batch,
+    fetch_read_write_once_pod_pvc_names, fetch_unbound_csi_pvc_drivers, find_preemption_plan,
+    http_get, is_bind_already_assigned, needs_scheduling, nominated_node_name_patch,
+    patch_pod_status, pick_node, pods_needing_resync, preemption_reservation_still_fits,
+    scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
     stamp_selected_node_for_pvcs, stream_watch_events, BindError, NodeTally, PendingPod, PodList,
 };
@@ -735,16 +736,13 @@ fn handle_pod_event(
         // Pending for the next watch tick rather than schedule it as if the
         // bound PV had no topology constraint at all.
         //
-        // The four `fetch_*` calls below each independently GET every one of
-        // `pending.pvc_names` (via their own `fetch_pvc_binding_info` call) —
-        // up to 4x redundant PVC GETs per scheduling attempt with no cache
-        // shared across them. Left as-is: cost is bounded by this pod's own
-        // PVC count (typically 1-3), not cluster size, and unifying four
-        // independently-typed derivations behind one shared fetch is a
-        // signature-touching refactor deferred as a follow-up, correctness
-        // being unaffected either way.
+        // The four derivations below all need this pod's own PVCs' (and any
+        // already-bound PV's) state. `pvc_info`/`pv_info` are each fetched
+        // ONCE here — one GET per distinct PVC, one GET per distinct bound
+        // PV — and threaded through all four in place of each independently
+        // re-GETting the same PVCs/PVs.
         if !pending.pvc_names.is_empty() {
-            match fetch_bound_pv_node_affinities(
+            let pvc_info = match fetch_pvc_binding_info_batch(
                 &connector_clone,
                 &server_clone,
                 &namespace,
@@ -752,10 +750,10 @@ fn handle_pod_event(
             )
             .await
             {
-                Ok(affinities) => pending.pv_node_affinities = affinities,
+                Ok(info) => info,
                 Err(e) => {
                     error!(
-                        "could not resolve bound PVC node affinity while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"
+                        "could not resolve PVC binding info while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"
                     );
                     in_flight_clone
                         .lock()
@@ -763,17 +761,48 @@ fn handle_pod_event(
                         .remove(&key);
                     return;
                 }
-            }
-            // Same reasoning as the PV nodeAffinity resolution above, for the
-            // CSILimits/NodeVolumeLimits predicate: without this, a pod whose
-            // PVCs already resolve to a CSI driver never gets its per-driver
-            // volume count populated, so `csi_volume_limits_fit` always sees
-            // an empty want-set and the pod is bound even past the node's
-            // advertised attach limit.
+            };
+            let bound_volume_names: Vec<String> = pvc_info
+                .values()
+                .map(|info| info.volume_name.clone())
+                .filter(|name| !name.is_empty())
+                .collect();
+            let pv_info = match fetch_pv_info_batch(
+                &connector_clone,
+                &server_clone,
+                &bound_volume_names,
+            )
+            .await
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    error!(
+                            "could not resolve bound PV info while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"
+                        );
+                    in_flight_clone
+                        .lock()
+                        .expect("in_flight lock poisoned")
+                        .remove(&key);
+                    return;
+                }
+            };
+            // For the VolumeBinding Filter's topology constraint: without
+            // this, an Immediate-mode (the StorageClass default) PVC's
+            // bound PV nodeAffinity is never enforced, and the kubelet
+            // blocks forever on `MountVolume.NodeAffinity check failed`
+            // once the scheduler commits a bad bind.
+            pending.pv_node_affinities =
+                fetch_bound_pv_node_affinities(&pvc_info, &pv_info, &pending.pvc_names);
+            // Same reasoning, for the CSILimits/NodeVolumeLimits predicate:
+            // without this, a pod whose PVCs already resolve to a CSI
+            // driver never gets its per-driver volume count populated, so
+            // `csi_volume_limits_fit` always sees an empty want-set and the
+            // pod is bound even past the node's advertised attach limit.
             match fetch_csi_volume_counts(
                 &connector_clone,
                 &server_clone,
-                &namespace,
+                &pvc_info,
+                &pv_info,
                 &pending.pvc_names,
             )
             .await
@@ -796,26 +825,8 @@ fn handle_pod_event(
             // `read_write_once_pod_conflict_free` always sees an empty
             // want-set and two pods can be bound onto the same node sharing
             // a volume Kubernetes guarantees at most one pod may use at a time.
-            match fetch_read_write_once_pod_pvc_names(
-                &connector_clone,
-                &server_clone,
-                &namespace,
-                &pending.pvc_names,
-            )
-            .await
-            {
-                Ok(names) => pending.read_write_once_pod_pvcs = names,
-                Err(e) => {
-                    error!(
-                        "could not resolve ReadWriteOncePod PVCs while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"
-                    );
-                    in_flight_clone
-                        .lock()
-                        .expect("in_flight lock poisoned")
-                        .remove(&key);
-                    return;
-                }
-            }
+            pending.read_write_once_pod_pvcs =
+                fetch_read_write_once_pod_pvc_names(&pvc_info, &pending.pvc_names);
             // Same reasoning again, for the CSI topology Filter: without
             // this, a pod's own unbound CSI-backed PVCs never get their
             // driver resolved, so `csi_topology_fit` always sees an empty
@@ -826,7 +837,7 @@ fn handle_pod_event(
             match fetch_unbound_csi_pvc_drivers(
                 &connector_clone,
                 &server_clone,
-                &namespace,
+                &pvc_info,
                 &pending.pvc_names,
             )
             .await
