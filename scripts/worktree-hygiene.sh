@@ -22,11 +22,17 @@
 # idle", and the idle state is exactly when orphaned host processes and
 # stale branches accumulate, so collapsing the two into one fail-safe would
 # defeat this script's only reap opportunity while zero workers are running.
-# STEP C/D's merge-state and open-PR checks (is_unmerged_by_patch_id,
-# has_open_pr, has_live_worktree_dir, is_checked_out) are independent of
-# LIVE_AGENTS' contents, so --no-live-workers only waives the live-agent
-# protection dimension -- it never lowers the staleness bar those other
-# checks enforce.
+# STEP C's merge-state and open-PR guards (is_unmerged_by_patch_id,
+# has_open_pr, has_live_worktree_dir, is_checked_out) already run
+# independent of LIVE_AGENTS' contents, so --no-live-workers only waives
+# the live-agent protection dimension there -- it never lowers the
+# staleness bar those checks enforce. STEP D needs no equivalent guard for
+# the same result: it only ever considers branches whose tracked upstream
+# is literally `[gone]`, and an open PR (or any other live reference) keeps
+# the remote ref alive, so such a branch can never enter STEP D's candidate
+# set in the first place -- this is a scope argument, not a guard STEP D
+# re-runs (it does NOT call has_open_pr/is_unmerged_by_patch_id itself; see
+# STEP D below).
 #
 # STEP A: kill host-side `u7s-apiserver`/`u7s-scheduler`/`konnectivity-server`/
 #   `sample-run-metrics.sh` processes left running after their worktree was
@@ -524,11 +530,12 @@ main() {
 
   if [ "$no_live_workers" -eq 1 ]; then
     # Affirmative idle-state declaration: run STEP A/C/D with an empty
-    # live-protection set. This does NOT lower the staleness bar those
-    # steps otherwise enforce -- STEP C/D's merge-state and open-PR checks
-    # apply regardless of LIVE_AGENTS' contents (see the file header), so a
-    # branch with an open, unmerged PR is still preserved even with zero
-    # live workers.
+    # live-protection set. This does NOT lower the staleness bar: STEP C's
+    # merge-state and open-PR guards apply regardless of LIVE_AGENTS'
+    # contents (see the file header), so a branch with an open, unmerged
+    # PR is still preserved by STEP C even with zero live workers. STEP D
+    # needs no such guard -- its scope (branches with a literally `[gone]`
+    # tracked upstream) already excludes any branch an open PR keeps alive.
     LIVE_AGENTS=""
   # Fail-safe, not a default: STEP A/C/D are destructive (process kill,
   # branch delete), and dir-existence/merge-state alone already proved
