@@ -248,8 +248,19 @@ else
   # below (pod-subnet CNI rewrite, kubelet/kube-proxy config, certs) already
   # runs unconditionally against the live VM regardless of how it was
   # provisioned, so no further clone-specific handling is needed.
+  # `limactl clone` only refuses a *Running* source -- a golden left
+  # Broken/Installing/Uninitialized by a failed bake is NOT blocked by a
+  # directory-existence check alone, and would get silently cloned into a
+  # broken worker VM. Gate on the same Stopped status check
+  # lima-golden-bake.sh itself uses to consider the golden "baked" -- any
+  # other status falls back to the fresh-provision path below.
   GOLDEN_DIR="${HOME}/.lima/lima-golden"
+  GOLDEN_USABLE=0
   if [ "$VM_NAME" != "lima-golden" ] && [ -d "$GOLDEN_DIR" ]; then
+    GOLDEN_STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk '/^lima-golden / {print $2}')
+    [ "$GOLDEN_STATUS" = "Stopped" ] && GOLDEN_USABLE=1
+  fi
+  if [ "$GOLDEN_USABLE" -eq 1 ]; then
     echo "Provisioning VM '$VM_NAME' via golden-clone (lima-golden template found)..."
     check_port_free "$KUBELET_PORT" "kubelet"
     # No-op here ($VM_DIR already doesn't exist in this branch), but mirrors
