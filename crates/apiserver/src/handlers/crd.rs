@@ -1196,7 +1196,13 @@ pub async fn put_crd_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    crate::handlers::status::replace_status_field(&mut current.body, &incoming.body["status"])?;
+    // `_dynamic`, not the built-in `replace_status_field`: a scalar status here is caught
+    // by structural-schema validation (422), not a typed decode failure (400) — see
+    // replace_status_field_dynamic's doc comment.
+    crate::handlers::status::replace_status_field_dynamic(
+        &mut current.body,
+        &incoming.body["status"],
+    )?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
 
@@ -3053,7 +3059,9 @@ mod tests {
     /// CustomResourceDefinition's own status; a PUT that wholesale-replaces it with a scalar
     /// corrupts the stored object's schema and later panics `apply_delete_policy`'s in-place
     /// `status["field"] = ...` stamp on the next DELETE, crashing the apiserver for every
-    /// other request in flight.
+    /// other request in flight. 422, matching the merge-patch equivalent: this handler
+    /// guards with `replace_status_field_dynamic`, the CR-shaped 422 check, same as
+    /// `put_cr_status`.
     #[tokio::test]
     async fn put_crd_status_rejects_non_object_status() {
         for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
