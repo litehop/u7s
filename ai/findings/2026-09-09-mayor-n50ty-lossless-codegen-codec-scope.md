@@ -15,7 +15,7 @@ still need to solve the same "which fields does the apiserver reason about"
 problem, plus several problems the hand-written path never has to face at all.
 Effort to build a genuinely lossless codec: **large** (multi-week, multiple
 PRs, comparable to or bigger than the existing multi-PR "codegen Phase 4.x"
-wire-format EPIC this audit found already in-tree — see below), **high risk**
+wire-format EPIC already in-tree — see §4), **high risk**
 (the failure mode is silent field drops, the exact bug class this whole effort
 exists to prevent), for a payoff that turns out to be **small**: the things it
 would supposedly "unblock beyond status" (defaults, discovery, protobuf content
@@ -73,13 +73,12 @@ general JSON-serving boundary. Concretely:
 
 - **No unknown-field passthrough anywhere.** `emit_field_encode` builds a
   fresh `serde_json::Map::new()` and only ever inserts fields the descriptor
-  declares (`crates/apiserver/build/codegen.rs:862-877`, `896-904`). A field
-  present in a stored JSON object but absent from the vendored `.proto`
-  (a newer k8s field, or anything genuinely unknown) is unrecoverable —
-  grepping the whole 10,968-line file for `flatten`/`passthrough`/`catch_all`/
-  `unknown field` returns **zero hits** related to preservation. This is the
-  single blocker for definition-point (2) above, and it is architectural, not
-  a bug to patch: see §3 for why.
+  declares (`crates/apiserver/build/codegen.rs:862-877`, `896-904`) — no
+  `flatten`/`passthrough`/catch-all mechanism exists anywhere in the 10,968-line
+  file. A field present in a stored JSON object but absent from the vendored
+  `.proto` (a newer k8s field, or anything genuinely unknown) is unrecoverable.
+  This is the single blocker for definition-point (2) above, and it is
+  architectural, not a bug to patch: see §3.
 - **~90% of the generated adapters are one-directional.** 201 `generate_*`
   functions exist; only **~18 are bidirectional** (16 call
   `generate_message_codec` directly, plus 1 that calls both directions and 1
@@ -95,10 +94,9 @@ general JSON-serving boundary. Concretely:
   `KNOWN_GAPS` (`codegen.rs:406`) is empty, meaning the EPIC considers itself
   complete **against its own reduced scope**, not against full JSON parity.
 - **Zero-value/empty-string filters are a mix of correct and previously-buggy.**
-  The bead's own example — `.filter(|&v| v != 0)` on `observedGeneration` —
-  lives at `codegen.rs:1293-1294` (`pod_status_delegated_field`) and its
-  sibling sites (`:1765`, `:1810-1822`, `:3783-3804`, `:4126-4135`, ...,
-  30+ call sites). Most of these correctly mirror upstream's own Go
+  `.filter(|&v| v != 0)` on `observedGeneration` (`codegen.rs:1293-1294`,
+  `pod_status_delegated_field`) and 30+ sibling sites (`:1765`, `:1810-1822`,
+  `:3783-3804`, `:4126-4135`, ...). Most of these correctly mirror upstream's own Go
   `omitempty`-on-plain-`int64`-field collapse (upstream *also* can't
   distinguish `observedGeneration: 0` from absent — matching that is
   faithful, not lossy). But this exact pattern already produced one confirmed,
@@ -118,87 +116,67 @@ general JSON-serving boundary. Concretely:
 
 ## 3. Mechanism options
 
-**(a) Custom serde impls generated in codegen, layered onto the existing
-prost structs.** **Doesn't work as stated.** The prost structs are
-`#[derive(Message)]` for protobuf wire encoding; every field on them is
-walked by that derive via its own `#[prost(...)]` attribute. There is no way
-to bolt a `#[serde(flatten)] rest: serde_json::Value` catch-all field onto a
-`Message`-deriving struct — it isn't a proto wire field, so `Message`'s
-derive has nowhere to put it, and prost's own derive doesn't support
-"extra, non-wire" fields. Any codec resting on flatten-based passthrough must
-generate a **second, JSON-only struct per message type** — which is no longer
-"a codec over the prost structs," it's *codegen the exact same `types.rs`
-minimal-field-plus-`rest` shape* the hand-written path already uses, just
-machine-generated. That's a real, distinct option — see (a′) below.
+**(a) Generate a parallel struct from the proto descriptors, in the
+`types.rs` minimal-field-plus-`rest` shape.** Layering serde directly onto
+the existing prost structs is structurally impossible: they are
+`#[derive(Message)]` for protobuf wire encoding, and every field on them is
+walked by that derive via its own `#[prost(...)]` attribute, so there is no
+way to add a `#[serde(flatten)] rest: serde_json::Value` catch-all — it isn't
+a wire field, and prost's derive has no concept of "extra, non-wire" fields.
+The only mechanically sound path is to generate a **second, JSON-only struct
+per message type**, reusing the already-vendored `.proto` descriptors and the
+existing `json_name`-aware field-naming logic (`proto_exceptions.rs:409`, the
+`json_key` helper) as the schema source — structurally identical to what
+ds8hb/ohh8o hand-wrote, just machine-generated. This still has to add the
+missing decode direction for the ~183 encode-only types, design the
+merge/passthrough logic the current snapshot-only walker has never needed
+(§4), and re-derive every zero/omitempty judgment call against upstream Go
+pointer-ness (the same audit the replicas bug proves is easy to get wrong) —
+and even then it only covers fields known to the *vendored* `.proto` at
+generation time, landing anything else in `rest` for exactly the reason a
+hand-written struct's `rest` field already does. Generation buys nothing on
+the one part of the work that matters: choosing *which* fields the apiserver
+reasons about is a judgment call a schema walker cannot make. A generated
+struct either types everything (defeating "minimal field," multiplying the
+omitempty-audit burden across every field instead of ~5-10 per type) or
+types nothing (back to hand-picking, per type, exactly what ds8hb/ohh8o
+already did).
 
-**(a′) Codegen the `types.rs` shape (minimal field + `flatten rest`) from the
-proto descriptors, as a parallel struct, not layered on the prost struct.**
-This reuses the already-vendored `.proto` descriptors and the existing
-`json_name`-aware field-naming logic (`proto_exceptions.rs:409`, the `json_key`
-helper) as the schema source, generating something structurally identical to
-what ds8hb/ohh8o hand-wrote. Feasible in principle. Cost: still has to (1) add
-the missing decode direction for the ~183 encode-only types, (2) design and add
-per-message `rest: Value` merge logic that the current snapshot-only walker
-has never needed (see below), (3) re-derive every zero/omitempty judgment
-call against upstream Go pointer-ness (the exact audit the replicas bug
-proves is easy to get wrong), and (4) still only covers fields known to the
-*vendored* `.proto` at generation time — an unknown JSON field lands in
-`rest`, so the "unknown-field passthrough" property from a struct with
-`#[serde(flatten)] rest: Value` is present, but only because it's
-**re-implementing the hand-written pattern's own mechanism** — the codec adds
-zero passthrough capability the hand-written struct didn't already have on
-its own. The only thing generation buys here is *authoring* effort for the
-minimal-field selection, and generation can't automate that part: choosing
-*which* fields the apiserver "reasons about" (the actual point of typing) is a
-judgment call a schema walker cannot make — a generated struct would either
-type everything (defeating "minimal field," and multiplying the
-upstream-omitempty-audit burden across every field instead of ~5-10 per type)
-or type nothing (and you're back to hand-picking, per type, exactly what
-ds8hb/ohh8o already did).
+**(b) A serde attribute layer on the prost structs** (rename_all + per-field
+rename + skip_serializing_if, no flatten). `crates/proto-generated/build.rs:10-23`
+configures `prost_build::Config` with one `type_attribute` (a `Sentinel`
+derive, unrelated) and zero serde derives or renames today. Building this
+needs the same per-field `json_name` walk as (a) to get k8s's exact
+camelCase, so it is no cheaper, and it inherits (a)'s structural blocker with
+no escape hatch: there is nowhere to put an unknown-field catch-all on a
+`Message`-deriving struct, and (b)'s whole premise is reusing that same
+struct rather than generating a second one.
 
-**(b) A serde attribute layer on the prost structs (rename_all + per-field
-rename + skip_serializing_if), no flatten.** Checked whether this is even
-wired up: `crates/proto-generated/build.rs:10-23` configures `prost_build::Config`
-with exactly one `type_attribute` (a `Sentinel` derive, unrelated) — **zero**
-serde derives or renames today. Building this from scratch still needs the
-same per-field `json_name` walk codegen.rs already does (to get k8s's exact
-camelCase, not a naive `heck`-style transform), so it isn't cheaper than (a′)
-to build, and it inherits (a)'s structural blocker exactly: no unknown-field
-container is possible on a `Message`-deriving struct, so it fails
-definition-point (2) unconditionally, with no escape hatch at all (not even
-"generate a second struct" — the point of (b) was reusing the *same* struct).
-**Does not work; ruled out.**
-
-**(c) An OpenAPI/JSON-schema-driven generator.** Would source field/type
+**(c) An OpenAPI/JSON-schema-driven generator**, sourcing field/type
 information from k8s's OpenAPI v3 schema instead of the vendored `.proto`.
-Checked the repo for any vendored schema to build on: **none** — no
-`swagger`/`openapi` file anywhere in the tree. Unlike proto (28 `.proto` files
-already vendored and already feeding the Phase-4.x EPIC), this option needs a
-**brand-new vendoring pipeline** (fetch, pin, and re-vendor a multi-MB schema
-document per k8s version bump) before any codegen work starts, and still
-shares (a′)'s two hard problems (missing-field selection needs human judgment;
-unknown-field passthrough still needs a hand-designed `rest` mechanism, since
-OpenAPI's `additionalProperties` doesn't map onto Rust structs automatically
-either). Strictly more upfront cost than (a′) for no offsetting benefit.
-**Does not clear the bar.**
+No OpenAPI/swagger schema is vendored anywhere in this repo, unlike the 28
+`.proto` files already vendored and already feeding the Phase-4.x EPIC, so
+this option needs a brand-new vendoring pipeline (fetch, pin, and re-vendor a
+multi-MB schema document per k8s version bump) before any codegen work
+starts — on top of sharing (a)'s two hard problems: field selection still
+needs human judgment, and unknown-field passthrough still needs a
+hand-designed `rest` mechanism, since OpenAPI's `additionalProperties`
+doesn't map onto Rust structs automatically either.
 
-**(d) Adopt an existing crate** (e.g. `pbjson`/`pbjson-build`, which generates
-serde impls implementing the canonical protobuf-JSON mapping for prost
-messages). Real prior art, but the canonical protobuf JSON mapping has the
-**same** no-unknown-field-passthrough property protobuf JSON has always had —
-adopting it would not clear definition-point (2) either, and it's a new
-external dependency the project's minimal-dependency stance already leans
-against (on top of the bead's explicit "no k8s-openapi"). **Does not clear
-the bar.**
+**(d) Adopt an existing crate** (e.g. `pbjson`/`pbjson-build`, which
+generates serde impls for the canonical protobuf-JSON mapping). The canonical
+protobuf JSON mapping has the same no-unknown-field-passthrough property
+protobuf JSON has always had, so it fails definition-point (2) regardless,
+and it adds a new external dependency against the project's
+minimal-dependency stance, on top of the bead's explicit "no k8s-openapi."
 
-**Verdict: only (a′) is mechanically sound, and even it saves nothing on the
-one part of the work that actually matters (deciding which fields to type),
-while adding real new cost (decode-direction backfill, a not-yet-designed
-merge/passthrough capability, and a fresh per-field omitempty-vs-pointer audit
-across a much larger field surface than "the ~5-10 fields per type the
-apiserver actually reasons about").**
+**Only (a) is mechanically sound, and it saves nothing on the field-selection
+judgment that is the actual work, while adding real new cost: decode-direction
+backfill, a not-yet-designed merge/passthrough capability, and a fresh
+per-field omitempty-vs-pointer audit across a much larger field surface than
+the ~5-10 fields per type the apiserver actually reasons about.**
 
-## 4. Effort estimate for the recommended mechanism (a′), if built anyway
+## 4. Effort estimate to build the codec (mechanism (a)) anyway
 
 - **Decode-direction backfill**: ~183 encode-only adapters need a matching
   decode function. Each of the existing ~18 bidirectional pairs runs
@@ -234,7 +212,7 @@ apiserver actually reasons about").**
 
 ## 5. Head-to-head vs the m10di hand-written path
 
-| | Hand-written `types.rs` (m10di) | Codec (a′) |
+| | Hand-written `types.rs` (m10di) | Codec (a) |
 |---|---|---|
 | Precedent | Shipped twice: mayor-ds8hb (19 structs, ~250 LOC, `defaults.rs`), mayor-ohh8o (`discovery.rs`); 2 of the 3 currently-typed statuses (`NamespaceStatus` `types.rs:636-644`, `CertificateSigningRequestStatus` `types.rs:750-764`) already use exactly this pattern | None — would be new |
 | Scope of field-selection judgment | Same either way — a human decides which ~5-10 fields per type the apiserver reasons about | Same, cannot be automated (see §3) |
@@ -264,13 +242,13 @@ blocker on m10di.
 - Codegen structure, one-directional/bidirectional counts (~183 vs ~18), the
   `DELIBERATE_OMISSIONS`/`KNOWN_GAPS` tables, and the absence of any
   passthrough mechanism: **high** — grepped and read directly in source.
-- The `Message`-derive-incompatible-with-flatten claim (mechanism (a)/(b)
-  ruled out): **high** — structural property of prost's derive macro, not an
+- The `Message`-derive-incompatible-with-flatten claim underlying (a) and
+  (b): **high** — structural property of prost's derive macro, not an
   assumption.
 - The replicas-bug-class evidence for the omitempty/pointer audit burden:
   **high** — verified against the actual commit (`6877c906`, 2026-09-04) and
   its own commit message.
-- Effort estimate for building (a′): **medium-high confidence it is large and
+- Effort estimate for building (a): **medium-high confidence it is large and
   risky**, extrapolated from the existing Phase-4.x EPIC's own multi-PR scale
   for a strictly easier (lossy-by-design, encode-mostly) problem; the exact
   LOC number is a rough order-of-magnitude, not a measured quantity.
