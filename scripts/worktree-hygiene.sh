@@ -6,11 +6,27 @@
 # orchestrator model turn parsing `ps`/`git` output by hand.
 #
 # --live-agents <comma-separated-agent-ids>: the mayor's own ListAgents-
-# derived set of currently running worker/agent-* subagents -- REQUIRED.
-# main() refuses to run at all without it (see below): dir-existence and
-# merge-state checks alone already proved insufficient to tell a live
-# worker's branch/worktree apart from a genuinely stale one, and STEP A/C/D
-# are destructive (process kill, branch delete).
+# derived set of currently running worker/agent-* subagents. main() refuses
+# to run at all without EITHER this or --no-live-workers below (see main()):
+# dir-existence and merge-state checks alone already proved insufficient to
+# tell a live worker's branch/worktree apart from a genuinely stale one, and
+# STEP A/C/D are destructive (process kill, branch delete).
+#
+# --no-live-workers: an affirmative alternative to --live-agents for the
+# idle state -- the caller has confirmed via ListAgents that ZERO
+# worker/agent-* subagents are running, so STEP A/C/D run with an empty
+# live-protection set. Mutually exclusive with --live-agents (passing both
+# is a usage error). Deliberately distinct from an empty/omitted
+# --live-agents value, which still refuses to run (see main()) -- without
+# this flag there is no way to tell "forgot the flag" apart from "genuinely
+# idle", and the idle state is exactly when orphaned host processes and
+# stale branches accumulate, so collapsing the two into one fail-safe would
+# defeat this script's only reap opportunity while zero workers are running.
+# STEP C/D's merge-state and open-PR checks (is_unmerged_by_patch_id,
+# has_open_pr, has_live_worktree_dir, is_checked_out) are independent of
+# LIVE_AGENTS' contents, so --no-live-workers only waives the live-agent
+# protection dimension -- it never lowers the staleness bar those other
+# checks enforce.
 #
 # STEP A: kill host-side `u7s-apiserver`/`u7s-scheduler`/`konnectivity-server`/
 #   `sample-run-metrics.sh` processes left running after their worktree was
@@ -62,7 +78,8 @@
 # script's own `set -e` (a `git fetch`/`branch` failure aborts the run with
 # git's exit code, which is itself already non-zero). STEP E never
 # contributes to the exit code -- it only reports, it never mutates. A
-# missing --live-agents flag exits 2 before any step runs (see main()).
+# missing/empty --live-agents flag with no --no-live-workers fallback (or
+# passing both together) exits 2 before any step runs (see main()).
 #
 # DRY_RUN=1 turns every destructive command (pkill, git branch -D/-d) into a
 # logged no-op via run_cmd() -- same idiom the sibling merge/dashboard
@@ -479,7 +496,7 @@ step_e_stale_findings() {
 }
 
 main() {
-  local live_agents_provided=0
+  local live_agents_provided=0 no_live_workers=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --live-agents)
@@ -487,12 +504,32 @@ main() {
         live_agents_provided=1
         shift 2
         ;;
+      --no-live-workers)
+        no_live_workers=1
+        shift
+        ;;
       *)
         shift
         ;;
     esac
   done
 
+  # Mutually exclusive: each flag is a different affirmative claim about
+  # the live-agent set (a specific non-empty set vs. affirmatively empty),
+  # and passing both leaves no way to tell which one the caller meant.
+  if [ "$live_agents_provided" -eq 1 ] && [ "$no_live_workers" -eq 1 ]; then
+    echo "worktree-hygiene: refusing to run -- --live-agents and --no-live-workers are mutually exclusive. Pass --live-agents <ids> when ListAgents shows running workers, or --no-live-workers when it shows zero -- never both." >&2
+    exit 2
+  fi
+
+  if [ "$no_live_workers" -eq 1 ]; then
+    # Affirmative idle-state declaration: run STEP A/C/D with an empty
+    # live-protection set. This does NOT lower the staleness bar those
+    # steps otherwise enforce -- STEP C/D's merge-state and open-PR checks
+    # apply regardless of LIVE_AGENTS' contents (see the file header), so a
+    # branch with an open, unmerged PR is still preserved even with zero
+    # live workers.
+    LIVE_AGENTS=""
   # Fail-safe, not a default: STEP A/C/D are destructive (process kill,
   # branch delete), and dir-existence/merge-state alone already proved
   # insufficient to distinguish a live worker from a stale one (the bug
@@ -504,9 +541,11 @@ main() {
   # presence) also closes an empty/whitespace-only value -- `--live-agents
   # ""` or `--live-agents "   "` -- which would otherwise sail past a
   # presence-only check and run the destructive steps with an effectively
-  # empty live set.
-  if [ "$live_agents_provided" -ne 1 ] || [ -z "$(normalize_live_agents "$LIVE_AGENTS")" ]; then
-    echo "worktree-hygiene: refusing to run -- --live-agents <comma-separated-agent-ids> is required (the mayor's own ListAgents-derived live set) and must be non-empty after trimming whitespace. Without it there is no way to tell a live worker's branch/worktree apart from a stale one, and STEP A/C/D are destructive." >&2
+  # empty live set. That case is indistinguishable from "forgot the flag"
+  # and must still refuse -- --no-live-workers above is the only way to
+  # affirmatively declare zero live workers.
+  elif [ "$live_agents_provided" -ne 1 ] || [ -z "$(normalize_live_agents "$LIVE_AGENTS")" ]; then
+    echo "worktree-hygiene: refusing to run -- --live-agents <comma-separated-agent-ids> (non-empty after trimming whitespace) or --no-live-workers is required. Without one there is no way to tell a live worker's branch/worktree apart from a stale one, and STEP A/C/D are destructive." >&2
     exit 2
   fi
 
