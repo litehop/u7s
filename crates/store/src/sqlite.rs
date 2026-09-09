@@ -15,7 +15,16 @@ const RING_CAPACITY: usize = 512;
 /// Live-event fan-out shared by EVERY watch — deliberately not sharded, so each stream filters
 /// this one channel down to its own prefix and a busy resource type can lag a quiet one's watcher.
 /// Overflow yields `Lagged`, recovered from that shard's ring; such recovery is extremely rare.
+/// Global bookmarks (see `GlobalBookmark`) are NOT sent here — they get their own channel at the
+/// same capacity below, so every one of these slots holds a real event.
 const BROADCAST_CAPACITY: usize = 1024;
+/// Capacity of the dedicated global-bookmark channel (see `GlobalBookmark`). Sized the same as
+/// `BROADCAST_CAPACITY` for the same reason: one bookmark is sent per write, so this channel sees
+/// the same send rate `tx` used to see before bookmarks had their own channel. Splitting them
+/// doubles both channels' effective retention at unchanged total memory: `tx` no longer loses half
+/// its slots to bookmarks, and this channel's payload (`GlobalBookmark`) is far smaller per slot
+/// than the `Arc<InternalEvent>` a bookmark used to occupy on `tx`.
+const BOOKMARK_BROADCAST_CAPACITY: usize = 1024;
 
 /// How long a per-watcher stream coalesces global-bookmark broadcasts (one per write, to
 /// every open watch) before yielding a single `WatchEvent::Bookmark`. KCM's EnsureReady()
@@ -362,8 +371,12 @@ pub struct SqliteStore {
     /// Broadcast channel for live events after writes. Deliberately NOT sharded — every open
     /// watch stream already filters this one channel down to its own prefix; sharding delivery
     /// itself is a separate, larger fan-out axis tracked independently of the ring/deletion_log
-    /// sharding this type does.
+    /// sharding this type does. Carries only real events — see `GlobalBookmark`'s doc for why
+    /// the synthetic global bookmark sent alongside every write goes on `bookmark_tx` instead.
     tx: broadcast::Sender<Arc<InternalEvent>>,
+    /// Dedicated channel for the global bookmark `push_event_locked` sends on every write — see
+    /// `GlobalBookmark`'s doc. Every `watch()` subscribes to this in lockstep with `tx`.
+    bookmark_tx: broadcast::Sender<GlobalBookmark>,
     /// Per-resource-type shards (ring buffer + deletion log), created lazily — normally by the
     /// first `watch()` on a resource type, or by a write if that write is a delete nobody's
     /// shard has recorded yet (see `push_event_locked`'s doc for why deletes are special) — and
@@ -448,6 +461,7 @@ impl SqliteStore {
         };
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (bookmark_tx, _) = broadcast::channel(BOOKMARK_BROADCAST_CAPACITY);
         let shards = Arc::new(RwLock::new(BTreeMap::new()));
         let reclaimed_horizons = Arc::new(RwLock::new(ReclaimedHorizons::default()));
         let compaction_horizon = Arc::new(AtomicU64::new(0));
@@ -457,6 +471,7 @@ impl SqliteStore {
             write_conn,
             read_conn,
             tx,
+            bookmark_tx,
             shards,
             reclaimed_horizons,
             compaction_horizon,
@@ -491,6 +506,7 @@ impl SqliteStore {
         get_or_create_shard(&self.shards, &self.reclaimed_horizons, &shard);
         push_event_locked(
             &self.tx,
+            &self.bookmark_tx,
             &self.shards,
             &self.reclaimed_horizons,
             &shard,
@@ -770,6 +786,21 @@ fn push_into_shard(
     }
 }
 
+/// A global bookmark: advances every open watch's informer-sync-RV signal without carrying an
+/// object body. Broadcast on its own channel (`SqliteStore::bookmark_tx`), separate from the real
+/// `Arc<InternalEvent>` channel (`SqliteStore::tx`) — see `BROADCAST_CAPACITY`'s doc for why. Much
+/// smaller per-slot than the `InternalEvent` it replaced there (no `value`/`deleted_body`/
+/// `is_create` fields, which a bookmark never used anyway).
+///
+/// `shard_root` uses `Arc<str>` rather than `String` so the per-watcher clone every open stream's
+/// `bookmark_rx.recv()` does on every send stays a refcount bump, matching why `InternalEvent` on
+/// the real channel is itself `Arc`-wrapped.
+#[derive(Debug, Clone)]
+struct GlobalBookmark {
+    shard_root: Arc<str>,
+    revision: u64,
+}
+
 /// Push one write's event onto the ring buffer, deletion log, and broadcast channel.
 ///
 /// Callers in `put`/`delete`/`delete_namespace_resources` invoke this from INSIDE the
@@ -792,6 +823,7 @@ fn push_into_shard(
 #[allow(clippy::too_many_arguments)]
 fn push_event_locked(
     tx: &broadcast::Sender<Arc<InternalEvent>>,
+    bookmark_tx: &broadcast::Sender<GlobalBookmark>,
     shards: &Arc<RwLock<BTreeMap<String, Arc<RingShard>>>>,
     reclaimed_horizons: &Arc<RwLock<ReclaimedHorizons>>,
     shard_key: &str,
@@ -836,12 +868,11 @@ fn push_event_locked(
     let event_revision = event.revision;
     let _ = tx.send(event);
     // Broadcast a global bookmark, tagged with this write's own shard root (e.g.
-    // "/registry/pods/" — always trailing-slash-terminated, so it can never collide with a
-    // real object key, which always ends in a name segment instead), to advance all
-    // informers' sync RVs. KCM's ConsistencyStore.EnsureReady() checks each informer's
-    // LastStoreSyncResourceVersion against the RV of writes the controller made.
-    // A StatefulSet watch only sees StatefulSet events — without a global bookmark,
-    // its sync RV lags pod write RVs and EnsureReady requeues indefinitely.
+    // "/registry/pods/"), to advance all informers' sync RVs. KCM's
+    // ConsistencyStore.EnsureReady() checks each informer's LastStoreSyncResourceVersion
+    // against the RV of writes the controller made. A StatefulSet watch only sees
+    // StatefulSet events — without a global bookmark, its sync RV lags pod write RVs and
+    // EnsureReady requeues indefinitely. On its own channel (`GlobalBookmark`'s doc), not `tx`.
     //
     // Use this event's own revision (not last_written_revision) so that concurrent
     // writes cannot inject a higher RV into this event's bookmark.  If write-B
@@ -849,13 +880,10 @@ fn push_event_locked(
     // last_written_revision.load(), write-A's bookmark would carry rv=N+1, advancing
     // watchers' last_replayed to N+1 before write-B's event(rv=N+1) is broadcast —
     // causing write-B's event to be dedup-skipped and silently dropped.
-    let _ = tx.send(Arc::new(InternalEvent {
-        key: shard_key.to_string(),
+    let _ = bookmark_tx.send(GlobalBookmark {
+        shard_root: Arc::from(shard_key),
         revision: event_revision,
-        value: None,
-        is_create: false,
-        deleted_body: None,
-    }));
+    });
 }
 
 /// Look up `shard`'s `RingShard` in `shards`, creating it on first use. Read-locks first (the
@@ -2022,6 +2050,7 @@ impl Store for SqliteStore {
         let key_str = key.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
+        let bookmark_tx = self.bookmark_tx.clone();
         let shards = Arc::clone(&self.shards);
         let reclaimed_horizons = Arc::clone(&self.reclaimed_horizons);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
@@ -2041,6 +2070,7 @@ impl Store for SqliteStore {
                 let shard = shard_key(&key_str, ns.as_deref());
                 push_event_locked(
                     &tx,
+                    &bookmark_tx,
                     &shards,
                     &reclaimed_horizons,
                     &shard,
@@ -2082,6 +2112,7 @@ impl Store for SqliteStore {
         let key_str = key.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
+        let bookmark_tx = self.bookmark_tx.clone();
         let shards = Arc::clone(&self.shards);
         let reclaimed_horizons = Arc::clone(&self.reclaimed_horizons);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
@@ -2104,6 +2135,7 @@ impl Store for SqliteStore {
             let shard = shard_key(&key_str, ns.as_deref());
             push_event_locked(
                 &tx,
+                &bookmark_tx,
                 &shards,
                 &reclaimed_horizons,
                 &shard,
@@ -2132,6 +2164,7 @@ impl Store for SqliteStore {
         let key_str = key.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
+        let bookmark_tx = self.bookmark_tx.clone();
         let shards = Arc::clone(&self.shards);
         let reclaimed_horizons = Arc::clone(&self.reclaimed_horizons);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
@@ -2146,6 +2179,7 @@ impl Store for SqliteStore {
             let shard = shard_key(&key_str, ns.as_deref());
             push_event_locked(
                 &tx,
+                &bookmark_tx,
                 &shards,
                 &reclaimed_horizons,
                 &shard,
@@ -2201,6 +2235,7 @@ impl Store for SqliteStore {
         let ns = namespace.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
+        let bookmark_tx = self.bookmark_tx.clone();
         let shards = Arc::clone(&self.shards);
         let reclaimed_horizons = Arc::clone(&self.reclaimed_horizons);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
@@ -2221,6 +2256,7 @@ impl Store for SqliteStore {
                 let shard = shard_key(&key, Some(&ns));
                 push_event_locked(
                     &tx,
+                    &bookmark_tx,
                     &shards,
                     &reclaimed_horizons,
                     &shard,
@@ -2250,6 +2286,7 @@ impl Store for SqliteStore {
     ) -> Result<impl futures_core::Stream<Item = WatchEvent> + Send + 'static> {
         // Subscribe FIRST to avoid missing events between replay and live.
         let mut rx = self.tx.subscribe();
+        let mut bookmark_rx = self.bookmark_tx.subscribe();
 
         // Create-on-first-watch: a watch is what brings a resource type's shard into being now
         // (see `push_event_locked`'s doc — writes no longer do). `find_shard_key` first, so a
@@ -2357,6 +2394,9 @@ impl Store for SqliteStore {
         // Captured for lag recovery: allows re-subscribing and re-scanning ring buffer
         // without terminating the stream when the broadcast channel lags transiently.
         let tx_clone = self.tx.clone();
+        // Same reason as `tx_clone`, for the bookmark channel's own `Lagged` arm below — and,
+        // like `tx_clone`, what makes the `RecvError::Closed` arm on that channel unreachable.
+        let bookmark_tx_clone = self.bookmark_tx.clone();
         // Re-resolved (via `find_shard`) on every use inside the stream below, rather than
         // reusing the `shard` computed above, so a watch opened before this resource type's
         // first-ever write still recovers correctly if that write (and its shard) arrives later
@@ -2449,39 +2489,6 @@ impl Store for SqliteStore {
                     }
                     recv_result = rx.recv() => match recv_result {
                     Ok(event) => {
-                        // A global bookmark (key holds the writer's shard root, always
-                        // trailing-slash-terminated — see push_event_locked) is delivered to
-                        // all watches regardless of prefix — it advances the informer's sync RV
-                        // without carrying an object (KCM ConsistencyStore relies on this).
-                        //
-                        // Do NOT update last_replayed here: a global bookmark may arrive from
-                        // a concurrent write on a completely different prefix, with a revision
-                        // higher than a pending event on this watcher's prefix. Advancing
-                        // last_replayed from a cross-prefix bookmark would cause that pending
-                        // event to be dedup-skipped and silently dropped.
-                        if event.key.ends_with('/') {
-                            // This watcher's own prefix is either exactly its shard's root or
-                            // that root plus one namespace segment (see `shard_key`), so
-                            // `prefix_owned.starts_with(&event.key)` is true only when this
-                            // bookmark came from the SAME shard this watcher is on. The trailing
-                            // per-matched-event bookmark just above already delivered an
-                            // equal-or-higher-revision bookmark to this watcher a moment earlier
-                            // via a different, unthrottled path — this one carries no new
-                            // information, so drop it before it can even arm the debounce timer.
-                            if prefix_owned.starts_with(event.key.as_str()) {
-                                continue;
-                            }
-                            if event.revision > bookmark_rv {
-                                bookmark_rv = event.revision;
-                                if !bookmark_debounce_pending {
-                                    bookmark_debounce_pending = true;
-                                    debounce_sleep
-                                        .as_mut()
-                                        .reset(tokio::time::Instant::now() + GLOBAL_BOOKMARK_DEBOUNCE);
-                                }
-                            }
-                            continue;
-                        }
                         if !event.key.starts_with(&prefix_owned) {
                             continue;
                         }
@@ -2647,6 +2654,64 @@ impl Store for SqliteStore {
                         // than deleted so a future change to `tx_clone`'s capture strategy that
                         // defeats this invariant fails loudly instead of silently leaking watch
                         // streams that poll a dead channel forever.
+                        unreachable!(
+                            "watch() retains its own broadcast Sender clone for this stream's \
+                             entire lifetime, so RecvError::Closed can never be observed here"
+                        )
+                    }
+                    },
+                    bookmark_recv_result = bookmark_rx.recv() => match bookmark_recv_result {
+                    Ok(bookmark) => {
+                        // Delivered to all watches regardless of prefix — it advances the
+                        // informer's sync RV without carrying an object (KCM ConsistencyStore
+                        // relies on this). Do NOT update last_replayed here: a global bookmark
+                        // may arrive from a concurrent write on a completely different prefix,
+                        // with a revision higher than a pending event on this watcher's prefix.
+                        // Advancing last_replayed from a cross-prefix bookmark would cause that
+                        // pending event to be dedup-skipped and silently dropped.
+                        //
+                        // This watcher's own prefix is either exactly its shard's root or that
+                        // root plus one namespace segment (see `shard_key`), so
+                        // `prefix_owned.starts_with(&bookmark.shard_root)` is true only when this
+                        // bookmark came from the SAME shard this watcher is on. The trailing
+                        // per-matched-event bookmark in the `rx.recv()` arm above already
+                        // delivered an equal-or-higher-revision bookmark to this watcher a moment
+                        // earlier via a different, unthrottled path — this one carries no new
+                        // information, so drop it before it can even arm the debounce timer.
+                        if prefix_owned.starts_with(bookmark.shard_root.as_ref()) {
+                            continue;
+                        }
+                        if bookmark.revision > bookmark_rv {
+                            bookmark_rv = bookmark.revision;
+                            if !bookmark_debounce_pending {
+                                bookmark_debounce_pending = true;
+                                debounce_sleep
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + GLOBAL_BOOKMARK_DEBOUNCE);
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Unlike `rx`'s Lagged arm, no ring-buffer recovery is needed: a global
+                        // bookmark never carries a payload that would otherwise be lost, and
+                        // KCM's EnsureReady() only needs eventual convergence (see
+                        // GLOBAL_BOOKMARK_DEBOUNCE's doc) — the next bookmark or matching event on
+                        // this prefix always re-establishes bookmark_rv at a revision at least as
+                        // high as any that were dropped here. Still counted under the same metric
+                        // as `rx`'s Lagged arm: both signal the same operator-facing condition
+                        // (this watcher's broadcast receiver fell behind).
+                        crate::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+                            .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned)])
+                            .inc_by(n);
+                        tracing::debug!(
+                            prefix = %prefix_owned,
+                            missed = n,
+                            "watch: bookmark channel lagged, resubscribing"
+                        );
+                        bookmark_rx = bookmark_tx_clone.subscribe();
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Same invariant as `tx_clone` above, for `bookmark_tx_clone`.
                         unreachable!(
                             "watch() retains its own broadcast Sender clone for this stream's \
                              entire lifetime, so RecvError::Closed can never be observed here"
@@ -3004,17 +3069,16 @@ mod tests {
         futures_util::pin_mut!(stream);
 
         let tx = store.tx.clone();
+        let bookmark_tx = store.bookmark_tx.clone();
 
         // 1. Global bookmark at rv=365 (from a concurrent Endpoints write on a different prefix).
         //    This arrives BEFORE the service event at rv=364 due to scheduling jitter.
-        tx.send(Arc::new(InternalEvent {
-            key: "/registry/endpoints/".to_string(),
-            revision: 365,
-            value: None,
-            is_create: false,
-            deleted_body: None,
-        }))
-        .expect("send bookmark");
+        bookmark_tx
+            .send(GlobalBookmark {
+                shard_root: Arc::from("/registry/endpoints/"),
+                revision: 365,
+            })
+            .expect("send bookmark");
 
         // 2. Service event at rv=364 (arrived late due to scheduling).
         tx.send(Arc::new(InternalEvent {
@@ -3165,10 +3229,12 @@ mod tests {
 
         // Assemble the store with the stale read_conn and write_conn that has the pod.
         let (tx, _) = broadcast::channel(16);
+        let (bookmark_tx, _) = broadcast::channel(16);
         let store = SqliteStore {
             write_conn,
             read_conn,
             tx,
+            bookmark_tx,
             shards: Arc::new(RwLock::new(BTreeMap::new())),
             reclaimed_horizons: Arc::new(RwLock::new(ReclaimedHorizons::default())),
             compaction_horizon: Arc::new(AtomicU64::new(0)),
@@ -5477,6 +5543,54 @@ mod tests {
             after > before,
             "a receiver that missed more than BROADCAST_CAPACITY messages must increment \
              u7s_watch_broadcast_lagged_total for its prefix once polled; before={before} after={after}"
+        );
+    }
+
+    /// The global bookmark sent on every write must NOT consume a slot on the real-event
+    /// broadcast channel (`tx`) — it has its own dedicated channel instead.
+    ///
+    /// Why it matters: before the fix, `push_event_locked` sent both the real event AND a
+    /// synthetic bookmark onto the SAME `BROADCAST_CAPACITY`-sized channel, so half its slots
+    /// were pure bookmark waste and an unpolled watcher only tolerated `BROADCAST_CAPACITY / 2`
+    /// real writes before `Lagged` — each `Lagged` then forces an O(ring) recovery scan under
+    /// the shard read lock. This writes just over half `BROADCAST_CAPACITY`: with bookmarks
+    /// folded back onto `tx` (2 sends/write) that would exceed capacity and increment
+    /// `u7s_watch_broadcast_lagged_total`; with the fix (1 send/write) it must not.
+    #[tokio::test]
+    async fn bookmark_channel_does_not_consume_real_event_broadcast_capacity() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/bookmark-capacity-test/";
+
+        // Subscribe but do not poll the stream, so the receiver falls behind if the channel
+        // it is subscribed to fills past its capacity.
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[prefix])
+            .get();
+
+        // Just over half BROADCAST_CAPACITY: 1 send/write stays comfortably under capacity, but
+        // 2 sends/write (the pre-fix behavior) would exceed it.
+        let writes = BROADCAST_CAPACITY as u64 / 2 + 1;
+        for i in 0..writes {
+            let key = format!("{prefix}obj-{i}");
+            store
+                .put(&key, svc_value(&format!("obj-{i}"), i), None)
+                .await
+                .expect("put must succeed");
+        }
+
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+
+        let after = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[prefix])
+            .get();
+        assert_eq!(
+            after, before,
+            "writing just over half BROADCAST_CAPACITY must not lag the real-event channel; \
+             before={before} after={after} — if this regresses, the global bookmark is back on \
+             the same channel as real events, halving its effective retention"
         );
     }
 
