@@ -81,13 +81,14 @@ general JSON-serving boundary. Concretely:
   single blocker for definition-point (2) above, and it is architectural, not
   a bug to patch: see §3 for why.
 - **~90% of the generated adapters are one-directional.** 201 `generate_*`
-  functions exist; only 20 call the bidirectional `generate_message_codec`
-  (both `to_json`/`from_json`) — the other **180 call
-  `generate_message_encode_only`** (proto→JSON only, e.g.
-  `generate_deployment_status` at `codegen.rs:3815-3839`, calling
-  `generate_message_encode_only` at `:3819`). Most status types have no
+  functions exist; only **~18 are bidirectional** (16 call
+  `generate_message_codec` directly, plus 1 that calls both directions and 1
+  bespoke bidirectional body) — the other **~183 are encode-only** (172 call
+  `generate_message_encode_only` directly, e.g. `generate_deployment_status`
+  at `codegen.rs:3815-3839` calling `generate_message_encode_only` at
+  `:3819`, plus 11 bespoke encode-only bodies). Most status types have no
   generated decode direction at all today.
-- **46 permanently, deliberately dropped fields**, `proto_exceptions.rs:177-406`
+- **26 permanently, deliberately dropped fields**, `proto_exceptions.rs:177-400`
   (`DELIBERATE_OMISSIONS`), e.g. `ObjectMeta.managedFields`,
   `VolumeSource.awsElasticBlockStore` (~15 legacy in-tree volume plugins) —
   scope decisions, not oversights, but real, permanent data loss vs point (2).
@@ -133,10 +134,10 @@ machine-generated. That's a real, distinct option — see (a′) below.
 **(a′) Codegen the `types.rs` shape (minimal field + `flatten rest`) from the
 proto descriptors, as a parallel struct, not layered on the prost struct.**
 This reuses the already-vendored `.proto` descriptors and the existing
-`json_name`-aware field-naming logic (`codegen.rs:71-78`, the `json_key`
+`json_name`-aware field-naming logic (`proto_exceptions.rs:409`, the `json_key`
 helper) as the schema source, generating something structurally identical to
 what ds8hb/ohh8o hand-wrote. Feasible in principle. Cost: still has to (1) add
-the missing decode direction for the 180 encode-only types, (2) design and add
+the missing decode direction for the ~183 encode-only types, (2) design and add
 per-message `rest: Value` merge logic that the current snapshot-only walker
 has never needed (see below), (3) re-derive every zero/omitempty judgment
 call against upstream Go pointer-ness (the exact audit the replicas bug
@@ -199,8 +200,8 @@ apiserver actually reasons about").**
 
 ## 4. Effort estimate for the recommended mechanism (a′), if built anyway
 
-- **Decode-direction backfill**: 180 encode-only adapters need a matching
-  decode function. Each of the existing 20 bidirectional pairs runs
+- **Decode-direction backfill**: ~183 encode-only adapters need a matching
+  decode function. Each of the existing ~18 bidirectional pairs runs
   roughly 20-40 generated lines per direction for a small message
   (`generate_pod_status`/`generate_container_status` are representative);
   scaled up, **order of 2,000-4,000 generated LOC** of new decode logic (not
@@ -238,7 +239,7 @@ apiserver actually reasons about").**
 | Precedent | Shipped twice: mayor-ds8hb (19 structs, ~250 LOC, `defaults.rs`), mayor-ohh8o (`discovery.rs`); 2 of the 3 currently-typed statuses (`NamespaceStatus` `types.rs:636-644`, `CertificateSigningRequestStatus` `types.rs:750-764`) already use exactly this pattern | None — would be new |
 | Scope of field-selection judgment | Same either way — a human decides which ~5-10 fields per type the apiserver reasons about | Same, cannot be automated (see §3) |
 | Unknown-field passthrough | Free — `#[serde(flatten)] rest: serde_json::Value` is one line per struct, already proven | Has to design + build the same mechanism from scratch inside a walker that has never needed it |
-| Decode direction | Comes free with `#[derive(Deserialize)]` | 180 of 201 existing adapters need it built |
+| Decode direction | Comes free with `#[derive(Deserialize)]` | ~183 of 201 existing adapters need it built |
 | Merge/PATCH-null semantics | Comes free — serde `Option<T>` + the existing `reject_non_object_status`/RFC 7396 handling at the handler boundary already does this | Not designed at all in the walker today |
 | LOC (extrapolated) | ~300 (23/19 × 250) | Multi-thousand (see §4) |
 | Risk | Low — narrow, reviewable, per-field | High — broad mechanical surface, same silent-drop failure mode, already caught once live |
@@ -260,7 +261,7 @@ blocker on m10di.
 
 ## 7. Confidence
 
-- Codegen structure, one-directional/bidirectional counts (180 vs 20), the
+- Codegen structure, one-directional/bidirectional counts (~183 vs ~18), the
   `DELIBERATE_OMISSIONS`/`KNOWN_GAPS` tables, and the absence of any
   passthrough mechanism: **high** — grepped and read directly in source.
 - The `Message`-derive-incompatible-with-flatten claim (mechanism (a)/(b)
