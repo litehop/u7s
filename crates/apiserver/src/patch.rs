@@ -296,9 +296,19 @@ fn strategic_merge_array(
     if !target.is_array() {
         *target = serde_json::Value::Array(vec![]);
     }
-    // Snapshot the pre-patch order: needed after the merge loop below to replicate
-    // upstream's element-ordering rule (see reorder_merged_array).
-    let original: Vec<serde_json::Value> = target.as_array().unwrap().clone();
+    // Index (not clone) the pre-patch order: reorder_merged_array only ever needs an
+    // element's merge-key field values and its position to replicate upstream's
+    // element-ordering rule, not a copy of the whole (potentially large) element.
+    let original_positions: Vec<(Vec<(String, serde_json::Value)>, usize)> = target
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            let fields = present_key_fields(v, merge_keys);
+            (!fields.is_empty()).then_some((fields, i))
+        })
+        .collect();
     let target_arr = target.as_array_mut().unwrap();
 
     for patch_elem in patch_arr {
@@ -351,7 +361,7 @@ fn strategic_merge_array(
         }
     }
 
-    reorder_merged_array(target, &original, patch_arr, merge_keys);
+    reorder_merged_array(target, &original_positions, patch_arr, merge_keys);
 
     Ok(())
 }
@@ -398,7 +408,7 @@ fn strategic_merge_set_array(target: &mut serde_json::Value, patch: &serde_json:
 /// fails immediately — no controller or watch behavior involved, purely a patch-storage bug.
 fn reorder_merged_array(
     target: &mut serde_json::Value,
-    original: &[serde_json::Value],
+    original_positions: &[(Vec<(String, serde_json::Value)>, usize)],
     patch_arr: &[serde_json::Value],
     merge_keys: &[String],
 ) {
@@ -414,7 +424,12 @@ fn reorder_merged_array(
         .filter(|fields| !fields.is_empty())
         .collect();
 
-    let merged = target.as_array().unwrap().clone();
+    // `target` is unconditionally overwritten below, so take its array instead of
+    // cloning it — the merge loop above already finished mutating it in place.
+    let merged = match std::mem::take(target) {
+        serde_json::Value::Array(a) => a,
+        _ => unreachable!("strategic_merge_array always leaves target as an array"),
+    };
     let (keyed, keyless): (Vec<_>, Vec<_>) = merged
         .into_iter()
         .partition(|v| !present_key_fields(v, merge_keys).is_empty());
@@ -437,41 +452,58 @@ fn reorder_merged_array(
         if fields.is_empty() {
             None
         } else {
-            original.iter().position(|o| matches_key_fields(o, &fields))
+            original_positions
+                .iter()
+                .find(|(of, _)| key_fields_subset(&fields, of))
+                .map(|(_, idx)| *idx)
         }
     };
     // server_only elements always existed pre-patch, so this is always Some(_) in
     // practice; unwrap_or is defensive only.
     server_only.sort_by_key(|v| original_index(v).unwrap_or(usize::MAX));
 
+    // Merge server_only and patch_items by taking ownership (via peekable iterators)
+    // instead of cloning each element again — both Vecs are otherwise unused after this.
     let mut result = Vec::with_capacity(server_only.len() + patch_items.len() + keyless.len());
-    let (mut i, mut j) = (0, 0);
-    while i < server_only.len() || j < patch_items.len() {
-        if i >= server_only.len() {
-            result.push(patch_items[j].clone());
-            j += 1;
-        } else if j >= patch_items.len() {
-            result.push(server_only[i].clone());
-            i += 1;
-        } else {
-            // Take the server-only element only if it demonstrably preceded the patch
-            // element pre-patch; a brand-new patch element (no original position) always
-            // loses this comparison, so it's emitted next instead.
-            let take_left = matches!(
-                (original_index(&server_only[i]), original_index(&patch_items[j])),
-                (Some(l), Some(r)) if l < r
-            );
-            if take_left {
-                result.push(server_only[i].clone());
-                i += 1;
-            } else {
-                result.push(patch_items[j].clone());
-                j += 1;
+    let mut server_only = server_only.into_iter().peekable();
+    let mut patch_items = patch_items.into_iter().peekable();
+    loop {
+        match (server_only.peek(), patch_items.peek()) {
+            (None, None) => break,
+            (Some(_), None) => result.push(server_only.next().unwrap()),
+            (None, Some(_)) => result.push(patch_items.next().unwrap()),
+            (Some(so), Some(pi)) => {
+                // Take the server-only element only if it demonstrably preceded the patch
+                // element pre-patch; a brand-new patch element (no original position) always
+                // loses this comparison, so it's emitted next instead.
+                let take_left = matches!(
+                    (original_index(so), original_index(pi)),
+                    (Some(l), Some(r)) if l < r
+                );
+                if take_left {
+                    result.push(server_only.next().unwrap());
+                } else {
+                    result.push(patch_items.next().unwrap());
+                }
             }
         }
     }
     result.extend(keyless);
     *target = serde_json::Value::Array(result);
+}
+
+/// True if every (key, value) pair in `fields` also appears in `other` — the same
+/// semantics as `matches_key_fields`, but comparing two already-extracted merge-key field
+/// sets (see `present_key_fields`) instead of a field set against a full element. Lets
+/// `reorder_merged_array` index the pre-patch array's merge-key fields once instead of
+/// keeping a clone of every (potentially large) pre-patch element around.
+fn key_fields_subset(
+    fields: &[(String, serde_json::Value)],
+    other: &[(String, serde_json::Value)],
+) -> bool {
+    fields
+        .iter()
+        .all(|(k, v)| other.iter().any(|(ok, ov)| ok == k && ov == v))
 }
 
 enum MergeKeyKind {

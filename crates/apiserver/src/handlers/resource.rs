@@ -1649,15 +1649,36 @@ pub(crate) async fn do_patch<S: Store>(
         } else {
             None
         };
+        // Only the 4 fields validate_storageclass_immutable actually compares — not the
+        // whole StorageClass (metadata/annotations included) — since it indexes `old`
+        // and `new` field-by-field rather than deep-comparing the objects.
         let storageclass_before_patch = if group == "storage.k8s.io" && plural == "storageclasses" {
-            Some(current.body.clone())
+            Some(serde_json::json!({
+                "provisioner": current.body["provisioner"].clone(),
+                "parameters": current.body["parameters"].clone(),
+                "reclaimPolicy": current.body["reclaimPolicy"].clone(),
+                "volumeBindingMode": current.body["volumeBindingMode"].clone(),
+            }))
         } else {
             None
         };
-        // Full body (not just spec): restrict_node_self_write below also needs
-        // metadata.labels/ownerReferences, not only spec.
+        // Only the spec/metadata sub-fields validate_node_spec_immutable and
+        // restrict_node_self_write actually compare — not the whole Node body (status,
+        // e.g. images/conditions, is never read by either).
         let node_before_patch = if group.is_empty() && plural == "nodes" {
-            Some(current.body.clone())
+            Some(serde_json::json!({
+                "spec": {
+                    "podCIDR": current.body["spec"]["podCIDR"].clone(),
+                    "podCIDRs": current.body["spec"]["podCIDRs"].clone(),
+                    "providerID": current.body["spec"]["providerID"].clone(),
+                    "configSource": current.body["spec"]["configSource"].clone(),
+                    "taints": current.body["spec"]["taints"].clone(),
+                },
+                "metadata": {
+                    "ownerReferences": current.body["metadata"]["ownerReferences"].clone(),
+                    "labels": current.body["metadata"]["labels"].clone(),
+                },
+            }))
         } else {
             None
         };
