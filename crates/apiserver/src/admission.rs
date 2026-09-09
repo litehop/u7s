@@ -1252,6 +1252,8 @@ fn apply_webhook_patch(object: &mut serde_json::Value, patch_b64: &str) -> Resul
 ///
 /// `is_reinvocation` controls whether we skip webhooks that don't have
 /// `reinvocationPolicy: IfNeeded` during the reinvocation pass.
+/// Returns `(None, false)` when the webhook didn't match/run or ran without patching —
+/// the caller keeps its existing object unchanged rather than paying for a clone of it.
 async fn invoke_mutating_webhook<S: Store>(
     state: &AppState<S>,
     webhook: &WebhookEntry,
@@ -1259,10 +1261,10 @@ async fn invoke_mutating_webhook<S: Store>(
     old_object: Option<&Arc<serde_json::Value>>,
     ctx: &AdmissionContext<'_>,
     is_reinvocation: bool,
-) -> Result<(serde_json::Value, bool), StatusError> {
+) -> Result<(Option<serde_json::Value>, bool), StatusError> {
     // During reinvocation, skip webhooks that don't opt in.
     if is_reinvocation && webhook.reinvocation_policy != "IfNeeded" {
-        return Ok((object.as_ref().clone(), false));
+        return Ok((None, false));
     }
 
     // Check if this webhook matches any rule.
@@ -1278,7 +1280,7 @@ async fn invoke_mutating_webhook<S: Store>(
             )
         });
         if !has_match {
-            return Ok((object.as_ref().clone(), false));
+            return Ok((None, false));
         }
     }
 
@@ -1301,7 +1303,7 @@ async fn invoke_mutating_webhook<S: Store>(
                     "admission: mutating webhook \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
                     webhook.name, ns
                 );
-                return Ok((object.as_ref().clone(), false));
+                return Ok((None, false));
             }
         }
     }
@@ -1321,7 +1323,7 @@ async fn invoke_mutating_webhook<S: Store>(
                 "admission: mutating webhook \"{}\" skipped: object does not match objectSelector",
                 webhook.name
             );
-            return Ok((object.as_ref().clone(), false));
+            return Ok((None, false));
         }
     }
 
@@ -1341,7 +1343,7 @@ async fn invoke_mutating_webhook<S: Store>(
                 "admission: mutating webhook \"{}\" skipped: matchCondition evaluated false",
                 webhook.name
             );
-            return Ok((object.as_ref().clone(), false));
+            return Ok((None, false));
         }
     }
 
@@ -1354,7 +1356,7 @@ async fn invoke_mutating_webhook<S: Store>(
                 "admission: mutating webhook \"{}\" skipped (dry-run unsupported, sideEffects={}, failurePolicy=Ignore)",
                 webhook.name, webhook.side_effects
             );
-            return Ok((object.as_ref().clone(), false));
+            return Ok((None, false));
         } else {
             return Err(Status::bad_request(format!(
                 "admission webhook \"{}\" does not support dry run",
@@ -1371,7 +1373,7 @@ async fn invoke_mutating_webhook<S: Store>(
                     "admission: mutating webhook \"{}\" skipped (service not found, failurePolicy=Ignore): {e}",
                     webhook.name
                 );
-                return Ok((object.as_ref().clone(), false));
+                return Ok((None, false));
             } else {
                 return Err(Status::internal(format!(
                     "admission webhook \"{}\": {e}",
@@ -1440,10 +1442,10 @@ async fn invoke_mutating_webhook<S: Store>(
                 if !patch_b64.is_empty() {
                     let mut mutated = object.as_ref().clone();
                     apply_webhook_patch(&mut mutated, patch_b64)?;
-                    return Ok((mutated, true));
+                    return Ok((Some(mutated), true));
                 }
             }
-            Ok((object.as_ref().clone(), false))
+            Ok((None, false))
         }
         None => {
             // Webhook call failed (network/timeout/parse error).
@@ -1452,7 +1454,7 @@ async fn invoke_mutating_webhook<S: Store>(
                     "admission: mutating webhook \"{}\" failed, ignoring (failurePolicy=Ignore)",
                     webhook.name
                 );
-                Ok((object.as_ref().clone(), false))
+                Ok((None, false))
             } else if timed_out {
                 // Include the full URL (with ?timeout=Ns) so the client error message
                 // matches what the conformance test checks: the URL path + "timeout".
@@ -3524,7 +3526,9 @@ pub async fn run_mutating_webhooks<S: Store>(
         if patched {
             any_patched = true;
         }
-        object = Arc::new(new_obj);
+        if let Some(new_obj) = new_obj {
+            object = Arc::new(new_obj);
+        }
     }
 
     // Reinvocation pass: if any patch was applied, re-run IfNeeded webhooks once.
@@ -3533,7 +3537,9 @@ pub async fn run_mutating_webhooks<S: Store>(
             let (new_obj, _) =
                 invoke_mutating_webhook(state, webhook, &object, old_object.as_ref(), ctx, true)
                     .await?;
-            object = Arc::new(new_obj);
+            if let Some(new_obj) = new_obj {
+                object = Arc::new(new_obj);
+            }
         }
     }
 
