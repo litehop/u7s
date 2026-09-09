@@ -541,6 +541,10 @@ impl CrContextCache {
     /// `expected_epoch` since the caller last called `epoch()` — in which case the scan that
     /// produced `value` may already be stale and the insert is silently skipped (the caller's
     /// own in-hand `value` is still returned to its request; only the cache write is refused).
+    /// `expected_epoch` is checked against the cache-wide epoch, not a per-key one: an
+    /// `invalidate` for an unrelated key also refuses this insert. That is over-conservative
+    /// (an avoidable cache miss) but never unsafe (never serves stale) — not worth a per-key
+    /// epoch unless multi-key write contention is ever measured to matter.
     /// Returns whether the insert happened (test/observability only).
     pub fn insert_if_current(
         &self,
