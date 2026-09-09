@@ -3642,6 +3642,25 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             serde_json::to_value(put_meta).map_err(|e| Status::internal(e.to_string()))?;
     }
 
+    // ResourceQuota: when the target doesn't exist, this PUT is a create just like
+    // create_namespaced_resource / do_patch's SSA-create branch — without this, a blind
+    // `kubectl replace` or kubelet's Lease-heartbeat PUT would create a namespaced object
+    // over a count/* quota with no admission check at all. Held across check-then-write for
+    // the same lost-update-race reason as the sibling create paths. The UPDATE case
+    // (object_existed) adds no new quota consumption, so it intentionally skips this check.
+    //
+    // Runs BEFORE the dry-run early-return below (moved from after it): quota admission must
+    // gate `kubectl replace --dry-run=server` the same way it gates a real create, or an
+    // over-quota dry-run create wrongly reports success instead of the denial a real create
+    // would get.
+    let _quota_lock = if !object_existed {
+        let lock = state.quota_admission_locks.lock(&ns).await;
+        quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj.body)).await?;
+        Some(lock)
+    } else {
+        None
+    };
+
     // Dry-run: validation and admission passed; return the would-be result without persisting.
     if replace_query.is_dry_run() {
         inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
@@ -3652,7 +3671,13 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
     // remove their finalizer via PUT, not PATCH. Complete the delete instead of storing an
     // update, or the object stays stuck Terminating forever.
-    if finalizer_drain_complete(&obj.body) {
+    //
+    // Gated on `object_existed`: a create-on-missing PUT can't be "completing a drain" of an
+    // object that was never there, and treating it as one here would call
+    // complete_finalizer_drain while `_quota_lock` (held above for the create-admission check)
+    // is still alive — complete_finalizer_drain reacquires the same per-namespace
+    // quota_admission_locks lock, which would deadlock on that non-reentrant semaphore.
+    if object_existed && finalizer_drain_complete(&obj.body) {
         complete_finalizer_drain(
             &state,
             FinalizerDrainCtx {
@@ -3670,34 +3695,38 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         return Ok(Json(obj.body).into_response());
     }
 
-    // ResourceQuota: when the target doesn't exist, this PUT is a create just like
-    // create_namespaced_resource / do_patch's SSA-create branch — Store::put's
-    // unconditional-write-on-missing-key semantics (`expected_revision: None` → create or
-    // overwrite) mean a blind `kubectl replace` or kubelet's Lease-heartbeat PUT would
-    // otherwise create a namespaced object over a count/* quota with no admission check at
-    // all. Held across check-then-write for the same lost-update-race reason as the sibling
-    // create paths. The UPDATE case (object_existed) adds no new quota consumption, so it
-    // intentionally skips this check.
-    let _quota_lock = if !object_existed {
-        let lock = state.quota_admission_locks.lock(&ns).await;
-        quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj.body)).await?;
-        Some(lock)
-    } else {
-        None
-    };
-
     let put_start = std::time::Instant::now();
-    let put_result = state
-        .store
-        .put(&key, obj.to_bytes(), expected_revision)
-        .await;
+    // Create-on-missing routes through the same Namespace-Terminating gate POST/SSA-create
+    // use (create_if_namespace_active) instead of a plain unconditional store.put — without
+    // this, `kubectl replace` (or any PUT resolving to a create) could create new content in
+    // a namespace mid-deletion, a bypass POST already closes via this same store method.
+    let new_rv = if !object_existed {
+        let ns_key = cluster_object_key("namespaces", &ns);
+        match state
+            .store
+            .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
+            .await
+        {
+            Ok(rv) => rv,
+            Err(CreateNamespacedError::NamespaceTerminating) => {
+                return Err(Status::forbidden(format!(
+                    "unable to create new content in namespace {ns} because it is being terminated"
+                )));
+            }
+            Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, &name, &meta.kind)),
+        }
+    } else {
+        let put_result = state
+            .store
+            .put(&key, obj.to_bytes(), expected_revision)
+            .await;
+        put_result.map_err(|e| store_err(e, &name, &meta.kind))?
+    };
     tracing::debug!(
         key = %key,
         elapsed_ms = put_start.elapsed().as_millis() as u64,
-        ok = put_result.is_ok(),
-        "replace_namespaced_resource: store.put call completed"
+        "replace_namespaced_resource: store write completed"
     );
-    let new_rv = put_result.map_err(|e| store_err(e, &name, &meta.kind))?;
 
     obj.set_resource_version(new_rv);
     if group == RBAC_GROUP {
@@ -4526,6 +4555,16 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 state.release_service_ip(ip).await;
             }
         }
+    }
+
+    // ResourceQuota: refresh status.used the same way a single DELETE would (see that
+    // handler's identical call for why) — without this, a DeleteCollection (e.g. namespace
+    // deletion draining a resource type, or `kubectl delete --all`) leaves status.used
+    // reporting every deleted object as still counted. Skipped for dry-run: no object in
+    // this collection was actually deleted above.
+    if !dry_run {
+        let _quota_lock = state.quota_admission_locks.lock(&ns).await;
+        quota::update_quota_status(&state, &ns).await;
     }
 
     Ok(Json(serde_json::json!({
@@ -7103,6 +7142,170 @@ mod tests {
         assert!(
             state.store.get(&key).await.unwrap().is_none(),
             "the over-quota ConfigMap must not have been created in the store"
+        );
+    }
+
+    /// `replace_namespaced_resource`'s quota admission check for PUT create-on-missing used
+    /// to run AFTER the dry-run early-return, so `kubectl replace --dry-run=server` against
+    /// an already-exhausted count/* quota reported success (200) instead of the denial a
+    /// real (non-dry-run) create gets — misleading a caller that relies on dry-run to
+    /// preview admission into believing the create is safe.
+    ///
+    /// Fails on revert: without moving the quota check before the dry-run return, this
+    /// dry-run PUT-create returns `Ok` instead of `Err`.
+    #[tokio::test]
+    async fn replace_namespaced_resource_put_create_dry_run_denied_by_quota() {
+        let state = make_state();
+        let ns = "default";
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "cm-quota", "namespace": ns },
+            "spec": { "hard": { "count/configmaps": "1" } }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key("", "resourcequotas", Some(ns), "cm-quota"),
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        let cm1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-1", "namespace": ns },
+            "data": { "k": "v" }
+        });
+        replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+                "cm-1".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm1).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed create must succeed: {e:?}"));
+
+        let cm2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-2", "namespace": ns },
+            "data": { "k": "v" }
+        });
+        let dry_run_result = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+                "cm-2".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery {
+                _field_manager: None,
+                dry_run: Some("All".to_string()),
+            }),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm2).unwrap()),
+        )
+        .await;
+        assert!(
+            dry_run_result.is_err(),
+            "`kubectl replace --dry-run=server` over an exhausted count/configmaps=1 quota \
+             must be denied exactly like a real create — the dry-run early-return must not \
+             skip quota admission"
+        );
+
+        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "cm-2");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "dry-run must never persist the object regardless of admission outcome"
+        );
+    }
+
+    /// `replace_namespaced_resource`'s create-on-missing branch wrote via a plain
+    /// `store.put`, bypassing the same Namespace-Terminating gate
+    /// (`create_if_namespace_active`) that POST/SSA-create route through — so `kubectl
+    /// replace` (or any blind PUT that resolves to a create, e.g. kubelet's Lease heartbeat)
+    /// could create new content in a namespace mid-deletion, the same bypass
+    /// `create_namespaced_resource_rejects_terminating_namespace` guards against for POST.
+    ///
+    /// Fails on revert: without routing through `create_if_namespace_active`, this
+    /// PUT-create into a Terminating namespace succeeds (200) instead of being rejected
+    /// (403).
+    #[tokio::test]
+    async fn replace_namespaced_resource_put_create_rejects_terminating_namespace() {
+        let state = make_state();
+        let ns = "dying-ns";
+
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": ns },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("namespaces", ns),
+                bytes::Bytes::from(serde_json::to_vec(&ns_obj).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed terminating namespace");
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "test-cm", "namespace": ns }
+        });
+
+        let result = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+                "test-cm".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "PUT create-on-missing into a Terminating namespace must be rejected — \
+                 namespace GC would leave orphans otherwise, exactly like POST already \
+                 prevents"
+            ),
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 403,
+            "Terminating namespace must return 403 Forbidden for PUT-create just like POST"
+        );
+
+        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "test-cm");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "the ConfigMap must not have been created in the Terminating namespace"
         );
     }
 
@@ -25891,6 +26094,98 @@ mod tests {
         assert_eq!(
             remaining_obj["metadata"]["name"], "beta",
             "the surviving Lease must be beta (holderIdentity=beta doesn't match the selector)"
+        );
+    }
+
+    /// Before this fix, delete_collection_namespaced_resource's per-object delete loop never
+    /// called quota::update_quota_status afterward, unlike single-object DELETE
+    /// (delete_namespaced_resource) — so `kubectl delete cm --all` (or namespace deletion
+    /// draining a resource type via DeleteCollection) left ResourceQuota.status.used stuck at
+    /// its pre-delete count even though every matching ConfigMap was actually removed.
+    ///
+    /// Fails on revert: without the update_quota_status call, status.used stays at "2"
+    /// instead of reflecting the 0 ConfigMaps left after DeleteCollection.
+    #[tokio::test]
+    async fn delete_collection_namespaced_resource_decrements_quota_status_used() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "quota-ns";
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "cm-quota", "namespace": ns },
+            "spec": { "hard": { "count/configmaps": "5" } }
+        });
+        let quota_key = crate::keys::group_object_key("", "resourcequotas", Some(ns), "cm-quota");
+        state
+            .store
+            .put(
+                &quota_key,
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        for name in ["cm-1", "cm-2"] {
+            let body = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": name, "namespace": ns },
+                "data": { "k": "v" }
+            });
+            create_namespaced_resource(
+                State(state.clone()),
+                Path(("".into(), "v1".into(), ns.into(), "configmaps".into())),
+                axum::extract::Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("ConfigMap create must succeed: {e:?}"));
+        }
+
+        let stored_quota = state.store.get(&quota_key).await.unwrap().unwrap();
+        let quota_val: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            quota_val["status"]["used"]["count/configmaps"].as_str(),
+            Some("2"),
+            "sanity check: status.used must reflect the 2 ConfigMaps just created"
+        );
+
+        delete_collection_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), ns.into(), "configmaps".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("DeleteCollection must succeed: {e:?}"));
+
+        let stored_quota = state.store.get(&quota_key).await.unwrap().unwrap();
+        let quota_val: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            quota_val["status"]["used"]["count/configmaps"].as_str(),
+            Some("0"),
+            "status.used must drop to 0 after DeleteCollection removes both ConfigMaps — \
+             without delete_collection_namespaced_resource calling update_quota_status, this \
+             stays stuck at 2 even though both objects were actually deleted, permanently \
+             under-reporting quota headroom to `kubectl describe resourcequota`"
         );
     }
 
