@@ -326,6 +326,63 @@ call is_live_agent_branch 'worker/agent-def456' 'abc123, def456, ghi789' || RC=$
 assert "the same whitespace tolerance holds at the STEP C/D branch-guard level (is_live_agent_branch) -- this is what actually protects a live worker's branch from force-delete" \
   "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
 
+# ---------------------------------------------------------------------------
+# 3f. STEP C -- reap-all (--no-live-workers) end-to-end. --no-live-workers
+#    sets LIVE_AGENTS="" (see main()); this proves that with an EMPTY live
+#    set, STEP C's merge-state and open-PR checks -- not --live-agents --
+#    are what decide what's safe to delete. That's the safety constraint
+#    --no-live-workers depends on: waiving the live-agent dimension must
+#    never lower the staleness bar, or reap-all mode would nuke a branch
+#    with a pending PR the instant zero workers are running. Mirrors the
+#    real scenario this flag exists for: several completed workers' branches
+#    have OPEN PRs (queued-to-merge or draft) and must survive a zero-live-
+#    worker hygiene tick, while a genuinely merged, no-PR branch is reaped.
+# ---------------------------------------------------------------------------
+BARE_NLW="$SANDBOX_ROOT/origin-nlw.git"
+git init -q --bare "$BARE_NLW"
+
+NLW="$SANDBOX_ROOT/reap-all-repo"
+new_sandbox "$NLW"
+printf 'line one\n' > "$NLW/file.txt"
+git -C "$NLW" add -A
+git -C "$NLW" commit -q -m initial
+git -C "$NLW" remote add origin "$BARE_NLW"
+git -C "$NLW" push -q origin main
+
+# Reapable: merged by patch-id (ff push straight to main), no open PR.
+git -C "$NLW" branch worker/agent-mergednopr main
+printf 'line one\nmerged no-pr work\n' > "$NLW/file.txt"
+git -C "$NLW" commit -q -am 'merged, no open PR'
+git -C "$NLW" push -q origin main
+
+# NOT reapable despite ALSO being merged by patch-id: an OPEN PR still
+# references it (the #1433/#1435 case STEP C's header documents) -- only
+# has_open_pr, not patch-id, can see this.
+git -C "$NLW" checkout -q -b worker/agent-openpr main
+printf 'line one\nqueued-to-merge work\n' > "$NLW/file.txt"
+git -C "$NLW" commit -q -am 'queued-to-merge work'
+git -C "$NLW" checkout -q main
+printf 'line one\nqueued-to-merge work\n' > "$NLW/file.txt"
+git -C "$NLW" commit -q -am 'queued-to-merge work (already landed on main by patch-id, e.g. via a different PR)'
+git -C "$NLW" push -q origin main
+
+STUB_GH_ONE_OPEN_PR="$SANDBOX_ROOT/stub-gh-one-open-pr"
+mkdir -p "$STUB_GH_ONE_OPEN_PR"
+cat > "$STUB_GH_ONE_OPEN_PR/gh" <<'EOF'
+#!/usr/bin/env bash
+echo 'worker/agent-openpr'
+EOF
+chmod +x "$STUB_GH_ONE_OPEN_PR/gh"
+
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$NLW" PATH="$STUB_GH_ONE_OPEN_PR:$PATH" \
+  call step_c_stale_worker_branches >/dev/null 2>&1
+
+assert "reap-all mode (LIVE_AGENTS=\"\", what --no-live-workers sets) reaps a branch that is merged by patch-id AND has no open PR -- the idle-state win this flag exists for" \
+  "$(! git -C "$NLW" branch --list worker/agent-mergednopr | grep -q worker/agent-mergednopr && echo 1 || echo 0)"
+
+assert "...but PRESERVES a branch in that SAME empty live-set run when an OPEN PR still references it, even though patch-id alone says it's already merged -- proves reap-all mode does not lower STEP C's staleness bar, it only waives the live-agent dimension (the safety constraint --no-live-workers must uphold, checked on revert: deleting has_open_pr's guard would flip this to reaped)" \
+  "$(git -C "$NLW" branch --list worker/agent-openpr | grep -q worker/agent-openpr && echo 1 || echo 0)"
+
 # End-to-end: a worker branch that is ALREADY MERGED (ff-mergeable, so
 # is_unmerged_by_patch_id says false), has no open PR, and no live worktree
 # directory -- by every OTHER STEP C guard this branch is indistinguishable
@@ -589,6 +646,56 @@ assert "worktree-hygiene also refuses to run when --live-agents is whitespace-on
   "$([ "$FAILSAFE_WS_RC" -eq 2 ] && echo 1 || echo 0)"
 assert "...and no destructive-step log output appears at all for the whitespace-only case either" \
   "$(! printf '%s' "$FAILSAFE_WS_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 7b. main() -- --no-live-workers: an explicit, affirmative "zero live
+#    workers" declaration, DISTINCT from the forgot-the-flag case above
+#    (which --live-agents "" and omitting both flags both still trigger).
+#    Without this flag, the idle state -- exactly when orphaned host
+#    processes and stale branches accumulate -- could never be reaped,
+#    since an empty --live-agents value is indistinguishable from a
+#    forgotten flag. Mutually exclusive with --live-agents: passing both
+#    leaves no way to tell which one the caller meant.
+# ---------------------------------------------------------------------------
+
+BOTH_RC=0
+BOTH_OUT=$(bash "$SCRIPT" --live-agents abc123 --no-live-workers 2>&1) || BOTH_RC=$?
+assert "worktree-hygiene refuses to run when BOTH --live-agents and --no-live-workers are given -- ambiguous which one the caller meant" \
+  "$([ "$BOTH_RC" -eq 2 ] && echo 1 || echo 0)"
+assert "...and the refusal names both flags as mutually exclusive, not a silent pick-one" \
+  "$(printf '%s' "$BOTH_OUT" | grep -q -- '--no-live-workers' && printf '%s' "$BOTH_OUT" | grep -q -- '--live-agents' && echo 1 || echo 0)"
+
+# --no-live-workers alone must NOT trip the fail-safe -- exercised through
+# the REAL main() (not __call, which bypasses argv parsing) against a
+# disposable sandbox repo. DRY_RUN=1 so STEP A's real `ps aux` scan of the
+# host machine can never actually kill a real process regardless of what
+# else happens to be running on the machine this test executes on, and
+# `gh` is stubbed so STEP C never hits the real network.
+BARE_NLW_MAIN="$SANDBOX_ROOT/origin-nlw-main.git"
+git init -q --bare "$BARE_NLW_MAIN"
+NLW_MAIN="$SANDBOX_ROOT/no-live-workers-main-repo"
+new_sandbox "$NLW_MAIN"
+printf 'line one\n' > "$NLW_MAIN/file.txt"
+git -C "$NLW_MAIN" add -A
+git -C "$NLW_MAIN" commit -q -m initial
+git -C "$NLW_MAIN" remote add origin "$BARE_NLW_MAIN"
+git -C "$NLW_MAIN" push -q origin main
+
+STUB_GH_EMPTY="$SANDBOX_ROOT/stub-gh-empty"
+mkdir -p "$STUB_GH_EMPTY"
+cat > "$STUB_GH_EMPTY/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$STUB_GH_EMPTY/gh"
+
+NLW_MAIN_RC=0
+NLW_MAIN_OUT=$(DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_MAIN" PATH="$STUB_GH_EMPTY:$PATH" \
+  bash "$SCRIPT" --no-live-workers 2>&1) || NLW_MAIN_RC=$?
+assert "worktree-hygiene runs (does not refuse) with --no-live-workers alone, unlike an omitted or empty --live-agents -- this is the idle-state reap path the flag exists to unlock" \
+  "$([ "$NLW_MAIN_RC" -eq 0 ] && echo 1 || echo 0)"
+assert "...and the fail-safe refusal message never appears for --no-live-workers" \
+  "$(! printf '%s' "$NLW_MAIN_OUT" | grep -q 'refusing to run' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

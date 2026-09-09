@@ -212,15 +212,23 @@ their own subagents.
 host-side `u7s-apiserver`/`u7s-scheduler`/`konnectivity-server` processes
 (STEP A), `git worktree prune` (STEP B), and stale worker/non-worker branch
 cleanup (STEPs C–D) — lives in `scripts/worktree-hygiene.sh`; the cron loop
-runs that script directly. Before running it, call `ListAgents`, extract
-the `worker/agent-*` ids of currently running subagents, and pass them as
-`--live-agents <comma-separated ids>` — the script REFUSES to run at all
-(non-destructively, exit 2) without this flag, since STEP A/C/D are
-destructive and dir-existence/merge-state alone cannot tell a live
-worker's branch/worktree apart from a stale one. A worktree/branch whose
-agent-id is in that set is protected from every destructive step
-unconditionally, regardless of dir existence or merge state. See the
-script for the STEP A–D implementation and its design rationale.
+runs that script directly. Before running it, call `ListAgents` and extract
+the `worker/agent-*` ids of currently running subagents. If that list is
+non-empty, pass it as `--live-agents <comma-separated ids>`; if ListAgents
+shows ZERO running workers (the idle state), pass `--no-live-workers`
+instead — an affirmative "nothing to protect" declaration, distinct from
+omitting or emptying `--live-agents`, which the script still refuses. The
+script REFUSES to run at all (non-destructively, exit 2) without one of
+these two, since STEP A/C/D are destructive and dir-existence/merge-state
+alone cannot tell a live worker's branch/worktree apart from a stale one.
+A worktree/branch whose agent-id is in `--live-agents` is protected from
+every destructive step unconditionally, regardless of dir existence or
+merge state; under `--no-live-workers`, STEP C's merge-state and open-PR
+checks still apply, so a branch with a pending PR is preserved even with
+zero live workers. STEP D needs no such check — its scope (branches whose
+tracked upstream is literally `[gone]`) already excludes any branch an
+open PR keeps alive. See the script for the STEP A–D implementation and
+its design rationale.
 
 Auto-kill/auto-delete with no approval gate (operator decision) — the script
 logs loudly instead of asking. Exit 0 means a clean tick; non-zero means an
