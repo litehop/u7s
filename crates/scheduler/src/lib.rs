@@ -4245,31 +4245,59 @@ async fn fetch_pvc_binding_info(
     }))
 }
 
-/// Resolve which of `pvc_names` (in `namespace`) carry the
-/// `ReadWriteOncePod` access mode — the VolumeRestrictions predicate's
-/// exclusivity dimension. The caller (`main.rs`'s `handle_pod_event`)
-/// fetches this once and fills it into `PendingPod::read_write_once_pod_pvcs`
-/// right before the first `pick_node` attempt, exactly like
-/// `fetch_bound_pv_node_affinities`/`fetch_csi_volume_counts`. A PVC that no
-/// longer exists (404) contributes nothing — mirrors
-/// `fetch_bound_pv_node_affinities`'s own convention for a gone PVC.
-pub async fn fetch_read_write_once_pod_pvc_names(
+/// Fetch `PvcBindingInfo` for every distinct name in `pvc_names` (in
+/// `namespace`) with exactly one GET per PVC — shared by every pre-`pick_node`
+/// derivation that needs a PVC's binding state (`fetch_bound_pv_node_affinities`,
+/// `fetch_csi_volume_counts`, `fetch_read_write_once_pod_pvc_names`,
+/// `fetch_unbound_csi_pvc_drivers`) in one scheduling attempt, instead of
+/// each independently re-GETting the same PVCs. A PVC that no longer exists
+/// (404) is simply absent from the returned map, matching
+/// `fetch_pvc_binding_info`'s own convention — a dropped PVC here would
+/// silently make every one of those derivations treat it as gone and
+/// mis-schedule the pod against a volume constraint it never checked.
+pub(crate) async fn fetch_pvc_binding_info_batch(
     connector: &TlsConnector,
     server: &str,
     namespace: &str,
     pvc_names: &[String],
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<std::collections::HashMap<String, PvcBindingInfo>> {
+    let mut infos = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for pvc_name in pvc_names {
+        if !seen.insert(pvc_name.clone()) {
+            continue;
+        }
+        if let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await? {
+            infos.insert(pvc_name.clone(), info);
+        }
+    }
+    Ok(infos)
+}
+
+/// Resolve which of `pvc_names` carry the `ReadWriteOncePod` access mode —
+/// the VolumeRestrictions predicate's exclusivity dimension. The caller
+/// (`run.rs`'s scheduling loop) fills this into
+/// `PendingPod::read_write_once_pod_pvcs` right before the first `pick_node`
+/// attempt, exactly like `fetch_bound_pv_node_affinities`/
+/// `fetch_csi_volume_counts`. A PVC that no longer exists (404) — i.e.
+/// absent from `pvc_info`, the caller's already-fetched
+/// `fetch_pvc_binding_info_batch` — contributes nothing, mirroring
+/// `fetch_bound_pv_node_affinities`'s own convention for a gone PVC. Pure
+/// lookup, issuing no GETs of its own.
+pub(crate) fn fetch_read_write_once_pod_pvc_names(
+    pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
+    pvc_names: &[String],
+) -> Vec<String> {
     let mut names = Vec::new();
     for pvc_name in pvc_names {
-        let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await?
-        else {
+        let Some(info) = pvc_info.get(pvc_name) else {
             continue;
         };
         if info.access_modes.iter().any(|m| m == "ReadWriteOncePod") {
             names.push(pvc_name.clone());
         }
     }
-    Ok(names)
+    names
 }
 
 async fn fetch_storage_class_binding_mode(
@@ -4447,34 +4475,21 @@ struct PvNodeAffinity {
     required: Option<NodeSelectorSpec>,
 }
 
-async fn fetch_pv_node_affinity(
-    connector: &TlsConnector,
-    server: &str,
-    name: &str,
-) -> anyhow::Result<Option<NodeSelectorSpec>> {
-    let path = pv_path(name);
-    let (status, body) = http_get(connector, server, &path).await?;
-    if status.as_u16() == 404 {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        bail!("GET {path} returned {status}: {body}");
-    }
-    let obj: PvObject = serde_json::from_str(&body).context("parse PersistentVolume")?;
-    Ok(obj.spec.node_affinity.and_then(|a| a.required))
+/// The subset of a PersistentVolume's spec both `fetch_bound_pv_node_affinities`
+/// and `resolve_csi_driver` need — fetched together with a single GET per PV
+/// (`fetch_pv_info`/`fetch_pv_info_batch`) instead of each independently
+/// re-GETting the same PV object.
+#[derive(Debug, Clone, Default)]
+struct PvInfo {
+    node_affinity: Option<NodeSelectorSpec>,
+    csi_driver: Option<String>,
 }
 
-/// The CSI driver name backing PV `name` — `spec.csi.driver` — for
-/// `resolve_csi_driver`'s bound-PVC path. `None` when the PV is gone, or has
-/// no `spec.csi` source at all (an in-tree, non-CSI volume type this MVP does
-/// not model) — `resolve_csi_driver` then falls back to the PVC's
-/// StorageClass, matching upstream's own in-tree-to-CSI fallback shape
-/// (without the migration machinery this scheduler has no need for).
-async fn fetch_pv_csi_driver(
+async fn fetch_pv_info(
     connector: &TlsConnector,
     server: &str,
     name: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<PvInfo>> {
     let path = pv_path(name);
     let (status, body) = http_get(connector, server, &path).await?;
     if status.as_u16() == 404 {
@@ -4484,7 +4499,34 @@ async fn fetch_pv_csi_driver(
         bail!("GET {path} returned {status}: {body}");
     }
     let obj: PvObject = serde_json::from_str(&body).context("parse PersistentVolume")?;
-    Ok(obj.spec.csi.map(|c| c.driver).filter(|d| !d.is_empty()))
+    Ok(Some(PvInfo {
+        node_affinity: obj.spec.node_affinity.and_then(|a| a.required),
+        csi_driver: obj.spec.csi.map(|c| c.driver).filter(|d| !d.is_empty()),
+    }))
+}
+
+/// Fetch `PvInfo` for every distinct, non-empty name in `volume_names` with
+/// exactly one GET per PV — shared by `fetch_bound_pv_node_affinities` and
+/// `resolve_csi_driver` (via `fetch_csi_volume_counts`) for the same bound
+/// PVC set in one scheduling attempt, instead of each independently GETting
+/// the same PV object. A PV that no longer exists (404) is simply absent
+/// from the returned map, matching `fetch_pv_info`'s own convention.
+pub(crate) async fn fetch_pv_info_batch(
+    connector: &TlsConnector,
+    server: &str,
+    volume_names: &[String],
+) -> anyhow::Result<std::collections::HashMap<String, PvInfo>> {
+    let mut infos = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for name in volume_names {
+        if name.is_empty() || !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(info) = fetch_pv_info(connector, server, name).await? {
+            infos.insert(name.clone(), info);
+        }
+    }
+    Ok(infos)
 }
 
 /// Resolve the `spec.nodeAffinity.required` selector of every PV already
@@ -4504,27 +4546,32 @@ async fn fetch_pv_csi_driver(
 /// resync), silently treating a failed lookup as "no constraint" here would
 /// let the scheduler bind the pod onto a node that cannot actually mount the
 /// volume — exactly the bug this function exists to close.
-pub async fn fetch_bound_pv_node_affinities(
-    connector: &TlsConnector,
-    server: &str,
-    namespace: &str,
+///
+/// `pvc_info`/`pv_info` are the caller's already-fetched batches
+/// (`fetch_pvc_binding_info_batch`/`fetch_pv_info_batch`) — pure lookups,
+/// issuing no GETs of their own, so a failed fetch is surfaced at the batch
+/// step instead.
+pub(crate) fn fetch_bound_pv_node_affinities(
+    pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
+    pv_info: &std::collections::HashMap<String, PvInfo>,
     pvc_names: &[String],
-) -> anyhow::Result<Vec<NodeSelectorSpec>> {
+) -> Vec<NodeSelectorSpec> {
     let mut affinities = Vec::new();
     for pvc_name in pvc_names {
-        let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await?
-        else {
+        let Some(info) = pvc_info.get(pvc_name) else {
             continue;
         };
         if info.volume_name.is_empty() {
             continue;
         }
-        if let Some(selector) = fetch_pv_node_affinity(connector, server, &info.volume_name).await?
+        if let Some(selector) = pv_info
+            .get(&info.volume_name)
+            .and_then(|pv| pv.node_affinity.clone())
         {
             affinities.push(selector);
         }
     }
-    Ok(affinities)
+    affinities
 }
 
 const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
@@ -4562,16 +4609,18 @@ const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
 /// `fetch_bound_pv_node_affinities` propagates its own: silently treating
 /// it as "no driver" here would let the scheduler bind the pod onto a node
 /// the eventual volume cannot be mounted on.
-pub async fn fetch_unbound_csi_pvc_drivers(
+///
+/// `pvc_info` is the caller's already-fetched batch (`fetch_pvc_binding_info_batch`)
+/// — this only issues the StorageClass provisioner GET, not a per-PVC one.
+pub(crate) async fn fetch_unbound_csi_pvc_drivers(
     connector: &TlsConnector,
     server: &str,
-    namespace: &str,
+    pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
     pvc_names: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let mut drivers = Vec::new();
     for pvc_name in pvc_names {
-        let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await?
-        else {
+        let Some(info) = pvc_info.get(pvc_name) else {
             continue;
         };
         if !info.volume_name.is_empty() {
@@ -4591,25 +4640,33 @@ pub async fn fetch_unbound_csi_pvc_drivers(
     Ok(drivers)
 }
 
-/// Resolve the CSI driver backing `pvc_name` (in `namespace`): prefer its
-/// already-bound PV's `spec.csi.driver`; fall back to its StorageClass's
-/// `provisioner` when unbound, or when the bound PV resolves to no CSI
-/// driver at all — mirrors upstream's `getCSIDriverInfo`/
-/// `getCSIDriverInfoFromSC` two-step fallback (minus the in-tree migration
-/// machinery this scheduler has no need for). `None` when neither resolves
-/// (PVC/PV gone, or the PVC has no StorageClass) — such a volume is simply
-/// not counted, matching upstream's own no-op for a non-CSI-backed volume.
+/// Resolve the CSI driver backing `pvc_name`: prefer its already-bound PV's
+/// `spec.csi.driver`; fall back to its StorageClass's `provisioner` when
+/// unbound, or when the bound PV resolves to no CSI driver at all — mirrors
+/// upstream's `getCSIDriverInfo`/`getCSIDriverInfoFromSC` two-step fallback
+/// (minus the in-tree migration machinery this scheduler has no need for).
+/// `None` when neither resolves (PVC/PV gone, or the PVC has no
+/// StorageClass) — such a volume is simply not counted, matching upstream's
+/// own no-op for a non-CSI-backed volume.
+///
+/// `pvc_info`/`pv_info` are the caller's already-fetched batches
+/// (`fetch_pvc_binding_info_batch`/`fetch_pv_info_batch`) — this only issues
+/// the StorageClass provisioner GET, not a per-PVC/PV one.
 async fn resolve_csi_driver(
     connector: &TlsConnector,
     server: &str,
-    namespace: &str,
+    pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
+    pv_info: &std::collections::HashMap<String, PvInfo>,
     pvc_name: &str,
 ) -> anyhow::Result<Option<String>> {
-    let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await? else {
+    let Some(info) = pvc_info.get(pvc_name) else {
         return Ok(None);
     };
     if !info.volume_name.is_empty() {
-        if let Some(driver) = fetch_pv_csi_driver(connector, server, &info.volume_name).await? {
+        if let Some(driver) = pv_info
+            .get(&info.volume_name)
+            .and_then(|pv| pv.csi_driver.clone())
+        {
             return Ok(Some(driver));
         }
     }
@@ -4622,14 +4679,14 @@ async fn resolve_csi_driver(
 /// Count how many CSI volumes `pvc_names` (deduplicated — the same PVC
 /// mounted twice by one pod is one volume) resolve to, grouped by driver
 /// name — the CSILimits/NodeVolumeLimits predicate's per-driver volume
-/// count. `cache` (keyed by "namespace/pvcName") is shared across every call
-/// within one scheduling decision, so a PVC referenced by more than one pod
-/// — or checked again while tallying a second node — is only ever resolved
-/// once.
+/// count. `cache` (keyed by pvcName) is shared across every call within one
+/// scheduling decision, so a PVC referenced by more than one pod — or
+/// checked again while tallying a second node — is only ever resolved once.
 async fn count_csi_volumes_by_driver(
     connector: &TlsConnector,
     server: &str,
-    namespace: &str,
+    pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
+    pv_info: &std::collections::HashMap<String, PvInfo>,
     pvc_names: &[String],
     cache: &mut std::collections::HashMap<String, Option<String>>,
 ) -> anyhow::Result<std::collections::BTreeMap<String, i64>> {
@@ -4639,12 +4696,12 @@ async fn count_csi_volumes_by_driver(
         if !seen.insert(pvc_name.clone()) {
             continue;
         }
-        let cache_key = format!("{namespace}/{pvc_name}");
-        let driver = if let Some(cached) = cache.get(&cache_key) {
+        let driver = if let Some(cached) = cache.get(pvc_name) {
             cached.clone()
         } else {
-            let resolved = resolve_csi_driver(connector, server, namespace, pvc_name).await?;
-            cache.insert(cache_key, resolved.clone());
+            let resolved =
+                resolve_csi_driver(connector, server, pvc_info, pv_info, pvc_name).await?;
+            cache.insert(pvc_name.clone(), resolved.clone());
             resolved
         };
         if let Some(driver) = driver {
@@ -4655,18 +4712,21 @@ async fn count_csi_volumes_by_driver(
 }
 
 /// Resolve `pvc_names`' CSI driver volume counts for the PENDING pod — see
-/// `count_csi_volumes_by_driver`. The caller (`main.rs`'s `handle_pod_event`)
+/// `count_csi_volumes_by_driver`. The caller (`run.rs`'s scheduling loop)
 /// fetches this once and fills it into `PendingPod::csi_volume_counts` right
 /// before the first `pick_node` attempt, exactly like
-/// `fetch_bound_pv_node_affinities`.
-pub async fn fetch_csi_volume_counts(
+/// `fetch_bound_pv_node_affinities`. `pvc_info`/`pv_info` are its
+/// already-fetched batches, shared with the other three pre-`pick_node`
+/// derivations instead of each re-GETting the same PVCs/PVs.
+pub(crate) async fn fetch_csi_volume_counts(
     connector: &TlsConnector,
     server: &str,
-    namespace: &str,
+    pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
+    pv_info: &std::collections::HashMap<String, PvInfo>,
     pvc_names: &[String],
 ) -> anyhow::Result<std::collections::BTreeMap<String, i64>> {
     let mut cache = std::collections::HashMap::new();
-    count_csi_volumes_by_driver(connector, server, namespace, pvc_names, &mut cache).await
+    count_csi_volumes_by_driver(connector, server, pvc_info, pv_info, pvc_names, &mut cache).await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -5363,6 +5423,251 @@ mod tests {
             "a volume with neither persistentVolumeClaim nor ephemeral (e.g. configMap, \
              emptyDir) must never be treated as a PVC reference — stamping a nonexistent \
              PVC name would just be a wasted GET/PATCH cycle"
+        );
+    }
+
+    // fetch_pvc_binding_info_batch/fetch_pv_info_batch tests — the shared
+    // per-scheduling-attempt fetch threaded into all four pre-`pick_node`
+    // derivations (fetch_bound_pv_node_affinities, fetch_csi_volume_counts,
+    // fetch_read_write_once_pod_pvc_names, fetch_unbound_csi_pvc_drivers) in
+    // place of each independently re-GETting the same PVCs/PVs. A PVC
+    // dropped or altered in the batch would silently feed a wrong or
+    // missing volume constraint into every one of those four predicates at
+    // once, mis-scheduling the pod onto a node that cannot actually serve
+    // its volumes.
+    #[tokio::test]
+    async fn fetch_pvc_binding_info_batch_matches_individual_fetch_and_issues_one_get_per_pvc() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let namespace = "default";
+        let pvc_bound_path = pvc_path(namespace, "pvc-bound");
+        let pvc_unbound_path = pvc_path(namespace, "pvc-unbound");
+        let bound_pv_path = pv_path("pv-1");
+
+        // Counts requests by exact path — the regression signal: if any of
+        // the four derivations exercised below ever re-fetches a PVC/PV on
+        // its own instead of reusing the shared batch, its path's count
+        // rises past what the one batch fetch alone accounts for.
+        let request_counts: Arc<Mutex<HashMap<String, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let request_counts_srv = request_counts.clone();
+        let pvc_bound_path_srv = pvc_bound_path.clone();
+        let pvc_unbound_path_srv = pvc_unbound_path.clone();
+        let bound_pv_path_srv = bound_pv_path.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let request_counts = request_counts_srv.clone();
+                let pvc_bound_path = pvc_bound_path_srv.clone();
+                let pvc_unbound_path = pvc_unbound_path_srv.clone();
+                let bound_pv_path = bound_pv_path_srv.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 4096];
+                    let mut total = 0usize;
+                    loop {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&buf[..total]).into_owned();
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_owned();
+                    *request_counts
+                        .lock()
+                        .expect("counts lock poisoned")
+                        .entry(path.clone())
+                        .or_insert(0) += 1;
+
+                    let (status_line, body) = if path == pvc_bound_path {
+                        (
+                            "200 OK",
+                            r#"{"spec":{"volumeName":"pv-1","storageClassName":"sc-a","accessModes":["ReadWriteOnce"]}}"#.to_owned(),
+                        )
+                    } else if path == pvc_unbound_path {
+                        (
+                            "200 OK",
+                            r#"{"spec":{"storageClassName":"sc-b","accessModes":["ReadWriteOncePod"]}}"#.to_owned(),
+                        )
+                    } else if path == bound_pv_path {
+                        (
+                            "200 OK",
+                            r#"{"spec":{"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"topology.kubernetes.io/zone","operator":"In","values":["us-east-1a"]}]}]}},"csi":{"driver":"csi.example.com"}}}"#.to_owned(),
+                        )
+                    } else {
+                        (
+                            "404 Not Found",
+                            r#"{"kind":"Status","status":"Failure"}"#.to_owned(),
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server = format!("https://127.0.0.1:{port}");
+
+        let pvc_names = vec!["pvc-bound".to_owned(), "pvc-unbound".to_owned()];
+
+        // The pre-batch behavior the batch fetch must reproduce exactly.
+        let individual_bound = fetch_pvc_binding_info(&connector, &server, namespace, "pvc-bound")
+            .await
+            .expect("individual fetch must succeed")
+            .expect("PVC must exist");
+        let individual_unbound =
+            fetch_pvc_binding_info(&connector, &server, namespace, "pvc-unbound")
+                .await
+                .expect("individual fetch must succeed")
+                .expect("PVC must exist");
+
+        let pvc_info = fetch_pvc_binding_info_batch(&connector, &server, namespace, &pvc_names)
+            .await
+            .expect("batch fetch must succeed");
+
+        assert_eq!(
+            pvc_info.get("pvc-bound"),
+            Some(&individual_bound),
+            "the batch must resolve a bound PVC to EXACTLY the same PvcBindingInfo as \
+             fetching it individually — a divergence would feed a wrong volumeName into \
+             every one of the four downstream predicate derivations that read the batch"
+        );
+        assert_eq!(
+            pvc_info.get("pvc-unbound"),
+            Some(&individual_unbound),
+            "same as above for the unbound PVC — its accessModes/storageClassName feed the \
+             ReadWriteOncePod and unbound-CSI-driver derivations"
+        );
+
+        let counts_after_batch = request_counts.lock().expect("counts lock poisoned").clone();
+        assert_eq!(
+            counts_after_batch
+                .get(&pvc_bound_path)
+                .copied()
+                .unwrap_or(0),
+            2,
+            "expected exactly one individual-fetch GET plus one batch-fetch GET for pvc-bound"
+        );
+        assert_eq!(
+            counts_after_batch
+                .get(&pvc_unbound_path)
+                .copied()
+                .unwrap_or(0),
+            2,
+            "expected exactly one individual-fetch GET plus one batch-fetch GET for pvc-unbound"
+        );
+
+        let bound_volume_names: Vec<String> = pvc_info
+            .values()
+            .map(|info| info.volume_name.clone())
+            .filter(|name| !name.is_empty())
+            .collect();
+        let pv_info = fetch_pv_info_batch(&connector, &server, &bound_volume_names)
+            .await
+            .expect("PV batch fetch must succeed");
+
+        // Drive all four pre-`pick_node` derivations off the SAME
+        // already-fetched batch, exactly like run.rs's scheduling loop.
+        let affinities = fetch_bound_pv_node_affinities(&pvc_info, &pv_info, &pvc_names);
+        let csi_counts =
+            fetch_csi_volume_counts(&connector, &server, &pvc_info, &pv_info, &pvc_names)
+                .await
+                .expect("csi volume counts must succeed");
+        let rwop_names = fetch_read_write_once_pod_pvc_names(&pvc_info, &pvc_names);
+        let unbound_drivers =
+            fetch_unbound_csi_pvc_drivers(&connector, &server, &pvc_info, &pvc_names)
+                .await
+                .expect("unbound csi pvc drivers must succeed");
+
+        assert_eq!(
+            affinities.len(),
+            1,
+            "the bound PVC's PV nodeAffinity must be resolved from the shared batch"
+        );
+        assert_eq!(
+            csi_counts.get("csi.example.com").copied(),
+            Some(1),
+            "the bound PVC's PV CSI driver must be resolved from the shared batch"
+        );
+        assert_eq!(
+            rwop_names,
+            vec!["pvc-unbound".to_owned()],
+            "the unbound PVC's ReadWriteOncePod access mode must be resolved from the shared batch"
+        );
+        assert!(
+            unbound_drivers.is_empty(),
+            "sc-b's StorageClass 404s in this test, so it resolves to no provisioner"
+        );
+
+        let counts_after_derivations = request_counts.lock().expect("counts lock poisoned").clone();
+        assert_eq!(
+            counts_after_derivations.get(&pvc_bound_path).copied(),
+            counts_after_batch.get(&pvc_bound_path).copied(),
+            "running all four pre-pick_node derivations off the shared batch must add ZERO \
+             further GETs for pvc-bound — a regression here means one of them started \
+             re-fetching the PVC on its own instead of reusing pvc_info, reintroducing the \
+             4x redundant GET cost this dedup exists to remove"
+        );
+        assert_eq!(
+            counts_after_derivations.get(&pvc_unbound_path).copied(),
+            counts_after_batch.get(&pvc_unbound_path).copied(),
+            "same as above for pvc-unbound"
+        );
+        assert_eq!(
+            counts_after_derivations.get(&bound_pv_path).copied(),
+            Some(1),
+            "fetch_bound_pv_node_affinities and fetch_csi_volume_counts (via resolve_csi_driver) \
+             both need pv-1's spec — the shared pv_info batch must fetch it exactly once, not \
+             once per consumer"
         );
     }
 
