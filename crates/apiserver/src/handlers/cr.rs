@@ -4489,7 +4489,10 @@ pub async fn put_cr_status<S: Store>(
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
     // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
-    crate::handlers::status::replace_status_field(&mut current, &incoming["status"])?;
+    // `_dynamic`, not the built-in `replace_status_field`: a scalar status here is caught
+    // by structural-schema validation (422), not a typed decode failure (400) — see
+    // replace_status_field_dynamic's doc comment.
+    crate::handlers::status::replace_status_field_dynamic(&mut current, &incoming["status"])?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current, &incoming, &kind);
 
@@ -19376,14 +19379,14 @@ mod tests {
         );
     }
 
-    /// put_cr_status with a scalar or array `status` body must be rejected with 400, not
-    /// persisted. `status` is a message/object type for every resource (built-in or CRD);
-    /// a PUT that wholesale-replaces it with a scalar corrupts the CR's own schema and
-    /// panics any later in-place status stamper (e.g. `apply_delete_policy`,
-    /// `merge_approval_conditions` for the CertificateSigningRequest built-in that also
-    /// routes through this handler) that indexes `["status"]["field"]` on it. 400 (not
-    /// 422): upstream fails a whole-body PUT with a scalar status at decode time, before
-    /// validation ever runs — unlike the merge-patch equivalent, which is a post-merge 422.
+    /// put_cr_status on a genuine custom resource with a scalar or array `status` body
+    /// must be rejected with 422, not persisted. `status` is a message/object type for
+    /// every resource; a PUT that wholesale-replaces it with a scalar corrupts the CR's
+    /// own schema and panics any later in-place status stamper (e.g. `apply_delete_policy`)
+    /// that indexes `["status"]["field"]` on it. 422, not 400: a CR is stored as
+    /// unstructured JSON with no typed decode step to fail — its scalar status is instead
+    /// caught by the CRD's structural-schema validation, which (like PATCH's post-merge
+    /// validation) runs after decode succeeds, so PUT gets the same 422 PATCH does.
     #[tokio::test]
     async fn put_cr_status_rejects_non_object_status() {
         for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
@@ -19441,10 +19444,11 @@ mod tests {
             };
             assert_eq!(
                 err.0,
-                axum::http::StatusCode::BAD_REQUEST,
-                "a non-object status via PUT must be rejected with 400, not 422 — upstream \
-                 fails a whole-body PUT with a scalar status at decode time, before schema \
-                 validation ever runs: got {bad_status}"
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "a non-object status on a genuine CR must be rejected with 422, not 400 — \
+                 unlike a built-in, a CR has no typed decode step to fail; structural-\
+                 schema validation catches the scalar after decode, same as PATCH: got \
+                 {bad_status}"
             );
 
             let key = "/registry/cr/example.io/widgets/put-scalar-widget";
@@ -19527,8 +19531,10 @@ mod tests {
     /// route real `PUT .../certificatesigningrequests/{name}/status` traffic falls into,
     /// since CSR is a resource_registry built-in and `put_cr_status` serves the generic
     /// cluster-scoped `/apis/{group}/{version}/{resource}/{name}/status` route — must be
-    /// rejected with 400 (upstream's PUT decode-layer BadRequest, not the merge-patch
-    /// path's post-merge 422), not persisted. Before this fix, a corrupted scalar status
+    /// rejected with 422, not persisted. `put_cr_status` guards every resource it serves
+    /// (CSR included) with `replace_status_field_dynamic`, the CR-shaped 422 guard, since
+    /// this handler has no code path that decodes the body into a typed CSR struct the
+    /// way a dedicated built-in handler would. Before this fix, a corrupted scalar status
     /// here would panic `merge_approval_conditions`'s in-place `status["conditions"]` stamp
     /// (approval.rs) the next time the CSR was approved, crashing the apiserver for every
     /// other request in flight.
@@ -19582,10 +19588,10 @@ mod tests {
         };
         assert_eq!(
             err.0,
-            axum::http::StatusCode::BAD_REQUEST,
-            "scalar status on CSR /status via PUT must be rejected with 400, not 422 — \
-             upstream fails a whole-body PUT with a scalar status at decode time, before \
-             validation ever runs"
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "scalar status on CSR /status via PUT must be rejected with 422: put_cr_status \
+             guards every resource it serves with the CR-shaped 422 check, not a per-type \
+             typed decode"
         );
 
         // The CSR's status must still be the original object — proving the approval-path

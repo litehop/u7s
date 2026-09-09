@@ -517,20 +517,11 @@ fn is_object_or_null_status(status: &serde_json::Value) -> bool {
     status.is_object() || status.is_null()
 }
 
-/// Shared PUT-/status body: replace `current`'s `status` field with `incoming_status`
-/// (null removes the field — a PUT's own field-clearing convention), or reject with 400
-/// if `incoming_status` is a present-but-non-object scalar/array (see
-/// `reject_non_object_status_put` for why PUT differs from PATCH's 422 here). Every PUT
-/// /status handler in this codebase (`put_resource_status`, `put_namespaced_resource_status`,
-/// `put_cr_status`, `put_crd_status`, `replace_pod_status`) round-trips through here
-/// instead of assigning `current["status"] = incoming_status.clone()` inline, so the
-/// object-type invariant cannot be missed for a PUT handler the way it was in two prior
-/// review rounds.
-pub(crate) fn replace_status_field(
-    current: &mut serde_json::Value,
-    incoming_status: &serde_json::Value,
-) -> Result<(), crate::status::StatusError> {
-    reject_non_object_status_put(incoming_status)?;
+/// Shared PUT-/status body mutation for both guard variants below: null removes the
+/// `status` field (a PUT's own field-clearing convention), a present value replaces it
+/// wholesale. Factored out so the 400-vs-422 guard choice can't drag a second, drifting
+/// copy of this assignment logic along with it.
+fn apply_status_replacement(current: &mut serde_json::Value, incoming_status: &serde_json::Value) {
     match incoming_status {
         serde_json::Value::Null => {
             if let Some(m) = current.as_object_mut() {
@@ -541,6 +532,40 @@ pub(crate) fn replace_status_field(
             current["status"] = v.clone();
         }
     }
+}
+
+/// PUT-/status body for BUILT-IN resources: replace `current`'s `status` field with
+/// `incoming_status`, or reject with 400 if `incoming_status` is a present-but-non-object
+/// scalar/array (see `reject_non_object_status_put`). Every built-in PUT /status handler
+/// (`put_resource_status`, `put_namespaced_resource_status`, `replace_pod_status`)
+/// round-trips through here instead of assigning `current["status"] = ...` inline, so the
+/// object-type invariant cannot be missed for a PUT handler the way it was in two prior
+/// review rounds.
+///
+/// NOT used by `put_cr_status`/`put_crd_status` — see `replace_status_field_dynamic`,
+/// their 422 sibling, for why custom-resource status writes get a different code here.
+pub(crate) fn replace_status_field(
+    current: &mut serde_json::Value,
+    incoming_status: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    reject_non_object_status_put(incoming_status)?;
+    apply_status_replacement(current, incoming_status);
+    Ok(())
+}
+
+/// PUT-/status body for CRDs and their custom resource instances: same field-replacement
+/// semantics as `replace_status_field`, but guarded by `reject_non_object_status` (422)
+/// instead of `reject_non_object_status_put` (400). A custom resource is stored as
+/// unstructured JSON with no typed Go-style decode step to fail — its scalar-status
+/// rejection instead comes from the CRD's structural-schema validation, which (like
+/// PATCH's post-merge validation) runs after decode succeeds, so it is a 422 for every
+/// verb including PUT, not just for PATCH.
+pub(crate) fn replace_status_field_dynamic(
+    current: &mut serde_json::Value,
+    incoming_status: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    reject_non_object_status(incoming_status)?;
+    apply_status_replacement(current, incoming_status);
     Ok(())
 }
 
@@ -938,14 +963,21 @@ mod tests {
         }
     }
 
-    /// The same scalar status, on the same resource, must be rejected with a DIFFERENT
-    /// HTTP status depending on the write verb: PUT fails at whole-body typed decode (400,
-    /// upstream `NewBadRequest`), merge-PATCH fails at post-merge validation (422, upstream
-    /// `NewInvalid`). A fix that made both verbs converge on one status code (either by
-    /// reverting PUT back to 422, or by over-applying the PUT fix to PATCH as well) would
-    /// pass the two single-verb tests above only if they were also reverted/changed in
-    /// lockstep — this test pins both codes for one shared request, so it fails on either
-    /// direction of drift.
+    /// A scalar status is rejected with a status code that depends on BOTH the write verb
+    /// AND the resource kind — three cases, all exercised here so drift in any one of them
+    /// fails this single test instead of three that could silently rot in lockstep:
+    ///   - built-in PUT (`put_resource_status`): 400 — upstream's whole-body typed decode
+    ///     fails before validation ever runs (`transformDecodeError` -> `NewBadRequest`).
+    ///   - CR/CRD PUT (`replace_status_field_dynamic`, used by `put_cr_status` /
+    ///     `put_crd_status`): 422 — a CR has no typed decode step to fail; the CRD's
+    ///     structural-schema validation catches the scalar after decode succeeds, same as
+    ///     PATCH.
+    ///   - merge-PATCH, any resource (`patch_resource_status`): 422 — the JSON merge
+    ///     itself succeeds, so rejection happens at the same post-merge validation point
+    ///     PUT-on-a-CR uses.
+    /// A fix that collapsed any two of these onto the same code (e.g. reverting the
+    /// built-in PUT fix, or applying it to CR/CRD too) would pass single-case tests only
+    /// if reverted in lockstep; pinning all three together here closes that gap.
     #[tokio::test]
     async fn put_and_merge_patch_diverge_on_scalar_status_code() {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
@@ -998,8 +1030,29 @@ mod tests {
         assert_eq!(
             put_err.0,
             axum::http::StatusCode::BAD_REQUEST,
-            "PUT with a scalar status must be a decode-layer 400, matching upstream's \
-             transformDecodeError -> NewBadRequest for a whole-body replace"
+            "built-in PUT with a scalar status must be a decode-layer 400, matching \
+             upstream's transformDecodeError -> NewBadRequest for a whole-body replace"
+        );
+
+        // Same scalar, same "PUT a whole status object" shape, but on a CR/CRD-shaped
+        // write: `replace_status_field_dynamic` is what `put_cr_status`/`put_crd_status`
+        // call instead of `replace_status_field`, precisely because a CR has no typed
+        // decode step to fail at 400 — the CRD's structural-schema validation catches
+        // the scalar post-decode, so PUT gets the same 422 PATCH does.
+        let mut cr_current = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "verb-split-widget" },
+            "status": { "ready": true }
+        });
+        let cr_err = replace_status_field_dynamic(&mut cr_current, &serde_json::json!("scalar"))
+            .expect_err("scalar status on a CR/CRD PUT must be rejected");
+        assert_eq!(
+            cr_err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "CR/CRD PUT with a scalar status must stay a post-merge-shaped 422, not the \
+             built-in's decode-layer 400 — a CR is unstructured JSON, so there is no typed \
+             decode to fail"
         );
 
         let patch = serde_json::json!({"status": "scalar"});
@@ -5182,6 +5235,7 @@ mod tests {
                 }
                 if !body.contains("reject_non_object_status(")
                     && !body.contains("replace_status_field(")
+                    && !body.contains("replace_status_field_dynamic(")
                 {
                     unguarded.push(format!("{name} in {}", path.display()));
                 }
@@ -5203,9 +5257,9 @@ mod tests {
              rejecting a non-object (scalar/array) status first: {unguarded:?} — a scalar \
              status corrupts the object's schema and panics the next in-place status \
              stamper, crashing the apiserver for every other request in flight. Call \
-             replace_status_field (or reject_non_object_status) before persisting, or add \
-             the handler to TYPED_SAFE with a comment proving it structurally cannot store \
-             a non-object status."
+             replace_status_field, replace_status_field_dynamic, or reject_non_object_status \
+             before persisting, or add the handler to TYPED_SAFE with a comment proving it \
+             structurally cannot store a non-object status."
         );
     }
 

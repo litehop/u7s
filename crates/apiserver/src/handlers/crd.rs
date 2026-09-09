@@ -1196,7 +1196,13 @@ pub async fn put_crd_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    crate::handlers::status::replace_status_field(&mut current.body, &incoming.body["status"])?;
+    // `_dynamic`, not the built-in `replace_status_field`: a scalar status here is caught
+    // by structural-schema validation (422), not a typed decode failure (400) — see
+    // replace_status_field_dynamic's doc comment.
+    crate::handlers::status::replace_status_field_dynamic(
+        &mut current.body,
+        &incoming.body["status"],
+    )?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
 
@@ -3049,13 +3055,13 @@ mod tests {
     }
 
     /// PUT .../{name}/status with a scalar or array `status` body must be rejected with
-    /// 400, not persisted. `status` is a message/object type for every resource including a
+    /// 422, not persisted. `status` is a message/object type for every resource including a
     /// CustomResourceDefinition's own status; a PUT that wholesale-replaces it with a scalar
     /// corrupts the stored object's schema and later panics `apply_delete_policy`'s in-place
     /// `status["field"] = ...` stamp on the next DELETE, crashing the apiserver for every
-    /// other request in flight. 400 (not 422): upstream fails a whole-body PUT with a scalar
-    /// status at decode time, before validation ever runs — unlike the merge-patch
-    /// equivalent, which is a post-merge 422.
+    /// other request in flight. 422, matching the merge-patch equivalent: this handler
+    /// guards with `replace_status_field_dynamic`, the CR-shaped 422 check, same as
+    /// `put_cr_status`.
     #[tokio::test]
     async fn put_crd_status_rejects_non_object_status() {
         for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
@@ -3091,10 +3097,8 @@ mod tests {
             };
             assert_eq!(
                 err.0,
-                StatusCode::BAD_REQUEST,
-                "a non-object status via PUT must be rejected with 400, not 422 — upstream \
-                 fails a whole-body PUT with a scalar status at decode time, before schema \
-                 validation ever runs: got {bad_status}"
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a non-object status must be rejected with 422: got {bad_status}"
             );
         }
     }
