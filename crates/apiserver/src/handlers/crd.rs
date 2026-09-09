@@ -3049,11 +3049,13 @@ mod tests {
     }
 
     /// PUT .../{name}/status with a scalar or array `status` body must be rejected with
-    /// 422, not persisted. `status` is a message/object type for every resource including a
+    /// 400, not persisted. `status` is a message/object type for every resource including a
     /// CustomResourceDefinition's own status; a PUT that wholesale-replaces it with a scalar
     /// corrupts the stored object's schema and later panics `apply_delete_policy`'s in-place
     /// `status["field"] = ...` stamp on the next DELETE, crashing the apiserver for every
-    /// other request in flight.
+    /// other request in flight. 400 (not 422): upstream fails a whole-body PUT with a scalar
+    /// status at decode time, before validation ever runs — unlike the merge-patch
+    /// equivalent, which is a post-merge 422.
     #[tokio::test]
     async fn put_crd_status_rejects_non_object_status() {
         for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
@@ -3089,8 +3091,10 @@ mod tests {
             };
             assert_eq!(
                 err.0,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "a non-object status must be rejected with 422: got {bad_status}"
+                StatusCode::BAD_REQUEST,
+                "a non-object status via PUT must be rejected with 400, not 422 — upstream \
+                 fails a whole-body PUT with a scalar status at decode time, before schema \
+                 validation ever runs: got {bad_status}"
             );
         }
     }

@@ -17674,11 +17674,13 @@ mod handler_tests {
     }
 
     /// PUT /pods/:name/status with a scalar or array `status` body must be rejected with
-    /// 422, not persisted. `status` is a message/object type for Pod like every resource;
+    /// 400, not persisted. `status` is a message/object type for Pod like every resource;
     /// a PUT that wholesale-replaces it with a scalar corrupts the pod's own schema and
     /// panics `apply_resize_patch`'s and `apply_delete_policy`'s in-place
     /// `status["field"] = ...` stamps on the next resize/delete, crashing the apiserver
-    /// for every other request in flight.
+    /// for every other request in flight. 400 (not 422): upstream fails a whole-body PUT
+    /// with a scalar status at decode time, before validation ever runs — unlike the
+    /// merge-patch equivalent, which is a post-merge 422.
     #[tokio::test]
     async fn replace_pod_status_rejects_non_object_status() {
         for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
@@ -17715,10 +17717,11 @@ mod handler_tests {
             let resp = app.oneshot(req).await.unwrap();
             assert_eq!(
                 resp.status(),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "a non-object status ({bad_status}) via PUT must be rejected with 422 — \
-                 it would corrupt the pod's schema and later crash apply_resize_patch/\
-                 apply_delete_policy's in-place status stamps"
+                StatusCode::BAD_REQUEST,
+                "a non-object status ({bad_status}) via PUT must be rejected with 400, not \
+                 422 — upstream fails a whole-body PUT with a scalar status at decode time, \
+                 before validation ever runs; it would also corrupt the pod's schema and \
+                 later crash apply_resize_patch/apply_delete_policy's in-place status stamps"
             );
 
             let key = "/registry/pods/default/put-scalar-pod";

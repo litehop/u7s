@@ -19376,12 +19376,14 @@ mod tests {
         );
     }
 
-    /// put_cr_status with a scalar or array `status` body must be rejected with 422, not
+    /// put_cr_status with a scalar or array `status` body must be rejected with 400, not
     /// persisted. `status` is a message/object type for every resource (built-in or CRD);
     /// a PUT that wholesale-replaces it with a scalar corrupts the CR's own schema and
     /// panics any later in-place status stamper (e.g. `apply_delete_policy`,
     /// `merge_approval_conditions` for the CertificateSigningRequest built-in that also
-    /// routes through this handler) that indexes `["status"]["field"]` on it.
+    /// routes through this handler) that indexes `["status"]["field"]` on it. 400 (not
+    /// 422): upstream fails a whole-body PUT with a scalar status at decode time, before
+    /// validation ever runs — unlike the merge-patch equivalent, which is a post-merge 422.
     #[tokio::test]
     async fn put_cr_status_rejects_non_object_status() {
         for bad_status in [serde_json::json!("x"), serde_json::json!(["a", "b"])] {
@@ -19439,8 +19441,10 @@ mod tests {
             };
             assert_eq!(
                 err.0,
-                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                "a non-object status must be rejected with 422: got {bad_status}"
+                axum::http::StatusCode::BAD_REQUEST,
+                "a non-object status via PUT must be rejected with 400, not 422 — upstream \
+                 fails a whole-body PUT with a scalar status at decode time, before schema \
+                 validation ever runs: got {bad_status}"
             );
 
             let key = "/registry/cr/example.io/widgets/put-scalar-widget";
@@ -19523,8 +19527,9 @@ mod tests {
     /// route real `PUT .../certificatesigningrequests/{name}/status` traffic falls into,
     /// since CSR is a resource_registry built-in and `put_cr_status` serves the generic
     /// cluster-scoped `/apis/{group}/{version}/{resource}/{name}/status` route — must be
-    /// rejected with 422, not persisted. Before this fix, a corrupted scalar status here
-    /// would panic `merge_approval_conditions`'s in-place `status["conditions"]` stamp
+    /// rejected with 400 (upstream's PUT decode-layer BadRequest, not the merge-patch
+    /// path's post-merge 422), not persisted. Before this fix, a corrupted scalar status
+    /// here would panic `merge_approval_conditions`'s in-place `status["conditions"]` stamp
     /// (approval.rs) the next time the CSR was approved, crashing the apiserver for every
     /// other request in flight.
     #[tokio::test]
@@ -19577,8 +19582,10 @@ mod tests {
         };
         assert_eq!(
             err.0,
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "scalar status on CSR /status must be rejected with 422"
+            axum::http::StatusCode::BAD_REQUEST,
+            "scalar status on CSR /status via PUT must be rejected with 400, not 422 — \
+             upstream fails a whole-body PUT with a scalar status at decode time, before \
+             validation ever runs"
         );
 
         // The CSR's status must still be the original object — proving the approval-path
