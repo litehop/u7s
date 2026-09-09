@@ -237,15 +237,41 @@ if [ -d "$VM_DIR" ]; then
     exit 1
   fi
 else
-  echo "Provisioning VM '$VM_NAME' (first run, takes ~15-20 min with the e2e-test-image pre-pull)..."
-  # lima's own default boot-readiness timeout (10m, DefaultWatchHostAgentEventsTimeout
-  # in lima-vm/lima) is tuned for a provision script that doesn't pull ~25 conformance
-  # images -- that alone can take longer than 10m, which made a real run fail with
-  # "did not receive an event with the running status" partway through the pull loop.
-  # 30m matches the value lima's own code already uses as an "extended" timeout for
-  # slow-boot cases (WinDefaultWatchHostAgentEventsTimeout).
-  check_port_free "$KUBELET_PORT" "kubelet"
-  limactl start --tty=false --timeout 30m --name="$VM_NAME" "$LIMA_YAML"
+  # lima-golden (scripts/conformance/lima-golden-bake.sh) is a stopped template
+  # already carrying the full package/image/sonobuoy install this VM would
+  # otherwise need ~9min of provisioning to reach. Cloning it is an APFS
+  # copy-on-write of its disk, so a new VM starts from that same state in
+  # seconds instead of re-running the provision script. The clone inherits the
+  # golden's OWN networks:/portForwards: verbatim, so both must be patched to
+  # this VM's slot at clone time -- `--set` is limactl's own embedded yq
+  # engine (no external yq binary needed). Everything else lima-start.sh does
+  # below (pod-subnet CNI rewrite, kubelet/kube-proxy config, certs) already
+  # runs unconditionally against the live VM regardless of how it was
+  # provisioned, so no further clone-specific handling is needed.
+  GOLDEN_DIR="${HOME}/.lima/lima-golden"
+  if [ "$VM_NAME" != "lima-golden" ] && [ -d "$GOLDEN_DIR" ]; then
+    echo "Provisioning VM '$VM_NAME' via golden-clone (lima-golden template found)..."
+    check_port_free "$KUBELET_PORT" "kubelet"
+    # No-op here ($VM_DIR already doesn't exist in this branch), but mirrors
+    # the approved golden-clone design (delete-then-clone) so this stays
+    # correct even if limactl's own state ever drifts from the directory
+    # check above.
+    limactl delete --force "$VM_NAME" 2>/dev/null || true
+    limactl clone lima-golden "$VM_NAME" \
+      --set ".networks[0].lima = \"${NETWORK}\"" \
+      --set ".portForwards[0].hostPort = ${KUBELET_PORT}" \
+      --start --tty=false
+  else
+    echo "Provisioning VM '$VM_NAME' (first run, takes ~15-20 min with the e2e-test-image pre-pull)..."
+    # lima's own default boot-readiness timeout (10m, DefaultWatchHostAgentEventsTimeout
+    # in lima-vm/lima) is tuned for a provision script that doesn't pull ~25 conformance
+    # images -- that alone can take longer than 10m, which made a real run fail with
+    # "did not receive an event with the running status" partway through the pull loop.
+    # 30m matches the value lima's own code already uses as an "extended" timeout for
+    # slow-boot cases (WinDefaultWatchHostAgentEventsTimeout).
+    check_port_free "$KUBELET_PORT" "kubelet"
+    limactl start --tty=false --timeout 30m --name="$VM_NAME" "$LIMA_YAML"
+  fi
 fi
 
 # Give this node its own disjoint pod-CIDR /24 out of the CRI-O default 10.85.0.0/16
