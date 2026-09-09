@@ -1168,7 +1168,7 @@ fn pvc_row(obj: serde_json::Value) -> serde_json::Value {
         status.phase.unwrap_or_default()
     };
     let volume = spec.volume_name.unwrap_or_default();
-    let storage_class = spec.storage_class_name.unwrap_or_default();
+    let storage_class = storage_class_column(&meta, spec.storage_class_name);
     let volume_attributes_class = spec
         .volume_attributes_class_name
         .unwrap_or_else(|| "<unset>".to_string());
@@ -1299,7 +1299,7 @@ fn pv_row(obj: serde_json::Value) -> serde_json::Value {
             )
         })
         .unwrap_or_default();
-    let storage_class = spec.storage_class_name.unwrap_or_default();
+    let storage_class = storage_class_column(&meta, spec.storage_class_name);
     let volume_attributes_class = spec
         .volume_attributes_class_name
         .unwrap_or_else(|| "<unset>".to_string());
@@ -1323,6 +1323,18 @@ fn pv_row(obj: serde_json::Value) -> serde_json::Value {
         ],
         "object": object_ref
     })
+}
+
+/// Mirrors upstream `helper.GetPersistentVolumeClaimClass`/`GetPersistentVolumeClass`:
+/// the legacy beta annotation is checked before spec.storageClassName, since older
+/// clients/controllers may still set only the annotation.
+fn storage_class_column(meta: &ObjectMeta, spec_storage_class_name: Option<String>) -> String {
+    meta.annotations
+        .as_ref()
+        .and_then(|a| a.get("volume.beta.kubernetes.io/storage-class"))
+        .cloned()
+        .or(spec_storage_class_name)
+        .unwrap_or_default()
 }
 
 /// Mirrors upstream `helper.GetAccessModesAsString`: modes are always rendered
@@ -2417,6 +2429,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pvc_storage_class_column_prefers_beta_annotation_over_spec_matching_upstream_1_36() {
+        // Upstream 1.36 helper.GetPersistentVolumeClaimClass checks the legacy
+        // `volume.beta.kubernetes.io/storage-class` annotation before spec.storageClassName.
+        // If u7s regressed to spec-only precedence, `kubectl get pvc` would show the wrong
+        // StorageClass for any claim still tagged with the (still-live) beta annotation.
+        let annotation_and_spec = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "legacy-pvc",
+                "creationTimestamp": "2020-01-01T00:00:00Z",
+                "annotations": {"volume.beta.kubernetes.io/storage-class": "beta-sc"}
+            },
+            "spec": {"storageClassName": "spec-sc"},
+            "status": {}
+        });
+        let spec_only = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "modern-pvc", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {"storageClassName": "spec-sc"},
+            "status": {}
+        });
+        let neither = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "classless-pvc", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {},
+            "status": {}
+        });
+
+        let table = build_table(
+            "",
+            "persistentvolumeclaims",
+            vec![annotation_and_spec, spec_only, neither],
+        );
+        let rows = table["rows"].as_array().unwrap();
+        assert_eq!(
+            rows[0]["cells"][5], "beta-sc",
+            "STORAGECLASS must prefer the beta annotation over spec.storageClassName"
+        );
+        assert_eq!(
+            rows[1]["cells"][5], "spec-sc",
+            "STORAGECLASS must fall back to spec.storageClassName when the annotation is absent"
+        );
+        assert_eq!(
+            rows[2]["cells"][5], "",
+            "STORAGECLASS must render blank when neither the annotation nor spec is set"
+        );
+    }
+
     // ── PersistentVolume tests ────────────────────────────────────────────────
 
     #[test]
@@ -2534,6 +2598,58 @@ mod tests {
             cells[4], "Terminating",
             "pv with deletionTimestamp must show Terminating regardless of phase — \
              otherwise `kubectl get pv` hides an in-progress delete from operators"
+        );
+    }
+
+    #[test]
+    fn pv_storage_class_column_prefers_beta_annotation_over_spec_matching_upstream_1_36() {
+        // Upstream 1.36 helper.GetPersistentVolumeClass checks the legacy
+        // `volume.beta.kubernetes.io/storage-class` annotation before spec.storageClassName.
+        // If u7s regressed to spec-only precedence, `kubectl get pv` would show the wrong
+        // StorageClass for any volume still tagged with the (still-live) beta annotation.
+        let annotation_and_spec = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {
+                "name": "legacy-pv",
+                "creationTimestamp": "2020-01-01T00:00:00Z",
+                "annotations": {"volume.beta.kubernetes.io/storage-class": "beta-sc"}
+            },
+            "spec": {"storageClassName": "spec-sc"},
+            "status": {}
+        });
+        let spec_only = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {"name": "modern-pv", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {"storageClassName": "spec-sc"},
+            "status": {}
+        });
+        let neither = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {"name": "classless-pv", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {},
+            "status": {}
+        });
+
+        let table = build_table(
+            "",
+            "persistentvolumes",
+            vec![annotation_and_spec, spec_only, neither],
+        );
+        let rows = table["rows"].as_array().unwrap();
+        assert_eq!(
+            rows[0]["cells"][6], "beta-sc",
+            "STORAGECLASS must prefer the beta annotation over spec.storageClassName"
+        );
+        assert_eq!(
+            rows[1]["cells"][6], "spec-sc",
+            "STORAGECLASS must fall back to spec.storageClassName when the annotation is absent"
+        );
+        assert_eq!(
+            rows[2]["cells"][6], "",
+            "STORAGECLASS must render blank when neither the annotation nor spec is set"
         );
     }
 
