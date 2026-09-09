@@ -4528,6 +4528,16 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
         }
     }
 
+    // ResourceQuota: refresh status.used the same way a single DELETE would (see that
+    // handler's identical call for why) — without this, a DeleteCollection (e.g. namespace
+    // deletion draining a resource type, or `kubectl delete --all`) leaves status.used
+    // reporting every deleted object as still counted. Skipped for dry-run: no object in
+    // this collection was actually deleted above.
+    if !dry_run {
+        let _quota_lock = state.quota_admission_locks.lock(&ns).await;
+        quota::update_quota_status(&state, &ns).await;
+    }
+
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
@@ -25891,6 +25901,98 @@ mod tests {
         assert_eq!(
             remaining_obj["metadata"]["name"], "beta",
             "the surviving Lease must be beta (holderIdentity=beta doesn't match the selector)"
+        );
+    }
+
+    /// Before this fix, delete_collection_namespaced_resource's per-object delete loop never
+    /// called quota::update_quota_status afterward, unlike single-object DELETE
+    /// (delete_namespaced_resource) — so `kubectl delete cm --all` (or namespace deletion
+    /// draining a resource type via DeleteCollection) left ResourceQuota.status.used stuck at
+    /// its pre-delete count even though every matching ConfigMap was actually removed.
+    ///
+    /// Fails on revert: without the update_quota_status call, status.used stays at "2"
+    /// instead of reflecting the 0 ConfigMaps left after DeleteCollection.
+    #[tokio::test]
+    async fn delete_collection_namespaced_resource_decrements_quota_status_used() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "quota-ns";
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "cm-quota", "namespace": ns },
+            "spec": { "hard": { "count/configmaps": "5" } }
+        });
+        let quota_key = crate::keys::group_object_key("", "resourcequotas", Some(ns), "cm-quota");
+        state
+            .store
+            .put(
+                &quota_key,
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        for name in ["cm-1", "cm-2"] {
+            let body = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": name, "namespace": ns },
+                "data": { "k": "v" }
+            });
+            create_namespaced_resource(
+                State(state.clone()),
+                Path(("".into(), "v1".into(), ns.into(), "configmaps".into())),
+                axum::extract::Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("ConfigMap create must succeed: {e:?}"));
+        }
+
+        let stored_quota = state.store.get(&quota_key).await.unwrap().unwrap();
+        let quota_val: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            quota_val["status"]["used"]["count/configmaps"].as_str(),
+            Some("2"),
+            "sanity check: status.used must reflect the 2 ConfigMaps just created"
+        );
+
+        delete_collection_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), ns.into(), "configmaps".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("DeleteCollection must succeed: {e:?}"));
+
+        let stored_quota = state.store.get(&quota_key).await.unwrap().unwrap();
+        let quota_val: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            quota_val["status"]["used"]["count/configmaps"].as_str(),
+            Some("0"),
+            "status.used must drop to 0 after DeleteCollection removes both ConfigMaps — \
+             without delete_collection_namespaced_resource calling update_quota_status, this \
+             stays stuck at 2 even though both objects were actually deleted, permanently \
+             under-reporting quota headroom to `kubectl describe resourcequota`"
         );
     }
 

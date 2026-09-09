@@ -3475,10 +3475,11 @@ pub async fn create_cr_namespaced<S: Store>(
     };
 
     // ResourceQuota: refresh status.used so a `count/<crd>.<group>` quota's usage reflects
-    // this create. check_resource_quota above only *admits* the request against the
-    // pre-create count — without this, a quota watching a CRD-backed resource never
-    // advances past 0 no matter how many CRs are created, and a subsequent create that
-    // should be denied at the hard limit is wrongly admitted instead.
+    // this create. check_resource_quota above already enforces the hard limit itself via a
+    // live count_objects recount (not the stored status.used), so admission is correct even
+    // without this call — without this, a quota watching a CRD-backed resource only ever
+    // *reports* stale usage (stuck at 0 no matter how many CRs are created), it does not
+    // admit past the hard limit.
     // Unlike update_quota_status's other call sites, this one needs no separate lock: the
     // check-then-write `_quota_lock` acquired above is still held here (dropped only at this
     // function's return), so this full-recompute write is already serialized against any
@@ -3764,9 +3765,10 @@ pub async fn delete_cr_namespaced<S: Store>(
 
     // ResourceQuota: refresh status.used so a `count/<crd>.<group>` quota's usage reflects
     // this delete (and any cascaded dependents, which the recompute above already covers
-    // since they were removed from the store before this runs). Without this, a quota
-    // watching a CRD-backed resource sticks at its old count forever once a CR is deleted,
-    // permanently blocking new creates once the hard limit was ever reached. Locked so this
+    // since they were removed from the store before this runs). check_resource_quota's live
+    // count_objects recount at the next admission already sees the reduced count regardless
+    // of this call, so admission is unaffected — without this, a quota watching a CRD-backed
+    // resource only ever *reports* its old count forever once a CR is deleted. Locked so this
     // full-recompute write can never interleave with a concurrent record_pod_created/
     // record_pod_removed's incremental read-modify-write of the same quota — see
     // complete_finalizer_drain's identical lock (resource.rs) for why.
@@ -3919,6 +3921,16 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
             Ok(_) | Err(u7s_store::StoreError::NotFound { .. }) => {}
             Err(e) => return Err(Status::internal(e.to_string())),
         }
+    }
+
+    // ResourceQuota: refresh status.used the same way a single delete_cr_namespaced call
+    // would (see that handler's identical call for why) — without this, a DeleteCollection
+    // over CRs (e.g. namespace deletion draining a CRD-backed resource) leaves status.used
+    // reporting every deleted CR as still counted. Skipped for dry-run: no CR in this
+    // collection was actually deleted above.
+    if !dry_run {
+        let _quota_lock = state.quota_admission_locks.lock(&ns).await;
+        crate::quota::update_quota_status(&state, &ns).await;
     }
 
     Ok(Json(serde_json::json!({
@@ -7290,6 +7302,95 @@ mod tests {
         assert!(
             state.store.get(&plain_key).await.unwrap().is_none(),
             "a CR without finalizers must be hard-deleted by DeleteCollection"
+        );
+    }
+
+    /// Before this fix, delete_collection_cr_namespaced's per-object delete loop never called
+    /// quota::update_quota_status afterward, unlike single-object DELETE
+    /// (delete_cr_namespaced) — so a DeleteCollection over CRs (e.g. namespace deletion
+    /// draining a CRD-backed resource) left ResourceQuota.status.used stuck at its pre-delete
+    /// count even though every matching CR was actually removed.
+    ///
+    /// Fails on revert: without the update_quota_status call, status.used stays at "1" instead
+    /// of reflecting the 0 Applications left after DeleteCollection.
+    #[tokio::test]
+    async fn delete_collection_cr_namespaced_decrements_quota_status_used() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io";
+        let version = "v1alpha1";
+        let ns = "argocd";
+        let plural = "applications";
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "crd-quota", "namespace": ns },
+            "spec": { "hard": { "count/applications.argoproj.io": "5" } }
+        });
+        let quota_key = crate::keys::group_object_key("", "resourcequotas", Some(ns), "crd-quota");
+        state
+            .store
+            .put(
+                &quota_key,
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    group.to_string(),
+                    version.to_string(),
+                    ns.to_string(),
+                    plural.to_string(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body("app-1", ns),
+            )
+            .await
+            .is_ok(),
+            "create app-1 must succeed"
+        );
+
+        let stored_quota = state.store.get(&quota_key).await.unwrap().unwrap();
+        let quota_val: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            quota_val["status"]["used"]["count/applications.argoproj.io"].as_str(),
+            Some("1"),
+            "sanity check: status.used must reflect the 1 Application just created"
+        );
+
+        delete_collection_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            test_user(),
+            HeaderMap::new(),
+            no_watch_query(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete_collection_cr_namespaced must succeed: {e:?}"));
+
+        let stored_quota = state.store.get(&quota_key).await.unwrap().unwrap();
+        let quota_val: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            quota_val["status"]["used"]["count/applications.argoproj.io"].as_str(),
+            Some("0"),
+            "status.used must drop to 0 after DeleteCollection removes the Application — \
+             without delete_collection_cr_namespaced calling update_quota_status, this stays \
+             stuck at 1 even though the CR was actually deleted, permanently under-reporting \
+             quota headroom to `kubectl describe resourcequota`"
         );
     }
 
