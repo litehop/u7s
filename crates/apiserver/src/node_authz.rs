@@ -36,11 +36,14 @@
 //! resources fall through to the same static, un-scoped rule match every other unsubdivided
 //! `system:node` permission gets (see the `_ =>` arm of `authorize`) — identical to today's
 //! behavior, not a regression. Mirror-pod create is authorized by the separate
-//! `authorize_pod_create` (it needs the request body, unavailable where `authorize()` runs);
-//! it isn't yet called from the pod-create handler, so the `system:node` ClusterRole's
-//! `create` grant on pods stays inert until that wiring lands. The SelfSubjectAccessReview/
-//! SubjectAccessReview/LocalSubjectAccessReview endpoints (`handlers/authorization.rs`) DO
-//! consult this authorizer, via the `authorized()` helper defined there.
+//! `authorize_pod_create` (it needs the request body, unavailable where `authorize()` runs) —
+//! called directly by the pod-create handler (`handlers/pods.rs::create_pod`) once the body is
+//! parsed; this authorizer's own `"create"` arm only defers to the `system:node` ClusterRole's
+//! rule set, matching how upstream's Node authorizer leaves pod-create to RBAC and relegates
+//! the actual restriction to the NodeRestriction admission plugin. The
+//! SelfSubjectAccessReview/SubjectAccessReview/LocalSubjectAccessReview endpoints
+//! (`handlers/authorization.rs`) DO consult this authorizer, via the `authorized()` helper
+//! defined there.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
@@ -347,6 +350,7 @@ fn authorize_pod(
     req: &AuthzRequest<'_>,
     raw_query: Option<&str>,
     graph: &NodeGraph,
+    rbac_index: &RbacIndex,
 ) -> bool {
     // A named single-pod check (get/delete/status/log, or the name-fallback branch of
     // list/watch below) always needs a namespace+name pair against the graph. The
@@ -364,13 +368,17 @@ fn authorize_pod(
             "list" | "watch" => {
                 field_selector_selects_node(raw_query, node_name) || req.name.is_some_and(owns)
             }
-            // Deliberately denied, not an oversight: telling a mirror pod (bound to this
-            // node) apart from any other pod needs the request body (the
-            // `kubernetes.io/config.mirror` annotation and `spec.nodeName`), which isn't
-            // available here — `authorize()` runs in `AuthService::call` before the body is
-            // read (see module doc). See `authorize_pod_create`, called directly by the
-            // create handler once the body is parsed.
-            "create" => false,
+            // This layer can't tell a mirror pod (bound to this node) apart from any other
+            // pod — that needs the request body (the `kubernetes.io/config.mirror`
+            // annotation and `spec.nodeName`), which isn't available here — `authorize()`
+            // runs in `AuthService::call` before the body is read (see module doc).
+            // Mirroring upstream: the graph-based Node authorizer doesn't adjudicate
+            // pod-create at all; RBAC (here, the same `system:node` ClusterRole rule set
+            // `authorize()`'s own `_ =>` fallback arm already consults) grants it
+            // unconditionally, and the NodeRestriction admission plugin — here,
+            // `authorize_pod_create`, called directly by the create handler once the body is
+            // parsed — does the actual mirror-pod-bound-to-self enforcement.
+            "create" => rbac::rules_allow(&rbac_index.cluster_role_rules(NODE_CLUSTER_ROLE), req),
             _ => false,
         },
         "status" => matches!(req.verb, "get" | "update" | "patch") && req.name.is_some_and(owns),
@@ -392,12 +400,9 @@ fn authorize_pod(
 /// registering one of its own locally-run static pods. Anything else (a non-mirror pod, or a
 /// mirror pod claiming a different node) is denied.
 ///
-/// Not reachable from `authorize()`/`authorize_pod` above — see the `"create" => false` arm's
-/// comment for why the pod body can't reach that layer. Call this directly wherever the
-/// create request's body has already been parsed (e.g. the pod-create handler); not wired up
-/// yet (`handlers/pods.rs` is a separate, concurrently-owned change), hence `dead_code`
-/// outside test builds.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Not reachable from `authorize()`/`authorize_pod` above — see the `"create"` arm's comment
+/// for why the pod body can't reach that layer. Called directly by `create_pod`
+/// (`handlers/pods.rs`) once the create request's body has been parsed.
 pub fn authorize_pod_create(
     username: &str,
     groups: &[String],
@@ -616,7 +621,7 @@ pub fn authorize(
         }
         ("coordination.k8s.io", "leases") => authorize_lease(node_name, req),
         ("", "nodes") => authorize_node(node_name, req),
-        ("", "pods") => authorize_pod(node_name, req, raw_query, graph),
+        ("", "pods") => authorize_pod(node_name, req, raw_query, graph, rbac_index),
         // Not subdivided by node: fall back to the same plain rule match RBAC would do
         // against the `system:node` ClusterRole's own rules (services, events, csinodes,
         // csidrivers, persistentvolumes, volumeattachments, SAR/TokenReview/CSR creation,
@@ -952,6 +957,41 @@ mod tests {
             authorize(&req, None, &graph, &idx),
             "node-a must be able to evict pod-a, its own pod — otherwise kubelet's \
              node-pressure eviction workflow 403s for every pod it manages"
+        );
+    }
+
+    #[test]
+    fn node_pod_create_falls_back_to_the_system_node_cluster_role_rules_at_the_coarse_layer() {
+        // Regression test for the coarse half of the mirror-pod-create wiring: this layer
+        // can't tell a mirror pod from an ordinary one (no request body), so — mirroring
+        // upstream, where the graph-based Node authorizer leaves pod-create to RBAC entirely —
+        // it must defer to the `system:node` ClusterRole's own rule set instead of hard-denying
+        // create. Reverting this arm back to an unconditional `false` never lets a create-pod
+        // request reach `create_pod`'s body-level `authorize_pod_create` check at all, so a
+        // kubelet's mirror-pod registration 403s before the body is even read.
+        let idx = RbacIndex::new();
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/system:node",
+            &serde_json::json!({"rules": [
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch", "create", "delete"]}
+            ]}),
+        );
+        let graph = NodeGraph::new();
+        let groups = vec![NODES_GROUP.to_owned()];
+        let req = node_req(
+            "system:node:node-a",
+            &groups,
+            "create",
+            "",
+            "pods",
+            "",
+            Some("default"),
+            None,
+        );
+        assert!(
+            authorize(&req, None, &graph, &idx),
+            "a system:node identity's pod CREATE must reach the body-level \
+             authorize_pod_create check, not be hard-denied before the body is even read"
         );
     }
 
