@@ -519,6 +519,20 @@ pub(crate) async fn create_pod<S: Store>(
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
+    // NodeRestriction-equivalent enforcement: `authorize_pod`'s coarse (pre-body) check lets
+    // a `system:node:*` identity's pod CREATE through unconditionally (matching upstream, which
+    // authorizes pod-create via RBAC and defers the actual restriction to admission) — so this
+    // is the only place a mirror-pod-bound-to-self is distinguished from an arbitrary pod. A
+    // non-node identity is a no-op here (`node_identity` returns `None`) and hits none of the
+    // existing create_pod behavior below.
+    if crate::node_authz::node_identity(&user.username, &user.groups).is_some()
+        && !crate::node_authz::authorize_pod_create(&user.username, &user.groups, &obj.body)
+    {
+        return Err(Status::forbidden(
+            "a node may only create a mirror pod bound to itself".to_owned(),
+        ));
+    }
+
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = crate::handlers::generic::wants_generate_name(&obj);
@@ -10636,6 +10650,132 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    fn node_user(node_name: &str) -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: format!("system:node:{node_name}"),
+            uid: String::new(),
+            groups: vec!["system:nodes".into()],
+            extra: Default::default(),
+        })
+    }
+
+    async fn post_pod_as(
+        state: AppState,
+        user: axum::Extension<crate::auth::UserInfo>,
+        pod: &serde_json::Value,
+    ) -> Response {
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(user)
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(pod))
+            .unwrap();
+
+        app.oneshot(req).await.unwrap()
+    }
+
+    /// A kubelet registers one of its own static pods by creating a mirror pod bound to its
+    /// own node — reverting the node_authz wiring (either the coarse allow arm or the
+    /// body-level check) makes this 403, breaking static pod support entirely.
+    #[tokio::test]
+    async fn create_pod_allows_node_to_create_mirror_pod_bound_to_itself() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "mirror-pod",
+                "namespace": "default",
+                "annotations": {"kubernetes.io/config.mirror": "abc123"}
+            },
+            "spec": {"nodeName": "node-a", "containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let resp = post_pod_as(state, node_user("node-a"), &pod).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "node-a must be able to register its own mirror pod"
+        );
+    }
+
+    /// A compromised (or buggy) kubelet must not be able to use pod-create to schedule an
+    /// arbitrary, non-mirror pod onto itself, bypassing the scheduler entirely.
+    #[tokio::test]
+    async fn create_pod_denies_node_creating_non_mirror_pod() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "not-a-mirror-pod", "namespace": "default"},
+            "spec": {"nodeName": "node-a", "containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let resp = post_pod_as(state, node_user("node-a"), &pod).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a node must not be able to create a non-mirror pod bound to itself"
+        );
+    }
+
+    /// A compromised kubelet must not be able to forge another node's static-pod mirror by
+    /// claiming a `spec.nodeName` that isn't its own.
+    #[tokio::test]
+    async fn create_pod_denies_node_creating_mirror_pod_bound_to_different_node() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "mirror-pod",
+                "namespace": "default",
+                "annotations": {"kubernetes.io/config.mirror": "abc123"}
+            },
+            "spec": {"nodeName": "node-b", "containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let resp = post_pod_as(state, node_user("node-a"), &pod).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "node-a must not be able to register a mirror pod claiming node-b"
+        );
+    }
+
+    /// The node_authz mirror-pod check must only ever engage for a `system:node:*` identity —
+    /// an ordinary user's pod create is untouched by this bead's wiring.
+    #[tokio::test]
+    async fn create_pod_unaffected_for_non_node_user() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "ordinary-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let resp = post_pod_as(state, auth_layer(), &pod).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a normal user's ordinary pod create must be unaffected by node_authz"
+        );
     }
 
     /// A store wrapper whose first `put()` call always fails with AlreadyExists,
