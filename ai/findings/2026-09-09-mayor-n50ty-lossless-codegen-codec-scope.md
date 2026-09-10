@@ -189,10 +189,14 @@ serde_json::Value` for everything else. `rest` preserves every
 non-enumerated field verbatim, so no field is ever dropped by omission —
 under-enumerating the reasoned-about set costs active validation on that
 field, never data loss. The only determination is *which* fields to
-actively reason about, read off upstream — the opposite of the codegen's
-lossy zero-collapse (`.filter(|&v| v != 0)`, `codegen.rs:1293-1294`) that
-fabricated `spec.replicas=0` in `6877c906`. This is why hand-written
-minimal-field structs are safe where the codegen is not.
+actively reason about, read off upstream. This is the opposite of the
+codegen's lossy decode: e.g. commit `6877c906`, where the
+Deployment/ReplicaSet/StatefulSet/ReplicationController protobuf decoders
+wrote `spec.replicas.unwrap_or(0)`, collapsing an omitted optional
+`replicas` into an explicit `0` and starving the ReplicaSet controller
+(`apply_defaults`'s "replicas defaults to 1 when unset" never saw the
+field). This is why hand-written minimal-field structs are safe where the
+codegen is not.
 
 ## 4. Effort estimate to build the codec (mechanism (a)) anyway
 
