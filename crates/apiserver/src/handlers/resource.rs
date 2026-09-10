@@ -21303,6 +21303,128 @@ mod tests {
         );
     }
 
+    /// A PVC created with only the deprecated `volume.beta.kubernetes.io/storage-class`
+    /// annotation (no `spec.storageClassName`) must have `spec.storageClassName` defaulted
+    /// from that annotation, and a later resize of that PVC must not be wrongly rejected.
+    ///
+    /// Upstream's `GetPersistentVolumeClaimClass` resolves the storage class from this
+    /// annotation first; u7s's own resize gate (`reject_disallowed_pvc_resize`) reads
+    /// `spec.storageClassName` directly. Without the create-time promotion, the stored PVC's
+    /// `spec.storageClassName` stays empty, `storage_class_allows_expansion` looks up a
+    /// nonexistent ""-named StorageClass, and every resize of the PVC is rejected with "only
+    /// dynamically provisioned pvc can be resized" — even though the real StorageClass (named
+    /// only in the annotation) has `allowVolumeExpansion: true`.
+    #[tokio::test]
+    async fn create_namespaced_resource_defaults_pvc_storage_class_from_deprecated_annotation() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let sc = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "annotation-sc" },
+            "provisioner": "csi-hostpath",
+            "allowVolumeExpansion": true
+        });
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "annotation-only-pvc",
+                "namespace": "default",
+                "annotations": {
+                    "volume.beta.kubernetes.io/storage-class": "annotation-sc"
+                }
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        let created = create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create with only the deprecated storage-class annotation must succeed")
+        .into_response();
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            created["spec"]["storageClassName"], "annotation-sc",
+            "spec.storageClassName must be defaulted from the deprecated \
+             volume.beta.kubernetes.io/storage-class annotation when the client sets only the \
+             annotation — otherwise every downstream reader of spec.storageClassName (this \
+             codebase's resize gate and storageClassName-immutability freeze) sees an empty \
+             class"
+        );
+
+        let grown = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "annotation-only-pvc",
+                "namespace": "default",
+                "annotations": {
+                    "volume.beta.kubernetes.io/storage-class": "annotation-sc"
+                }
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "annotation-sc",
+                "resources": { "requests": { "storage": "2Gi" } }
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "annotation-only-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&grown).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PUT growing a PVC's storage request must succeed when the PVC's only StorageClass \
+             reference was the deprecated storage-class annotation at create time — the \
+             annotation's StorageClass allows expansion, so resolving an empty class from an \
+             undefaulted spec.storageClassName must not wrongly reject the resize",
+        );
+    }
+
     /// PATCH growing a PVC's `spec.resources.requests.storage` must return 403 Forbidden when
     /// the bound StorageClass has `allowVolumeExpansion: false`.
     ///
