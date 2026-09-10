@@ -28466,6 +28466,72 @@ mod tests {
         })
     }
 
+    /// A Node registered with only `spec.podCIDR` (the legacy singular field) must have
+    /// `spec.podCIDRs` (the field that superseded it) filled in from it, and a Node registered
+    /// with only `spec.podCIDRs` must have `spec.podCIDR` filled in from `podCIDRs[0]`.
+    ///
+    /// Upstream's NodeSpec conversion (`Convert_core_NodeSpec_To_v1_NodeSpec` /
+    /// `Convert_v1_NodeSpec_To_core_NodeSpec`) syncs the two fields on every read/write, and
+    /// both fields are frozen once non-empty (`validate_node_spec_immutable`) — so a Node that
+    /// registers with only one field set would otherwise have the other stuck permanently
+    /// empty for the node's entire lifetime, with no later write ever able to fill it in.
+    #[tokio::test]
+    async fn create_resource_node_pod_cidr_and_pod_cidrs_cross_fill_each_other() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let cidr_only = node_body("cidr-only-node", Some("10.244.3.0/24"));
+        let created = create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cidr_only).unwrap()),
+        )
+        .await
+        .expect("Node create with only spec.podCIDR must succeed")
+        .into_response();
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            created["spec"]["podCIDRs"],
+            serde_json::json!(["10.244.3.0/24"]),
+            "spec.podCIDRs must be filled from spec.podCIDR when only the legacy singular \
+             field is set — otherwise a client that only reads podCIDRs sees this node as \
+             having no pod CIDR assigned at all"
+        );
+
+        let cidrs_only = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "cidrs-only-node" },
+            "spec": { "podCIDRs": ["10.244.4.0/24"] }
+        });
+        let created = create_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cidrs_only).unwrap()),
+        )
+        .await
+        .expect("Node create with only spec.podCIDRs must succeed")
+        .into_response();
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            created["spec"]["podCIDR"], "10.244.4.0/24",
+            "spec.podCIDR must be filled from spec.podCIDRs[0] when only the modern list field \
+             is set — otherwise a client that only reads the legacy singular podCIDR sees this \
+             node as having no pod CIDR assigned at all"
+        );
+    }
+
     /// PATCH changing an already-set Node.spec.podCIDR must return 422.
     ///
     /// Upstream `ValidateNodeUpdate` (core validation.go L7371-7387, release-1.36) allows

@@ -49,6 +49,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "persistentvolumes") = (group, plural) {
         default_pv(obj);
     }
+    if let ("", "nodes") = (group, plural) {
+        default_node(obj);
+    }
     if let ("", "secrets") = (group, plural) {
         default_secret(obj);
     }
@@ -307,6 +310,39 @@ fn default_pv(obj: &mut serde_json::Value) {
         serde_json::to_value(&status).expect("PersistentVolumeStatusFields is always serializable");
     obj["spec"] =
         serde_json::to_value(&spec).expect("PersistentVolumeSpecFields is always serializable");
+}
+
+/// Cross-fill `spec.podCIDR` and `spec.podCIDRs` on a Node from each other when only one is
+/// set, matching upstream's `Convert_core_NodeSpec_To_v1_NodeSpec` /
+/// `Convert_v1_NodeSpec_To_core_NodeSpec` (pkg/apis/core/v1/conversion.go), which sync the two
+/// on every read/write: `podCIDR` is the legacy singular field, `podCIDRs` is the list that
+/// superseded it.
+///
+/// KCM's node-ipam-controller always writes both together, so this is a no-op on that path.
+/// It matters for any other client that sets only one field directly (kubectl patch/apply, SSA,
+/// an e2e helper): without it, the other field stays permanently empty, since both are frozen
+/// once non-empty (`validate_node_spec_immutable`).
+///
+/// Idempotent: if `podCIDRs` is already non-empty it is never overwritten from `podCIDR`, and
+/// vice versa — mirrors upstream, which only backfills the side that's still empty.
+fn default_node(obj: &mut serde_json::Value) {
+    let pod_cidr = obj["spec"]["podCIDR"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    let first_pod_cidr = obj["spec"]["podCIDRs"][0]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    match (pod_cidr, first_pod_cidr) {
+        (Some(cidr), None) => {
+            obj["spec"]["podCIDRs"] = serde_json::json!([cidr]);
+        }
+        (None, Some(first)) => {
+            obj["spec"]["podCIDR"] = serde_json::json!(first);
+        }
+        _ => {}
+    }
 }
 
 /// Default the pointer-typed fields of `CSIDriver.spec`, matching upstream
