@@ -745,6 +745,7 @@ pub(crate) async fn replace_resource<S: Store>(
         pv_spec_before_replace,
         storageclass_before_replace,
         node_before_replace,
+        old_object,
     ) = if needs_stored_read {
         let parsed = state
             .store
@@ -812,9 +813,10 @@ pub(crate) async fn replace_resource<S: Store>(
             pv_spec_before_replace,
             storageclass_before_replace,
             node_before_replace,
+            parsed,
         )
     } else {
-        (None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None)
     };
 
     // UID is immutable; a client's blind PUT (built from a locally-held copy that never
@@ -916,8 +918,8 @@ pub(crate) async fn replace_resource<S: Store>(
         })),
         dry_run: replace_query.is_dry_run(),
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, old_object.as_ref(), &admission_ctx).await?;
 
     // Restore the stored status: controllers write status via /status; a full PUT on
     // the main endpoint must preserve whatever the controller last wrote.
@@ -1577,6 +1579,9 @@ pub(crate) async fn do_patch<S: Store>(
         attempt += 1;
         let mut current = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        // Snapshotted before the patch mutates `current.body` in place below — this is the
+        // only pre-patch copy available to pass as old_object to the admission webhooks.
+        let old_object = current.body.clone();
 
         // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
         // snapshot data/binaryData/stringData before the patch is applied so the rejection
@@ -1918,8 +1923,9 @@ pub(crate) async fn do_patch<S: Store>(
             user_info: user_info.clone(),
             dry_run,
         };
-        current.body = run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
-        run_validating_webhooks(state, &current.body, None, &admission_ctx).await?;
+        current.body =
+            run_mutating_webhooks(state, current.body, Some(&old_object), &admission_ctx).await?;
+        run_validating_webhooks(state, &current.body, Some(&old_object), &admission_ctx).await?;
 
         // A user PATCH on an Endpoints object signals that the endpoints are now user-managed.
         // Clear the annotation the KCM endpoints-controller stamps; the mirroring controller
@@ -3361,6 +3367,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         stored_deletion_timestamp,
         stored_deletion_grace,
         object_existed,
+        old_object,
     ) = if needs_stored_read {
         let parsed = state
             .store
@@ -3483,9 +3490,12 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             deletion_timestamp,
             deletion_grace,
             parsed.is_some(),
+            parsed,
         )
     } else {
-        (None, None, None, None, None, None, None, None, None, false)
+        (
+            None, None, None, None, None, None, None, None, None, false, None,
+        )
     };
 
     // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
@@ -3625,8 +3635,8 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         })),
         dry_run: replace_query.is_dry_run(),
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, old_object.as_ref(), &admission_ctx).await?;
 
     if let Some(ref spec_before) = spec_before_replace {
         log_spec_replace(&ns, &name, &meta.kind, spec_before, &obj.body["spec"]);
@@ -19379,6 +19389,241 @@ mod tests {
             "AdmissionContext.dry_run must reflect the real ?dryRun=All flag; if this fails, \
              create_namespaced_resource went back to hardcoding dry_run: false and the \
              sideEffects:Some webhook's HTTP endpoint was wrongly invoked on a dry-run request"
+        );
+    }
+
+    // -- built-in UPDATE paths must thread the pre-update object as the mutating webhook's
+    // oldObject, not None --
+    //
+    // do_patch (PATCH) and replace_namespaced_resource (PUT) both read the current stored
+    // object before applying the client's change, but historically dropped it before calling
+    // run_mutating_webhooks, always passing None. A mutating webhook enforcing an immutability
+    // rule (e.g. "this field cannot change after creation") compares request.oldObject against
+    // request.object — with oldObject always null it has nothing to diff against and silently
+    // allows every mutation to pass through on every UPDATE. These two tests spin up a real
+    // mock webhook HTTP server and assert the captured AdmissionReview actually carries the
+    // pre-update object as oldObject, for one PATCH call site and one PUT call site (the two
+    // independent places old_object is captured in this file).
+
+    async fn spawn_capturing_mutating_webhook_server(
+        captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    ) -> String {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/mutate",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured);
+                async move {
+                    let uid = body["request"]["uid"].as_str().unwrap_or("").to_string();
+                    *captured.lock().unwrap() = Some(body);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": { "uid": uid, "allowed": true }
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = start_mock_admission_webhook_server(router).await;
+        format!("{base_url}/mutate")
+    }
+
+    async fn put_mutating_webhook_config(state: &AppState, name: &str, url: &str) {
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": { "name": name },
+            "webhooks": [{
+                "name": format!("{name}.test.example.com"),
+                "clientConfig": { "url": url },
+                "rules": [{
+                    "apiGroups": ["*"], "apiVersions": ["*"], "resources": ["configmaps"],
+                    "operations": ["UPDATE"]
+                }],
+                "sideEffects": "None",
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                &format!(
+                    "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/{name}"
+                ),
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// patch_namespaced_resource (merge-patch PATCH, do_patch's shared UPDATE path) must give
+    /// a mutating webhook the pre-patch object as oldObject — otherwise an immutability rule
+    /// comparing oldObject to the new object can never detect a change and silently no-ops on
+    /// every PATCH.
+    #[tokio::test]
+    async fn patch_namespaced_resource_threads_pre_patch_object_as_mutating_webhook_old_object() {
+        let state = make_state();
+
+        create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": { "name": "patch-old-object-cm", "namespace": "default" },
+                    "data": { "key": "before" }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed create must succeed: {e:?}"));
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_capturing_mutating_webhook_server(std::sync::Arc::clone(&captured)).await;
+        put_mutating_webhook_config(&state, "patch-old-object-mwc", &url).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+                "patch-old-object-cm".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::json!({ "data": { "key": "after" } }).to_string()),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("patch must succeed when the mutating webhook allows it: {e:?}")
+        });
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("mutating webhook must have been called on UPDATE");
+        assert!(
+            !review["request"]["oldObject"].is_null(),
+            "patch_namespaced_resource must pass the pre-patch object as old_object to the \
+             mutating webhook — a null oldObject means an immutability-enforcing webhook has \
+             nothing to compare the new object against and silently allows any change"
+        );
+        assert_eq!(
+            review["request"]["oldObject"]["data"]["key"], "before",
+            "old_object must carry the value that was actually stored before this patch, not \
+             the already-patched value"
+        );
+        assert_eq!(
+            review["request"]["object"]["data"]["key"], "after",
+            "object must carry the post-patch value the client actually requested"
+        );
+    }
+
+    /// replace_namespaced_resource (PUT UPDATE) must give a mutating webhook the pre-update
+    /// object as oldObject — same defect as the PATCH case above, but through the independent
+    /// old_object capture point replace_namespaced_resource uses (a full stored-object read,
+    /// not a pre-patch clone).
+    #[tokio::test]
+    async fn replace_namespaced_resource_threads_pre_update_object_as_mutating_webhook_old_object()
+    {
+        let state = make_state();
+
+        create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": { "name": "replace-old-object-cm", "namespace": "default" },
+                    "data": { "key": "before" }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed create must succeed: {e:?}"));
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_capturing_mutating_webhook_server(std::sync::Arc::clone(&captured)).await;
+        put_mutating_webhook_config(&state, "replace-old-object-mwc", &url).await;
+
+        replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+                "replace-old-object-cm".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": { "name": "replace-old-object-cm", "namespace": "default" },
+                    "data": { "key": "after" }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("replace must succeed when the mutating webhook allows it: {e:?}")
+        });
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("mutating webhook must have been called on UPDATE");
+        assert!(
+            !review["request"]["oldObject"].is_null(),
+            "replace_namespaced_resource must pass the pre-update object as old_object to the \
+             mutating webhook — a null oldObject means an immutability-enforcing webhook has \
+             nothing to compare the new object against and silently allows any change"
+        );
+        assert_eq!(
+            review["request"]["oldObject"]["data"]["key"], "before",
+            "old_object must carry the value that was actually stored before this replace, not \
+             the just-replaced value"
+        );
+        assert_eq!(
+            review["request"]["object"]["data"]["key"], "after",
+            "object must carry the post-replace value the client actually requested"
         );
     }
 

@@ -947,10 +947,11 @@ pub(crate) async fn replace_pod<S: Store>(
         })),
         dry_run: replace_query.is_dry_run(),
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    obj.body =
+        run_mutating_webhooks(&state, obj.body, Some(&stored_obj.body), &admission_ctx).await?;
     validate_pod_spec_immutable(&spec_before, &obj.body["spec"])
         .map_err(Status::unprocessable_entity)?;
-    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, Some(&stored_obj.body), &admission_ctx).await?;
 
     increment_pod_generation_if_spec_changed(&mut obj.body, &spec_before);
 
