@@ -106,7 +106,7 @@ mod tests {
             ])
             .inc();
         u7s_store::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-            .with_label_values(&["/registry/metrics-endpoint-test-touch/"])
+            .with_label_values(&["/registry/metrics-endpoint-test-touch/", "event"])
             .inc_by(0);
         // These two shard-labeled gauges have no handler-side `.set()` call (unlike
         // u7s_watch_broadcast_receivers, set every scrape from real store state) — they are
