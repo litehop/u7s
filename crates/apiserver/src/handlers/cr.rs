@@ -2599,7 +2599,7 @@ pub async fn replace_cr<S: Store>(
         })),
         dry_run: is_dry_run_header(&headers),
     };
-    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
     debug_assert_eq!(
         existing["metadata"]["uid"], obj["metadata"]["uid"],
         "old_object passed to run_validating_webhooks must be the same resource's pre-update \
@@ -3620,7 +3620,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         })),
         dry_run: is_dry_run_header(&headers),
     };
-    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
     debug_assert_eq!(
         existing["metadata"]["uid"], obj["metadata"]["uid"],
         "old_object passed to run_validating_webhooks must be the same resource's pre-update \
@@ -4128,7 +4128,7 @@ pub async fn patch_cr<S: Store>(
         })),
         dry_run: is_dry_run_header(&headers),
     };
-    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, Some(&old), &admission_ctx).await?;
     // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
     // (stored) value here, after both the patch body and any mutating webhook have had a
     // chance to touch it — this used to be a debug_assert_eq! that panicked in debug builds
@@ -4395,7 +4395,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         })),
         dry_run: is_dry_run_header(&headers),
     };
-    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, Some(&old), &admission_ctx).await?;
     // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
     // (stored) value here, after both the patch body and any mutating webhook have had a
     // chance to touch it — this used to be a debug_assert_eq! that panicked in debug builds
@@ -22225,6 +22225,183 @@ mod tests {
             review["request"]["oldObject"]["spec"]["destination"]["namespace"], "default",
             "old_object must carry the namespace the Application was created with, before \
              this strategic-merge patch"
+        );
+    }
+
+    async fn put_mutating_webhook_config(state: &AppState, name: &str, url: &str, op: &str) {
+        use u7s_store::Store;
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": { "name": name },
+            "webhooks": [{
+                "name": format!("{name}.test.example.com"),
+                "clientConfig": { "url": url },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": [op]}],
+                "sideEffects": "None",
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                &format!(
+                    "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/{name}"
+                ),
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// replace_cr (PUT, cluster-scoped) must give a mutating webhook the pre-update spec as
+    /// oldObject, not None. A CRD immutability rule enforced by a mutating webhook that
+    /// stamps or rejects based on `request.oldObject` vs `request.object` has nothing to
+    /// diff against with a null oldObject and silently allows every field to change on
+    /// every UPDATE.
+    #[tokio::test]
+    async fn replace_cr_threads_pre_update_spec_as_mutating_webhook_old_object() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "replace-mutating-old-object-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_capturing_admission_server(std::sync::Arc::clone(&captured)).await;
+        put_mutating_webhook_config(&state, "replace-mutating-old-object-mwc", &url, "UPDATE")
+            .await;
+
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name },
+                "spec": { "color": "red" }
+            })
+            .to_string(),
+        );
+        assert!(
+            replace_cr(
+                State(state.clone()),
+                Path((group, version, plural, name)),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                update_body,
+            )
+            .await
+            .is_ok(),
+            "replace must succeed when the mutating webhook allows it"
+        );
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("mutating webhook must have been called on UPDATE");
+        assert!(
+            !review["request"]["oldObject"].is_null(),
+            "replace_cr must pass the pre-update object as old_object to the mutating \
+             webhook — a null oldObject means an immutability-enforcing webhook has nothing \
+             to compare the new object against and silently allows any change"
+        );
+        assert_eq!(
+            review["request"]["oldObject"]["spec"]["color"], "blue",
+            "old_object must carry the color the widget was created with, before this \
+             replace — not the just-replaced value"
+        );
+        assert_eq!(
+            review["request"]["object"]["spec"]["color"], "red",
+            "object must still carry the post-replace value the client actually requested"
+        );
+    }
+
+    /// patch_cr (JSON merge patch, cluster-scoped) must give a mutating webhook the
+    /// pre-patch spec as oldObject. patch_cr deserializes the stored object straight into
+    /// the mutable `obj` that the patch then mutates in place, so without a deliberate
+    /// pre-patch snapshot threaded through to the mutating call there is nothing left to
+    /// pass once the patch has applied.
+    #[tokio::test]
+    async fn patch_cr_threads_pre_patch_spec_as_mutating_webhook_old_object() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "patch-mutating-old-object-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_capturing_admission_server(std::sync::Arc::clone(&captured)).await;
+        put_mutating_webhook_config(&state, "patch-mutating-old-object-mwc", &url, "UPDATE").await;
+
+        let patch_body = Bytes::from(serde_json::json!({ "spec": { "color": "red" } }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        assert!(
+            patch_cr(
+                State(state.clone()),
+                Path((group, version, plural, name)),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "cluster-scoped patch must succeed when the mutating webhook allows it"
+        );
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("mutating webhook must have been called on UPDATE");
+        assert!(
+            !review["request"]["oldObject"].is_null(),
+            "patch_cr must pass the pre-patch object as old_object to the mutating webhook, \
+             not None"
+        );
+        assert_eq!(
+            review["request"]["oldObject"]["spec"]["color"], "blue",
+            "old_object must carry the color the widget was created with, before this patch \
+             — if patch_cr snapshotted obj AFTER the patch mutates it in place, old_object \
+             and object would be identical and a webhook could never see what changed"
+        );
+        assert_eq!(
+            review["request"]["object"]["spec"]["color"], "red",
+            "object must still carry the post-patch value the client actually requested"
         );
     }
 
