@@ -327,7 +327,18 @@ pub(crate) async fn list_resource<S: Store>(
     }
 
     if table {
-        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
+        let api_version = super::table::table_api_version(accept);
+        let continue_token = resp.continue_key.map(|key| {
+            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
+        });
+        let built = super::table::build_table(&group, &plural, items);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            Some(&list_revision.to_string()),
+            continue_token,
+        ))
+        .into_response());
     }
 
     let body = build_list_response(
@@ -387,7 +398,18 @@ pub(crate) async fn get_resource<S: Store>(
     // decode the response and falls back to printing only NAME/AGE (list_resource already
     // handles this for LIST — see above).
     if super::table::wants_table(accept) {
-        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
+        let resource_version = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_string);
+        let api_version = super::table::table_api_version(accept);
+        let built = super::table::build_table(&group, &plural, vec![obj]);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            resource_version.as_deref(),
+            None,
+        ))
+        .into_response());
     }
 
     Ok(crate::content_type::negotiated_response(accept, obj))
@@ -2768,7 +2790,18 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
     }
 
     if table {
-        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
+        let api_version = super::table::table_api_version(accept);
+        let continue_token = resp.continue_key.map(|key| {
+            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
+        });
+        let built = super::table::build_table(&group, &plural, items);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            Some(&list_revision.to_string()),
+            continue_token,
+        ))
+        .into_response());
     }
 
     let body = build_list_response(
@@ -2833,7 +2866,18 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
     // decode the response and falls back to printing only NAME/AGE (list_namespaced_resource
     // already handles this for LIST — see above).
     if super::table::wants_table(accept) {
-        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
+        let resource_version = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_string);
+        let api_version = super::table::table_api_version(accept);
+        let built = super::table::build_table(&group, &plural, vec![obj]);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            resource_version.as_deref(),
+            None,
+        ))
+        .into_response());
     }
 
     Ok(crate::content_type::negotiated_response(accept, obj))

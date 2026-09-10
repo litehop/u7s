@@ -2232,7 +2232,18 @@ pub async fn list_cr<S: Store>(
     }
 
     if super::table::wants_table(accept) {
-        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
+        let api_version = super::table::table_api_version(accept);
+        let continue_token = resp.continue_key.map(|key| {
+            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
+        });
+        let built = super::table::build_table(&group, &plural, items);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            Some(&list_revision.to_string()),
+            continue_token,
+        ))
+        .into_response());
     }
 
     let body = super::generic::build_list_response(
@@ -2301,10 +2312,16 @@ pub async fn get_cr<S: Store>(
                 return Ok(Json(to_partial_object_metadata(&converted_obj)).into_response());
             }
             if super::table::wants_table(accept) {
-                return Ok(Json(super::table::build_table(
-                    &group,
-                    &plural,
-                    vec![converted_obj],
+                let resource_version = converted_obj["metadata"]["resourceVersion"]
+                    .as_str()
+                    .map(str::to_string);
+                let api_version = super::table::table_api_version(accept);
+                let built = super::table::build_table(&group, &plural, vec![converted_obj]);
+                return Ok(Json(super::table::finalize_table(
+                    built,
+                    &api_version,
+                    resource_version.as_deref(),
+                    None,
                 ))
                 .into_response());
             }
@@ -2331,7 +2348,18 @@ pub async fn get_cr<S: Store>(
         return Ok(Json(to_partial_object_metadata(&obj)).into_response());
     }
     if super::table::wants_table(accept) {
-        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
+        let resource_version = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_string);
+        let api_version = super::table::table_api_version(accept);
+        let built = super::table::build_table(&group, &plural, vec![obj]);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            resource_version.as_deref(),
+            None,
+        ))
+        .into_response());
     }
     Ok(Json(obj).into_response())
 }
@@ -3216,7 +3244,18 @@ pub async fn list_cr_namespaced<S: Store>(
     }
 
     if super::table::wants_table(accept) {
-        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
+        let api_version = super::table::table_api_version(accept);
+        let continue_token = resp.continue_key.map(|key| {
+            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
+        });
+        let built = super::table::build_table(&group, &plural, items);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            Some(&list_revision.to_string()),
+            continue_token,
+        ))
+        .into_response());
     }
 
     let body = super::generic::build_list_response(
@@ -3285,10 +3324,16 @@ pub async fn get_cr_namespaced<S: Store>(
                 return Ok(Json(to_partial_object_metadata(&converted_obj)).into_response());
             }
             if super::table::wants_table(accept) {
-                return Ok(Json(super::table::build_table(
-                    &group,
-                    &plural,
-                    vec![converted_obj],
+                let resource_version = converted_obj["metadata"]["resourceVersion"]
+                    .as_str()
+                    .map(str::to_string);
+                let api_version = super::table::table_api_version(accept);
+                let built = super::table::build_table(&group, &plural, vec![converted_obj]);
+                return Ok(Json(super::table::finalize_table(
+                    built,
+                    &api_version,
+                    resource_version.as_deref(),
+                    None,
                 ))
                 .into_response());
             }
@@ -3315,7 +3360,18 @@ pub async fn get_cr_namespaced<S: Store>(
         return Ok(Json(to_partial_object_metadata(&obj)).into_response());
     }
     if super::table::wants_table(accept) {
-        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
+        let resource_version = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_string);
+        let api_version = super::table::table_api_version(accept);
+        let built = super::table::build_table(&group, &plural, vec![obj]);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            resource_version.as_deref(),
+            None,
+        ))
+        .into_response());
     }
     Ok(Json(obj).into_response())
 }

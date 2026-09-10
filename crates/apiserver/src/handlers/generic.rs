@@ -523,7 +523,7 @@ fn unix_now() -> u64 {
 /// every page of one pagination pass — the store's live global revision otherwise drifts
 /// upward between pages (other resources being written concurrently), which would fail
 /// that assertion even though the actual paged items are correct.
-fn encode_continue(key: &str, revision: u64, signing_key: &[u8; 32]) -> String {
+pub(crate) fn encode_continue(key: &str, revision: u64, signing_key: &[u8; 32]) -> String {
     use base64::Engine;
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;

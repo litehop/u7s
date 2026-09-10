@@ -50,9 +50,10 @@ pub(crate) async fn core_list_resource<S: Store>(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if let Some(version) = super::table::table_accept_version(accept) {
-            if version != "v1" {
+            if !super::table::is_supported_table_version(version) {
                 return Err(Status::not_acceptable(format!(
-                    "Table version \"{version}\" is not supported; only meta.k8s.io/v1 is accepted"
+                    "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                     meta.k8s.io/v1beta1 are accepted"
                 )));
             }
         }
@@ -231,7 +232,18 @@ pub(crate) async fn core_list_resource<S: Store>(
         // kubectl can't decode the response and falls back to printing only NAME/AGE instead of
         // the usual READY/STATUS/RESTARTS/AGE columns.
         if table {
-            return Ok(Json(super::table::build_table("", "pods", items)).into_response());
+            let api_version = super::table::table_api_version(accept);
+            let continue_token = resp.continue_key.map(|key| {
+                super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
+            });
+            let built = super::table::build_table("", "pods", items);
+            return Ok(Json(super::table::finalize_table(
+                built,
+                &api_version,
+                Some(&list_revision.to_string()),
+                continue_token,
+            ))
+            .into_response());
         }
 
         let body = build_list_response(
@@ -968,11 +980,11 @@ mod tests {
         );
     }
 
-    /// A Table request for a v1beta1 Table (long deprecated) on the cross-namespace pods LIST
-    /// must be rejected the same way the namespaced list_pods already rejects it — a stale
-    /// client must be told the format isn't supported rather than silently downgraded.
+    /// `kubectl get pods -A -o wide` and stale clients still negotiate `as=Table;v=v1beta1` on
+    /// the cross-namespace pods LIST — rejecting it with 406 (the pre-fix behavior) breaks
+    /// them even though u7s's own Table shape is identical between v1 and v1beta1.
     #[tokio::test]
-    async fn core_list_resource_cross_namespace_pods_with_v1beta1_table_accept_returns_406() {
+    async fn core_list_resource_cross_namespace_pods_with_v1beta1_table_accept_returns_table() {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use axum::routing::get;
@@ -1010,7 +1022,20 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "v1beta1 Table must be accepted, not 406 — this is the same request \
+             `kubectl get pods -A` issues against a client still negotiating v1beta1"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            v["apiVersion"], "meta.k8s.io/v1beta1",
+            "the Table response must echo the negotiated groupVersion, not hard-code v1"
+        );
     }
 
     /// metrics-server's cluster-wide Pod-metadata informer negotiates
