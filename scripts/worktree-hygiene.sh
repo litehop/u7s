@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Worktree hygiene loop body -- see the bootstrap doc's worktree-hygiene
 # section for WHEN this runs (60m cron) and WHY it's auto-run instead of
-# approval-gated. This file is the WHAT: the mechanical STEP A-E body,
+# approval-gated. This file is the WHAT: the mechanical STEP A-F body,
 # extracted out of that doc so a routine hygiene tick no longer costs an
 # orchestrator model turn parsing `ps`/`git` output by hand.
 #
@@ -10,11 +10,11 @@
 # to run at all without EITHER this or --no-live-workers below (see main()):
 # dir-existence and merge-state checks alone already proved insufficient to
 # tell a live worker's branch/worktree apart from a genuinely stale one, and
-# STEP A/C/D are destructive (process kill, branch delete).
+# STEP A/C/D/F are destructive (process kill, branch delete).
 #
 # --no-live-workers: an affirmative alternative to --live-agents for the
 # idle state -- the caller has confirmed via ListAgents that ZERO
-# worker/agent-* subagents are running, so STEP A/C/D run with an empty
+# worker/agent-* subagents are running, so STEP A/C/D/F run with an empty
 # live-protection set. Mutually exclusive with --live-agents (passing both
 # is a usage error). Deliberately distinct from an empty/omitted
 # --live-agents value, which still refuses to run (see main()) -- without
@@ -76,22 +76,32 @@
 #   backstop for check-findings-closed-bead-refs.sh's CI-side check, which
 #   can only see the git-tracked bd export and so misses a bead closed
 #   since the export's last commit, or pruned after closing.
+# STEP F: delete `origin/worker/agent-<id>` branches that have no local
+#   trace at all -- a crashed worker (before ever opening a PR) or a
+#   closed-unmerged PR leaves a remote branch that nothing else ever
+#   deletes (the merge queue only deletes a head branch ON MERGE), so these
+#   accumulate on origin indefinitely. Enumerated via `ls-remote` against
+#   origin directly rather than local `refs/remotes/origin/*` -- unlike
+#   STEP C/D, this branch may have no local ref to iterate at all. Guarded
+#   exactly like STEP C/D: an in-flight worker's branch (its agent-id is in
+#   --live-agents) and any branch with an open PR are never touched.
 #
 # Exit codes: 0 = clean tick, nothing found. Non-zero = an anomaly for the
 # mayor to look at -- currently only STEP A's kill-verify failure (a process
 # that survives its kill signal may be zombied/reparented and needs manual
-# investigation, not an automatic retry); STEP B-D failures surface via this
-# script's own `set -e` (a `git fetch`/`branch` failure aborts the run with
-# git's exit code, which is itself already non-zero). STEP E never
-# contributes to the exit code -- it only reports, it never mutates. A
-# missing/empty --live-agents flag with no --no-live-workers fallback (or
-# passing both together) exits 2 before any step runs (see main()).
+# investigation, not an automatic retry); STEP B-D and F failures surface
+# via this script's own `set -e` (a `git fetch`/`branch`/`push` failure
+# aborts the run with git's exit code, which is itself already non-zero).
+# STEP E never contributes to the exit code -- it only reports, it never
+# mutates. A missing/empty --live-agents flag with no --no-live-workers
+# fallback (or passing both together) exits 2 before any step runs (see
+# main()).
 #
-# DRY_RUN=1 turns every destructive command (pkill, git branch -D/-d) into a
-# logged no-op via run_cmd() -- same idiom the sibling merge/dashboard
-# script uses for its own dry-run gate -- so this script's test suite
-# (scripts/test-worktree-hygiene-logic.sh) never kills a real process or
-# deletes a real branch.
+# DRY_RUN=1 turns every destructive command (pkill, git branch -D/-d, git
+# push origin --delete) into a logged no-op via run_cmd() -- same idiom the
+# sibling merge/dashboard script uses for its own dry-run gate -- so this
+# script's test suite (scripts/test-worktree-hygiene-logic.sh) never kills a
+# real process or deletes a real branch.
 #
 # Testability: `worktree-hygiene.sh __call <fn> [args...]` invokes a single
 # function from this file and exits, the same convention used across
@@ -109,7 +119,7 @@ run_cmd() {
 }
 
 # ---------------------------------------------------------------------------
-# --live-agents liveness guard, shared by STEP A/C/D. The mayor's own
+# --live-agents liveness guard, shared by STEP A/C/D/F. The mayor's own
 # ListAgents call is the ONLY reliable signal that an in-process worker
 # sub-agent is still running: a sub-agent cannot call ListAgents on itself,
 # and `claude agents --json` doesn't enumerate in-process subagents (both
@@ -451,7 +461,7 @@ step_d_gone_upstream_branches() {
 # exported yet". Live bd has no such staleness excuse, so this step
 # treats "no live record at all" as ALSO stale, unlike the CI check.
 #
-# WARN-ONLY, not auto-delete: unlike STEP A-D (process kills, worktree
+# WARN-ONLY, not auto-delete: unlike STEP A-D/F (process kills, worktree
 # metadata pruning, branch deletion -- none of which touch the tracked
 # tree or need a commit), deleting a findings/*.md file requires
 # committing that deletion. An unattended cron sweep committing tree
@@ -501,6 +511,42 @@ step_e_stale_findings() {
   done <<< "$findings"
 }
 
+# ---------------------------------------------------------------------------
+# STEP F -- orphaned origin/worker/agent-* branches.
+#
+# The merge queue deletes a PR's head branch ON MERGE, and STEP C above
+# deletes a stale LOCAL worker/agent-* branch -- but neither ever touches a
+# branch that only exists on origin with no local trace at all: a crashed
+# worker (dead before it ever opened a PR) or a closed-unmerged PR (closing
+# a PR does not delete its branch) both leave exactly that. Nothing else in
+# this script, or in the merge queue, ever revisits it, so these accumulate
+# on origin indefinitely (observed: ~30 orphaned origin/worker/agent-*
+# branches before this step existed).
+# ---------------------------------------------------------------------------
+
+# worker/agent-<id> branch names that currently exist on origin, queried
+# directly via `ls-remote` rather than local refs/remotes/origin/* -- unlike
+# STEP C/D's targets, a crashed worker's branch may have no local ref at all
+# to iterate (its worktree, and often its local branch, are already gone).
+origin_worker_branches() {
+  local repo_root="$1"
+  git -C "$repo_root" ls-remote --heads origin 'worker/agent-*' 2>/dev/null | awk '{print $2}' | sed -E 's#^refs/heads/##'
+}
+
+step_f_orphaned_origin_branches() {
+  local branch open_pr_branches
+  # Fetched once up front, same reasoning as STEP C: a `gh` failure here
+  # aborts the whole tick via this script's own `set -e` rather than
+  # deleting a branch without the PR check that guards it.
+  open_pr_branches=$(gh pr list -R litehop/u7s --state open --json headRefName --jq '.[].headRefName')
+  while IFS= read -r branch; do
+    [ -n "$branch" ] || continue
+    is_live_agent_branch "$branch" "$LIVE_AGENTS" && continue
+    has_open_pr "$branch" "$open_pr_branches" && continue
+    run_cmd git -C "$REPO_ROOT" push origin --delete "$branch"
+  done < <(origin_worker_branches "$REPO_ROOT")
+}
+
 main() {
   local live_agents_provided=0 no_live_workers=0
   while [ "$#" -gt 0 ]; do
@@ -529,15 +575,16 @@ main() {
   fi
 
   if [ "$no_live_workers" -eq 1 ]; then
-    # Affirmative idle-state declaration: run STEP A/C/D with an empty
+    # Affirmative idle-state declaration: run STEP A/C/D/F with an empty
     # live-protection set. This does NOT lower the staleness bar: STEP C's
     # merge-state and open-PR guards apply regardless of LIVE_AGENTS'
     # contents (see the file header), so a branch with an open, unmerged
     # PR is still preserved by STEP C even with zero live workers. STEP D
     # needs no such guard -- its scope (branches with a literally `[gone]`
     # tracked upstream) already excludes any branch an open PR keeps alive.
+    # STEP F's own open-PR guard applies the same way as STEP C's.
     LIVE_AGENTS=""
-  # Fail-safe, not a default: STEP A/C/D are destructive (process kill,
+  # Fail-safe, not a default: STEP A/C/D/F are destructive (process kill,
   # branch delete), and dir-existence/merge-state alone already proved
   # insufficient to distinguish a live worker from a stale one (the bug
   # this script exists to close). Refusing outright on a missing flag --
@@ -552,7 +599,7 @@ main() {
   # and must still refuse -- --no-live-workers above is the only way to
   # affirmatively declare zero live workers.
   elif [ "$live_agents_provided" -ne 1 ] || [ -z "$(normalize_live_agents "$LIVE_AGENTS")" ]; then
-    echo "worktree-hygiene: refusing to run -- --live-agents <comma-separated-agent-ids> (non-empty after trimming whitespace) or --no-live-workers is required. Without one there is no way to tell a live worker's branch/worktree apart from a stale one, and STEP A/C/D are destructive." >&2
+    echo "worktree-hygiene: refusing to run -- --live-agents <comma-separated-agent-ids> (non-empty after trimming whitespace) or --no-live-workers is required. Without one there is no way to tell a live worker's branch/worktree apart from a stale one, and STEP A/C/D/F are destructive." >&2
     exit 2
   fi
 
@@ -562,6 +609,7 @@ main() {
   step_c_stale_worker_branches
   step_d_gone_upstream_branches
   step_e_stale_findings
+  step_f_orphaned_origin_branches
   exit "$rc"
 }
 
