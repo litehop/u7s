@@ -158,7 +158,7 @@ Long-running arcs tracked in bd, not tied to a single gate.
 | EPIC | Priority | Status | Trigger / un-defer condition |
 |---|---|---|---|
 | `mayor-u6ju` | P3 | DEFERRED | Gate 5 probes demonstrate a real Server-Side Apply requirement — not pursued speculatively given SSA's scope |
-| `mayor-8qcaw` | P4 | DEFERRED | Backlog otherwise clears OR DRA conformance failure traces to claim allocation |
+| `mayor-8qcaw` | P2 | OPEN | DRA claim allocation: CEL selector evaluation, allocation algorithm, deallocation controller (scouts complete, verdict B) |
 
 Closed: `mayor-axi12` (superseded), `mayor-0bd14` (all children closed).
 
