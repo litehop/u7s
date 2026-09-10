@@ -130,13 +130,18 @@ existing `json_name`-aware field-naming logic (`proto_exceptions.rs:409`, the
 ds8hb/ohh8o hand-wrote, just machine-generated. This still has to add the
 missing decode direction for the ~183 encode-only types, design the
 merge/passthrough logic the current snapshot-only walker has never needed
-(§4), and re-derive every zero/omitempty judgment call against upstream Go
-pointer-ness (the same audit the replicas bug proves is easy to get wrong) —
-and even then it only covers fields known to the *vendored* `.proto` at
-generation time, landing anything else in `rest` for exactly the reason a
-hand-written struct's `rest` field already does. Generation buys nothing on
-the one part of the work that matters: choosing *which* fields the apiserver
-reasons about is a judgment call a schema walker cannot make. A generated
+(§4), and re-derive every zero/omitempty field's determination — transcribed
+from upstream Go pointer-ness / `+optional`, never invented; the same audit
+the replicas bug proves is easy to get wrong — and even then it only covers
+fields known to the *vendored* `.proto` at generation time, landing anything
+else in `rest` for exactly the reason a hand-written struct's `rest` field
+already does. Generation buys nothing on the one part of the work that
+matters: which fields carry upstream-defined server-side semantics
+(defaulting, validation, immutability, status stamping, subresource routing)
+is fixed by upstream Kubernetes, not by us; a schema walker cannot derive it
+from the `.proto` because that information lives in upstream's Go behavior,
+not the wire schema — so codegen does not reduce this upstream-fidelity
+work. A generated
 struct either types everything (defeating "minimal field," multiplying the
 omitempty-audit burden across every field instead of ~5-10 per type) or
 types nothing (back to hand-picking, per type, exactly what ds8hb/ohh8o
@@ -159,9 +164,10 @@ No OpenAPI/swagger schema is vendored anywhere in this repo, unlike the 28
 this option needs a brand-new vendoring pipeline (fetch, pin, and re-vendor a
 multi-MB schema document per k8s version bump) before any codegen work
 starts — on top of sharing (a)'s two hard problems: field selection still
-needs human judgment, and unknown-field passthrough still needs a
-hand-designed `rest` mechanism, since OpenAPI's `additionalProperties`
-doesn't map onto Rust structs automatically either.
+needs the same upstream-semantics reading (not derivable from OpenAPI
+either), and unknown-field passthrough still needs a hand-designed `rest`
+mechanism, since OpenAPI's `additionalProperties` doesn't map onto Rust
+structs automatically either.
 
 **(d) Adopt an existing crate** (e.g. `pbjson`/`pbjson-build`, which
 generates serde impls for the canonical protobuf-JSON mapping). The canonical
@@ -170,11 +176,23 @@ protobuf JSON has always had, so it fails definition-point (2) regardless,
 and it adds a new external dependency against the project's
 minimal-dependency stance, on top of the bead's explicit "no k8s-openapi."
 
-**Only (a) is mechanically sound, and it saves nothing on the field-selection
-judgment that is the actual work, while adding real new cost: decode-direction
+**Only (a) is mechanically sound, and it saves nothing on the per-field
+upstream-fidelity work (reading each field's server-side semantics off
+upstream) that is the actual work, while adding real new cost: decode-direction
 backfill, a not-yet-designed merge/passthrough capability, and a fresh
 per-field omitempty-vs-pointer audit across a much larger field surface than
 the ~5-10 fields per type the apiserver actually reasons about.**
+
+**Safety invariant of the hand-written pattern:** it types the fields with
+upstream server-side semantics and carries `#[serde(flatten)] rest:
+serde_json::Value` for everything else. `rest` preserves every
+non-enumerated field verbatim, so no field is ever dropped by omission —
+under-enumerating the reasoned-about set costs active validation on that
+field, never data loss. The only determination is *which* fields to
+actively reason about, read off upstream — the opposite of the codegen's
+lossy zero-collapse (`.filter(|&v| v != 0)`, `codegen.rs:1293-1294`) that
+fabricated `spec.replicas=0` in `6877c906`. This is why hand-written
+minimal-field structs are safe where the codegen is not.
 
 ## 4. Effort estimate to build the codec (mechanism (a)) anyway
 
@@ -201,7 +219,7 @@ the ~5-10 fields per type the apiserver actually reasons about.**
   `6877c906` replicas bug) the whole typed-status effort exists to prevent —
   building a bigger, more mechanical system to solve it is fighting the
   problem with more surface area for the same class of bug, verified only by
-  re-deriving the same per-field judgment calls by hand anyway.
+  re-deriving the same per-field upstream determinations by hand anyway.
 - **Coverage if it worked**: all ~24 built-in status kinds plus, in
   principle, spec/full-object/defaults/discovery — genuinely broader than the
   hand-written path's status-only scope. See §5 for why that breadth doesn't
@@ -215,7 +233,7 @@ the ~5-10 fields per type the apiserver actually reasons about.**
 | | Hand-written `types.rs` (m10di) | Codec (a) |
 |---|---|---|
 | Precedent | Shipped twice: mayor-ds8hb (19 structs, ~250 LOC, `defaults.rs`), mayor-ohh8o (`discovery.rs`); 2 of the 3 currently-typed statuses (`NamespaceStatus` `types.rs:636-644`, `CertificateSigningRequestStatus` `types.rs:750-764`) already use exactly this pattern | None — would be new |
-| Scope of field-selection judgment | Same either way — a human decides which ~5-10 fields per type the apiserver reasons about | Same, cannot be automated (see §3) |
+| Scope of field-selection determination | Same either way — which ~5-10 fields per type have upstream server-side semantics is read off upstream, not decided by us | Same; codegen can't derive it from the schema (see §3) |
 | Unknown-field passthrough | Free — `#[serde(flatten)] rest: serde_json::Value` is one line per struct, already proven | Has to design + build the same mechanism from scratch inside a walker that has never needed it |
 | Decode direction | Comes free with `#[derive(Deserialize)]` | ~183 of 201 existing adapters need it built |
 | Merge/PATCH-null semantics | Comes free — serde `Option<T>` + the existing `reject_non_object_status`/RFC 7396 handling at the handler boundary already does this | Not designed at all in the walker today |
@@ -230,8 +248,9 @@ the ~5-10 fields per type the apiserver actually reasons about.**
 **Hand-write the ~23 status structs now** (mayor-m10di's own plan), and do
 **not** make the codec a prerequisite. The codec is not "the same work,
 automated" — it is a materially larger, higher-risk project that still
-requires the one judgment call (which fields matter) that can't be automated,
-while adding a merge-safety and passthrough design the existing codegen
+requires the one determination (which fields carry upstream server-side
+semantics) that can't be automated from the schema, while adding a
+merge-safety and passthrough design the existing codegen
 machinery has never needed and doesn't have. Compose with codegen later only
 if the *protobuf wire-format* Phase-4.x EPIC's own scope grows toward
 something the JSON boundary could reuse cheaply — not before, and not as a
