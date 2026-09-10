@@ -61,6 +61,24 @@ host_kill_pattern_for() {
   esac
 }
 
+# Pure: lists still-alive PIDs matching any component's host_kill_pattern_for
+# pattern for this workdir, one "component pid" line per survivor. The kill
+# attempts above are all '... || true': pkill's exit code can't tell "matched
+# and killed" apart from "nothing matched", so without re-checking here, an
+# apiserver-less scheduler+konnectivity-server orphan pair whose pid files
+# were stale/absent (relying entirely on the cmdline fallback) or a process
+# that ignores SIGTERM could survive while this script still reports success.
+host_process_survivors() {
+  local workdir="$1"
+  local component pattern surv_pid
+  for component in apiserver scheduler konnectivity-server; do
+    pattern="$(host_kill_pattern_for "$component" "$workdir")"
+    for surv_pid in $(pgrep -f "$pattern" 2>/dev/null || true); do
+      printf '%s %s\n' "$component" "$surv_pid"
+    done
+  done
+}
+
 # SIGKILL is not synchronous: 'kill -0 $pid' checked immediately after
 # 'kill -9 $pid' can still report the PID alive for a brief moment before the
 # kernel finishes tearing the process down (confirmed live), which would
@@ -222,6 +240,25 @@ main() {
   # reject that stale cert with "certificate signed by unknown authority ... ECDSA
   # verification failure" — kill it before regenerating certs, scoped by cmdline.
   pkill -f "$(host_kill_pattern_for konnectivity-server "$WORKDIR")" 2>/dev/null || true
+
+  # Verify-then-report: SIGTERM is not synchronous, so poll briefly (same
+  # pattern as pid_still_alive_after_kill below) before concluding a survivor
+  # is real. Never print "Done" / exit 0 while a targeted process is still
+  # alive — that's exactly the silent-success bug this guards against.
+  local survivors=""
+  local _try
+  for _try in 1 2 3 4 5; do
+    survivors="$(host_process_survivors "$WORKDIR")"
+    [ -z "$survivors" ] && break
+    sleep 0.2
+  done
+  if [ -n "$survivors" ]; then
+    echo "[reset] ERROR: host process(es) survived the kill attempt:" >&2
+    while read -r surv_component surv_pid; do
+      echo "[reset]   ${surv_component} (PID ${surv_pid}) still alive" >&2
+    done <<< "$survivors"
+    exit 1
+  fi
 
   if [ "$HOST_ONLY" -eq 1 ]; then
     echo "[reset] --host-only: skipping \$WORKDIR wipe and VM teardown"
