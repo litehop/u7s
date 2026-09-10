@@ -1435,6 +1435,24 @@ pub(crate) async fn do_patch<S: Store>(
         } else {
             None
         };
+
+        // Admission webhook pipeline (mutating then validating). An SSA-create is a create
+        // just like create_resource/create_namespaced_resource — without this, `kubectl apply
+        // --server-side` onto a not-yet-existing name of ANY built-in resource (including
+        // Namespace, whose PATCH SSA branch delegates here) skipped admission entirely.
+        let admission_ctx = AdmissionContext {
+            group,
+            version,
+            resource: plural,
+            name,
+            namespace: ns,
+            operation: "CREATE",
+            user_info: user_info.clone(),
+            dry_run,
+        };
+        obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
+        run_validating_webhooks(state, &obj.body, None, &admission_ctx).await?;
+
         if dry_run {
             // Dry-run: validation passed; return the would-be created object without persisting.
             if let Some(fm) = field_manager {
@@ -1540,6 +1558,25 @@ pub(crate) async fn do_patch<S: Store>(
                     )
                     .map_err(Status::forbidden)?;
                 }
+
+                // Admission webhook pipeline (mutating then validating) — same rationale as
+                // the primary create path above: this branch lost the create/create race but
+                // is still a create from the caller's perspective, so it must not skip
+                // admission just because another writer's create won first.
+                let admission_ctx = AdmissionContext {
+                    group,
+                    version,
+                    resource: plural,
+                    name,
+                    namespace: ns,
+                    operation: "CREATE",
+                    user_info: user_info.clone(),
+                    dry_run,
+                };
+                current.body =
+                    run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
+                run_validating_webhooks(state, &current.body, None, &admission_ctx).await?;
+
                 if let Some(fm) = field_manager {
                     let api_ver = current.body["apiVersion"]
                         .as_str()
@@ -7611,6 +7648,100 @@ mod tests {
             "status.used must reflect the ConfigMap created via SSA apply-create — without \
              do_patch's SSA-create branch calling update_quota_status, this stays \
              unset/stale even though the object itself was correctly admitted and persisted"
+        );
+    }
+
+    /// `kubectl apply --server-side` onto a not-yet-existing name calls into do_patch's
+    /// SSA-create branch — a validating webhook that denies CREATE must reject it, and the
+    /// object must never be created. Without this fix, do_patch's SSA-create branch called
+    /// neither run_mutating_webhooks nor run_validating_webhooks at all, so ANY built-in
+    /// resource created via `kubectl apply --server-side` onto a missing name skipped
+    /// admission entirely — this is the shared convergence point for every resource type
+    /// (including Namespace, covered by its own test in namespaces.rs).
+    #[tokio::test]
+    async fn patch_namespaced_resource_ssa_create_invokes_validating_admission_when_missing() {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": false,
+                        "status": {"code": 403, "message": "denied by test webhook"}
+                    }
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_admission_webhook_server(router).await;
+
+        let state = make_state();
+        let ns = "default";
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating-ssa-create-cm"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{base_url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["configmaps"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-ssa-create-cm",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-ssa-denied", "namespace": ns },
+            "data": { "k": "v" }
+        });
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+                "cm-ssa-denied".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "SSA-create of a not-yet-existing ConfigMap must be rejected when validating \
+             webhook denies — without do_patch's SSA-create fix, admission was bypassed \
+             entirely and the object was silently created"
+        );
+
+        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "cm-ssa-denied");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "denied SSA-create must not persist the ConfigMap"
         );
     }
 
