@@ -2522,9 +2522,11 @@ impl Store for SqliteStore {
                         // The broadcast channel dropped messages because this receiver was too slow.
                         // Labeled by prefix_bucket, not the raw prefix: a namespace-scoped watch
                         // prefix includes the namespace segment, which would otherwise mint one
-                        // time series per namespace a long conformance run ever creates.
+                        // time series per namespace a long conformance run ever creates. Labeled
+                        // channel="event" (not "bookmark") since this arm's Lagged always drives
+                        // the O(ring) recovery scan below — see WATCH_BROADCAST_LAGGED_TOTAL's doc.
                         crate::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-                            .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned)])
+                            .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned), "event"])
                             .inc_by(n);
                         // Attempt recovery: re-subscribe (to capture all future events) then
                         // re-scan the ring buffer for events missed during the lag.  This avoids
@@ -2697,11 +2699,12 @@ impl Store for SqliteStore {
                         // KCM's EnsureReady() only needs eventual convergence (see
                         // GLOBAL_BOOKMARK_DEBOUNCE's doc) — the next bookmark or matching event on
                         // this prefix always re-establishes bookmark_rv at a revision at least as
-                        // high as any that were dropped here. Still counted under the same metric
-                        // as `rx`'s Lagged arm: both signal the same operator-facing condition
-                        // (this watcher's broadcast receiver fell behind).
+                        // high as any that were dropped here. Counted under the same counter as
+                        // `rx`'s Lagged arm but with channel="bookmark", NOT channel="event": both
+                        // signal a slow watcher, but only channel="event" implies a recovery scan
+                        // ran — collapsing the two onto one series would make that inference wrong.
                         crate::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-                            .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned)])
+                            .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned), "bookmark"])
                             .inc_by(n);
                         tracing::debug!(
                             prefix = %prefix_owned,
@@ -5501,10 +5504,10 @@ mod tests {
     }
 
     /// A real `RecvError::Lagged(n)` must add exactly `n` to
-    /// `u7s_watch_broadcast_lagged_total{prefix}` — this is the currently-discarded `_n` that
-    /// motivated the metric: without counting it, an operator has no way to see that a watcher
-    /// fell behind and silently missed events (recovered via ring-buffer catchup or a 410, but
-    /// only after the fact).
+    /// `u7s_watch_broadcast_lagged_total{prefix,channel="event"}` — this is the
+    /// currently-discarded `_n` that motivated the metric: without counting it, an operator has
+    /// no way to see that a watcher fell behind and silently missed events (recovered via
+    /// ring-buffer catchup or a 410, but only after the fact).
     #[tokio::test]
     async fn broadcast_lag_increments_lagged_total_by_exact_missed_count() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
@@ -5516,7 +5519,7 @@ mod tests {
         futures_util::pin_mut!(stream);
 
         let before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-            .with_label_values(&[prefix])
+            .with_label_values(&[prefix, "event"])
             .get();
 
         // Write one more than the broadcast capacity so the unpolled subscriber is guaranteed
@@ -5537,7 +5540,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
 
         let after = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-            .with_label_values(&[prefix])
+            .with_label_values(&[prefix, "event"])
             .get();
         assert!(
             after > before,
@@ -5567,7 +5570,7 @@ mod tests {
         futures_util::pin_mut!(stream);
 
         let before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-            .with_label_values(&[prefix])
+            .with_label_values(&[prefix, "event"])
             .get();
 
         // Just over half BROADCAST_CAPACITY: 1 send/write stays comfortably under capacity, but
@@ -5584,7 +5587,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
 
         let after = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-            .with_label_values(&[prefix])
+            .with_label_values(&[prefix, "event"])
             .get();
         assert_eq!(
             after, before,
@@ -5622,7 +5625,7 @@ mod tests {
         futures_util::pin_mut!(stream_b);
 
         let before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-            .with_label_values(&[bucket])
+            .with_label_values(&[bucket, "event"])
             .get();
 
         let writes = BROADCAST_CAPACITY as u64 + 1;
@@ -5637,12 +5640,106 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(200), stream_b.next()).await;
 
         let after = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-            .with_label_values(&[bucket])
+            .with_label_values(&[bucket, "event"])
             .get();
         assert!(
             after > before,
             "two different namespace-scoped watches under the same resource type must \
              accumulate onto the SAME prefix_bucket series; before={before} after={after}"
+        );
+    }
+
+    /// A bookmark-channel `Lagged` must increment ONLY `channel="bookmark"`, and a real-event
+    /// `Lagged` must increment ONLY `channel="event"` on `u7s_watch_broadcast_lagged_total`.
+    ///
+    /// Why it matters: an operator uses this counter as a dispatch gate for "a recovery scan
+    /// ran" — every increment used to imply an O(ring) scan happened. The bookmark channel's
+    /// `Lagged` is advisory-only and never scans the ring, so if it landed on the same series as
+    /// the real-event channel's `Lagged`, that gate would be spuriously tripped by a harmless
+    /// bookmark hiccup. Fails on revert: with both arms sharing one label value again, bumping
+    /// either channel increments the same series, so the "other channel stayed flat" assertions
+    /// below fail.
+    #[tokio::test]
+    async fn bookmark_lag_and_event_lag_land_on_distinct_channel_labels() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/lag-channel-label-test/";
+        let bucket = super::metrics::prefix_bucket(prefix);
+
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let event_before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket, "event"])
+            .get();
+        let bookmark_before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket, "bookmark"])
+            .get();
+
+        // Phase 1: send directly on the raw event Sender, bypassing push_event_locked (which
+        // would also send a bookmark per write) — this way ONLY the real-event channel overflows.
+        let tx = store.tx.clone();
+        for i in 0..(BROADCAST_CAPACITY as u64 + 1) {
+            tx.send(Arc::new(InternalEvent {
+                key: format!("{prefix}obj-{i}"),
+                revision: i + 1,
+                value: Some(svc_value(&format!("obj-{i}"), i + 1)),
+                is_create: true,
+                deleted_body: None,
+            }))
+            .expect("send event");
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+
+        let event_after_phase1 = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket, "event"])
+            .get();
+        let bookmark_after_phase1 = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket, "bookmark"])
+            .get();
+        assert!(
+            event_after_phase1 > event_before,
+            "a real-event Lagged must still increment channel=\"event\" — this is the \
+             recovery-scan-triggering lag the dispatch gate depends on seeing; \
+             before={event_before} after={event_after_phase1}"
+        );
+        assert_eq!(
+            bookmark_after_phase1, bookmark_before,
+            "a real-event Lagged must NOT bump channel=\"bookmark\" — the bookmark channel \
+             was never touched in this phase; before={bookmark_before} \
+             after={bookmark_after_phase1}"
+        );
+
+        // Phase 2: send directly on the raw bookmark Sender — ONLY the bookmark channel
+        // overflows this time, the real-event channel is untouched.
+        let bookmark_tx = store.bookmark_tx.clone();
+        for i in 0..(BOOKMARK_BROADCAST_CAPACITY as u64 + 1) {
+            bookmark_tx
+                .send(GlobalBookmark {
+                    shard_root: Arc::from(prefix),
+                    revision: i + 1,
+                })
+                .expect("send bookmark");
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+
+        let event_after_phase2 = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket, "event"])
+            .get();
+        let bookmark_after_phase2 = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket, "bookmark"])
+            .get();
+        assert!(
+            bookmark_after_phase2 > bookmark_after_phase1,
+            "a bookmark-channel Lagged must increment channel=\"bookmark\" — this advisory-only \
+             lag must stay visible even though it never triggers a recovery scan; \
+             before={bookmark_after_phase1} after={bookmark_after_phase2}"
+        );
+        assert_eq!(
+            event_after_phase2, event_after_phase1,
+            "a bookmark-channel Lagged must NOT bump channel=\"event\" — collapsing the two \
+             would make an operator's recovery-scan dispatch-gate inference wrong, since a \
+             bookmark lag is free (no ring scan) while an event lag is not; \
+             before={event_after_phase1} after={event_after_phase2}"
         );
     }
 
