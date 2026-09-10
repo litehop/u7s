@@ -49,6 +49,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "persistentvolumes") = (group, plural) {
         default_pv(obj);
     }
+    if let ("", "nodes") = (group, plural) {
+        default_node(obj);
+    }
     if let ("", "secrets") = (group, plural) {
         default_secret(obj);
     }
@@ -226,6 +229,7 @@ pub fn increment_endpointslice_generation_if_changed(
 ///
 /// Idempotent: if a field is already set it is not overwritten.
 fn default_pvc(obj: &mut serde_json::Value) {
+    default_pvc_storage_class_from_annotation(obj);
     let mut status: PersistentVolumeStatusFields =
         PersistentVolumeStatusFields::deserialize(std::mem::take(&mut obj["status"]))
             .unwrap_or_default();
@@ -237,6 +241,35 @@ fn default_pvc(obj: &mut serde_json::Value) {
         serde_json::to_value(&status).expect("PersistentVolumeStatusFields is always serializable");
     obj["spec"] =
         serde_json::to_value(&spec).expect("PersistentVolumeSpecFields is always serializable");
+}
+
+/// Promote the deprecated `volume.beta.kubernetes.io/storage-class` annotation into
+/// `spec.storageClassName` when the client set only the annotation.
+///
+/// Upstream's `GetPersistentVolumeClaimClass` (pkg/apis/core/helper/helpers.go)
+/// resolves a PVC's storage class from this annotation first, falling back to
+/// `spec.storageClassName` — consumed by the real volume-expansion admission
+/// plugin. u7s's own equivalent (`reject_disallowed_pvc_resize` in resource.rs)
+/// and the storageClassName immutability freeze both read `spec.storageClassName`
+/// directly, so a PVC created with only the annotation resolved an empty class and
+/// had every resize request wrongly rejected with "only dynamically provisioned pvc
+/// can be resized".
+///
+/// Only fills spec from the annotation, never the reverse: nothing in this codebase
+/// reads the annotation directly, so backfilling it from spec would invent behavior
+/// no code path consumes. When spec.storageClassName is already set (whether or not
+/// it agrees with the annotation), it is left untouched — overwriting a
+/// client-authored spec field would defeat the very immutability freeze this fix is
+/// meant to restore.
+fn default_pvc_storage_class_from_annotation(obj: &mut serde_json::Value) {
+    if !obj["spec"]["storageClassName"].is_null() {
+        return;
+    }
+    if let Some(class) =
+        obj["metadata"]["annotations"]["volume.beta.kubernetes.io/storage-class"].as_str()
+    {
+        obj["spec"]["storageClassName"] = serde_json::Value::String(class.to_string());
+    }
 }
 
 /// The actual reasoning shared by PV and PVC defaulting: `status.phase`
@@ -277,6 +310,39 @@ fn default_pv(obj: &mut serde_json::Value) {
         serde_json::to_value(&status).expect("PersistentVolumeStatusFields is always serializable");
     obj["spec"] =
         serde_json::to_value(&spec).expect("PersistentVolumeSpecFields is always serializable");
+}
+
+/// Cross-fill `spec.podCIDR` and `spec.podCIDRs` on a Node from each other when only one is
+/// set, matching upstream's `Convert_core_NodeSpec_To_v1_NodeSpec` /
+/// `Convert_v1_NodeSpec_To_core_NodeSpec` (pkg/apis/core/v1/conversion.go), which sync the two
+/// on every read/write: `podCIDR` is the legacy singular field, `podCIDRs` is the list that
+/// superseded it.
+///
+/// KCM's node-ipam-controller always writes both together, so this is a no-op on that path.
+/// It matters for any other client that sets only one field directly (kubectl patch/apply, SSA,
+/// an e2e helper): without it, the other field stays permanently empty, since both are frozen
+/// once non-empty (`validate_node_spec_immutable`).
+///
+/// Idempotent: if `podCIDRs` is already non-empty it is never overwritten from `podCIDR`, and
+/// vice versa — mirrors upstream, which only backfills the side that's still empty.
+fn default_node(obj: &mut serde_json::Value) {
+    let pod_cidr = obj["spec"]["podCIDR"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    let first_pod_cidr = obj["spec"]["podCIDRs"][0]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    match (pod_cidr, first_pod_cidr) {
+        (Some(cidr), None) => {
+            obj["spec"]["podCIDRs"] = serde_json::json!([cidr]);
+        }
+        (None, Some(first)) => {
+            obj["spec"]["podCIDR"] = serde_json::json!(first);
+        }
+        _ => {}
+    }
 }
 
 /// Default the pointer-typed fields of `CSIDriver.spec`, matching upstream

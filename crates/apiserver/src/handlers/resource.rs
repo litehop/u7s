@@ -21418,6 +21418,128 @@ mod tests {
         );
     }
 
+    /// A PVC created with only the deprecated `volume.beta.kubernetes.io/storage-class`
+    /// annotation (no `spec.storageClassName`) must have `spec.storageClassName` defaulted
+    /// from that annotation, and a later resize of that PVC must not be wrongly rejected.
+    ///
+    /// Upstream's `GetPersistentVolumeClaimClass` resolves the storage class from this
+    /// annotation first; u7s's own resize gate (`reject_disallowed_pvc_resize`) reads
+    /// `spec.storageClassName` directly. Without the create-time promotion, the stored PVC's
+    /// `spec.storageClassName` stays empty, `storage_class_allows_expansion` looks up a
+    /// nonexistent ""-named StorageClass, and every resize of the PVC is rejected with "only
+    /// dynamically provisioned pvc can be resized" — even though the real StorageClass (named
+    /// only in the annotation) has `allowVolumeExpansion: true`.
+    #[tokio::test]
+    async fn create_namespaced_resource_defaults_pvc_storage_class_from_deprecated_annotation() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let sc = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "annotation-sc" },
+            "provisioner": "csi-hostpath",
+            "allowVolumeExpansion": true
+        });
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "annotation-only-pvc",
+                "namespace": "default",
+                "annotations": {
+                    "volume.beta.kubernetes.io/storage-class": "annotation-sc"
+                }
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        let created = create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create with only the deprecated storage-class annotation must succeed")
+        .into_response();
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            created["spec"]["storageClassName"], "annotation-sc",
+            "spec.storageClassName must be defaulted from the deprecated \
+             volume.beta.kubernetes.io/storage-class annotation when the client sets only the \
+             annotation — otherwise every downstream reader of spec.storageClassName (this \
+             codebase's resize gate and storageClassName-immutability freeze) sees an empty \
+             class"
+        );
+
+        let grown = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "annotation-only-pvc",
+                "namespace": "default",
+                "annotations": {
+                    "volume.beta.kubernetes.io/storage-class": "annotation-sc"
+                }
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "annotation-sc",
+                "resources": { "requests": { "storage": "2Gi" } }
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "annotation-only-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&grown).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PUT growing a PVC's storage request must succeed when the PVC's only StorageClass \
+             reference was the deprecated storage-class annotation at create time — the \
+             annotation's StorageClass allows expansion, so resolving an empty class from an \
+             undefaulted spec.storageClassName must not wrongly reject the resize",
+        );
+    }
+
     /// PATCH growing a PVC's `spec.resources.requests.storage` must return 403 Forbidden when
     /// the bound StorageClass has `allowVolumeExpansion: false`.
     ///
@@ -28457,6 +28579,72 @@ mod tests {
             "metadata": { "name": name },
             "spec": spec
         })
+    }
+
+    /// A Node registered with only `spec.podCIDR` (the legacy singular field) must have
+    /// `spec.podCIDRs` (the field that superseded it) filled in from it, and a Node registered
+    /// with only `spec.podCIDRs` must have `spec.podCIDR` filled in from `podCIDRs[0]`.
+    ///
+    /// Upstream's NodeSpec conversion (`Convert_core_NodeSpec_To_v1_NodeSpec` /
+    /// `Convert_v1_NodeSpec_To_core_NodeSpec`) syncs the two fields on every read/write, and
+    /// both fields are frozen once non-empty (`validate_node_spec_immutable`) — so a Node that
+    /// registers with only one field set would otherwise have the other stuck permanently
+    /// empty for the node's entire lifetime, with no later write ever able to fill it in.
+    #[tokio::test]
+    async fn create_resource_node_pod_cidr_and_pod_cidrs_cross_fill_each_other() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let cidr_only = node_body("cidr-only-node", Some("10.244.3.0/24"));
+        let created = create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cidr_only).unwrap()),
+        )
+        .await
+        .expect("Node create with only spec.podCIDR must succeed")
+        .into_response();
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            created["spec"]["podCIDRs"],
+            serde_json::json!(["10.244.3.0/24"]),
+            "spec.podCIDRs must be filled from spec.podCIDR when only the legacy singular \
+             field is set — otherwise a client that only reads podCIDRs sees this node as \
+             having no pod CIDR assigned at all"
+        );
+
+        let cidrs_only = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "cidrs-only-node" },
+            "spec": { "podCIDRs": ["10.244.4.0/24"] }
+        });
+        let created = create_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cidrs_only).unwrap()),
+        )
+        .await
+        .expect("Node create with only spec.podCIDRs must succeed")
+        .into_response();
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            created["spec"]["podCIDR"], "10.244.4.0/24",
+            "spec.podCIDR must be filled from spec.podCIDRs[0] when only the modern list field \
+             is set — otherwise a client that only reads the legacy singular podCIDR sees this \
+             node as having no pod CIDR assigned at all"
+        );
     }
 
     /// PATCH changing an already-set Node.spec.podCIDR must return 422.
