@@ -9,12 +9,17 @@
 # actually worked -- it printed "Done (host-only)." and exited 0 regardless,
 # so a process immune to SIGTERM (or any other reason a targeted process
 # survives) went undetected. This test runs the REAL script end-to-end (not
-# a reimplementation) and proves both halves of the fix:
+# a reimplementation) and proves all three halves of the fix:
 #   1. An apiserver-less orphan pair with NO pid files is actually reaped by
 #      --host-only, and the script reports success (exit 0).
 #   2. A process that survives the kill attempt (SIGTERM-ignoring) makes the
 #      script exit NONZERO and name the survivor -- it must never claim
 #      "Done" while a targeted process is still alive.
+#   3. That same verify-then-report gate must NOT fire on the full (non
+#      --host-only) reset path -- a survivor there must not abort the reset,
+#      since run-all.sh's --reset flow (and its "the VM is deleted"
+#      postcondition) never passed --host-only and relies on this path
+#      continuing to wipe $WORKDIR and tear down the VM regardless.
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
@@ -88,6 +93,21 @@ spawn_sigterm_immune_process() {
   echo $!
 }
 
+# Stubs `limactl` on PATH so the full (non --host-only) reset path below can
+# reach and complete teardown_vm() without a real Lima install -- this test
+# suite (script-tests CI job) runs on ubuntu-latest with no limactl on PATH.
+# `list` reports no VMs (so teardown_vm takes its "VM does not exist" branch)
+# and every subcommand exits 0, matching a real already-absent VM.
+setup_limactl_stub() {
+  local bindir="$1"
+  mkdir -p "$bindir"
+  cat > "$bindir/limactl" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+  chmod +x "$bindir/limactl"
+}
+
 TMPROOT="$(mktemp -d)"
 
 # ---------------------------------------------------------------------------
@@ -141,6 +161,45 @@ if [[ "$OUT2" == *"Done"* ]]; then
   FAIL=$(( FAIL + 1 ))
 else
   echo "PASS: surviving orphan: reset.sh does not print 'Done' while a targeted process is still alive"
+  PASS=$(( PASS + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Same SIGTERM-immune survivor, but on the FULL reset path (no
+#    --host-only): run-all.sh's --reset flow calls reset.sh this way, and its
+#    documented postcondition is "the VM is deleted" -- the verify-then-report
+#    gate must not abort that path just because a host process survived.
+#    Reverting the scoping fix (hoisting the gate back above the
+#    --host-only check) makes this fail: the script would exit 1 and skip
+#    $WORKDIR wipe / VM teardown instead of completing them.
+# ---------------------------------------------------------------------------
+WORKDIR3="$TMPROOT/full-reset/temp/u7s"
+mkdir -p "$WORKDIR3"
+STUBBIN="$TMPROOT/bin"
+setup_limactl_stub "$STUBBIN"
+
+IMMUNE_PID3="$(spawn_sigterm_immune_process "u7s-scheduler --db ${WORKDIR3}/sched.db --kubeconfig ${WORKDIR3}/kubeconfig-scheduler --other ${WORKDIR3}/kubeconfig")"
+LEFTOVER_PIDS+=("$IMMUNE_PID3")
+sleep 0.2
+
+set +e
+OUT3="$(PATH="$STUBBIN:$PATH" bash "$SCRIPT" --vm u7s-test-no-such-vm --workdir "$WORKDIR3" 2>&1)"
+EXIT3=$?
+set -e
+
+assert_exit_code "full reset (no --host-only): surviving host process does not abort the reset" "$EXIT3" 0
+if [[ "$OUT3" == *"ERROR: host process(es) survived"* ]]; then
+  echo "FAIL: full reset (no --host-only): survivor gate must not fire outside --host-only"
+  FAIL=$(( FAIL + 1 ))
+else
+  echo "PASS: full reset (no --host-only): survivor gate does not fire outside --host-only"
+  PASS=$(( PASS + 1 ))
+fi
+if [ -d "$WORKDIR3" ]; then
+  echo "FAIL: full reset (no --host-only): \$WORKDIR must still be wiped despite the surviving process"
+  FAIL=$(( FAIL + 1 ))
+else
+  echo "PASS: full reset (no --host-only): \$WORKDIR is still wiped despite the surviving process"
   PASS=$(( PASS + 1 ))
 fi
 

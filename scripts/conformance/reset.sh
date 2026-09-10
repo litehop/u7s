@@ -241,26 +241,30 @@ main() {
   # verification failure" — kill it before regenerating certs, scoped by cmdline.
   pkill -f "$(host_kill_pattern_for konnectivity-server "$WORKDIR")" 2>/dev/null || true
 
-  # Verify-then-report: SIGTERM is not synchronous, so poll briefly (same
-  # pattern as pid_still_alive_after_kill below) before concluding a survivor
-  # is real. Never print "Done" / exit 0 while a targeted process is still
-  # alive — that's exactly the silent-success bug this guards against.
-  local survivors=""
-  local _try
-  for _try in 1 2 3 4 5; do
-    survivors="$(host_process_survivors "$WORKDIR")"
-    [ -z "$survivors" ] && break
-    sleep 0.2
-  done
-  if [ -n "$survivors" ]; then
-    echo "[reset] ERROR: host process(es) survived the kill attempt:" >&2
-    while read -r surv_component surv_pid; do
-      echo "[reset]   ${surv_component} (PID ${surv_pid}) still alive" >&2
-    done <<< "$survivors"
-    exit 1
-  fi
-
   if [ "$HOST_ONLY" -eq 1 ]; then
+    # Verify-then-report: SIGTERM is not synchronous, so poll briefly (same
+    # pattern as pid_still_alive_after_kill below) before concluding a
+    # survivor is real. Never print "Done" / exit 0 while a targeted process
+    # is still alive — that's exactly the silent-success bug this guards
+    # against. Scoped to --host-only: the full reset path below deletes the
+    # VM regardless (a stray host process there doesn't leave a stale VM
+    # slot behind the way it does for --host-only's "worker teardown" use
+    # case), so it must keep its pre-existing behavior of not aborting here.
+    local survivors=""
+    local _try
+    for _try in 1 2 3 4 5; do
+      survivors="$(host_process_survivors "$WORKDIR")"
+      [ -z "$survivors" ] && break
+      sleep 0.2
+    done
+    if [ -n "$survivors" ]; then
+      echo "[reset] ERROR: host process(es) survived the kill attempt:" >&2
+      while read -r surv_component surv_pid; do
+        echo "[reset]   ${surv_component} (PID ${surv_pid}) still alive" >&2
+      done <<< "$survivors"
+      exit 1
+    fi
+
     echo "[reset] --host-only: skipping \$WORKDIR wipe and VM teardown"
     echo "[reset] Done (host-only)."
     exit 0

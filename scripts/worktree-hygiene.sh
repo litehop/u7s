@@ -374,6 +374,18 @@ has_open_pr() {
   printf '%s\n' "$open_pr_branches" | grep -qxF "$branch"
 }
 
+# All open PRs' head branch names, one per line -- the shared query behind
+# has_open_pr's exact-match check. `--limit` is set well above `gh pr list`'s
+# default page cap (30): without it, a repo with more than 30 open PRs would
+# silently truncate this list, and a branch whose PR fell past the cap would
+# then look exactly like a branch with no open PR at all -- has_open_pr's
+# exact match can't tell a missing entry from a truncated one. Shared by
+# STEP C and STEP F so this fix (and the single `gh` call per invocation
+# each already relies on) lives in one place.
+fetch_open_pr_branches() {
+  gh pr list -R litehop/u7s --state open --limit 1000 --json headRefName --jq '.[].headRefName'
+}
+
 # True (exit 0) iff `branch` is `worker/agent-<id>` and a live worktree
 # directory ai/worktrees/agent-<id> exists, regardless of which branch that
 # worktree currently has checked out. Observed 2026-08-28: a worker
@@ -400,7 +412,7 @@ step_c_stale_worker_branches() {
   # failure here aborts the whole tick via this script's own `set -e`
   # (see file header) rather than silently deleting branches without the
   # PR check that motivated this guard in the first place.
-  open_pr_branches=$(gh pr list -R litehop/u7s --state open --json headRefName --jq '.[].headRefName')
+  open_pr_branches=$(fetch_open_pr_branches)
   while IFS= read -r branch; do
     [ -n "$branch" ] || continue
     case "$branch" in
@@ -538,7 +550,7 @@ step_f_orphaned_origin_branches() {
   # Fetched once up front, same reasoning as STEP C: a `gh` failure here
   # aborts the whole tick via this script's own `set -e` rather than
   # deleting a branch without the PR check that guards it.
-  open_pr_branches=$(gh pr list -R litehop/u7s --state open --json headRefName --jq '.[].headRefName')
+  open_pr_branches=$(fetch_open_pr_branches)
   while IFS= read -r branch; do
     [ -n "$branch" ] || continue
     is_live_agent_branch "$branch" "$LIVE_AGENTS" && continue
