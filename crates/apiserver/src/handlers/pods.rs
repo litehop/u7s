@@ -296,16 +296,17 @@ pub(crate) async fn list_pods<S: Store>(
     headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
-    // Detect as=Table before namespace validation: a v1beta1 Table request must return
-    // 406 Not Acceptable regardless of namespace validity (the format is not supported).
+    // Detect as=Table before namespace validation: an unsupported Table version must return
+    // 406 Not Acceptable regardless of namespace validity (the format is not implementable).
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if let Some(version) = super::table::table_accept_version(accept) {
-        if version != "v1" {
+        if !super::table::is_supported_table_version(version) {
             return Err(Status::not_acceptable(format!(
-                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 is accepted"
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
             )));
         }
     }
@@ -473,9 +474,21 @@ pub(crate) async fn list_pods<S: Store>(
         return Ok(Json(body).into_response());
     }
 
-    // Return Table format when as=Table;v=v1 is requested (v1beta1 was rejected above).
+    // Return Table format when as=Table;v=v1 or v=v1beta1 is requested (anything else was
+    // rejected above).
     if table {
-        return Ok(Json(super::table::build_table("", "pods", items)).into_response());
+        let api_version = super::table::table_api_version(accept);
+        let continue_token = resp.continue_key.map(|key| {
+            super::generic::encode_continue(&key, resp.revision, &state.continue_token_key)
+        });
+        let built = super::table::build_table("", "pods", items);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            Some(&resp.revision.to_string()),
+            continue_token,
+        ))
+        .into_response());
     }
 
     let body = serde_json::json!({
@@ -741,9 +754,10 @@ pub(crate) async fn get_pod<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if let Some(version) = super::table::table_accept_version(accept) {
-        if version != "v1" {
+        if !super::table::is_supported_table_version(version) {
             return Err(Status::not_acceptable(format!(
-                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 is accepted"
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
             )));
         }
     }
@@ -774,7 +788,18 @@ pub(crate) async fn get_pod<S: Store>(
     if super::table::wants_table(accept) {
         let pod: serde_json::Value =
             serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
-        return Ok(Json(super::table::build_table("", "pods", vec![pod])).into_response());
+        let resource_version = pod["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_string);
+        let api_version = super::table::table_api_version(accept);
+        let built = super::table::build_table("", "pods", vec![pod]);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            resource_version.as_deref(),
+            None,
+        ))
+        .into_response());
     }
 
     if crate::content_type::wants_protobuf(accept) {
@@ -10380,11 +10405,13 @@ mod handler_tests {
         );
     }
 
-    /// A Table request for a v1beta1 Table (long deprecated) on a single-name GET must be
-    /// rejected the same way list_pods already rejects it on LIST — a stale client must be
-    /// told the format isn't supported rather than silently downgraded to plain JSON or v1.
+    /// sig-api-machinery's "should return pod details" conformance test negotiates
+    /// `as=Table;v=v1beta1` on a single-name GET (upstream clients never migrated off it even
+    /// though v1beta1 is long deprecated). Rejecting it with 406 breaks that test and any
+    /// stale client still requesting v1beta1 — u7s must accept it and echo it back rather
+    /// than silently downgrading to v1.
     #[tokio::test]
-    async fn get_pod_with_v1beta1_table_accept_returns_406() {
+    async fn get_pod_with_v1beta1_table_accept_returns_table_with_v1beta1_api_version() {
         let (state, store) = make_state();
         seed_namespace(&store, "default").await;
         seed_pod(&store, "default", "nginx", serde_json::json!({})).await;
@@ -10404,7 +10431,50 @@ mod handler_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "v1beta1 Table must be accepted, not 406 — reverting the version-negotiation fix \
+             breaks the sig-api-machinery \"should return pod details\" conformance test"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            v["apiVersion"], "meta.k8s.io/v1beta1",
+            "the Table response must echo the negotiated groupVersion, not hard-code v1"
+        );
+        assert_eq!(v["rows"][0]["cells"][0], "nginx");
+    }
+
+    /// An unsupported Table version (e.g. v2) must 406, not be echoed into apiVersion — a
+    /// client must never be told a format it asked for was served when it wasn't. Fail-on-
+    /// revert: dropping get_pod's version gate makes this build and return a bogus
+    /// "meta.k8s.io/v2" Table instead of rejecting the request.
+    #[tokio::test]
+    async fn get_pod_with_unsupported_table_version_returns_406() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "nginx", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/nginx")
+            .header("accept", "application/json;as=Table;g=meta.k8s.io;v=v2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_ACCEPTABLE,
+            "clients must not be told an unsupported Table version was served"
+        );
     }
 
     /// kcm's GC sends `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`

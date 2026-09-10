@@ -31,6 +31,48 @@ pub fn table_accept_version(accept: &str) -> Option<&str> {
     None
 }
 
+/// The Table apiVersions u7s implements. Upstream clients (and the sig-api-machinery
+/// conformance suite) still negotiate the long-deprecated `meta.k8s.io/v1beta1` alongside
+/// `v1` — both carry an identical field shape, so both are accepted; anything else is 406.
+pub fn is_supported_table_version(version: &str) -> bool {
+    version == "v1" || version == "v1beta1"
+}
+
+/// The `meta.k8s.io/<version>` apiVersion to echo in a Table response, reflecting whichever
+/// supported version the client negotiated via Accept's `v=` parameter (defaulting to v1,
+/// matching `table_accept_version`'s own default for a versionless `as=Table` request).
+pub fn table_api_version(accept: &str) -> String {
+    format!(
+        "meta.k8s.io/{}",
+        table_accept_version(accept).unwrap_or("v1")
+    )
+}
+
+/// Stamps the negotiated `apiVersion` onto a Table built by `build_table`, and — for LIST
+/// calls — the `metadata.resourceVersion`/`metadata.continue` fields upstream's `Table` type
+/// carries via an embedded `ListMeta` (same as every List type). The e2e chunking client reads
+/// `table.Continue` to fetch the next page and requires `table.ResourceVersion` to be non-empty
+/// on every list-shaped Table response.
+pub fn finalize_table(
+    mut table: serde_json::Value,
+    api_version: &str,
+    resource_version: Option<&str>,
+    continue_token: Option<String>,
+) -> serde_json::Value {
+    table["apiVersion"] = serde_json::Value::from(api_version);
+    if resource_version.is_some() || continue_token.is_some() {
+        let mut meta = serde_json::Map::new();
+        if let Some(rv) = resource_version {
+            meta.insert("resourceVersion".to_string(), serde_json::Value::from(rv));
+        }
+        if let Some(c) = continue_token {
+            meta.insert("continue".to_string(), serde_json::Value::from(c));
+        }
+        table["metadata"] = serde_json::Value::Object(meta);
+    }
+    table
+}
+
 pub fn build_table(
     group: &str,
     plural: &str,
@@ -2654,7 +2696,8 @@ mod tests {
     }
 
     // table_accept_version must correctly parse the Table API version from the Accept header
-    // so that handlers can reject v1beta1 with 406 rather than serving an incompatible format.
+    // so handlers know which of the accepted versions (v1, v1beta1) to echo, and can 406
+    // anything else.
     #[test]
     fn table_accept_version_extracts_version() {
         assert_eq!(
@@ -2667,7 +2710,7 @@ mod tests {
                 "application/json;as=Table;g=meta.k8s.io;v=v1beta1,application/json"
             ),
             Some("v1beta1"),
-            "v1beta1 Table must be detected so handlers can return 406 instead of wrong format"
+            "v1beta1 Table must be detected so handlers echo it back rather than always v1"
         );
         assert_eq!(
             table_accept_version("application/json;as=Table;g=meta.k8s.io;v=v1,application/json"),
@@ -2696,6 +2739,85 @@ mod tests {
             table_accept_version("application/json;as=Table;g=meta.k8s.io"),
             Some("v1"),
             "as=Table without v= must default to v1 — some older clients omit the version"
+        );
+    }
+
+    // is_supported_table_version is the single convergence point every handler's version
+    // check calls; if it drifts (e.g. someone reverts v1beta1 support here) every handler
+    // that calls it starts rejecting v1beta1 again, breaking kubectl and conformance clients
+    // that still negotiate it.
+    #[test]
+    fn is_supported_table_version_accepts_v1_and_v1beta1_only() {
+        assert!(is_supported_table_version("v1"));
+        assert!(
+            is_supported_table_version("v1beta1"),
+            "upstream clients (and sig-api-machinery's Table conformance tests) still \
+             negotiate v1beta1 Table — rejecting it breaks kubectl get -o wide and 3 \
+             conformance specs"
+        );
+        assert!(
+            !is_supported_table_version("v2"),
+            "an unknown Table version must still 406 rather than silently downgrading"
+        );
+    }
+
+    #[test]
+    fn table_api_version_echoes_the_negotiated_version() {
+        assert_eq!(
+            table_api_version("application/json;as=Table;g=meta.k8s.io;v=v1beta1"),
+            "meta.k8s.io/v1beta1",
+            "a v1beta1 Table request must get back apiVersion=meta.k8s.io/v1beta1, not a \
+             hardcoded v1 — a client that decodes into a versioned Table type checks this"
+        );
+        assert_eq!(
+            table_api_version("application/json;as=Table;g=meta.k8s.io;v=v1"),
+            "meta.k8s.io/v1"
+        );
+    }
+
+    // finalize_table must attach the ListMeta fields the e2e chunking client reads
+    // (table.ResourceVersion, table.Continue) — build_table alone never sets them, which is
+    // exactly why "should return chunks of table results for list calls" and "should return
+    // generic metadata details ... for nodes" failed even once v1beta1 stopped being rejected.
+    #[test]
+    fn finalize_table_sets_api_version_and_list_meta() {
+        let pod = serde_json::json!({
+            "metadata": {"name": "p1", "creationTimestamp": "2024-01-01T00:00:00Z"},
+            "status": {}
+        });
+        let table = build_table("", "pods", vec![pod]);
+        let finalized = finalize_table(
+            table,
+            "meta.k8s.io/v1beta1",
+            Some("42"),
+            Some("cont-token".to_string()),
+        );
+        assert_eq!(finalized["apiVersion"], "meta.k8s.io/v1beta1");
+        assert_eq!(
+            finalized["metadata"]["resourceVersion"], "42",
+            "table.ResourceVersion must be non-empty or the chunking/nodes conformance tests \
+             fail on `Expect(...).ToNot(BeEmpty())` even though the request itself succeeded"
+        );
+        assert_eq!(finalized["metadata"]["continue"], "cont-token");
+        assert_eq!(
+            finalized["rows"].as_array().unwrap().len(),
+            1,
+            "finalize_table must not drop or alter the rows/columns build_table produced"
+        );
+    }
+
+    #[test]
+    fn finalize_table_omits_metadata_when_no_list_meta_given() {
+        let pod = serde_json::json!({
+            "metadata": {"name": "p1", "creationTimestamp": "2024-01-01T00:00:00Z"},
+            "status": {}
+        });
+        let table = build_table("", "pods", vec![pod]);
+        let finalized = finalize_table(table, "meta.k8s.io/v1", None, None);
+        assert!(
+            finalized.get("metadata").is_none(),
+            "a single-object GET Table has no list to paginate; adding an empty metadata \
+             object would be a needless shape change from today's behavior"
         );
     }
 }

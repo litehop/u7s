@@ -153,6 +153,16 @@ pub(crate) async fn list_resource<S: Store>(
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    // Reject an unsupported Table version up front, regardless of whether this turns out to
+    // be a watch or a plain list (same gate as list_pods/core_list_resource).
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if !super::table::is_supported_table_version(version) {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
+            )));
+        }
+    }
     let pom = wants_partial_object_metadata(accept);
     let table = super::table::wants_table(accept);
 
@@ -327,7 +337,18 @@ pub(crate) async fn list_resource<S: Store>(
     }
 
     if table {
-        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
+        let api_version = super::table::table_api_version(accept);
+        let continue_token = resp.continue_key.map(|key| {
+            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
+        });
+        let built = super::table::build_table(&group, &plural, items);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            Some(&list_revision.to_string()),
+            continue_token,
+        ))
+        .into_response());
     }
 
     let body = build_list_response(
@@ -375,6 +396,16 @@ pub(crate) async fn get_resource<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // Reject an unsupported Table version (same gate as list_resource above).
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if !super::table::is_supported_table_version(version) {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
+            )));
+        }
+    }
+
     // kcm's GC verifies owner references via metadata-only Get() calls
     // (garbagecollector.go's isDangling); without this, it receives a typed object it can't
     // decode and retries the owner-check forever, so newly-orphaned dependents are never
@@ -387,7 +418,18 @@ pub(crate) async fn get_resource<S: Store>(
     // decode the response and falls back to printing only NAME/AGE (list_resource already
     // handles this for LIST — see above).
     if super::table::wants_table(accept) {
-        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
+        let resource_version = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_string);
+        let api_version = super::table::table_api_version(accept);
+        let built = super::table::build_table(&group, &plural, vec![obj]);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            resource_version.as_deref(),
+            None,
+        ))
+        .into_response());
     }
 
     Ok(crate::content_type::negotiated_response(accept, obj))
@@ -2603,6 +2645,15 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    // Reject an unsupported Table version up front (same gate as list_resource above).
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if !super::table::is_supported_table_version(version) {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
+            )));
+        }
+    }
     let pom = wants_partial_object_metadata(accept);
     let table = super::table::wants_table(accept);
 
@@ -2768,7 +2819,18 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
     }
 
     if table {
-        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
+        let api_version = super::table::table_api_version(accept);
+        let continue_token = resp.continue_key.map(|key| {
+            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
+        });
+        let built = super::table::build_table(&group, &plural, items);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            Some(&list_revision.to_string()),
+            continue_token,
+        ))
+        .into_response());
     }
 
     let body = build_list_response(
@@ -2821,6 +2883,16 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // Reject an unsupported Table version (same gate as list_namespaced_resource above).
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if !super::table::is_supported_table_version(version) {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
+            )));
+        }
+    }
+
     // kcm's GC verifies owner references via metadata-only Get() calls
     // (garbagecollector.go's isDangling); without this, it receives a typed object it can't
     // decode and retries the owner-check forever, so newly-orphaned dependents are never
@@ -2833,7 +2905,18 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
     // decode the response and falls back to printing only NAME/AGE (list_namespaced_resource
     // already handles this for LIST — see above).
     if super::table::wants_table(accept) {
-        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
+        let resource_version = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_string);
+        let api_version = super::table::table_api_version(accept);
+        let built = super::table::build_table(&group, &plural, vec![obj]);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &api_version,
+            resource_version.as_deref(),
+            None,
+        ))
+        .into_response());
     }
 
     Ok(crate::content_type::negotiated_response(accept, obj))
@@ -8252,6 +8335,65 @@ mod tests {
         assert_eq!(
             rows[0]["object"]["metadata"]["name"], "worker-1",
             "kubectl reads the row's embedded object to resolve the resource on selection"
+        );
+    }
+
+    /// An unsupported Table version (e.g. v2) must 406, not be echoed into apiVersion — a
+    /// client must never be told a format it asked for was served when it wasn't. Without the
+    /// version gate this test guards, get_resource builds and returns a bogus
+    /// "meta.k8s.io/v2" Table instead of rejecting the request.
+    #[tokio::test]
+    async fn get_resource_with_unsupported_table_version_returns_406() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-1" }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/worker-1",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v2"),
+        );
+
+        let err = get_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-1".into(),
+            )),
+            headers,
+        )
+        .await
+        .expect_err("an unsupported Table version must 406, not silently echo v2 into apiVersion");
+
+        assert_eq!(
+            err.0,
+            StatusCode::NOT_ACCEPTABLE,
+            "clients must not be told an unsupported Table version was served"
         );
     }
 
