@@ -1220,6 +1220,7 @@ mod shorten_grace_period_secs_tests {
 pub(crate) async fn delete_collection_pods<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
+    Extension(user): Extension<UserInfo>,
     Query(query): Query<super::generic::CollectionQuery>,
     Query(grace_query): Query<GracePeriodQuery>,
     headers: HeaderMap,
@@ -1253,6 +1254,14 @@ pub(crate) async fn delete_collection_pods<S: Store>(
         .map(super::generic::parse_label_selector)
         .transpose()?;
 
+    // Built once — reused for every per-pod AdmissionContext below.
+    let user_info = Some(serde_json::json!({
+        "username": user.username,
+        "uid": user.uid,
+        "groups": user.groups,
+        "extra": user.extra,
+    }));
+
     for obj in resp.items {
         let mut soft_deleted = false;
         // Captured only on the hard-delete branch below, so the incremental quota counter
@@ -1267,6 +1276,27 @@ pub(crate) async fn delete_collection_pods<S: Store>(
                     continue;
                 }
             }
+
+            // Admission webhook pipeline (validating only — mutating webhooks do not apply to
+            // DELETE), invoked per pod exactly like delete_pod and the generic
+            // delete_collection_resource/_namespaced. Without this, a validating webhook
+            // registered for pods/DELETE was silently skipped on every DeleteCollection —
+            // evadable by a client just switching from single-object DELETE to bulk delete.
+            let pod_name = parsed["metadata"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let admission_ctx = AdmissionContext {
+                group: "",
+                version: "v1",
+                resource: "pods",
+                name: &pod_name,
+                namespace: Some(ns.as_str()),
+                operation: "DELETE",
+                user_info: user_info.clone(),
+                dry_run,
+            };
+            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
 
             // Mirror delete_pod's soft/hard-delete decision instead of always hard-deleting:
             // a pod already Terminating (or force-deleted with an explicit gracePeriodSeconds=0)
@@ -1559,6 +1589,7 @@ pub(crate) async fn patch_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Query(patch_query): Query<super::json_patch::PatchQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1597,6 +1628,10 @@ pub(crate) async fn patch_pod<S: Store>(
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+        // Snapshotted before the patch mutates current_obj.body in place below — the only
+        // pre-patch copy available to pass as oldObject to the admission webhooks.
+        let pre_patch_obj = current_obj.body.clone();
+
         let spec_before = current_obj.body["spec"].clone();
         // Save the stored generation so a PATCH that sets metadata.generation
         // cannot downgrade it. generation is server-managed; only increment
@@ -1632,12 +1667,46 @@ pub(crate) async fn patch_pod<S: Store>(
         current_obj.body["status"] = stored_status;
         current_obj.body["metadata"]["uid"] = stored_uid;
 
+        // Admission webhook pipeline (mutating then validating), threading the pre-patch
+        // stored pod as oldObject — mirrors replace_pod's UPDATE call above. Previously
+        // patch_pod called neither hook at all, so a webhook registered for pods/UPDATE
+        // (e.g. one that denies PUT) was silently evadable by switching to PATCH.
+        let admission_ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: &name,
+            namespace: Some(ns.as_str()),
+            operation: "UPDATE",
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+                "extra": user.extra,
+            })),
+            dry_run: patch_query.is_dry_run(),
+        };
+        current_obj.body = run_mutating_webhooks(
+            &state,
+            current_obj.body,
+            Some(&pre_patch_obj),
+            &admission_ctx,
+        )
+        .await?;
+
         // Enforce the same spec-immutability guard replace_pod (PUT) already applies —
         // without this, a caller holding only `patch pods` (not `pods/binding`) could set
         // spec.nodeName directly, bypassing the scheduler entirely, or rewrite containers/
         // resources/tolerations on an already-running pod a live kubelet is watching.
         validate_pod_spec_immutable(&spec_before, &current_obj.body["spec"])
             .map_err(Status::unprocessable_entity)?;
+        run_validating_webhooks(
+            &state,
+            &current_obj.body,
+            Some(&pre_patch_obj),
+            &admission_ctx,
+        )
+        .await?;
 
         // Restore the stored generation before computing the increment so that
         // a patch attempting to set generation is ignored.
@@ -14302,6 +14371,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"metadata": {"labels": {"app": "test"}}});
@@ -14343,6 +14413,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"nodeName": "other-node"}});
@@ -14389,6 +14460,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"nodeName": "attacker-node"}});
@@ -14425,6 +14497,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"schedulerName": "other-scheduler"}});
@@ -14473,6 +14546,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"automountServiceAccountToken": true}});
@@ -14507,6 +14581,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"serviceAccountName": "other-sa"}});
@@ -14539,6 +14614,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"securityContext": {"runAsUser": 0}}});
@@ -14583,6 +14659,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body =
@@ -14625,6 +14702,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"activeDeadlineSeconds": 30}});
@@ -14667,6 +14745,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"activeDeadlineSeconds": 120}});
@@ -14711,6 +14790,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"dnsPolicy": "ClusterFirst"}});
@@ -14754,6 +14834,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"tolerations": [
@@ -14801,6 +14882,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"spec": {"tolerations": [{"key": "keep-me", "operator": "Exists"}]}});
@@ -14840,6 +14922,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"status": {"phase": "Running"}});
@@ -14884,6 +14967,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!([
@@ -14937,6 +15021,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         // Merge patch.
@@ -15020,6 +15105,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let req = Request::builder()
@@ -15058,6 +15144,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         // SSA PATCH with dryRun=All: change image to "nginx:new".
@@ -17985,6 +18072,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let req = Request::builder()
@@ -18015,6 +18103,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!({"metadata": {"annotations": {"k": "v"}}});
@@ -18053,6 +18142,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         // Genuine YAML block syntax — NOT JSON serialized to bytes.
@@ -18104,6 +18194,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state.clone());
 
         // Patch to remove the finalizer.
@@ -18158,6 +18249,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state.clone());
 
         let patch_body = serde_json::json!({"metadata": {"finalizers": []}});
@@ -18210,6 +18302,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let patch_body = serde_json::json!([{"op": "remove", "path": "/metadata/labels/env"}]);
@@ -18918,6 +19011,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         // KCM removes the job-tracking finalizer via a merge PATCH.
@@ -19161,6 +19255,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         // The aggregator's annotation PATCH — the write sonobuoy status polling depends on.
@@ -21637,6 +21732,181 @@ mod admission_tests {
         );
     }
 
+    /// patch_pod must invoke the validating admission pipeline.
+    /// A validating webhook that denies UPDATE must cause patch_pod to return an error, and
+    /// the stored pod must be unchanged. Without this fix, patch_pod called neither admission
+    /// hook at all, so a webhook blocking PUT (replace_pod) was trivially evadable by a client
+    /// just switching to PATCH.
+    #[tokio::test]
+    async fn patch_pod_invokes_validating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        seed_namespace(&store, "default").await;
+
+        let pod_key = "/registry/pods/default/patch-denied-pod";
+        let existing = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "patch-denied-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(
+                pod_key,
+                Bytes::from(serde_json::to_vec(&existing).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (url, _handle) = start_mock_webhook(deny_router()).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating-patch-pod"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-patch-pod",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch_body =
+            Bytes::from(serde_json::json!({"metadata": {"labels": {"x": "y"}}}).to_string());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let result = patch_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(), "patch-denied-pod".to_string())),
+            axum::extract::Query(crate::handlers::json_patch::PatchQuery::default()),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "patch_pod must be rejected when validating webhook denies — \
+             without the fix, admission was bypassed and the patch was silently applied"
+        );
+
+        let stored = store
+            .get(pod_key)
+            .await
+            .unwrap()
+            .expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["labels"].get("x").is_none(),
+            "denied patch must not be persisted — the stored pod must not carry the label \
+             the (rejected) patch tried to add"
+        );
+    }
+
+    /// delete_collection_pods must invoke the validating admission pipeline per pod.
+    /// A validating webhook that denies DELETE must cause delete_collection_pods to return an
+    /// error, and the targeted pod must remain in the store. Without this fix,
+    /// delete_collection_pods never called run_validating_webhooks at all, so a webhook
+    /// blocking single-pod DELETE was trivially evadable by a client switching to
+    /// DeleteCollection.
+    #[tokio::test]
+    async fn delete_collection_pods_invokes_validating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        seed_namespace(&store, "default").await;
+
+        let pod_key = "/registry/pods/default/collection-denied-pod";
+        let existing = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "collection-denied-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(
+                pod_key,
+                Bytes::from(serde_json::to_vec(&existing).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (url, _handle) = start_mock_webhook(deny_router()).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating-delete-collection"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["DELETE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-delete-collection",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = delete_collection_pods(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(),)),
+            test_user(),
+            axum::extract::Query(crate::handlers::generic::CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            axum::extract::Query(GracePeriodQuery {
+                grace_period_seconds: None,
+            }),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "delete_collection_pods must be rejected when validating webhook denies — \
+             without the fix, admission was bypassed and the pod was silently deleted"
+        );
+
+        let stored = store.get(pod_key).await.unwrap();
+        assert!(
+            stored.is_some(),
+            "denied pod must remain in the store — DeleteCollection must not have deleted it"
+        );
+    }
+
     /// Concurrent create_pod calls in a quota-limited namespace must never let more pods
     /// through than the hard limit allows.
     ///
@@ -21804,6 +22074,7 @@ mod admission_tests {
             axum::extract::State(state.clone()),
             axum::extract::Path(("default".to_string(), "term-pod".to_string())),
             axum::extract::Query(crate::handlers::json_patch::PatchQuery::default()),
+            test_user(),
             headers,
             Bytes::from(patch_body.to_string()),
         )

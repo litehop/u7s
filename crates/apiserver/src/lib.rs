@@ -10004,11 +10004,21 @@ mod tests {
 
         let mut router = build_router(state);
 
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::DELETE)
             .uri("/api/v1/namespaces/sonobuoy/pods?labelSelector=sonobuoy-run%3Dabc123")
             .body(axum::body::Body::empty())
             .expect("request build must not fail");
+        // This test targets ROUTING (does DELETE-collection resolve at all), not the real
+        // AuthLayer's RBAC decision — bypasses AuthLayer entirely, so the UserInfo
+        // delete_collection_pods now requires is inserted directly, mirroring the pattern
+        // other bare-build_router routing tests in this module already use.
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
         let resp = router.call(req).await.expect("router must not error");
 
         assert_ne!(
