@@ -698,6 +698,70 @@ assert "...and the fail-safe refusal message never appears for --no-live-workers
   "$(! printf '%s' "$NLW_MAIN_OUT" | grep -q 'refusing to run' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 8. STEP F -- orphaned origin/worker/agent-* branches. Mirrors STEP C/D's
+#    end-to-end sandbox style (a real bare "origin" repo, a stub `gh`), but
+#    each branch under test is pushed to origin and then deleted LOCALLY --
+#    the exact crashed-worker shape this step exists for (its worktree, and
+#    often its local branch, are already gone; only the origin ref
+#    remains). This proves origin_worker_branches() finds such a branch via
+#    `ls-remote` -- STEP C's local `refs/heads/*` iteration cannot see it at
+#    all, since there IS no local branch.
+# ---------------------------------------------------------------------------
+
+BARE_F="$SANDBOX_ROOT/origin-f.git"
+git init -q --bare "$BARE_F"
+
+F="$SANDBOX_ROOT/step-f-repo"
+new_sandbox "$F"
+printf 'line one\n' > "$F/file.txt"
+git -C "$F" add -A
+git -C "$F" commit -q -m initial
+git -C "$F" remote add origin "$BARE_F"
+git -C "$F" push -q origin main
+
+# Reapable: crashed worker, no PR ever opened, id not in --live-agents.
+git -C "$F" branch worker/agent-crashed main
+git -C "$F" push -q origin worker/agent-crashed
+git -C "$F" branch -D worker/agent-crashed
+
+# NOT reapable: an OPEN PR still references this branch, even though it
+# looks just as "crashed" (zero local trace) as the one above.
+git -C "$F" branch worker/agent-openpr main
+git -C "$F" push -q origin worker/agent-openpr
+git -C "$F" branch -D worker/agent-openpr
+
+# NOT reapable: id IS in --live-agents, even with no PR at all -- an
+# in-flight worker that simply hasn't opened a PR yet.
+git -C "$F" branch worker/agent-liveagent main
+git -C "$F" push -q origin worker/agent-liveagent
+git -C "$F" branch -D worker/agent-liveagent
+
+assert "origin_worker_branches finds a branch via ls-remote even with zero local trace -- the crashed-worker shape STEP C's local refs/heads/* iteration cannot see" \
+  "$(printf '%s\n' "$(call origin_worker_branches "$F")" | grep -qxF 'worker/agent-openpr' && echo 1 || echo 0)"
+
+STUB_GH_STEP_F="$SANDBOX_ROOT/stub-gh-step-f"
+mkdir -p "$STUB_GH_STEP_F"
+cat > "$STUB_GH_STEP_F/gh" <<'EOF'
+#!/usr/bin/env bash
+echo 'worker/agent-openpr'
+EOF
+chmod +x "$STUB_GH_STEP_F/gh"
+
+LIVE_AGENTS="liveagent" WORKTREE_HYGIENE_REPO_ROOT="$F" PATH="$STUB_GH_STEP_F:$PATH" \
+  call step_f_orphaned_origin_branches >/dev/null 2>&1
+
+origin_f_heads() {
+  git -C "$F" ls-remote --heads origin 'worker/agent-*' | awk '{print $2}'
+}
+
+assert "STEP F deletes a crashed-worker branch that exists ONLY on origin, has no open PR, and whose id is not in --live-agents -- the class of branch nothing else in this script or the merge queue ever revisits" \
+  "$(! origin_f_heads | grep -qxF 'refs/heads/worker/agent-crashed' && echo 1 || echo 0)"
+assert "...but PRESERVES a same-shaped orphan-looking branch when an OPEN PR still references it -- has_open_pr, not liveness, is what saves it here" \
+  "$(origin_f_heads | grep -qxF 'refs/heads/worker/agent-openpr' && echo 1 || echo 0)"
+assert "...and PRESERVES a branch whose id IS in --live-agents even with no PR at all -- an in-flight worker that hasn't opened a PR yet must never be reaped" \
+  "$(origin_f_heads | grep -qxF 'refs/heads/worker/agent-liveagent' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
