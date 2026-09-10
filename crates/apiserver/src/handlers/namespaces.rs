@@ -366,6 +366,7 @@ pub(crate) async fn get_namespace<S: Store>(
 pub(crate) async fn replace_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -440,6 +441,28 @@ pub(crate) async fn replace_namespace<S: Store>(
             )));
         }
     }
+
+    // Admission webhook pipeline (mutating then validating), threading the pre-existing
+    // namespace as oldObject — mirrors create_namespace's CREATE call above. Previously
+    // replace_namespace called neither hook at all, so a webhook registered for
+    // namespaces/UPDATE was silently skipped on every PUT.
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "namespaces",
+        name: &name,
+        namespace: None,
+        operation: "UPDATE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+            "extra": user.extra,
+        })),
+        dry_run: is_dry_run_header(&headers),
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, stored_obj.as_ref(), &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, stored_obj.as_ref(), &admission_ctx).await?;
 
     // Post-replace: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let replace_meta: ObjectMeta =
@@ -548,6 +571,10 @@ pub(crate) async fn patch_namespace<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    // Snapshotted before the patch mutates current.body in place below — the only pre-patch
+    // copy available to pass as oldObject to the admission webhooks.
+    let pre_patch_obj = current.body.clone();
+
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
@@ -577,6 +604,29 @@ pub(crate) async fn patch_namespace<S: Store>(
     } else {
         current.body["status"] = stored_status;
     }
+
+    // Admission webhook pipeline (mutating then validating), threading the pre-patch stored
+    // namespace as oldObject — mirrors replace_namespace's UPDATE call. The SSA branch above
+    // already gets webhooks for free via do_patch; this merge/strategic-merge branch has its
+    // own store.put and previously called neither hook at all.
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "namespaces",
+        name: &name,
+        namespace: None,
+        operation: "UPDATE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+            "extra": user.extra,
+        })),
+        dry_run: patch_query.is_dry_run(),
+    };
+    current.body =
+        run_mutating_webhooks(&state, current.body, Some(&pre_patch_obj), &admission_ctx).await?;
+    run_validating_webhooks(&state, &current.body, Some(&pre_patch_obj), &admission_ctx).await?;
 
     // Post-patch: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let current_meta: ObjectMeta =
@@ -2072,6 +2122,7 @@ mod tests {
             replace_namespace(
                 State(state.clone()),
                 Path("label-ns".to_string()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 replace_body,
             )
@@ -2154,6 +2205,7 @@ mod tests {
             replace_namespace(
                 State(state.clone()),
                 Path("dry-run-replace-ns".to_string()),
+                test_user(),
                 dry_run_headers,
                 replace_body,
             )
@@ -2289,6 +2341,7 @@ mod tests {
             replace_namespace(
                 State(state.clone()),
                 Path("status-ns".to_string()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 put_body,
             )
@@ -2337,6 +2390,7 @@ mod tests {
             replace_namespace(
                 State(state.clone()),
                 Path("status-ns".to_string()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 put_body_no_status,
             )
@@ -3313,6 +3367,7 @@ mod tests {
         let result = replace_namespace(
             State(state.clone()),
             Path("different-ns".to_string()),
+            test_user(),
             axum::http::HeaderMap::new(),
             body,
         )
@@ -5279,6 +5334,7 @@ mod tests {
         let result = replace_namespace(
             State(state.clone()),
             Path("occ-ns".to_string()),
+            test_user(),
             axum::http::HeaderMap::new(),
             stale_body,
         )
@@ -5352,6 +5408,7 @@ mod tests {
         let result = replace_namespace(
             State(state),
             Path("uid-guard-ns".to_string()),
+            test_user(),
             axum::http::HeaderMap::new(),
             replace_body,
         )
@@ -5825,6 +5882,7 @@ mod tests {
             replace_namespace(
                 State(state.clone()),
                 Path("put-drain-ns".to_string()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 replace_body,
             )
@@ -8777,6 +8835,280 @@ mod admission_tests {
         assert!(
             stored.is_none(),
             "denied namespace must not be stored in the backing store"
+        );
+    }
+
+    fn deny_webhook_router() -> Router {
+        Router::new().route(
+            "/webhook",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": false,
+                        "status": {"code": 403, "message": "denied by test webhook"}
+                    }
+                }))
+            }),
+        )
+    }
+
+    /// replace_namespace must invoke the validating admission pipeline.
+    /// A validating webhook that denies UPDATE must cause replace_namespace to return an
+    /// error, and the stored namespace must be unchanged. Without this fix,
+    /// replace_namespace called neither admission hook at all, so a webhook registered for
+    /// namespaces/UPDATE was silently skipped on every PUT.
+    #[tokio::test]
+    async fn replace_namespace_invokes_validating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        let ns_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "replace-denied-ns"}
+            })
+            .to_string(),
+        );
+        create_namespace(
+            axum::extract::State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            ns_body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let (url, _handle) = start_mock_webhook(deny_webhook_router()).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating-replace-ns"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["namespaces"], "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-replace-ns",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let replace_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "replace-denied-ns", "labels": {"env": "prod"}}
+            })
+            .to_string(),
+        );
+
+        let result = replace_namespace(
+            axum::extract::State(state),
+            Path("replace-denied-ns".to_string()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            replace_body,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "replace_namespace must be rejected when validating webhook denies — \
+             without the fix, admission was bypassed and the PUT was silently applied"
+        );
+
+        let stored = store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "replace-denied-ns",
+            ))
+            .await
+            .unwrap()
+            .expect("namespace must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["labels"].get("env").is_none(),
+            "denied replace must not be persisted"
+        );
+    }
+
+    /// patch_namespace's merge/strategic-merge branch must invoke the validating admission
+    /// pipeline. A validating webhook that denies UPDATE must cause it to return an error,
+    /// and the stored namespace must be unchanged. Without this fix, this branch called
+    /// neither admission hook at all — the SSA branch of the same handler delegates into
+    /// do_patch and got admission for free, so this was a sibling-drift gap within one
+    /// handler.
+    #[tokio::test]
+    async fn patch_namespace_merge_patch_invokes_validating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        let ns_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "patch-denied-ns"}
+            })
+            .to_string(),
+        );
+        create_namespace(
+            axum::extract::State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            ns_body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let (url, _handle) = start_mock_webhook(deny_webhook_router()).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating-patch-ns"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["namespaces"], "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-patch-ns",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch_body =
+            Bytes::from(serde_json::json!({"metadata": {"labels": {"env": "prod"}}}).to_string());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let result = patch_namespace(
+            axum::extract::State(state),
+            Path("patch-denied-ns".to_string()),
+            Query(PatchQuery::default()),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "patch_namespace's merge/strategic-merge branch must be rejected when validating \
+             webhook denies — without the fix, admission was bypassed and the patch was \
+             silently applied"
+        );
+
+        let stored = store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "patch-denied-ns",
+            ))
+            .await
+            .unwrap()
+            .expect("namespace must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["labels"].get("env").is_none(),
+            "denied patch must not be persisted"
+        );
+    }
+
+    /// `kubectl apply --server-side` onto a not-yet-existing Namespace name delegates into
+    /// do_patch's SSA-create branch (see patch_namespace's apply-patch+yaml branch above) — a
+    /// validating webhook that denies CREATE must reject it, and the namespace must never be
+    /// created. Without do_patch's own SSA-create fix, this bypassed admission entirely: not
+    /// just Namespace, but ANY built-in resource created via `kubectl apply --server-side`
+    /// onto a missing name skipped both mutating and validating webhooks.
+    #[tokio::test]
+    async fn patch_namespace_ssa_create_invokes_validating_admission_when_missing() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        let (url, _handle) = start_mock_webhook(deny_webhook_router()).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating-ssa-create-ns"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["namespaces"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-ssa-create-ns",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let apply_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "ssa-denied-ns"}
+            })
+            .to_string(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let result = patch_namespace(
+            axum::extract::State(state),
+            Path("ssa-denied-ns".to_string()),
+            Query(PatchQuery::default()),
+            test_user(),
+            headers,
+            apply_body,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "SSA-create of a not-yet-existing Namespace must be rejected when validating \
+             webhook denies — without do_patch's SSA-create fix, admission was bypassed \
+             entirely and the namespace was silently created"
+        );
+
+        let stored = store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "ssa-denied-ns",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "denied SSA-create must not persist the namespace"
         );
     }
 
