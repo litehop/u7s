@@ -3744,6 +3744,19 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
                     "unable to create new content in namespace {ns} because it is being terminated"
                 )));
             }
+            // Mirrors create_namespaced_resource's POST loop: a create-on-missing PUT that
+            // loses a create race against a concurrent create of the same createOrUpdate
+            // resource (events) must still upsert, not surface the store's AlreadyExists as
+            // a spurious 409 on what the client sees as a plain PUT.
+            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
+                if meta.create_or_update =>
+            {
+                state
+                    .store
+                    .put(&key, obj.to_bytes(), None)
+                    .await
+                    .map_err(|e| store_err(e, &name, &meta.kind))?
+            }
             Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, &name, &meta.kind)),
         }
     } else {
@@ -7337,6 +7350,108 @@ mod tests {
         assert!(
             state.store.get(&key).await.unwrap().is_none(),
             "the ConfigMap must not have been created in the Terminating namespace"
+        );
+    }
+
+    /// `replace_namespaced_resource`'s create-on-missing branch handled
+    /// `CreateNamespacedError::Store(StoreError::AlreadyExists)` by surfacing a 409, even for
+    /// createOrUpdate resources (events) — unlike `create_namespaced_resource`'s POST loop,
+    /// which falls back to an unconditional update on the same error (the `meta.create_or_update`
+    /// guard around line 3012). A PUT create-on-missing of an Event that loses a concurrent
+    /// create race (two controllers reporting the same deduplicated Event key) must upsert
+    /// like POST does, or the losing write is dropped as a spurious conflict instead of
+    /// updating the event's count/message.
+    ///
+    /// Forces the race deterministically via `RaceWinnerAlreadyExistsStore`: `get()` (which
+    /// decides `object_existed`) sees nothing, so the handler takes the create-on-missing
+    /// path, but the store's `put()` reports `AlreadyExists` on first call (as if a second
+    /// writer's create landed in between). Fails on revert: without the fallback, this
+    /// returns 409 and the request's own body is never persisted.
+    #[tokio::test]
+    async fn replace_namespaced_resource_put_create_on_missing_event_upserts_on_concurrent_create_race(
+    ) {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/events/default/my-pod.race-event";
+
+        let winner = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-pod.race-event", "namespace": "default" },
+            "involvedObject": { "kind": "Pod", "name": "my-pod", "namespace": "default" },
+            "reason": "BackOff",
+            "message": "winner's message"
+        });
+        let winner_body = bytes::Bytes::from(serde_json::to_vec(&winner).unwrap());
+
+        let store = Arc::new(RaceWinnerAlreadyExistsStore::new(
+            inner.clone(),
+            winner_body,
+        ));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let event = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-pod.race-event", "namespace": "default" },
+            "involvedObject": { "kind": "Pod", "name": "my-pod", "namespace": "default" },
+            "reason": "BackOff",
+            "message": "this request's own message"
+        });
+
+        let result = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "events".to_string(),
+                "my-pod.race-event".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&event).unwrap()),
+        )
+        .await;
+
+        let response = result
+            .unwrap_or_else(|e| {
+                panic!(
+                    "PUT create-on-missing of an Event racing a concurrent create must upsert \
+                     (200), not surface the store's AlreadyExists as a 409 — got error: {e:?}"
+                )
+            })
+            .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "createOrUpdate resources (events) must upsert on an AlreadyExists create race \
+             instead of returning a spurious 409, exactly like create_namespaced_resource's \
+             POST loop already does"
+        );
+
+        let stored = inner
+            .get(key)
+            .await
+            .unwrap()
+            .expect("the Event must be persisted despite the create race");
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["message"], "this request's own message",
+            "the fallback must replace the race winner's object with THIS request's body \
+             (createOrUpdate is an unconditional replace, not a merge) — if this fails, the \
+             fallback never ran and the winner's stale object was left in place"
         );
     }
 
