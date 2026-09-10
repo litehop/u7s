@@ -10448,6 +10448,35 @@ mod handler_tests {
         assert_eq!(v["rows"][0]["cells"][0], "nginx");
     }
 
+    /// An unsupported Table version (e.g. v2) must 406, not be echoed into apiVersion — a
+    /// client must never be told a format it asked for was served when it wasn't. Fail-on-
+    /// revert: dropping get_pod's version gate makes this build and return a bogus
+    /// "meta.k8s.io/v2" Table instead of rejecting the request.
+    #[tokio::test]
+    async fn get_pod_with_unsupported_table_version_returns_406() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "nginx", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/nginx")
+            .header("accept", "application/json;as=Table;g=meta.k8s.io;v=v2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_ACCEPTABLE,
+            "clients must not be told an unsupported Table version was served"
+        );
+    }
+
     /// kcm's GC sends `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`
     /// when verifying a Pod owner reference still exists (garbagecollector.go:434-444
     /// isDangling). Before this fix, get_pod always returned the full typed Pod object,

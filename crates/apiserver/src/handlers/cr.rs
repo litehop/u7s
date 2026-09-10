@@ -2029,6 +2029,17 @@ pub async fn list_cr<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // Reject an unsupported Table version up front, regardless of whether a CRD backs this
+    // group (same gate as list_resource/list_pods) — the format is not implementable either way.
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if !super::table::is_supported_table_version(version) {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
+            )));
+        }
+    }
+
     // When no CRD exists for this group, return 406 if Table format was requested
     // (the resource is registered via APIService but Table is not implementable without
     // a CRD or proxy backend) rather than 404 Not Found.
@@ -2277,6 +2288,15 @@ pub async fn get_cr<S: Store>(
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    // Reject an unsupported Table version (same gate as list_cr above).
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if !super::table::is_supported_table_version(version) {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
+            )));
+        }
+    }
     let pom = wants_partial_object_metadata(accept);
 
     let key = cr_store_key(&group, &plural, None, &name);
@@ -3040,6 +3060,17 @@ pub async fn list_cr_namespaced<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // Reject an unsupported Table version up front, regardless of whether a CRD backs this
+    // group (same gate as list_cr above) — the format is not implementable either way.
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if !super::table::is_supported_table_version(version) {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
+            )));
+        }
+    }
+
     // When no CRD exists for this group, return 406 if Table format was requested
     // rather than 404 Not Found (the group may be registered via APIService but
     // Table is not implementable without a CRD or proxy backend).
@@ -3289,6 +3320,15 @@ pub async fn get_cr_namespaced<S: Store>(
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    // Reject an unsupported Table version (same gate as list_cr_namespaced above).
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if !super::table::is_supported_table_version(version) {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 and \
+                 meta.k8s.io/v1beta1 are accepted"
+            )));
+        }
+    }
     let pom = wants_partial_object_metadata(accept);
 
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
