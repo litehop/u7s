@@ -3260,7 +3260,18 @@ pub(crate) async fn replace_pod_status<S: Store>(
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    crate::handlers::status::replace_status_field(&mut current_obj.body, &incoming["status"])?;
+    // Typed dispatch: Pod is always registered in status_dispatch (mirrors
+    // put_namespace_status's identical null/typed-decode split), so a scalar or
+    // wrong-typed status fails at typed decode (400) instead of the old
+    // reject-non-object-only check.
+    let incoming_status = &incoming["status"];
+    if incoming_status.is_null() {
+        current_obj.body.as_object_mut().map(|m| m.remove("status"));
+    } else {
+        current_obj.body["status"] =
+            crate::status_dispatch::decode_status_put("v1", "Pod", incoming_status)
+                .expect("Pod is always registered in status_dispatch")?;
+    }
 
     crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, "Pod");
 
@@ -3399,6 +3410,14 @@ pub(crate) fn apply_status_patch(
     // object (e.g. `apply_resize_patch`'s resize stamp), crashing the apiserver on the next
     // resize/delete of this pod. Reject before it's ever written to the store.
     crate::handlers::status::reject_non_object_status(&result["status"])?;
+    // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
+    // on a wrong-typed enumerated field, e.g. `status.phase: 5`), same 422 code. Pod is
+    // always registered in status_dispatch. `null` already passed the check above and is
+    // skipped here — the codec has no null case to decode into.
+    if !result["status"].is_null() {
+        crate::status_dispatch::decode_status_patch("v1", "Pod", &result["status"])
+            .expect("Pod is always registered in status_dispatch")?;
+    }
 
     // Apply metadata changes from the patch body (annotations, etc.) via the same guard the
     // generic status handlers use: identity fields, lifecycle-control fields, and `labels`
@@ -15810,6 +15829,122 @@ mod handler_tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // status_dispatch coverage matrix: Pod merge-PATCH/strategic-merge-PATCH scalar status
+    // and an object-shaped-but-wrong-typed-field status. JSON-Patch is not a valid cell for
+    // Pod: `patch_pod_status_unsupported_content_type_returns_415` above already proves the
+    // route 415s on `application/json-patch+json` before any merge/decode logic runs. PUT's
+    // scalar-status cell is `replace_pod_status_rejects_non_object_status` above (400,
+    // unmodified by this migration — it already goes through `decode_status_put` now).
+    // ---------------------------------------------------------------------------
+
+    /// PATCH /status with a strategic-merge-patch body `{"status":"x"}` must also be rejected
+    /// with 422. Pod's own `apply_status_patch` doesn't dispatch on merge-vs-strategic-merge
+    /// for a top-level status replace (unlike the generic status handlers' `crate::patch`
+    /// helpers, whose `strategic_merge_patch` requires the patch value itself be a JSON
+    /// object and would 400 earlier) — both content types hit the same
+    /// `result["status"] = patch_status.clone()` fallback, so this proves
+    /// `reject_non_object_status` is reached from this content type too.
+    #[tokio::test]
+    async fn patch_pod_status_rejects_scalar_status_strategic_merge_patch() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "sm-scalar-pod",
+            serde_json::json!({"status": {"phase": "Running"}}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"status": "x"});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/sm-scalar-pod/status")
+            .header(
+                header::CONTENT_TYPE,
+                "application/strategic-merge-patch+json",
+            )
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a scalar status via strategic-merge-patch must be rejected with 422, same as \
+             merge-patch"
+        );
+
+        let key = "/registry/pods/default/sm-scalar-pod";
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "the rejected patch must not have been persisted"
+        );
+    }
+
+    /// PATCH /status with an OBJECT-shaped status whose `phase` field is the wrong JSON type
+    /// (a number, not a string) must also be 422. The scalar-status tests above never reach
+    /// `decode_status_patch`: `reject_non_object_status` already rejects a top-level
+    /// scalar/array before typed dispatch runs, so they'd pass identically even if the
+    /// `decode_status_patch` call in `apply_status_patch` were deleted. This status IS an
+    /// object, so it clears that guard — only the typed decode inside `decode_status_patch`
+    /// can catch the wrong-typed field, making this the real fail-on-revert case for Pod PATCH.
+    #[tokio::test]
+    async fn patch_pod_status_rejects_object_status_wrong_typed_field_merge_patch() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "wrong-typed-pod",
+            serde_json::json!({"status": {"phase": "Running"}}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"status": {"phase": 5}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/wrong-typed-pod/status")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "status.phase as a number instead of a string must be rejected — \
+             reject_non_object_status alone can't see inside the object; this only fails via \
+             decode_status_patch's typed decode, proving it is actually wired into \
+             apply_status_patch"
+        );
+
+        let key = "/registry/pods/default/wrong-typed-pod";
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "the rejected patch must not have been persisted"
+        );
+    }
+
     /// PATCH /status must reject a smuggled metadata.labels change while still applying a
     /// legitimate status update. A caller granted only `pods/status` RBAC rights
     /// (e.g. the kubelet) must not be able to rewrite a pod's labels through this endpoint —
@@ -18072,6 +18207,152 @@ mod handler_tests {
             resp.status(),
             StatusCode::OK,
             "a null status PUT is legitimate field-clearing, not a 422"
+        );
+    }
+
+    /// PUT /status with an OBJECT-shaped status whose `phase` field is the wrong JSON type
+    /// (a number, not a string) must be 400, not 200. `replace_pod_status_rejects_non_object_status`
+    /// above only proves a top-level scalar/array is rejected; this status IS an object, so it
+    /// clears that check — only the typed decode inside `decode_status_put` can catch a
+    /// wrong-typed field nested inside it, making this the real fail-on-revert case for Pod PUT.
+    #[tokio::test]
+    async fn replace_pod_status_rejects_object_status_wrong_typed_field() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "put-wrong-typed-pod",
+            serde_json::json!({"status": {"phase": "Running"}}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "put-wrong-typed-pod", "namespace": "default"},
+            "status": {"phase": 5}
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/put-wrong-typed-pod/status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "status.phase as a number instead of a string must be rejected with 400 — this \
+             only fails via decode_status_put's typed decode, proving it is actually wired \
+             into replace_pod_status"
+        );
+
+        let key = "/registry/pods/default/put-wrong-typed-pod";
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "the rejected PUT must not have been persisted"
+        );
+    }
+
+    /// PUT /status with a valid, richly-populated kubelet-shaped status round-trips 200 and
+    /// preserves unenumerated fields verbatim — the flatten-rest lossless-passthrough property
+    /// that makes `PodStatus`'s hand-written minimal field set safe: Pod status is
+    /// kubelet-owned and field-rich, so under-enumerating a field must cost "not validated
+    /// yet", never data loss.
+    #[tokio::test]
+    async fn replace_pod_status_valid_rich_status_round_trips_and_preserves_unknown_fields() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "rich-status-pod",
+            serde_json::json!({"status": {"phase": "Pending"}}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "rich-status-pod", "namespace": "default"},
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-02T00:00:01Z"}
+                ],
+                "podIP": "10.0.0.5",
+                "podIPs": [{"ip": "10.0.0.5"}],
+                "hostIP": "192.168.1.1",
+                "startTime": "2026-06-02T00:00:00Z",
+                "qosClass": "Burstable",
+                "containerStatuses": [{"name": "app", "ready": true, "restartCount": 0}],
+                "resize": "",
+                "message": "not enumerated — must survive via rest",
+                "nominatedNodeName": "node-7"
+            }
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/rich-status-pod/status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a valid, fully-populated kubelet-shaped Pod status must round-trip through the \
+             typed decode"
+        );
+
+        let key = "/registry/pods/default/rich-status-pod";
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "the enumerated `phase` field must persist"
+        );
+        assert_eq!(
+            v["status"]["conditions"][0]["status"], "True",
+            "the enumerated `conditions` field must persist"
+        );
+        assert_eq!(
+            v["status"]["podIP"], "10.0.0.5",
+            "the enumerated `podIP` field must persist"
+        );
+        assert_eq!(
+            v["status"]["containerStatuses"][0]["restartCount"], 0,
+            "the (opaquely-typed) `containerStatuses` field must persist"
+        );
+        assert_eq!(
+            v["status"]["message"], "not enumerated — must survive via rest",
+            "a field not enumerated on PodStatus must survive verbatim via `rest` — \
+             under-enumerating must cost \"not validated\", never data loss"
+        );
+        assert_eq!(
+            v["status"]["nominatedNodeName"], "node-7",
+            "nominatedNodeName is not enumerated on PodStatus but must still survive via rest \
+             — it drives field-selector routing (pod_matches_field_selector) off the raw \
+             stored JSON, not the typed struct"
         );
     }
 

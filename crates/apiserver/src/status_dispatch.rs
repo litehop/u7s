@@ -25,7 +25,10 @@
 //! `handlers::status::apply_status_replacement`.
 
 use crate::status::{Status, StatusError};
-use crate::types::{ApiServiceStatus, CertificateSigningRequestStatus, NamespaceStatus};
+use crate::types::{
+    ApiServiceStatus, CertificateSigningRequestStatus, NamespaceStatus, PodStatus,
+    ResourceQuotaStatus,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -61,6 +64,8 @@ fn status_codecs() -> &'static HashMap<(&'static str, &'static str), StatusCodec
             ("apiregistration.k8s.io/v1", "APIService"),
             codec::<ApiServiceStatus>,
         );
+        m.insert(("v1", "ResourceQuota"), codec::<ResourceQuotaStatus>);
+        m.insert(("v1", "Pod"), codec::<PodStatus>);
         // Test-only: none of the real Phase-1 kinds above collide on `kind` today, so this
         // synthetic pair is what makes `composite_key_keeps_both_api_versions_resolvable`
         // below an actual regression test instead of a no-op — see that test's doc comment.
