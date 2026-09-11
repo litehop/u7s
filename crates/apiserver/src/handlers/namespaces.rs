@@ -6574,6 +6574,74 @@ mod tests {
         );
     }
 
+    /// patch_namespace_status with an OBJECT-shaped status whose `phase` field is the wrong
+    /// JSON type (a number, not a string) must also be 422. The two scalar-status tests above
+    /// never reach `decode_status_patch`: `reject_non_object_status` already rejects a
+    /// scalar/array before typed dispatch runs, so they'd pass identically even if the
+    /// `decode_status_patch` call in `patch_namespace_status` were deleted. This status IS an
+    /// object, so it clears that guard — only the typed decode inside `decode_status_patch`
+    /// can catch the wrong-typed `phase` field, making this the real fail-on-revert case.
+    #[tokio::test]
+    async fn patch_namespace_status_rejects_object_status_wrong_typed_phase_merge_patch() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("wrong-typed-phase-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(serde_json::json!({ "status": { "phase": 5 } }).to_string());
+
+        let result = patch_namespace_status(
+            State(state.clone()),
+            Path("wrong-typed-phase-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "an object status with a wrong-typed `phase` field must be rejected — \
+                 reject_non_object_status alone can't see inside the object, so this only \
+                 fails if decode_status_patch's typed decode is actually wired in"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "typed decode failure on an object-shaped status is still upstream's post-merge \
+             validation semantics (422), same code as the scalar case"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "wrong-typed-phase-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_ne!(
+            body["status"]["phase"], 5,
+            "the rejected patch must not have been persisted"
+        );
+    }
+
     /// patch_namespace_status must accept a genuine multi-line YAML apply-patch+yaml body,
     /// not just a JSON body wearing the +yaml content-type.
     ///

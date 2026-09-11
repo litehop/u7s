@@ -19948,6 +19948,52 @@ mod tests {
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// CSR merge-PATCH with an OBJECT-shaped status whose `conditions[].status` field is the
+    /// wrong JSON type (a number, not a string) must also be 422. The four scalar-status
+    /// tests above never reach `decode_status_patch`: `reject_non_object_status` already
+    /// rejects a scalar/array before typed dispatch runs, so they'd pass identically even if
+    /// the `decode_status_patch` call were deleted. This status IS an object, so it clears
+    /// that guard — only the typed decode inside `decode_status_patch` can catch the
+    /// wrong-typed field, making this the real fail-on-revert case for CSR.
+    #[tokio::test]
+    async fn patch_cr_status_rejects_object_status_wrong_typed_field_on_csr_via_typed_dispatch() {
+        let state = make_state();
+        seed_csr(&state, "wrong-typed-csr").await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!({ "status": { "conditions": [{"type": "Approved", "status": 5}] } })
+                .to_string(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((
+                    "certificates.k8s.io".into(),
+                    "v1".into(),
+                    "certificatesigningrequests".into(),
+                    "wrong-typed-csr".into(),
+                )),
+                headers,
+                patch_body,
+            )
+            .await,
+            "an object status whose conditions[].status is a number, not a string, must be \
+             rejected — reject_non_object_status alone can't see inside the object",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this only fails via decode_status_patch's typed decode, not the object-shape \
+             guard — proves decode_status_patch is actually wired into patch_cr_status"
+        );
+    }
+
     async fn seed_apiservice(state: &AppState, name: &str, status: serde_json::Value) {
         let obj = serde_json::json!({
             "apiVersion": "apiregistration.k8s.io/v1",
@@ -20085,6 +20131,57 @@ mod tests {
             "a scalar status JSON Patch on APIService must be rejected",
         );
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// APIService merge-PATCH with an OBJECT-shaped status whose `conditions[].status` field
+    /// is the wrong JSON type (a number, not a string) must also be 422 — same gap as the CSR
+    /// case above: `reject_non_object_status` passes this object through, so only
+    /// `decode_status_patch`'s typed decode can reject it. The scalar-status tests above pass
+    /// identically whether or not `decode_status_patch` is wired into `patch_cr_status`; this
+    /// one does not.
+    #[tokio::test]
+    async fn patch_cr_status_rejects_object_status_wrong_typed_field_on_apiservice_via_typed_dispatch(
+    ) {
+        let state = make_state();
+        seed_apiservice(
+            &state,
+            "wrong-typed-apisvc",
+            serde_json::json!({"conditions": []}),
+        )
+        .await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!({ "status": { "conditions": [{"type": "Available", "status": 5}] } })
+                .to_string(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((
+                    "apiregistration.k8s.io".into(),
+                    "v1".into(),
+                    "apiservices".into(),
+                    "wrong-typed-apisvc".into(),
+                )),
+                headers,
+                patch_body,
+            )
+            .await,
+            "an object status whose conditions[].status is a number, not a string, must be \
+             rejected — reject_non_object_status alone can't see inside the object",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this only fails via decode_status_patch's typed decode, not the object-shape \
+             guard — proves decode_status_patch is actually wired into patch_cr_status"
+        );
     }
 
     /// A valid typed APIService status round-trips through PUT (200) and an unrecognized
