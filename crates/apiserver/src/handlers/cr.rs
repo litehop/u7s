@@ -4597,10 +4597,33 @@ pub async fn put_cr_status<S: Store>(
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
     // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
-    // `_dynamic`, not the built-in `replace_status_field`: a scalar status here is caught
-    // by structural-schema validation (422), not a typed decode failure (400) — see
-    // replace_status_field_dynamic's doc comment.
-    crate::handlers::status::replace_status_field_dynamic(&mut current, &incoming["status"])?;
+    // Typed dispatch first: a registry-hit built-in kind with a registered status codec
+    // (Namespace/CertificateSigningRequest/APIService today) fails a scalar status at
+    // typed decode (400) — this closes the KNOWN EDGE where CSR's real /status route
+    // returned 422 (the CR-shaped code) for a built-in with no typed decode to fail. A
+    // dispatch miss (every other kind, and every genuine CR/CRD) falls through to
+    // `replace_status_field_dynamic` UNCHANGED: a scalar status there is caught by
+    // structural-schema validation (422), not a typed decode failure — see that
+    // function's doc comment.
+    let incoming_status = &incoming["status"];
+    if incoming_status.is_null() {
+        current.as_object_mut().map(|m| m.remove("status"));
+    } else {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{group}/{version}")
+        };
+        match crate::status_dispatch::decode_status_put(&api_version, &kind, incoming_status) {
+            Some(result) => current["status"] = result?,
+            None => {
+                crate::handlers::status::replace_status_field_dynamic(
+                    &mut current,
+                    incoming_status,
+                )?;
+            }
+        }
+    }
 
     crate::handlers::status::merge_incoming_metadata(&mut current, &incoming, &kind);
 
@@ -4782,6 +4805,23 @@ pub async fn patch_cr_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     crate::handlers::status::reject_non_object_status(&current["status"])?;
+    // Typed dispatch, layered on top of the object-shape check above: stronger, same 422
+    // code, for a registry-hit built-in with a registered status codec. `null` already
+    // passed the check above and is skipped here — the codec has no null case to decode
+    // into. A dispatch miss (every other kind, and every genuine CR/CRD) leaves the
+    // object-shape check above as the only guard, UNCHANGED.
+    if !current["status"].is_null() {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{group}/{version}")
+        };
+        if let Some(result) =
+            crate::status_dispatch::decode_status_patch(&api_version, &kind, &current["status"])
+        {
+            result?;
+        }
+    }
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
@@ -19785,10 +19825,11 @@ mod tests {
         };
         assert_eq!(
             err.0,
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "scalar status on CSR /status via PUT must be rejected with 422: put_cr_status \
-             guards every resource it serves with the CR-shaped 422 check, not a per-type \
-             typed decode"
+            axum::http::StatusCode::BAD_REQUEST,
+            "scalar status on CSR /status via PUT must be rejected with 400: CSR is now a \
+             status_dispatch-registered built-in, so a scalar status fails at typed decode \
+             (upstream's whole-body decode-failure semantics), not the CR-shaped 422 \
+             structural check"
         );
 
         // The CSR's status must still be the original object — proving the approval-path
@@ -19802,6 +19843,293 @@ mod tests {
             current.body["status"]["conditions"].is_array(),
             "merge_approval_conditions must still work on this CSR after the rejected PUT — \
              the approval-path panic is only closed if the corrupted status never persists"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // status_dispatch coverage matrix: {CSR, APIService} PUT/merge-PATCH/
+    // JSON-Patch/strategic-merge-PATCH scalar status, plus one valid-status round-trip
+    // proving the flatten-rest lossless-passthrough property at the handler level (not
+    // just status_dispatch.rs's own unit tests). Merge-PATCH and strategic-merge-PATCH
+    // share the exact same post-match convergence-point guard call in patch_cr_status
+    // (both fall into the same `_ =>` arm before the shared `decode_status_patch` check),
+    // so one of the two plus JSON-Patch (a genuinely different code branch) proves every
+    // patch content-type reaches the guard.
+    // ---------------------------------------------------------------------------
+
+    async fn seed_csr(state: &AppState, name: &str) {
+        let csr = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": { "name": name },
+            "spec": { "request": "ZmFrZQ==", "signerName": "kubernetes.io/kube-apiserver-client", "usages": ["client auth"] },
+            "status": { "conditions": [] }
+        });
+        state
+            .store
+            .put(
+                &format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}"),
+                Bytes::from(serde_json::to_vec(&csr).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// CSR merge-PATCH with a scalar status must stay 422 (not flip to 400): only PUT's
+    /// whole-body decode failure is 400 upstream; PATCH's is post-merge validation (422).
+    #[tokio::test]
+    async fn patch_cr_status_rejects_scalar_status_merge_patch_on_csr_via_typed_dispatch() {
+        let state = make_state();
+        seed_csr(&state, "merge-scalar-csr").await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(serde_json::json!({ "status": "oops" }).to_string());
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((
+                    "certificates.k8s.io".into(),
+                    "v1".into(),
+                    "certificatesigningrequests".into(),
+                    "merge-scalar-csr".into(),
+                )),
+                headers,
+                patch_body,
+            )
+            .await,
+            "a scalar status merge-patch on a typed built-in CSR must be rejected",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "merge-PATCH scalar status on a typed kind must stay 422 — the typed dispatch \
+             only changes PUT's code, not PATCH's"
+        );
+    }
+
+    /// CSR JSON-Patch with a whole-`/status` scalar replace must also be 422 — a different
+    /// code branch (`PatchType::Json`) than merge/strategic-merge, so this proves the shared
+    /// convergence point is reached from that branch too.
+    #[tokio::test]
+    async fn patch_cr_status_rejects_scalar_status_json_patch_on_csr_via_typed_dispatch() {
+        let state = make_state();
+        seed_csr(&state, "jp-scalar-csr").await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!([{"op": "replace", "path": "/status", "value": "oops"}]).to_string(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((
+                    "certificates.k8s.io".into(),
+                    "v1".into(),
+                    "certificatesigningrequests".into(),
+                    "jp-scalar-csr".into(),
+                )),
+                headers,
+                patch_body,
+            )
+            .await,
+            "a scalar status JSON Patch on a typed built-in CSR must be rejected",
+        );
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    async fn seed_apiservice(state: &AppState, name: &str, status: serde_json::Value) {
+        let obj = serde_json::json!({
+            "apiVersion": "apiregistration.k8s.io/v1",
+            "kind": "APIService",
+            "metadata": { "name": name },
+            "spec": { "group": "wardle.example.com", "version": "v1", "groupPriorityMinimum": 100, "versionPriority": 100 },
+            "status": status
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key("apiregistration.k8s.io", "apiservices", None, name),
+                Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// APIService PUT with a scalar status must be 400 (typed decode failure), same as CSR
+    /// — the second built-in this bead types, proving the dispatch table generalizes to a
+    /// kind that had no pre-existing typed-status code at all.
+    #[tokio::test]
+    async fn put_cr_status_rejects_scalar_status_on_apiservice_via_typed_dispatch() {
+        let state = make_state();
+        seed_apiservice(
+            &state,
+            "put-scalar-apisvc",
+            serde_json::json!({"conditions": []}),
+        )
+        .await;
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiregistration.k8s.io/v1",
+                "kind": "APIService",
+                "metadata": { "name": "put-scalar-apisvc" },
+                "status": "oops"
+            })
+            .to_string(),
+        );
+        let err = expect_err_status(
+            put_cr_status(
+                State(state.clone()),
+                Path((
+                    "apiregistration.k8s.io".into(),
+                    "v1".into(),
+                    "apiservices".into(),
+                    "put-scalar-apisvc".into(),
+                )),
+                axum::http::HeaderMap::new(),
+                put_body,
+            )
+            .await,
+            "a scalar status PUT on APIService must be rejected",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::BAD_REQUEST,
+            "APIService is a status_dispatch-registered built-in, so PUT scalar status fails \
+             at typed decode (400), not the CR-shaped 422"
+        );
+    }
+
+    /// APIService merge-PATCH with a scalar status must be 422 (post-merge validation, not
+    /// PUT's whole-body decode failure).
+    #[tokio::test]
+    async fn patch_cr_status_rejects_scalar_status_merge_patch_on_apiservice_via_typed_dispatch() {
+        let state = make_state();
+        seed_apiservice(
+            &state,
+            "merge-scalar-apisvc",
+            serde_json::json!({"conditions": []}),
+        )
+        .await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(serde_json::json!({ "status": "oops" }).to_string());
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((
+                    "apiregistration.k8s.io".into(),
+                    "v1".into(),
+                    "apiservices".into(),
+                    "merge-scalar-apisvc".into(),
+                )),
+                headers,
+                patch_body,
+            )
+            .await,
+            "a scalar status merge-patch on APIService must be rejected",
+        );
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// APIService JSON-Patch with a whole-`/status` scalar replace must also be 422.
+    #[tokio::test]
+    async fn patch_cr_status_rejects_scalar_status_json_patch_on_apiservice_via_typed_dispatch() {
+        let state = make_state();
+        seed_apiservice(
+            &state,
+            "jp-scalar-apisvc",
+            serde_json::json!({"conditions": []}),
+        )
+        .await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!([{"op": "replace", "path": "/status", "value": "oops"}]).to_string(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_status(
+                State(state.clone()),
+                Path((
+                    "apiregistration.k8s.io".into(),
+                    "v1".into(),
+                    "apiservices".into(),
+                    "jp-scalar-apisvc".into(),
+                )),
+                headers,
+                patch_body,
+            )
+            .await,
+            "a scalar status JSON Patch on APIService must be rejected",
+        );
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A valid typed APIService status round-trips through PUT (200) and an unrecognized
+    /// field survives verbatim via `rest` — the flatten-rest lossless-passthrough property
+    /// (the safety invariant behind hand-writing minimal-field structs instead of a lossy
+    /// codegen struct) exercised through the real handler, not just the codec directly.
+    #[tokio::test]
+    async fn put_cr_status_apiservice_valid_status_round_trips_and_preserves_unknown_field() {
+        let state = make_state();
+        seed_apiservice(&state, "valid-apisvc", serde_json::json!({})).await;
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiregistration.k8s.io/v1",
+                "kind": "APIService",
+                "metadata": { "name": "valid-apisvc" },
+                "status": {
+                    "conditions": [{"type": "Available", "status": "True", "reason": "Passed"}],
+                    "someFutureField": "must-survive"
+                }
+            })
+            .to_string(),
+        );
+        let result = put_cr_status(
+            State(state.clone()),
+            Path((
+                "apiregistration.k8s.io".into(),
+                "v1".into(),
+                "apiservices".into(),
+                "valid-apisvc".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            put_body,
+        )
+        .await;
+        let obj = result.expect("a valid typed status must be accepted");
+        let body = axum::body::to_bytes(obj.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"]["conditions"][0]["type"], "Available");
+        assert_eq!(
+            v["status"]["someFutureField"], "must-survive",
+            "an unrecognized status field must survive the typed round-trip via \
+             ApiServiceStatus.rest, never be dropped by omission"
         );
     }
 

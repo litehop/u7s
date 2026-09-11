@@ -24,10 +24,7 @@ use crate::{
     proto,
     state::AppState,
     status::Status,
-    types::{
-        DeleteOptions, NamespacePhase, NamespaceSpec, NamespaceStatus, Object, ObjectMeta,
-        ResourceMeta,
-    },
+    types::{DeleteOptions, NamespacePhase, NamespaceSpec, Object, ObjectMeta, ResourceMeta},
     util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
@@ -806,10 +803,9 @@ pub(crate) async fn put_namespace_status<S: Store>(
             current.body.as_object_mut().map(|m| m.remove("status"));
         }
         v => {
-            let status: NamespaceStatus = NamespaceStatus::deserialize(v).unwrap_or_default();
-            current.body["status"] = serde_json::to_value(&status).map_err(|e| {
-                Status::internal(format!("failed to serialize NamespaceStatus: {e}"))
-            })?;
+            current.body["status"] =
+                crate::status_dispatch::decode_status_put("v1", "Namespace", v)
+                    .expect("Namespace is always registered in status_dispatch")?;
         }
     }
 
@@ -907,6 +903,17 @@ pub(crate) async fn patch_namespace_status<S: Store>(
     // handler previously guarded neither branch, so a merge-patch or JSON Patch `/status`
     // replace could persist a scalar status and later panic the in-place terminating-stamp.
     crate::handlers::status::reject_non_object_status(&current.body["status"])?;
+    // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
+    // on a wrong-typed enumerated field, e.g. `status.phase: 5`), same 422 code. `null`
+    // already passed the check above and is skipped here — RFC 7396 field deletion is
+    // legal regardless of typed shape, and the codec has no null case to decode into.
+    if !current.body["status"].is_null() {
+        if let Some(result) =
+            crate::status_dispatch::decode_status_patch("v1", "Namespace", &current.body["status"])
+        {
+            result?;
+        }
+    }
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
@@ -6020,6 +6027,86 @@ mod tests {
         assert_eq!(
             body["metadata"]["name"], "status-put-ns",
             "metadata must be unchanged after PUT /status"
+        );
+    }
+
+    /// Regression for the silent-coercion bug: before status_dispatch, PUT
+    /// decoded via `NamespaceStatus::deserialize(v).unwrap_or_default()`, which swallowed a
+    /// decode failure and stored `status: {}` with a 200 — a caller whose controller sent a
+    /// malformed status got no error and a namespace that silently lost its real status.
+    /// Reverting to that `.unwrap_or_default()` makes this test fail: it would see 200 and
+    /// an overwritten `{}` instead of a 400 and the original status left untouched.
+    #[tokio::test]
+    async fn put_namespace_status_rejects_scalar_status_instead_of_silently_defaulting() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("status-scalar-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let stored_before = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-scalar-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "status-scalar-ns" },
+                "status": "oops"
+            })
+            .to_string(),
+        );
+
+        let result = put_namespace_status(
+            State(state.clone()),
+            Path("status-scalar-ns".to_string()),
+            axum::http::HeaderMap::new(),
+            status_body,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a scalar status PUT must be rejected, not silently coerced to {{}} — this is \
+                 exactly the silent-corruption bug status_dispatch closes"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a scalar status on PUT /status must fail at typed decode (400), matching \
+             upstream's whole-body decode-failure semantics"
+        );
+
+        let stored_after = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-scalar-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_after.value, stored_before.value,
+            "the rejected PUT must not have persisted anything — the namespace's status must \
+             be exactly what it was before, not overwritten with a defaulted {{}}"
         );
     }
 

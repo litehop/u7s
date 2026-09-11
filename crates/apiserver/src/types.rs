@@ -1262,6 +1262,21 @@ pub struct Condition {
     pub observed_generation: Option<i64>,
 }
 
+/// Upstream apiregistration/v1 `APIServiceStatus` — the only field upstream reasons
+/// about is `conditions` (the aggregator's own Available-condition sweep,
+/// `handlers/aggregation.rs::upsert_available_condition`, already reads and writes this
+/// shape via `Condition`; this is the write-boundary counterpart for the `/status`
+/// subresource itself, wired through `status_dispatch`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiServiceStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<Condition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    pub rest: serde_json::Value,
+}
+
 // ---------------------------------------------------------------------------
 // Kubernetes object store type
 // ---------------------------------------------------------------------------
