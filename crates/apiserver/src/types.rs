@@ -1246,7 +1246,7 @@ pub struct HpaScalingRules {
 ///
 /// First consumer: `handlers/aggregation.rs`'s `upsert_available_condition`
 /// (APIService's `status.conditions[type=Available]`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Condition {
     #[serde(rename = "type")]
@@ -1260,6 +1260,22 @@ pub struct Condition {
     pub last_transition_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+}
+
+/// Upstream apiregistration/v1 `APIServiceStatus` — the only field upstream reasons
+/// about is `conditions` (the aggregator's own Available-condition sweep,
+/// `handlers/aggregation.rs::upsert_available_condition`, already reads and writes this
+/// shape via `Condition`; this is the write-boundary counterpart for the `/status`
+/// subresource itself, wired through `status_dispatch`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiServiceStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<Condition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
