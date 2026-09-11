@@ -143,7 +143,24 @@ pub async fn put_resource_status<S: Store>(
     };
 
     // Replace status and merge metadata; leave spec and identity fields untouched.
-    replace_status_field(&mut current.body, &incoming.body["status"])?;
+    // Typed dispatch first: a registered built-in kind (ResourceQuota/Pod today) fails a
+    // scalar or wrong-typed status at typed decode (400). A dispatch miss (every other
+    // built-in) falls through to `replace_status_field` UNCHANGED — same object-shape
+    // guard (400) this call site always had.
+    let incoming_status = &incoming.body["status"];
+    if incoming_status.is_null() {
+        current.body.as_object_mut().map(|m| m.remove("status"));
+    } else {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{group}/{version}")
+        };
+        match crate::status_dispatch::decode_status_put(&api_version, &meta.kind, incoming_status) {
+            Some(result) => current.body["status"] = result?,
+            None => replace_status_field(&mut current.body, incoming_status)?,
+        }
+    }
     merge_incoming_metadata(&mut current.body, &incoming.body, &meta.kind);
 
     if let Some(ref old_node) = node_before {
@@ -247,6 +264,24 @@ pub async fn patch_resource_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     reject_non_object_status(&current.body["status"])?;
+    // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
+    // on a wrong-typed enumerated field), same 422 code, for a registered built-in
+    // (ResourceQuota/Pod today). `null` already passed the check above and is skipped here.
+    // A dispatch miss leaves the object-shape check above as the only guard, UNCHANGED.
+    if !current.body["status"].is_null() {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{group}/{version}")
+        };
+        if let Some(result) = crate::status_dispatch::decode_status_patch(
+            &api_version,
+            &meta.kind,
+            &current.body["status"],
+        ) {
+            result?;
+        }
+    }
 
     if let Some(ref old_node) = node_before {
         crate::node_authz::restrict_node_self_write(
@@ -346,7 +381,24 @@ pub async fn put_namespaced_resource_status<S: Store>(
         .map(|e| e.kind)
         .unwrap_or(kind_fallback);
 
-    replace_status_field(&mut current.body, &incoming.body["status"])?;
+    // Typed dispatch first: a registered built-in kind (ResourceQuota/Pod today) fails a
+    // scalar or wrong-typed status at typed decode (400). A dispatch miss (every other
+    // built-in, and every genuine CR) falls through to `replace_status_field` UNCHANGED —
+    // same object-shape guard (400) this call site always had.
+    let incoming_status = &incoming.body["status"];
+    if incoming_status.is_null() {
+        current.body.as_object_mut().map(|m| m.remove("status"));
+    } else {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{group}/{version}")
+        };
+        match crate::status_dispatch::decode_status_put(&api_version, &kind, incoming_status) {
+            Some(result) => current.body["status"] = result?,
+            None => replace_status_field(&mut current.body, incoming_status)?,
+        }
+    }
     merge_incoming_metadata(&mut current.body, &incoming.body, &kind);
 
     // Dry-run: return the would-be status object without persisting — mirrors
@@ -450,6 +502,25 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     reject_non_object_status(&current.body["status"])?;
+    // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
+    // on a wrong-typed enumerated field), same 422 code, for a registered built-in
+    // (ResourceQuota/Pod today). `null` already passed the check above and is skipped here.
+    // A dispatch miss (every other built-in, and every genuine CR) leaves the object-shape
+    // check above as the only guard, UNCHANGED.
+    if !current.body["status"].is_null() {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{group}/{version}")
+        };
+        if let Some(result) = crate::status_dispatch::decode_status_patch(
+            &api_version,
+            &kind,
+            &current.body["status"],
+        ) {
+            result?;
+        }
+    }
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
@@ -2765,6 +2836,321 @@ mod tests {
         assert_eq!(
             v["spec"]["hard"]["services"], "5",
             "spec.hard.services must survive a PATCH to /status"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // status_dispatch coverage matrix: ResourceQuota PUT/merge-PATCH/JSON-Patch/
+    // strategic-merge-PATCH scalar status, an object-shaped-but-wrong-typed-field
+    // status, and a valid round-trip proving flatten-rest lossless-passthrough at the
+    // handler level (not just status_dispatch.rs's own unit tests). Mirrors the
+    // {CSR, APIService} matrix in cr.rs from Phase 1.
+    // ---------------------------------------------------------------------------
+
+    async fn seed_quota(state: &crate::state::AppState, name: &str, status: serde_json::Value) {
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": name, "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } },
+            "status": status
+        });
+        state
+            .store
+            .put(
+                &format!("/registry/resourcequotas/default/{name}"),
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// ResourceQuota PUT with a scalar status must be 400 (typed decode failure) — the
+    /// same code CSR/APIService got in Phase 1, now generalized through the shared
+    /// convergence point in `put_namespaced_resource_status` instead of a per-kind handler.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_rejects_scalar_status_on_resourcequota_via_typed_dispatch(
+    ) {
+        let state = make_state();
+        seed_quota(&state, "put-scalar-quota", serde_json::json!({"hard": {}})).await;
+
+        let body = serde_json::json!({
+            "apiVersion": "v1", "kind": "ResourceQuota",
+            "metadata": { "name": "put-scalar-quota", "namespace": "default" },
+            "status": "oops"
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "resourcequotas".into(),
+                "put-scalar-quota".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a scalar status PUT on ResourceQuota must be rejected, not persisted"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "ResourceQuota is a status_dispatch-registered built-in, so PUT scalar status \
+             fails at typed decode (400), same as CSR/APIService"
+        );
+    }
+
+    /// ResourceQuota merge-PATCH with a scalar status must stay 422 (not flip to 400): only
+    /// PUT's whole-body decode failure is 400 upstream; PATCH's is post-merge validation.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_rejects_scalar_status_merge_patch_on_resourcequota_via_typed_dispatch(
+    ) {
+        let state = make_state();
+        seed_quota(
+            &state,
+            "merge-scalar-quota",
+            serde_json::json!({"hard": {"pods": "10"}}),
+        )
+        .await;
+
+        let patch = serde_json::json!({"status": "oops"});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "resourcequotas".into(),
+                "merge-scalar-quota".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a scalar status merge-patch on ResourceQuota must be rejected, not persisted"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "merge-PATCH scalar status on a typed kind must stay 422"
+        );
+    }
+
+    /// ResourceQuota strategic-merge-PATCH with an OBJECT-shaped status whose `hard` field is
+    /// the wrong JSON type must also be 422, reached via `decode_status_patch`.
+    ///
+    /// Unlike merge-patch (RFC 7396: a non-object patch value replaces the target wholesale,
+    /// so `{"status": "oops"}` turns `status` itself into a scalar), a top-level scalar
+    /// `{"status": "oops"}` sent as strategic-merge-patch fails earlier and differently:
+    /// `strategic_merge_patch` requires its patch value be a JSON object
+    /// (`patch.as_object().ok_or(PatchError::NotAnObject)`), so `status_patch = "oops"` 400s
+    /// at that call, never reaching `reject_non_object_status`/`decode_status_patch` at all.
+    /// A per-FIELD type mismatch inside an object patch has no such early exit — strategic
+    /// merge treats a scalar patch value for a known key as a plain overwrite
+    /// (`target_obj.insert(key, value.clone())`) regardless of the stored field's type — so
+    /// this is the genuine way to reach `decode_status_patch` through this content type.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_rejects_object_status_wrong_typed_field_strategic_merge_on_resourcequota_via_typed_dispatch(
+    ) {
+        let state = make_state();
+        seed_quota(
+            &state,
+            "sm-wrong-typed-quota",
+            serde_json::json!({"hard": {"pods": "10"}}),
+        )
+        .await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let patch = serde_json::json!({"status": {"hard": "not-a-map"}});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "resourcequotas".into(),
+                "sm-wrong-typed-quota".into(),
+            )),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "status.hard as a string instead of a map via strategic-merge-patch must be \
+                 rejected — reject_non_object_status alone can't see inside the object"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "this only fails via decode_status_patch's typed decode — proves it is reached \
+             from the strategic-merge branch too, not just plain merge-patch"
+        );
+    }
+
+    /// ResourceQuota JSON-Patch with a whole-`/status` scalar replace must also be 422 — a
+    /// different code branch (`PatchType::Json`) than merge/strategic-merge, proving the
+    /// shared convergence point is reached from that branch too.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_rejects_scalar_status_json_patch_on_resourcequota_via_typed_dispatch(
+    ) {
+        let state = make_state();
+        seed_quota(
+            &state,
+            "jp-scalar-quota",
+            serde_json::json!({"hard": {"pods": "10"}}),
+        )
+        .await;
+
+        let patch = serde_json::json!([{"op": "replace", "path": "/status", "value": "oops"}]);
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "resourcequotas".into(),
+                "jp-scalar-quota".into(),
+            )),
+            json_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a scalar status JSON Patch on ResourceQuota must be rejected"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// ResourceQuota merge-PATCH with an OBJECT-shaped status whose `hard` field is the wrong
+    /// JSON type (a string, not a map) must also be 422. The scalar-status tests above never
+    /// reach `decode_status_patch`: `reject_non_object_status` already rejects a top-level
+    /// scalar/array before typed dispatch runs, so they'd pass identically even if the
+    /// `decode_status_patch` call were deleted. This status IS an object, so it clears that
+    /// guard — only the typed decode inside `decode_status_patch` can catch the wrong-typed
+    /// field, making this the real fail-on-revert case for ResourceQuota.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_rejects_object_status_wrong_typed_field_on_resourcequota_via_typed_dispatch(
+    ) {
+        let state = make_state();
+        seed_quota(
+            &state,
+            "wrong-typed-quota",
+            serde_json::json!({"hard": {"pods": "10"}}),
+        )
+        .await;
+
+        let patch = serde_json::json!({"status": {"hard": "not-a-map"}});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "resourcequotas".into(),
+                "wrong-typed-quota".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "status.hard as a string instead of a map must be rejected — \
+                 reject_non_object_status alone can't see inside the object"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "this only fails via decode_status_patch's typed decode, not the object-shape \
+             guard — proves decode_status_patch is actually wired into \
+             patch_namespaced_resource_status"
+        );
+    }
+
+    /// ResourceQuota PUT with a valid, richly-populated status round-trips 200 and preserves
+    /// an unenumerated field verbatim — the flatten-rest lossless-passthrough property that
+    /// makes a hand-written minimal-field struct safe instead of a lossy codegen struct.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_resourcequota_valid_status_round_trips_and_preserves_unknown_field(
+    ) {
+        let state = make_state();
+        seed_quota(&state, "valid-quota", serde_json::json!({})).await;
+
+        let body = serde_json::json!({
+            "apiVersion": "v1", "kind": "ResourceQuota",
+            "metadata": { "name": "valid-quota", "namespace": "default" },
+            "status": {
+                "hard": { "pods": "10", "cpu": 4 },
+                "used": { "pods": "3" },
+                "someFutureField": { "nested": 1 }
+            }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "resourcequotas".into(),
+                "valid-quota".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a valid ResourceQuota status must round-trip through the typed decode"
+        );
+
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/valid-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["hard"]["pods"], "10",
+            "the enumerated `hard` map must persist"
+        );
+        assert_eq!(
+            v["status"]["hard"]["cpu"], 4,
+            "a bare-number quantity value (not quoted) must decode — upstream's \
+             resource.Quantity JSON decoder accepts both forms"
+        );
+        assert_eq!(
+            v["status"]["used"]["pods"], "3",
+            "the enumerated `used` map must persist"
+        );
+        assert_eq!(
+            v["status"]["someFutureField"]["nested"], 1,
+            "a field not enumerated on ResourceQuotaStatus must survive verbatim via `rest` — \
+             under-enumerating must cost \"not validated\", never data loss"
         );
     }
 
@@ -5207,12 +5593,12 @@ mod tests {
     /// one is added without calling the shared guard.
     #[test]
     fn every_status_put_handler_guards_against_non_object_status() {
-        // put_namespace_status is the one handler exempt from calling the guard directly: it
-        // round-trips the incoming status through the typed `NamespaceStatus` struct
-        // (`serde_json::from_value::<NamespaceStatus>` then `serde_json::to_value`) before
-        // ever assigning it back, so a scalar/array status is structurally impossible to
-        // produce there — `to_value` on a struct always yields a JSON object.
-        const TYPED_SAFE: &[&str] = &["put_namespace_status"];
+        // put_namespace_status and replace_pod_status are exempt from calling the guard
+        // directly: both round-trip the incoming status through a typed struct
+        // (`decode_status_put` -> `serde_json::from_value::<T>` then `serde_json::to_value`)
+        // before ever assigning it back, so a scalar/array status is structurally impossible
+        // to produce there — `to_value` on a struct always yields a JSON object.
+        const TYPED_SAFE: &[&str] = &["put_namespace_status", "replace_pod_status"];
 
         let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
         let mut checked = Vec::new();

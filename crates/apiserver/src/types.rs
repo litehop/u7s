@@ -1279,6 +1279,114 @@ pub struct ApiServiceStatus {
 }
 
 // ---------------------------------------------------------------------------
+// ResourceQuotaStatus — typed status for ResourceQuota objects
+// ---------------------------------------------------------------------------
+
+/// Typed status for a ResourceQuota object. `hard`/`used` are the only two fields
+/// upstream defines (`generated.proto`'s `ResourceQuotaStatus`) and the only two the
+/// quota reconciler (`quota.rs`) reads and writes on every pod create/delete/resize.
+///
+/// Map values are `serde_json::Value`, not `String`: upstream's `resource.Quantity`
+/// JSON decoder accepts both a quoted string (`"4"`) and a bare JSON number (`4`) for
+/// the same value, so a `String`-typed map would reject the (valid) bare-number form
+/// as a decode failure.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceQuotaStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// PodStatus — typed status for Pod objects
+// ---------------------------------------------------------------------------
+
+/// A single `status.conditions[]` entry on a Pod. Diverges from the generic
+/// `Condition` struct (APIService/etc): a `PodCondition` additionally carries
+/// `lastProbeTime`, matching upstream's `generated.proto` `PodCondition` message.
+///
+/// Unlike `CsrCondition`, `type` is the only required field here: the kubelet's own
+/// periodic conditions resync sends partial entries (`{"observedGeneration":1,
+/// "type":"Ready"}`, no `status`) that `apply_status_patch`'s `merge_conditions`
+/// merges onto the stored condition by `type` before this struct ever sees them, but
+/// a condition losslessly passed straight through (or a genuinely new one from a
+/// non-kubelet client) must not fail the whole status write just because `status` is
+/// momentarily absent.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PodCondition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    /// All other fields on this condition preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a Pod object. Enumerates only the fields u7s validates, defaults,
+/// stamps, or routes on: `phase`/`conditions` (pod-creation default-stamping in
+/// `create_pod`, readiness read by the endpoints controller),
+/// `podIP`/`podIPs`/`hostIP` (the hostNetwork podIP override in `apply_status_patch`,
+/// and `status.podIP` field-selector routing), `startTime`/`qosClass` (stamped at
+/// admission), `resize` (the in-place-resize stamp `apply_resize_patch` writes), and
+/// `containerStatuses` (kept opaque — u7s never reads inside a container status, only
+/// strategic-merges and passes the array through).
+///
+/// Kubelet writes many more fields (`message`, `reason`, `nominatedNodeName`,
+/// `hostIPs`, `initContainerStatuses`, `ephemeralContainerStatuses`,
+/// `observedGeneration`, DRA claim statuses, ...) — all of them survive round-trips
+/// via `rest`, since Pod status is kubelet-owned and field-rich: under-enumerating a
+/// field here costs "not validated yet", never data loss.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PodStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<PodCondition>>,
+    #[serde(rename = "podIP", default, skip_serializing_if = "Option::is_none")]
+    pub pod_ip: Option<String>,
+    /// Kept opaque: u7s only ever writes this wholesale (`[{"ip": host_ip}]`) or
+    /// passes the kubelet's array through untouched; nothing reads individual entries.
+    #[serde(rename = "podIPs", default, skip_serializing_if = "Option::is_none")]
+    pub pod_ips: Option<serde_json::Value>,
+    #[serde(rename = "hostIP", default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qos_class: Option<String>,
+    /// Kept opaque: u7s strategic-merges this array by container name but never reads
+    /// or validates a container status's own subfields (state, restartCount, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_statuses: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize: Option<String>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
 // Kubernetes object store type
 // ---------------------------------------------------------------------------
 
