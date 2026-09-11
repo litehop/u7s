@@ -797,14 +797,62 @@ pub(crate) fn detect_patch_type(
     )))
 }
 
+/// The exact inverse of one already-applied patch operation, recorded so a later
+/// operation's failure can unwind everything done so far without ever having cloned
+/// the whole (potentially large) object up front.
+enum UndoOp {
+    /// Undoes an 'add' that created a brand-new value (object key or array element):
+    /// delete it back out.
+    Remove(String),
+    /// Undoes an 'add' that overwrote an existing object key, or a 'replace': put the
+    /// captured old value back at the same path.
+    Replace(String, serde_json::Value),
+    /// Undoes a 'remove': re-add the captured value at the exact path/index it was
+    /// removed from.
+    Add(String, serde_json::Value),
+    /// Undoes an 'add' targeting the root pointer ("" — RFC 6902 §4.1 replaces the whole
+    /// document): restore the previous whole value. This is the one case where the undo
+    /// entry is as big as `obj`, but only because the operation it undoes was too.
+    ReplaceRoot(serde_json::Value),
+}
+
+impl UndoOp {
+    /// Replays this single inverse operation. Each variant mirrors a mutation that was
+    /// just performed by `apply_one_json_patch_op` against this same `obj`, using the
+    /// same path/index, so it is expected to always succeed — a failure here means the
+    /// undo log was built inconsistently with the forward apply, which is a bug in this
+    /// module, not a runtime condition callers can hit.
+    fn apply(self, obj: &mut serde_json::Value) {
+        match self {
+            UndoOp::Remove(path) => {
+                json_patch_remove(obj, &path)
+                    .expect("undo-log remove must replay the path a prior 'add' just created");
+            }
+            UndoOp::Replace(path, old) => {
+                json_patch_set(obj, &path, old)
+                    .expect("undo-log replace must replay the path a prior op just overwrote");
+            }
+            UndoOp::Add(path, old) => {
+                json_patch_add(obj, &path, old)
+                    .expect("undo-log add must replay the path a prior 'remove' just vacated");
+            }
+            UndoOp::ReplaceRoot(old) => {
+                *obj = old;
+            }
+        }
+    }
+}
+
 /// Apply a JSON Patch (RFC 6902) to `obj`.
 /// Supports `add`, `remove`, `replace`, and `test` operations.
 /// Returns Err(422) for unsupported operations, invalid paths, or a failing `test`.
 ///
-/// Applies atomically: operations run against a clone of `obj` and are only written back
-/// once every operation succeeds, so a failing `test` (or any other op) leaves `obj`
-/// untouched rather than half-patched — `test` is used by clients as an optimistic-
-/// concurrency guard, and a partial apply on failure would defeat that guarantee.
+/// Applies atomically via an undo log: each operation mutates `obj` directly, recording
+/// the inverse of what it just did. If a later operation fails, the log is replayed in
+/// reverse to restore `obj` exactly before the error is returned, so a failing `test`
+/// (used by clients as an optimistic-concurrency guard) or any other op leaves `obj`
+/// untouched rather than half-patched. Memory cost is proportional to the patch (op
+/// count plus captured values), not to the size of `obj`.
 pub(crate) fn apply_json_patch(
     obj: &mut serde_json::Value,
     patch: &serde_json::Value,
@@ -813,65 +861,203 @@ pub(crate) fn apply_json_patch(
         Status::unprocessable_entity("JSON patch must be an array of operations".into())
     })?;
 
-    let mut working = obj.clone();
+    let mut undo_log: Vec<UndoOp> = Vec::new();
     for op in ops {
-        let op_str = op["op"].as_str().ok_or_else(|| {
-            Status::unprocessable_entity("each JSON patch operation must have an 'op' field".into())
-        })?;
-        let path = op["path"].as_str().ok_or_else(|| {
-            Status::unprocessable_entity(
-                "each JSON patch operation must have a 'path' field".into(),
-            )
-        })?;
+        if let Err(e) = apply_one_json_patch_op(obj, op, &mut undo_log) {
+            for undo in undo_log.into_iter().rev() {
+                undo.apply(obj);
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
 
-        match op_str {
-            "add" => {
-                let value = op
-                    .get("value")
-                    .ok_or_else(|| {
-                        Status::unprocessable_entity(
-                            "'add' operation requires a 'value' field".into(),
-                        )
-                    })?
-                    .clone();
-                // RFC 6902 §4.1: 'add' creates intermediate objects when missing.
-                json_patch_add(&mut working, path, value)?;
-            }
-            "replace" => {
-                let value = op
-                    .get("value")
-                    .ok_or_else(|| {
-                        Status::unprocessable_entity(
-                            "'replace' operation requires a 'value' field".into(),
-                        )
-                    })?
-                    .clone();
-                // 'replace' is strict: 422 if path does not exist.
-                json_patch_set(&mut working, path, value)?;
-            }
-            "remove" => {
-                json_patch_remove(&mut working, path)?;
-            }
-            "test" => {
-                let expected = op.get("value").ok_or_else(|| {
-                    Status::unprocessable_entity("'test' operation requires a 'value' field".into())
-                })?;
-                let actual = json_patch_get(&working, path)?;
-                if actual != expected {
-                    return Err(Status::unprocessable_entity(format!(
-                        "'test' operation failed: value at path '{path}' does not match expected value"
-                    )));
-                }
-            }
-            other => {
+/// Applies a single decoded operation to `obj` and, on success, pushes its inverse onto
+/// `undo_log`. On failure `obj` is guaranteed untouched by this call: every branch below
+/// either mutates only after the same checks its corresponding `json_patch_*` helper
+/// would perform have already passed, or returns before mutating at all.
+fn apply_one_json_patch_op(
+    obj: &mut serde_json::Value,
+    op: &serde_json::Value,
+    undo_log: &mut Vec<UndoOp>,
+) -> Result<(), crate::status::StatusError> {
+    let op_str = op["op"].as_str().ok_or_else(|| {
+        Status::unprocessable_entity("each JSON patch operation must have an 'op' field".into())
+    })?;
+    let path = op["path"].as_str().ok_or_else(|| {
+        Status::unprocessable_entity("each JSON patch operation must have a 'path' field".into())
+    })?;
+
+    match op_str {
+        "add" => {
+            let value = op
+                .get("value")
+                .ok_or_else(|| {
+                    Status::unprocessable_entity("'add' operation requires a 'value' field".into())
+                })?
+                .clone();
+            let segs = json_pointer_segments(path);
+            // Plan the inverse before mutating: read-only, so it never observes a
+            // half-applied `add` (add is atomic within itself — see `plan_add_undo`).
+            let undo = plan_add_undo(obj, &segs);
+            // RFC 6902 §4.1: 'add' creates intermediate objects when missing.
+            json_patch_add(obj, path, value)?;
+            undo_log.push(undo);
+        }
+        "replace" => {
+            let value = op
+                .get("value")
+                .ok_or_else(|| {
+                    Status::unprocessable_entity(
+                        "'replace' operation requires a 'value' field".into(),
+                    )
+                })?
+                .clone();
+            let segs = json_pointer_segments(path);
+            // 'replace' is strict: 422 if the parent path does not exist.
+            let undo = plan_replace_undo(obj, &segs)?;
+            json_patch_set(obj, path, value)?;
+            undo_log.push(undo);
+        }
+        "remove" => {
+            let old = json_patch_get(obj, path)?.clone();
+            json_patch_remove(obj, path)?;
+            undo_log.push(UndoOp::Add(path.to_string(), old));
+        }
+        "test" => {
+            let expected = op.get("value").ok_or_else(|| {
+                Status::unprocessable_entity("'test' operation requires a 'value' field".into())
+            })?;
+            let actual = json_patch_get(obj, path)?;
+            if actual != expected {
                 return Err(Status::unprocessable_entity(format!(
-                    "unsupported JSON patch operation '{other}'; supported: add, remove, replace, test"
+                    "'test' operation failed: value at path '{path}' does not match expected value"
                 )));
             }
         }
+        other => {
+            return Err(Status::unprocessable_entity(format!(
+                "unsupported JSON patch operation '{other}'; supported: add, remove, replace, test"
+            )));
+        }
     }
-    *obj = working;
     Ok(())
+}
+
+/// Read-only twin of `json_navigate_one`, used to plan an undo entry before mutating.
+fn json_navigate_one_ref<'a>(
+    node: &'a serde_json::Value,
+    seg: &str,
+) -> Result<&'a serde_json::Value, crate::status::StatusError> {
+    match node {
+        serde_json::Value::Object(map) => map
+            .get(seg)
+            .ok_or_else(|| Status::unprocessable_entity(format!("path segment '{seg}' not found"))),
+        serde_json::Value::Array(arr) => {
+            let idx: usize = seg.parse().map_err(|_| {
+                Status::unprocessable_entity(format!(
+                    "path segment '{seg}' is not a valid array index"
+                ))
+            })?;
+            arr.get(idx).ok_or_else(|| {
+                Status::unprocessable_entity(format!("array index {idx} out of bounds"))
+            })
+        }
+        _ => Err(Status::unprocessable_entity(format!(
+            "cannot traverse into non-object/array at segment '{seg}'"
+        ))),
+    }
+}
+
+/// Determines the inverse of an 'add' at `segs` before it runs.
+///
+/// `add` (per `json_patch_add`) is atomic within itself: any parent segment missing from
+/// an *object* is auto-vivified as a fresh empty object, and a freshly-created object can
+/// never already contain the next segment, so once creation starts every remaining
+/// segment is guaranteed fresh too. Array parents are never auto-vivified, so reaching a
+/// real (pre-existing) array or a scalar mid-walk means every segment up to that point
+/// already existed before this op. Consequently `add` either fully succeeds or fails
+/// without mutating anything — so on the failure paths below (an out-of-place scalar, a
+/// bad array index) the returned placeholder `UndoOp` is simply never pushed to the undo
+/// log by the caller.
+fn plan_add_undo(obj: &serde_json::Value, segs: &[String]) -> UndoOp {
+    if segs.is_empty() {
+        return UndoOp::ReplaceRoot(obj.clone());
+    }
+    let (parents, last) = segs.split_at(segs.len() - 1);
+    let mut cur = obj;
+    let mut walked: Vec<String> = Vec::with_capacity(parents.len());
+    for seg in parents {
+        walked.push(seg.clone());
+        match json_navigate_one_ref(cur, seg) {
+            Ok(next) => cur = next,
+            // First missing ancestor: everything from here down will be freshly
+            // created, so undoing this one path removes it all in one step.
+            Err(_) => return UndoOp::Remove(join_pointer(&walked)),
+        }
+    }
+    let key = &last[0];
+    match cur {
+        serde_json::Value::Object(map) => {
+            let mut full = walked;
+            full.push(key.clone());
+            match map.get(key.as_str()) {
+                Some(old) => UndoOp::Replace(join_pointer(&full), old.clone()),
+                None => UndoOp::Remove(join_pointer(&full)),
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            // 'add' on an array always inserts (never overwrites), so its inverse is
+            // always a removal at the resolved index — never a captured old value.
+            let idx = if key == "-" {
+                arr.len()
+            } else {
+                key.parse().unwrap_or(arr.len())
+            };
+            let mut full = walked;
+            full.push(idx.to_string());
+            UndoOp::Remove(join_pointer(&full))
+        }
+        _ => UndoOp::Remove(join_pointer(&walked)),
+    }
+}
+
+/// Determines the inverse of a 'replace' at `segs` before it runs. Unlike 'add', a
+/// missing parent is a hard error (matching `json_patch_set`'s own strictness), so this
+/// returns `Result` rather than a should-never-be-used placeholder.
+fn plan_replace_undo(
+    obj: &serde_json::Value,
+    segs: &[String],
+) -> Result<UndoOp, crate::status::StatusError> {
+    if segs.is_empty() {
+        return Ok(UndoOp::ReplaceRoot(obj.clone()));
+    }
+    let (parents, last) = segs.split_at(segs.len() - 1);
+    let mut cur = obj;
+    for seg in parents {
+        cur = json_navigate_one_ref(cur, seg)?;
+    }
+    let key = &last[0];
+    match cur {
+        // `json_patch_set` inserts unconditionally on objects (it does not require the
+        // leaf to pre-exist), so a leaf that isn't there yet must undo as a removal, not
+        // a captured-old-value replace.
+        serde_json::Value::Object(map) => Ok(match map.get(key.as_str()) {
+            Some(old) => UndoOp::Replace(join_pointer(segs), old.clone()),
+            None => UndoOp::Remove(join_pointer(segs)),
+        }),
+        serde_json::Value::Array(arr) => {
+            let idx: usize = key.parse().unwrap_or(usize::MAX);
+            Ok(match arr.get(idx) {
+                Some(old) => UndoOp::Replace(join_pointer(segs), old.clone()),
+                // Real `json_patch_set` will 422 (arrays never grow via 'replace');
+                // placeholder is never pushed to the undo log.
+                None => UndoOp::Remove(join_pointer(segs)),
+            })
+        }
+        _ => Ok(UndoOp::Remove(join_pointer(segs))),
+    }
 }
 
 /// Parse a JSON Pointer (RFC 6901) into path segments.
@@ -885,6 +1071,17 @@ pub(crate) fn json_pointer_segments(pointer: &str) -> Vec<String> {
         .split('/')
         .map(|seg| seg.replace("~1", "/").replace("~0", "~"))
         .collect()
+}
+
+/// Inverse of `json_pointer_segments`: joins path segments back into an RFC 6901
+/// pointer, used by the undo log to address a prefix of an operation's original path.
+fn join_pointer(segs: &[String]) -> String {
+    let mut out = String::new();
+    for seg in segs {
+        out.push('/');
+        out.push_str(&seg.replace('~', "~0").replace('/', "~1"));
+    }
+    out
 }
 
 /// Navigate to the parent of the target, returning a mutable ref to the parent and the final key.
@@ -1123,6 +1320,131 @@ pub(crate) fn json_patch_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- apply_json_patch: undo-log atomicity --
+    //
+    // These pin the undo-log itself (as opposed to generic.rs's
+    // json_patch_test_op_failure_rejects_whole_patch_atomically, which only exercises the
+    // replace+test case). Each fails if the undo-log is reverted to a naive
+    // apply-in-place-with-no-rollback implementation: a failed patch that half-applies
+    // would corrupt the stored object for every client that reads it next.
+
+    /// A successful 'replace' followed by a failing op must roll the replace back, not
+    /// just reject the failing op — otherwise a client retrying the whole patch after a
+    /// 422 would silently build on a value the server already (wrongly) committed.
+    #[test]
+    fn apply_json_patch_undo_log_reverts_replace_on_later_failure() {
+        let mut obj = serde_json::json!({"spec": {"replicas": 1}});
+        let before = obj.clone();
+        let patch = serde_json::json!([
+            {"op": "replace", "path": "/spec/replicas", "value": 99},
+            {"op": "remove", "path": "/does/not/exist"}
+        ]);
+        apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(
+            obj, before,
+            "a rolled-back 'replace' must restore the exact prior value"
+        );
+    }
+
+    /// A successful 'remove' followed by a failing op must restore the removed value —
+    /// otherwise data a client believed was still present (the whole patch failed) is
+    /// gone from the stored object.
+    #[test]
+    fn apply_json_patch_undo_log_restores_removed_value_on_later_failure() {
+        let mut obj = serde_json::json!({"metadata": {"name": "x", "extra": "keep-me"}});
+        let before = obj.clone();
+        let patch = serde_json::json!([
+            {"op": "remove", "path": "/metadata/extra"},
+            {"op": "test", "path": "/metadata/name", "value": "not-x"}
+        ]);
+        apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(
+            obj, before,
+            "a rolled-back 'remove' must bring the deleted value back"
+        );
+    }
+
+    /// A successful 'add' that created a brand-new path, followed by a failing op, must
+    /// remove the added path entirely — otherwise the object gains a field the client's
+    /// failed patch never should have produced.
+    #[test]
+    fn apply_json_patch_undo_log_removes_new_path_added_before_later_failure() {
+        let mut obj = serde_json::json!({"metadata": {"name": "x"}});
+        let before = obj.clone();
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/status/conditions", "value": []},
+            {"op": "test", "path": "/metadata/name", "value": "not-x"}
+        ]);
+        apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(
+            obj, before,
+            "a rolled-back 'add' of a new path must leave no trace, including any \
+             auto-created intermediate objects"
+        );
+    }
+
+    /// A successful 'add' that overwrote an EXISTING object key, followed by a failing
+    /// op, must restore the original value — an overwriting 'add' undoes differently
+    /// from a brand-new one (replace-back, not remove), and getting this branch wrong
+    /// would leave the overwrite applied despite the patch failing overall.
+    #[test]
+    fn apply_json_patch_undo_log_restores_overwritten_value_on_later_failure() {
+        let mut obj = serde_json::json!({"metadata": {"name": "x", "label": "old"}});
+        let before = obj.clone();
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/metadata/label", "value": "new"},
+            {"op": "test", "path": "/metadata/name", "value": "not-x"}
+        ]);
+        apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(
+            obj, before,
+            "a rolled-back overwriting 'add' must restore the pre-overwrite value"
+        );
+    }
+
+    /// A multi-op patch that fails partway through (op 3 of 4) must leave `obj`
+    /// byte-for-byte identical to before the patch — every successful op before the
+    /// failure must be unwound, not just the most recent one.
+    #[test]
+    fn apply_json_patch_undo_log_fully_reverts_multi_op_partial_failure() {
+        let mut obj = serde_json::json!({
+            "metadata": {"name": "x", "extra": "keep-me"},
+            "spec": {"replicas": 1}
+        });
+        let before = obj.clone();
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/metadata/label", "value": "v1"},
+            {"op": "remove", "path": "/metadata/extra"},
+            {"op": "replace", "path": "/spec/replicas", "value": 5},
+            {"op": "test", "path": "/spec/replicas", "value": 1}
+        ]);
+        apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(
+            obj, before,
+            "op 4 failing must unwind ops 1-3, not leave any of them applied"
+        );
+    }
+
+    /// The two-op add-then-append-to-it pattern (op2 depends on op1's mutation) must
+    /// still succeed under the undo-log implementation — guards against a regression to
+    /// the rejected "pre-validate all ops against the original object" candidate, which
+    /// would wrongly reject op2 because the array it targets doesn't exist yet in the
+    /// unmutated original.
+    #[test]
+    fn apply_json_patch_undo_log_allows_later_op_to_depend_on_earlier_ops_mutation() {
+        let mut obj = serde_json::json!({"metadata": {"name": "x"}});
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/status/conditions", "value": []},
+            {"op": "add", "path": "/status/conditions/-", "value": {"type": "Ready"}}
+        ]);
+        apply_json_patch(&mut obj, &patch)
+            .unwrap_or_else(|_| panic!("op2 must see op1's mutation, not the original object"));
+        assert_eq!(
+            obj["status"]["conditions"],
+            serde_json::json!([{"type": "Ready"}])
+        );
+    }
 
     /// strip_managed_fields removes the managedFields key from metadata.
     /// This matters because Argo CD sends managedFields in apply bodies to signal
