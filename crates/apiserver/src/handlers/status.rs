@@ -143,10 +143,10 @@ pub async fn put_resource_status<S: Store>(
     };
 
     // Replace status and merge metadata; leave spec and identity fields untouched.
-    // Typed dispatch first: a registered built-in kind (ResourceQuota/Pod today) fails a
-    // scalar or wrong-typed status at typed decode (400). A dispatch miss (every other
-    // built-in) falls through to `replace_status_field` UNCHANGED — same object-shape
-    // guard (400) this call site always had.
+    // Typed dispatch first: a registered built-in kind (see status_dispatch.rs's table for
+    // the full list) fails a scalar or wrong-typed status at typed decode (400). A dispatch
+    // miss (every other built-in) falls through to `replace_status_field` UNCHANGED — same
+    // object-shape guard (400) this call site always had.
     let incoming_status = &incoming.body["status"];
     if incoming_status.is_null() {
         current.body.as_object_mut().map(|m| m.remove("status"));
@@ -265,9 +265,10 @@ pub async fn patch_resource_status<S: Store>(
     // `apply_json_patch` happily turns that into a scalar.
     reject_non_object_status(&current.body["status"])?;
     // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
-    // on a wrong-typed enumerated field), same 422 code, for a registered built-in
-    // (ResourceQuota/Pod today). `null` already passed the check above and is skipped here.
-    // A dispatch miss leaves the object-shape check above as the only guard, UNCHANGED.
+    // on a wrong-typed enumerated field), same 422 code, for a registered built-in (see
+    // status_dispatch.rs's table for the full list). `null` already passed the check above
+    // and is skipped here. A dispatch miss leaves the object-shape check above as the only
+    // guard, UNCHANGED.
     if !current.body["status"].is_null() {
         let api_version = if group.is_empty() {
             version.clone()
@@ -381,10 +382,11 @@ pub async fn put_namespaced_resource_status<S: Store>(
         .map(|e| e.kind)
         .unwrap_or(kind_fallback);
 
-    // Typed dispatch first: a registered built-in kind (ResourceQuota/Pod today) fails a
-    // scalar or wrong-typed status at typed decode (400). A dispatch miss (every other
-    // built-in, and every genuine CR) falls through to `replace_status_field` UNCHANGED —
-    // same object-shape guard (400) this call site always had.
+    // Typed dispatch first: a registered built-in kind (see status_dispatch.rs's table for
+    // the full list) fails a scalar or wrong-typed status at typed decode (400). A dispatch
+    // miss (every other built-in, and every genuine CR) falls through to
+    // `replace_status_field` UNCHANGED — same object-shape guard (400) this call site
+    // always had.
     let incoming_status = &incoming.body["status"];
     if incoming_status.is_null() {
         current.body.as_object_mut().map(|m| m.remove("status"));
@@ -503,10 +505,10 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     // `apply_json_patch` happily turns that into a scalar.
     reject_non_object_status(&current.body["status"])?;
     // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
-    // on a wrong-typed enumerated field), same 422 code, for a registered built-in
-    // (ResourceQuota/Pod today). `null` already passed the check above and is skipped here.
-    // A dispatch miss (every other built-in, and every genuine CR) leaves the object-shape
-    // check above as the only guard, UNCHANGED.
+    // on a wrong-typed enumerated field), same 422 code, for a registered built-in (see
+    // status_dispatch.rs's table for the full list). `null` already passed the check above
+    // and is skipped here. A dispatch miss (every other built-in, and every genuine CR)
+    // leaves the object-shape check above as the only guard, UNCHANGED.
     if !current.body["status"].is_null() {
         let api_version = if group.is_empty() {
             version.clone()
@@ -607,11 +609,15 @@ fn apply_status_replacement(current: &mut serde_json::Value, incoming_status: &s
 
 /// PUT-/status body for BUILT-IN resources: replace `current`'s `status` field with
 /// `incoming_status`, or reject with 400 if `incoming_status` is a present-but-non-object
-/// scalar/array (see `reject_non_object_status_put`). Every built-in PUT /status handler
-/// (`put_resource_status`, `put_namespaced_resource_status`, `replace_pod_status`)
-/// round-trips through here instead of assigning `current["status"] = ...` inline, so the
-/// object-type invariant cannot be missed for a PUT handler the way it was in two prior
-/// review rounds.
+/// scalar/array (see `reject_non_object_status_put`).
+///
+/// `put_resource_status` and `put_namespaced_resource_status` call this only on a
+/// `status_dispatch` MISS — a registered built-in (see status_dispatch.rs's table) takes its
+/// typed-decode path instead and never reaches here. `replace_pod_status` never calls this at
+/// all: Pod is unconditionally registered in `status_dispatch`, so it always takes the typed
+/// path too. This function's own object-type guard is what every OTHER (unregistered)
+/// built-in still relies on, so the object-type invariant cannot be missed for those the way
+/// it was in two prior review rounds.
 ///
 /// NOT used by `put_cr_status`/`put_crd_status` — see `replace_status_field_dynamic`,
 /// their 422 sibling, for why custom-resource status writes get a different code here.
@@ -3151,6 +3157,159 @@ mod tests {
             v["status"]["someFutureField"]["nested"], 1,
             "a field not enumerated on ResourceQuotaStatus must survive verbatim via `rest` — \
              under-enumerating must cost \"not validated\", never data loss"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 3 (m10di) representative coverage: a scalar-status-rejection sample spanning
+    // three different resource families (apps, flowcontrol, core/Node), at the HANDLER
+    // level — proving `status_dispatch`'s table is actually wired into
+    // put_namespaced_resource_status/patch_resource_status, not just reachable from
+    // status_dispatch.rs's own unit tests.
+    // ---------------------------------------------------------------------------
+
+    /// Deployment PUT with a scalar status must be 400, exercised through
+    /// `put_namespaced_resource_status` (apps/v1, namespaced).
+    #[tokio::test]
+    async fn put_namespaced_resource_status_rejects_scalar_status_on_deployment_via_typed_dispatch()
+    {
+        let state = make_state();
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": { "name": "scalar-deploy", "namespace": "default" },
+            "spec": { "replicas": 1 },
+            "status": { "replicas": 1 }
+        });
+        state
+            .store
+            .put(
+                "/registry/apps/deployments/default/scalar-deploy",
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": { "name": "scalar-deploy", "namespace": "default" },
+            "status": "oops"
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "scalar-deploy".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a scalar status PUT on Deployment must be rejected, not persisted"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "Deployment is a Phase-3 status_dispatch-registered built-in, so PUT scalar \
+             status fails at typed decode (400), same as ResourceQuota in Phase 2"
+        );
+    }
+
+    /// FlowSchema merge-PATCH with a scalar status must be 422, exercised through
+    /// `patch_resource_status` (flowcontrol.apiserver.k8s.io/v1, cluster-scoped).
+    #[tokio::test]
+    async fn patch_resource_status_rejects_scalar_status_on_flowschema_via_typed_dispatch() {
+        let state = make_state();
+        let fs = serde_json::json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1", "kind": "FlowSchema",
+            "metadata": { "name": "scalar-fs" },
+            "spec": { "priorityLevelConfiguration": { "name": "exempt" } },
+            "status": { "conditions": [] }
+        });
+        state
+            .store
+            .put(
+                "/registry/flowcontrol.apiserver.k8s.io/flowschemas/scalar-fs",
+                bytes::Bytes::from(serde_json::to_vec(&fs).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!({"status": "oops"});
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "flowcontrol.apiserver.k8s.io".into(),
+                "v1".into(),
+                "flowschemas".into(),
+                "scalar-fs".into(),
+            )),
+            axum::Extension(test_user()),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("a scalar status merge-patch on FlowSchema must be rejected, not persisted")
+            }
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "merge-PATCH scalar status on a Phase-3 typed kind must stay 422, not flip to 400"
+        );
+    }
+
+    /// Node JSON-Patch whole-`/status` scalar replace must also be 422, exercised through
+    /// `patch_resource_status` (core/v1, cluster-scoped) with the JSON-Patch content-type —
+    /// a different code branch than merge-patch, proving the convergence point is reached
+    /// from that branch too for a Phase-3 kind.
+    #[tokio::test]
+    async fn patch_resource_status_rejects_scalar_status_json_patch_on_node_via_typed_dispatch() {
+        let state = make_state();
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": { "name": "scalar-node" },
+            "status": { "capacity": { "cpu": "4" } }
+        });
+        state
+            .store
+            .put(
+                "/registry/nodes/scalar-node",
+                bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!([{"op": "replace", "path": "/status", "value": "oops"}]);
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path(("".into(), "v1".into(), "nodes".into(), "scalar-node".into())),
+            axum::Extension(test_user()),
+            json_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a scalar status JSON Patch on Node must be rejected, not persisted"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "JSON-Patch scalar status on a Phase-3 typed kind must stay 422"
         );
     }
 
