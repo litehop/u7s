@@ -716,8 +716,11 @@ echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnecti
 # kube-proxy runs as a systemd service inside the VM using the kube-proxy binary from the
 # official container image. This avoids the pod sandbox loop that occurs with hostNetwork
 # pods in u7s (strategic-merge-patch accumulation in podIPs causes the kubelet to
-# continuously recreate the sandbox). The binary uses IPVS mode because the Lima VM's
-# iptables uses nf_tables which lacks the userspace extension library for protocol matching.
+# continuously recreate the sandbox). The binary runs in iptables mode to match the
+# shipped config (manifests/kube-proxy.yaml). This rig previously ran IPVS on the belief
+# that the Lima VM's nf_tables-backed iptables lacked the userspace extension for protocol
+# matching -- that belief was wrong (all matches kube-proxy needs load fine), and iptables
+# mode passes the full CI conformance focus set here.
 
 # Detect kubelet version to pull the matching kube-proxy binary. A wrong/stale
 # fallback version here is safe, not silent: it only feeds the image tag for the
@@ -802,7 +805,7 @@ KUBEEOF
 limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/kube-proxy/config.conf' <<'CONFEOF'
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
-mode: ipvs
+mode: iptables
 clusterCIDR: 10.85.0.0/16
 clientConnection:
   kubeconfig: /etc/kube-proxy/kubeconfig.conf
