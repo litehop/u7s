@@ -1311,13 +1311,15 @@ pub struct ResourceQuotaStatus {
 /// `Condition` struct (APIService/etc): a `PodCondition` additionally carries
 /// `lastProbeTime`, matching upstream's `generated.proto` `PodCondition` message.
 ///
-/// Unlike `CsrCondition`, `type` is the only required field here: the kubelet's own
-/// periodic conditions resync sends partial entries (`{"observedGeneration":1,
-/// "type":"Ready"}`, no `status`) that `apply_status_patch`'s `merge_conditions`
-/// merges onto the stored condition by `type` before this struct ever sees them, but
-/// a condition losslessly passed straight through (or a genuinely new one from a
-/// non-kubelet client) must not fail the whole status write just because `status` is
-/// momentarily absent.
+/// Unlike `CsrCondition`, `type` is the only required field here. `merge_conditions`
+/// already preserves a prior non-missing `status` when merging a partial kubelet resync
+/// entry (`{"observedGeneration":1,"type":"Ready"}`, no `status`) onto an EXISTING stored
+/// condition of the same `type` — the merge loop simply never touches a key absent from the
+/// patch. So `status` being `Option` only matters for the two paths that skip that merge:
+/// a brand-new condition `type` seen for the first time (pushed as-is), and the
+/// `!stored.is_array()` whole-array-replacement branch (e.g. `status.conditions` was absent
+/// or non-array before this write). Either path must not fail the whole status write just
+/// because the incoming entry's `status` is momentarily absent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PodCondition {
@@ -1380,6 +1382,602 @@ pub struct PodStatus {
     pub container_statuses: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resize: Option<String>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// Shared condition shapes — m10di Phase 3 (status_dispatch bulk kinds)
+//
+// Every struct below enumerates exactly the top-level scalar fields of its
+// upstream status type (per the vendored `k8s.io/api/.../generated.proto`,
+// the mechanical transcription of upstream 1.36 Go behavior) plus
+// `#[serde(flatten)] rest` for everything else. Nested nontrivial structures
+// (load-balancer ingress points, DRA allocation results, kubelet NodeInfo,
+// ...) are deliberately left inside `rest` rather than modeled field-by-field:
+// nothing in u7s reasons about their sub-fields, so typing them would add
+// decode surface without any validation payoff, and — since `rest` already
+// preserves them verbatim — leaving them opaque costs nothing.
+// ---------------------------------------------------------------------------
+
+/// The `type`/`status`/`lastTransitionTime`/`reason`/`message`/`lastUpdateTime` condition
+/// shape shared, byte-for-byte or as a safe superset, by `DeploymentCondition`,
+/// `ReplicaSetCondition`, `StatefulSetCondition`, `DaemonSetCondition`,
+/// `ReplicationControllerCondition`, `FlowSchemaCondition`,
+/// `PriorityLevelConfigurationCondition`, and autoscaling/v2's
+/// `HorizontalPodAutoscalerCondition` — none of these are `metav1.Condition` (the generic
+/// `Condition` struct above), so reusing `Condition` here would silently drop
+/// `lastUpdateTime` (Deployment's only) via its own lack of a `rest` field. `last_update_time`
+/// is `None` for every kind that doesn't have it on the wire; being `Option` makes that safe.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadCondition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// All other fields on this condition preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// `NodeCondition`'s wire shape: `type`/`status`/`lastHeartbeatTime`/`lastTransitionTime`/
+/// `reason`/`message`. `lastHeartbeatTime` (kubelet re-stamps this on every periodic status
+/// resync) is not on any other condition struct here, so it needs its own type rather than
+/// reusing `WorkloadCondition` or `Condition` — either would silently drop it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeCondition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// All other fields on this condition preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// apps/v1 workload statuses — Deployment, ReplicaSet, StatefulSet, DaemonSet
+// ---------------------------------------------------------------------------
+
+/// Typed status for a Deployment object. Source: `apps/v1/generated.proto`'s
+/// `DeploymentStatus` — every top-level scalar field it defines; `conditions` uses
+/// `WorkloadCondition` (Deployment's own condition carries `lastUpdateTime`, which the
+/// generic `Condition` struct lacks a `rest` field to preserve).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminating_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision_count: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<WorkloadCondition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a ReplicaSet object. Source: `apps/v1/generated.proto`'s
+/// `ReplicaSetStatus`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaSetStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fully_labeled_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminating_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<WorkloadCondition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a StatefulSet object. Source: `apps/v1/generated.proto`'s
+/// `StatefulSetStatus`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulSetStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision_count: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<WorkloadCondition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_replicas: Option<i32>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a DaemonSet object. Source: `apps/v1/generated.proto`'s
+/// `DaemonSetStatus`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonSetStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_number_scheduled: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_misscheduled: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_number_scheduled: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_ready: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_number_scheduled: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_available: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_unavailable: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision_count: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<WorkloadCondition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// batch/v1 — Job, CronJob
+// ---------------------------------------------------------------------------
+
+/// Typed status for a Job object. Source: `batch/v1/generated.proto`'s `JobStatus`.
+/// `conditions` reuses `PodCondition`: `JobCondition`'s shape (type/status/lastProbeTime/
+/// lastTransitionTime/reason/message) is a subset of `PodCondition`'s, and `PodCondition`
+/// already carries a `rest` catch-all so nothing is dropped. `uncountedTerminatedPods` (a
+/// nested struct) stays in `rest` — nothing in u7s reasons about its sub-fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JobStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<PodCondition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub succeeded: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminating: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_indexes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_indexes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<i32>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a CronJob object. Source: `batch/v1/generated.proto`'s `CronJobStatus`.
+/// `active` (a list of `ObjectReference`s) stays in `rest` — it is the only field on this
+/// type with any internal structure, and nothing in u7s reasons about its sub-fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CronJobStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_schedule_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_time: Option<String>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// core/v1 — PersistentVolume, PersistentVolumeClaim, ReplicationController, Node
+// ---------------------------------------------------------------------------
+
+/// Typed status for a PersistentVolume object, used by `status_dispatch`. Source:
+/// `core/v1/generated.proto`'s `PersistentVolumeStatus` — every field it defines (all four
+/// are scalars; there is no `conditions` field on this type upstream). Distinct from
+/// `PersistentVolumeStatusFields` in the defaulting section above: that struct exists only to
+/// read/write `phase` at create-time defaulting and is shared with PVC for that narrow
+/// purpose; this one is the full status-subresource decode surface for PV specifically.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_phase_transition_time: Option<String>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a PersistentVolumeClaim object, used by `status_dispatch`. Source:
+/// `core/v1/generated.proto`'s `PersistentVolumeClaimStatus`. `capacity`/`allocatedResources`
+/// map values are `serde_json::Value`, not `String`, for the same reason as
+/// `ResourceQuotaStatus`: upstream's `resource.Quantity` JSON decoder accepts both a quoted
+/// string and a bare JSON number for the same value. `conditions` reuses `PodCondition` —
+/// `PersistentVolumeClaimCondition`'s shape (type/status/lastProbeTime/lastTransitionTime/
+/// reason/message) is a subset of it, and this is exactly the field the CSI conformance
+/// test '\[sig-storage\] PersistentVolumes CSI Conformance should apply changes to a pv/pvc
+/// status' patches and reads back (see status.rs's `pvc_status_conditions_persisted_via_patch`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeClaimStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_modes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<PodCondition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_resources: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_resource_statuses: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_volume_attributes_class_name: Option<String>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a ReplicationController object. Source: `core/v1/generated.proto`'s
+/// `ReplicationControllerStatus`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicationControllerStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fully_labeled_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<WorkloadCondition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a Node object, used by `status_dispatch`. Source: `core/v1/generated.proto`'s
+/// `NodeStatus`. `capacity`/`allocatable` are the scheduler's own fit-check inputs (read as raw
+/// `Value` over HTTP by the scheduler crate, external to this typed decode, but the same
+/// Quantity-ambiguity reasoning as `ResourceQuotaStatus` applies to their map values).
+/// `conditions` uses the dedicated `NodeCondition` (see its doc comment for why). Every other
+/// field (`addresses`, `daemonEndpoints`, `nodeInfo`, `images`, `volumesInUse`,
+/// `volumesAttached`, `config`) is a nested structure nothing in u7s reasons about the
+/// sub-fields of, so it stays in `rest`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocatable: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<NodeCondition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// autoscaling/v1 and autoscaling/v2 — HorizontalPodAutoscaler
+//
+// Two distinct structs, not one shared by version: v1 and v2 have genuinely
+// different wire shapes (v1 has no `conditions`/`currentMetrics`; v2 replaces v1's
+// `currentCPUUtilizationPercentage` scalar with the generic `currentMetrics` list).
+// status_dispatch keys on the full (apiVersion, kind) pair for exactly this reason —
+// see that module's doc comment.
+// ---------------------------------------------------------------------------
+
+/// Typed status for a autoscaling/v1 HorizontalPodAutoscaler. Source:
+/// `autoscaling/v1/generated.proto`'s `HorizontalPodAutoscalerStatus` — every field it
+/// defines (all scalars). `currentCPUUtilizationPercentage` needs an explicit `rename`:
+/// `rename_all = "camelCase"` would otherwise produce `currentCpuUtilizationPercentage`,
+/// not upstream's all-caps `CPU`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HorizontalPodAutoscalerStatusV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scale_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_replicas: Option<i32>,
+    #[serde(
+        rename = "currentCPUUtilizationPercentage",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub current_cpu_utilization_percentage: Option<i32>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for an autoscaling/v2 HorizontalPodAutoscaler. Source:
+/// `autoscaling/v2/generated.proto`'s `HorizontalPodAutoscalerStatus`. `currentMetrics` (a
+/// nested list of `MetricStatus`) stays in `rest` — nothing in u7s reasons about individual
+/// metric entries. `conditions` uses `WorkloadCondition`: `HorizontalPodAutoscalerCondition`'s
+/// shape (type/status/lastTransitionTime/reason/message) is a subset of it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HorizontalPodAutoscalerStatusV2 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scale_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<WorkloadCondition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// networking.k8s.io/v1 — Ingress, ServiceCIDR
+// ---------------------------------------------------------------------------
+
+/// Typed status for an Ingress object. Source: `networking/v1/generated.proto`'s
+/// `IngressStatus` — its only field, `loadBalancer`, is itself a nested structure
+/// (`IngressLoadBalancerStatus`) nothing in u7s reasons about the sub-fields of, so it stays
+/// in `rest`. The struct still exists (rather than skipping Ingress) so that a scalar/array
+/// `status` on Ingress is rejected the same way every other registered built-in's is.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IngressStatus {
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a ServiceCIDR object. Source: `networking/v1/generated.proto`'s
+/// `ServiceCIDRStatus`, whose only field, `conditions`, is explicitly typed
+/// `metav1.Condition` upstream — the generic `Condition` struct above is the exact match,
+/// no reuse-with-superset needed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceCidrStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<Condition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// storage.k8s.io/v1 — VolumeAttachment
+// ---------------------------------------------------------------------------
+
+/// Typed status for a VolumeAttachment object. Source: `storage/v1/generated.proto`'s
+/// `VolumeAttachmentStatus`. `attached` is the external-attacher CSI sidecar's primary
+/// output signal. `attachError`/`detachError` (each a small `time`/`message`/`errorCode`
+/// struct) stay in `rest` — nothing in u7s reasons about their sub-fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeAttachmentStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_metadata: Option<std::collections::BTreeMap<String, String>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// flowcontrol.apiserver.k8s.io/v1 — FlowSchema, PriorityLevelConfiguration
+// ---------------------------------------------------------------------------
+
+/// Typed status for a FlowSchema object. Source: `flowcontrol/v1/generated.proto`'s
+/// `FlowSchemaStatus`, whose only field is `conditions`. `FlowSchemaCondition`'s shape
+/// (type/status/lastTransitionTime/reason/message) is a subset of `WorkloadCondition`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowSchemaStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<WorkloadCondition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a PriorityLevelConfiguration object. Source:
+/// `flowcontrol/v1/generated.proto`'s `PriorityLevelConfigurationStatus`, whose only field is
+/// `conditions`. `PriorityLevelConfigurationCondition`'s shape is the same subset of
+/// `WorkloadCondition` as `FlowSchemaCondition`'s.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PriorityLevelConfigurationStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<WorkloadCondition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// admissionregistration.k8s.io/v1 — ValidatingAdmissionPolicy(+Binding)
+// ---------------------------------------------------------------------------
+
+/// Typed status for a ValidatingAdmissionPolicy object. Source:
+/// `admissionregistration/v1/generated.proto`'s `ValidatingAdmissionPolicyStatus`.
+/// `conditions` is explicitly typed `metav1.Condition` upstream, so the generic `Condition`
+/// struct is the exact match. `typeChecking` (a nested `expressionWarnings` list) stays in
+/// `rest` — nothing in u7s reasons about its sub-fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidatingAdmissionPolicyStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<Condition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a ValidatingAdmissionPolicyBinding object. Upstream's
+/// `ValidatingAdmissionPolicyBinding` type (`admissionregistration/v1/generated.proto`) has
+/// no `status` field at all — u7s's resource registry nonetheless marks this kind
+/// `has_status=true` (a pre-existing, wider-than-upstream `/status` route), so this struct
+/// exists purely to give that route the same scalar/array-status rejection every other
+/// registered built-in gets; there is nothing upstream-defined to enumerate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ValidatingAdmissionPolicyBindingStatus {
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// resource.k8s.io/v1 — ResourceClaim, DeviceClass (Dynamic Resource Allocation)
+// ---------------------------------------------------------------------------
+
+/// Typed status for a ResourceClaim object. Source: `resource/v1/generated.proto`'s
+/// `ResourceClaimStatus`: `allocation`, `reservedFor`, and `devices` are its only three
+/// fields, and all three are nested structures (allocation results, consumer references,
+/// per-device driver status) nothing in u7s reasons about the sub-fields of — so every field
+/// stays in `rest`. The struct still exists so a scalar/array `status` is rejected the same
+/// way every other registered built-in's is.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ResourceClaimStatus {
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed status for a DeviceClass object. Upstream's `DeviceClass` type
+/// (`resource/v1/generated.proto`) has no `status` field at all — same situation as
+/// `ValidatingAdmissionPolicyBindingStatus` above: u7s's registry marks this kind
+/// `has_status=true` regardless, so this struct exists purely to reject a scalar/array
+/// status on that route.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DeviceClassStatus {
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// certificates.k8s.io/v1beta1 — PodCertificateRequest
+// ---------------------------------------------------------------------------
+
+/// Typed status for a PodCertificateRequest object. Source: upstream
+/// `staging/src/k8s.io/api/certificates/v1beta1/types.go`'s `PodCertificateRequestStatus`
+/// (not vendored as a `.proto` in this repo — fetched directly, see
+/// `temp/research/certificates_v1beta1_types.go`). `conditions` is `[]metav1.Condition`
+/// upstream, so the generic `Condition` struct is the exact match. `certificateChain`/
+/// `notBefore`/`beginRefreshAt`/`notAfter` are upstream-documented as immutable once set by
+/// the signer via this exact subresource — the closest thing to a Phase-1/2-style
+/// server-reasoned field this bulk phase has, even though u7s does not yet enforce that
+/// immutability itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PodCertificateRequestStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<Condition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_chain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub begin_refresh_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<String>,
     /// All other status fields preserved opaquely.
     #[serde(flatten)]
     #[schemars(skip)]
