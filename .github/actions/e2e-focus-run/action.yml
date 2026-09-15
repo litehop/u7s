@@ -540,6 +540,14 @@ runs:
         # needed (e.g. the namespace controller finalizing each test's
         # ephemeral namespace). kcm-supervisor.sh restarts kcm on crash instead
         # of silently blacking out the control plane for the rest of the run.
+        # node-ipam-controller must stay enabled (unlike an earlier version of
+        # this workflow that excluded it): it is the only thing that ever sets
+        # Node.spec.podCIDR, which flanneld's --kube-subnet-mgr reads to compute
+        # this node's lease before it will write /run/flannel/subnet.env --
+        # without it flannel never becomes ready and every pod sandbox creation
+        # fails with "failed to load flannel 'subnet.env' file".
+        # --cluster-cidr matches manifests/flannel.yaml's net-conf.json Network
+        # (10.244.0.0/16, substituted into the same literal above).
         setsid bash scripts/conformance/kcm-supervisor.sh \
           "$WORKDIR/kube-controller-manager" "$WORKDIR/kcm.log" \
           --kubeconfig="$WORKDIR/kubeconfig-cert" \
@@ -547,12 +555,49 @@ runs:
           --cluster-signing-key-file="$WORKDIR/ca.key" \
           --service-account-private-key-file="$WORKDIR/sa.key" \
           --root-ca-file="$WORKDIR/ca.pem" \
-          --controllers='*,-cloud-node-lifecycle-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \
+          --controllers='*,-cloud-node-lifecycle-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \
+          --allocate-node-cidrs=true \
+          --cluster-cidr=10.244.0.0/16 \
+          --node-cidr-mask-size=24 \
           --use-service-account-credentials=false \
           --leader-elect=false \
           --bind-address=127.0.0.1 \
           --kube-api-content-type=application/json \
           >/tmp/kcm-supervisor.log 2>&1 &
+
+    - name: Wait for flannel ready
+      # kube-controller-manager (above) is what makes node-ipam-controller
+      # assign ci-node a spec.podCIDR; flanneld's --kube-subnet-mgr only
+      # computes this node's lease and writes /run/flannel/subnet.env once
+      # that podCIDR exists. Must land before the scheduler (below) can place
+      # any pod -- CoreDNS included -- or that pod's sandbox creation either
+      # fails outright with the flannel plugin's own subnet.env error, or (if
+      # the flannel conflist hasn't landed on disk yet either) falls through
+      # to whatever other CNI network cri-o picks instead.
+      env:
+        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+      shell: bash
+      run: |
+        FOUND=0
+        for i in $(seq 1 90); do
+          if [ -f /run/flannel/subnet.env ]; then
+            FOUND=1
+            break
+          fi
+          sleep 1
+        done
+        if [ "$FOUND" -eq 0 ]; then
+          echo "ERROR: /run/flannel/subnet.env did not appear within 90s"
+          echo "--- kube-flannel pods -o wide ---"
+          kubectl -n kube-flannel get pods -o wide || true
+          echo "--- kube-flannel pod logs ---"
+          kubectl -n kube-flannel logs -l app=flannel --all-containers --prefix || true
+          echo "--- /etc/cni/net.d ---"
+          ls -la /etc/cni/net.d || true
+          exit 1
+        fi
+        echo "flannel ready:"
+        cat /run/flannel/subnet.env
 
     - name: Start u7s-scheduler
       shell: bash
@@ -741,6 +786,19 @@ runs:
         sudo journalctl -u kube-proxy --no-pager -n 50 || true
         echo "=== iptables nat rules (KUBE-SERVICES/KUBE-SVC chains) ==="
         sudo iptables -t nat -S | grep -i "10.96.0.1\|KUBE-SERVICES\|KUBE-SVC" || true
+
+        # Captures the flannel DS pod's own state -- sonobuoy sandboxes have
+        # failed the flannel CNI plugin with subnet.env missing while CoreDNS
+        # landed on a different subnet entirely, and this diagnose step had no
+        # visibility into kube-flannel at all when that happened.
+        echo "=== kube-flannel pods -o wide ==="
+        kubectl -n kube-flannel get pods -o wide || true
+        echo "=== kube-flannel pod logs ==="
+        kubectl -n kube-flannel logs -l app=flannel --all-containers --prefix || true
+        echo "=== /run/flannel/subnet.env ==="
+        cat /run/flannel/subnet.env 2>&1 || true
+        echo "=== /etc/cni/net.d ==="
+        ls -la /etc/cni/net.d || true
 
     - name: Retrieve sonobuoy results
       env:
