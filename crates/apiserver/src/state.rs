@@ -1829,7 +1829,7 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     // policy/v1
     m.insert(
         rk("policy", "v1", "poddisruptionbudgets"),
-        rm("PodDisruptionBudget", true, false),
+        rm("PodDisruptionBudget", true, true),
     );
 
     // storage.k8s.io/v1 — all cluster-scoped

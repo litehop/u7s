@@ -1983,6 +1983,41 @@ pub struct PodCertificateRequestStatus {
 }
 
 // ---------------------------------------------------------------------------
+// policy/v1 — PodDisruptionBudget
+// ---------------------------------------------------------------------------
+
+/// Typed status for a PodDisruptionBudget object. Source: `policy/v1/generated.proto`'s
+/// `PodDisruptionBudgetStatus` — every top-level field it defines. `conditions` is
+/// `[]metav1.Condition` upstream, so the generic `Condition` struct is the exact match.
+/// `disruptedPods` maps a pod name to the RFC3339 timestamp the eviction handler processed
+/// its eviction at (`map<string, meta.v1.Time>`, which marshals to a JSON string, not an
+/// object) — `pods.rs`'s `decrement_pdb_disruptions_allowed` is the only writer of this map,
+/// and this typed decode is what makes a client-forged non-object `status` (the panic vector
+/// that map-indexing into it hits) rejected before it ever reaches that eviction-spend path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PodDisruptionBudgetStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disrupted_pods: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disruptions_allowed: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_healthy: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_healthy: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_pods: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<Condition>>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
 // Kubernetes object store type
 // ---------------------------------------------------------------------------
 
