@@ -651,6 +651,18 @@ apt-get install -y cri-o crun conmon
 # already sets the correct path.
 mkdir -p /etc/crio/crio.conf.d
 
+# Reap idle exec/attach/logs/port-forward streaming connections' goroutines and
+# buffers instead of holding them open for cri-o's 4h default; reopens on
+# demand, so this only affects memory held by connections nobody is using.
+# log_size_max and log_level from the original memory-tuning proposal are
+# intentionally not here: log_size_max caps the on-disk log file, already
+# enforced by kubelet --container-log-max-size (no memory benefit), and
+# log_level stays at its current level for debuggability.
+cat > /etc/crio/crio.conf.d/10-memory.conf <<'CRIO_MEM_EOF'
+[crio.runtime]
+stream_idle_timeout = "5m"
+CRIO_MEM_EOF
+
 # br_netfilter isn't loaded by default on a fresh Ubuntu cloud image, and
 # Flannel's vxlan backend hard-fails at startup without it (fatal "Failed to
 # check br_netfilter: stat /proc/sys/net/bridge/bridge-nf-call-iptables: no
