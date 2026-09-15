@@ -1,0 +1,3 @@
+NAME                    READY   STATUS    RESTARTS   AGE   IP              NODE          NOMINATED NODE   READINESS GATES
+kube-flannel-ds-c25e0   1/1     Running   0          28s   192.168.108.5   lima-node-3   <none>           <none>
+kube-flannel-ds-d4fc8   1/1     Running   0          28s   192.168.108.4   lima-node-2   <none>           <none>

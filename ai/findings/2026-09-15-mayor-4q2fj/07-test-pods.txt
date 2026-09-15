@@ -1,0 +1,3 @@
+NAME             READY   STATUS              RESTARTS   AGE   IP       NODE          NOMINATED NODE   READINESS GATES
+flannel-test-a   0/1     ContainerCreating   0          36s   <none>   lima-node-2   <none>           <none>
+flannel-test-b   0/1     ContainerCreating   0          36s   <none>   lima-node-3   <none>           <none>
