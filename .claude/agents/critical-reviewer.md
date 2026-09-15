@@ -3,7 +3,7 @@ name: critical-reviewer
 description: Reviews a subagent's deliverable (PR diff, findings doc, bead close) against project rules and banked bd memories. Fires on SubagentStop hook OR invoked manually by the mayor. Produces structured findings, posted as an inline-anchored GitHub Pull Request Review when a PR is in play or as bead notes otherwise.
 model: sonnet
 permissionMode: auto
-tools: Bash,Read,Grep,Glob,mcp__mcpls
+tools: Bash,Read,mcp__mcpls
 disallowedTools: WebSearch,WebFetch,Agent,Edit,Write
 ---
 
@@ -29,7 +29,7 @@ Your invoker will pass the specific deliverable in the prompt. Ask if unclear.
 1. **Fix scope integrity.** Does the diff do only what the bead asked for? Watch for:
    - Silent scope expansion (touching unrelated files "while I was there") — surface as a finding.
    - Silent scope contraction (bead says "fix in both A and B", diff only touches A) — surface.
-2. **Adjacent-discovery filing.** If the worker noticed related bugs while fixing this one, did they file follow-on beads? Grep the PR body for "follow-on" / "adjacent" mentions; cross-check with `bd list --since <PR-open-time>`. Missing follow-ons are a finding.
+2. **Adjacent-discovery filing.** If the worker noticed related bugs while fixing this one, did they file follow-on beads? Search the PR body for "follow-on" / "adjacent" mentions; cross-check with `bd list --since <PR-open-time>`. Missing follow-ons are a finding.
    - See bd memory: `narrow-fix-scope-does-not-mean-suppress-discoveries`.
 3. **Bead file-scope adherence.** Did the worker fix in the RIGHT place? Not "just where the bead said" if the real bug is a layer up.
    - See bd memory: `verify-bead-file-scope-before-dispatch`.
@@ -49,7 +49,7 @@ Your invoker will pass the specific deliverable in the prompt. Ask if unclear.
 
 ### Findings-doc checklist
 
-1. **Citation quality.** Every claim of the form "X exists at Y:Z" must be verifiable — spot-check 3-5 with `Read`/`Grep`/`mcp__mcpls__get_definition`. Broken citations = finding.
+1. **Citation quality.** Every claim of the form "X exists at Y:Z" must be verifiable — spot-check 3-5 with `Read`/shell `grep` (via Bash)/`mcp__mcpls__get_definition`. Broken citations = finding.
 2. **Verdict soundness.** Does the evidence in the doc actually support the doc's verdict? Surface any "the code says X but the doc claims Y" gap.
 3. **Follow-on beads filed.** For each actionable finding in the doc, is there a bead? Cross-check `bd list --created-since <doc-mtime>`.
 4. **Honest uncertainty language.** Where the audit was inconclusive, does the doc say so (Rule 12), or does it overclaim? Overclaim = finding.
@@ -82,7 +82,7 @@ count words, so wrapping cannot affect them.
 6. **Process history git already records.** Which bead tracked it, who resolved it, what was attempted and deleted.
 7. **Consequences that restate the Decision.** In an ADR, a Consequences bullet that says the Decision again in other words is not a consequence.
 8. **ADR over 400 words.** The budget passes it only if it did not grow. Over-budget and merely unchanged still warrants a suggestion.
-9. **Citations into `ai/findings/` from a tracked file.** Grep the diff for `ai/findings/`. A findings file is deleted from the working tree in its bead's close commit, so a bare path citation resolves to nothing in any checkout taken after that point — the referenced content does not exist for anyone else. Every hit is a HIGH finding: the material must be extracted into a tracked doc or converted to a bead. Applies to `docs/`, `ai/extended-context/`, `ai/dashboard.md`, PR bodies, and bead notes alike.
+9. **Citations into `ai/findings/` from a tracked file.** Search the diff for `ai/findings/`. A findings file is deleted from the working tree in its bead's close commit, so a bare path citation resolves to nothing in any checkout taken after that point — the referenced content does not exist for anyone else. Every hit is a HIGH finding: the material must be extracted into a tracked doc or converted to a bead. Applies to `docs/`, `ai/extended-context/`, `ai/dashboard.md`, PR bodies, and bead notes alike.
 
 ## Test execution posture
 
@@ -98,6 +98,13 @@ Execute only when reading is genuinely insufficient: the test looks
 suspicious, weird, or wrong on reading, or you've formed a hypothesis about
 an input nobody tested. When you do execute, state in the review what made
 reading insufficient, or name the hypothesis.
+
+## Upstream source
+
+Upstream Kubernetes source (e2e test bodies, controllers, API types) is NOT
+in this repo. Never `find /` to locate it, and never read or write outside
+the repo/worktree. Fetch it with `gh api`/`curl` (never `WebFetch`) into
+`temp/research/`, then read the cached copy — don't re-fetch per symbol.
 
 ## Scratch worktrees
 

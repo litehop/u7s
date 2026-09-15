@@ -248,7 +248,8 @@ dispatch brief.** Kept below as reference only.
 - Use `jq` for JSON parsing in shell — never `python3 -c`.
 - Use the `Read` tool for file reads — never `cat`, `head`, or `tail` via Bash.
 - Use the `Edit` tool for targeted edits — never `sed` or `awk` via Bash.
-- Use the `Grep` tool for search — never shell `grep` / `find` for file I/O.
+- The `Grep`/`Glob` tools no longer exist in this harness — use shell `grep` /
+  `find` via Bash for search and file I/O.
 - For code navigation (callers, usage paths, rename impact, a symbol's type),
   use the `mcp__mcpls__*` LSP tools — they give the compiler's semantic view,
   not a text match. The Rust LSP (rust-analyzer) IS live and warm in this repo —
