@@ -4803,23 +4803,25 @@ pub async fn patch_cr_status<S: Store>(
     // merge): guard once here, right before the store write, instead of per-branch. A
     // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
-    // `apply_json_patch` happily turns that into a scalar.
-    crate::handlers::status::reject_non_object_status(&current["status"])?;
-    // Typed dispatch, layered on top of the object-shape check above: stronger, same 422
-    // code, for a registry-hit built-in with a registered status codec. `null` already
-    // passed the check above and is skipped here — the codec has no null case to decode
-    // into. A dispatch miss (every other kind, and every genuine CR/CRD) leaves the
-    // object-shape check above as the only guard, UNCHANGED.
+    // `apply_json_patch` happily turns that into a scalar. `null` bypasses both guards below
+    // (RFC 7396 field deletion is legal regardless of typed shape).
+    //
+    // Typed dispatch first: every built-in kind with a status subresource is registered in
+    // status_dispatch (see its table), so this is the only guard that ever actually runs for
+    // a registry-hit built-in — it also fails on a wrong-typed enumerated field, which
+    // `reject_non_object_status` alone can't see. A dispatch miss (every genuine CR/CRD)
+    // falls through to `reject_non_object_status` UNCHANGED.
     if !current["status"].is_null() {
         let api_version = if group.is_empty() {
             version.clone()
         } else {
             format!("{group}/{version}")
         };
-        if let Some(result) =
-            crate::status_dispatch::decode_status_patch(&api_version, &kind, &current["status"])
-        {
-            result?;
+        match crate::status_dispatch::decode_status_patch(&api_version, &kind, &current["status"]) {
+            Some(result) => {
+                result?;
+            }
+            None => crate::handlers::status::reject_non_object_status(&current["status"])?,
         }
     }
 

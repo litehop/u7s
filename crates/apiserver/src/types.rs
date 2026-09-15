@@ -1389,7 +1389,7 @@ pub struct PodStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Shared condition shapes — m10di Phase 3 (status_dispatch bulk kinds)
+// Shared condition shapes for the status_dispatch bulk-registered kinds
 //
 // Every struct below enumerates exactly the top-level scalar fields of its
 // upstream status type (per the vendored `k8s.io/api/.../generated.proto`,
@@ -1958,13 +1958,11 @@ pub struct DeviceClassStatus {
 
 /// Typed status for a PodCertificateRequest object. Source: upstream
 /// `staging/src/k8s.io/api/certificates/v1beta1/types.go`'s `PodCertificateRequestStatus`
-/// (not vendored as a `.proto` in this repo — fetched directly, see
-/// `temp/research/certificates_v1beta1_types.go`). `conditions` is `[]metav1.Condition`
-/// upstream, so the generic `Condition` struct is the exact match. `certificateChain`/
-/// `notBefore`/`beginRefreshAt`/`notAfter` are upstream-documented as immutable once set by
-/// the signer via this exact subresource — the closest thing to a Phase-1/2-style
-/// server-reasoned field this bulk phase has, even though u7s does not yet enforce that
-/// immutability itself.
+/// (not vendored as a `.proto` in this repo). `conditions` is `[]metav1.Condition` upstream,
+/// so the generic `Condition` struct is the exact match. `certificateChain`/`notBefore`/
+/// `beginRefreshAt`/`notAfter` are upstream-documented as immutable once set by the signer
+/// via this exact subresource, even though u7s does not yet enforce that immutability
+/// itself.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PodCertificateRequestStatus {

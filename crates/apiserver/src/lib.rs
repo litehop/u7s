@@ -3487,11 +3487,13 @@ pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
         };
         let key = item.key.clone();
 
-        // A prior status-subresource write could (bug notwithstanding) have left `status`
-        // as a non-object scalar/array; indexing that with ["used"] below would panic and
-        // crash the apiserver on every reconcile cycle for every ResourceQuota, not just
-        // this one. Coerce back to an empty object first so this reconciler is panic-safe
-        // regardless of what's stored.
+        // Every /status subresource write for ResourceQuota now funnels through
+        // status_dispatch's typed decode, but plain CREATE on the main resource endpoint
+        // does not — create_resource and create_namespaced_resource persist the client's
+        // body verbatim, including a scalar/array `status`, with no typed check at all.
+        // Indexing that with ["used"] below would panic and crash the apiserver on every
+        // reconcile cycle for every ResourceQuota, not just this one. Coerce back to an
+        // empty object first so this reconciler is panic-safe regardless of what's stored.
         if !quota["status"].is_object() {
             quota["status"] = serde_json::json!({});
         }
@@ -11823,10 +11825,12 @@ mod tests {
     }
 
     /// reconcile_quota_status must not panic when a stored ResourceQuota's `status` is a
-    /// scalar (possible if a status-subresource merge-patch bypassed schema validation).
-    /// Indexing `quota["status"]["used"]` on a non-object status panics — crashing the
-    /// apiserver's background reconciler task on every reconcile cycle, not just for the
-    /// one corrupted quota, since the loop iterates every ResourceQuota in the store.
+    /// scalar (possible via a plain CREATE: create_namespaced_resource persists the
+    /// client's body, including `status`, with no typed check — only the /status
+    /// subresource routes through status_dispatch). Indexing `quota["status"]["used"]` on a
+    /// non-object status panics — crashing the apiserver's background reconciler task on
+    /// every reconcile cycle, not just for the one corrupted quota, since the loop iterates
+    /// every ResourceQuota in the store.
     #[tokio::test]
     async fn reconcile_quota_status_does_not_panic_on_scalar_status() {
         use bytes::Bytes;

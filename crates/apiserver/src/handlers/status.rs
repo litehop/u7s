@@ -262,25 +262,29 @@ pub async fn patch_resource_status<S: Store>(
     // merge): guard once here, right before the store write, instead of per-branch. A
     // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
-    // `apply_json_patch` happily turns that into a scalar.
-    reject_non_object_status(&current.body["status"])?;
-    // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
-    // on a wrong-typed enumerated field), same 422 code, for a registered built-in (see
-    // status_dispatch.rs's table for the full list). `null` already passed the check above
-    // and is skipped here. A dispatch miss leaves the object-shape check above as the only
-    // guard, UNCHANGED.
+    // `apply_json_patch` happily turns that into a scalar. `null` bypasses both guards below
+    // (RFC 7396 field deletion is legal regardless of typed shape).
+    //
+    // Typed dispatch first: every built-in kind with a status subresource is registered in
+    // status_dispatch (see its table), so this is the only guard that ever actually runs for
+    // a built-in — it also fails on a wrong-typed enumerated field, which
+    // `reject_non_object_status` alone can't see. A dispatch miss (a genuine CR/CRD reaching
+    // this call site) falls through to `reject_non_object_status` UNCHANGED.
     if !current.body["status"].is_null() {
         let api_version = if group.is_empty() {
             version.clone()
         } else {
             format!("{group}/{version}")
         };
-        if let Some(result) = crate::status_dispatch::decode_status_patch(
+        match crate::status_dispatch::decode_status_patch(
             &api_version,
             &meta.kind,
             &current.body["status"],
         ) {
-            result?;
+            Some(result) => {
+                result?;
+            }
+            None => reject_non_object_status(&current.body["status"])?,
         }
     }
 
@@ -502,25 +506,29 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     // merge): guard once here, right before the store write, instead of per-branch. A
     // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
-    // `apply_json_patch` happily turns that into a scalar.
-    reject_non_object_status(&current.body["status"])?;
-    // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
-    // on a wrong-typed enumerated field), same 422 code, for a registered built-in (see
-    // status_dispatch.rs's table for the full list). `null` already passed the check above
-    // and is skipped here. A dispatch miss (every other built-in, and every genuine CR)
-    // leaves the object-shape check above as the only guard, UNCHANGED.
+    // `apply_json_patch` happily turns that into a scalar. `null` bypasses both guards below
+    // (RFC 7396 field deletion is legal regardless of typed shape).
+    //
+    // Typed dispatch first: every built-in kind with a status subresource is registered in
+    // status_dispatch (see its table), so this is the only guard that ever actually runs for
+    // a built-in — it also fails on a wrong-typed enumerated field, which
+    // `reject_non_object_status` alone can't see. A dispatch miss (every genuine CR) falls
+    // through to `reject_non_object_status` UNCHANGED.
     if !current.body["status"].is_null() {
         let api_version = if group.is_empty() {
             version.clone()
         } else {
             format!("{group}/{version}")
         };
-        if let Some(result) = crate::status_dispatch::decode_status_patch(
+        match crate::status_dispatch::decode_status_patch(
             &api_version,
             &kind,
             &current.body["status"],
         ) {
-            result?;
+            Some(result) => {
+                result?;
+            }
+            None => reject_non_object_status(&current.body["status"])?,
         }
     }
 
@@ -615,9 +623,11 @@ fn apply_status_replacement(current: &mut serde_json::Value, incoming_status: &s
 /// `status_dispatch` MISS — a registered built-in (see status_dispatch.rs's table) takes its
 /// typed-decode path instead and never reaches here. `replace_pod_status` never calls this at
 /// all: Pod is unconditionally registered in `status_dispatch`, so it always takes the typed
-/// path too. This function's own object-type guard is what every OTHER (unregistered)
-/// built-in still relies on, so the object-type invariant cannot be missed for those the way
-/// it was in two prior review rounds.
+/// path too. Every built-in with a status subresource is registered today, so this
+/// object-type guard is currently unreachable dead weight for the happy path — kept as the
+/// fallback for a future built-in added to the resource registry before its status kind is
+/// also registered in `status_dispatch`, so the object-type invariant can't silently lapse
+/// for that window the way it did across two prior review rounds.
 ///
 /// NOT used by `put_cr_status`/`put_crd_status` — see `replace_status_field_dynamic`,
 /// their 422 sibling, for why custom-resource status writes get a different code here.
@@ -3161,9 +3171,9 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Phase 3 (m10di) representative coverage: a scalar-status-rejection sample spanning
-    // three different resource families (apps, flowcontrol, core/Node), at the HANDLER
-    // level — proving `status_dispatch`'s table is actually wired into
+    // Representative coverage: a scalar-status-rejection sample spanning three different
+    // resource families (apps, flowcontrol, core/Node), at the HANDLER level — proving
+    // `status_dispatch`'s table is actually wired into
     // put_namespaced_resource_status/patch_resource_status, not just reachable from
     // status_dispatch.rs's own unit tests.
     // ---------------------------------------------------------------------------
@@ -3216,8 +3226,8 @@ mod tests {
         assert_eq!(
             err.0,
             axum::http::StatusCode::BAD_REQUEST,
-            "Deployment is a Phase-3 status_dispatch-registered built-in, so PUT scalar \
-             status fails at typed decode (400), same as ResourceQuota in Phase 2"
+            "Deployment is a status_dispatch-registered built-in, so PUT scalar status \
+             fails at typed decode (400), same as ResourceQuota"
         );
     }
 
@@ -3266,14 +3276,15 @@ mod tests {
         assert_eq!(
             err.0,
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "merge-PATCH scalar status on a Phase-3 typed kind must stay 422, not flip to 400"
+            "merge-PATCH scalar status on a status_dispatch-registered kind must stay 422, \
+             not flip to 400"
         );
     }
 
     /// Node JSON-Patch whole-`/status` scalar replace must also be 422, exercised through
     /// `patch_resource_status` (core/v1, cluster-scoped) with the JSON-Patch content-type —
     /// a different code branch than merge-patch, proving the convergence point is reached
-    /// from that branch too for a Phase-3 kind.
+    /// from that branch too for a status_dispatch-registered kind.
     #[tokio::test]
     async fn patch_resource_status_rejects_scalar_status_json_patch_on_node_via_typed_dispatch() {
         let state = make_state();
@@ -3309,7 +3320,7 @@ mod tests {
         assert_eq!(
             err.0,
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "JSON-Patch scalar status on a Phase-3 typed kind must stay 422"
+            "JSON-Patch scalar status on a status_dispatch-registered kind must stay 422"
         );
     }
 
@@ -5813,12 +5824,10 @@ mod tests {
     /// `PatchType::Json` arm right next to it stayed unguarded, because
     /// `validate_status_json_patch_paths` explicitly permits a whole-`/status` replace and
     /// nothing re-checked the result afterward. Every PATCH status-subresource handler must
-    /// instead call the guard as an unconditional statement placed directly in the
-    /// function body — reached no matter which `match patch_type` arm ran — rather than
-    /// nested inside one specific arm. rustfmt indents a function's own top-level
-    /// statements at exactly 4 spaces, so a guard call that only ever shows up deeper than
-    /// that proves it is per-branch rather than a shared convergence point that runs before
-    /// every store write.
+    /// call the guard (directly, or as the dispatch-miss fallback inside
+    /// `decode_status_patch`'s own convergence point) somewhere textually AFTER the
+    /// `match patch_type { ... }` block closes, so it is reached no matter which arm ran,
+    /// rather than nested inside one specific arm.
     #[test]
     fn every_status_patch_handler_guards_non_object_status_outside_any_branch() {
         let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
@@ -5844,16 +5853,14 @@ mod tests {
                 }
                 checked.push(name.clone());
 
-                let min_guard_indent = body
-                    .lines()
-                    .filter(|l| {
-                        l.contains("reject_non_object_status(")
-                            || l.contains("replace_status_field(")
-                    })
-                    .map(|l| l.len() - l.trim_start().len())
-                    .min();
-
-                if min_guard_indent != Some(4) {
+                let guarded = match text_after_match_patch_type_block(&body) {
+                    Some(tail) => {
+                        tail.contains("reject_non_object_status(")
+                            || tail.contains("replace_status_field(")
+                    }
+                    None => false,
+                };
+                if !guarded {
                     unguarded.push(format!("{name} in {}", path.display()));
                 }
             }
@@ -6039,6 +6046,31 @@ mod tests {
         handler_bodies_matching(source, |name| {
             name.starts_with("patch_") && name.contains("status")
         })
+    }
+
+    /// Returns the text of `body` starting right after the closing `}` of its first
+    /// `match patch_type { ... }` block, or `None` if no such block is found. Used to prove a
+    /// guard call is reached regardless of which `PatchType` arm ran, without hard-coding the
+    /// exact indentation the guard call sits at — the guard may itself be wrapped in an
+    /// unrelated `if`/`match` (e.g. a dispatch-first-then-fallback structure), which pushes
+    /// it deeper than a bare top-level statement without making it per-branch.
+    fn text_after_match_patch_type_block(body: &str) -> Option<&str> {
+        let start = body.find("match patch_type")?;
+        let open = start + body[start..].find('{')?;
+        let mut depth = 0i32;
+        let mut started = false;
+        for (i, ch) in body[open..].char_indices() {
+            if ch == '{' {
+                depth += 1;
+                started = true;
+            } else if ch == '}' {
+                depth -= 1;
+                if started && depth == 0 {
+                    return Some(&body[open + i + 1..]);
+                }
+            }
+        }
+        None
     }
 
     /// Naming convention every MAIN-resource (non-status) mutating handler in this codebase
