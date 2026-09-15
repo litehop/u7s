@@ -1994,6 +1994,18 @@ fn decrement_pdb_disruptions_allowed(
     }
     let mut updated = pdb.clone();
     updated["status"]["disruptionsAllowed"] = serde_json::Value::from(disruptions_allowed - 1);
+    // Defense in depth: `disruptedPods` being anything but an object or absent would panic
+    // the indexed write below — `serde_json::Value`'s `IndexMut` panics ("cannot access key
+    // ... in JSON ...") when the target is a scalar/array. `disruptions_allowed` reading as
+    // positive above guarantees `status` itself is already an object (a non-object status
+    // reads as 0 and returns 429 above, before this line), but a same-shaped status object
+    // with `disruptedPods` forged as e.g. a string would still panic this write and take the
+    // whole apiserver down with it, blocking every other in-flight eviction too.
+    // `status_dispatch`'s typed `PodDisruptionBudgetStatus` decode rejects this shape on
+    // every client-facing write path; this coercion is the last line of defense.
+    if !updated["status"]["disruptedPods"].is_object() {
+        updated["status"]["disruptedPods"] = serde_json::Value::Object(Default::default());
+    }
     updated["status"]["disruptedPods"][pod_name] =
         serde_json::Value::String(now_rfc3339.to_string());
     Ok(updated)
@@ -13657,6 +13669,42 @@ mod handler_tests {
             v["metadata"]["deletionTimestamp"].is_null(),
             "dryRun=All in Eviction.deleteOptions must NOT stamp deletionTimestamp — if this \
              fails, evict_pod's dry-run guard was removed and the pod was actually evicted"
+        );
+    }
+
+    /// Fail-on-revert regression for the disruption-path DoS this closes: a PDB whose
+    /// `status.disruptedPods` a mutating webhook or a not-yet-closed CREATE bypass forged as
+    /// a non-map value (here, a string) must not panic the eviction spend.
+    /// `updated["status"]["disruptedPods"][pod_name] = ...` is a `serde_json::Value`
+    /// `IndexMut` chain that panics ("cannot access key ... in JSON ...") once it reaches a
+    /// scalar/array instead of an object — crashing the apiserver on this one eviction would
+    /// take down every other in-flight eviction request with it. `disruptionsAllowed` staying
+    /// readable and positive despite the forged `disruptedPods` proves this is a genuinely
+    /// reachable shape (a fully non-object `status` never gets this far — it reads as 0 and
+    /// is rejected as budget-exhausted before the write), not a shape the read-side guards
+    /// already rule out.
+    #[test]
+    fn decrement_pdb_disruptions_allowed_does_not_panic_on_forged_disrupted_pods() {
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default", "generation": 1 },
+            "status": {
+                "observedGeneration": 1,
+                "disruptionsAllowed": 1,
+                "disruptedPods": "forged-not-a-map"
+            }
+        });
+        let updated = decrement_pdb_disruptions_allowed(&pdb, "web-0", "2026-01-01T00:00:00Z")
+            .expect("a budget with disruptionsAllowed:1 must permit spending one disruption");
+        assert_eq!(
+            updated["status"]["disruptionsAllowed"], 0,
+            "the disruption must still be spent despite the forged disruptedPods"
+        );
+        assert_eq!(
+            updated["status"]["disruptedPods"]["web-0"], "2026-01-01T00:00:00Z",
+            "disruptedPods must be coerced to a fresh map and stamped with this pod, not left \
+             as the forged scalar"
         );
     }
 
