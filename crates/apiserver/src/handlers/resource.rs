@@ -35,6 +35,41 @@ use super::json_patch::{
 };
 use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
+/// Restores the previously-stored `status` onto `body`, or strips whatever `status` is
+/// currently on `body` if there was no prior stored value (`stored_status` is `None` or
+/// `Value::Null` — including a create-race fallback merging onto a winner whose kind has
+/// no status subresource at all).
+///
+/// Every call site that persists onto an object it did not itself just create — a full PUT,
+/// a PATCH, or a create-race fallback that lost the create and is merging onto the winner —
+/// must call this AFTER `run_mutating_webhooks`, with nothing else touching `body["status"]`
+/// between that call and `store.put`. A mutating webhook's JSON patch can otherwise reinject
+/// whatever status this function just discarded/restored (see `clear_create_status`'s doc
+/// comment for the identical CREATE-from-scratch case this mirrors). `replace_resource` and
+/// `replace_namespaced_resource` already call it exactly once, after webhooks; `do_patch`'s
+/// SSA-create-race fallback calls it twice — once before webhooks (so the escalation/
+/// validation checks that run before admission see the corrected status) and once after, to
+/// close that reinjection gap. `do_patch`'s main PATCH/PUT-onto-a-live-object loop still
+/// calls it only once, pre-webhook: that call site's operation is UPDATE, not CREATE — out
+/// of this fix's scope, tracked separately.
+fn restore_or_strip_status(
+    has_status_subresource: bool,
+    body: &mut serde_json::Value,
+    stored_status: &Option<serde_json::Value>,
+) {
+    if !has_status_subresource {
+        return;
+    }
+    match stored_status {
+        Some(s) if !s.is_null() => {
+            body["status"] = s.clone();
+        }
+        _ => {
+            body.as_object_mut().map(|m| m.remove("status"));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cluster-scoped handlers  (group/version/resource)
 // ---------------------------------------------------------------------------
@@ -991,16 +1026,7 @@ pub(crate) async fn replace_resource<S: Store>(
 
     // Restore the stored status: controllers write status via /status; a full PUT on
     // the main endpoint must preserve whatever the controller last wrote.
-    if meta.has_status_subresource {
-        match stored_status {
-            Some(ref s) if !s.is_null() => {
-                obj.body["status"] = s.clone();
-            }
-            _ => {
-                obj.body.as_object_mut().map(|m| m.remove("status"));
-            }
-        }
-    }
+    restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
 
     // Dry-run: validation and admission passed; return the would-be result without persisting.
     if replace_query.is_dry_run() {
@@ -1561,16 +1587,11 @@ pub(crate) async fn do_patch<S: Store>(
                 };
                 crate::patch::strategic_merge_patch(&mut current.body, &patch)
                     .map_err(|e| Status::bad_request(e.to_string()))?;
-                if meta.has_status_subresource {
-                    match stored_status {
-                        Some(ref s) if !s.is_null() => {
-                            current.body["status"] = s.clone();
-                        }
-                        _ => {
-                            current.body.as_object_mut().map(|m| m.remove("status"));
-                        }
-                    }
-                }
+                restore_or_strip_status(
+                    meta.has_status_subresource,
+                    &mut current.body,
+                    &stored_status,
+                );
                 super::defaults::apply_defaults(group, plural, &mut current.body);
                 super::defaults::validate_resource(group, plural, &current.body)
                     .map_err(Status::unprocessable_entity)?;
@@ -1627,6 +1648,16 @@ pub(crate) async fn do_patch<S: Store>(
                 };
                 current.body =
                     run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
+                // Re-restore status after mutating webhooks — same rationale as the primary
+                // create path's post-webhook clear_create_status re-call above: a webhook's
+                // JSON patch can reinject a forged/scalar status the earlier restore already
+                // discarded, and this is the last point before persistence that can discard
+                // it again.
+                restore_or_strip_status(
+                    meta.has_status_subresource,
+                    &mut current.body,
+                    &stored_status,
+                );
                 run_validating_webhooks(state, &current.body, None, &admission_ctx).await?;
 
                 if let Some(fm) = field_manager {
@@ -1887,16 +1918,11 @@ pub(crate) async fn do_patch<S: Store>(
 
         current.body["metadata"]["uid"] = stored_uid;
 
-        if meta.has_status_subresource {
-            match stored_status {
-                Some(ref s) if !s.is_null() => {
-                    current.body["status"] = s.clone();
-                }
-                _ => {
-                    current.body.as_object_mut().map(|m| m.remove("status"));
-                }
-            }
-        }
+        restore_or_strip_status(
+            meta.has_status_subresource,
+            &mut current.body,
+            &stored_status,
+        );
 
         if let Some(ref old_value) = priorityclass_value_before_patch {
             if &current.body["value"] != old_value {
@@ -3842,16 +3868,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
 
     // Restore the stored status: controllers write status via /status; a full PUT on
     // the main endpoint must preserve whatever the controller last wrote.
-    if meta.has_status_subresource {
-        match stored_status {
-            Some(ref s) if !s.is_null() => {
-                obj.body["status"] = s.clone();
-            }
-            _ => {
-                obj.body.as_object_mut().map(|m| m.remove("status"));
-            }
-        }
-    }
+    restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
 
     // A user PUT on an Endpoints object signals that the endpoints are now user-managed,
     // not service-controller-managed.  Clear the annotation the KCM endpoints-controller
@@ -25352,6 +25369,171 @@ mod tests {
         );
     }
 
+    /// A mutating webhook — not just the losing request's own body (see the sibling test
+    /// above) — that reinjects a forged `status` after the SSA-create-race fallback's
+    /// pre-merge restore must not have it persist either. Before this fix, the fallback
+    /// restored `stored_status` exactly once, before `run_mutating_webhooks`; a webhook's
+    /// JSON patch adding `status` back in afterward reached `store.put` untouched — the
+    /// same webhook-ordering bug ppjid's first fix round closed for the primary create
+    /// path (`create_resource`/`create_namespaced_resource`'s own post-webhook
+    /// `clear_create_status` re-call), just missed on this fallback branch, whose merge is
+    /// a `restore_or_strip_status` restore rather than a fresh clear. Fails on revert:
+    /// removing the fallback's second (post-webhook) `restore_or_strip_status` call makes
+    /// this see the webhook's forged `status.replicas: 99` persisted verbatim.
+    #[tokio::test]
+    async fn ssa_create_race_fallback_discards_status_reinjected_by_mutating_webhook() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::Router;
+        use base64::Engine;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/apps/statefulsets/default/web";
+
+        let router = Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/status", "value": {"replicas": 99}}
+                ]);
+                let patch_b64 = base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_string(&patch).unwrap());
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "webhook-race-status-reinject-uid",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_admission_webhook_server(router).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": { "name": "race-status-reinject-mwc" },
+            "webhooks": [{
+                "name": "race-status-reinject.test.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{
+                    "apiGroups": ["*"], "apiVersions": ["*"], "resources": ["statefulsets"],
+                    "operations": ["CREATE"]
+                }],
+                "sideEffects": "None",
+                "failurePolicy": "Fail"
+            }]
+        });
+        // Seeded directly on `inner`, bypassing the race-injecting wrapper below — the
+        // wrapper intercepts only the very FIRST put() it sees, and that must be the actual
+        // create attempt this test forces into the race, not this setup write.
+        inner
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/race-status-reinject-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let winner = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
+                }
+            },
+            "status": { "replicas": 3, "readyReplicas": 3 }
+        });
+        let winner_body = bytes::Bytes::from(serde_json::to_vec(&winner).unwrap());
+
+        let store = Arc::new(RaceWinnerAlreadyExistsStore::new(
+            inner.clone(),
+            winner_body,
+        ));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // This request's own body carries no status at all — isolating the test to the
+        // webhook's reinjection, not the client's own forged status (see the sibling test
+        // above for that case).
+        let ssa_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
+                }
+            }
+        });
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "statefulsets".to_string(),
+                "web".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&ssa_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("race-fallback SSA merge must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::OK,
+            "the race-losing request must land in the AlreadyExists merge branch (200), not \
+             the primary create path (201) — if this doesn't hold, the mock never forced \
+             the race and this test isn't exercising the branch it exists to cover"
+        );
+
+        let stored = inner
+            .get(key)
+            .await
+            .unwrap()
+            .expect("the winner's StatefulSet must be persisted");
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["status"],
+            serde_json::json!({ "replicas": 3, "readyReplicas": 3 }),
+            "a mutating webhook's forged status.replicas must not survive to the store even \
+             on the SSA-create-race fallback — restore_or_strip_status must run AFTER \
+             run_mutating_webhooks there too, not just before, or a webhook can reinject a \
+             forged status the earlier restore already discarded"
+        );
+    }
+
     /// `strip_or_delete_dependent` must re-read the dependent fresh and retry on conflict
     /// rather than blindly overwriting whatever the caller's LIST-time snapshot contained.
     ///
@@ -30344,5 +30526,171 @@ mod tests {
             Some("svc-a"),
             "the decoded ServiceList item must be the real seeded Service, not a placeholder"
         );
+    }
+
+    /// Every CREATE-operation `run_mutating_webhooks` call site in a built-in handler must
+    /// clear or restore `status` again AFTER that call, before the next store write — a
+    /// mutating webhook's JSON patch can otherwise reinject whatever `status` an earlier
+    /// clear/restore already discarded (see `clear_create_status`'s and
+    /// `restore_or_strip_status`'s doc comments). Three review rounds each found and fixed
+    /// this on a subset of built-in CREATE surfaces by hand — `create_resource`/
+    /// `create_namespaced_resource`/`create_pod`/`create_namespace` in round one, then
+    /// `do_patch`'s SSA-create-race fallback in round two — because nothing forced a
+    /// re-enumeration of every site. This test greps the built-in handler files for every
+    /// `run_mutating_webhooks(` call whose nearest preceding `operation: "..."` literal is
+    /// `"CREATE"`, and fails the moment one is added or regressed without a
+    /// `clear_create_status(`/`restore_or_strip_status(` call in the text between that call
+    /// and the next store write (`.put(` / `create_if_namespace_active(`).
+    ///
+    /// Deliberately scoped to `operation: "CREATE"` sites only, not every
+    /// `run_mutating_webhooks` call in these files: `do_patch`'s main PATCH/PUT-onto-a-
+    /// live-object loop (tagged `operation: "UPDATE"`, even for the create-on-missing PUT
+    /// path in `replace_resource`/`replace_namespaced_resource`, which restore status via
+    /// the same helper but are tagged UPDATE like any other full-object PUT) has the same
+    /// class of gap on its own axis (the stored-status restore there runs only once, before
+    /// webhooks) — that is a separate, already-tracked follow-up on the UPDATE path, out of
+    /// this test's CREATE-only scope by construction, not by an exemption list.
+    ///
+    /// Scoped to resource.rs/pods.rs/namespaces.rs (not the whole `src/handlers` directory,
+    /// unlike status.rs's completeness tests): Custom Resource and CRD create paths
+    /// (cr.rs/crd.rs) use their own schema-driven status/pruning mechanism, a different bug
+    /// class this test doesn't reason about.
+    #[test]
+    fn every_create_operation_webhook_call_clears_status_after_webhook() {
+        const FILES: &[&str] = &["resource.rs", "pods.rs", "namespaces.rs"];
+        let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
+
+        let mut checked = 0usize;
+        let mut violations = Vec::new();
+
+        for file in FILES {
+            let path = handlers_dir.join(file);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for (name, body) in top_level_fn_bodies(&source) {
+                for start in webhook_call_offsets(&body) {
+                    let Some(op) = nearest_preceding_operation(&body, start) else {
+                        continue;
+                    };
+                    if op != "CREATE" {
+                        continue;
+                    }
+                    checked += 1;
+                    let write_end = next_store_write_offset(&body, start);
+                    let window = &body[start..write_end];
+                    if !window.contains("clear_create_status(")
+                        && !window.contains("restore_or_strip_status(")
+                    {
+                        violations.push(format!(
+                            "{name} in {file} (byte offset {start} within the function body)"
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked >= 6,
+            "sanity check: expected at least 6 CREATE-operation run_mutating_webhooks call \
+             sites across resource.rs/pods.rs/namespaces.rs (create_resource, \
+             create_namespaced_resource, create_pod, create_namespace, do_patch's \
+             SSA-create branch, do_patch's create-race fallback), found {checked} — did the \
+             `operation: \"CREATE\"` convention change (this test would otherwise pass \
+             vacuously)?"
+        );
+        assert!(
+            violations.is_empty(),
+            "CREATE-operation run_mutating_webhooks call site(s) do not clear/restore \
+             status before the next store write: {violations:?} — a mutating webhook's \
+             JSON patch can reinject a forged/scalar status between an earlier clear and \
+             persistence otherwise. Call clear_create_status (fresh create) or \
+             restore_or_strip_status (merge onto an object that already exists, e.g. a \
+             create-race fallback) immediately after run_mutating_webhooks, with nothing \
+             else touching status before the store write."
+        );
+    }
+
+    /// Extracts `(function_name, body)` for every function whose signature starts at column
+    /// 0 (`pub`/`pub(crate)`/plain `fn`) — deliberately excludes anything indented (e.g. the
+    /// `#[tokio::test] async fn ..._status_...()` functions inside this very `mod tests`),
+    /// mirroring `status.rs`'s identical column-0 requirement so a test helper is never
+    /// mistaken for a production handler.
+    fn top_level_fn_bodies(source: &str) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+        let lines: Vec<&str> = source.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            let is_top_level_fn =
+                line.starts_with("pub") || line.starts_with("fn ") || line.starts_with("async fn ");
+            if is_top_level_fn {
+                if let Some(fn_idx) = line.find("fn ") {
+                    let after = &line[fn_idx + 3..];
+                    let end = after
+                        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(after.len());
+                    let name = after[..end].to_string();
+                    let mut depth = 0i32;
+                    let mut started = false;
+                    let mut body = String::new();
+                    let mut j = i;
+                    while j < lines.len() {
+                        let l = lines[j];
+                        for ch in l.chars() {
+                            if ch == '{' {
+                                depth += 1;
+                                started = true;
+                            } else if ch == '}' {
+                                depth -= 1;
+                            }
+                        }
+                        body.push_str(l);
+                        body.push('\n');
+                        j += 1;
+                        if started && depth <= 0 {
+                            break;
+                        }
+                    }
+                    results.push((name, body));
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        results
+    }
+
+    /// Byte offsets of every `run_mutating_webhooks(` call within `body`.
+    fn webhook_call_offsets(body: &str) -> Vec<usize> {
+        body.match_indices("run_mutating_webhooks(")
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The value of the nearest `operation: "..."` literal textually preceding `before` in
+    /// `body` — the `AdmissionContext` field every `run_mutating_webhooks` call site in
+    /// this codebase builds right above the call.
+    fn nearest_preceding_operation(body: &str, before: usize) -> Option<&str> {
+        let marker = "operation: \"";
+        let start = body[..before].rfind(marker)? + marker.len();
+        let rest = &body[start..];
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    }
+
+    /// Byte offset of the next store-write entry point (`.put(` or
+    /// `create_if_namespace_active(`, mirroring status.rs's `calls_store_write_entry_point`)
+    /// at or after `from` in `body`, or `body.len()` if none remains.
+    fn next_store_write_offset(body: &str, from: usize) -> usize {
+        let tail = &body[from..];
+        let put_pos = tail.find(".put(");
+        let create_pos = tail.find("create_if_namespace_active(");
+        match (put_pos, create_pos) {
+            (Some(a), Some(b)) => from + a.min(b),
+            (Some(a), None) => from + a,
+            (None, Some(b)) => from + b,
+            (None, None) => body.len(),
+        }
     }
 }
