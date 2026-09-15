@@ -229,6 +229,27 @@ EXTEOF
 
   pkill -f "konnectivity-server.*${WORKDIR}" || true
 
+  # pkill only matches processes whose command line contains THIS workdir, so
+  # it can never kill a foreign konnectivity-server (e.g. another worktree's,
+  # or a leftover from an earlier session) that happens to be squatting the
+  # same derived port from a DIFFERENT workdir. Without this wait+check, the
+  # nc -z probe below would report the port "up" against that foreign
+  # process — it has no way to tell "my own freshly (re)started server" from
+  # "someone else's process that was already listening" — silently leaving
+  # konnectivity-agent stuck failing mTLS against the wrong CA
+  # ("certificate signed by unknown authority") for the rest of the run,
+  # with every Service-based webhook call failing far downstream instead of
+  # a clear error here. Give our own pkill target a moment to actually exit
+  # before treating a still-occupied port as foreign.
+  for i in $(seq 1 5); do
+    lsof -n -iTCP:"$KONNECTIVITY_PROXY_PORT" -sTCP:LISTEN -t >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  check_port_free "$KONNECTIVITY_PROXY_PORT" "konnectivity-server"
+  check_port_free "$KONNECTIVITY_AGENT_PORT" "konnectivity-agent"
+  check_port_free "$KONNECTIVITY_ADMIN_PORT" "konnectivity-admin"
+  check_port_free "$KONNECTIVITY_HEALTH_PORT" "konnectivity-health"
+
   # klog has no --utc flag, so konnectivity-server renders whatever local time
   # it inherits; force UTC so konnectivity-server.log matches apiserver.log.
   TZ=UTC "$SERVER_BIN" \
