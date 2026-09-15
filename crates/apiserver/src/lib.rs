@@ -3464,6 +3464,23 @@ pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) -> bool {
 /// only when `status.used` differs from the live count. Uses optimistic concurrency
 /// (`Some(revision)`) so a concurrent write wins and the next reconcile cycle corrects it.
 ///
+/// Coerces a non-object `status` back to `{}` before indexing it. CREATE is now fully
+/// closed against a client- or webhook-supplied non-object `status` (see
+/// `clear_create_status`, run both before AND after mutating admission webhooks at every
+/// create site — `resource.rs`/`pods.rs`/`namespaces.rs`), but a plain UPDATE (PUT/PATCH on
+/// the main resource, not the `/status` subresource) restores the pre-patch stored `status`
+/// BEFORE running mutating webhooks too (see `stored_status` in `do_patch`'s main branch,
+/// resource.rs), with no second restore after — the same ordering gap CREATE had, just on
+/// UPDATE, and out of scope for the CREATE-only fix that retired this guard. Keeping this
+/// coercion is the difference between a corrupted quota merely losing its live-usage
+/// tracking for one cycle and taking down this reconciler's background task for every
+/// ResourceQuota in the store. See
+/// `create_namespaced_resource_rejects_scalar_status_on_resourcequota_preventing_stamper_panic`
+/// and
+/// `create_namespaced_resource_discards_status_reinjected_by_mutating_webhook_on_deployment_create`
+/// (resource.rs) for the CREATE-path regression tests, and
+/// `reconcile_quota_status_does_not_panic_on_scalar_status` below for this guard's own.
+///
 /// Returns `true` if no storage errors occurred, `false` otherwise.
 pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
     use bytes::Bytes;
@@ -3487,13 +3504,10 @@ pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
         };
         let key = item.key.clone();
 
-        // Every /status subresource write for ResourceQuota now funnels through
-        // status_dispatch's typed decode, but plain CREATE on the main resource endpoint
-        // does not — create_resource and create_namespaced_resource persist the client's
-        // body verbatim, including a scalar/array `status`, with no typed check at all.
-        // Indexing that with ["used"] below would panic and crash the apiserver on every
-        // reconcile cycle for every ResourceQuota, not just this one. Coerce back to an
-        // empty object first so this reconciler is panic-safe regardless of what's stored.
+        // A non-object `status` (e.g. via the UPDATE-path webhook-reinjection gap described
+        // in this function's own doc comment) would panic the `["used"]` index below and
+        // crash this reconciler for every ResourceQuota, not just this one. Coerce back to
+        // an empty object first so this reconciler is panic-safe regardless of what's stored.
         if !quota["status"].is_object() {
             quota["status"] = serde_json::json!({});
         }
@@ -11825,12 +11839,14 @@ mod tests {
     }
 
     /// reconcile_quota_status must not panic when a stored ResourceQuota's `status` is a
-    /// scalar (possible via a plain CREATE: create_namespaced_resource persists the
-    /// client's body, including `status`, with no typed check — only the /status
-    /// subresource routes through status_dispatch). Indexing `quota["status"]["used"]` on a
-    /// non-object status panics — crashing the apiserver's background reconciler task on
-    /// every reconcile cycle, not just for the one corrupted quota, since the loop iterates
-    /// every ResourceQuota in the store.
+    /// scalar. Indexing `quota["status"]["used"]` on a non-object status panics — crashing
+    /// the apiserver's background reconciler task on every reconcile cycle, not just for
+    /// the one corrupted quota, since the loop iterates every ResourceQuota in the store.
+    /// This scalar status can no longer reach the store via a plain CREATE (see
+    /// `clear_create_status`'s two call sites per create handler), but reconcile_quota_status
+    /// still guards defensively — see this function's own doc comment for the UPDATE-path
+    /// gap (mutating-webhook reinjection after the pre-patch `stored_status` restore) that
+    /// keeps this coercion load-bearing.
     #[tokio::test]
     async fn reconcile_quota_status_does_not_panic_on_scalar_status() {
         use bytes::Bytes;

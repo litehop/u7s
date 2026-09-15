@@ -205,8 +205,12 @@ pub(crate) async fn create_namespace<S: Store>(
     if obj.body.get("apiVersion").is_none() {
         obj.body["apiVersion"] = serde_json::Value::String("v1".into());
     }
-    // status.phase=Active is set by apply_defaults, the same defaulter the SSA
-    // create-on-missing path (do_patch) uses — see its "namespaces" branch.
+    // Reject a scalar/array client status at typed decode (400), then discard whatever the
+    // client sent — matches upstream's unconditional PrepareForCreate wipe (see
+    // clear_create_status's doc comment). status.phase=Active is then set by apply_defaults,
+    // the same defaulter the SSA create-on-missing path (do_patch) uses — see its
+    // "namespaces" branch.
+    crate::handlers::generic::clear_create_status(true, "v1", "Namespace", &mut obj.body)?;
     crate::handlers::defaults::apply_defaults("", "namespaces", &mut obj.body);
 
     // Stamp the "kubernetes" finalizer into spec.finalizers at creation time.
@@ -286,6 +290,12 @@ pub(crate) async fn create_namespace<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    // Re-clear status after mutating webhooks — see create_resource's identical call
+    // (resource.rs) for why: a webhook can reinject a forged/scalar status the earlier
+    // clear_create_status already stripped, and this is the last point before
+    // persistence that can discard it.
+    crate::handlers::generic::clear_create_status(true, "v1", "Namespace", &mut obj.body)?;
+    crate::handlers::defaults::apply_defaults("", "namespaces", &mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // Dry-run: validation and admission passed; return the would-be created namespace
@@ -1812,6 +1822,97 @@ mod tests {
                 .map(|s| !s.is_empty())
                 .unwrap_or(false),
             "created namespace must have a non-empty UID"
+        );
+    }
+
+    /// A client POSTing a scalar `status` on Namespace create must be rejected (400), not
+    /// silently coerced to a default: KCM's ServiceAccount controller and the disruption
+    /// controller both index `status.phase`/`status.conditions` as objects, and the terminating
+    /// stamp (`generic.rs`) writes into `status` in place — a scalar there is the same
+    /// stamper-panic vector the ResourceQuota reconciler has, just for Namespace's own
+    /// internal writers.
+    #[tokio::test]
+    async fn create_namespace_rejects_scalar_status_preventing_stamper_panic() {
+        let state = make_state();
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "evil-ns" },
+                "status": "oops"
+            })
+            .to_string(),
+        );
+
+        let err = create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a scalar status must fail typed decode on create"));
+
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "CREATE with a scalar status is a whole-body typed-decode failure (400)"
+        );
+        assert!(
+            state
+                .store
+                .get(&crate::keys::cluster_object_key("namespaces", "evil-ns"))
+                .await
+                .unwrap()
+                .is_none(),
+            "the rejected create must not have persisted anything"
+        );
+    }
+
+    /// A client POSTing a validly-shaped but forged `status.phase` (e.g. claiming the
+    /// namespace is already Active with no server-side check) must still not have that exact
+    /// value trusted — apply_defaults independently re-derives phase=Active on create, so this
+    /// mainly proves create_namespace's own status handling doesn't reject a normal object
+    /// status outright.
+    #[tokio::test]
+    async fn create_namespace_sets_active_phase_regardless_of_client_supplied_status() {
+        let state = make_state();
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "phase-test-ns" },
+                "status": { "phase": "Terminating" }
+            })
+            .to_string(),
+        );
+
+        create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a validly-shaped status must not be rejected: {e:?}"));
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "phase-test-ns",
+            ))
+            .await
+            .unwrap()
+            .expect("namespace must have been created");
+        let stored_val: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_val["status"]["phase"], "Active",
+            "a client claiming Terminating on create must not be trusted — a namespace born \
+             Terminating would never let KCM's ServiceAccount controller seed the default SA"
         );
     }
 

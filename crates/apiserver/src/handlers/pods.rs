@@ -542,6 +542,12 @@ pub(crate) async fn create_pod<S: Store>(
     obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.as_str().to_owned());
     crate::handlers::generic::stamp_metadata(&mut obj);
 
+    // Reject a scalar/array client status at typed decode (400), then discard whatever the
+    // client sent — matches upstream's unconditional PrepareForCreate wipe (see
+    // clear_create_status's doc comment). apply_pod_create_defaults then stamps
+    // status.phase=Pending and the PodScheduled=False condition onto the now-empty status,
+    // same as it always has for the common (status-absent) case.
+    super::generic::clear_create_status(true, "v1", "Pod", &mut obj.body)?;
     apply_pod_create_defaults(&mut obj.body);
     initialize_pod_generation(&mut obj.body);
     apply_automount_sa_token_default(&state, &mut obj.body, ns.as_str()).await;
@@ -642,16 +648,24 @@ pub(crate) async fn create_pod<S: Store>(
         dry_run: create_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    // Re-clear status after mutating webhooks: a webhook's JSON patch can reinject a
+    // forged/scalar status the earlier clear_create_status already stripped — matches
+    // upstream ordering (mutating admission runs BEFORE PrepareForCreate's unconditional
+    // status wipe). Without this, the line below indexing obj.body["status"]["qosClass"]
+    // would panic on a webhook-reinjected scalar status.
+    super::generic::clear_create_status(true, "v1", "Pod", &mut obj.body)?;
     // Re-apply spec/container defaults (terminationMessagePolicy etc.) after mutating
     // webhooks run, so a container a webhook injects via JSON patch is defaulted too.
     // apply_pod_create_defaults (above, before the webhook chain) only ever saw the
     // client-supplied containers; a webhook can add new ones the first pass never
     // touched. Real kube-apiserver re-runs defaulting after each mutating-webhook
     // round; this single re-apply is the MVP form of that. Idempotent —
-    // apply_pod_spec_defaults only fills absent/empty fields, so containers already
-    // defaulted above are unchanged. Must run before validation so validating
-    // webhooks see the fully-defaulted object, matching upstream ordering.
-    apply_pod_spec_defaults(&mut obj.body);
+    // apply_pod_create_defaults only fills absent/empty fields, so containers/status
+    // already defaulted above are unchanged. Must run before validation so validating
+    // webhooks see the fully-defaulted object, matching upstream ordering. Using the
+    // full apply_pod_create_defaults (not just apply_pod_spec_defaults) also
+    // re-establishes status.phase/conditions the clear_create_status call just wiped.
+    apply_pod_create_defaults(&mut obj.body);
     validate_pod_sysctls(&obj.body).map_err(Status::unprocessable_entity)?;
     super::defaults::validate_pod_certificate_projections(&obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -3420,12 +3434,14 @@ pub(crate) fn apply_status_patch(
     // patch value). That corrupts the object's schema and panics any LATER call that
     // stamps status fields in place via `["status"]["field"] = ...` on this same stored
     // object (e.g. `apply_resize_patch`'s resize stamp), crashing the apiserver on the next
-    // resize/delete of this pod. Reject before it's ever written to the store.
-    crate::handlers::status::reject_non_object_status(&result["status"])?;
-    // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
-    // on a wrong-typed enumerated field, e.g. `status.phase: 5`), same 422 code. Pod is
-    // always registered in status_dispatch. `null` already passed the check above and is
-    // skipped here — the codec has no null case to decode into.
+    // resize/delete of this pod.
+    //
+    // Pod is unconditionally registered in status_dispatch, so the typed decode below (also
+    // 422, and stronger — it fails on a wrong-typed enumerated field like `status.phase: 5`
+    // too) is the only guard ever reached here; a separate `reject_non_object_status` call
+    // would be dead weight, same as the 4 generic status handlers already retired it for.
+    // `null` is skipped — RFC 7396 field deletion is legal regardless of typed shape, and the
+    // codec has no null case to decode into.
     if !result["status"].is_null() {
         crate::status_dispatch::decode_status_patch("v1", "Pod", &result["status"])
             .expect("Pod is always registered in status_dispatch")?;
@@ -10681,6 +10697,98 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// A client POSTing a scalar `status` on Pod create must be rejected (400), not silently
+    /// coerced to `{}`: before this fix, `apply_pod_create_defaults`'s own `is_object()` check
+    /// would have coerced it — the same lenient-coercion class Q1 ruled out for PUT/PATCH,
+    /// now closed for CREATE too via the same typed-decode convergence point.
+    #[tokio::test]
+    async fn create_pod_rejects_scalar_status_preventing_lenient_coercion() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "evil-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": "oops"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "CREATE with a scalar status is a whole-body typed-decode failure (400)"
+        );
+        assert!(
+            store
+                .get("/registry/pods/default/evil-pod")
+                .await
+                .unwrap()
+                .is_none(),
+            "the rejected create must not have persisted anything"
+        );
+    }
+
+    /// A client POSTing a validly-shaped but forged `status.phase` on Pod create must not have
+    /// it trusted: upstream unconditionally zeroes Pod status on create (same as every other
+    /// status-subresource strategy), so `apply_pod_create_defaults`'s own Pending/PodScheduled
+    /// stamping runs on the now-empty status exactly as it does when status is absent — a
+    /// client claiming Running with no scheduler/kubelet involvement would desync every
+    /// consumer of pod readiness.
+    #[tokio::test]
+    async fn create_pod_discards_forged_status_phase_on_create() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "forged-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": { "phase": "Running" }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/forged-pod")
+            .await
+            .unwrap()
+            .expect("pod must have been created");
+        let stored_val: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_val["status"]["phase"], "Pending",
+            "a client claiming Running on create must not be trusted — the scheduler/kubelet, \
+             not the client, own status.phase"
+        );
     }
 
     fn node_user(node_name: &str) -> axum::Extension<crate::auth::UserInfo> {
