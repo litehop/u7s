@@ -72,7 +72,7 @@ fn status_codecs() -> &'static HashMap<(&'static str, &'static str), StatusCodec
         );
         m.insert(("v1", "ResourceQuota"), codec::<ResourceQuotaStatus>);
         m.insert(("v1", "Pod"), codec::<PodStatus>);
-        // Phase 3 (m10di) — the remaining built-in status kinds, grouped by resource family.
+        // The remaining built-in status kinds, grouped by resource family.
         // apps/v1
         m.insert(("apps/v1", "Deployment"), codec::<DeploymentStatus>);
         m.insert(("apps/v1", "ReplicaSet"), codec::<ReplicaSetStatus>);
@@ -317,7 +317,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Phase 3 (m10di) — the ~20 remaining built-in status kinds. Each test below
+    // The remaining built-in status kinds. Each test below
     // round-trips a real-shaped status payload for every kind in a resource family and
     // asserts (a) every enumerated field decodes and re-encodes losslessly, and (b) at
     // least one field NOT enumerated on the struct survives verbatim via `rest` — a
@@ -328,7 +328,7 @@ mod tests {
     /// condition shape (`WorkloadCondition`), so each gets its own `someFutureField`-style
     /// unknown-field check to prove `rest` catches it independently of the others.
     #[test]
-    fn phase3_apps_v1_workload_statuses_round_trip_and_preserve_unknown_fields() {
+    fn apps_v1_workload_statuses_round_trip_and_preserve_unknown_fields() {
         let deploy = json!({
             "observedGeneration": 2,
             "replicas": 3,
@@ -403,7 +403,7 @@ mod tests {
     /// must resolve independently, proving the composite (apiVersion, kind) key does its
     /// job for a REAL kind, not just the synthetic `SameKindDifferentVersion` test pair.
     #[test]
-    fn phase3_hpa_v1_and_v2_are_distinct_gvk_entries() {
+    fn hpa_v1_and_v2_are_distinct_gvk_entries() {
         let v1 = json!({
             "observedGeneration": 1, "lastScaleTime": "2026-01-01T00:00:00Z",
             "currentReplicas": 2, "desiredReplicas": 3,
@@ -436,15 +436,34 @@ mod tests {
         );
         assert_eq!(decoded["someFutureField"], "hpa-v2-x");
 
-        // v1 and v2 must not cross-contaminate: a v1 payload has no `conditions`, so
-        // decoding it through v1's codec must not spuriously invent one, and v2's codec
-        // must still be independently reachable after v1's lookup above.
-        assert!(decoded.get("currentCPUUtilizationPercentage").is_none());
+        // `currentMetrics` alone doesn't prove the two codecs are distinct: it isn't
+        // enumerated on EITHER struct, so it round-trips via `rest` identically no matter
+        // which codec decodes it. A malformed `currentCPUUtilizationPercentage` (v1's own
+        // enumerated int field) does discriminate: v1's codec must reject the wrong type,
+        // while v2 — which doesn't enumerate this field at all — must pass it through `rest`
+        // untouched. If the composite (apiVersion, kind) key ever collapsed these two
+        // entries onto the same codec, this differential would disappear (either both
+        // reject, or both silently accept).
+        let malformed = json!({"currentCPUUtilizationPercentage": "not-a-number"});
+        assert!(
+            decode_status_put("autoscaling/v1", "HorizontalPodAutoscaler", &malformed)
+                .expect("autoscaling/v1 HorizontalPodAutoscaler is registered")
+                .is_err(),
+            "v1 enumerates currentCPUUtilizationPercentage as an int; a string must fail \
+             v1's typed decode"
+        );
+        assert!(
+            decode_status_put("autoscaling/v2", "HorizontalPodAutoscaler", &malformed)
+                .expect("autoscaling/v2 HorizontalPodAutoscaler is registered")
+                .is_ok(),
+            "v2 does not enumerate currentCPUUtilizationPercentage — it must pass through \
+             v2's rest untouched, proving v2 is not silently reusing v1's codec"
+        );
     }
 
     /// batch/v1: Job, CronJob.
     #[test]
-    fn phase3_batch_v1_statuses_round_trip_and_preserve_unknown_fields() {
+    fn batch_v1_statuses_round_trip_and_preserve_unknown_fields() {
         let job = json!({
             "conditions": [{"type": "Complete", "status": "True", "lastProbeTime": "2026-01-01T00:00:00Z"}],
             "startTime": "2026-01-01T00:00:00Z", "completionTime": "2026-01-01T00:05:00Z",
@@ -482,7 +501,7 @@ mod tests {
 
     /// core/v1: PersistentVolume, PersistentVolumeClaim, ReplicationController, Node.
     #[test]
-    fn phase3_core_v1_statuses_round_trip_and_preserve_unknown_fields() {
+    fn core_v1_statuses_round_trip_and_preserve_unknown_fields() {
         let pv = json!({
             "phase": "Bound", "message": "bound ok", "reason": "",
             "lastPhaseTransitionTime": "2026-01-01T00:00:00Z",
@@ -556,7 +575,7 @@ mod tests {
 
     /// networking.k8s.io/v1 (Ingress, ServiceCIDR) and storage.k8s.io/v1 (VolumeAttachment).
     #[test]
-    fn phase3_networking_and_storage_statuses_round_trip_and_preserve_unknown_fields() {
+    fn networking_and_storage_statuses_round_trip_and_preserve_unknown_fields() {
         let ingress = json!({
             "loadBalancer": {"ingress": [{"ip": "10.0.0.1"}]},
             "someFutureField": "ingress-x"
@@ -603,7 +622,7 @@ mod tests {
 
     /// flowcontrol.apiserver.k8s.io/v1: FlowSchema, PriorityLevelConfiguration.
     #[test]
-    fn phase3_flowcontrol_statuses_round_trip_and_preserve_unknown_fields() {
+    fn flowcontrol_statuses_round_trip_and_preserve_unknown_fields() {
         let flow_schema = json!({
             "conditions": [{"type": "Dangling", "status": "False", "reason": "Bound", "message": "ok"}],
             "someFutureField": "fs-x"
@@ -639,7 +658,7 @@ mod tests {
     /// all — both structs are `rest`-only, so this proves an all-`rest` struct still
     /// round-trips an arbitrary object body rather than rejecting it.
     #[test]
-    fn phase3_admissionregistration_dra_and_certificates_statuses_round_trip() {
+    fn admissionregistration_dra_and_certificates_statuses_round_trip() {
         let vap = json!({
             "observedGeneration": 1,
             "conditions": [{"type": "Ready", "status": "True"}],
@@ -716,12 +735,57 @@ mod tests {
         assert_eq!(decoded["someFutureField"], "pcr-x");
     }
 
-    /// Representative 400 (PUT)/422 (PATCH) scalar-status-rejection sample across three
-    /// different Phase-3 families (apps, core, DRA) — proves the SAME typed-decode
-    /// mechanism `scalar_status_is_rejected_not_defaulted` proved for Namespace also fires
-    /// for the new bulk-registered kinds, not just the table lookup succeeding.
+    /// `ValidatingAdmissionPolicyBindingStatus` and `DeviceClassStatus` are structurally
+    /// identical to `ResourceClaimStatus` (all three are pure `#[serde(flatten)] rest`
+    /// structs, so `bulk_registered_kinds_reject_scalar_status_400_put_422_patch`'s coverage
+    /// of ResourceClaim implies the same codec behavior for these two) — but "implies" is an
+    /// assumption about serde's flatten semantics, not a guarantee that these two SPECIFIC
+    /// (apiVersion, kind) table entries actually reject a scalar. Test each directly so a
+    /// future registration bug (e.g. an entry accidentally pointing at a codec with a
+    /// non-flatten field, or a typo'd GVK key that resolves to `None` and silently skips
+    /// this check) fails here instead of only ever being inferred from a different kind.
     #[test]
-    fn phase3_new_kinds_reject_scalar_status_400_put_422_patch() {
+    fn vapbinding_and_deviceclass_reject_scalar_status_directly() {
+        for (api_version, kind) in [
+            (
+                "admissionregistration.k8s.io/v1",
+                "ValidatingAdmissionPolicyBinding",
+            ),
+            ("resource.k8s.io/v1", "DeviceClass"),
+        ] {
+            let put_err = decode_status_put(api_version, kind, &json!("oops"))
+                .unwrap_or_else(|| panic!("{kind} must be registered"))
+                .expect_err(&format!("a scalar status must not decode for {kind}"));
+            assert_eq!(
+                put_err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "PUT scalar status on {kind} must be 400 (whole-body typed decode failure)"
+            );
+
+            let patch_err = decode_status_patch(api_version, kind, &json!("oops"))
+                .unwrap_or_else(|| panic!("{kind} must be registered"))
+                .expect_err(&format!("a scalar status must not decode for {kind}"));
+            assert_eq!(
+                patch_err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH scalar status on {kind} must stay 422 (post-merge validation failure)"
+            );
+
+            assert!(
+                decode_status_put(api_version, kind, &json!([1, 2, 3]))
+                    .unwrap_or_else(|| panic!("{kind} must be registered"))
+                    .is_err(),
+                "an array status must be rejected the same way a scalar is for {kind}"
+            );
+        }
+    }
+
+    /// Representative 400 (PUT)/422 (PATCH) scalar-status-rejection sample across three
+    /// different bulk-registered families (apps, core, DRA) — proves the SAME typed-decode
+    /// mechanism `scalar_status_is_rejected_not_defaulted` proved for Namespace also fires
+    /// for these kinds, not just the table lookup succeeding.
+    #[test]
+    fn bulk_registered_kinds_reject_scalar_status_400_put_422_patch() {
         for (api_version, kind) in [
             ("apps/v1", "Deployment"),
             ("v1", "Node"),

@@ -902,16 +902,21 @@ pub(crate) async fn patch_namespace_status<S: Store>(
     // merge): guard once here, right before the store write, instead of per-branch — this
     // handler previously guarded neither branch, so a merge-patch or JSON Patch `/status`
     // replace could persist a scalar status and later panic the in-place terminating-stamp.
-    crate::handlers::status::reject_non_object_status(&current.body["status"])?;
-    // Typed dispatch, layered on top of the object-shape check above: stronger (also fails
-    // on a wrong-typed enumerated field, e.g. `status.phase: 5`), same 422 code. `null`
-    // already passed the check above and is skipped here — RFC 7396 field deletion is
-    // legal regardless of typed shape, and the codec has no null case to decode into.
+    // `null` bypasses the check (RFC 7396 field deletion is legal regardless of typed shape,
+    // and the codec has no null case to decode into). Namespace is unconditionally
+    // registered in status_dispatch, so `decode_status_patch` never actually misses here —
+    // it also fails on a wrong-typed enumerated field (e.g. `status.phase: 5`), which a bare
+    // object-shape check can't see.
     if !current.body["status"].is_null() {
-        if let Some(result) =
-            crate::status_dispatch::decode_status_patch("v1", "Namespace", &current.body["status"])
-        {
-            result?;
+        match crate::status_dispatch::decode_status_patch(
+            "v1",
+            "Namespace",
+            &current.body["status"],
+        ) {
+            Some(result) => {
+                result?;
+            }
+            None => crate::handlers::status::reject_non_object_status(&current.body["status"])?,
         }
     }
 
