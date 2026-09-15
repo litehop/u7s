@@ -2674,9 +2674,13 @@ mod field_selector_tests {
     }
 
     /// spec.nodeName holding a non-string JSON value (malformed stored data) must be
-    /// treated the same as absent, matching the typed decode this replaced. If a borrowed
-    /// read ever coerced the value to a string instead of requiring one, a malformed pod
-    /// could match every nodeName selector value and get delivered to the wrong kubelet.
+    /// treated the same as absent, matching the typed decode this replaced. The selector
+    /// value here ("1") equals the *stringified* form of the stored value (the number 1),
+    /// so a naive read that coerced nodeName via to_string() instead of requiring a real
+    /// string would match here — proving this test actually distinguishes "requires a
+    /// string" from "stringifies whatever is stored". Without that distinction, a
+    /// malformed pod could match a nodeName selector and get delivered to the wrong
+    /// kubelet.
     #[test]
     fn eq_filter_treats_non_string_node_name_as_absent() {
         let pod = serde_json::json!({
@@ -2685,10 +2689,11 @@ mod field_selector_tests {
             "metadata": {"name": "p", "namespace": "default"},
             "spec": {"nodeName": 1}
         });
-        let result = filter_pods_by_field_selector(vec![pod], "spec.nodeName=worker-1");
+        let result = filter_pods_by_field_selector(vec![pod], "spec.nodeName=1");
         assert!(
             result.is_empty(),
-            "a pod with a malformed (non-string) nodeName must not match any nodeName selector"
+            "a pod with a malformed (non-string) nodeName must not match a selector \
+             value equal to its stringified form"
         );
     }
 
