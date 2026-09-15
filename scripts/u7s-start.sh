@@ -155,6 +155,13 @@ if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
       nc -z "$HOST_IP" "$PORT" 2>/dev/null || break
       sleep 1
     done
+    # Same defect class as the konnectivity-server restart below: nc -z
+    # alone cannot tell "our own kill target finally exited" from "a
+    # foreign process squatting this port that our kill never touched" --
+    # without this hard-fail, the script fell through and launched a new
+    # apiserver anyway, and the health-loop below could then mistake the
+    # foreign listener for our own freshly started one.
+    check_port_free "$PORT" "apiserver"
   else
     echo "If u7s is already running, set KUBECONFIG=$WORKDIR/kubeconfig and use it." >&2
     echo "To start fresh: scripts/u7s-start.sh --reset  (rotates CA, re-join kubelet needed)" >&2
@@ -355,7 +362,13 @@ fi
 
 echo "Waiting for server to accept connections ..."
 for i in $(seq 1 10); do
-  if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
+  # A bare nc -z can't tell "our own SERVER_PID just bound the port" from "a
+  # foreign process already occupies it" (e.g. our own bind lost a race
+  # against a squatter and SERVER_PID already died) -- confirm the actual
+  # listener is ours before declaring the apiserver up, the same defect
+  # class the konnectivity-server checks above hard-fail on.
+  LISTEN_PID=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1) || true
+  if [ -n "$LISTEN_PID" ] && [ "$LISTEN_PID" = "$SERVER_PID" ]; then
     break
   fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -370,7 +383,13 @@ for i in $(seq 1 10); do
   sleep 1
 done
 
-if ! nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
+LISTEN_PID=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1) || true
+if [ -n "$LISTEN_PID" ] && [ "$LISTEN_PID" != "$SERVER_PID" ]; then
+  echo "error: port $HOST_IP:$PORT is held by pid $LISTEN_PID, not our own apiserver (pid $SERVER_PID) — a foreign process squatted this port. See ai/prompts/vm-operations.md for the per-worker port-assignment scheme." >&2
+  kill "$SERVER_PID" 2>/dev/null || true
+  exit 1
+fi
+if [ "$LISTEN_PID" != "$SERVER_PID" ]; then
   if [ "$BACKGROUND" -eq 1 ]; then
     echo "error: server did not open port $HOST_IP:$PORT within 10s — see $LOG" >&2
     tail -20 "$LOG" >&2

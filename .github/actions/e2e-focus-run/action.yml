@@ -105,12 +105,22 @@ runs:
         version: ${{ inputs.k8s_version }}
 
     - name: Configure and start cri-o
-      # Always runs regardless of cache hit/miss -- CNI conflist and the
-      # systemd unit aren't part of what gets cached above.
+      # Always runs regardless of cache hit/miss. The cri-o package ships a
+      # default 10-crio-bridge.conf(list) that gives this node its own
+      # independent, uncoordinated bridge with no CNI conflist Flannel's own
+      # DaemonSet installs (10-flannel.conflist) once it lands further below
+      # -- must be disabled up front, since CRI-O picks whichever conflist
+      # sorts first alphabetically in this directory and "10-crio-bridge"
+      # would otherwise keep winning over "10-flannel" forever. Mirrors
+      # scripts/install.sh:692-696 / lima-start.sh's matching disable step.
       shell: bash
       run: |
         sudo mkdir -p /etc/cni/net.d
-        sudo cp .github/workflows/e2e-focus-resources/cni-bridge.conflist /etc/cni/net.d/10-bridge.conflist
+        for f in 10-crio-bridge.conf 10-crio-bridge.conflist; do
+          if [ -f "/etc/cni/net.d/$f" ]; then
+            sudo mv "/etc/cni/net.d/$f" "/etc/cni/net.d/$f.disabled"
+          fi
+        done
         sudo systemctl enable --now crio
 
     - name: Install containernetworking-plugins
@@ -193,10 +203,10 @@ runs:
         # scripts/install.sh (the production release-tarball path), this workflow
         # never staged anything there, so CoreDNS silently stopped being applied
         # and sonobuoy's preflight failed with "no dns pods found" (run 32922063667).
-        # Stage just the one vendored manifest this single-node runner needs;
-        # flannel.yaml/kube-proxy.yaml carry install.sh-only substitution
-        # placeholders and are irrelevant here (kube-proxy runs as its own binary
-        # below, no CNI needed for loopback networking).
+        # Stage just the one vendored manifest this single-node runner needs
+        # in --manifest-dir; kube-proxy runs as its own binary below (not via
+        # a manifest), and Flannel is applied via a separate kubectl apply
+        # step further down once the node has registered, not staged here.
         mkdir -p "$WORKDIR/manifests"
         cp manifests/coredns.yaml "$WORKDIR/manifests/"
         # No --konnectivity-proxy-addr: apiserver and kubelet are co-located on
@@ -307,6 +317,25 @@ runs:
         fi
         echo "Node registered:"
         kubectl get nodes
+
+    - name: Apply flannel CNI
+      # Renders manifests/flannel.yaml the same way scripts/install.sh
+      # (919-932) and scripts/conformance/lima-start.sh (949-959) do --
+      # __IFACE__ substituted with this runner's primary NIC, __POD_CLUSTER_CIDR__
+      # matching kube-controller-manager's node-ipam-controller default
+      # elsewhere in this repo. node-ipam-controller is excluded from this
+      # workflow's --controllers set below, so flanneld's --kube-subnet-mgr
+      # self-allocates ci-node's subnet directly instead of waiting on a
+      # spec.podCIDR that would otherwise never get assigned.
+      env:
+        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+      shell: bash
+      run: |
+        FLANNEL_RENDERED="$(mktemp)"
+        sed -e "s/__IFACE__/eth0/g" -e "s#__POD_CLUSTER_CIDR__#10.244.0.0/16#g" \
+          manifests/flannel.yaml > "$FLANNEL_RENDERED"
+        kubectl apply --validate=false -f "$FLANNEL_RENDERED"
+        rm -f "$FLANNEL_RENDERED"
 
     - name: Assert kubelet not crash-looping
       # Checks every second instead of one sleep-then-check: an immediate
