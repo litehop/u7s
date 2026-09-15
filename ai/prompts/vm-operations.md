@@ -386,9 +386,10 @@ Two places only, in this order:
    names the file+line, e.g. `k8s.io/kubernetes/test/e2e/node/pods.go:530` →
    `gh api -H "Accept: application/vnd.github.raw" "/repos/kubernetes/kubernetes/contents/test/e2e/node/pods.go?ref=release-1.36"`
    (pin the branch to `release-1.36` per the version rule above). Fetch the
-   whole file in that one call, then use local `Grep`/`Read` for anything else
-   you need from it — don't re-fetch per symbol. Read the function around the
-   cited line to get the exact create→update→assert sequence.
+   whole file in that one call, then use shell `grep` (via Bash) / `Read` for
+   anything else you need from it — don't re-fetch per symbol. Read the
+   function around the cited line to get the exact create→update→assert
+   sequence.
 
 Never reconstruct the test from the failure message alone — the assertion text
 (`Expected 2 to be equivalent to 1`) is meaningless without the surrounding

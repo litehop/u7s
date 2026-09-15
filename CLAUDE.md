@@ -69,8 +69,9 @@ to surfacing uncertainty rather than papering over it.
 ### Rule 13 — Prefer Native Tooling
 Use Bash and Rust over Python. Do not introduce Python scripts or Python
 dependencies. For file I/O: Read over cat/head/tail; Edit over sed/awk;
-Write over echo>/heredoc; Grep over shell grep/find. Bash is for runtime
-commands only: git, cargo, gh, kubectl, bd.
+Write over echo>/heredoc. The Grep/Glob tools do not exist in this harness —
+search file contents and find files with `grep`/`find`/`rg` via Bash. Bash
+is for runtime commands: git, cargo, gh, kubectl, bd, grep, find, rg.
 
 ### Rule 14 — Every Bug Fix Ships with a Regression Test
 Gate: can this test fail if the fix is reverted? If not, it is not a
