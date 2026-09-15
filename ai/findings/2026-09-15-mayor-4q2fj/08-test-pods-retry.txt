@@ -1,3 +1,0 @@
-NAME             READY   STATUS    RESTARTS   AGE   IP            NODE          NOMINATED NODE   READINESS GATES
-flannel-test-a   1/1     Running   0          20s   10.244.0.16   lima-node-2   <none>           <none>
-flannel-test-b   1/1     Running   0          20s   10.244.1.8    lima-node-3   <none>           <none>

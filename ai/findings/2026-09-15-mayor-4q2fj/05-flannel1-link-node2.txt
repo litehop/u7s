@@ -1,3 +1,0 @@
-16: flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UNKNOWN mode DEFAULT group default 
-    link/ether f6:4b:e0:e8:1c:3d brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 65535 
-    vxlan id 1 local 192.168.108.4 dev eth0 srcport 0 0 dstport 8472 ttl auto ageing 300 reserved_bits 0xf7ffffff000000ff nolearning addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 

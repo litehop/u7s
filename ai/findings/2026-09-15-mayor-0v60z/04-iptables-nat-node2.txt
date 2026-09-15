@@ -1,0 +1,96 @@
+Chain PREROUTING (policy ACCEPT 360 packets, 44845 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+ 2609  270K KUBE-SERVICES  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kubernetes service portals */
+  360 44845 LIMADNS    all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain OUTPUT (policy ACCEPT 1042 packets, 106K bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+  929 97591 KUBE-SERVICES  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kubernetes service portals */
+ 1042  106K LIMADNS    all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain POSTROUTING (policy ACCEPT 3298 packets, 337K bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+ 3338  339K KUBE-POSTROUTING  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kubernetes postrouting rules */
+ 3185  328K FLANNEL-POSTRTG  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* flanneld masq */
+
+Chain FLANNEL-POSTRTG (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 RETURN     all  --  *      *       0.0.0.0/0            0.0.0.0/0            mark match 0x4000/0x4000 /* flanneld masq */
+ 2433  236K RETURN     all  --  *      *       10.244.0.0/24        10.244.0.0/16        /* flanneld masq */
+  155 15592 RETURN     all  --  *      *       10.244.0.0/16        10.244.0.0/24        /* flanneld masq */
+    0     0 RETURN     all  --  *      *      !10.244.0.0/16        10.244.0.0/24        /* flanneld masq */
+   28  1680 MASQUERADE  all  --  *      *       10.244.0.0/16       !224.0.0.0/4          /* flanneld masq */ random-fully
+    0     0 MASQUERADE  all  --  *      *      !10.244.0.0/16        10.244.0.0/16        /* flanneld masq */ random-fully
+
+Chain KUBE-KUBELET-CANARY (0 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain KUBE-MARK-MASQ (8 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 MARK       all  --  *      *       0.0.0.0/0            0.0.0.0/0            MARK or 0x4000
+
+Chain KUBE-NODEPORTS (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain KUBE-POSTROUTING (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+  725 91660 RETURN     all  --  *      *       0.0.0.0/0            0.0.0.0/0            mark match ! 0x4000/0x4000
+    0     0 MARK       all  --  *      *       0.0.0.0/0            0.0.0.0/0            MARK xor 0x4000
+    0     0 MASQUERADE  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kubernetes service traffic requiring SNAT */ random-fully
+
+Chain KUBE-PROXY-CANARY (0 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain KUBE-SEP-67UGAIEPRTZXQD7U (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 KUBE-MARK-MASQ  all  --  *      *       10.244.0.2           0.0.0.0/0            /* kube-system/metrics-server:https */
+   50  3000 DNAT       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/metrics-server:https */ tcp to:10.244.0.2:10250
+
+Chain KUBE-SEP-M37FKVHRSY4O4EXR (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 KUBE-MARK-MASQ  all  --  *      *       192.168.108.2        0.0.0.0/0            /* default/kubernetes:https */
+    0     0 DNAT       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* default/kubernetes:https */ tcp to:192.168.108.2:6444
+
+Chain KUBE-SEP-SF3LG62VAE5ALYDV (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 KUBE-MARK-MASQ  all  --  *      *       10.244.0.4           0.0.0.0/0            /* kube-system/kube-dns:dns-tcp */
+    0     0 DNAT       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/kube-dns:dns-tcp */ tcp to:10.244.0.4:53
+
+Chain KUBE-SEP-WXWGHGKZOCNYRYI7 (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 KUBE-MARK-MASQ  all  --  *      *       10.244.0.4           0.0.0.0/0            /* kube-system/kube-dns:dns */
+  288 31008 DNAT       udp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/kube-dns:dns */ udp to:10.244.0.4:53
+
+Chain KUBE-SERVICES (2 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 KUBE-SVC-NPX46M4PTMTKRN6Y  tcp  --  *      *       0.0.0.0/0            10.96.0.1            /* default/kubernetes:https cluster IP */ tcp dpt:443
+  288 31008 KUBE-SVC-TCOU7JCQXEZGVUNU  udp  --  *      *       0.0.0.0/0            10.96.0.10           /* kube-system/kube-dns:dns cluster IP */ udp dpt:53
+    0     0 KUBE-SVC-ERIFXISQEP7F7OF4  tcp  --  *      *       0.0.0.0/0            10.96.0.10           /* kube-system/kube-dns:dns-tcp cluster IP */ tcp dpt:53
+   50  3000 KUBE-SVC-Z4ANX4WAEWEBLCTM  tcp  --  *      *       0.0.0.0/0            10.96.0.11           /* kube-system/metrics-server:https cluster IP */ tcp dpt:443
+  192 26520 KUBE-NODEPORTS  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kubernetes service nodeports; NOTE: this must be the last rule in this chain */ ADDRTYPE match dst-type LOCAL
+
+Chain KUBE-SVC-ERIFXISQEP7F7OF4 (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 KUBE-MARK-MASQ  tcp  --  *      *      !10.244.0.0/16        10.96.0.10           /* kube-system/kube-dns:dns-tcp cluster IP */ tcp dpt:53
+    0     0 KUBE-SEP-SF3LG62VAE5ALYDV  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/kube-dns:dns-tcp -> 10.244.0.4:53 */
+
+Chain KUBE-SVC-NPX46M4PTMTKRN6Y (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 KUBE-MARK-MASQ  tcp  --  *      *      !10.244.0.0/16        10.96.0.1            /* default/kubernetes:https cluster IP */ tcp dpt:443
+    0     0 KUBE-SEP-M37FKVHRSY4O4EXR  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* default/kubernetes:https -> 192.168.108.2:6444 */
+
+Chain KUBE-SVC-TCOU7JCQXEZGVUNU (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 KUBE-MARK-MASQ  udp  --  *      *      !10.244.0.0/16        10.96.0.10           /* kube-system/kube-dns:dns cluster IP */ udp dpt:53
+  288 31008 KUBE-SEP-WXWGHGKZOCNYRYI7  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/kube-dns:dns -> 10.244.0.4:53 */
+
+Chain KUBE-SVC-Z4ANX4WAEWEBLCTM (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 KUBE-MARK-MASQ  tcp  --  *      *      !10.244.0.0/16        10.96.0.11           /* kube-system/metrics-server:https cluster IP */ tcp dpt:443
+   50  3000 KUBE-SEP-67UGAIEPRTZXQD7U  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/metrics-server:https -> 10.244.0.2:10250 */
+
+Chain LIMADNS (2 references)
+ pkts bytes target     prot opt in     out     source               destination         

@@ -1,2 +1,2 @@
 NAME              DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
-kube-flannel-ds   2         2         2       2            2           <none>          4m
+kube-flannel-ds   2         2         2       2            2           <none>          17m
