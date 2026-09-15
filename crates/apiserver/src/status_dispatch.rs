@@ -29,10 +29,10 @@ use crate::types::{
     ApiServiceStatus, CertificateSigningRequestStatus, CronJobStatus, DaemonSetStatus,
     DeploymentStatus, DeviceClassStatus, FlowSchemaStatus, HorizontalPodAutoscalerStatusV1,
     HorizontalPodAutoscalerStatusV2, IngressStatus, JobStatus, NamespaceStatus, NodeStatus,
-    PersistentVolumeClaimStatus, PersistentVolumeStatus, PodCertificateRequestStatus, PodStatus,
-    PriorityLevelConfigurationStatus, ReplicaSetStatus, ReplicationControllerStatus,
-    ResourceClaimStatus, ResourceQuotaStatus, ServiceCidrStatus, StatefulSetStatus,
-    ValidatingAdmissionPolicyBindingStatus, ValidatingAdmissionPolicyStatus,
+    PersistentVolumeClaimStatus, PersistentVolumeStatus, PodCertificateRequestStatus,
+    PodDisruptionBudgetStatus, PodStatus, PriorityLevelConfigurationStatus, ReplicaSetStatus,
+    ReplicationControllerStatus, ResourceClaimStatus, ResourceQuotaStatus, ServiceCidrStatus,
+    StatefulSetStatus, ValidatingAdmissionPolicyBindingStatus, ValidatingAdmissionPolicyStatus,
     VolumeAttachmentStatus,
 };
 use serde_json::Value;
@@ -153,6 +153,11 @@ fn status_codecs() -> &'static HashMap<(&'static str, &'static str), StatusCodec
         m.insert(
             ("certificates.k8s.io/v1beta1", "PodCertificateRequest"),
             codec::<PodCertificateRequestStatus>,
+        );
+        // policy/v1
+        m.insert(
+            ("policy/v1", "PodDisruptionBudget"),
+            codec::<PodDisruptionBudgetStatus>,
         );
         // Test-only: none of the real Phase-1 kinds above collide on `kind` today, so this
         // synthetic pair is what makes `composite_key_keeps_both_api_versions_resolvable`
@@ -809,5 +814,74 @@ mod tests {
                 "PATCH scalar status on {kind} must stay 422 (post-merge validation failure)"
             );
         }
+    }
+
+    /// Fail-on-revert regression for the eviction-path DoS this registration closes:
+    /// `pods.rs`'s `decrement_pdb_disruptions_allowed` writes
+    /// `status.disruptionsAllowed`/`status.disruptedPods` via `serde_json::Value` `IndexMut`,
+    /// which panics if `status` is anything but an object or `Value::Null` (indexing a
+    /// scalar/array with a string key hits `serde_json`'s `panic!("cannot access key ...")`
+    /// branch). Before PDB was registered here, nothing stopped a client-forged scalar/array
+    /// `status` from being persisted, so the next eviction against that PDB would crash the
+    /// apiserver. Reverting PDB's table entry makes `decode_status_put`/`decode_status_patch`
+    /// return `None` here, failing this test.
+    #[test]
+    fn poddisruptionbudget_status_rejects_scalar_and_array_status_preventing_eviction_panic() {
+        let put_err = decode_status_put("policy/v1", "PodDisruptionBudget", &json!("oops"))
+            .expect("PodDisruptionBudget must be registered")
+            .expect_err("a scalar status must not decode into a default PodDisruptionBudgetStatus");
+        assert_eq!(
+            put_err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "PUT scalar status on PodDisruptionBudget must be 400 (whole-body typed decode failure)"
+        );
+
+        let patch_err = decode_status_patch("policy/v1", "PodDisruptionBudget", &json!("oops"))
+            .expect("PodDisruptionBudget must be registered")
+            .expect_err("a scalar status must not decode into a default PodDisruptionBudgetStatus");
+        assert_eq!(
+            patch_err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "PATCH scalar status on PodDisruptionBudget must stay 422 (post-merge validation failure)"
+        );
+
+        assert!(
+            decode_status_put("policy/v1", "PodDisruptionBudget", &json!([1, 2, 3]))
+                .expect("PodDisruptionBudget must be registered")
+                .is_err(),
+            "an array status must be rejected the same way a scalar is — decrement_pdb_disruptions_allowed \
+             would panic on either shape"
+        );
+    }
+
+    /// Round-trip: every enumerated `PodDisruptionBudgetStatus` field decodes and re-encodes
+    /// losslessly, including `disruptedPods` (a `map<string, meta.v1.Time>` upstream, so its
+    /// values are plain RFC3339 strings, not nested objects) — the exact field
+    /// `decrement_pdb_disruptions_allowed` writes on every successful eviction. An unenumerated
+    /// field must still survive via `rest`.
+    #[test]
+    fn poddisruptionbudget_status_round_trips_and_preserves_unknown_field() {
+        let pdb = json!({
+            "observedGeneration": 3,
+            "disruptedPods": {"web-0": "2026-01-01T00:00:00Z"},
+            "disruptionsAllowed": 1,
+            "currentHealthy": 2,
+            "desiredHealthy": 2,
+            "expectedPods": 3,
+            "conditions": [{"type": "DisruptionAllowed", "status": "True", "reason": "SufficientPods"}],
+            "someFutureField": "pdb-x"
+        });
+        let decoded = decode_status_put("policy/v1", "PodDisruptionBudget", &pdb)
+            .expect("PodDisruptionBudget must be registered")
+            .expect("valid status must decode");
+        assert_eq!(decoded["disruptionsAllowed"], 1);
+        assert_eq!(
+            decoded["disruptedPods"]["web-0"], "2026-01-01T00:00:00Z",
+            "disruptedPods is the map decrement_pdb_disruptions_allowed writes on every \
+             eviction — its string-valued Time entries must round-trip, not be dropped or \
+             coerced into a nested object"
+        );
+        assert_eq!(decoded["conditions"][0]["reason"], "SufficientPods");
+        assert_eq!(decoded["someFutureField"], "pdb-x");
     }
 }
