@@ -469,6 +469,20 @@ pub(crate) async fn replace_namespace<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, stored_obj.as_ref(), &admission_ctx).await?;
+
+    // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
+    // forged/scalar status the earlier restore already discarded, and this is the last point
+    // before persistence that can discard it again. Mirrors do_patch's (resource.rs) identical
+    // post-webhook re-restore on its generic PATCH/PUT-onto-live-object path.
+    match stored_status {
+        Some(ref s) if !s.is_null() => {
+            obj.body["status"] = s.clone();
+        }
+        _ => {
+            obj.body.as_object_mut().map(|m| m.remove("status"));
+        }
+    }
+
     run_validating_webhooks(&state, &obj.body, stored_obj.as_ref(), &admission_ctx).await?;
 
     // Post-replace: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
@@ -609,7 +623,7 @@ pub(crate) async fn patch_namespace<S: Store>(
     if stored_status.is_null() {
         current.body.as_object_mut().map(|m| m.remove("status"));
     } else {
-        current.body["status"] = stored_status;
+        current.body["status"] = stored_status.clone();
     }
 
     // Admission webhook pipeline (mutating then validating), threading the pre-patch stored
@@ -633,6 +647,17 @@ pub(crate) async fn patch_namespace<S: Store>(
     };
     current.body =
         run_mutating_webhooks(&state, current.body, Some(&pre_patch_obj), &admission_ctx).await?;
+
+    // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
+    // forged/scalar status the earlier restore already discarded, and this is the last point
+    // before persistence that can discard it again. Mirrors do_patch's (resource.rs) identical
+    // post-webhook re-restore on its generic PATCH/PUT-onto-live-object path.
+    if stored_status.is_null() {
+        current.body.as_object_mut().map(|m| m.remove("status"));
+    } else {
+        current.body["status"] = stored_status;
+    }
+
     run_validating_webhooks(&state, &current.body, Some(&pre_patch_obj), &admission_ctx).await?;
 
     // Post-patch: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
