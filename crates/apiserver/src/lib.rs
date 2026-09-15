@@ -3464,6 +3464,15 @@ pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) -> bool {
 /// only when `status.used` differs from the live count. Uses optimistic concurrency
 /// (`Some(revision)`) so a concurrent write wins and the next reconcile cycle corrects it.
 ///
+/// No longer coerces a non-object `status` back to `{}` before indexing it: that guard
+/// existed because CREATE (`create_namespaced_resource`) persisted a client-supplied `status`
+/// verbatim, including a scalar/array, with no typed check — the only write path that could
+/// leave a non-object `status` here. CREATE now funnels through the same typed-decode
+/// convergence point PUT/PATCH already use (`status_dispatch`, via `clear_create_status`), so
+/// a scalar/array status can no longer reach the store through any client-facing write path;
+/// see `create_namespaced_resource_rejects_scalar_status_on_resourcequota_preventing_stamper_panic`
+/// (resource.rs) for the entry-point-level regression test.
+///
 /// Returns `true` if no storage errors occurred, `false` otherwise.
 pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
     use bytes::Bytes;
@@ -3486,17 +3495,6 @@ pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
             Err(_) => continue,
         };
         let key = item.key.clone();
-
-        // Every /status subresource write for ResourceQuota now funnels through
-        // status_dispatch's typed decode, but plain CREATE on the main resource endpoint
-        // does not — create_resource and create_namespaced_resource persist the client's
-        // body verbatim, including a scalar/array `status`, with no typed check at all.
-        // Indexing that with ["used"] below would panic and crash the apiserver on every
-        // reconcile cycle for every ResourceQuota, not just this one. Coerce back to an
-        // empty object first so this reconciler is panic-safe regardless of what's stored.
-        if !quota["status"].is_object() {
-            quota["status"] = serde_json::json!({});
-        }
 
         let live_used = quota::count_quota_usage(store, &quota).await;
 
@@ -11821,70 +11819,6 @@ mod tests {
             Some("1"),
             "status.used.pods must reflect the live pod count — \
              without the reconciler kubectl describe quota shows stale 0"
-        );
-    }
-
-    /// reconcile_quota_status must not panic when a stored ResourceQuota's `status` is a
-    /// scalar (possible via a plain CREATE: create_namespaced_resource persists the
-    /// client's body, including `status`, with no typed check — only the /status
-    /// subresource routes through status_dispatch). Indexing `quota["status"]["used"]` on a
-    /// non-object status panics — crashing the apiserver's background reconciler task on
-    /// every reconcile cycle, not just for the one corrupted quota, since the loop iterates
-    /// every ResourceQuota in the store.
-    #[tokio::test]
-    async fn reconcile_quota_status_does_not_panic_on_scalar_status() {
-        use bytes::Bytes;
-
-        let store = Arc::new(make_store());
-
-        let quota = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ResourceQuota",
-            "metadata": { "name": "corrupt-quota", "namespace": "default" },
-            "spec": { "hard": { "pods": "10" } },
-            "status": "corrupted-scalar-status"
-        });
-        store
-            .put(
-                "/registry/resourcequotas/default/corrupt-quota",
-                Bytes::from(serde_json::to_vec(&quota).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let pod = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "pod-0", "namespace": "default" }
-        });
-        store
-            .put(
-                "/registry/pods/default/pod-0",
-                Bytes::from(serde_json::to_vec(&pod).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let ok = reconcile_quota_status(&store).await;
-        assert!(
-            ok,
-            "reconciler must not panic or error on a scalar status — a corrupted quota \
-             must not take down the whole background reconciler task"
-        );
-
-        let item = store
-            .get("/registry/resourcequotas/default/corrupt-quota")
-            .await
-            .unwrap()
-            .expect("quota must still exist");
-        let updated: serde_json::Value = serde_json::from_slice(&item.value).unwrap();
-        assert_eq!(
-            updated["status"]["used"]["pods"].as_str(),
-            Some("1"),
-            "the scalar status must be coerced to an object so live usage can still be \
-             recorded, not silently dropped"
         );
     }
 

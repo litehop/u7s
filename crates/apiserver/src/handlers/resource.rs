@@ -22,10 +22,11 @@ use crate::{
 
 use super::generic::{
     apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
-    check_crb_escalation, check_rb_escalation, check_role_escalation, decode_continue,
-    generate_suffix, lookup, parse_field_selector, parse_label_selector, resolve_name,
-    stamp_metadata, store_err, validate_name, validate_name_for_group, wants_generate_name,
-    CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
+    check_crb_escalation, check_rb_escalation, check_role_escalation, clear_create_status,
+    decode_continue, generate_suffix, lookup, parse_field_selector, parse_label_selector,
+    resolve_name, stamp_metadata, store_err, validate_name, validate_name_for_group,
+    wants_generate_name, CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS,
+    RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
@@ -499,6 +500,17 @@ pub(crate) async fn create_resource<S: Store>(
     if meta.kind == "VolumeAttributesClass" {
         add_vac_protection_finalizer(&mut obj);
     }
+    let api_version = if group.is_empty() {
+        version.clone()
+    } else {
+        format!("{group}/{version}")
+    };
+    clear_create_status(
+        meta.has_status_subresource,
+        &api_version,
+        &meta.kind,
+        &mut obj.body,
+    )?;
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -1383,6 +1395,21 @@ pub(crate) async fn do_patch<S: Store>(
         obj.body["metadata"] =
             serde_json::to_value(obj_meta).map_err(|e| Status::internal(e.to_string()))?;
         stamp_metadata(&mut obj);
+        // An SSA apply-create is a create just like create_resource/create_namespaced_resource
+        // — without this, `kubectl apply --server-side` on a not-yet-existing built-in with a
+        // status subresource persisted whatever `status` the client's apply manifest carried,
+        // scalar or not, since it never went through either POST create path's guard.
+        let api_version = if group.is_empty() {
+            version.to_string()
+        } else {
+            format!("{group}/{version}")
+        };
+        clear_create_status(
+            meta.has_status_subresource,
+            &api_version,
+            &meta.kind,
+            &mut obj.body,
+        )?;
         super::defaults::apply_defaults(group, plural, &mut obj.body);
         super::defaults::validate_resource(group, plural, &obj.body)
             .map_err(Status::unprocessable_entity)?;
@@ -3054,6 +3081,17 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             .await?;
     }
 
+    let api_version = if group.is_empty() {
+        version.clone()
+    } else {
+        format!("{group}/{version}")
+    };
+    clear_create_status(
+        meta.has_status_subresource,
+        &api_version,
+        &meta.kind,
+        &mut obj.body,
+    )?;
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -6292,6 +6330,70 @@ mod tests {
 
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/lima-node";
         assert!(store.get(key).await.unwrap().is_some());
+    }
+
+    /// apply-patch+yaml SSA-create-on-missing is a third CREATE surface (alongside plain POST
+    /// and create_namespaced_resource) that must not let a client inject a corrupt `status`
+    /// into a not-yet-existing built-in: `do_patch`'s upsert branch writes `obj.body` (the raw
+    /// parsed apply manifest) straight to the store with no `has_status_subresource` handling
+    /// at all before this fix — `kubectl apply --server-side` on a not-yet-existing
+    /// ResourceQuota carrying a scalar `status` would have persisted it verbatim, and the
+    /// background quota reconciler's `["used"]` index into that scalar panics, taking down the
+    /// reconcile task for every ResourceQuota, not just this one.
+    #[tokio::test]
+    async fn apply_patch_yaml_create_on_missing_rejects_scalar_status_preventing_stamper_panic() {
+        let state = crate::handlers::test_support::make_state();
+
+        let patch = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "new-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } },
+            "status": "oops"
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "resourcequotas".to_string(),
+                "new-quota".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a scalar status must fail typed decode on SSA create, not persist"),
+        };
+
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "SSA create-on-missing with a scalar status is a whole-body typed-decode \
+             failure, same code as plain POST create"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/resourcequotas/default/new-quota")
+                .await
+                .unwrap()
+                .is_none(),
+            "the rejected create must not have persisted anything"
+        );
     }
 
     /// A ClusterRoleBinding created via Server-Side-Apply (`kubectl apply --server-side`, and
@@ -15886,6 +15988,166 @@ mod tests {
         );
     }
 
+    /// A client POSTing a scalar `status` on ResourceQuota create must not have it persisted:
+    /// the background quota reconciler (`reconcile_quota_status`) indexes stored `status` as
+    /// `["used"]` — a scalar there panics and crashes the reconcile task for every
+    /// ResourceQuota, not just this one. This is the exact vector #1658's convergence proof
+    /// found: create_namespaced_resource previously wrote the client's body, including
+    /// `status`, with no typed check at all.
+    #[tokio::test]
+    async fn create_namespaced_resource_rejects_scalar_status_on_resourcequota_preventing_stamper_panic(
+    ) {
+        let state = crate::handlers::test_support::make_state();
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "evil-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } },
+            "status": "oops"
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "resourcequotas".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("a scalar status must fail typed decode on create, not be stored verbatim")
+            }
+        };
+
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "CREATE with a scalar status is a whole-body typed-decode failure (400), same \
+             code PUT already uses for the identical malformed shape"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/resourcequotas/default/evil-quota")
+                .await
+                .unwrap()
+                .is_none(),
+            "the rejected create must not have persisted the scalar status anywhere"
+        );
+    }
+
+    /// A client POSTing an array `status` on create (a Deployment, reachable via the generic
+    /// dispatch table's apps/v1 codec) must be rejected the same way a scalar is — both are
+    /// "not an object", the same upstream typed-decode failure, and either would starve any
+    /// controller (e.g. the Deployment controller reading `status.replicas`) that reasons
+    /// about `status` as an object.
+    #[tokio::test]
+    async fn create_namespaced_resource_rejects_array_status_on_deployment_preventing_controller_starvation(
+    ) {
+        let state = crate::handlers::test_support::make_state();
+
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "evil-deploy", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "evil" } },
+                "template": {
+                    "metadata": { "labels": { "app": "evil" } },
+                    "spec": { "containers": [{ "name": "c", "image": "nginx" }] }
+                }
+            },
+            "status": [1, 2, 3]
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "deployments".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("an array status must fail typed decode on create, not be stored verbatim")
+            }
+        };
+
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(state
+            .store
+            .get("/registry/apps/deployments/default/evil-deploy")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A client POSTing a validly-shaped but forged `status` (no scalar/array — just a status
+    /// object the client made up, e.g. claiming quota is already fully consumed) must still not
+    /// have it persisted: upstream's `PrepareForCreate` unconditionally zeroes `Status` on
+    /// create regardless of validity (verified against release-1.36
+    /// `resourcequotaStrategy.PrepareForCreate`), so a forged-but-valid status is exactly as
+    /// discarded as a malformed one — the boundary rejects malformed shapes and discards
+    /// everything else, it never stores what the client sent.
+    #[tokio::test]
+    async fn create_namespaced_resource_discards_forged_object_status_on_resourcequota_create() {
+        let state = crate::handlers::test_support::make_state();
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "forged-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } },
+            "status": { "used": { "pods": "9999" } }
+        });
+
+        create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "resourcequotas".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a validly-shaped status must not be rejected outright: {e:?}"));
+
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/forged-quota")
+            .await
+            .unwrap()
+            .expect("quota must have been created");
+        let stored_val: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_ne!(
+            stored_val["status"]["used"]["pods"], "9999",
+            "the client-forged status.used.pods must not be persisted — a client claiming its \
+             own quota is already exhausted would block every future admission check against it"
+        );
+    }
+
     /// Regression test: patching a ConfigMap must emit a MODIFIED watch event
     /// with the updated data (missing the deleted key).
     ///
@@ -16093,6 +16355,53 @@ mod tests {
             uuid::Uuid::parse_str(uid).is_ok(),
             "metadata.uid must be a valid UUID; got: {uid}"
         );
+    }
+
+    /// A client POSTing an array `status` on a cluster-scoped built-in's create must not have
+    /// it persisted: Node's own status is read by the scheduler (capacity/allocatable) and by
+    /// kubelet's own resync — an array there would panic any of that code the same way a
+    /// scalar would on a namespaced kind (see the ResourceQuota vector above). Proves
+    /// `clear_create_status` is reached from `create_resource` (cluster-scoped), not just
+    /// `create_namespaced_resource`.
+    #[tokio::test]
+    async fn create_resource_rejects_array_status_on_node_preventing_stamper_panic() {
+        let state = make_state();
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "evil-node" },
+            "status": [1, 2, 3]
+        });
+
+        let result = create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("".to_string(), "v1".to_string(), "nodes".to_string())),
+            axum::extract::Query(CreateQuery::default()),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+                extra: Default::default(),
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("an array status must fail typed decode on create, not be stored verbatim")
+            }
+        };
+
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(state
+            .store
+            .get("/registry/nodes/evil-node")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// Every VolumeAttributesClass must carry `kubernetes.io/vac-protection` in its
@@ -24766,24 +25075,25 @@ mod tests {
         }
     }
 
-    /// do_patch's SSA-create-race fallback (`is_ssa && stored_opt.is_none()`, then
-    /// `CreateNamespacedError::Store(StoreError::AlreadyExists)`) restores the race
-    /// winner's pre-merge stored status before persisting — the same status-subresource
-    /// guard the main patch loop above already has (see `stored_status`), applied here to
-    /// this separate merge-and-write. Without it, a request that loses the create race
-    /// still gets its own SSA body's `status` field merged onto the winner's already-
-    /// persisted object, bypassing the fact that `patch statefulsets` and `patch
-    /// statefulsets/status` are separate RBAC grants.
+    /// `clear_create_status` (`do_patch`'s SSA-create branch, before the first `put()`
+    /// attempt) discards whatever `status` the SSA body carried — valid-shaped or not —
+    /// before the create-race fallback (`CreateNamespacedError::Store(StoreError::
+    /// AlreadyExists)`) ever merges it onto the race winner's already-persisted object.
+    /// Without that, a request that loses the create race would still get its own SSA
+    /// body's `status` field merged onto the winner's object, bypassing the fact that
+    /// `patch statefulsets` and `patch statefulsets/status` are separate RBAC grants.
     ///
     /// This test forces the race deterministically — a mock store injects the winner's
     /// object on the very first `put()`, simulating a second writer that beat this
-    /// request to the create — instead of relying on `tokio::join!` timing, and the
-    /// losing request's body carries a bare scalar for `status` (not an object), so a
-    /// pass here proves the restore is an unconditional overwrite, not merely two objects
-    /// happening to merge cleanly. Fails on revert: without the restore line, the scalar
-    /// this request's own body carried ends up persisted in place of the winner's status.
+    /// request to the create — instead of relying on `tokio::join!` timing. The losing
+    /// request's body carries a validly-shaped (not scalar — that case 400s earlier, before
+    /// the race is ever reached, see `apply_patch_yaml_create_on_missing_rejects_scalar_status_preventing_stamper_panic`)
+    /// but forged `status`, so a pass here proves the discard survives even a status that
+    /// would otherwise decode cleanly. Fails on revert: without `clear_create_status`
+    /// stripping status up front, the forged replica counts this request's own body
+    /// carried end up merged onto the winner's status.
     #[tokio::test]
-    async fn ssa_create_race_fallback_restores_stored_status_over_scalar_body_status() {
+    async fn ssa_create_race_fallback_discards_forged_body_status() {
         use axum::response::IntoResponse;
         use std::sync::Arc;
         use u7s_store::SqliteStore;
@@ -24820,9 +25130,10 @@ mod tests {
         );
 
         // This request loses the create race (the mock injects the winner first) and
-        // lands in the AlreadyExists merge branch. Its "status" is a bare scalar: if the
-        // restore below the merge didn't run, strategic_merge_patch would overwrite
-        // current.body["status"] with it verbatim.
+        // lands in the AlreadyExists merge branch. Its "status" is a validly-shaped
+        // StatefulSetStatus (so it survives the earlier typed-decode check) claiming a
+        // replica count the winner never had: if `clear_create_status` didn't strip it
+        // before this branch runs, the merge would overwrite current.body["status"] with it.
         let ssa_body = serde_json::json!({
             "apiVersion": "apps/v1",
             "kind": "StatefulSet",
@@ -24835,7 +25146,7 @@ mod tests {
                     "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
                 }
             },
-            "status": "forged-scalar-status"
+            "status": { "replicas": 999, "readyReplicas": 999 }
         });
 
         let mut ssa_headers = axum::http::HeaderMap::new();

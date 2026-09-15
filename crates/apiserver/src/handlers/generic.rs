@@ -748,6 +748,49 @@ pub(crate) fn stamp_metadata(obj: &mut Object) {
     }
 }
 
+/// Clears a newly-created built-in's client-supplied `status` before it is persisted.
+///
+/// Matches upstream `PrepareForCreate` (verified against release-1.36 source): every
+/// strategy with a status subresource unconditionally zeroes `Status` on create — e.g.
+/// `deploymentStrategy.PrepareForCreate`: `deployment.Status = apps.DeploymentStatus{}`,
+/// `resourcequotaStrategy.PrepareForCreate`: `resourcequota.Status =
+/// api.ResourceQuotaStatus{}` — regardless of what the client sent, valid or not. Before
+/// discarding it, a status that can't decode into its typed shape (scalar/array) is routed
+/// through the SAME typed decode PUT already enforces (`status_dispatch`'s table), matching
+/// upstream's whole-body decode failure (400) instead of silently vanishing along with a
+/// validly-shaped one. This is the check that closes the CREATE gap: without it,
+/// `create_resource`/`create_namespaced_resource`/`create_namespace`/`create_pod` persisted
+/// the client's status verbatim — scalar or not — where an internal stamper/reconciler that
+/// indexes it as an object (e.g. the ResourceQuota reconciler's `["used"]` lookup) would panic.
+///
+/// A dispatch miss (a built-in with a status subresource not yet registered in
+/// `status_dispatch`) still clears status — unlike every other `status_dispatch` call site,
+/// there is no prior CREATE behavior to leave "unchanged": clearing is unconditionally safe
+/// and upstream-correct regardless of whether a typed codec exists to validate the discarded
+/// value first.
+pub(crate) fn clear_create_status(
+    has_status_subresource: bool,
+    api_version: &str,
+    kind: &str,
+    obj_body: &mut serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    if !has_status_subresource {
+        return Ok(());
+    }
+    let incoming_status = &obj_body["status"];
+    if !incoming_status.is_null() {
+        if let Some(result) =
+            crate::status_dispatch::decode_status_put(api_version, kind, incoming_status)
+        {
+            result?;
+        }
+    }
+    if let Some(map) = obj_body.as_object_mut() {
+        map.remove("status");
+    }
+    Ok(())
+}
+
 pub(crate) const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
 const CLUSTER_ROLE_BINDINGS: &str = "clusterrolebindings";
 pub(crate) const CLUSTER_ROLES: &str = "clusterroles";
