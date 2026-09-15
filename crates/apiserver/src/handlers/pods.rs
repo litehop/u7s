@@ -648,16 +648,24 @@ pub(crate) async fn create_pod<S: Store>(
         dry_run: create_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    // Re-clear status after mutating webhooks: a webhook's JSON patch can reinject a
+    // forged/scalar status the earlier clear_create_status already stripped — matches
+    // upstream ordering (mutating admission runs BEFORE PrepareForCreate's unconditional
+    // status wipe). Without this, the line below indexing obj.body["status"]["qosClass"]
+    // would panic on a webhook-reinjected scalar status.
+    super::generic::clear_create_status(true, "v1", "Pod", &mut obj.body)?;
     // Re-apply spec/container defaults (terminationMessagePolicy etc.) after mutating
     // webhooks run, so a container a webhook injects via JSON patch is defaulted too.
     // apply_pod_create_defaults (above, before the webhook chain) only ever saw the
     // client-supplied containers; a webhook can add new ones the first pass never
     // touched. Real kube-apiserver re-runs defaulting after each mutating-webhook
     // round; this single re-apply is the MVP form of that. Idempotent —
-    // apply_pod_spec_defaults only fills absent/empty fields, so containers already
-    // defaulted above are unchanged. Must run before validation so validating
-    // webhooks see the fully-defaulted object, matching upstream ordering.
-    apply_pod_spec_defaults(&mut obj.body);
+    // apply_pod_create_defaults only fills absent/empty fields, so containers/status
+    // already defaulted above are unchanged. Must run before validation so validating
+    // webhooks see the fully-defaulted object, matching upstream ordering. Using the
+    // full apply_pod_create_defaults (not just apply_pod_spec_defaults) also
+    // re-establishes status.phase/conditions the clear_create_status call just wiped.
+    apply_pod_create_defaults(&mut obj.body);
     validate_pod_sysctls(&obj.body).map_err(Status::unprocessable_entity)?;
     super::defaults::validate_pod_certificate_projections(&obj.body)
         .map_err(Status::unprocessable_entity)?;

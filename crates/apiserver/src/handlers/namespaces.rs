@@ -290,6 +290,12 @@ pub(crate) async fn create_namespace<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    // Re-clear status after mutating webhooks — see create_resource's identical call
+    // (resource.rs) for why: a webhook can reinject a forged/scalar status the earlier
+    // clear_create_status already stripped, and this is the last point before
+    // persistence that can discard it.
+    crate::handlers::generic::clear_create_status(true, "v1", "Namespace", &mut obj.body)?;
+    crate::handlers::defaults::apply_defaults("", "namespaces", &mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // Dry-run: validation and admission passed; return the would-be created namespace
