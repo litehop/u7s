@@ -47,11 +47,9 @@ use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 /// whatever status this function just discarded/restored (see `clear_create_status`'s doc
 /// comment for the identical CREATE-from-scratch case this mirrors). `replace_resource` and
 /// `replace_namespaced_resource` already call it exactly once, after webhooks; `do_patch`'s
-/// SSA-create-race fallback calls it twice — once before webhooks (so the escalation/
-/// validation checks that run before admission see the corrected status) and once after, to
-/// close that reinjection gap. `do_patch`'s main PATCH/PUT-onto-a-live-object loop still
-/// calls it only once, pre-webhook: that call site's operation is UPDATE, not CREATE — out
-/// of this fix's scope, tracked separately.
+/// SSA-create-race fallback and its main PATCH/PUT-onto-a-live-object loop (operation UPDATE)
+/// both call it twice — once before webhooks (so the escalation/validation checks that run
+/// before admission see the corrected status) and once after, to close that reinjection gap.
 fn restore_or_strip_status(
     has_status_subresource: bool,
     body: &mut serde_json::Value,
@@ -2082,6 +2080,15 @@ pub(crate) async fn do_patch<S: Store>(
         };
         current.body =
             run_mutating_webhooks(state, current.body, Some(&old_object), &admission_ctx).await?;
+        // Re-restore status after mutating webhooks — same rationale as the SSA-create-race
+        // fallback's post-webhook re-call above: a webhook's JSON patch can reinject a
+        // forged/scalar status the earlier restore (before this match block) already
+        // discarded, and this is the last point before persistence that can discard it again.
+        restore_or_strip_status(
+            meta.has_status_subresource,
+            &mut current.body,
+            &stored_status,
+        );
         run_validating_webhooks(state, &current.body, Some(&old_object), &admission_ctx).await?;
 
         // A user PATCH on an Endpoints object signals that the endpoints are now user-managed.
@@ -25534,6 +25541,160 @@ mod tests {
         );
     }
 
+    /// A mutating webhook that reinjects a forged `status` on a plain PATCH of an already
+    /// existing object (`do_patch`'s main, non-SSA-create branch — operation UPDATE) must
+    /// not have it persist either — the UPDATE-path sibling of
+    /// `ssa_create_race_fallback_discards_status_reinjected_by_mutating_webhook` above.
+    /// Before this fix, this branch restored `stored_status` exactly once, before
+    /// `run_mutating_webhooks`; a webhook's JSON patch adding `status` back in afterward
+    /// reached `store.put` untouched, letting a caller with only ordinary `patch` rights (not
+    /// the `/status` subresource grant) forge status merely by registering a webhook, on
+    /// every UPDATE to any built-in with a status subresource. Fails on revert: removing this
+    /// branch's second (post-webhook) `restore_or_strip_status` call makes this see the
+    /// webhook's forged `status.replicas: 99` persisted verbatim.
+    #[tokio::test]
+    async fn patch_namespaced_resource_discards_status_reinjected_by_mutating_webhook_on_update() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::Router;
+        use base64::Engine;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/apps/statefulsets/default/web";
+
+        let router = Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/status", "value": {"replicas": 99}}
+                ]);
+                let patch_b64 = base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_string(&patch).unwrap());
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "webhook-update-status-reinject-uid",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_admission_webhook_server(router).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": { "name": "update-status-reinject-mwc" },
+            "webhooks": [{
+                "name": "update-status-reinject.test.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{
+                    "apiGroups": ["*"], "apiVersions": ["*"], "resources": ["statefulsets"],
+                    "operations": ["UPDATE"]
+                }],
+                "sideEffects": "None",
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/update-status-reinject-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let existing = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
+                }
+            },
+            "status": { "replicas": 3, "readyReplicas": 3 }
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&existing).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Ordinary label patch — carries no status of its own, isolating the test to the
+        // webhook's reinjection (see the SSA-create-race sibling test above for the
+        // client's-own-forged-body case on the CREATE side).
+        let patch_body = serde_json::json!({
+            "metadata": { "labels": { "updated": "true" } }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "statefulsets".to_string(),
+                "web".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("plain merge-patch UPDATE must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::OK,
+            "the merge-patch must apply successfully so this test actually exercises \
+             do_patch's main UPDATE branch, not an early error return"
+        );
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("the StatefulSet must still be persisted");
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["status"],
+            serde_json::json!({ "replicas": 3, "readyReplicas": 3 }),
+            "a mutating webhook's forged status.replicas must not survive to the store on a \
+             plain UPDATE — restore_or_strip_status must run AFTER run_mutating_webhooks on \
+             do_patch's main branch too, not just before, or a webhook can reinject a forged \
+             status the earlier (pre-patch) restore already discarded"
+        );
+    }
+
     /// `strip_or_delete_dependent` must re-read the dependent fresh and retry on conflict
     /// rather than blindly overwriting whatever the caller's LIST-time snapshot contained.
     ///
@@ -30528,35 +30689,38 @@ mod tests {
         );
     }
 
-    /// Every CREATE-operation `run_mutating_webhooks` call site in a built-in handler must
-    /// clear or restore `status` again AFTER that call, before the next store write — a
-    /// mutating webhook's JSON patch can otherwise reinject whatever `status` an earlier
-    /// clear/restore already discarded (see `clear_create_status`'s and
-    /// `restore_or_strip_status`'s doc comments). Three review rounds each found and fixed
-    /// this on a subset of built-in CREATE surfaces by hand — `create_resource`/
-    /// `create_namespaced_resource`/`create_pod`/`create_namespace` in round one, then
-    /// `do_patch`'s SSA-create-race fallback in round two — because nothing forced a
+    /// Every CREATE- or UPDATE-operation `run_mutating_webhooks` call site in a built-in
+    /// handler must clear or restore `status` again AFTER that call, before the next store
+    /// write — a mutating webhook's JSON patch can otherwise reinject whatever `status` an
+    /// earlier clear/restore already discarded (see `clear_create_status`'s and
+    /// `restore_or_strip_status`'s doc comments). Four review rounds each found and fixed
+    /// this on a subset of built-in surfaces by hand — `create_resource`/
+    /// `create_namespaced_resource`/`create_pod`/`create_namespace` in round one, `do_patch`'s
+    /// SSA-create-race fallback in round two, then `do_patch`'s main UPDATE branch plus
+    /// `patch_pod`/`replace_namespace`/`patch_namespace` in round three (all UPDATE, the exact
+    /// gap round two's CREATE fix left open on this axis) — because nothing forced a
     /// re-enumeration of every site. This test greps the built-in handler files for every
     /// `run_mutating_webhooks(` call whose nearest preceding `operation: "..."` literal is
-    /// `"CREATE"`, and fails the moment one is added or regressed without a
-    /// `clear_create_status(`/`restore_or_strip_status(` call in the text between that call
-    /// and the next store write (`.put(` / `create_if_namespace_active(`).
+    /// `"CREATE"` or `"UPDATE"`, and fails the moment one is added or regressed without a
+    /// status-restore in the text between that call and the next store write (`.put(` /
+    /// `create_if_namespace_active(`): either a `clear_create_status(`/
+    /// `restore_or_strip_status(` call (resource.rs's idiom) or a direct `body["status"] =`/
+    /// `.remove("status")` restore (pods.rs's/namespaces.rs's idiom for the same invariant).
     ///
-    /// Deliberately scoped to `operation: "CREATE"` sites only, not every
-    /// `run_mutating_webhooks` call in these files: `do_patch`'s main PATCH/PUT-onto-a-
-    /// live-object loop (tagged `operation: "UPDATE"`, even for the create-on-missing PUT
-    /// path in `replace_resource`/`replace_namespaced_resource`, which restore status via
-    /// the same helper but are tagged UPDATE like any other full-object PUT) has the same
-    /// class of gap on its own axis (the stored-status restore there runs only once, before
-    /// webhooks) — that is a separate, already-tracked follow-up on the UPDATE path, out of
-    /// this test's CREATE-only scope by construction, not by an exemption list.
+    /// `replace_resource`/`replace_namespaced_resource`/`replace_pod` restore status exactly
+    /// once, already positioned after webhooks — this test doesn't distinguish "restored once,
+    /// correctly after" from "restored twice, once before (for pre-admission checks) and once
+    /// after"; both satisfy the invariant this test enforces (a restore textually between the
+    /// webhook call and the store write), which is all a static grep can prove.
     ///
     /// Scoped to resource.rs/pods.rs/namespaces.rs (not the whole `src/handlers` directory,
-    /// unlike status.rs's completeness tests): Custom Resource and CRD create paths
+    /// unlike status.rs's completeness tests): Custom Resource and CRD create/update paths
     /// (cr.rs/crd.rs) use their own schema-driven status/pruning mechanism, a different bug
-    /// class this test doesn't reason about.
+    /// class this test doesn't reason about. The `/status` subresource handlers
+    /// (`put_namespace_status`, `replace_pod_status`, ...) are excluded by construction: they
+    /// never call `run_mutating_webhooks` at all, so they never match `webhook_call_offsets`.
     #[test]
-    fn every_create_operation_webhook_call_clears_status_after_webhook() {
+    fn every_create_or_update_operation_webhook_call_clears_status_after_webhook() {
         const FILES: &[&str] = &["resource.rs", "pods.rs", "namespaces.rs"];
         let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
 
@@ -30572,7 +30736,7 @@ mod tests {
                     let Some(op) = nearest_preceding_operation(&body, start) else {
                         continue;
                     };
-                    if op != "CREATE" {
+                    if op != "CREATE" && op != "UPDATE" {
                         continue;
                     }
                     checked += 1;
@@ -30580,9 +30744,12 @@ mod tests {
                     let window = &body[start..write_end];
                     if !window.contains("clear_create_status(")
                         && !window.contains("restore_or_strip_status(")
+                        && !window.contains("[\"status\"] =")
+                        && !window.contains(".remove(\"status\")")
                     {
                         violations.push(format!(
-                            "{name} in {file} (byte offset {start} within the function body)"
+                            "{name} in {file} (byte offset {start} within the function body, \
+                             operation {op})"
                         ));
                     }
                 }
@@ -30590,23 +30757,21 @@ mod tests {
         }
 
         assert!(
-            checked >= 6,
-            "sanity check: expected at least 6 CREATE-operation run_mutating_webhooks call \
-             sites across resource.rs/pods.rs/namespaces.rs (create_resource, \
-             create_namespaced_resource, create_pod, create_namespace, do_patch's \
-             SSA-create branch, do_patch's create-race fallback), found {checked} — did the \
-             `operation: \"CREATE\"` convention change (this test would otherwise pass \
-             vacuously)?"
+            checked >= 13,
+            "sanity check: expected at least 13 CREATE/UPDATE-operation run_mutating_webhooks \
+             call sites across resource.rs/pods.rs/namespaces.rs, found {checked} — did the \
+             `operation: \"CREATE\"`/`\"UPDATE\"` convention change (this test would otherwise \
+             pass vacuously)?"
         );
         assert!(
             violations.is_empty(),
-            "CREATE-operation run_mutating_webhooks call site(s) do not clear/restore \
+            "CREATE/UPDATE-operation run_mutating_webhooks call site(s) do not clear/restore \
              status before the next store write: {violations:?} — a mutating webhook's \
-             JSON patch can reinject a forged/scalar status between an earlier clear and \
-             persistence otherwise. Call clear_create_status (fresh create) or \
-             restore_or_strip_status (merge onto an object that already exists, e.g. a \
-             create-race fallback) immediately after run_mutating_webhooks, with nothing \
-             else touching status before the store write."
+             JSON patch can reinject a forged/scalar status between an earlier clear/restore \
+             and persistence otherwise. Restore status (clear_create_status, \
+             restore_or_strip_status, or a direct body[\"status\"] assign/remove) immediately \
+             after run_mutating_webhooks, with nothing else touching status before the store \
+             write."
         );
     }
 

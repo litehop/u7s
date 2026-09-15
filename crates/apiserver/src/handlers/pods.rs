@@ -1692,7 +1692,7 @@ pub(crate) async fn patch_pod<S: Store>(
             }
         }
 
-        current_obj.body["status"] = stored_status;
+        current_obj.body["status"] = stored_status.clone();
         current_obj.body["metadata"]["uid"] = stored_uid;
 
         // Admission webhook pipeline (mutating then validating), threading the pre-patch
@@ -1721,6 +1721,12 @@ pub(crate) async fn patch_pod<S: Store>(
             &admission_ctx,
         )
         .await?;
+
+        // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
+        // forged/scalar status the earlier restore already discarded, and this is the last
+        // point before persistence that can discard it again. Mirrors do_patch's (resource.rs)
+        // identical post-webhook re-restore on its generic PATCH/PUT-onto-live-object path.
+        current_obj.body["status"] = stored_status;
 
         // Enforce the same spec-immutability guard replace_pod (PUT) already applies —
         // without this, a caller holding only `patch pods` (not `pods/binding`) could set
