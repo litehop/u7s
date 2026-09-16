@@ -565,40 +565,6 @@ runs:
           --kube-api-content-type=application/json \
           >/tmp/kcm-supervisor.log 2>&1 &
 
-    - name: Wait for flannel ready
-      # kube-controller-manager (above) is what makes node-ipam-controller
-      # assign ci-node a spec.podCIDR; flanneld's --kube-subnet-mgr only
-      # computes this node's lease and writes /run/flannel/subnet.env once
-      # that podCIDR exists. Must land before the scheduler (below) can place
-      # any pod -- CoreDNS included -- or that pod's sandbox creation either
-      # fails outright with the flannel plugin's own subnet.env error, or (if
-      # the flannel conflist hasn't landed on disk yet either) falls through
-      # to whatever other CNI network cri-o picks instead.
-      env:
-        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
-      shell: bash
-      run: |
-        FOUND=0
-        for i in $(seq 1 90); do
-          if [ -f /run/flannel/subnet.env ]; then
-            FOUND=1
-            break
-          fi
-          sleep 1
-        done
-        if [ "$FOUND" -eq 0 ]; then
-          echo "ERROR: /run/flannel/subnet.env did not appear within 90s"
-          echo "--- kube-flannel pods -o wide ---"
-          kubectl -n kube-flannel get pods -o wide || true
-          echo "--- kube-flannel pod logs ---"
-          kubectl -n kube-flannel logs -l app=flannel --all-containers --prefix || true
-          echo "--- /etc/cni/net.d ---"
-          ls -la /etc/cni/net.d || true
-          exit 1
-        fi
-        echo "flannel ready:"
-        cat /run/flannel/subnet.env
-
     - name: Start u7s-scheduler
       shell: bash
       run: |
@@ -640,6 +606,40 @@ runs:
           }
           sleep 1
         done
+
+    - name: Wait for flannel ready
+      # The kube-flannel DS pod (applied earlier, above) needed the scheduler
+      # (just started) to place it on ci-node before it could even run --
+      # its main container then needs kube-controller-manager's
+      # node-ipam-controller to have assigned ci-node a spec.podCIDR before
+      # --kube-subnet-mgr can compute a lease and write
+      # /run/flannel/subnet.env. Waiting for that file here, before sonobuoy
+      # starts, turns a silent multi-minute CNI failure deep inside the e2e
+      # run into a fast, clearly-diagnosed one right at bring-up.
+      env:
+        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+      shell: bash
+      run: |
+        FOUND=0
+        for i in $(seq 1 90); do
+          if [ -f /run/flannel/subnet.env ]; then
+            FOUND=1
+            break
+          fi
+          sleep 1
+        done
+        if [ "$FOUND" -eq 0 ]; then
+          echo "ERROR: /run/flannel/subnet.env did not appear within 90s"
+          echo "--- kube-flannel pods -o wide ---"
+          kubectl -n kube-flannel get pods -o wide || true
+          echo "--- kube-flannel pod logs ---"
+          kubectl -n kube-flannel logs -l app=flannel --all-containers --prefix || true
+          echo "--- /etc/cni/net.d ---"
+          ls -la /etc/cni/net.d || true
+          exit 1
+        fi
+        echo "flannel ready:"
+        cat /run/flannel/subnet.env
 
     - name: Sample baseline RSS
       shell: bash
