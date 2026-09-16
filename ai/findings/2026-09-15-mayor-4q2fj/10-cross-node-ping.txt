@@ -1,3 +1,0 @@
-ping: permission denied (are you root?)
-PING 10.244.1.8 (10.244.1.8): 56 data bytes
-command terminated with exit code 1

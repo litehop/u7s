@@ -105,12 +105,22 @@ runs:
         version: ${{ inputs.k8s_version }}
 
     - name: Configure and start cri-o
-      # Always runs regardless of cache hit/miss -- CNI conflist and the
-      # systemd unit aren't part of what gets cached above.
+      # Always runs regardless of cache hit/miss. The cri-o package ships a
+      # default 10-crio-bridge.conf(list) that gives this node its own
+      # independent, uncoordinated bridge with no CNI conflist Flannel's own
+      # DaemonSet installs (10-flannel.conflist) once it lands further below
+      # -- must be disabled up front, since CRI-O picks whichever conflist
+      # sorts first alphabetically in this directory and "10-crio-bridge"
+      # would otherwise keep winning over "10-flannel" forever. Mirrors
+      # scripts/install.sh:692-696 / lima-start.sh's matching disable step.
       shell: bash
       run: |
         sudo mkdir -p /etc/cni/net.d
-        sudo cp .github/workflows/e2e-focus-resources/cni-bridge.conflist /etc/cni/net.d/10-bridge.conflist
+        for f in 10-crio-bridge.conf 10-crio-bridge.conflist; do
+          if [ -f "/etc/cni/net.d/$f" ]; then
+            sudo mv "/etc/cni/net.d/$f" "/etc/cni/net.d/$f.disabled"
+          fi
+        done
         sudo systemctl enable --now crio
 
     - name: Install containernetworking-plugins
@@ -193,10 +203,10 @@ runs:
         # scripts/install.sh (the production release-tarball path), this workflow
         # never staged anything there, so CoreDNS silently stopped being applied
         # and sonobuoy's preflight failed with "no dns pods found" (run 32922063667).
-        # Stage just the one vendored manifest this single-node runner needs;
-        # flannel.yaml/kube-proxy.yaml carry install.sh-only substitution
-        # placeholders and are irrelevant here (kube-proxy runs as its own binary
-        # below, no CNI needed for loopback networking).
+        # Stage just the one vendored manifest this single-node runner needs
+        # in --manifest-dir; kube-proxy runs as its own binary below (not via
+        # a manifest), and Flannel is applied via a separate kubectl apply
+        # step further down once the node has registered, not staged here.
         mkdir -p "$WORKDIR/manifests"
         cp manifests/coredns.yaml "$WORKDIR/manifests/"
         # No --konnectivity-proxy-addr: apiserver and kubelet are co-located on
@@ -307,6 +317,25 @@ runs:
         fi
         echo "Node registered:"
         kubectl get nodes
+
+    - name: Apply flannel CNI
+      # Renders manifests/flannel.yaml the same way scripts/install.sh
+      # (919-932) and scripts/conformance/lima-start.sh (949-959) do --
+      # __IFACE__ substituted with this runner's primary NIC, __POD_CLUSTER_CIDR__
+      # matching kube-controller-manager's node-ipam-controller default
+      # elsewhere in this repo. node-ipam-controller is excluded from this
+      # workflow's --controllers set below, so flanneld's --kube-subnet-mgr
+      # self-allocates ci-node's subnet directly instead of waiting on a
+      # spec.podCIDR that would otherwise never get assigned.
+      env:
+        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+      shell: bash
+      run: |
+        FLANNEL_RENDERED="$(mktemp)"
+        sed -e "s/__IFACE__/eth0/g" -e "s#__POD_CLUSTER_CIDR__#10.244.0.0/16#g" \
+          manifests/flannel.yaml > "$FLANNEL_RENDERED"
+        kubectl apply --validate=false -f "$FLANNEL_RENDERED"
+        rm -f "$FLANNEL_RENDERED"
 
     - name: Assert kubelet not crash-looping
       # Checks every second instead of one sleep-then-check: an immediate
@@ -511,6 +540,14 @@ runs:
         # needed (e.g. the namespace controller finalizing each test's
         # ephemeral namespace). kcm-supervisor.sh restarts kcm on crash instead
         # of silently blacking out the control plane for the rest of the run.
+        # node-ipam-controller must stay enabled (unlike an earlier version of
+        # this workflow that excluded it): it is the only thing that ever sets
+        # Node.spec.podCIDR, which flanneld's --kube-subnet-mgr reads to compute
+        # this node's lease before it will write /run/flannel/subnet.env --
+        # without it flannel never becomes ready and every pod sandbox creation
+        # fails with "failed to load flannel 'subnet.env' file".
+        # --cluster-cidr matches manifests/flannel.yaml's net-conf.json Network
+        # (10.244.0.0/16, substituted into the same literal above).
         setsid bash scripts/conformance/kcm-supervisor.sh \
           "$WORKDIR/kube-controller-manager" "$WORKDIR/kcm.log" \
           --kubeconfig="$WORKDIR/kubeconfig-cert" \
@@ -518,7 +555,10 @@ runs:
           --cluster-signing-key-file="$WORKDIR/ca.key" \
           --service-account-private-key-file="$WORKDIR/sa.key" \
           --root-ca-file="$WORKDIR/ca.pem" \
-          --controllers='*,-cloud-node-lifecycle-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \
+          --controllers='*,-cloud-node-lifecycle-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \
+          --allocate-node-cidrs=true \
+          --cluster-cidr=10.244.0.0/16 \
+          --node-cidr-mask-size=24 \
           --use-service-account-credentials=false \
           --leader-elect=false \
           --bind-address=127.0.0.1 \
@@ -566,6 +606,40 @@ runs:
           }
           sleep 1
         done
+
+    - name: Wait for flannel ready
+      # The kube-flannel DS pod (applied earlier, above) needed the scheduler
+      # (just started) to place it on ci-node before it could even run --
+      # its main container then needs kube-controller-manager's
+      # node-ipam-controller to have assigned ci-node a spec.podCIDR before
+      # --kube-subnet-mgr can compute a lease and write
+      # /run/flannel/subnet.env. Waiting for that file here, before sonobuoy
+      # starts, turns a silent multi-minute CNI failure deep inside the e2e
+      # run into a fast, clearly-diagnosed one right at bring-up.
+      env:
+        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+      shell: bash
+      run: |
+        FOUND=0
+        for i in $(seq 1 90); do
+          if [ -f /run/flannel/subnet.env ]; then
+            FOUND=1
+            break
+          fi
+          sleep 1
+        done
+        if [ "$FOUND" -eq 0 ]; then
+          echo "ERROR: /run/flannel/subnet.env did not appear within 90s"
+          echo "--- kube-flannel pods -o wide ---"
+          kubectl -n kube-flannel get pods -o wide || true
+          echo "--- kube-flannel pod logs ---"
+          kubectl -n kube-flannel logs -l app=flannel --all-containers --prefix || true
+          echo "--- /etc/cni/net.d ---"
+          ls -la /etc/cni/net.d || true
+          exit 1
+        fi
+        echo "flannel ready:"
+        cat /run/flannel/subnet.env
 
     - name: Sample baseline RSS
       shell: bash
@@ -712,6 +786,19 @@ runs:
         sudo journalctl -u kube-proxy --no-pager -n 50 || true
         echo "=== iptables nat rules (KUBE-SERVICES/KUBE-SVC chains) ==="
         sudo iptables -t nat -S | grep -i "10.96.0.1\|KUBE-SERVICES\|KUBE-SVC" || true
+
+        # Captures the flannel DS pod's own state -- sonobuoy sandboxes have
+        # failed the flannel CNI plugin with subnet.env missing while CoreDNS
+        # landed on a different subnet entirely, and this diagnose step had no
+        # visibility into kube-flannel at all when that happened.
+        echo "=== kube-flannel pods -o wide ==="
+        kubectl -n kube-flannel get pods -o wide || true
+        echo "=== kube-flannel pod logs ==="
+        kubectl -n kube-flannel logs -l app=flannel --all-containers --prefix || true
+        echo "=== /run/flannel/subnet.env ==="
+        cat /run/flannel/subnet.env 2>&1 || true
+        echo "=== /etc/cni/net.d ==="
+        ls -la /etc/cni/net.d || true
 
     - name: Retrieve sonobuoy results
       env:

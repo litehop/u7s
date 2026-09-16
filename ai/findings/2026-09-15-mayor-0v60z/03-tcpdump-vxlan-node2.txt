@@ -1,0 +1,165 @@
+reading from file /Users/balint.erdos/litehop/u7s/ai/worktrees/agent-a6c930c2eb99d3c9e/ai/findings/2026-09-15-mayor-0v60z/03-vxlan-node2.pcap, link-type EN10MB (Ethernet)
+21:54:14.204965 IP (tos 0x0, ttl 64, id 22577, offset 0, flags [none], proto UDP (17), length 167)
+    192.168.108.5.45027 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 63749, offset 0, flags [DF], proto UDP (17), length 117)
+    10.244.1.2.53249 > 10.244.0.4.53: 17477+ [1au] AAAA? metrics-server.kube-system.svc.kube-system.svc.cluster.local. (89)
+21:54:14.205140 IP (tos 0x0, ttl 64, id 22578, offset 0, flags [none], proto UDP (17), length 167)
+    192.168.108.5.51522 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 20028, offset 0, flags [DF], proto UDP (17), length 117)
+    10.244.1.2.59233 > 10.244.0.4.53: 50683+ [1au] A? metrics-server.kube-system.svc.kube-system.svc.cluster.local. (89)
+21:54:14.205886 IP (tos 0x0, ttl 64, id 9659, offset 0, flags [none], proto UDP (17), length 260)
+    192.168.108.4.53134 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 25761, offset 0, flags [DF], proto UDP (17), length 210)
+    10.244.0.4.53 > 10.244.1.2.59233: 50683 NXDomain*- 0/1/1 (182)
+21:54:14.206086 IP (tos 0x0, ttl 64, id 9660, offset 0, flags [none], proto UDP (17), length 260)
+    192.168.108.4.33470 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 25762, offset 0, flags [DF], proto UDP (17), length 210)
+    10.244.0.4.53 > 10.244.1.2.53249: 17477 NXDomain*- 0/1/1 (182)
+21:54:14.207095 IP (tos 0x0, ttl 64, id 22580, offset 0, flags [none], proto UDP (17), length 155)
+    192.168.108.5.38771 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 52529, offset 0, flags [DF], proto UDP (17), length 105)
+    10.244.1.2.54929 > 10.244.0.4.53: 34206+ [1au] A? metrics-server.kube-system.svc.svc.cluster.local. (77)
+21:54:14.207095 IP (tos 0x0, ttl 64, id 22579, offset 0, flags [none], proto UDP (17), length 155)
+    192.168.108.5.53914 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 51924, offset 0, flags [DF], proto UDP (17), length 105)
+    10.244.1.2.35733 > 10.244.0.4.53: 50004+ [1au] AAAA? metrics-server.kube-system.svc.svc.cluster.local. (77)
+21:54:14.207544 IP (tos 0x0, ttl 64, id 9661, offset 0, flags [none], proto UDP (17), length 248)
+    192.168.108.4.46883 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 25763, offset 0, flags [DF], proto UDP (17), length 198)
+    10.244.0.4.53 > 10.244.1.2.35733: 50004 NXDomain*- 0/1/1 (170)
+21:54:14.207631 IP (tos 0x0, ttl 64, id 9662, offset 0, flags [none], proto UDP (17), length 248)
+    192.168.108.4.38082 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 25764, offset 0, flags [DF], proto UDP (17), length 198)
+    10.244.0.4.53 > 10.244.1.2.54929: 34206 NXDomain*- 0/1/1 (170)
+21:54:14.208308 IP (tos 0x0, ttl 64, id 22581, offset 0, flags [none], proto UDP (17), length 151)
+    192.168.108.5.40972 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 39910, offset 0, flags [DF], proto UDP (17), length 101)
+    10.244.1.2.37020 > 10.244.0.4.53: 35312+ [1au] AAAA? metrics-server.kube-system.svc.cluster.local. (73)
+21:54:14.208308 IP (tos 0x0, ttl 64, id 22582, offset 0, flags [none], proto UDP (17), length 151)
+    192.168.108.5.57673 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 12335, offset 0, flags [DF], proto UDP (17), length 101)
+    10.244.1.2.49354 > 10.244.0.4.53: 26448+ [1au] A? metrics-server.kube-system.svc.cluster.local. (73)
+21:54:14.208539 IP (tos 0x0, ttl 64, id 9663, offset 0, flags [none], proto UDP (17), length 211)
+    192.168.108.4.54896 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 25765, offset 0, flags [DF], proto UDP (17), length 161)
+    10.244.0.4.53 > 10.244.1.2.49354: 26448*- 1/0/1 metrics-server.kube-system.svc.cluster.local. A 10.96.0.11 (133)
+21:54:14.208639 IP (tos 0x0, ttl 64, id 9664, offset 0, flags [none], proto UDP (17), length 244)
+    192.168.108.4.59374 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 25766, offset 0, flags [DF], proto UDP (17), length 194)
+    10.244.0.4.53 > 10.244.1.2.37020: 35312*- 0/1/1 (166)
+21:54:14.209187 IP (tos 0x0, ttl 64, id 22583, offset 0, flags [none], proto UDP (17), length 110)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33553, offset 0, flags [DF], proto TCP (6), length 60)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [S], cksum 0x90b0 (correct), seq 867568149, win 64860, options [mss 1410,sackOK,TS val 3614280690 ecr 0,nop,wscale 10], length 0
+21:54:14.209277 IP (tos 0x0, ttl 64, id 9665, offset 0, flags [none], proto UDP (17), length 110)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [S.], cksum 0xb923 (correct), seq 3345881003, ack 867568150, win 64308, options [mss 1410,sackOK,TS val 495246597 ecr 3614280690,nop,wscale 10], length 0
+21:54:14.209546 IP (tos 0x0, ttl 64, id 22584, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33554, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [.], cksum 0xe2b5 (correct), ack 1, win 64, options [nop,nop,TS val 3614280690 ecr 495246597], length 0
+21:54:14.211166 IP (tos 0x0, ttl 64, id 22586, offset 0, flags [none], proto UDP (17), length 1604)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33555, offset 0, flags [DF], proto TCP (6), length 1554)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [P.], cksum 0x1cf0 (incorrect -> 0xd29d), seq 1:1503, ack 1, win 64, options [nop,nop,TS val 3614280692 ecr 495246597], length 1502
+21:54:14.211286 IP (tos 0x0, ttl 64, id 9667, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 4981, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [.], cksum 0xdcd5 (correct), ack 1503, win 62, options [nop,nop,TS val 495246599 ecr 3614280692], length 0
+21:54:14.213538 IP (tos 0x0, ttl 64, id 9668, offset 0, flags [none], proto UDP (17), length 1500)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 4982, offset 0, flags [DF], proto TCP (6), length 1450)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [.], cksum 0xc2a0 (correct), seq 1:1399, ack 1503, win 62, options [nop,nop,TS val 495246601 ecr 3614280692], length 1398
+21:54:14.213542 IP (tos 0x0, ttl 64, id 9669, offset 0, flags [none], proto UDP (17), length 1500)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 4983, offset 0, flags [DF], proto TCP (6), length 1450)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [.], cksum 0xcd79 (correct), seq 1399:2797, ack 1503, win 62, options [nop,nop,TS val 495246601 ecr 3614280692], length 1398
+21:54:14.213543 IP (tos 0x0, ttl 64, id 9670, offset 0, flags [none], proto UDP (17), length 723)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 4984, offset 0, flags [DF], proto TCP (6), length 673)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [P.], cksum 0x486e (correct), seq 2797:3418, ack 1503, win 62, options [nop,nop,TS val 495246601 ecr 3614280692], length 621
+21:54:14.213802 IP (tos 0x0, ttl 64, id 22590, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33557, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [.], cksum 0xcf6f (correct), ack 3418, win 70, options [nop,nop,TS val 3614280695 ecr 495246601], length 0
+21:54:14.214948 IP (tos 0x0, ttl 64, id 22591, offset 0, flags [none], proto UDP (17), length 108)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33558, offset 0, flags [DF], proto TCP (6), length 58)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [P.], cksum 0xb75c (correct), seq 1503:1509, ack 3418, win 70, options [nop,nop,TS val 3614280696 ecr 495246601], length 6
+21:54:14.214948 IP (tos 0x0, ttl 64, id 22592, offset 0, flags [none], proto UDP (17), length 566)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33559, offset 0, flags [DF], proto TCP (6), length 516)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [P.], cksum 0x9d56 (correct), seq 1509:1973, ack 3418, win 70, options [nop,nop,TS val 3614280696 ecr 495246601], length 464
+21:54:14.214993 IP (tos 0x0, ttl 64, id 22593, offset 0, flags [none], proto UDP (17), length 220)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33560, offset 0, flags [DF], proto TCP (6), length 170)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [P.], cksum 0xf807 (correct), seq 1973:2091, ack 3418, win 70, options [nop,nop,TS val 3614280696 ecr 495246601], length 118
+21:54:14.215063 IP (tos 0x0, ttl 64, id 9671, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 4985, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [.], cksum 0xcd28 (correct), ack 2091, win 62, options [nop,nop,TS val 495246603 ecr 3614280696], length 0
+21:54:14.215279 IP (tos 0x0, ttl 64, id 9672, offset 0, flags [none], proto UDP (17), length 564)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 4986, offset 0, flags [DF], proto TCP (6), length 514)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [P.], cksum 0x4365 (correct), seq 3418:3880, ack 2091, win 62, options [nop,nop,TS val 495246603 ecr 3614280696], length 462
+21:54:14.215784 IP (tos 0x0, ttl 64, id 9673, offset 0, flags [none], proto UDP (17), length 454)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 4987, offset 0, flags [DF], proto TCP (6), length 404)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [P.], cksum 0xefcd (correct), seq 3880:4232, ack 2091, win 62, options [nop,nop,TS val 495246603 ecr 3614280696], length 352
+21:54:14.216128 IP (tos 0x0, ttl 64, id 22594, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33561, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [.], cksum 0xc9ef (correct), ack 4232, win 72, options [nop,nop,TS val 3614280697 ecr 495246603], length 0
+21:54:14.217021 IP (tos 0x0, ttl 64, id 22595, offset 0, flags [none], proto UDP (17), length 126)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33562, offset 0, flags [DF], proto TCP (6), length 76)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [P.], cksum 0x96d9 (correct), seq 2091:2115, ack 4232, win 72, options [nop,nop,TS val 3614280698 ecr 495246603], length 24
+21:54:14.217151 IP (tos 0x0, ttl 64, id 22596, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 33563, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [F.], cksum 0xc9d5 (correct), seq 2115, ack 4232, win 72, options [nop,nop,TS val 3614280698 ecr 495246603], length 0
+21:54:14.217223 IP (tos 0x0, ttl 64, id 9675, offset 0, flags [none], proto UDP (17), length 126)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 4988, offset 0, flags [DF], proto TCP (6), length 76)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [P.], cksum 0x93b4 (correct), seq 4232:4256, ack 2116, win 62, options [nop,nop,TS val 495246605 ecr 3614280698], length 24
+21:54:14.217257 IP (tos 0x0, ttl 64, id 9676, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.4.52097 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 4989, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.0.2.10250 > 10.244.1.2.55808: Flags [F.], cksum 0xc9c4 (correct), seq 4256, ack 2116, win 62, options [nop,nop,TS val 495246605 ecr 3614280698], length 0
+21:54:14.217486 IP (tos 0x0, ttl 64, id 22597, offset 0, flags [none], proto UDP (17), length 90)
+    192.168.108.5.60044 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 0, offset 0, flags [DF], proto TCP (6), length 40)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [R], cksum 0x50db (correct), seq 867570265, win 0, length 0
+21:54:14.217486 IP (tos 0x0, ttl 64, id 22598, offset 0, flags [none], proto UDP (17), length 90)
+    192.168.108.5.45891 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 0, offset 0, flags [DF], proto TCP (6), length 40)
+    10.244.1.2.55808 > 10.244.0.2.10250: Flags [R], cksum 0x50db (correct), seq 867570265, win 0, length 0
+21:54:16.534824 IP (tos 0x0, ttl 64, id 23500, offset 0, flags [none], proto UDP (17), length 110)
+    192.168.108.5.58456 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 52530, offset 0, flags [DF], proto TCP (6), length 60)
+    10.244.1.3.37363 > 10.244.0.7.8080: Flags [S], cksum 0x8734 (correct), seq 598209780, win 64860, options [mss 1410,sackOK,TS val 2763406806 ecr 0,nop,wscale 10], length 0
+21:54:16.534960 IP (tos 0x0, ttl 64, id 10555, offset 0, flags [none], proto UDP (17), length 110)
+    192.168.108.4.48371 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    10.244.0.7.8080 > 10.244.1.3.37363: Flags [S.], cksum 0x2089 (correct), seq 1472483497, ack 598209781, win 64308, options [mss 1410,sackOK,TS val 1213036551 ecr 2763406806,nop,wscale 10], length 0
+21:54:16.535118 IP (tos 0x0, ttl 64, id 23501, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.5.58456 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 52531, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.1.3.37363 > 10.244.0.7.8080: Flags [.], cksum 0x4a1b (correct), ack 1, win 64, options [nop,nop,TS val 2763406806 ecr 1213036551], length 0
+21:54:16.535170 IP (tos 0x0, ttl 64, id 23502, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.5.58456 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 52532, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.1.3.37363 > 10.244.0.7.8080: Flags [F.], cksum 0x4a1a (correct), seq 1, ack 1, win 64, options [nop,nop,TS val 2763406806 ecr 1213036551], length 0
+21:54:16.535875 IP (tos 0x0, ttl 64, id 10556, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.4.48371 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 27716, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.0.7.8080 > 10.244.1.3.37363: Flags [.], cksum 0x4a1a (correct), ack 2, win 63, options [nop,nop,TS val 1213036552 ecr 2763406806], length 0
+21:54:16.535884 IP (tos 0x0, ttl 64, id 10557, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.4.48371 > 192.168.108.5.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 27717, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.0.7.8080 > 10.244.1.3.37363: Flags [F.], cksum 0x4a19 (correct), seq 1, ack 2, win 63, options [nop,nop,TS val 1213036552 ecr 2763406806], length 0
+21:54:16.536110 IP (tos 0x0, ttl 64, id 23503, offset 0, flags [none], proto UDP (17), length 102)
+    192.168.108.5.58456 > 192.168.108.4.8472: OTV, flags [I] (0x08), overlay 0, instance 1
+IP (tos 0x0, ttl 63, id 0, offset 0, flags [DF], proto TCP (6), length 52)
+    10.244.1.3.37363 > 10.244.0.7.8080: Flags [.], cksum 0x4a17 (correct), ack 2, win 64, options [nop,nop,TS val 2763406807 ecr 1213036552], length 0

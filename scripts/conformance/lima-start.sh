@@ -28,19 +28,15 @@
 #     limactl shell lima-node sudo journalctl -u crio --no-pager --utc -n 30
 #     (pass --verbose to raise both kubelet --v and CRI-O's log_level to debug)
 #   Container sandbox failures ("unknown version specified"):
-#     Two possible causes:
-#     1. System crun used instead of CRI-O's bundled one (10-crun.conf drop-in):
-#        Fix: limactl shell lima-node sudo rm /etc/crio/crio.conf.d/10-crun.conf
-#             limactl shell lima-node sudo systemctl restart crio
-#     2. Wrong CNI config format (10-crio-bridge.conf 0.4.0 instead of 1.0.0 conflist):
-#        Fix: limactl shell lima-node sudo mv /etc/cni/net.d/10-crio-bridge.conf /etc/cni/net.d/10-crio-bridge.conf.disabled
-#             limactl shell lima-node sudo mv /etc/cni/net.d/10-crio-bridge.conflist.disabled /etc/cni/net.d/10-crio-bridge.conflist
-#             limactl shell lima-node sudo systemctl restart crio
-#     (lima/kubelet.yaml provision now prevents both — delete+reprovision fixes them permanently)
+#     System crun used instead of CRI-O's bundled one (10-crun.conf drop-in):
+#       Fix: limactl shell lima-node sudo rm /etc/crio/crio.conf.d/10-crun.conf
+#            limactl shell lima-node sudo systemctl restart crio
+#     (lima/kubelet.yaml provision now prevents this — delete+reprovision fixes it permanently)
 set -euo pipefail
 
 LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
 KUBE_NETWORK_POLICIES_YAML="$(dirname "$0")/manifests/kube-network-policies.yaml"
+FLANNEL_YAML="$(dirname "$0")/../../manifests/flannel.yaml"
 # shellcheck source=scripts/conformance/_lib.sh
 source "$(dirname "$0")/_lib.sh"
 
@@ -285,79 +281,28 @@ else
   fi
 fi
 
-# Give this node its own disjoint pod-CIDR /24 out of the CRI-O default 10.85.0.0/16
-# (primary = .0, -2 = .1, -3 = .2, ...). The stock conflist hands every node the
-# identical flat /16, so nodes independently allocate overlapping pod IPs and every
-# node's route table treats the whole /16 as locally attached, which is why
-# cross-node pod traffic fails with "Host is unreachable" (fixed by the inter-node
-# routes added near the end of this script). Skip the crio restart + IPAM-lease
-# wipe when the subnet is already correct so a plain reconnect never risks
-# recycling an IP a live pod still holds.
-# node_suffix_for() (_lib.sh) now also derives non-numeric suffixes (e.g.
+# CRI-O ships a default 10-crio-bridge.conf(list) that gives every node its own
+# independent, uncoordinated subnet with no cross-node routing at all. Flannel
+# supplies the real CNI config instead (10-flannel.conflist, installed by its
+# own DaemonSet once node-ipam-controller can hand out podCIDRs) and must be the
+# only conflist present, since CRI-O picks whichever file sorts first
+# alphabetically ("10-crio-bridge" < "10-flannel") -- mirrors install.sh:692-696.
+# Idempotent: a VM that already disabled these on a prior run just no-ops here.
+for f in 10-crio-bridge.conf 10-crio-bridge.conflist; do
+  limactl shell "$VM_NAME" sudo bash -c "[ -f /etc/cni/net.d/$f ] && mv /etc/cni/net.d/$f /etc/cni/net.d/$f.disabled || true"
+done
+
+# node_suffix_for() (_lib.sh) also derives non-numeric suffixes (e.g.
 # lima-node-smoke -> "-smoke") to keep resource names collision-free -- but
 # arithmetic on a non-numeric suffix would abort this script under `set -u`,
 # so treat any non-numeric NODE_SUFFIX the same as the empty (primary) case.
+# POD_SUBNET_OCTET no longer feeds a hand-assigned pod subnet (flannel's
+# node-ipam-controller owns that now) -- it only feeds this node's stable
+# IPv6 ULA address further down.
 if [[ "$NODE_SUFFIX" =~ ^-[0-9]+$ ]]; then
   POD_SUBNET_OCTET=$(( ${NODE_SUFFIX#-} - 1 ))
 else
   POD_SUBNET_OCTET=0
-fi
-POD_SUBNET="10.85.${POD_SUBNET_OCTET}.0/24"
-# `|| true` here is safe: a failure to read the current subnet (e.g. a transient
-# `limactl shell` hiccup) just falls through to the "unset" branch below, which
-# re-asserts the same rewrite this run would have wanted anyway — it never masks
-# a failure that leaves the VM in a broken state, only ever costs an extra (idempotent)
-# rewrite + crio restart on an already-correct subnet.
-CURRENT_POD_SUBNET=$(limactl shell "$VM_NAME" sudo jq -r '.plugins[0].ipam.ranges[0][0].subnet' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
-# The bridge plugin's own `ipMasq` exemption is computed from each pod's OWN
-# allocated address (containernetworking-plugins' bridge.go feeds
-# result.IPs[].Address -- this node's /24, not the conflist's declared subnet
-# -- into SetupIPMasqForNetworks), so there is no conflist knob that widens
-# just the exemption without also widening the pod's own interface prefix,
-# which would break on-link ARP resolution for every OTHER node's /24 (see
-# the disjoint-/24 comment above). So per-pod ipMasq is disabled here and
-# replaced with one cluster-wide pair of rules below.
-CURRENT_IPMASQ=$(limactl shell "$VM_NAME" sudo jq -r '.plugins[0].ipMasq' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
-if [ "$CURRENT_POD_SUBNET" != "$POD_SUBNET" ] || [ "$CURRENT_IPMASQ" != "false" ]; then
-  echo "Rewriting CNI bridge pod subnet: ${CURRENT_POD_SUBNET:-<unset>} -> ${POD_SUBNET}, disabling per-node ipMasq"
-  limactl shell "$VM_NAME" sudo bash -c "
-    jq --arg s '${POD_SUBNET}' '.plugins[0].ipam.ranges[0][0].subnet = \$s | .plugins[0].ipMasq = false' /etc/cni/net.d/10-crio-bridge.conflist > /tmp/10-crio-bridge.conflist.new
-    mv /tmp/10-crio-bridge.conflist.new /etc/cni/net.d/10-crio-bridge.conflist
-    systemctl restart crio
-    rm -rf /var/lib/cni/networks/crio/*
-  "
-else
-  echo "CNI bridge pod subnet already ${POD_SUBNET} with ipMasq disabled, skipping rewrite."
-fi
-
-# The bridge CNI plugin does not re-address an already-existing cni0 device when
-# the conflist's subnet changes underneath it — only a freshly-created bridge
-# picks up a new range. So a VM whose conflist file above already says the right
-# subnet can still be carrying a live cni0 stuck on a stale one from before that
-# rewrite ever took effect. Fail loud rather than let an inter-node route get
-# programmed against an address this node's pods were never actually assigned.
-CNI0_LIVE=$(limactl shell "$VM_NAME" ip -4 addr show cni0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}/[0-9]+' | awk '{print $2}' | head -1 || true)
-if [ -n "$CNI0_LIVE" ] && [ "$CNI0_LIVE" != "10.85.${POD_SUBNET_OCTET}.1/24" ]; then
-  echo "error: $VM_NAME's cni0 bridge is still ${CNI0_LIVE}, not this node's assigned ${POD_SUBNET}." >&2
-  echo "  Fix: limactl delete $VM_NAME   (or re-run with --reset, which now recreates a named --extra-node too)" >&2
-  exit 1
-fi
-
-# Cluster-wide replacement for the per-node ipMasq disabled above: ACCEPT (no
-# NAT) any traffic staying within the shared 10.85.0.0/16 pod CIDR, ahead of a
-# catch-all MASQUERADE for genuinely external destinations -- mirrors what the
-# bridge plugin used to do per-pod, but scoped to the whole cluster instead of
-# just this node's /24. Without this, cross-node pod traffic was silently
-# SNAT'd to the sending node's own address, since only same-node traffic ever
-# matched the old node-scoped ACCEPT exception. Checked via `-C` before
-# inserting so a re-run of this script never duplicates the rule.
-if ! limactl shell "$VM_NAME" sudo iptables -t nat -C POSTROUTING -s 10.85.0.0/16 -d 10.85.0.0/16 -j ACCEPT 2>/dev/null; then
-  echo "Adding cluster-wide no-SNAT rule for 10.85.0.0/16 pod-to-pod traffic"
-  limactl shell "$VM_NAME" sudo iptables -t nat -I POSTROUTING 1 -s 10.85.0.0/16 -d 10.85.0.0/16 -j ACCEPT
-fi
-if ! limactl shell "$VM_NAME" sudo iptables -t nat -C POSTROUTING -s 10.85.0.0/16 ! -d 224.0.0.0/4 -j MASQUERADE 2>/dev/null; then
-  echo "Adding cluster-wide MASQUERADE rule for pod traffic leaving 10.85.0.0/16"
-  limactl shell "$VM_NAME" sudo iptables -t nat -A POSTROUTING -s 10.85.0.0/16 ! -d 224.0.0.0/4 -j MASQUERADE
 fi
 
 # Toggle CRI-O debug logging via a crio.conf.d drop-in, controlled by --verbose. A
@@ -806,7 +751,7 @@ limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/kube-proxy/config.conf' <<'CON
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
 mode: iptables
-clusterCIDR: 10.85.0.0/16
+clusterCIDR: 10.244.0.0/16
 clientConnection:
   kubeconfig: /etc/kube-proxy/kubeconfig.conf
 CONFEOF
@@ -999,11 +944,26 @@ echo ""
 echo "Success! Node registered:"
 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
 
+# Flannel is the real CNI now that crio-bridge is disabled above. Render its
+# install-time placeholders the same way install.sh does (__IFACE__/
+# __POD_CLUSTER_CIDR__, install.sh:919-932) and apply. Cluster-scoped, so
+# re-applying from a 2nd node's lima-start.sh run (which may detect a different
+# LIMA_VM_IFACE) is a harmless idempotent no-op -- flannel.yaml's own
+# --iface-regex fallback already tolerates per-node interface-name variance, so
+# whichever node's --iface value wins the last apply is not a correctness issue.
+echo "Applying flannel CNI DaemonSet..."
+FLANNEL_RENDERED="$(mktemp)"
+sed -e "s/__IFACE__/$LIMA_VM_IFACE/g" -e "s#__POD_CLUSTER_CIDR__#10.244.0.0/16#g" \
+  "$FLANNEL_YAML" > "$FLANNEL_RENDERED"
+kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$FLANNEL_RENDERED"
+rm -f "$FLANNEL_RENDERED"
+
 # kube-network-policies enforces NetworkPolicy ingress+egress via NFQUEUE+nftables+NRI
-# on top of CRI-O's stock bridge CNI (no CNI swap needed) — CRI-O's bridge plugin has
-# no policy engine of its own, so without this DaemonSet, NetworkPolicy objects are
-# accepted+stored by the apiserver but never enforced. Cluster-scoped, so re-applying
-# from a 2nd node's lima-start.sh run is a harmless idempotent no-op.
+# on top of Flannel's CNI (no additional CNI swap needed) — neither CRI-O's stock
+# bridge nor Flannel has a policy engine of its own, so without this DaemonSet,
+# NetworkPolicy objects are accepted+stored by the apiserver but never enforced.
+# Cluster-scoped, so re-applying from a 2nd node's lima-start.sh run is a harmless
+# idempotent no-op.
 echo "Applying kube-network-policies DaemonSet..."
 kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$KUBE_NETWORK_POLICIES_YAML"
 
@@ -1012,40 +972,6 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$KUBE_NETWORK
 # it) exist — waiting here made desired/ready unable to ever leave 0/0 on a fresh
 # --reset, deadlocking every run. run-all.sh performs the wait itself once KCM,
 # the scheduler, and the final node topology are all up.
-
-# Inter-node pod routes: nothing else programs a path to a peer's pod subnet — no
-# CNI/BGP here, by design (static routes over the shared user-v2 network). Re-run
-# on every invocation, of this node OR a peer's, because routes don't survive a VM
-# reboot. A lone primary has no peers yet, so this loop is a no-op until a 2nd node
-# joins; whichever node's lima-start.sh runs re-asserts the pairing both ways, so a
-# stale route on either side self-heals the next time either node reconnects.
-PEERS=$(kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
-THIS_NODE_IP=$(limactl shell "$VM_NAME" ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
-for PEER in $PEERS; do
-  [ "$PEER" = "$VM_NAME" ] && continue
-  # Separate Lima networks are separate L2 segments with no path between them —
-  # a route programmed across a network boundary can never actually deliver a
-  # packet, it just fails silently later as "Host is unreachable". Compare each
-  # VM's OWN recorded network (not the current invocation's $NETWORK, which only
-  # describes $VM_NAME) so a cross-network pairing fails loud here instead of
-  # producing that unreachable route.
-  THIS_NET=$(awk '/^networks:/{f=1;next} f&&/lima:/{print $NF;exit}' "${HOME}/.lima/${VM_NAME}/lima.yaml")
-  PEER_NET=$(awk '/^networks:/{f=1;next} f&&/lima:/{print $NF;exit}' "${HOME}/.lima/${PEER}/lima.yaml")
-  if [ "$THIS_NET" != "$PEER_NET" ]; then
-    echo "error: ${VM_NAME} is on network '${THIS_NET}' but peer '${PEER}' is on '${PEER_NET}' — no L2 path exists between separate Lima networks, refusing to program an unreachable route" >&2
-    exit 1
-  fi
-  PEER_IP=$(limactl shell "$PEER" ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
-  PEER_SUBNET=$(limactl shell "$PEER" sudo jq -r '.plugins[0].ipam.ranges[0][0].subnet' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
-  if [ -z "$PEER_IP" ] || [ -z "$PEER_SUBNET" ] || [ -z "$THIS_NODE_IP" ]; then
-    echo "WARNING: could not resolve route info for peer '${PEER}' — skipping inter-node route" >&2
-    continue
-  fi
-  echo "Routing ${VM_NAME} -> ${PEER_SUBNET} via ${PEER_IP} (${PEER})"
-  limactl shell "$VM_NAME" sudo ip route replace "$PEER_SUBNET" via "$PEER_IP"
-  echo "Routing ${PEER} -> ${POD_SUBNET} via ${THIS_NODE_IP} (${VM_NAME})"
-  limactl shell "$PEER" sudo ip route replace "$POD_SUBNET" via "$THIS_NODE_IP"
-done
 
 echo ""
 echo "Run kubectl commands with:"

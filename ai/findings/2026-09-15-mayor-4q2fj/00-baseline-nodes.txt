@@ -1,3 +1,0 @@
-NAME          STATUS   ROLES    AGE   VERSION   INTERNAL-IP     EXTERNAL-IP   OS-IMAGE           KERNEL-VERSION     CONTAINER-RUNTIME
-lima-node-2   Ready    <none>   1m    v1.36.4   192.168.108.4   <none>        Ubuntu 26.04 LTS   7.0.0-31-generic   cri-o://1.36.5
-lima-node-3   Ready    <none>   16s   v1.36.4   192.168.108.5   <none>        Ubuntu 26.04 LTS   7.0.0-31-generic   cri-o://1.36.5

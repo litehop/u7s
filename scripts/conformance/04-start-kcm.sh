@@ -155,7 +155,10 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
   --service-account-private-key-file="\$WORKDIR/sa.key" \\
   --root-ca-file="\$CA_CERT" \\
-  --controllers='*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \\
+  --controllers='*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-lb-controller,-service-cidr-controller' \\
+  --cluster-cidr=10.244.0.0/16 \\
+  --allocate-node-cidrs=true \\
+  --node-cidr-mask-size=24 \\
   --concurrent-gc-syncs=5 \\
   --use-service-account-credentials=false \\
   --leader-elect=false \\

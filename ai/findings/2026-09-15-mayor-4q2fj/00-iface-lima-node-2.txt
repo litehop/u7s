@@ -1,7 +1,0 @@
-1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
-2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000\    link/ether 52:55:55:bf:95:43 brd ff:ff:ff:ff:ff:ff\    altname enx525555bf9543
-3: cni0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default qlen 1000\    link/ether a6:97:f1:86:62:4c brd ff:ff:ff:ff:ff:ff
-4: veth8168be23@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master cni0 state UP mode DEFAULT group default \    link/ether ee:69:f8:1d:5d:dd brd ff:ff:ff:ff:ff:ff link-netns f0c6eda1-7477-4719-a011-e132d2eae2ac
-6: veth00266b0a@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master cni0 state UP mode DEFAULT group default \    link/ether 6a:43:31:e0:4f:8b brd ff:ff:ff:ff:ff:ff link-netns 8e3775a2-9498-47a8-b2db-5350f932bb87
-7: veth13856507@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master cni0 state UP mode DEFAULT group default \    link/ether e2:a6:1e:f6:6f:3b brd ff:ff:ff:ff:ff:ff link-netns a39a1481-ae55-471e-ad1c-9c9ae581197c
-8: vethcacd2aba@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master cni0 state UP mode DEFAULT group default \    link/ether e2:1e:78:a8:44:f5 brd ff:ff:ff:ff:ff:ff link-netns b13bfb5d-9249-4bc8-98a7-47fe3d1c3bef

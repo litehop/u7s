@@ -1,6 +1,0 @@
-namespace/kube-flannel created
-serviceaccount/flannel created
-clusterrole.rbac.authorization.k8s.io/flannel created
-clusterrolebinding.rbac.authorization.k8s.io/flannel created
-configmap/kube-flannel-cfg created
-daemonset.apps/kube-flannel-ds created
