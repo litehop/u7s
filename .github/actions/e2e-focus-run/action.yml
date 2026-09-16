@@ -323,10 +323,11 @@ runs:
       # (919-932) and scripts/conformance/lima-start.sh (949-959) do --
       # __IFACE__ substituted with this runner's primary NIC, __POD_CLUSTER_CIDR__
       # matching kube-controller-manager's node-ipam-controller default
-      # elsewhere in this repo. node-ipam-controller is excluded from this
-      # workflow's --controllers set below, so flanneld's --kube-subnet-mgr
-      # self-allocates ci-node's subnet directly instead of waiting on a
-      # spec.podCIDR that would otherwise never get assigned.
+      # elsewhere in this repo. node-ipam-controller stays enabled in this
+      # workflow's --controllers set below so it assigns ci-node's
+      # spec.podCIDR, which flanneld's --kube-subnet-mgr reads to compute its
+      # lease (full rationale at the kube-controller-manager step below and
+      # the "Wait for flannel ready" step further down).
       env:
         KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
       shell: bash
@@ -534,12 +535,14 @@ runs:
       run: |
         WORKDIR="$PWD/temp/u7s"
         # The wildcard controller set (minus cloud-specific controllers u7s does
-        # not implement) matches scripts/conformance/04-start-kcm.sh's proven
-        # real-conformance configuration -- real upstream e2e specs depend on
-        # controllers this workflow's narrower smoke/perf-test peers never
-        # needed (e.g. the namespace controller finalizing each test's
-        # ephemeral namespace). kcm-supervisor.sh restarts kcm on crash instead
-        # of silently blacking out the control plane for the rest of the run.
+        # not implement) matches scripts/install.sh's u7s-kcm.service
+        # --controllers set exactly (see its rationale there for
+        # -clusterrole-aggregation-controller / -device-taint-eviction-controller)
+        # -- real upstream e2e specs depend on controllers this workflow's
+        # narrower smoke/perf-test peers never needed (e.g. the namespace
+        # controller finalizing each test's ephemeral namespace).
+        # kcm-supervisor.sh restarts kcm on crash instead of silently
+        # blacking out the control plane for the rest of the run.
         # node-ipam-controller must stay enabled (unlike an earlier version of
         # this workflow that excluded it): it is the only thing that ever sets
         # Node.spec.podCIDR, which flanneld's --kube-subnet-mgr reads to compute
@@ -555,7 +558,7 @@ runs:
           --cluster-signing-key-file="$WORKDIR/ca.key" \
           --service-account-private-key-file="$WORKDIR/sa.key" \
           --root-ca-file="$WORKDIR/ca.pem" \
-          --controllers='*,-cloud-node-lifecycle-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \
+          --controllers='*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \
           --allocate-node-cidrs=true \
           --cluster-cidr=10.244.0.0/16 \
           --node-cidr-mask-size=24 \
