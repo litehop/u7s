@@ -19,6 +19,9 @@
       "mcp__mcpls__*"
     ]
   },
+  "env":{
+    "CLAUDE_CODE_COZY_TEAPOT": "relaxed"
+  },
   "worktree": {
     "baseRef": "fresh"
   },

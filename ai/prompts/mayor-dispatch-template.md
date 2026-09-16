@@ -845,6 +845,15 @@ not wired into `run-all.sh` today — an option when you only need "is the clust
   final gate once a fix is in, not for iterative diagnosis.
 - `--stack-only` + `--focus` together: `--focus` is ignored (warning to stderr),
   stack-only wins.
+- **Decide `--reset` by work-relatedness, not a fixed default.** UNRELATED work should
+  `--reset` — an unrelated bead can't trust the accumulated state a prior run left, so
+  it needs a clean, known-good base. A bead RESUMING the same or closely-related work
+  (same rig/run/investigation) on a stack that's already up can OMIT `--reset` and
+  reproduce straight against it (`kubectl --kubeconfig ./temp/u7s/kubeconfig ...`) with
+  no bring-up. `--reset` tears down and rebuilds from scratch (~25 min on the flannel
+  rig), so spend it only when relatedness (or an unhealthy/stale stack) warrants it
+  (mayor-dkov2, a resumption, burned ~25 min on an unneeded `--reset` because the brief
+  defaulted to it).
 
 `--workdir ./temp/u7s` (relative to CWD = worktree root) is where state lands.
 `--verbose` turns on `RUST_LOG=debug` (set inside the script — never export it
