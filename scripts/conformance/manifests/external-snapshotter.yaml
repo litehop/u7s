@@ -1,4 +1,4 @@
-# Vendored from kubernetes-csi/external-snapshotter tag v8.5.0: the
+# Vendored from kubernetes-csi/external-snapshotter tag v8.6.0: the
 # snapshot.storage.k8s.io CRDs (VolumeSnapshotClass, VolumeSnapshotContent,
 # VolumeSnapshot), the cluster-level snapshot-controller Deployment, and its
 # RBAC (ServiceAccount/ClusterRole/ClusterRoleBinding for the control loop,
@@ -10,26 +10,27 @@
 # "snapshot.storage.k8s.io/v1/volumesnapshotclasses" not found`
 # (test/e2e/storage/framework/snapshot_resource.go).
 #
-# Version pin -- v8.5.0, not the newer v8.6.0: the csi-hostpath driver
-# manifest the conformance image (registry.k8s.io/conformance:v1.36.4)
-# installs per-driver (test/e2e/testing-manifests/storage-csi/hostpath/
-# hostpath/csi-hostpath-plugin.yaml, hostpathplugin:v1.17.1) already runs
-# its own `csi-snapshotter` sidecar at image tag
-# registry.k8s.io/sig-storage/csi-snapshotter:v8.5.0 plus its own
-# ServiceAccount/ClusterRole(external-snapshotter-runner)/RBAC (test/e2e/
-# testing-manifests/storage-csi/external-snapshotter/csi-snapshotter/
-# rbac-csi-snapshotter.yaml) -- so this manifest only needs to add the
-# missing cluster-level half (CRDs + snapshot-controller), pinned to the
-# exact same v8.5.0 release the sidecar already ships so the CRD schema the
-# sidecar's client code expects and the schema the apiserver actually
-# serves never skew.
+# Version pin -- one static v8.6.0 pin covers the whole 1.35/1.36/1.37 e2e
+# matrix, even though each minor's own conformance image bundles a
+# different csi-hostpath-plugin.yaml csi-snapshotter sidecar tag
+# (release-1.35: v8.4.0, release-1.36: v8.5.0, release-1.37: v8.6.0):
+# diffing kubernetes-csi/external-snapshotter's CRDs (client/config/crd/
+# snapshot.storage.k8s.io_volume{snapshot,snapshotclass,snapshotcontent}s.yaml)
+# and its snapshot-controller RBAC (deploy/kubernetes/snapshot-controller/
+# rbac-snapshot-controller.yaml) across tags v8.4.0/v8.5.0/v8.6.0 shows them
+# byte-identical -- the v1 snapshot API has been stable since 4.1.0, so
+# there is no schema to skew regardless of which of those three sidecar
+# tags this manifest's snapshot-controller talks to. Pinned to v8.6.0 (the
+# newest, matching release-1.37) rather than splitting the pin per
+# --k8s-version, since the evidence above makes a single value compatible.
 #
 # One deviation from upstream's stock deploy/kubernetes/snapshot-controller/
 # setup-snapshot-controller.yaml: that reference file still pins
-# snapshot-controller:v8.4.0, a known one-release lag behind the v8.5.0
-# tag's own CRDs/RBAC (the v8.5.0 GitHub release notes' own `docker pull`
-# list names snapshot-controller:v8.5.0) -- bumped here to v8.5.0 to match
-# everything else this manifest pins.
+# snapshot-controller:v8.5.0, a known one-release lag behind the v8.6.0
+# tag's own CRDs/RBAC (registry.k8s.io/sig-storage/snapshot-controller:v8.6.0
+# does exist and is pullable, confirmed via a manifest HEAD against
+# registry.k8s.io/v2/sig-storage/snapshot-controller/manifests/v8.6.0) --
+# bumped here to v8.6.0 to match everything else this manifest pins.
 #
 # Not baked into the apiserver's own boot sequence, install.sh, or any
 # production release bundle -- the VolumeSnapshot API stays out of scope for
@@ -1112,11 +1113,12 @@ spec:
       containers:
         - name: snapshot-controller
           # Upstream's own deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml
-          # still pins v8.4.0 at the v8.5.0 tag (a one-release lag in that reference
-          # file); bumped here to v8.5.0 to match the CRDs/RBAC above and the
-          # csi-snapshotter:v8.5.0 sidecar the csi-hostpath driver runs -- see this
-          # file's header comment.
-          image: registry.k8s.io/sig-storage/snapshot-controller:v8.5.0
+          # still pins v8.5.0 at the v8.6.0 tag (a one-release lag in that reference
+          # file); bumped here to v8.6.0 to match the CRDs/RBAC above -- see this
+          # file's header comment for why one pin covers the whole 1.35/1.36/1.37
+          # e2e matrix despite each minor's conformance image shipping a
+          # different csi-snapshotter sidecar tag.
+          image: registry.k8s.io/sig-storage/snapshot-controller:v8.6.0
           args:
             - "--v=5"
             - "--leader-election=true"

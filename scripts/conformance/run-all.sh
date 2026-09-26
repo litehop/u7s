@@ -15,6 +15,7 @@
 #                                  [--stack-only] [--vm <name>] [--network <name>]
 #                                  [--binary <path>] [--port <N>] [--workdir <path>]
 #                                  [--konnectivity-server-port <N>] [--procs <N>]
+#                                  [--k8s-version <ver>]
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #                                  [--embedded-scheduler <true|false>]
 #
@@ -73,6 +74,12 @@
 #             namespace/pod churn OOMs a 4GiB lima VM under concurrent-load
 #             scouting, where --focus's own matched-spec-count was the only
 #             (weaker, imprecise) cap on real parallelism.
+#   --k8s-version  Overrides the conformance image tag 06-run-sonobuoy.sh passes to
+#             `sonobuoy run` as --kube-conformance-image=registry.k8s.io/conformance:v<ver>,
+#             mirroring the per-matrix-branch override .github/workflows/e2e-focus.yaml
+#             already does inline. Without it, 06-run-sonobuoy.sh's own default applies
+#             (unchanged behavior) — this is the only way to run a version other than
+#             whatever scripts/conformance/sonobuoy-plugin-e2e.yaml hardcodes.
 #   -v, -vv, -vvv  Repeatable-flag tiered debug logging, apt-style (--verbose is
 #                kept as an alias for a single -v). -v scopes RUST_LOG to u7s's own
 #                crates: u7s_apiserver=debug,u7s_store=debug,u7s_scheduler=debug,info.
@@ -204,6 +211,7 @@ PROFILE=0
 DHAT_DEPTH=""
 SAMPLE_INTERVAL=""
 PROCS=""
+K8S_VERSION=""
 EMBEDDED_SCHEDULER=""
 
 while [[ $# -gt 0 ]]; do
@@ -230,6 +238,7 @@ while [[ $# -gt 0 ]]; do
     --dhat-depth) DHAT_DEPTH="$2"; shift 2 ;;
     --sample-interval) SAMPLE_INTERVAL="$2"; shift 2 ;;
     --procs) PROCS="$2"; shift 2 ;;
+    --k8s-version) K8S_VERSION="$2"; shift 2 ;;
     --embedded-scheduler) EMBEDDED_SCHEDULER="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -367,6 +376,8 @@ _SAMPLE_INTERVAL_ARG=""
 [ -n "$SAMPLE_INTERVAL" ] && _SAMPLE_INTERVAL_ARG="--interval $SAMPLE_INTERVAL"
 _PROCS_ARG=""
 [ -n "$PROCS" ] && _PROCS_ARG="--procs $PROCS"
+_K8S_VERSION_ARG=""
+[ -n "$K8S_VERSION" ] && _K8S_VERSION_ARG="--k8s-version $K8S_VERSION"
 _EMBEDDED_SCHEDULER_ARG=""
 [ -n "$EMBEDDED_SCHEDULER" ] && _EMBEDDED_SCHEDULER_ARG="--embedded-scheduler $EMBEDDED_SCHEDULER"
 
@@ -532,7 +543,7 @@ else
   banner "Step 6/6: Run sonobuoy"
   export SONOBUOY_FOCUS="$FOCUS"
   # shellcheck disable=SC2086
-  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG} ${_PROCS_ARG}
+  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG} ${_PROCS_ARG} ${_K8S_VERSION_ARG}
 
   # Build provenance: record what was actually tested (git SHA, dhat feature/
   # depth, node topology, exact invocation) into this run's own meta/build.json
