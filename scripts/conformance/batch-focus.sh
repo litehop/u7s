@@ -68,7 +68,7 @@ TIMEOUT="5m"
 POD_NAME="batch-focus"
 KEEP_POD=0
 LIST_ONLY=0
-IMAGE="registry.k8s.io/conformance:v1.36.4"
+IMAGE="registry.k8s.io/conformance:v1.37.1"
 
 usage() {
   cat <<'EOF'

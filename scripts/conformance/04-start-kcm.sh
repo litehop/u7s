@@ -42,7 +42,7 @@ fi
 
 # Kill any stale kube-controller-manager from a previous run. The real process
 # is launched via an absolute cached-binary path (e.g.
-# /home/.../kube-controller-manager-1.36.4-linux-arm64), so an anchored
+# /home/.../kube-controller-manager-1.37.1-linux-arm64), so an anchored
 # '^kube-controller-manager' pattern never matches — match the versioned
 # binary basename instead (the trailing [0-9] also keeps this guard's own
 # quoted pattern text below from matching itself).
@@ -90,8 +90,8 @@ KCM_V_FLAG="$([ -n "$KCM_V" ] && echo "--v=$KCM_V" || echo "")"
 CACHE_DIR="\${KCM_CACHE_DIR:-\${HOME}/.cache/u7s/kcm}"
 KCM_LOG="$KCM_LOG"
 
-# Determine k8s version from kubectl inside the VM; fallback to 1.36.4.
-DEFAULT_VERSION="1.36.4"
+# Determine k8s version from kubectl inside the VM; fallback to 1.37.1.
+DEFAULT_VERSION="1.37.1"
 if command -v kubectl &>/dev/null; then
   DETECTED=\$(kubectl version --client -o json 2>/dev/null \
     | jq -r '.clientVersion.gitVersion' 2>/dev/null \
@@ -141,7 +141,9 @@ fi
 echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
 SUPERVISOR_LOG="/tmp/kcm-supervisor.log"
 chmod +x /tmp/kcm-supervisor.sh
-# -clusterrole-aggregation-controller / -device-taint-eviction-controller:
+# -clusterrole-aggregation-controller / -device-taint-eviction-controller,
+# and the deliberate absence of cloud-node-lifecycle-controller /
+# node-route-controller / service-lb-controller from this exclusion list:
 # see scripts/install.sh's u7s-kcm.service for why -- mirrored here so the
 # conformance run exercises what ships.
 # --authorization-always-allow-paths below adds /metrics to the default
@@ -155,7 +157,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
   --service-account-private-key-file="\$WORKDIR/sa.key" \\
   --root-ca-file="\$CA_CERT" \\
-  --controllers='*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-lb-controller,-service-cidr-controller' \\
+  --controllers='*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller' \\
   --cluster-cidr=10.244.0.0/16 \\
   --allocate-node-cidrs=true \\
   --node-cidr-mask-size=24 \\
