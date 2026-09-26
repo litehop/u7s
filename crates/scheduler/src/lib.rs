@@ -1498,19 +1498,49 @@ impl PreemptionWaiters {
 /// the waiting pod, never a stuck-forever one.
 #[derive(Debug, Default)]
 struct PvcWaiters {
-    by_pvc: std::collections::HashMap<String, Vec<String>>,
+    by_pvc: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 impl PvcWaiters {
+    /// Idempotent: `main.rs`'s missing-PVC branch releases `pod_key` from
+    /// `in_flight` on every defer (unlike `PreemptionWaiters`'s deferred
+    /// bind, which keeps it there), so a still-missing PVC gets this same
+    /// `(pvc_key, pod_key)` pair re-registered every RESYNC_INTERVAL —
+    /// forever, for a permanently-missing PVC. A plain `Vec::push` here
+    /// would grow that one pod's entry once per tick without bound; the set
+    /// makes re-registering the same pair a no-op instead.
     fn register(&mut self, pvc_key: String, pod_key: String) {
-        self.by_pvc.entry(pvc_key).or_default().push(pod_key);
+        self.by_pvc.entry(pvc_key).or_default().insert(pod_key);
     }
 
     /// `pvc_key` was just observed as ADDED/MODIFIED (i.e. it now exists).
     /// Returns every pod key that was waiting on exactly this PVC, ready for
     /// the caller to re-drive.
     fn resolve(&mut self, pvc_key: &str) -> Vec<String> {
-        self.by_pvc.remove(pvc_key).unwrap_or_default()
+        self.by_pvc
+            .remove(pvc_key)
+            .map(|pods| pods.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// `pvc_key` was just observed as DELETED — drop its waiters outright,
+    /// rather than leaving them registered against a PVC that no longer
+    /// exists to ever ADD/MODIFY again.
+    fn forget(&mut self, pvc_key: &str) {
+        self.by_pvc.remove(pvc_key);
+    }
+
+    /// `pod_key` was just observed bound or deleted — either way it will
+    /// never need `resolve`'s re-drive again, so drop its registration
+    /// wherever it appears. Without this, a pod that binds (via some path
+    /// other than this exact waiter resolving) or is deleted while still
+    /// registered leaves a stale entry that `resolve` would otherwise hand
+    /// back to a caller with nothing left to schedule.
+    fn remove_pod(&mut self, pod_key: &str) {
+        self.by_pvc.retain(|_, pods| {
+            pods.remove(pod_key);
+            !pods.is_empty()
+        });
     }
 
     fn clear(&mut self) {
@@ -1683,6 +1713,8 @@ impl NodeTally {
 
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.remove_pod(&key);
+            // A deleted pod can never be re-driven — see `PvcWaiters::remove_pod`.
+            self.pvc_waiters.remove_pod(&key);
             return self.waiters.resolve(&key);
         }
         let terminal = matches!(
@@ -1703,6 +1735,10 @@ impl NodeTally {
         let node_name = watch_event.object.spec.node_name.filter(|n| !n.is_empty());
         match node_name {
             Some(node_name) if !terminal => {
+                // Now bound — a waiter registered against it can never be
+                // re-driven off `resolve` any more (see
+                // `PvcWaiters::remove_pod`).
+                self.pvc_waiters.remove_pod(&key);
                 self.insert_pod(
                     key,
                     TalliedPod {
@@ -1726,6 +1762,7 @@ impl NodeTally {
                 // preemption victim that completes this way (rather than
                 // being hard-deleted first) must resolve waiters too.
                 self.remove_pod(&key);
+                self.pvc_waiters.remove_pod(&key);
                 self.waiters.resolve(&key)
             }
             None => {
@@ -2040,6 +2077,10 @@ impl NodeTally {
         let key = pvc_key(&namespace, &name);
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.pvcs.remove(&key);
+            // The PVC is confirmed gone, not merely not-yet-created — drop
+            // any waiters registered against it too (see
+            // `PvcWaiters::forget`).
+            self.pvc_waiters.forget(&key);
             return Vec::new();
         }
         self.pvcs.insert(

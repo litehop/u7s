@@ -3251,4 +3251,120 @@ mod tests {
              persistentvolumeclaim \"prime-pvc\" not found message; got {patches:?}"
         );
     }
+
+    /// `PvcWaiters::register` used to push unconditionally: the missing-PVC
+    /// branch releases `in_flight` on every defer (unlike the preemption
+    /// Deferred path, which keeps the key in `in_flight` so its own waiter
+    /// registers exactly once), so a permanently-missing PVC got this same
+    /// pod key re-registered every RESYNC_INTERVAL — an unbounded leak for
+    /// any typo'd `claimName` or PVC deleted out from under a pod and never
+    /// recreated. This drives several resync ticks against the same
+    /// permanently-missing PVC and checks the waiter set still holds exactly
+    /// one entry, then registers once more and checks the pod's own
+    /// deletion drops it to zero. A revert of either the set-semantics fix
+    /// or the delete-cleanup hook makes this fail: the count would grow with
+    /// every tick, or the deleted pod's entry would still be handed back.
+    #[tokio::test]
+    async fn missing_pvc_waiter_holds_one_entry_per_pod_across_repeated_resync_ticks_and_drops_on_pod_delete(
+    ) {
+        let (connector, server, _status_patches, _events) =
+            spawn_permanently_missing_pvc_mock_server().await;
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+
+        // Several resync ticks against the same permanently-missing PVC —
+        // exactly what production's 30s RESYNC_INTERVAL loop does forever
+        // for a pod stuck this way.
+        for _ in 0..5 {
+            handle_pod_event(pod_event.clone(), &connector, &server, &in_flight, &tally);
+            wait_until(
+                || {
+                    !in_flight
+                        .lock()
+                        .expect("in_flight lock poisoned")
+                        .contains("default/web-0")
+                },
+                "each repeated defer to release its in_flight dedup key before the next tick",
+            )
+            .await;
+        }
+
+        let ready = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_pvc_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "prime-pvc", "namespace": "default"}, "spec": {}}
+            }));
+        assert_eq!(
+            ready,
+            vec!["default/web-0".to_owned()],
+            "5 resync ticks against the same permanently-missing PVC must leave exactly one \
+             waiter entry for the pod, not one per tick — got {ready:?}"
+        );
+
+        // Register the waiter again, then delete the pod — its own entry
+        // must be dropped, or it would sit here forever waiting on a PVC it
+        // can never actually use once the pod referencing it is gone.
+        handle_pod_event(pod_event.clone(), &connector, &server, &in_flight, &tally);
+        wait_until(
+            || {
+                !in_flight
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .contains("default/web-0")
+            },
+            "the defer to release its in_flight dedup key before the pod is deleted",
+        )
+        .await;
+
+        handle_pod_event(
+            json!({
+                "type": "DELETED",
+                "object": {
+                    "metadata": {"name": "web-0", "namespace": "default"},
+                    "spec": {},
+                    "status": {}
+                }
+            }),
+            &connector,
+            &server,
+            &in_flight,
+            &tally,
+        );
+
+        let ready_after_delete = tally.lock().expect("tally lock poisoned").apply_pvc_event(
+            &json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "prime-pvc", "namespace": "default"}, "spec": {}}
+            }),
+        );
+        assert!(
+            ready_after_delete.is_empty(),
+            "a deleted pod's waiter must not linger — resolving its PVC afterward must not \
+             hand back a pod key that no longer exists; got {ready_after_delete:?}"
+        );
+    }
 }
