@@ -1482,6 +1482,42 @@ impl PreemptionWaiters {
     }
 }
 
+/// Pod keys ("namespace/name") deferred because a live GET of one of their
+/// OWN referenced PVCs 404'd at scheduling time (`main.rs`'s missing-PVC
+/// branch) — the AnyVolumeDataSource populator creation race this exists to
+/// close. Keyed by the missing PVC's own `pvc_key`, so `apply_pvc_event`'s
+/// ADDED/MODIFIED branch can hand back every pod waiting on it the instant
+/// the PVC becomes visible, instead of relying solely on
+/// `pods_needing_resync`'s RESYNC_INTERVAL (30s) bound to notice — mirrors
+/// upstream's VolumeBinding PreFilter, which requeues off the PVC's own Add
+/// event rather than a fixed-interval rescan.
+///
+/// CACHE ONLY, same guarantee as `PreemptionWaiters` (see its own doc
+/// comment): losing an entry here — `clear_pvc_cache` on a watch reconnect,
+/// or a process restart — costs at most RESYNC_INTERVAL of extra latency for
+/// the waiting pod, never a stuck-forever one.
+#[derive(Debug, Default)]
+struct PvcWaiters {
+    by_pvc: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl PvcWaiters {
+    fn register(&mut self, pvc_key: String, pod_key: String) {
+        self.by_pvc.entry(pvc_key).or_default().push(pod_key);
+    }
+
+    /// `pvc_key` was just observed as ADDED/MODIFIED (i.e. it now exists).
+    /// Returns every pod key that was waiting on exactly this PVC, ready for
+    /// the caller to re-drive.
+    fn resolve(&mut self, pvc_key: &str) -> Vec<String> {
+        self.by_pvc.remove(pvc_key).unwrap_or_default()
+    }
+
+    fn clear(&mut self) {
+        self.by_pvc.clear();
+    }
+}
+
 /// An in-memory, watch-maintained running tally of every bound, non-terminal
 /// pod's resource requests, keyed by "namespace/name".
 ///
@@ -1526,6 +1562,8 @@ pub struct NodeTally {
     /// "namespace/name" -> (bound PV name, StorageClass name) — watch-
     /// maintained by `apply_pvc_event`, mirroring upstream's PVC lister.
     pvcs: std::collections::HashMap<String, PvcVolumeInfo>,
+    /// Pods deferred on a missing PVC, keyed by that PVC — see `PvcWaiters`.
+    pvc_waiters: PvcWaiters,
     /// PV name -> CSI driver (`spec.csi.driver`) — watch-maintained by
     /// `apply_pv_event`, mirroring upstream's PV lister.
     pv_csi_drivers: std::collections::HashMap<String, String>,
@@ -1979,13 +2017,19 @@ impl NodeTally {
     /// comment. A malformed event, or one with no name, is silently ignored
     /// exactly like `apply_event`'s pod handling (a bookmark event has no
     /// usable object, not a real change to react to).
-    pub fn apply_pvc_event(&mut self, event: &Value) {
+    ///
+    /// Returns every pod key (`PvcWaiters::resolve`) that was deferred
+    /// waiting on exactly this PVC — empty for the overwhelming majority of
+    /// events, which never touch a tracked waiter at all. The caller
+    /// (`main.rs`'s PVC watch loop) re-drives each one immediately, instead
+    /// of leaving it to `pods_needing_resync`'s RESYNC_INTERVAL bound.
+    pub fn apply_pvc_event(&mut self, event: &Value) -> Vec<String> {
         let Ok(watch_event) = WatchEvent::<PvcObject>::deserialize(event) else {
-            return;
+            return Vec::new();
         };
         let name = watch_event.object.metadata.name.clone().unwrap_or_default();
         if name.is_empty() {
-            return;
+            return Vec::new();
         }
         let namespace = watch_event
             .object
@@ -1996,15 +2040,26 @@ impl NodeTally {
         let key = pvc_key(&namespace, &name);
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.pvcs.remove(&key);
-            return;
+            return Vec::new();
         }
         self.pvcs.insert(
-            key,
+            key.clone(),
             PvcVolumeInfo {
                 volume_name: watch_event.object.spec.volume_name,
                 storage_class_name: watch_event.object.spec.storage_class_name,
             },
         );
+        self.pvc_waiters.resolve(&key)
+    }
+
+    /// Register `pod_key` ("namespace/name") as deferred until PVC
+    /// `namespace/pvc_name` is observed to exist — called by `main.rs`'s
+    /// missing-PVC branch right before it releases `pod_key` from
+    /// `in_flight` and gives up on this scheduling attempt. See
+    /// `PvcWaiters`'s doc comment for what re-drives it.
+    pub fn register_pvc_waiter(&mut self, namespace: &str, pvc_name: &str, pod_key: String) {
+        self.pvc_waiters
+            .register(pvc_key(namespace, pvc_name), pod_key);
     }
 
     /// Update the PV cache from one raw PersistentVolume watch event — see
@@ -2106,6 +2161,7 @@ impl NodeTally {
     /// StorageClass/CSINode watches (independent connections) also dropped.
     pub fn clear_pvc_cache(&mut self) {
         self.pvcs.clear();
+        self.pvc_waiters.clear();
     }
 
     /// Drop the PV cache — see `clear_pvc_cache`'s doc comment.
@@ -10189,6 +10245,93 @@ mod tests {
              make the reservation no longer fit — binding anyway here is \
              exactly the 'the map says so' shortcut the fast path must never \
              take"
+        );
+    }
+
+    /// The AnyVolumeDataSource populator race this fix closes (see
+    /// `run.rs`'s missing-PVC branch): `main.rs` registers a deferred pod's
+    /// key against exactly the PVC it 404'd on, and `apply_pvc_event`'s
+    /// ADDED branch must hand that key straight back the instant the PVC's
+    /// own create lands — without waiting for `pods_needing_resync`'s 30s
+    /// RESYNC_INTERVAL bound. If this regressed to only clearing the cache
+    /// entry (the pre-fix behavior), the caller would never learn a waiter
+    /// exists to re-drive at all, and the pod would be stuck on the slow
+    /// resync path for every single PVC-creation race, not just a genuinely
+    /// missing PVC.
+    #[test]
+    fn apply_pvc_event_resolves_the_pod_waiting_on_exactly_this_pvc() {
+        let mut tally = NodeTally::default();
+        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+
+        let ready = tally.apply_pvc_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "prime-pvc", "namespace": "default" },
+                "spec": {}
+            }
+        }));
+
+        assert_eq!(
+            ready,
+            vec!["default/populate-a".to_owned()],
+            "the PVC's own ADDED event must hand back exactly the pod key registered against \
+             it, so the caller can re-drive scheduling immediately instead of waiting out \
+             RESYNC_INTERVAL"
+        );
+    }
+
+    /// A different PVC's ADDED event must never resolve an unrelated pod's
+    /// waiter — the AnyVolumeDataSource populator often creates several
+    /// `prime-*` PVCs close together, and mixing them up would either
+    /// re-drive the wrong (still-blocked) pod pointlessly or, worse, leave
+    /// the RIGHT pod's waiter dangling until the next resync even though its
+    /// own PVC never actually appeared here.
+    #[test]
+    fn apply_pvc_event_does_not_resolve_a_waiter_registered_for_a_different_pvc() {
+        let mut tally = NodeTally::default();
+        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+
+        let ready = tally.apply_pvc_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "unrelated-pvc", "namespace": "default" },
+                "spec": {}
+            }
+        }));
+
+        assert!(
+            ready.is_empty(),
+            "an unrelated PVC's ADDED event must never resolve a different PVC's waiter — got \
+             {ready:?}"
+        );
+    }
+
+    /// `clear_pvc_cache` runs on every PVC watch reconnect — it must drop
+    /// stale waiters along with the PVC cache itself, or a waiter registered
+    /// before a reconnect could still fire after the fresh
+    /// `sendInitialEvents=true` relist replays that PVC's ADDED event a
+    /// second time, potentially re-driving a pod whose scheduling attempt
+    /// has long since moved on. Losing the entry here costs at most
+    /// RESYNC_INTERVAL of extra latency (see `PvcWaiters`'s doc comment),
+    /// never a stuck-forever pod.
+    #[test]
+    fn clear_pvc_cache_drops_registered_pvc_waiters() {
+        let mut tally = NodeTally::default();
+        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+
+        tally.clear_pvc_cache();
+
+        let ready = tally.apply_pvc_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "prime-pvc", "namespace": "default" },
+                "spec": {}
+            }
+        }));
+        assert!(
+            ready.is_empty(),
+            "a waiter registered before clear_pvc_cache must not still fire afterward — got \
+             {ready:?}"
         );
     }
 
