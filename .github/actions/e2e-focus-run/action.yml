@@ -6,7 +6,7 @@ description: >-
   job and the sensitive-e2e-guard job so both exercise identical bring-up.
 inputs:
   k8s_version:
-    description: Kubernetes version for kubelet/kubectl/kube-proxy/KCM + the conformance image, e.g. 1.36.4.
+    description: Kubernetes version for kubelet/kubectl/kube-proxy/KCM + the conformance image, e.g. 1.37.1.
     required: true
   focus:
     description: ginkgo --e2e-focus regex passed to sonobuoy.
@@ -682,11 +682,11 @@ runs:
       shell: bash
       run: |
         # scripts/conformance/sonobuoy-plugin-e2e.yaml hardcodes the
-        # plugin's image field at a specific v1.36.4 tag (it's a static
+        # plugin's image field at a specific v1.37.1 tag (it's a static
         # manifest -- sonobuoy loads it verbatim, not per-cluster the way
         # its own --kubernetes-version=auto default does). Without this
         # CLI-level override every matrix branch would run the same fixed
-        # v1.36.4 e2e binaries against its own matrix-selected kubelet --
+        # v1.37.1 e2e binaries against its own matrix-selected kubelet --
         # burying real per-version issues. --kube-conformance-image
         # overrides just the image tag on the plugin (shorthand for
         # --plugin-image=e2e:<image>) without touching the manifest.

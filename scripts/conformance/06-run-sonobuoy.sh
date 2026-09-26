@@ -44,7 +44,7 @@ UNSAFE_FOCUS=0
 # SONOBUOY_K8S_VERSION/image tag, so an invocation that omits --k8s-version
 # behaves exactly as before (same reasoning as PROCS's default above). Keep
 # these two in sync.
-K8S_VERSION="1.36.4"
+K8S_VERSION="1.37.1"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

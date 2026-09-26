@@ -69,23 +69,23 @@ build_base_args() {
 
 # Default (no --k8s-version): must still emit a well-formed image tag, not an
 # empty/broken one -- an invocation that omits the flag must keep working.
-# 1.36.4 matches 06-run-sonobuoy.sh's own K8S_VERSION default (kept in sync
+# 1.37.1 matches 06-run-sonobuoy.sh's own K8S_VERSION default (kept in sync
 # with sonobuoy-plugin-e2e.yaml's hardcoded SONOBUOY_K8S_VERSION/image) --
 # update both together if that default ever moves again.
-DEFAULT_ARGS=$(build_base_args "1.36.4")
-assert "default (no --k8s-version) emits --kube-conformance-image=...v1.36.4" \
-  "$(printf '%s' "$DEFAULT_ARGS" | grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.36.4' && echo 1 || echo 0)"
+DEFAULT_ARGS=$(build_base_args "1.37.1")
+assert "default (no --k8s-version) emits --kube-conformance-image=...v1.37.1" \
+  "$(printf '%s' "$DEFAULT_ARGS" | grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.37.1' && echo 1 || echo 0)"
 
 # Explicit override to a DIFFERENT version than the default above -- the
 # actual motivating case (scouting new specs needs a conformance image the
 # default never contains). Using a distinct value here (not just re-asserting the
 # default) is what actually proves the override substitutes, rather than the
 # assertion coincidentally matching a hardcoded default either way.
-OVERRIDE_ARGS=$(build_base_args "1.37.1")
-assert "--k8s-version 1.37.1 emits --kube-conformance-image=...v1.37.1" \
-  "$(printf '%s' "$OVERRIDE_ARGS" | grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.37.1' && echo 1 || echo 0)"
-assert "--k8s-version 1.37.1 does NOT emit the default's v1.36.4 tag" \
-  "$(printf '%s' "$OVERRIDE_ARGS" | grep -q -- 'v1.36.4' && echo 0 || echo 1)"
+OVERRIDE_ARGS=$(build_base_args "1.35.9")
+assert "--k8s-version 1.35.9 emits --kube-conformance-image=...v1.35.9" \
+  "$(printf '%s' "$OVERRIDE_ARGS" | grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.35.9' && echo 1 || echo 0)"
+assert "--k8s-version 1.35.9 does NOT emit the default's v1.37.1 tag" \
+  "$(printf '%s' "$OVERRIDE_ARGS" | grep -q -- 'v1.37.1' && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 3. Real end-to-end invocation: run-all.sh's arg parser must actually accept
@@ -94,7 +94,7 @@ assert "--k8s-version 1.37.1 does NOT emit the default's v1.36.4 tag" \
 #    fix, and the one a stray typo in a future refactor would reproduce).
 # ---------------------------------------------------------------------------
 set +e
-K8S_VERSION_OUT="$(bash "$RUN_ALL" --k8s-version 1.37.1 --stack-only --binary /nonexistent 2>&1)"
+K8S_VERSION_OUT="$(bash "$RUN_ALL" --k8s-version 1.35.9 --stack-only --binary /nonexistent 2>&1)"
 set -e
 assert "run-all.sh does not reject --k8s-version as an unknown argument" \
   "$(printf '%s' "$K8S_VERSION_OUT" | grep -qF -- 'Unknown argument: --k8s-version' && echo 0 || echo 1)"
