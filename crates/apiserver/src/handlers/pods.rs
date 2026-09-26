@@ -20,7 +20,8 @@ use crate::{
     status::Status,
     types::{Binding, DeleteOptions, Namespace, Object, ObjectMeta, PodSpec},
     util::{
-        content_type, extract_body, parse_resource_version, rfc3339_to_unix_secs, secs_to_rfc3339,
+        content_type, extract_body, extract_body_quiet, parse_resource_version,
+        rfc3339_to_unix_secs, secs_to_rfc3339,
     },
 };
 
@@ -1256,9 +1257,10 @@ pub(crate) async fn delete_collection_pods<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
-    // block a DELETE, so extract_body's Err falls back to the original bytes here (matching the
-    // pre-existing serde_json::from_slice(...).unwrap_or_default() below).
-    let body = extract_body(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -1436,9 +1438,10 @@ pub(crate) async fn delete_pod<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
-    // block a DELETE, so extract_body's Err falls back to the original bytes here (matching the
-    // pre-existing serde_json::from_slice(...).unwrap_or_default() below).
-    let body = extract_body(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {

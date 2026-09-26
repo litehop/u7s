@@ -25,7 +25,9 @@ use crate::{
     state::AppState,
     status::Status,
     types::{DeleteOptions, NamespacePhase, NamespaceSpec, Object, ObjectMeta, ResourceMeta},
-    util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
+    util::{
+        content_type, extract_body, extract_body_quiet, parse_resource_version, utc_now_rfc3339,
+    },
 };
 
 /// Validate a namespace name: lowercase alphanumeric + hyphens, 1–63 chars.
@@ -1469,9 +1471,10 @@ pub(crate) async fn delete_namespace<S: Store>(
     // instead send it as ?dryRun=All (caught by the router-wide inject_dry_run_header
     // layer) — accept either.
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
-    // block a DELETE, so extract_body's Err falls back to the original bytes here (matching the
-    // pre-existing serde_json::from_slice(...).unwrap_or_default() below).
-    let body = extract_body(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
