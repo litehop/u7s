@@ -171,8 +171,8 @@ provision:
       apt-get update -qq
       # Pinned: this script re-runs on every boot (incl. golden clones), and an
       # unpinned install against the held package aborts it (set -e) as soon as
-      # upstream publishes a newer patch. Keep in sync with lima-start.sh's
-      # KUBELET_VERSION fallback.
+      # upstream publishes a newer patch. Keep in sync with the KUBELET_VERSION
+      # fallback in scripts/conformance/lima-start.sh.
       KUBELET_PKG_VERSION="1.36.4-1.1"
       apt-get install -y "kubelet=${KUBELET_PKG_VERSION}"
       apt-mark hold kubelet
