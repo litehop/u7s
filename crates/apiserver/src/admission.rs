@@ -23,10 +23,20 @@ use crate::status::{Status, StatusError};
 const MAX_WEBHOOK_RESPONSE_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Backoff schedule (ms) for retrying a webhook POST after a connection-refused or
-/// connection-reset error. Total budget is capped at 300ms: kube-proxy normally finishes
-/// programming a freshly created Service's ClusterIP -> PodIP NAT rule well within that
-/// window, and the apiserver still owes its own request-timeout budget to the caller.
-const WEBHOOK_CONNECT_RETRY_BACKOFFS_MS: &[u64] = &[100, 200];
+/// connection-reset error. Total budget is capped at 1500ms: iptables-mode kube-proxy
+/// (the default in both the conformance rig and real clusters) rate-limits how often it
+/// reprograms dataplane rules to roughly once per second (`--iptables-min-sync-period`),
+/// so a freshly created Service's ClusterIP -> PodIP NAT rule can legitimately take up to
+/// ~1s to appear, not "a handful of milliseconds" — a 300ms budget (this constant's
+/// previous value) reliably absorbed the old IPVS-mode rig's faster convergence but
+/// under-budgets iptables mode by more than 3x. Confirmed live via konnectivity-server's
+/// own DIAL_RSP log: three consecutive `dial tcp <ClusterIP>:<port>: connect: connection
+/// refused` failures spanning attempts at t=0/100/300ms, i.e. still refused at the old
+/// budget's exhaustion point, while kube-proxy's own "SyncProxyRules complete" log lines
+/// on both rig nodes show its sync cadence landing about once per second. 1500ms comfortably
+/// covers one full sync cycle with margin while remaining a small fraction of the
+/// apiserver's own request-timeout budget owed to the caller.
+const WEBHOOK_CONNECT_RETRY_BACKOFFS_MS: &[u64] = &[100, 200, 400, 800];
 
 /// True when `err`'s source chain bottoms out in an OS-level connection-refused or
 /// connection-reset `io::Error` — the signature of kube-proxy not having (yet, or any
@@ -5785,7 +5795,7 @@ mod tests {
 
     /// A TLS handshake failure (server certificate not signed by the CA the client
     /// pinned to) must NOT be classified as retryable. If it were, a genuinely
-    /// misconfigured webhook would be retried for up to 300ms on every single call
+    /// misconfigured webhook would be retried for up to 1500ms on every single call
     /// instead of failing fast and surfacing the real TLS problem.
     #[tokio::test]
     async fn is_connect_refused_or_reset_false_for_tls_handshake_failure() {
@@ -5856,7 +5866,7 @@ mod tests {
     }
 
     /// The retry loop must actually retry a connect-refused failure, and must stop
-    /// within the documented ~300ms budget rather than retrying forever — an unbounded
+    /// within the documented ~1500ms budget rather than retrying forever — an unbounded
     /// retry would eat into the apiserver's own upstream request-timeout budget and
     /// turn a fast failure into a slow one for a webhook that is genuinely down.
     #[tokio::test]
@@ -5892,16 +5902,76 @@ mod tests {
             "the backoffs must actually be waited out before giving up, got {elapsed:?}"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "the retry budget must stay bounded to a few hundred ms so it doesn't eat \
-             into the apiserver's own upstream request-timeout budget, got {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(3),
+            "the retry budget must stay bounded to ~1.5s so it doesn't eat into the \
+             apiserver's own upstream request-timeout budget, got {elapsed:?}"
+        );
+    }
+
+    /// iptables-mode kube-proxy (the rig's and real clusters' default) rate-limits how
+    /// often it reprograms dataplane rules to roughly once per second, so a freshly
+    /// created Service's ClusterIP can stay connection-refused for nearly a full second
+    /// before its NAT rule appears — live evidence: a conformance run's konnectivity-server
+    /// log showed three straight `connect: connection refused` DIAL_RSPs at t=0/100/300ms
+    /// (the pre-fix budget's exact attempt schedule) while kube-proxy's own
+    /// "SyncProxyRules complete" lines landed about once per second on both rig nodes.
+    /// A 300ms retry budget can never survive that gap; this pins the fix to a case that
+    /// fails if the budget regresses back to [100, 200].
+    #[tokio::test]
+    async fn send_webhook_request_with_retry_recovers_from_kube_proxy_sync_period_delay() {
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        // Grab a free port, then release it immediately — nothing listens on it until
+        // the spawned task below binds it again, simulating the gap between a Service's
+        // creation and kube-proxy actually programming its NAT rule.
+        let addr = {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap()
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            let router = Router::new().route("/webhook", post(|| async { "ok" }));
+            let listener = TcpListener::bind(addr)
+                .await
+                .expect("port must be free again after being released above");
+            axum::serve(listener, router)
+                .await
+                .expect("webhook stub server must not fail");
+        });
+
+        let client = reqwest::Client::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+
+        let result = send_webhook_request_with_retry(|| {
+            attempts_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client.post(format!("http://{addr}/webhook"))
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a webhook Service whose dataplane rule only appears ~900ms after the first \
+             attempt must eventually succeed — got {:?}",
+            result.err()
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1 + WEBHOOK_CONNECT_RETRY_BACKOFFS_MS.len(),
+            "the 900ms-delayed listener is designed to fall strictly between this \
+             schedule's 4th attempt (t=700ms, still refused) and its 5th (t=1500ms, \
+             succeeds) — succeeding on any other attempt means the backoff schedule \
+             changed out from under this test's timing assumptions"
         );
     }
 
     /// A webhook that responds — even with a 5xx status — is not a network error:
     /// reqwest returns `Ok`, and the caller (not this retry loop) is responsible for
     /// inspecting the AdmissionReview/ConversionReview body. Retrying an application-level
-    /// failure would only add up to 300ms of latency without ever changing the outcome
+    /// failure would only add up to 1500ms of latency without ever changing the outcome
     /// for a webhook that is genuinely broken.
     #[tokio::test]
     async fn send_webhook_request_with_retry_does_not_retry_application_error_response() {
@@ -5943,7 +6013,7 @@ mod tests {
     /// A webhook that connects fine but never responds within its configured timeout
     /// must fail fast, not be retried — connect already succeeded, so this is not the
     /// kube-proxy NAT-rule race the retry targets, and retrying a real timeout would
-    /// waste up to 300ms without ever succeeding sooner.
+    /// waste up to 1500ms without ever succeeding sooner.
     #[tokio::test]
     async fn send_webhook_request_with_retry_does_not_retry_on_timeout() {
         use axum::routing::get;
