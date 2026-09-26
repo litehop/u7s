@@ -42,7 +42,7 @@ fi
 
 # Kill any stale kube-controller-manager from a previous run. The real process
 # is launched via an absolute cached-binary path (e.g.
-# /home/.../kube-controller-manager-1.36.4-linux-arm64), so an anchored
+# /home/.../kube-controller-manager-1.37.1-linux-arm64), so an anchored
 # '^kube-controller-manager' pattern never matches — match the versioned
 # binary basename instead (the trailing [0-9] also keeps this guard's own
 # quoted pattern text below from matching itself).
