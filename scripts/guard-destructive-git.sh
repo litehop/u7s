@@ -32,10 +32,28 @@ resolve_dir() {
   printf '%s' "$resolved"
 }
 
+mayor_root() {
+  # mayor_root -- canonicalized path to the mayor checkout: CLAUDE_PROJECT_DIR
+  # when Claude Code sets it (it stays fixed to the session's original
+  # project directory even as a subagent's Bash cwd differs -- the same
+  # assumption scripts/critical-reviewer-dispatch.sh already relies on for
+  # a shared review-queue location), else the main worktree root of the
+  # repo this script itself lives in. Never derived from the hook's target
+  # dir -- that would make any standalone repo with no linked worktrees
+  # see itself as "the mayor checkout".
+  local root script_dir
+  if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+    root=$(cd "$CLAUDE_PROJECT_DIR" 2>/dev/null && pwd -P) || root=""
+    [ -n "$root" ] && { printf '%s' "$root"; return; }
+  fi
+  script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || return
+  git -C "$script_dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}'
+}
+
 is_target_protected() {
   # is_target_protected <dir> -- true if <dir>'s repo is checked out on
-  # branch `main`, or <dir>'s worktree root is the main worktree root
-  # (MAIN_ROOT, set by the caller from `git worktree list --porcelain`).
+  # branch `main`, or <dir>'s worktree root is the mayor checkout
+  # (MAIN_ROOT, set by the caller from `mayor_root`).
   local dir="$1"
   [ -z "$dir" ] && return 1
   local branch toplevel
@@ -113,7 +131,7 @@ check_command() {
   # if any segment is a destructive git command against a protected repo.
   local cmd="$1" cwd="$2" current_dir seg raw_seg cdarg rest target_dir
 
-  MAIN_ROOT=$(git -C "$cwd" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
+  MAIN_ROOT=$(mayor_root)
   current_dir="$cwd"
 
   while IFS= read -r raw_seg; do

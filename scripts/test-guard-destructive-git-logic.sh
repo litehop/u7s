@@ -186,6 +186,36 @@ assert "'git checkout -B x origin/y' in the linked worker worktree is allowed --
   "$(allowed "git checkout -B x origin/y" "$WORKER")"
 
 # ---------------------------------------------------------------------------
+# 10. MAIN_ROOT must identify the mayor checkout specifically, not "whatever
+#     repo the hook happens to be checking" -- a standalone repo with no
+#     linked worktrees is not the mayor just because it has no worktree
+#     siblings, and a worker session naming the mayor via `-C` must still
+#     resolve to the mayor's fixed identity regardless of the worker's own
+#     branch/toplevel.
+# ---------------------------------------------------------------------------
+FRESH_STANDALONE="$SANDBOX_ROOT/fresh-standalone-repo"
+git init -q -b master "$FRESH_STANDALONE"
+git -C "$FRESH_STANDALONE" config user.email test@example.com
+git -C "$FRESH_STANDALONE" config user.name "Test"
+echo x > "$FRESH_STANDALONE/f.txt"
+git -C "$FRESH_STANDALONE" add f.txt
+git -C "$FRESH_STANDALONE" commit -q -m init
+
+assert "'git reset --hard HEAD' in a fresh standalone repo with no linked worktrees (not the mayor checkout, not on branch main) is allowed -- having no worktree siblings must not make an unrelated repo see itself as the mayor" \
+  "$(CLAUDE_PROJECT_DIR= allowed "git reset --hard HEAD" "$FRESH_STANDALONE")"
+
+TRUNK_BRANCH_CHECKOUT="$SANDBOX_ROOT/trunk-branch-checkout"
+git init -q -b trunk "$TRUNK_BRANCH_CHECKOUT"
+git -C "$TRUNK_BRANCH_CHECKOUT" config user.email test@example.com
+git -C "$TRUNK_BRANCH_CHECKOUT" config user.name "Test"
+echo y > "$TRUNK_BRANCH_CHECKOUT/g.txt"
+git -C "$TRUNK_BRANCH_CHECKOUT" add g.txt
+git -C "$TRUNK_BRANCH_CHECKOUT" commit -q -m init
+
+assert "'git -C <trunk-branch-checkout> reset --hard HEAD' from a worker cwd is blocked via CLAUDE_PROJECT_DIR even though this mayor checkout's branch isn't literally 'main' -- a worker's own branch/toplevel must never leak into the mayor's identity" \
+  "$(CLAUDE_PROJECT_DIR="$TRUNK_BRANCH_CHECKOUT" blocked "git -C $TRUNK_BRANCH_CHECKOUT reset --hard HEAD" "$WORKER")"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
