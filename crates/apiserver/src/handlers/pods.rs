@@ -515,7 +515,7 @@ pub(crate) async fn create_pod<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -878,7 +878,7 @@ pub(crate) async fn replace_pod<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -1255,7 +1255,10 @@ pub(crate) async fn delete_collection_pods<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body's Err falls back to the original bytes here (matching the
+    // pre-existing serde_json::from_slice(...).unwrap_or_default() below).
+    let body = extract_body(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -1432,7 +1435,10 @@ pub(crate) async fn delete_pod<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body's Err falls back to the original bytes here (matching the
+    // pre-existing serde_json::from_slice(...).unwrap_or_default() below).
+    let body = extract_body(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -3282,7 +3288,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let incoming: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -4051,7 +4057,7 @@ pub(crate) async fn patch_pod_resize<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let incoming: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -4209,7 +4215,7 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -4257,7 +4263,7 @@ pub(crate) async fn put_ephemeral_containers<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let incoming: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -8853,7 +8859,7 @@ pub(crate) async fn bind_pod<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let binding: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 

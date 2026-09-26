@@ -2,7 +2,10 @@ use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use u7s_store::StoreError;
 
-use crate::{proto, status::Status};
+use crate::{
+    proto,
+    status::{Status, StatusError},
+};
 
 /// Validates a filesystem path supplied at the CLI boundary.
 /// Rejects paths containing `..` components to prevent traversal.
@@ -42,6 +45,42 @@ pub(crate) fn content_type(headers: &HeaderMap) -> &str {
         .unwrap_or("")
 }
 
+/// Build the precise 4xx error for a request body that was detected as k8s protobuf (either
+/// the magic prefix was present, or an inner decode step had already committed to treating the
+/// body as protobuf) but could not be decoded. Also logs the same details at `warn` — the
+/// request's `request_id` is attached automatically via the enclosing tracing span set up in
+/// `content_type.rs`.
+///
+/// Returning this instead of the original bytes is the whole point: previously, undecodable
+/// bytes flowed straight into `Object::from_bytes`, which reported the generic and misleading
+/// `invalid JSON: expected value at line 1 column 1` — indistinguishable from a dozen unrelated
+/// failure modes and useless for finding out *why* the decode failed.
+fn undecodable_proto_body(
+    stage: &str,
+    detail: &str,
+    bytes: &Bytes,
+    content_type: &str,
+) -> StatusError {
+    let body_len = bytes.len();
+    let prefix_len = body_len.min(16);
+    let first_16_bytes = bytes[..prefix_len]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    tracing::warn!(
+        stage = %stage,
+        detail = %detail,
+        content_type = %content_type,
+        body_len,
+        first_16_bytes = %first_16_bytes,
+        "undecodable protobuf request body"
+    );
+    Status::bad_request(format!(
+        "cannot decode protobuf-encoded request body: {stage} decode failed: {detail}; \
+         content-type={content_type:?}; body_len={body_len}; first_16_bytes={first_16_bytes}"
+    ))
+}
+
 /// If the request body uses the Kubernetes protobuf encoding, decode it and return the embedded
 /// raw payload as JSON bytes. Otherwise return the bytes unchanged.
 ///
@@ -52,17 +91,33 @@ pub(crate) fn content_type(headers: &HeaderMap) -> &str {
 ///
 /// This allows all write handlers to support both `application/json` and
 /// `application/vnd.kubernetes.protobuf` without duplicating decode logic.
-pub fn extract_body(bytes: &Bytes, content_type: &str) -> Bytes {
+///
+/// Returns `Err` when the body was genuinely detected as protobuf-encoded (magic prefix present,
+/// or the envelope decoded and committed to a Kind) but a later decode step failed — see
+/// `undecodable_proto_body`. Never falls through to returning bytes that will fail JSON parsing
+/// with a misleading error.
+pub fn extract_body(bytes: &Bytes, content_type: &str) -> Result<Bytes, StatusError> {
     if !content_type.starts_with("application/vnd.kubernetes.protobuf") {
-        return bytes.clone();
+        return Ok(bytes.clone());
     }
-    let env = match proto::decode_k8s_proto_envelope(bytes) {
-        Some(e) => e,
-        None => return bytes.clone(),
+    let env = match proto::decode_k8s_proto_envelope_detailed(bytes) {
+        Ok(e) => e,
+        // No magic prefix means this was never detected as protobuf in the first place —
+        // e.g. a handler that already ran extract_body once and is re-checking the now-JSON
+        // result against the original (still protobuf) Content-Type header. Not an error.
+        Err(proto::EnvelopeDecodeError::NoMagicPrefix) => return Ok(bytes.clone()),
+        Err(e) => {
+            return Err(undecodable_proto_body(
+                "envelope",
+                &e.to_string(),
+                bytes,
+                content_type,
+            ))
+        }
     };
     // When contentType is explicitly JSON, raw is JSON — return as-is.
     if env.content_type == "application/json" {
-        return Bytes::from(env.raw);
+        return Ok(Bytes::from(env.raw));
     }
     // For all other cases (empty or explicit protobuf contentType), raw bytes are proto-encoded.
     // Try type-specific decoders first, using apiVersion to disambiguate kinds like "Event"
@@ -72,27 +127,58 @@ pub fn extract_body(bytes: &Bytes, content_type: &str) -> Bytes {
             proto::decode_proto_by_kind_and_version(&env.kind, &env.api_version, &env.raw)
         {
             if let Ok(json_bytes) = serde_json::to_vec(&json_val) {
-                return Bytes::from(json_bytes);
+                return Ok(Bytes::from(json_bytes));
             }
         }
     }
     // Fallback: if raw bytes look like JSON (start with '{'), return them directly.
     // This handles non-core types that send JSON with empty contentType.
-    // Reject if the JSON kind field contradicts the envelope kind (both non-empty and differ).
+    // Reject if the JSON kind field contradicts the envelope kind (both non-empty and differ) —
+    // a proto envelope whose TypeMeta says one kind but whose JSON payload claims another is a
+    // spoofing attempt, not a legitimate body; rejecting it precisely (rather than returning the
+    // original enveloped bytes for the JSON parser to choke on) still refuses the request, it
+    // just says why.
     if env.raw.first() == Some(&b'{') {
         if !env.kind.is_empty() {
             if let Ok(obj) = serde_json::from_slice::<serde_json::Value>(&env.raw) {
                 if let Some(json_kind) = obj["kind"].as_str() {
                     if !json_kind.is_empty() && json_kind != env.kind {
-                        return bytes.clone();
+                        return Err(undecodable_proto_body(
+                            "kind-mismatch",
+                            &format!(
+                                "envelope TypeMeta.kind={:?} but embedded JSON kind={:?}",
+                                env.kind, json_kind
+                            ),
+                            bytes,
+                            content_type,
+                        ));
                     }
                 }
             }
         }
-        return Bytes::from(env.raw);
+        return Ok(Bytes::from(env.raw));
     }
-    // Cannot decode — return original bytes so the handler reports a meaningful error.
-    bytes.clone()
+    // Cannot decode: kind-specific decode failed (or the envelope carried no Kind at all) and
+    // the raw payload is not JSON either.
+    let detail = if env.kind.is_empty() {
+        "envelope TypeMeta.kind is empty and the raw payload is not JSON".to_string()
+    } else if proto::has_registered_decoder(&env.kind) {
+        format!(
+            "registered decoder for kind={:?} rejected the payload",
+            env.kind
+        )
+    } else {
+        format!(
+            "no decoder registered for kind={:?} (apiVersion={:?})",
+            env.kind, env.api_version
+        )
+    };
+    Err(undecodable_proto_body(
+        "kind-specific",
+        &detail,
+        bytes,
+        content_type,
+    ))
 }
 
 /// Parse an optional `resourceVersion` string into an optional `u64`.
@@ -1000,7 +1086,7 @@ mod tests {
         let body = build_kubectl_proto_body(b"v1", b"Namespace", &namespace_proto, None);
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
         let json: serde_json::Value =
             serde_json::from_slice(&decoded).expect("extract_body must produce valid JSON");
 
@@ -1040,7 +1126,7 @@ mod tests {
         let body = build_kubectl_proto_body(b"v1", b"ConfigMap", &configmap_proto, None);
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
         let json: serde_json::Value =
             serde_json::from_slice(&decoded).expect("extract_body must produce valid JSON");
 
@@ -1084,7 +1170,7 @@ mod tests {
         let body_bytes = serde_json::to_vec(&crd_json).unwrap();
         let bytes = Bytes::from(body_bytes.clone());
 
-        let decoded = extract_body(&bytes, "application/json");
+        let decoded = extract_body(&bytes, "application/json").unwrap();
         assert_eq!(
             decoded.as_ref(),
             body_bytes.as_slice(),
@@ -1117,7 +1203,7 @@ mod tests {
         let body_bytes = serde_json::to_vec(&cr_json).unwrap();
         let bytes = Bytes::from(body_bytes.clone());
 
-        let decoded = extract_body(&bytes, "application/json");
+        let decoded = extract_body(&bytes, "application/json").unwrap();
         assert_eq!(
             decoded.as_ref(),
             body_bytes.as_slice(),
@@ -1144,7 +1230,7 @@ mod tests {
             build_kubectl_proto_body(b"v1", b"Namespace", inner_json, Some(b"application/json"));
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
         let json: serde_json::Value = serde_json::from_slice(&decoded).expect("must be valid JSON");
         assert_eq!(
             json["metadata"]["name"], "ns-via-json",
@@ -1185,7 +1271,7 @@ mod tests {
         let body = build_kubectl_proto_body(b"v1", b"Pod", &pod_proto, None);
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
         let json: serde_json::Value = serde_json::from_slice(&decoded).expect(
             "extract_body must produce valid JSON for a kubectl pod proto — \
              before the fix, PodSpec used wrong field numbers (containers at field 3 instead \
@@ -1225,7 +1311,9 @@ mod tests {
     /// test_extract_body_kind_mismatch_rejects_json_fallback
     ///
     /// When the proto envelope declares kind="Foo" but the raw JSON body contains kind="Secret",
-    /// extract_body must return the original proto bytes (reject), not the mismatched JSON.
+    /// extract_body must reject the body with a precise error, not silently accept the
+    /// mismatched JSON and not hand the caller bytes that will fail JSON parsing with a
+    /// misleading "invalid JSON" message.
     ///
     /// This prevents a spoofing vector where a client crafts a proto envelope whose TypeMeta says
     /// one kind but whose JSON payload claims another. Without this check, the JSON would be
@@ -1237,24 +1325,19 @@ mod tests {
 
         // No contentType in envelope (empty), so we fall through to the JSON fallback path
         let body = build_kubectl_proto_body(b"v1", b"Foo", inner_json, None);
-        let bytes = Bytes::from(body.clone());
+        let bytes = Bytes::from(body);
 
-        let result = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
-        // Must return the original proto bytes, not the inner JSON
-        assert_eq!(
-            result.as_ref(),
-            bytes.as_ref(),
-            "proto envelope with kind='Foo' but JSON body kind='Secret' must be rejected: \
-             returning original bytes prevents the mismatched JSON from being stored as Foo"
+        let err = extract_body(&bytes, "application/vnd.kubernetes.protobuf").expect_err(
+            "proto envelope with kind='Foo' but JSON body kind='Secret' must be rejected — \
+             accepting it would let a client persist the wrong kind under the Foo endpoint",
         );
-
-        // Confirm the returned bytes are NOT the inner JSON
+        let message = format!("{err:?}");
         assert!(
-            serde_json::from_slice::<serde_json::Value>(&result).is_err()
-                || serde_json::from_slice::<serde_json::Value>(&result)
-                    .map(|v| v["kind"] != "Secret")
-                    .unwrap_or(true),
-            "rejected body must not be the mismatched Secret JSON"
+            message.contains("kind-mismatch")
+                && message.contains("Foo")
+                && message.contains("Secret"),
+            "rejection must name the mismatched kinds so the failure is diagnosable, not just \
+             'invalid JSON': got {message:?}"
         );
     }
 
@@ -1269,12 +1352,81 @@ mod tests {
         let body = build_kubectl_proto_body(b"example.com/v1", b"Widget", inner_json, None);
         let bytes = Bytes::from(body);
 
-        let result = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let result = extract_body(&bytes, "application/vnd.kubernetes.protobuf")
+            .expect("matching kind must allow JSON fallback, not an error");
         let json: serde_json::Value =
             serde_json::from_slice(&result).expect("matching kind must allow JSON fallback");
         assert_eq!(
             json["kind"], "Widget",
             "JSON with matching kind must pass through the fallback path"
+        );
+    }
+
+    /// test_extract_body_envelope_decode_failure_is_precise_not_invalid_json
+    ///
+    /// A csi-hostpath e2e run saw one PVC-create POST out of five near-simultaneous
+    /// protobuf requests fail with the generic, misleading "invalid JSON: expected value at
+    /// line 1 column 1" — the wording extract_body's old silent fallback produced whenever it
+    /// gave up and returned undecoded protobuf bytes to the JSON parser. If this envelope-decode
+    /// failure path regresses to that old fallback, the next occurrence of this class of bug is
+    /// once again undiagnosable from the error message alone.
+    ///
+    /// Body: magic prefix + a truncated Unknown message (a length-delimited field 1 tag claiming
+    /// more bytes than are present) — genuinely detected as protobuf (magic prefix present) but
+    /// the envelope itself does not parse.
+    #[test]
+    fn test_extract_body_envelope_decode_failure_is_precise_not_invalid_json() {
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00]; // k8s magic prefix
+                                                     // field 1 (TypeMeta), wire type 2 (length-delimited), claims a 10-byte payload but
+                                                     // supplies none — prost must fail to decode this, not silently accept it.
+        body.push(0x0a);
+        body.push(0x0a);
+        let bytes = Bytes::from(body);
+
+        let err = extract_body(&bytes, "application/vnd.kubernetes.protobuf")
+            .expect_err("a body with the k8s magic prefix but a corrupt envelope must be rejected");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("envelope"),
+            "error must name the envelope stage so the next occurrence is diagnosable \
+             without a live repro: got {message:?}"
+        );
+        assert!(
+            !message.contains("invalid JSON"),
+            "must never fall through to the generic serde 'invalid JSON' message — that's \
+             indistinguishable from a dozen unrelated failure modes: got {message:?}"
+        );
+    }
+
+    /// test_extract_body_kind_decode_failure_is_precise_not_invalid_json
+    ///
+    /// Same bug class as the envelope-decode test above, but for the *other*
+    /// undiagnosed fallback — the envelope decodes fine (magic prefix, TypeMeta, raw all
+    /// present) but the kind-specific decoder rejects the payload. Uses kind=
+    /// "PersistentVolumeClaim", the exact kind involved in the observed conformance flake, so a
+    /// regression here reproduces the diagnostic gap for that specific bug rather than an
+    /// unrelated kind.
+    #[test]
+    fn test_extract_body_kind_decode_failure_is_precise_not_invalid_json() {
+        // Not valid protobuf for PersistentVolumeClaimSpec, and does not start with '{' so the
+        // JSON fallback cannot mistake it for JSON either.
+        let garbage_raw: &[u8] = &[0xff, 0xff, 0xff, 0xff];
+        let body = build_kubectl_proto_body(b"v1", b"PersistentVolumeClaim", garbage_raw, None);
+        let bytes = Bytes::from(body);
+
+        let err = extract_body(&bytes, "application/vnd.kubernetes.protobuf").expect_err(
+            "a well-formed envelope wrapping a payload the PVC decoder rejects must be \
+             rejected, not silently handed to the JSON parser as raw protobuf bytes",
+        );
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("kind-specific") && message.contains("PersistentVolumeClaim"),
+            "error must name the kind-specific stage and the kind so the next occurrence of \
+             this PVC flake is diagnosable without a live repro: got {message:?}"
+        );
+        assert!(
+            !message.contains("invalid JSON"),
+            "must never fall through to the generic serde 'invalid JSON' message: got {message:?}"
         );
     }
 
@@ -1314,7 +1466,7 @@ mod tests {
         );
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
         let json: serde_json::Value = serde_json::from_slice(&decoded).expect(
             "extract_body must return the inner JSON for CRD proto envelope — \
              CRD has no proto codec so kubectl wraps JSON in the proto envelope with \
@@ -1358,7 +1510,7 @@ mod tests {
         );
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
 
         // The key assertion: response must be non-empty valid JSON.
         // If the StorageClass decoder is removed, extract_body returns the raw proto bytes,
@@ -1406,7 +1558,7 @@ mod tests {
         let body = build_kubectl_proto_body(b"v1", b"ResourceQuota", &resourcequota_proto, None);
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
 
         assert!(
             !decoded.is_empty(),
@@ -1437,7 +1589,7 @@ mod tests {
         let body = build_kubectl_proto_body(b"v1", b"LimitRange", &limitrange_proto, None);
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
 
         assert!(
             !decoded.is_empty(),
@@ -1465,7 +1617,7 @@ mod tests {
         let body = build_kubectl_proto_body(b"policy/v1", b"PodDisruptionBudget", &pdb_proto, None);
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
 
         assert!(
             !decoded.is_empty(),
@@ -1524,7 +1676,7 @@ mod tests {
         );
         let bytes = Bytes::from(body);
 
-        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf").unwrap();
 
         assert!(
             !decoded.is_empty(),

@@ -612,7 +612,7 @@ pub async fn create_crd<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let crd = parse_crd(&body)?;
     let name = crd.metadata.name.clone();
     let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
@@ -669,7 +669,7 @@ pub async fn replace_crd<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let mut crd = parse_crd(&body)?;
 
     if crd.metadata.name != name {
@@ -821,7 +821,10 @@ pub async fn delete_crd<S: Store>(
     // handlers). client-go's typed Delete() sends DryRun in this body; a raw/proxied caller
     // may instead send it as ?dryRun=All (caught by the router-wide inject_dry_run_header
     // layer) — accept either.
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body's Err falls back to the original bytes here (matching the
+    // pre-existing serde_json::from_slice(...).unwrap_or_default() below).
+    let body = extract_body(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -1183,7 +1186,7 @@ pub async fn put_crd_status<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
