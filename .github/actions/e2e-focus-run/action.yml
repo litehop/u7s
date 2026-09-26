@@ -6,7 +6,7 @@ description: >-
   job and the sensitive-e2e-guard job so both exercise identical bring-up.
 inputs:
   k8s_version:
-    description: Kubernetes version for kubelet/kubectl/kube-proxy/KCM + the conformance image, e.g. 1.36.4.
+    description: Kubernetes version for kubelet/kubectl/kube-proxy/KCM + the conformance image, e.g. 1.37.1.
     required: true
   focus:
     description: ginkgo --e2e-focus regex passed to sonobuoy.
@@ -534,10 +534,11 @@ runs:
       shell: bash
       run: |
         WORKDIR="$PWD/temp/u7s"
-        # The wildcard controller set (minus cloud-specific controllers u7s does
-        # not implement) matches scripts/install.sh's u7s-kcm.service
+        # The wildcard controller set matches scripts/install.sh's u7s-kcm.service
         # --controllers set exactly (see its rationale there for
-        # -clusterrole-aggregation-controller / -device-taint-eviction-controller)
+        # -clusterrole-aggregation-controller / -device-taint-eviction-controller,
+        # and for why cloud-node-lifecycle-controller / node-route-controller /
+        # service-lb-controller are deliberately NOT excluded)
         # -- real upstream e2e specs depend on controllers this workflow's
         # narrower smoke/perf-test peers never needed (e.g. the namespace
         # controller finalizing each test's ephemeral namespace).
@@ -558,7 +559,7 @@ runs:
           --cluster-signing-key-file="$WORKDIR/ca.key" \
           --service-account-private-key-file="$WORKDIR/sa.key" \
           --root-ca-file="$WORKDIR/ca.pem" \
-          --controllers='*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \
+          --controllers='*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller' \
           --allocate-node-cidrs=true \
           --cluster-cidr=10.244.0.0/16 \
           --node-cidr-mask-size=24 \
@@ -682,11 +683,11 @@ runs:
       shell: bash
       run: |
         # scripts/conformance/sonobuoy-plugin-e2e.yaml hardcodes the
-        # plugin's image field at a specific v1.36.4 tag (it's a static
+        # plugin's image field at a specific v1.37.1 tag (it's a static
         # manifest -- sonobuoy loads it verbatim, not per-cluster the way
         # its own --kubernetes-version=auto default does). Without this
         # CLI-level override every matrix branch would run the same fixed
-        # v1.36.4 e2e binaries against its own matrix-selected kubelet --
+        # v1.37.1 e2e binaries against its own matrix-selected kubelet --
         # burying real per-version issues. --kube-conformance-image
         # overrides just the image tag on the plugin (shorthand for
         # --plugin-image=e2e:<image>) without touching the manifest.
