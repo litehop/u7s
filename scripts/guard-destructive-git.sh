@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # PreToolUse hook for Bash. Blocks git commands that discard uncommitted
 # work (reset --hard, checkout ... -- <path> or a bare `.`/existing-path
-# checkout with no `--`, restore, stash push/save/
-# drop/clear/pop and bare `git stash`, clean -f*, switch -f/--discard-
-# changes) when the target repo is on branch `main` or is the mayor
-# checkout (the main worktree root). This is a string-match guardrail,
-# not a sandbox.
+# checkout with no `--`, restore, any `stash` subcommand other than
+# list/show/apply/branch (including a bare `git stash -u` with no
+# subcommand word at all), clean -f*, switch -f/--discard-changes) when
+# the target repo is on branch `main` or is the mayor checkout. This is a
+# string-match guardrail, not a sandbox.
 #
 # Hook input arrives as JSON on stdin: {cwd, tool_input: {command, ...}}.
 # Missing/unparseable input fails OPEN (exit 0) so a hook bug can never
@@ -100,10 +100,16 @@ is_destructive_git_args() {
       fi
       ;;
     stash)
+      # Default-deny: any subcommand other than the read-only `list`/`show`
+      # or `apply`/`branch` (which never discard the pending stash) is
+      # destructive -- including bare `git stash` (implicit push), any
+      # flag-prefixed form like `git stash -u` (still implicit push, no
+      # subcommand word at all), and any subcommand this list doesn't know
+      # about yet. A flag in $second must not read as an allowed subcommand.
       second=$(printf '%s\n' "$args" | awk '{print $2}')
       case "$second" in
-        ""|push|save|drop|clear|pop) return 0 ;;
-        *) return 1 ;;
+        list|show|apply|branch) return 1 ;;
+        *) return 0 ;;
       esac
       ;;
     clean)

@@ -216,6 +216,23 @@ assert "'git -C <trunk-branch-checkout> reset --hard HEAD' from a worker cwd is 
   "$(CLAUDE_PROJECT_DIR="$TRUNK_BRANCH_CHECKOUT" blocked "git -C $TRUNK_BRANCH_CHECKOUT reset --hard HEAD" "$WORKER")"
 
 # ---------------------------------------------------------------------------
+# 11. A flag before/instead of the stash subcommand must not read as an
+#     allowed subcommand -- `git stash -u` has no subcommand word at all
+#     (it's an implicit `push -u`), exactly as destructive as bare
+#     `git stash`, but a naive "match $2 against an exact list" missed it.
+# ---------------------------------------------------------------------------
+assert "'git stash -u' on main is blocked -- no subcommand word means implicit push, just as destructive as bare 'git stash'" \
+  "$(blocked "git stash -u" "$MAIN")"
+assert "'git stash --all' on main is blocked -- same implicit-push case with a different flag" \
+  "$(blocked "git stash --all" "$MAIN")"
+assert "'git stash -u' in the linked worker worktree is allowed -- destructive git on a worker's own branch is the normal workflow, not an incident" \
+  "$(allowed "git stash -u" "$WORKER")"
+assert "'git stash branch tmp-branch' on main is allowed -- branch never discards the stash entry, matching apply's carve-out" \
+  "$(allowed "git stash branch tmp-branch" "$MAIN")"
+assert "'git stash pop' on main is blocked -- pop removes uncommitted changes from the worktree, same as before this rewrite" \
+  "$(blocked "git stash pop" "$MAIN")"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
