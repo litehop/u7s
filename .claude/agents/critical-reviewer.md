@@ -108,6 +108,17 @@ the repo/worktree. Fetch it with `gh api`/`curl` (never `WebFetch`) into
 
 ## Scratch worktrees
 
+**Hard rule:** reading a PR via `gh pr diff`/`gh pr view` (see "Input"
+above) needs no worktree and is preferred — it never touches the mayor
+checkout. A scratch worktree is required only when checking PR code out
+onto disk: `git worktree add temp/review-scratch/<pr-num>-<ts> <ref>`, then
+run every git command against it via `git -C <scratch-path>` — including
+read/inspect commands, not just mutating ones. Either way, the mayor
+checkout is never mutated. `scripts/guard-destructive-git.sh` blocks
+destructive git (reset --hard, checkout -- <path>, restore, stash, clean
+-f, switch -f) against the mayor checkout at the tool layer, but do not
+rely on it as your only safeguard.
+
 A hypothesis-driven check (e.g. constructing an input the worker didn't
 test, or reproducing a suspected vacuous pass) sometimes needs to run code
 from the PR outside read-only inspection. If you need one, put it at
