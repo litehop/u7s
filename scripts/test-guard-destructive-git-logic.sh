@@ -171,6 +171,21 @@ assert "is_target_protected's toplevel==MAIN_ROOT check alone protects a repo no
   "$([ "$RC" = "0" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 9. Bare-path checkout (no `--` at all) discards worktree changes exactly
+#    like the `-- <path>` form, but has no `--` for the old regex to match.
+#    Must block on main; -B branch creation, which the worker setup flow
+#    depends on, must stay allowed even on a protected target.
+# ---------------------------------------------------------------------------
+assert "'git checkout .' on main is blocked -- with no '--' at all this silently discards every uncommitted worktree change" \
+  "$(blocked "git checkout ." "$MAIN")"
+assert "'git checkout a.txt' on main is blocked -- checking out an existing tracked path with no '--' overwrites it from the index" \
+  "$(blocked "git checkout a.txt" "$MAIN")"
+assert "'git checkout -B x origin/y' on main is allowed -- -B branch creation must survive the bare-path check even on a protected target" \
+  "$(allowed "git checkout -B x origin/y" "$MAIN")"
+assert "'git checkout -B x origin/y' in the linked worker worktree is allowed -- this is the exact 'checkout -B <branch> <remote-ref>' form the worker setup flow depends on" \
+  "$(allowed "git checkout -B x origin/y" "$WORKER")"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

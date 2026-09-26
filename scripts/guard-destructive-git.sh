@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # PreToolUse hook for Bash. Blocks git commands that discard uncommitted
-# work (reset --hard, checkout ... -- <path>, restore, stash push/save/
+# work (reset --hard, checkout ... -- <path> or a bare `.`/existing-path
+# checkout with no `--`, restore, stash push/save/
 # drop/clear/pop and bare `git stash`, clean -f*, switch -f/--discard-
 # changes) when the target repo is on branch `main` or is the mayor
 # checkout (the main worktree root). This is a string-match guardrail,
@@ -46,16 +47,32 @@ is_target_protected() {
 }
 
 is_destructive_git_args() {
-  # is_destructive_git_args <args> -- <args> is everything after `git`
-  # (and after any leading `-C <dir>` has been stripped by the caller).
-  local args="$1" first second
+  # is_destructive_git_args <args> <target-dir> -- <args> is everything
+  # after `git` (and after any leading `-C <dir>` has been stripped by the
+  # caller). <target-dir> is only used by the `checkout` branch, to check
+  # whether a bare argument names an existing path.
+  local args="$1" target_dir="$2" first second tok
   first=$(printf '%s\n' "$args" | awk '{print $1}')
   case "$first" in
     reset)
       printf '%s' "$args" | grep -qE '(^|[[:space:]])--hard([[:space:]]|$)'
       ;;
     checkout)
-      printf '%s' "$args" | grep -qE '(^|[[:space:]])--[[:space:]]+[^[:space:]]'
+      # `checkout -- <path>` / `checkout <ref> -- <path>` and bare
+      # `checkout .` / `checkout <existing-path>` (no `--` at all) both
+      # discard worktree changes; only `-B <branch> <ref>` and plain
+      # branch switches (whose args never resolve to an existing path)
+      # must stay allowed.
+      for tok in $args; do
+        if [ "$tok" = "." ] || [ "$tok" = "--" ]; then
+          return 0
+        fi
+        case "$tok" in
+          -*) continue ;;
+        esac
+        [ -e "$target_dir/$tok" ] && return 0
+      done
+      return 1
       ;;
     restore)
       if printf '%s' "$args" | grep -qE '(^|[[:space:]])--staged([[:space:]]|$)'; then
@@ -118,7 +135,7 @@ check_command() {
       rest="${BASH_REMATCH[2]}"
     fi
 
-    if is_destructive_git_args "$rest" && is_target_protected "$target_dir"; then
+    if is_destructive_git_args "$rest" "$target_dir" && is_target_protected "$target_dir"; then
       # shellcheck disable=SC2059
       printf "$BLOCK_MSG_TEMPLATE" "$seg" "$target_dir" >&2
       return 2
