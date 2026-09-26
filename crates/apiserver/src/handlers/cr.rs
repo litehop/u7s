@@ -195,6 +195,12 @@ pub struct CrContext {
     /// (CRD group, matched version name, CRD's own resourceVersion) — the
     /// `cr_schema_cache` key for `schema`. See `state::CrSchemaCache` for why.
     pub schema_cache_key: crate::state::CrSchemaCacheKey,
+    /// The CRD's `spec.versions[].storage == true` version name — where writes are
+    /// normalized to, mirroring upstream's `customresource_handler.go` `encoderVersion`
+    /// (see `convert_cr_for_storage`). Independent of `version` in the request path: a
+    /// request naming a served-but-non-storage version needs its write converted, a
+    /// request naming the storage version itself does not.
+    pub storage_version: String,
     /// The matched version's `subresources.scale` configuration, if declared. Unlike
     /// `has_status_subresource` (a version-independent bool — status is always just the
     /// `.status` key), scale requires the three CRD-author-declared JSON paths, which are
@@ -334,6 +340,17 @@ pub async fn find_crd<S: Store>(
                     label_selector_path,
                 })
             });
+        // Every valid CRD has exactly one storage=true version (API machinery validation
+        // enforces this on write); falling back to the matched (request) version if a
+        // malformed CRD somehow lacks one just disables write-path conversion for it rather
+        // than panicking or guessing wrong.
+        let storage_version = crd
+            .spec
+            .versions
+            .iter()
+            .find(|v| v.storage)
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| matched_version.name.clone());
         // Extract conversion webhook clientConfig if strategy is Webhook.
         let conversion_webhook_client_config = crd
             .spec
@@ -355,6 +372,7 @@ pub async fn find_crd<S: Store>(
             conversion_webhook_client_config,
             selectable_fields,
             schema_cache_key,
+            storage_version,
             scale,
         };
         state.cr_context_cache.insert_if_current(
@@ -593,6 +611,55 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
     }
 
     Ok(())
+}
+
+/// Convert `obj` — already at the request's own apiVersion (`group/version`, stamped by
+/// `stamp_cr_fields` on create or carried over by `resolve_cr_metadata`/the patch path on
+/// update) — to the CRD's storage version via the conversion webhook. Returns the value to
+/// persist; `obj` itself is untouched, so every call site keeps using its own copy (still at
+/// the request version) to build the response.
+///
+/// This is the write-side mirror of `object_needs_conversion`/`call_conversion_webhook`
+/// above: kube-apiserver's generic REST layer always encodes at the storage version
+/// (apiextensions-apiserver's `customresource_handler.go` sets
+/// `encoderVersion: schema.GroupVersion{..., Version: storageVersion}` on every CRD
+/// `RequestScope`, with the same webhook-backed `ObjectConvertor` used for reads), so a
+/// create/update/patch at a non-storage version must dial the webhook here exactly once,
+/// before the object is written — not lazily on the next read. Without this, u7s never
+/// dials the conversion webhook Service on write at all, so upstream's own
+/// `waitWebhookConversionReady` e2e warm-up (which creates a throwaway CR at a non-storage
+/// version specifically to pre-warm the Service before the real assertions run) never
+/// exercises the webhook, and the real first-ever dial races the two-node rig's iptables
+/// kube-proxy NAT-programming window instead of a warm one.
+///
+/// A no-op (returns `obj` unchanged, no clone, no webhook call) when the request version
+/// already IS the storage version — same version-to-itself skip PR #830 established for the
+/// read path; see `object_needs_conversion`'s doc.
+async fn convert_cr_for_storage<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    group: &str,
+    obj: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    let storage_api_version = format!("{group}/{}", ctx.storage_version);
+    if !object_needs_conversion(
+        &obj,
+        &storage_api_version,
+        ctx.conversion_webhook_client_config.as_deref(),
+    ) {
+        return Ok(obj);
+    }
+    // object_needs_conversion only returns true when conversion_webhook_client_config is
+    // Some — see its own `is_none()` early-return.
+    let cfg = ctx
+        .conversion_webhook_client_config
+        .as_deref()
+        .expect("object_needs_conversion returned true, so client_config must be Some");
+    let mut converted =
+        call_conversion_webhook(state, cfg, vec![obj], &storage_api_version).await?;
+    converted
+        .pop()
+        .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))
 }
 
 /// Evict `state.cr_conversion_cache` entries keyed on `superseded_resource_version` (any
@@ -2472,7 +2539,12 @@ pub async fn create_cr<S: Store>(
     let mut attempts_made = 1u32;
     let rv = loop {
         let key = cr_store_key(&group, &plural, None, &name);
-        let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+        // Store at the CRD's storage version, not the request version — see
+        // convert_cr_for_storage. `obj` itself is left at the request version for the
+        // response below.
+        let storage_obj = convert_cr_for_storage(&state, &ctx, &group, obj.clone()).await?;
+        let bytes =
+            serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
         match state.store.put(&key, Bytes::from(bytes), Some(0)).await {
             Ok(rv) => break rv,
             // The client never chose this name (it came from generateName) — a collision is
@@ -2665,7 +2737,10 @@ pub async fn replace_cr<S: Store>(
         return Ok(Json(obj));
     }
 
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    // Store at the CRD's storage version, not the request version — see
+    // convert_cr_for_storage. `obj` itself is left at the request version for the response.
+    let storage_obj = convert_cr_for_storage(&state, &ctx, &group, obj.clone()).await?;
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_revision)
@@ -3519,7 +3594,12 @@ pub async fn create_cr_namespaced<S: Store>(
     let mut attempts_made = 1u32;
     let rv = loop {
         let key = cr_store_key(&group, &plural, Some(&ns), &name);
-        let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+        // Store at the CRD's storage version, not the request version — see
+        // convert_cr_for_storage. `obj` itself is left at the request version for the
+        // response below.
+        let storage_obj = convert_cr_for_storage(&state, &ctx, &group, obj.clone()).await?;
+        let bytes =
+            serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
         match state
             .store
             .create_if_namespace_active(Some(&ns_key), &key, Bytes::from(bytes))
@@ -3734,7 +3814,10 @@ pub async fn replace_cr_namespaced<S: Store>(
         return Ok(Json(obj));
     }
 
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    // Store at the CRD's storage version, not the request version — see
+    // convert_cr_for_storage. `obj` itself is left at the request version for the response.
+    let storage_obj = convert_cr_for_storage(&state, &ctx, &group, obj.clone()).await?;
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_revision)
@@ -4120,7 +4203,12 @@ pub async fn patch_cr<S: Store>(
             return Ok(resp);
         }
 
-        let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+        // Store at the CRD's storage version, not the request version — see
+        // convert_cr_for_storage. `obj` itself is left at the request version for the
+        // response.
+        let storage_obj = convert_cr_for_storage(&state, &ctx, &group, obj.clone()).await?;
+        let bytes =
+            serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
         let rv = state
             .store
             .put(&key, Bytes::from(bytes), Some(0))
@@ -4141,6 +4229,24 @@ pub async fn patch_cr<S: Store>(
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+
+    // The stored object may be at a different apiVersion than this request named (e.g. it
+    // was written under an older CRD storage version — see object_needs_conversion's doc on
+    // reading from an object's own stored apiVersion). Every patch flavour below is applied
+    // against the REQUEST version's field shape (mirrors upstream's patch.go: `smpPatcher`
+    // explicitly converts the current object to the request GroupVersion before patching,
+    // and `jsonPatcher`'s Encode/DecodeInto round-trip does the same implicitly via the
+    // codec's convertor), so convert up-front, before the patch, admission, or the
+    // pre-patch `old` snapshot below see it.
+    let desired_api_version = format!("{group}/{version}");
+    convert_cr_list_items(
+        &state,
+        ctx.conversion_webhook_client_config.as_deref(),
+        std::slice::from_mut(&mut obj),
+        &desired_api_version,
+    )
+    .await?;
+    stamp_cr_envelope(&mut obj, &group, &version, &ctx.kind);
 
     // apply-patch+yaml bodies are genuine YAML (same conformance client as the create path
     // above); every other patch type here is JSON.
@@ -4252,7 +4358,10 @@ pub async fn patch_cr<S: Store>(
         return Ok(resp);
     }
 
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    // Store at the CRD's storage version, not the request version — see
+    // convert_cr_for_storage. `obj` itself is left at the request version for the response.
+    let storage_obj = convert_cr_for_storage(&state, &ctx, &group, obj.clone()).await?;
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), Some(stored.revision))
@@ -4361,7 +4470,12 @@ pub async fn patch_cr_namespaced<S: Store>(
             return Ok(resp);
         }
 
-        let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+        // Store at the CRD's storage version, not the request version — see
+        // convert_cr_for_storage. `obj` itself is left at the request version for the
+        // response.
+        let storage_obj = convert_cr_for_storage(&state, &ctx, &group, obj.clone()).await?;
+        let bytes =
+            serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
         let ns_key = cluster_object_key("namespaces", &ns);
         // Reject object creation in a Terminating namespace, atomically with the create —
         // matches create_cr_namespaced/create_namespaced_resource/create_pod. Without this,
@@ -4408,6 +4522,24 @@ pub async fn patch_cr_namespaced<S: Store>(
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+
+    // The stored object may be at a different apiVersion than this request named (e.g. it
+    // was written under an older CRD storage version — see object_needs_conversion's doc on
+    // reading from an object's own stored apiVersion). Every patch flavour below is applied
+    // against the REQUEST version's field shape (mirrors upstream's patch.go: `smpPatcher`
+    // explicitly converts the current object to the request GroupVersion before patching,
+    // and `jsonPatcher`'s Encode/DecodeInto round-trip does the same implicitly via the
+    // codec's convertor), so convert up-front, before the patch, admission, or the
+    // pre-patch `old` snapshot below see it.
+    let desired_api_version = format!("{group}/{version}");
+    convert_cr_list_items(
+        &state,
+        ctx.conversion_webhook_client_config.as_deref(),
+        std::slice::from_mut(&mut obj),
+        &desired_api_version,
+    )
+    .await?;
+    stamp_cr_envelope(&mut obj, &group, &version, &ctx.kind);
 
     // apply-patch+yaml bodies are genuine YAML (same conformance client as the create path
     // above); every other patch type here is JSON.
@@ -4519,7 +4651,10 @@ pub async fn patch_cr_namespaced<S: Store>(
         return Ok(resp);
     }
 
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    // Store at the CRD's storage version, not the request version — see
+    // convert_cr_for_storage. `obj` itself is left at the request version for the response.
+    let storage_obj = convert_cr_for_storage(&state, &ctx, &group, obj.clone()).await?;
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), Some(stored.revision))
@@ -6965,6 +7100,22 @@ mod tests {
         )
     }
 
+    /// v1 (the CRD's storage version, see hostport_crd_bytes) submitted at its own shape —
+    /// used by tests that need to create a CR at the storage version itself, so
+    /// convert_cr_for_storage has nothing to do and every conversion-webhook call in the
+    /// test is genuinely attributable to a later cross-version read/write.
+    fn gizmo_v1_body(name: &str, ns: &str, host_port: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": format!("{HOSTPORT_CRD_GROUP}/v1"),
+                "kind": "Gizmo",
+                "metadata": { "name": name, "namespace": ns },
+                "hostPort": host_port
+            })
+            .to_string(),
+        )
+    }
+
     /// A conversion webhook that mirrors the real conformance suite's CRD converter closely
     /// enough to exercise the exact hostPort<->host+port scenario: v1's `hostPort` is
     /// `"{host}:{port}"`; converting to v2 splits it back apart.
@@ -7037,14 +7188,16 @@ mod tests {
     /// converted to the REQUESTED version before the field-selector filter runs, not served
     /// as raw stored bytes.
     ///
-    /// Before this fix, `list_cr_namespaced`'s watch branch passed `fetch_initial_events`'s
-    /// items straight into `watch_generic_for_cr` unconverted; `cr_matches_field_selector`
-    /// (the #858 fix) then correctly evaluated `hostPort` — declared selectable on v1 — as
-    /// absent on the raw v2 body (no `hostPort` key at all) and dropped every CR. A v1 watch
-    /// with `fieldSelector=hostPort=host1:80` therefore delivered nothing: the exact
-    /// `crd_selectable_fields.go:259` failure. This fails on revert because reverting Hook A
-    /// removes the `convert_cr_list_items` call, so `hostPort` is never present on gizmo-a's
-    /// delivered body and the selector never matches it.
+    /// Both CRs are submitted via v2 but — since create/update now convert to the CRD's
+    /// storage version on write — end up stored at v1 regardless; the watch
+    /// below requests v2, so it is the one that needs a cross-version conversion, not the
+    /// create. Before the read-path fix, `list_cr_namespaced`'s watch branch passed
+    /// `fetch_initial_events`'s items straight into `watch_generic_for_cr` unconverted;
+    /// `cr_matches_field_selector` (the #858 fix) then correctly evaluated `port` —
+    /// declared selectable on v2 — as absent on the raw v1 body (no `port` key at all) and
+    /// dropped every CR. This fails on revert because reverting Hook A removes the
+    /// `convert_cr_list_items` call, so `port` is never present on gizmo-a's delivered body
+    /// and the selector never matches it.
     #[tokio::test]
     async fn list_cr_namespaced_watch_send_initial_events_converts_backlog_before_field_selector() {
         use crate::handlers::crd;
@@ -7066,8 +7219,8 @@ mod tests {
         .await
         .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
 
-        // Both CRs are created via v2 (their own stored apiVersion is v2) — only gizmo-a's
-        // host:port matches the v1 selector below.
+        // Both CRs are submitted via v2 but end up stored at v1 (the storage version) —
+        // only gizmo-a's port matches the v2 selector below.
         for (name, host, port) in [("gizmo-a", "host1", "80"), ("gizmo-b", "host1", "8080")] {
             assert!(
                 create_cr_namespaced(
@@ -7088,10 +7241,15 @@ mod tests {
             );
         }
 
+        // Baseline captured AFTER the creates above (which now also call the webhook, once
+        // per create, to normalize to the storage version) so the assertion below isolates
+        // calls made by the watch itself, not the setup.
+        let call_count_before_watch = call_count.load(Ordering::SeqCst);
+
         let watch_query = super::super::generic::CollectionQuery {
             watch: Some(true),
             send_initial_events: Some(true),
-            field_selector: Some("hostPort=host1:80".to_string()),
+            field_selector: Some("port=80".to_string()),
             timeout_seconds: Some(2),
             ..no_watch_query()
         };
@@ -7099,7 +7257,7 @@ mod tests {
             State(state.clone()),
             Path((
                 HOSTPORT_CRD_GROUP.to_string(),
-                "v1".to_string(),
+                "v2".to_string(),
                 ns.to_string(),
                 "gizmos".to_string(),
             )),
@@ -7108,7 +7266,7 @@ mod tests {
             "test-user".to_string(),
         )
         .await
-        .unwrap_or_else(|e| panic!("v1 watch with sendInitialEvents must succeed, got {e:?}"));
+        .unwrap_or_else(|e| panic!("v2 watch with sendInitialEvents must succeed, got {e:?}"));
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = tokio::time::timeout(
@@ -7121,22 +7279,21 @@ mod tests {
         let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
 
         assert!(
-            call_count.load(Ordering::SeqCst) > 0,
-            "gizmo-a/b are stored at v2 but the watch requested v1, so the conversion webhook \
+            call_count.load(Ordering::SeqCst) > call_count_before_watch,
+            "gizmo-a/b are stored at v1 but the watch requested v2, so the conversion webhook \
              must have been called to convert the sendInitialEvents backlog (got: {body_str})"
         );
         assert!(
-            body_str.contains("\"gizmo-a\"") && body_str.contains("\"hostPort\":\"host1:80\""),
-            "a v1 watch's sendInitialEvents backlog must deliver gizmo-a CONVERTED to v1 shape \
-             (with hostPort present) — if conversion is skipped, the field selector \
-             hostPort=host1:80 is evaluated against the raw v2 body (no hostPort key) and \
-             matches nothing, reproducing the CustomResourceFieldSelectors watch failure \
-             (got: {body_str})"
+            body_str.contains("\"gizmo-a\"") && body_str.contains("\"port\":\"80\""),
+            "a v2 watch's sendInitialEvents backlog must deliver gizmo-a CONVERTED to v2 shape \
+             (with port present) — if conversion is skipped, the field selector port=80 is \
+             evaluated against the raw v1 body (no port key) and matches nothing, reproducing \
+             the CustomResourceFieldSelectors watch failure (got: {body_str})"
         );
         assert!(
             !body_str.contains("\"gizmo-b\""),
-            "gizmo-b converts to hostPort=host1:8080, which must NOT match the v1 selector \
-             hostPort=host1:80 (got: {body_str})"
+            "gizmo-b converts to port=8080, which must NOT match the v2 selector port=80 \
+             (got: {body_str})"
         );
     }
 
@@ -7145,13 +7302,18 @@ mod tests {
     /// also be converted to the requested version before the field-selector filter runs.
     ///
     /// The watch is opened BEFORE the matching CR exists, reproducing what the conformance
-    /// test's `v1hostPortWatch` does: it opens the v1 watch first, then the CRs are created
-    /// afterward and must arrive as live ADDED events, not backlog. Before this fix,
+    /// test's `v1hostPortWatch` does: it opens the watch first, then the CR is created
+    /// afterward and must arrive as a live ADDED event, not backlog. gizmo-a is submitted
+    /// via v2 but — since create now converts to the CRD's storage version on write —
+    /// ends up stored at v1; the watch below requests v2, so it needs its
+    /// own cross-version conversion on top of the create's. Before the read-path fix,
     /// `watch_generic_impl`'s live-event handling restamped only apiVersion/kind on the raw
-    /// stored v2 body and filtered THAT against the v1 selector — hostPort is never present
-    /// on a v2 body, so nothing was ever delivered. This fails on revert because reverting
-    /// Hook B removes the `convert_watched_cr_object` call, so the live ADDED event is
-    /// filtered (and dropped) before conversion ever happens.
+    /// stored v1 body and filtered THAT against the v2 selector — `port` is never present on
+    /// a v1 body, so nothing was ever delivered. Asserting `call_count >= 2` (one for the
+    /// create's write-conversion, one for the live event's read-conversion) rather than just
+    /// `> 0` is what still fails on revert now that create alone already makes one call:
+    /// reverting Hook B removes the `convert_watched_cr_object` call, dropping the total back
+    /// to 1 and filtering the live ADDED event out before conversion ever happens.
     #[tokio::test]
     async fn list_cr_namespaced_watch_converts_live_event_before_field_selector() {
         use crate::handlers::crd;
@@ -7174,11 +7336,11 @@ mod tests {
         .await
         .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
 
-        // Open the v1 watch BEFORE the matching CR exists — a plain watch (no
+        // Open the v2 watch BEFORE the matching CR exists — a plain watch (no
         // sendInitialEvents), so the only way gizmo-a can be delivered is the LIVE path.
         let watch_query = super::super::generic::CollectionQuery {
             watch: Some(true),
-            field_selector: Some("hostPort=host1:80".to_string()),
+            field_selector: Some("port=80".to_string()),
             timeout_seconds: Some(2),
             ..no_watch_query()
         };
@@ -7186,7 +7348,7 @@ mod tests {
             State(state.clone()),
             Path((
                 HOSTPORT_CRD_GROUP.to_string(),
-                "v1".to_string(),
+                "v2".to_string(),
                 ns.to_string(),
                 "gizmos".to_string(),
             )),
@@ -7195,7 +7357,7 @@ mod tests {
             "test-user".to_string(),
         )
         .await
-        .unwrap_or_else(|e| panic!("v1 watch must succeed, got {e:?}"));
+        .unwrap_or_else(|e| panic!("v2 watch must succeed, got {e:?}"));
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Create the matching CR via v2 AFTER the watch is open, on a separate task so the
@@ -7230,16 +7392,17 @@ mod tests {
         let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
 
         assert!(
-            call_count.load(Ordering::SeqCst) > 0,
-            "gizmo-a is stored at v2 but the watch requested v1, so the live event must have \
-             gone through the conversion webhook (got: {body_str})"
+            call_count.load(Ordering::SeqCst) >= 2,
+            "gizmo-a's create makes one webhook call to normalize to the v1 storage version; \
+             the v2 watch's live event must make a SECOND call to convert it back for the \
+             field-selector filter (got: {body_str})"
         );
         assert!(
-            body_str.contains("\"gizmo-a\"") && body_str.contains("\"hostPort\":\"host1:80\""),
+            body_str.contains("\"gizmo-a\"") && body_str.contains("\"port\":\"80\""),
             "a live ADDED event on a cross-version CR watch must be delivered CONVERTED (with \
-             hostPort present) — before this fix, watch_generic_impl only restamped \
-             apiVersion/kind on the raw v2 body and filtered that against the v1 selector, so \
-             a v2-stored CR never matched a v1 fieldSelector and was silently dropped, exactly \
+             port present) — before this fix, watch_generic_impl only restamped \
+             apiVersion/kind on the raw v1 body and filtered that against the v2 selector, so \
+             a v1-stored CR never matched a v2 fieldSelector and was silently dropped, exactly \
              the CustomResourceFieldSelectors watch failure (got: {body_str})"
         );
     }
@@ -7251,9 +7414,14 @@ mod tests {
     /// that version's declared field silently matches nothing, because the raw stored body
     /// doesn't carry that field's name at all.
     ///
-    /// Fails on revert: without the convert_cr_list_items call, gizmo-a's raw v2 body has no
-    /// "hostPort" key, cr_matches_field_selector never matches it, and DeleteCollection
-    /// deletes nothing instead of gizmo-a.
+    /// gizmo-a/b are submitted via v2 but — since create now converts to the CRD's storage
+    /// version on write — end up stored at v1; DeleteCollection below requests
+    /// v2, so it is the one that needs its own cross-version conversion. The call-count
+    /// baseline is captured AFTER the creates (which now also call the webhook once each)
+    /// so the assertion isolates DeleteCollection's own call. Fails on revert: without the
+    /// convert_cr_list_items call, gizmo-a's raw v1 body has no "port" key,
+    /// cr_matches_field_selector never matches it, and DeleteCollection deletes nothing
+    /// instead of gizmo-a.
     #[tokio::test]
     async fn delete_collection_cr_namespaced_converts_before_field_selector() {
         use crate::handlers::crd;
@@ -7291,15 +7459,17 @@ mod tests {
             .unwrap_or_else(|e| panic!("create {name} via v2 must succeed: {e:?}"));
         }
 
+        let call_count_before_delete = call_count.load(Ordering::SeqCst);
+
         let query = super::super::generic::CollectionQuery {
-            field_selector: Some("hostPort=host1:80".to_string()),
+            field_selector: Some("port=80".to_string()),
             ..no_watch_query()
         };
         delete_collection_cr_namespaced(
             State(state.clone()),
             Path((
                 HOSTPORT_CRD_GROUP.to_string(),
-                "v1".to_string(),
+                "v2".to_string(),
                 ns.to_string(),
                 "gizmos".to_string(),
             )),
@@ -7309,12 +7479,12 @@ mod tests {
             Bytes::new(),
         )
         .await
-        .unwrap_or_else(|e| panic!("v1 DeleteCollection with fieldSelector must succeed: {e:?}"));
+        .unwrap_or_else(|e| panic!("v2 DeleteCollection with fieldSelector must succeed: {e:?}"));
 
         assert!(
-            call_count.load(Ordering::SeqCst) > 0,
-            "gizmo-a/b are stored at v2 but DeleteCollection requested v1, so the conversion \
-             webhook must have been called to evaluate hostPort against the converted view"
+            call_count.load(Ordering::SeqCst) > call_count_before_delete,
+            "gizmo-a/b are stored at v1 but DeleteCollection requested v2, so the conversion \
+             webhook must have been called to evaluate port against the converted view"
         );
 
         let a_gone = get_cr_namespaced(
@@ -7331,8 +7501,7 @@ mod tests {
         .await;
         assert!(
             a_gone.is_err(),
-            "gizmo-a (host1:80) must be deleted by v1 DeleteCollection \
-             fieldSelector=hostPort=host1:80"
+            "gizmo-a (port=80) must be deleted by v2 DeleteCollection fieldSelector=port=80"
         );
 
         let b_survives = get_cr_namespaced(
@@ -7349,7 +7518,7 @@ mod tests {
         .await;
         assert!(
             b_survives.is_ok(),
-            "gizmo-b (host1:8080) must survive — it does not match hostPort=host1:80"
+            "gizmo-b (port=8080) must survive — it does not match port=80"
         );
     }
 
@@ -7538,15 +7707,16 @@ mod tests {
         );
     }
 
-    /// A watch at the SAME version the CR is stored at must never call the conversion
-    /// webhook — the free common case (controllers watch the storage version, not a
-    /// different one). Guards `convert_watched_cr_object`'s short-circuit: a naive "always
-    /// convert when a CRD has a webhook" implementation would call the webhook on every
-    /// event even when no conversion is needed, and real conversion webhooks (including the
-    /// conformance suite's) reject a version-to-itself conversion as a client bug — so
-    /// failing to short-circuit would break EVERY CR watch on a CRD with a conversion
-    /// webhook, not just cross-version ones. Fails on revert if the short-circuit check is
-    /// removed (e.g. converting unconditionally whenever a webhook is configured).
+    /// A create/watch pair both at the CRD's storage version must never call the conversion
+    /// webhook — the free common case (controllers create and watch the storage version, not
+    /// a different one). Guards both `convert_cr_for_storage`'s write-path short-circuit and
+    /// `convert_watched_cr_object`'s read-path one: a naive "always convert when a CRD has a
+    /// webhook" implementation would call the webhook on every write and every event even
+    /// when no conversion is needed, and real conversion webhooks (including the conformance
+    /// suite's) reject a version-to-itself conversion as a client bug — so failing to
+    /// short-circuit would break EVERY create/watch on a CRD with a conversion webhook, not
+    /// just cross-version ones. Fails on revert if either short-circuit check is removed
+    /// (e.g. converting unconditionally whenever a webhook is configured).
     #[tokio::test]
     async fn list_cr_namespaced_watch_same_version_does_not_call_conversion_webhook() {
         use crate::handlers::crd;
@@ -7568,30 +7738,32 @@ mod tests {
         .await
         .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
 
+        // v1 IS the storage version (see hostport_crd_bytes), so this create has nothing to
+        // convert on write.
         assert!(
             create_cr_namespaced(
                 State(state.clone()),
                 Path((
                     HOSTPORT_CRD_GROUP.to_string(),
-                    "v2".to_string(),
+                    "v1".to_string(),
                     ns.to_string(),
                     "gizmos".to_string(),
                 )),
                 test_user(),
                 axum::http::HeaderMap::new(),
-                gizmo_v2_body("gizmo-a", ns, "host1", "80"),
+                gizmo_v1_body("gizmo-a", ns, "host1:80"),
             )
             .await
             .is_ok(),
-            "create gizmo-a via v2 must succeed"
+            "create gizmo-a via v1 must succeed"
         );
 
-        // Watch at v2 — the CR's own stored version — with sendInitialEvents so gizmo-a is
+        // Watch at v1 — the CR's own stored version — with sendInitialEvents so gizmo-a is
         // delivered from the backlog (Hook A), the same phase Hook A's conversion runs in.
         let watch_query = super::super::generic::CollectionQuery {
             watch: Some(true),
             send_initial_events: Some(true),
-            field_selector: Some("host=host1".to_string()),
+            field_selector: Some("hostPort=host1:80".to_string()),
             timeout_seconds: Some(2),
             ..no_watch_query()
         };
@@ -7599,7 +7771,7 @@ mod tests {
             State(state.clone()),
             Path((
                 HOSTPORT_CRD_GROUP.to_string(),
-                "v2".to_string(),
+                "v1".to_string(),
                 ns.to_string(),
                 "gizmos".to_string(),
             )),
@@ -7608,7 +7780,7 @@ mod tests {
             "test-user".to_string(),
         )
         .await
-        .unwrap_or_else(|e| panic!("v2 watch must succeed, got {e:?}"));
+        .unwrap_or_else(|e| panic!("v1 watch must succeed, got {e:?}"));
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = tokio::time::timeout(
@@ -7621,16 +7793,270 @@ mod tests {
         let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
 
         assert!(
-            body_str.contains("\"gizmo-a\"") && body_str.contains("\"host\":\"host1\""),
-            "a same-version watch must still deliver the matching CR (got: {body_str})"
+            body_str.contains("\"gizmo-a\"") && body_str.contains("\"hostPort\":\"host1:80\""),
+            "a same-version create+watch must still deliver the matching CR (got: {body_str})"
         );
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             0,
-            "gizmo-a's own stored apiVersion already IS v2 — the requested version — so this \
-             is a version-to-itself request; calling the conversion webhook for it is both \
-             wasted work and something real conversion webhooks reject as a client bug \
-             (got: {body_str})"
+            "gizmo-a is created and watched both at v1 — the CRD's storage version — so \
+             neither the create's write-path conversion nor the watch's read-path one has \
+             anything to do; calling the conversion webhook for a version-to-itself request \
+             is both wasted work and something real conversion webhooks reject as a client \
+             bug (got: {body_str})"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Write-path conversion: create/update/patch must normalize a CR to the
+    // CRD's storage version via the conversion webhook, matching upstream's
+    // customresource_handler.go encoderVersion. Without this, u7s never dials the webhook on
+    // write, so upstream's own waitWebhookConversionReady e2e warm-up never warms the
+    // webhook Service before the real conformance assertions make the first genuine dial.
+    // ---------------------------------------------------------------------------
+
+    /// A create submitted at a served-but-non-storage version must be normalized to the
+    /// storage version on write, dialing the conversion webhook exactly once. This is the
+    /// mechanism this bead exists for: without it, upstream's waitWebhookConversionReady
+    /// warm-up (which creates a throwaway CR at a non-storage version specifically to
+    /// pre-warm the webhook Service) never dials the webhook, so the real first-ever dial
+    /// races the two-node rig's iptables kube-proxy NAT-programming window instead of a warm
+    /// one. Fails on revert: without convert_cr_for_storage, call_count stays 0 and the
+    /// stored bytes carry v2's shape/apiVersion, not v1's.
+    #[tokio::test]
+    async fn create_cr_namespaced_at_non_storage_version_converts_and_stores_storage_version() {
+        use crate::handlers::crd;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+
+        let state = make_state();
+        let ns = "default";
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            hostport_crd_bytes(&base_url),
+        )
+        .await
+        .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
+
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v2".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v2_body("gizmo-a", ns, "host1", "80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create gizmo-a via v2 must succeed: {e:?}"));
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "a create at v2 (non-storage) must dial the conversion webhook exactly once, to \
+             normalize to v1 (storage) before the object is written"
+        );
+
+        let key = cr_store_key(HOSTPORT_CRD_GROUP, "gizmos", Some(ns), "gizmo-a");
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .expect("store get must succeed")
+            .expect("gizmo-a must be stored");
+        let stored_obj: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored bytes must be valid JSON");
+        assert_eq!(
+            stored_obj["apiVersion"].as_str(),
+            Some("fieldconv.example.com/v1"),
+            "the object must be persisted at the CRD's storage version (v1), not the request \
+             version (v2) it was submitted at (got: {stored_obj})"
+        );
+        assert_eq!(
+            stored_obj["hostPort"].as_str(),
+            Some("host1:80"),
+            "the persisted body must be in v1's shape (hostPort), produced by the conversion \
+             webhook from the submitted v2 host/port fields (got: {stored_obj})"
+        );
+    }
+
+    /// A create submitted at the CRD's storage version has nothing to convert — it must make
+    /// zero conversion-webhook calls. Guards convert_cr_for_storage's version-to-itself
+    /// short-circuit: real conversion webhooks (including the conformance suite's) reject a
+    /// version-to-itself ConversionReview as a client bug, so failing to short-circuit here
+    /// would break every create on a CRD with a conversion webhook, not just cross-version
+    /// ones. Fails on revert if convert_cr_for_storage's object_needs_conversion check is
+    /// removed (e.g. always dialing the webhook whenever one is configured).
+    #[tokio::test]
+    async fn create_cr_namespaced_at_storage_version_makes_zero_webhook_calls() {
+        use crate::handlers::crd;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+
+        let state = make_state();
+        let ns = "default";
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            hostport_crd_bytes(&base_url),
+        )
+        .await
+        .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
+
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v1_body("gizmo-a", ns, "host1:80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create gizmo-a via v1 must succeed: {e:?}"));
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "a create at v1 (already the storage version) has nothing to convert; calling \
+             the webhook for a version-to-itself request is both wasted work and something \
+             real conversion webhooks reject as a client bug"
+        );
+    }
+
+    /// A merge-patch PATCH submitted at a served-but-non-storage version must convert the
+    /// stored object UP to the request version before the patch is applied (so the patch's
+    /// field names — "port", not "hostPort" — actually match something), then convert the
+    /// patched result BACK DOWN to the storage version before it is persisted, dialing the
+    /// webhook once for each direction. gizmo-a is created at v1 (the storage version, zero
+    /// webhook calls) so the two calls counted here are unambiguously the patch's own.
+    /// Fails on revert: without the read-conversion, the merge patch's "port" key lands
+    /// beside "hostPort" instead of updating it (v1 has no "port" field); without the
+    /// write-conversion, the stored object regresses to v2's shape instead of staying at v1.
+    #[tokio::test]
+    async fn patch_cr_namespaced_at_non_storage_version_converts_patch_and_stores_storage_version()
+    {
+        use crate::handlers::crd;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+
+        let state = make_state();
+        let ns = "default";
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            hostport_crd_bytes(&base_url),
+        )
+        .await
+        .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
+
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v1_body("gizmo-a", ns, "host1:80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create gizmo-a via v1 must succeed: {e:?}"));
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "the setup create is at v1 (storage) and must not call the webhook, so the \
+             assertions below can attribute every call to the patch itself"
+        );
+
+        let patch_body = Bytes::from(serde_json::json!({ "port": "8080" }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let resp = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v2".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+                "gizmo-a".to_string(),
+            )),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v2 merge patch must succeed: {e:?}"))
+        .into_response();
+        let resp_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect patch response body");
+        let resp_obj: serde_json::Value =
+            serde_json::from_slice(&resp_bytes).expect("response body must be valid JSON");
+        assert_eq!(
+            resp_obj["host"].as_str(),
+            Some("host1"),
+            "the response must be at the request version (v2) with the pre-existing host \
+             carried through the round-trip conversion (got: {resp_obj})"
+        );
+        assert_eq!(
+            resp_obj["port"].as_str(),
+            Some("8080"),
+            "the response must reflect the patch's new port value (got: {resp_obj})"
+        );
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "a v2 patch on a v1-stored object must convert once to read it at v2 (so the \
+             patch's \"port\" key matches something) and once more to store the result back \
+             at v1"
+        );
+
+        let key = cr_store_key(HOSTPORT_CRD_GROUP, "gizmos", Some(ns), "gizmo-a");
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .expect("store get must succeed")
+            .expect("gizmo-a must still be stored");
+        let stored_obj: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored bytes must be valid JSON");
+        assert_eq!(
+            stored_obj["apiVersion"].as_str(),
+            Some("fieldconv.example.com/v1"),
+            "the patched object must remain persisted at the storage version (v1), not \
+             regress to the patch request's version (v2) (got: {stored_obj})"
+        );
+        assert_eq!(
+            stored_obj["hostPort"].as_str(),
+            Some("host1:8080"),
+            "the persisted body must reflect the patch's new port, merged back into v1's \
+             hostPort shape by the write-path conversion (got: {stored_obj})"
         );
     }
 
@@ -8991,6 +9417,7 @@ mod tests {
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("test".into(), "v1".into(), "0".into()),
+            storage_version: "v1".into(),
             scale: None,
         };
         // Fresh cache per call: these tests exercise schema-correctness, not caching, and
@@ -9126,6 +9553,7 @@ mod tests {
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
+            storage_version: "v1".into(),
             scale: None,
         };
         // Local to this test (not a shared/global counter) so parallel test execution in
@@ -9175,6 +9603,7 @@ mod tests {
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
+            storage_version: "v1".into(),
             scale: None,
         };
         let cache = crate::state::CrSchemaCache::new();
@@ -9241,6 +9670,7 @@ mod tests {
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), rv.into()),
+            storage_version: "v1".into(),
             scale: None,
         };
         let cache = crate::state::CrSchemaCache::new();
