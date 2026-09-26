@@ -74,7 +74,10 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
     // bounded retry — a freshly created webhook Service's ClusterIP can see a few of these
     // in the first tens of milliseconds, before kube-proxy finishes programming its
     // IPVS/iptables NAT rule (see the function doc in admission.rs for the mechanism).
-    let resp = send_webhook_request_with_retry(|| {
+    // CRD conversion webhooks (unlike admission webhooks) have no `timeoutSeconds` field
+    // to read; 10s matches the default `prepare_webhook_call` already bakes into
+    // `wh_client`'s own per-attempt timeout via `build_webhook_call_client`.
+    let resp = send_webhook_request_with_retry(std::time::Duration::from_secs(10), || {
         wh_client
             .post(&url)
             .header("Content-Type", "application/json")
