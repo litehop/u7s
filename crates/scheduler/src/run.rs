@@ -529,6 +529,89 @@ async fn run_cache_watch_loop(
     }
 }
 
+/// The PVC watch: maintains `NodeTally`'s PVC cache exactly like
+/// `run_cache_watch_loop` would, but ALSO re-drives every pod
+/// `NodeTally::apply_pvc_event` reports as waiting on the PVC an
+/// ADDED/MODIFIED event just brought into existence (see `PvcWaiters` in
+/// lib.rs) — the moment `main.rs`'s missing-PVC branch deferred it on, not
+/// `pods_needing_resync`'s RESYNC_INTERVAL (30s) bound. Split out of
+/// `run_cache_watch_loop`'s generic `fn(&mut NodeTally, &Value)` dispatch
+/// because this needs `in_flight`/`connector`/`server` to act on a waiter,
+/// which that shared signature has no room to carry.
+async fn run_pvc_watch_loop(
+    connector: TlsConnector,
+    server: String,
+    tally: Arc<Mutex<NodeTally>>,
+    in_flight: Arc<Mutex<HashSet<String>>>,
+) {
+    loop {
+        info!("starting cache watch on {PVC_WATCH_PATH}");
+        tally.lock().expect("tally lock poisoned").clear_pvc_cache();
+        let result = stream_watch_events(&connector, &server, PVC_WATCH_PATH, |event| {
+            let waiting_pods = tally
+                .lock()
+                .expect("tally lock poisoned")
+                .apply_pvc_event(&event);
+            for pod_key in waiting_pods {
+                let connector = connector.clone();
+                let server = server.clone();
+                let in_flight = in_flight.clone();
+                let tally = tally.clone();
+                tokio::spawn(async move {
+                    redrive_pod(&pod_key, &connector, &server, &in_flight, &tally).await;
+                });
+            }
+        })
+        .await;
+        if let Err(e) = result {
+            error!("cache watch on {PVC_WATCH_PATH} error: {e} — reconnecting in 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Re-fetch `pod_key` ("namespace/name") live and feed the result through
+/// `handle_pod_event` exactly as `run_resync_loop`'s next tick would — used
+/// by `run_pvc_watch_loop` to re-drive a pod the instant the PVC it was
+/// deferred on appears, instead of waiting out RESYNC_INTERVAL.
+/// `handle_pod_event`'s own `in_flight` dedup is the sole authority on
+/// whether this attempt actually proceeds (e.g. a concurrent resync tick
+/// already claimed it) — this function does no dedup of its own, mirroring
+/// `run_resync_loop`'s identical reliance on that same check.
+///
+/// A GET failure (the pod itself was deleted while deferred, a transient
+/// disconnect, ...) is not logged as an error: `pods_needing_resync`'s own
+/// retry covers it regardless, so this is just a missed opportunity to go
+/// faster, never a correctness gap.
+async fn redrive_pod(
+    pod_key: &str,
+    connector: &TlsConnector,
+    server: &str,
+    in_flight: &Arc<Mutex<HashSet<String>>>,
+    tally: &Arc<Mutex<NodeTally>>,
+) {
+    let Some((namespace, pod_name)) = pod_key.split_once('/') else {
+        return;
+    };
+    let path = format!("/api/v1/namespaces/{namespace}/pods/{pod_name}");
+    let Ok((status, body)) = http_get(connector, server, &path).await else {
+        return;
+    };
+    if !status.is_success() {
+        return;
+    }
+    let Ok(object) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return;
+    };
+    handle_pod_event(
+        serde_json::json!({"type": "MODIFIED", "object": object}),
+        connector,
+        server,
+        in_flight,
+        tally,
+    );
+}
+
 /// True for the single synthetic BOOKMARK the apiserver sends to mark the end
 /// of a `sendInitialEvents=true` relist (Kubernetes 1.27+ informer protocol —
 /// see `crates/apiserver/src/handlers/watch.rs`). Distinct from an ordinary
@@ -762,6 +845,78 @@ fn handle_pod_event(
                     return;
                 }
             };
+            // `pending`'s own spec.volumes named every one of `pvc_names` moments
+            // ago, so a name missing here is (almost always) the populator/
+            // ephemeral-volume creation race — the pod's own just-created PVC
+            // hasn't landed yet when this live GET runs — not a truly deleted
+            // PVC. `fetch_pvc_binding_info_batch`'s 404-is-absent convention is
+            // correct for a genuinely gone PVC, but treating a RACY absence the
+            // same way would make every one of the four derivations below (most
+            // importantly `fetch_unbound_csi_pvc_drivers`) silently see this PVC
+            // as carrying no constraint at all — which is exactly how the
+            // AnyVolumeDataSource populate-pod got bound onto a node lacking the
+            // CSI driver its still-unbound PVC needs. Defer instead, exactly
+            // like the GET-failure branch above.
+            if let Some(missing) = pending
+                .pvc_names
+                .iter()
+                .find(|name| !pvc_info.contains_key(name.as_str()))
+                .cloned()
+            {
+                info!(
+                    "PVC {namespace}/{missing} referenced by {pod_name} not found yet — deferring \
+                     until it appears (re-driven immediately on its own watch event, or within \
+                     RESYNC_INTERVAL at worst)"
+                );
+                // Upstream visibility for the case this really is a
+                // permanently-missing PVC (typo'd claimName, deleted out from
+                // under the pod, wrong namespace), not the populator race the
+                // comment above is about: without this, such a pod sits
+                // Pending forever with nothing but a log line nobody outside
+                // this process ever sees. Fired on every deferral, including
+                // the race case, exactly like the FailedScheduling event this
+                // async block's own Err(no-node-fits) branch below already
+                // emits unconditionally on every failed cycle — the race
+                // case self-heals within microseconds either way (this fix's
+                // whole point), so the extra Event/condition churn it costs
+                // is negligible.
+                let message = format!(r#"persistentvolumeclaim "{missing}" not found"#);
+                if let Some(patch) = failed_scheduling_status_patch(&event, &message) {
+                    if let Err(patch_err) = patch_pod_status(
+                        &connector_clone,
+                        &server_clone,
+                        &namespace,
+                        &pod_name,
+                        &patch,
+                    )
+                    .await
+                    {
+                        error!("failed to set PodScheduled=False status for {key}: {patch_err}");
+                    }
+                }
+                if let Err(e) = emit_scheduling_event(
+                    &connector_clone,
+                    &server_clone,
+                    &namespace,
+                    &pod_name,
+                    "FailedScheduling",
+                    &message,
+                    "Warning",
+                )
+                .await
+                {
+                    error!("failed to emit FailedScheduling event for {key}: {e}");
+                }
+                tally_clone
+                    .lock()
+                    .expect("tally lock poisoned")
+                    .register_pvc_waiter(&namespace, &missing, key.clone());
+                in_flight_clone
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .remove(&key);
+                return;
+            }
             let bound_volume_names: Vec<String> = pvc_info
                 .values()
                 .map(|info| info.volume_name.clone())
@@ -1115,13 +1270,20 @@ pub async fn run_scheduler(
     // lands — never a permanent wedge. Gating the pod watch on it too would
     // trade a bounded, narrow, self-healing delay for an unconditional
     // startup stall on every pod, CSI or not — not worth it pre-alpha.
+    //
+    // The PVC watch runs its own dedicated loop (below), not this generic
+    // one: unlike the other three caches, a PVC ADDED/MODIFIED event can also
+    // mean "re-drive a pod `main.rs`'s missing-PVC branch deferred" (see
+    // `run_pvc_watch_loop`'s doc comment), which needs `in_flight` and the
+    // connector/server to act on — context this generic loop's `fn(&mut
+    // NodeTally, &Value)` apply signature has no room for.
+    tokio::spawn(run_pvc_watch_loop(
+        connector.clone(),
+        server.clone(),
+        tally.clone(),
+        in_flight.clone(),
+    ));
     for (path, apply, clear, ready) in [
-        (
-            PVC_WATCH_PATH,
-            NodeTally::apply_pvc_event as fn(&mut NodeTally, &serde_json::Value),
-            NodeTally::clear_pvc_cache as fn(&mut NodeTally),
-            None,
-        ),
         (
             PV_WATCH_PATH,
             NodeTally::apply_pv_event as fn(&mut NodeTally, &serde_json::Value),
@@ -2441,6 +2603,768 @@ mod tests {
             "a PVC whose StorageClass is Immediate must never be stamped — it already has its \
              own non-topology-gated provisioning path, and stamping it anyway would just be a \
              dead write nothing ever reads"
+        );
+    }
+
+    /// Spin up an in-process TLS mock server that answers the first
+    /// `flip_after` `GET .../persistentvolumeclaims/prime-pvc` requests with
+    /// a 404 (simulating the AnyVolumeDataSource populator race: the pod
+    /// referencing it was just watched, but the PVC it names hasn't landed
+    /// in the store yet) and every one after that with 200 (the PVC has now
+    /// been created — unbound, backed by a StorageClass whose provisioner is
+    /// a real CSI driver). `flip_after` set past any real test's attempt
+    /// count (e.g. `usize::MAX`) reproduces the original always-404 mock —
+    /// a PVC that truly never appears.
+    ///
+    /// Also answers the StorageClass GET the once-visible PVC's provisioner
+    /// lookup needs, and `POST .../binding` with 201 Created while recording
+    /// each bind's target node name (parsed from the request body) — so a
+    /// caller can assert not just THAT a bind happened, but WHICH node it
+    /// landed on. Everything else gets a bare 200 OK.
+    async fn spawn_missing_referenced_pvc_mock_server(
+        flip_after: usize,
+    ) -> (
+        TlsConnector,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let bind_count = Arc::new(AtomicUsize::new(0));
+        let bind_count_srv = bind_count.clone();
+        let pvc_get_count = Arc::new(AtomicUsize::new(0));
+        let pvc_get_count_srv = pvc_get_count.clone();
+        let bound_nodes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let bound_nodes_srv = bound_nodes.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let bind_count = bind_count_srv.clone();
+                let pvc_get_count = pvc_get_count_srv.clone();
+                let bound_nodes = bound_nodes_srv.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 8192];
+                    let mut total = 0usize;
+                    let header_end = loop {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        total += n;
+                        if let Some(pos) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let request_line = head.lines().next().unwrap_or("");
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_owned();
+                    let path = parts.next().unwrap_or("").to_owned();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while total < header_end + content_length {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                    }
+                    let body_end = (header_end + content_length).min(total);
+                    let request_body =
+                        String::from_utf8_lossy(&buf[header_end..body_end]).to_string();
+
+                    let (status_line, body): (String, String) = if method == "GET"
+                        && path == "/api/v1/namespaces/default/persistentvolumeclaims/prime-pvc"
+                    {
+                        if pvc_get_count.fetch_add(1, Ordering::SeqCst) < flip_after {
+                            (
+                                "404 Not Found".to_owned(),
+                                r#"{"kind":"Status","status":"Failure","code":404}"#.to_owned(),
+                            )
+                        } else {
+                            (
+                                "200 OK".to_owned(),
+                                json!({
+                                    "metadata": {"name": "prime-pvc", "namespace": "default"},
+                                    "spec": {"storageClassName": "csi-hostpath-class"}
+                                })
+                                .to_string(),
+                            )
+                        }
+                    } else if method == "GET"
+                        && path == "/apis/storage.k8s.io/v1/storageclasses/csi-hostpath-class"
+                    {
+                        (
+                            "200 OK".to_owned(),
+                            json!({"provisioner": "csi-hostpath.csi.k8s.io"}).to_string(),
+                        )
+                    } else if method == "GET" && path == "/api/v1/namespaces/default/pods/web-0" {
+                        // `redrive_pod`'s own single-pod GET, re-fetching
+                        // web-0 exactly as it stood when deferred.
+                        (
+                            "200 OK".to_owned(),
+                            json!({
+                                "metadata": {"name": "web-0", "namespace": "default"},
+                                "spec": {
+                                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                                    "volumes": [
+                                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                                    ]
+                                },
+                                "status": {}
+                            })
+                            .to_string(),
+                        )
+                    } else if method == "GET" && path == RESYNC_PODS_PATH {
+                        // Replays web-0's still-unscheduled pod object exactly
+                        // as `run_resync_loop` would fetch it fresh from the
+                        // store — the caller relies on this to redrive the
+                        // pod deferred earlier via the resync path.
+                        (
+                            "200 OK".to_owned(),
+                            json!({
+                                "items": [{
+                                    "metadata": {"name": "web-0", "namespace": "default"},
+                                    "spec": {
+                                        "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                                        "volumes": [
+                                            {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                                        ]
+                                    },
+                                    "status": {}
+                                }]
+                            })
+                            .to_string(),
+                        )
+                    } else if method == "POST" && path.ends_with("/binding") {
+                        bind_count.fetch_add(1, Ordering::SeqCst);
+                        let target: serde_json::Value =
+                            serde_json::from_str(&request_body).unwrap_or_default();
+                        let node = target["target"]["name"].as_str().unwrap_or("").to_owned();
+                        bound_nodes
+                            .lock()
+                            .expect("bound_nodes lock poisoned")
+                            .push(node);
+                        ("201 Created".to_owned(), r#"{"kind":"Binding"}"#.to_owned())
+                    } else {
+                        (
+                            "200 OK".to_owned(),
+                            r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                        )
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server = format!("https://127.0.0.1:{port}");
+
+        (connector, server, bind_count, bound_nodes)
+    }
+
+    #[tokio::test]
+    async fn pod_is_never_bound_while_its_own_referenced_pvc_still_404s() {
+        use std::sync::atomic::Ordering;
+
+        // Regression for the AnyVolumeDataSource populate-pod hang: the
+        // populator creates the PVC and the pod that mounts it back-to-back,
+        // so the scheduler can observe the pod's ADDED watch event before its
+        // own just-created PVC is visible to a live GET. Before this fix,
+        // that 404 made `fetch_unbound_csi_pvc_drivers` (and the other three
+        // PVC-derived predicates) silently see an EMPTY constraint for
+        // prime-pvc, so `pick_node` bound the pod to worker-0 as if it had no
+        // CSI driver requirement at all — exactly how the real conformance
+        // run landed the populate-pod on a node lacking the csi-hostpath
+        // driver.
+        //
+        // The PVC GET flips from 404 to 200 after 2 attempts — the mock's
+        // stand-in for the populator's own create eventually landing —
+        // proving out the second half of this regression: a deferred pod
+        // must not just stay unbound while its PVC is still missing, it must
+        // actually recover and bind once the PVC exists. A bug that
+        // permanently dropped this pod from resync (e.g. a
+        // `pods_needing_resync` filter regression) would leave `bind_count`
+        // at 0 forever and this test would time out instead of passing.
+        let (connector, server, bind_count, bound_nodes) =
+            spawn_missing_referenced_pvc_mock_server(2).await;
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+            // A second node that DOES register the CSI driver the eventually-
+            // visible PVC needs — the exact real-world shape this bug hangs
+            // on: a single-replica CSI driver StatefulSet, so only ONE of the
+            // rig's nodes has a CSINode entry for it. If the fix regressed
+            // back to ignoring `unbound_csi_pvc_drivers` on retry, pick_node
+            // would once again treat both nodes as equally eligible and
+            // could land back on worker-0 — the node without the driver.
+            guard.apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-1"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+            guard.apply_csi_node_event(&json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": "worker-1"},
+                    "spec": {"drivers": [{"name": "csi-hostpath.csi.k8s.io"}]}
+                }
+            }));
+        }
+
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+
+        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        wait_until(
+            || {
+                !in_flight
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .contains("default/web-0")
+            },
+            "the deferred scheduling attempt to release its in_flight dedup key",
+        )
+        .await;
+        // Give a would-be (buggy) bind time to reach the mock server before
+        // asserting it never did.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            bind_count.load(Ordering::SeqCst),
+            0,
+            "a pod must never be bound while a PVC its OWN spec.volumes directly references is \
+             still absent from a live GET — that absence is (almost always) the populator's \
+             creation race, not a truly deleted PVC, and binding anyway throws away the CSI \
+             topology constraint that PVC was about to carry"
+        );
+        assert_eq!(
+            tally
+                .lock()
+                .expect("tally lock poisoned")
+                .pods_on("worker-0")
+                .len(),
+            0,
+            "worker-0 must not carry a tallied reservation for a pod that was never actually \
+             bound to it"
+        );
+
+        // Drive the deferred pod's retry via the same periodic resync loop
+        // production uses, on a millisecond-scale interval so this test
+        // doesn't need to wait out the real 30s RESYNC_INTERVAL — mirrors
+        // `resync_loop_gates_on_node_cache_synced`'s own pattern for driving
+        // `run_resync_loop` directly in a test.
+        let (_node_cache_synced_tx, node_cache_synced_rx) = tokio::sync::watch::channel(true);
+        tokio::spawn(run_resync_loop(
+            connector.clone(),
+            server.clone(),
+            in_flight.clone(),
+            tally.clone(),
+            node_cache_synced_rx,
+            std::time::Duration::from_millis(10),
+        ));
+
+        wait_until(
+            || bind_count.load(Ordering::SeqCst) >= 1,
+            "the deferred pod to actually bind once its PVC becomes visible — if the resync \
+             loop dropped it instead of retrying, bind_count would stay 0 forever and this \
+             wait would time out",
+        )
+        .await;
+
+        // The mock's RESYNC_PODS_PATH response always replays web-0 as still
+        // unscheduled (it doesn't model the bind sticking), so the resync
+        // loop may fire more than one successful bind attempt before this
+        // assertion runs — harmless for what this test cares about: EVERY
+        // one of them must land on worker-1, never worker-0.
+        let bound = bound_nodes
+            .lock()
+            .expect("bound_nodes lock poisoned")
+            .clone();
+        assert!(
+            !bound.is_empty() && bound.iter().all(|n| n == "worker-1"),
+            "the pod must bind to worker-1 — the only node whose CSINode registers the \
+             csi-hostpath driver its now-visible PVC needs — never worker-0, which has no \
+             CSINode entry for it at all; got {bound:?}"
+        );
+    }
+
+    /// Regression for the other half of the PVC-add re-drive fix: before it,
+    /// a PVC ADDED event never re-triggered scheduling of a pod deferred on
+    /// it — only the 30s periodic resync did (`crates/scheduler/src/lib.rs`'s
+    /// `apply_pvc_event`, pre-fix, only ever mutated the PVC cache). This
+    /// drives `redrive_pod` — what `run_pvc_watch_loop` calls the instant
+    /// `NodeTally::apply_pvc_event` reports a waiter for the PVC that just
+    /// appeared — directly, with NO resync loop running at all, so a
+    /// regression that dropped the pod back to resync-only recovery would
+    /// leave `bind_count` at 0 forever here (this test would time out)
+    /// instead of passing.
+    #[tokio::test]
+    async fn redrive_pod_binds_the_deferred_pod_once_its_pvc_appears() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, bind_count, bound_nodes) =
+            spawn_missing_referenced_pvc_mock_server(1).await;
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+            guard.apply_csi_node_event(&json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": "worker-0"},
+                    "spec": {"drivers": [{"name": "csi-hostpath.csi.k8s.io"}]}
+                }
+            }));
+        }
+
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+
+        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        wait_until(
+            || {
+                !in_flight
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .contains("default/web-0")
+            },
+            "the deferred scheduling attempt to release its in_flight dedup key",
+        )
+        .await;
+        assert_eq!(
+            bind_count.load(Ordering::SeqCst),
+            0,
+            "the pod must still be deferred (PVC still 404s) before redrive_pod is ever called"
+        );
+
+        redrive_pod("default/web-0", &connector, &server, &in_flight, &tally).await;
+
+        wait_until(
+            || bind_count.load(Ordering::SeqCst) >= 1,
+            "redrive_pod's own live GET + resubmission through handle_pod_event to actually \
+             bind the pod once its PVC exists — a regression that only released in_flight (or \
+             only refreshed the cache) without re-attempting scheduling would leave this at 0 \
+             forever",
+        )
+        .await;
+
+        assert_eq!(
+            bound_nodes
+                .lock()
+                .expect("bound_nodes lock poisoned")
+                .as_slice(),
+            ["worker-0"],
+            "the redriven attempt must bind to worker-0 — the only node, which does register \
+             the driver its now-visible PVC needs"
+        );
+    }
+
+    /// Spin up an in-process TLS mock server for a PVC that NEVER appears
+    /// (a typo'd `claimName`, one deleted out from under the pod, ...) —
+    /// unlike `spawn_missing_referenced_pvc_mock_server`, this always 404s
+    /// the PVC GET. Captures every `PATCH .../status` and
+    /// `POST .../events` request body, so a test can assert on the
+    /// FailedScheduling event and PodScheduled=False condition the
+    /// missing-PVC branch must emit for this case.
+    async fn spawn_permanently_missing_pvc_mock_server() -> (
+        TlsConnector,
+        String,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let status_patches: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let status_patches_srv = status_patches.clone();
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_srv = events.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let status_patches = status_patches_srv.clone();
+                let events = events_srv.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 8192];
+                    let mut total = 0usize;
+                    let header_end = loop {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        total += n;
+                        if let Some(pos) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let request_line = head.lines().next().unwrap_or("");
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_owned();
+                    let path = parts.next().unwrap_or("").to_owned();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while total < header_end + content_length {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                    }
+                    let body_end = (header_end + content_length).min(total);
+                    let request_body =
+                        String::from_utf8_lossy(&buf[header_end..body_end]).to_string();
+
+                    let (status_line, body): (String, String) = if method == "GET"
+                        && path == "/api/v1/namespaces/default/persistentvolumeclaims/prime-pvc"
+                    {
+                        (
+                            "404 Not Found".to_owned(),
+                            r#"{"kind":"Status","status":"Failure","code":404}"#.to_owned(),
+                        )
+                    } else if method == "PATCH" && path.ends_with("/status") {
+                        status_patches
+                            .lock()
+                            .expect("status_patches lock poisoned")
+                            .push(request_body);
+                        ("200 OK".to_owned(), r#"{"kind":"Pod"}"#.to_owned())
+                    } else if method == "POST" && path.ends_with("/events") {
+                        events
+                            .lock()
+                            .expect("events lock poisoned")
+                            .push(request_body);
+                        ("201 Created".to_owned(), r#"{"kind":"Event"}"#.to_owned())
+                    } else {
+                        (
+                            "200 OK".to_owned(),
+                            r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                        )
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server = format!("https://127.0.0.1:{port}");
+
+        (connector, server, status_patches, events)
+    }
+
+    /// Upstream visibility for a PVC that never appears at all (typo'd
+    /// `claimName`, deleted out from under the pod, wrong namespace, ...) —
+    /// before this fix, the missing-PVC branch left such a pod silently
+    /// Pending forever with nothing but an `info!` log line nobody outside
+    /// this process ever sees. Matches upstream kube-scheduler: a
+    /// FailedScheduling Event AND a PodScheduled=False/Unschedulable status
+    /// condition, both carrying the exact
+    /// `persistentvolumeclaim "<name>" not found` message a client (or a
+    /// conformance test's condition-message assertion) would look for.
+    #[tokio::test]
+    async fn missing_pvc_branch_emits_failed_scheduling_event_and_condition() {
+        let (connector, server, status_patches, events) =
+            spawn_permanently_missing_pvc_mock_server().await;
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+
+        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        wait_until(
+            || !events.lock().expect("events lock poisoned").is_empty(),
+            "a FailedScheduling event to be posted for a pod whose referenced PVC never appears",
+        )
+        .await;
+
+        let events = events.lock().expect("events lock poisoned").clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains(r#""reason":"FailedScheduling""#)
+                    && e.contains(r#""message":"persistentvolumeclaim \"prime-pvc\" not found""#)),
+            "expected a FailedScheduling event carrying the exact \
+             persistentvolumeclaim \"prime-pvc\" not found message; got {events:?}"
+        );
+
+        let patches = status_patches
+            .lock()
+            .expect("status_patches lock poisoned")
+            .clone();
+        assert!(
+            patches.iter().any(|p| {
+                p.contains(r#""type":"PodScheduled""#)
+                    && p.contains(r#""status":"False""#)
+                    && p.contains(r#""reason":"Unschedulable""#)
+                    && p.contains(r#""message":"persistentvolumeclaim \"prime-pvc\" not found""#)
+            }),
+            "expected a PodScheduled=False/Unschedulable status patch carrying the exact \
+             persistentvolumeclaim \"prime-pvc\" not found message; got {patches:?}"
+        );
+    }
+
+    /// `PvcWaiters::register` used to push unconditionally: the missing-PVC
+    /// branch releases `in_flight` on every defer (unlike the preemption
+    /// Deferred path, which keeps the key in `in_flight` so its own waiter
+    /// registers exactly once), so a permanently-missing PVC got this same
+    /// pod key re-registered every RESYNC_INTERVAL — an unbounded leak for
+    /// any typo'd `claimName` or PVC deleted out from under a pod and never
+    /// recreated. This drives several resync ticks against the same
+    /// permanently-missing PVC and checks the waiter set still holds exactly
+    /// one entry, then registers once more and checks the pod's own
+    /// deletion drops it to zero. A revert of either the set-semantics fix
+    /// or the delete-cleanup hook makes this fail: the count would grow with
+    /// every tick, or the deleted pod's entry would still be handed back.
+    #[tokio::test]
+    async fn missing_pvc_waiter_holds_one_entry_per_pod_across_repeated_resync_ticks_and_drops_on_pod_delete(
+    ) {
+        let (connector, server, _status_patches, _events) =
+            spawn_permanently_missing_pvc_mock_server().await;
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+
+        // Several resync ticks against the same permanently-missing PVC —
+        // exactly what production's 30s RESYNC_INTERVAL loop does forever
+        // for a pod stuck this way.
+        for _ in 0..5 {
+            handle_pod_event(pod_event.clone(), &connector, &server, &in_flight, &tally);
+            wait_until(
+                || {
+                    !in_flight
+                        .lock()
+                        .expect("in_flight lock poisoned")
+                        .contains("default/web-0")
+                },
+                "each repeated defer to release its in_flight dedup key before the next tick",
+            )
+            .await;
+        }
+
+        let ready = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_pvc_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "prime-pvc", "namespace": "default"}, "spec": {}}
+            }));
+        assert_eq!(
+            ready,
+            vec!["default/web-0".to_owned()],
+            "5 resync ticks against the same permanently-missing PVC must leave exactly one \
+             waiter entry for the pod, not one per tick — got {ready:?}"
+        );
+
+        // Register the waiter again, then delete the pod — its own entry
+        // must be dropped, or it would sit here forever waiting on a PVC it
+        // can never actually use once the pod referencing it is gone.
+        handle_pod_event(pod_event.clone(), &connector, &server, &in_flight, &tally);
+        wait_until(
+            || {
+                !in_flight
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .contains("default/web-0")
+            },
+            "the defer to release its in_flight dedup key before the pod is deleted",
+        )
+        .await;
+
+        handle_pod_event(
+            json!({
+                "type": "DELETED",
+                "object": {
+                    "metadata": {"name": "web-0", "namespace": "default"},
+                    "spec": {},
+                    "status": {}
+                }
+            }),
+            &connector,
+            &server,
+            &in_flight,
+            &tally,
+        );
+
+        let ready_after_delete = tally.lock().expect("tally lock poisoned").apply_pvc_event(
+            &json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "prime-pvc", "namespace": "default"}, "spec": {}}
+            }),
+        );
+        assert!(
+            ready_after_delete.is_empty(),
+            "a deleted pod's waiter must not linger — resolving its PVC afterward must not \
+             hand back a pod key that no longer exists; got {ready_after_delete:?}"
         );
     }
 }
