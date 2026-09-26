@@ -53,8 +53,13 @@ assert "06-run-sonobuoy.sh threads --kube-conformance-image into SONOBUOY_BASE_A
   "$(grep -qF -- '--kube-conformance-image=registry.k8s.io/conformance:v${K8S_VERSION}' "$RUN_SONOBUOY" && echo 1 || echo 0)"
 assert "run-all.sh accepts a --k8s-version CLI flag" \
   "$(grep -qE -- '--k8s-version\) K8S_VERSION=' "$RUN_ALL" && echo 1 || echo 0)"
+# Assert at the actual dispatch line (not just that _K8S_VERSION_ARG appears
+# somewhere in the file, e.g. its own assignment) -- a prior version of this
+# assertion still passed after removing ${_K8S_VERSION_ARG} from the call
+# site below, because the assignment above it kept the substring alive.
+DISPATCH_LINE="$(grep -F -- '"$DIR/06-run-sonobuoy.sh"' "$RUN_ALL")"
 assert "run-all.sh forwards --k8s-version to 06-run-sonobuoy.sh" \
-  "$(grep -qF -- '_K8S_VERSION_ARG' "$RUN_ALL" && echo 1 || echo 0)"
+  "$(printf '%s' "$DISPATCH_LINE" | grep -qF -- '${_K8S_VERSION_ARG}' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 2. build_base_args() -- mirrors 06-run-sonobuoy.sh's own
