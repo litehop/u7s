@@ -108,6 +108,14 @@ the repo/worktree. Fetch it with `gh api`/`curl` (never `WebFetch`) into
 
 ## Scratch worktrees
 
+**Hard rule:** inspect PR code only in a scratch worktree, never in the
+mayor checkout. `git worktree add temp/review-scratch/<pr-num>-<ts> <ref>`,
+then run every git command against it via `git -C <scratch-path>` —
+including read/inspect commands, not just mutating ones.
+`scripts/guard-destructive-git.sh` blocks destructive git (reset --hard,
+checkout -- <path>, restore, stash, clean -f, switch -f) against the mayor
+checkout at the tool layer, but do not rely on it as your only safeguard.
+
 A hypothesis-driven check (e.g. constructing an input the worker didn't
 test, or reproducing a suspected vacuous pass) sometimes needs to run code
 from the PR outside read-only inspection. If you need one, put it at
