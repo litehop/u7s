@@ -762,6 +762,32 @@ fn handle_pod_event(
                     return;
                 }
             };
+            // `pending`'s own spec.volumes named every one of `pvc_names` moments
+            // ago, so a name missing here is (almost always) the populator/
+            // ephemeral-volume creation race — the pod's own just-created PVC
+            // hasn't landed yet when this live GET runs — not a truly deleted
+            // PVC. `fetch_pvc_binding_info_batch`'s 404-is-absent convention is
+            // correct for a genuinely gone PVC, but treating a RACY absence the
+            // same way would make every one of the four derivations below (most
+            // importantly `fetch_unbound_csi_pvc_drivers`) silently see this PVC
+            // as carrying no constraint at all — which is exactly how the
+            // AnyVolumeDataSource populate-pod got bound onto a node lacking the
+            // CSI driver its still-unbound PVC needs. Defer instead, exactly
+            // like the GET-failure branch above.
+            if let Some(missing) = pending
+                .pvc_names
+                .iter()
+                .find(|name| !pvc_info.contains_key(name.as_str()))
+            {
+                info!(
+                    "PVC {namespace}/{missing} referenced by {pod_name} not found yet — retrying on next watch tick"
+                );
+                in_flight_clone
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .remove(&key);
+                return;
+            }
             let bound_volume_names: Vec<String> = pvc_info
                 .values()
                 .map(|info| info.volume_name.clone())
@@ -2441,6 +2467,185 @@ mod tests {
             "a PVC whose StorageClass is Immediate must never be stamped — it already has its \
              own non-topology-gated provisioning path, and stamping it anyway would just be a \
              dead write nothing ever reads"
+        );
+    }
+
+    /// Spin up an in-process TLS mock server that answers every
+    /// `GET .../persistentvolumeclaims/prime-pvc` with a 404 (simulating the
+    /// AnyVolumeDataSource populator race: the pod referencing it was just
+    /// watched, but the PVC it names hasn't landed in the store yet),
+    /// answers `POST .../binding` with 201 Created while counting it, and
+    /// answers everything else with a bare 200 OK.
+    async fn spawn_missing_referenced_pvc_mock_server(
+    ) -> (TlsConnector, String, Arc<std::sync::atomic::AtomicUsize>) {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let bind_count = Arc::new(AtomicUsize::new(0));
+        let bind_count_srv = bind_count.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let bind_count = bind_count_srv.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 8192];
+                    let mut total = 0usize;
+                    loop {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&buf[..total]);
+                    let request_line = request.lines().next().unwrap_or("");
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("");
+
+                    let (status_line, body): (String, String) = if method == "GET"
+                        && path == "/api/v1/namespaces/default/persistentvolumeclaims/prime-pvc"
+                    {
+                        (
+                            "404 Not Found".to_owned(),
+                            r#"{"kind":"Status","status":"Failure","code":404}"#.to_owned(),
+                        )
+                    } else if method == "POST" && path.ends_with("/binding") {
+                        bind_count.fetch_add(1, Ordering::SeqCst);
+                        ("201 Created".to_owned(), r#"{"kind":"Binding"}"#.to_owned())
+                    } else {
+                        (
+                            "200 OK".to_owned(),
+                            r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                        )
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server = format!("https://127.0.0.1:{port}");
+
+        (connector, server, bind_count)
+    }
+
+    #[tokio::test]
+    async fn pod_is_never_bound_while_its_own_referenced_pvc_still_404s() {
+        use std::sync::atomic::Ordering;
+
+        // Regression for the AnyVolumeDataSource populate-pod hang: the
+        // populator creates the PVC and the pod that mounts it back-to-back,
+        // so the scheduler can observe the pod's ADDED watch event before its
+        // own just-created PVC is visible to a live GET. Before this fix,
+        // that 404 made `fetch_unbound_csi_pvc_drivers` (and the other three
+        // PVC-derived predicates) silently see an EMPTY constraint for
+        // prime-pvc, so `pick_node` bound the pod to worker-0 as if it had no
+        // CSI driver requirement at all — exactly how the real conformance
+        // run landed the populate-pod on a node lacking the csi-hostpath
+        // driver.
+        let (connector, server, bind_count) = spawn_missing_referenced_pvc_mock_server().await;
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+
+        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        wait_until(
+            || {
+                !in_flight
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .contains("default/web-0")
+            },
+            "the deferred scheduling attempt to release its in_flight dedup key",
+        )
+        .await;
+        // Give a would-be (buggy) bind time to reach the mock server before
+        // asserting it never did.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            bind_count.load(Ordering::SeqCst),
+            0,
+            "a pod must never be bound while a PVC its OWN spec.volumes directly references is \
+             still absent from a live GET — that absence is (almost always) the populator's \
+             creation race, not a truly deleted PVC, and binding anyway throws away the CSI \
+             topology constraint that PVC was about to carry"
+        );
+        assert_eq!(
+            tally
+                .lock()
+                .expect("tally lock poisoned")
+                .pods_on("worker-0")
+                .len(),
+            0,
+            "worker-0 must not carry a tallied reservation for a pod that was never actually \
+             bound to it"
         );
     }
 }
