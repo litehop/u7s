@@ -115,15 +115,15 @@ provision:
       apt-get update -qq
       apt-get install -y apt-transport-https ca-certificates curl gpg
 
-      # Install cri-o 1.36 and crun
-      curl -fsSL https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/Release.key \
+      # Install cri-o 1.37 and crun
+      curl -fsSL https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/Release.key \
         | gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-      echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/ /' \
+      echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/ /' \
         > /etc/apt/sources.list.d/cri-o.list
       apt-get update -qq
       # Pinned: this script re-runs on every boot (incl. golden clones), so an
       # unpinned install silently upgrades cri-o whenever upstream publishes.
-      CRIO_VERSION="1.36.5-1.1"
+      CRIO_VERSION="1.37.1-3.1"
       apt-get install -y "cri-o=${CRIO_VERSION}" crun conmon
       # Do NOT add a 10-crun.conf drop-in pointing at /usr/bin/crun.
       # CRI-O ships its own crun at /usr/libexec/crio/crun that matches the OCI
@@ -163,17 +163,17 @@ provision:
       systemctl disable --now containerd containerd.service 2>/dev/null || true
       systemctl mask containerd 2>/dev/null || true
 
-      # Install kubelet 1.36 from pkgs.k8s.io
-      curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key \
+      # Install kubelet 1.37 from pkgs.k8s.io
+      curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.37/deb/Release.key \
         | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-      echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' \
+      echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.37/deb/ /' \
         > /etc/apt/sources.list.d/kubernetes.list
       apt-get update -qq
       # Pinned: this script re-runs on every boot (incl. golden clones), and an
       # unpinned install against the held package aborts it (set -e) as soon as
       # upstream publishes a newer patch. Keep in sync with the KUBELET_VERSION
       # fallback in scripts/conformance/lima-start.sh.
-      KUBELET_PKG_VERSION="1.36.4-1.1"
+      KUBELET_PKG_VERSION="1.37.1-1.1"
       apt-get install -y "kubelet=${KUBELET_PKG_VERSION}"
       apt-mark hold kubelet
 
