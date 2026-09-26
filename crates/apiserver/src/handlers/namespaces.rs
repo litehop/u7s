@@ -25,7 +25,9 @@ use crate::{
     state::AppState,
     status::Status,
     types::{DeleteOptions, NamespacePhase, NamespaceSpec, Object, ObjectMeta, ResourceMeta},
-    util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
+    util::{
+        content_type, extract_body, extract_body_quiet, parse_resource_version, utc_now_rfc3339,
+    },
 };
 
 /// Validate a namespace name: lowercase alphanumeric + hyphens, 1–63 chars.
@@ -381,7 +383,7 @@ pub(crate) async fn replace_namespace<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -717,7 +719,7 @@ pub(crate) async fn finalize_namespace<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = crate::util::extract_body(&body, ct);
+    let body = crate::util::extract_body(&body, ct)?;
 
     // Parse the finalizers from the request body.
     // KCM sends the finalizers in spec.finalizers. We also accept metadata.finalizers
@@ -818,7 +820,7 @@ pub(crate) async fn put_namespace_status<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -1468,7 +1470,11 @@ pub(crate) async fn delete_namespace<S: Store>(
     // client-go's typed Delete() sends DryRun in this body; a raw/proxied caller may
     // instead send it as ?dryRun=All (caught by the router-wide inject_dry_run_header
     // layer) — accept either.
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {

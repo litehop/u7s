@@ -122,7 +122,10 @@ pub async fn self_subject_access_review<S: Store>(
         )
         .into_response();
     }
-    let body = extract_body(&body, content_type(&headers));
+    let body = match extract_body(&body, content_type(&headers)) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     let req: SelfSubjectAccessReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -259,7 +262,10 @@ pub async fn self_subject_rules_review<S: Store>(
         )
         .into_response();
     }
-    let body = extract_body(&body, content_type(&headers));
+    let body = match extract_body(&body, content_type(&headers)) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     let req: SelfSubjectRulesReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -365,7 +371,10 @@ pub async fn subject_access_review<S: Store>(
         )
         .into_response();
     }
-    let body = extract_body(&body, content_type(&headers));
+    let body = match extract_body(&body, content_type(&headers)) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     let parsed: SubjectAccessReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -516,7 +525,10 @@ pub async fn local_subject_access_review<S: Store>(
         )
         .into_response();
     }
-    let body = extract_body(&body, content_type(&headers));
+    let body = match extract_body(&body, content_type(&headers)) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     let mut parsed: SubjectAccessReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -670,7 +682,10 @@ pub async fn token_review<S: Store>(
         )
         .into_response();
     }
-    let body = extract_body(&body, content_type(&headers));
+    let body = match extract_body(&body, content_type(&headers)) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     let req: TokenReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {

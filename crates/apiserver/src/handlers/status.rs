@@ -117,7 +117,7 @@ pub async fn put_resource_status<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("name", &name)?;
     let meta = lookup(&state, &group, &version, &plural)?.clone();
-    let body = extract_body(&body, content_type(&headers));
+    let body = extract_body(&body, content_type(&headers))?;
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -351,7 +351,7 @@ pub async fn put_namespaced_resource_status<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
     validate_name("name", &name)?;
-    let body = extract_body(&body, content_type(&headers));
+    let body = extract_body(&body, content_type(&headers))?;
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 

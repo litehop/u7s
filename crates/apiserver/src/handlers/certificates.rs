@@ -153,7 +153,7 @@ pub(crate) async fn create_cluster_trust_bundle<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, crate::status::StatusError> {
-    let decoded = extract_body(&body, content_type(&headers));
+    let decoded = extract_body(&body, content_type(&headers))?;
     let obj = Object::from_bytes(&decoded)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
     validate_cluster_trust_bundle_spec(&obj.body)?;
@@ -327,7 +327,7 @@ pub(crate) async fn create_pod_certificate_request<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, crate::status::StatusError> {
-    let decoded = extract_body(&body, content_type(&headers));
+    let decoded = extract_body(&body, content_type(&headers))?;
     let mut obj = Object::from_bytes(&decoded)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
     validate_pod_certificate_request_spec(&obj.body)?;

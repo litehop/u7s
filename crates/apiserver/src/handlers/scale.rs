@@ -14,7 +14,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::{Object, ObjectMeta},
-    util::{content_type, extract_body},
+    util::{content_type, extract_body_quiet},
 };
 
 use super::generic::store_err;
@@ -182,19 +182,21 @@ pub(crate) fn decode_scale_body(
     headers: &HeaderMap,
 ) -> Result<Scale, crate::status::StatusError> {
     let ct = content_type(headers);
-    // Try extract_body first: handles JSON-in-proto-envelope transparently.
-    let decoded = extract_body(body, ct);
-
-    // Fast path: try JSON parse (works for plain JSON or JSON extracted from
-    // a proto envelope by extract_body).
-    if let Ok(s) = serde_json::from_slice::<Scale>(&decoded) {
-        return Ok(s);
+    // Try extract_body_quiet first: handles JSON-in-proto-envelope transparently. Its Err is
+    // expected and ignored here — Scale has no decoder registered in
+    // decode_proto_by_kind_and_version (it's a synthetic subresource view, not a stored kind),
+    // so extract_body legitimately cannot decode it; try_decode_proto_scale_body below is the
+    // dedicated decoder for it. Quiet because every Scale PUT/PATCH hits this path.
+    if let Ok(decoded) = extract_body_quiet(body, ct) {
+        // Fast path: try JSON parse (works for plain JSON or JSON extracted from
+        // a proto envelope by extract_body).
+        if let Ok(s) = serde_json::from_slice::<Scale>(&decoded) {
+            return Ok(s);
+        }
     }
 
     // Slow path: body was a proto envelope whose raw field is proto-encoded
-    // Scale (not JSON).  extract_body returns the original bytes in this case
-    // because there is no Scale decoder registered in decode_core_proto_by_kind.
-    // Use the inline decoder instead.
+    // Scale (not JSON). Use the inline decoder instead.
     if let Some(s) = try_decode_proto_scale_body(body) {
         return Ok(s);
     }
@@ -514,8 +516,10 @@ async fn scale_patch_impl<S: Store>(
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Accept both JSON and proto bodies; extract spec.replicas from whichever.
+    // extract_body_quiet's Err is expected and ignored here — see decode_scale_body's comment
+    // on why Scale has no registered proto decoder of its own.
     let ct = content_type(headers);
-    let decoded = extract_body(body, ct);
+    let decoded = extract_body_quiet(body, ct).unwrap_or_else(|_| body.clone());
     let patch_body: serde_json::Value =
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&decoded) {
             v
