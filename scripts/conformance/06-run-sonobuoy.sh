@@ -7,6 +7,11 @@
 # --procs overrides ginkgo's --procs=<N> parallelism (default 16) — see
 # run-all.sh's own --procs doc comment for why (16 OOMs a 4GiB VM under
 # concurrent-load scouting).
+# --k8s-version overrides the conformance image tag via `sonobuoy run`'s
+# --kube-conformance-image, mirroring the per-matrix-branch override
+# .github/workflows/e2e-focus.yaml already does inline — without it, every
+# local run is stuck on whatever version scripts/conformance/sonobuoy-plugin-e2e.yaml
+# hardcodes, which blocks scouting any other Kubernetes conformance version locally.
 #
 # Part of the scripts/conformance/ orchestration sequence.
 set -euo pipefail
@@ -35,6 +40,11 @@ PROCS=16
 # run-all.sh, and erroring here too would just be a second enforcement of the
 # same rule.
 UNSAFE_FOCUS=0
+# Default mirrors scripts/conformance/sonobuoy-plugin-e2e.yaml's own hardcoded
+# SONOBUOY_K8S_VERSION/image tag, so an invocation that omits --k8s-version
+# behaves exactly as before (same reasoning as PROCS's default above). Keep
+# these two in sync.
+K8S_VERSION="1.36.4"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --workdir) WORKDIR="$2"; shift 2 ;;
     --extra-node) EXTRA_NODE="$2"; shift 2 ;;
     --procs) PROCS="$2"; shift 2 ;;
+    --k8s-version) K8S_VERSION="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -263,7 +274,13 @@ build_filter_args() {
 # lenient AlreadyExists tolerance in pkg/client/run.go's handleCreateError
 # used for the manifest-apply step itself. dnscheck/versioncheck (the other
 # two built-in preflight checks) are left enabled.
-SONOBUOY_BASE_ARGS="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --skip-preflight=existingnamespace --kubeconfig /tmp/sonobuoy-kubeconfig"
+#
+# --kube-conformance-image overrides just the plugin manifest's own image tag
+# (scripts/conformance/sonobuoy-plugin-e2e.yaml hardcodes one, since it's a
+# static manifest sonobuoy loads verbatim) with $K8S_VERSION — same override
+# .github/workflows/e2e-focus.yaml already applies per matrix branch, now
+# available locally via run-all.sh's --k8s-version.
+SONOBUOY_BASE_ARGS="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --skip-preflight=existingnamespace --kubeconfig /tmp/sonobuoy-kubeconfig --kube-conformance-image=registry.k8s.io/conformance:v${K8S_VERSION}"
 
 echo "Running sonobuoy inside $VM_NAME..."
 # Start the namespace TTL watchdog in the background now that sonobuoy is
