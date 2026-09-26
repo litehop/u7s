@@ -2011,6 +2011,7 @@ mod tests {
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("example.io".to_string(), "v1".to_string(), "1".to_string()),
+            storage_version: "v1".to_string(),
             scale: None,
         });
         let inserted = cache.insert_if_current(key.clone(), stale_ctx, epoch_before_scan);
