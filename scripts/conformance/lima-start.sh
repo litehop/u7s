@@ -673,7 +673,8 @@ echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnecti
 # binary still never lands at /usr/local/bin/kube-proxy, the KUBE_PROXY_ACTIVE
 # check further down (systemd can't exec a nonexistent binary) already fails the
 # script loud with a journalctl dump — this fallback can't produce a silently
-# broken kube-proxy.
+# broken kube-proxy. Keep the fallback in sync with KUBELET_PKG_VERSION in
+# lima/kubelet.yaml.
 KUBELET_VERSION=$(limactl shell "$VM_NAME" kubelet --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 KUBELET_VERSION="${KUBELET_VERSION:-1.36.4}"
 
