@@ -534,10 +534,11 @@ runs:
       shell: bash
       run: |
         WORKDIR="$PWD/temp/u7s"
-        # The wildcard controller set (minus cloud-specific controllers u7s does
-        # not implement) matches scripts/install.sh's u7s-kcm.service
+        # The wildcard controller set matches scripts/install.sh's u7s-kcm.service
         # --controllers set exactly (see its rationale there for
-        # -clusterrole-aggregation-controller / -device-taint-eviction-controller)
+        # -clusterrole-aggregation-controller / -device-taint-eviction-controller,
+        # and for why cloud-node-lifecycle-controller / node-route-controller /
+        # service-lb-controller are deliberately NOT excluded)
         # -- real upstream e2e specs depend on controllers this workflow's
         # narrower smoke/perf-test peers never needed (e.g. the namespace
         # controller finalizing each test's ephemeral namespace).
@@ -558,7 +559,7 @@ runs:
           --cluster-signing-key-file="$WORKDIR/ca.key" \
           --service-account-private-key-file="$WORKDIR/sa.key" \
           --root-ca-file="$WORKDIR/ca.pem" \
-          --controllers='*,-cloud-node-lifecycle-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \
+          --controllers='*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller' \
           --allocate-node-cidrs=true \
           --cluster-cidr=10.244.0.0/16 \
           --node-cidr-mask-size=24 \
