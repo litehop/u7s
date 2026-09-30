@@ -5976,6 +5976,14 @@ mod tests {
         let ns = "argocd";
         let name = "my-app";
         let cr_key = format!("/registry/cr/{group}/{plural}/{ns}/{name}");
+        crate::handlers::test_support::install_namespaced_crd(
+            &state,
+            group,
+            version,
+            plural,
+            "Application",
+        )
+        .await;
 
         let initial = serde_json::json!({
             "apiVersion": "argoproj.io/v1alpha1",
