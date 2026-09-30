@@ -10,7 +10,7 @@ use u7s_store::{ListOptions, Store};
 use crate::{
     admission::{
         prepare_webhook_call, run_mutating_webhooks, run_validating_webhooks,
-        send_webhook_request_with_retry, AdmissionContext,
+        send_webhook_request_with_retry, AdmissionContext, DEFAULT_WEBHOOK_TIMEOUT_SECS,
     },
     auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
@@ -78,23 +78,26 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
     // in the first tens of milliseconds, before kube-proxy finishes programming its
     // IPVS/iptables NAT rule (see the function doc in admission.rs for the mechanism).
     // CRD conversion webhooks (unlike admission webhooks) have no `timeoutSeconds` field
-    // to read; 10s matches the default `prepare_webhook_call` already bakes into
+    // to read; the default matches what `prepare_webhook_call` already bakes into
     // `wh_client`'s own per-attempt timeout via `build_webhook_call_client`.
-    let resp = send_webhook_request_with_retry(std::time::Duration::from_secs(10), || {
-        wh_client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            // Real conversion webhooks (including the k8s conformance suite's sample
-            // webhook) content-negotiate their response body from the Accept header,
-            // falling back to an arbitrary (even non-JSON, e.g. YAML) encoding when it
-            // doesn't name a type explicitly. Without this, reqwest's default
-            // `Accept: */*` leaves that choice up to the webhook, and a response we can't
-            // parse as JSON below is indistinguishable from a broken one. This mirrors
-            // upstream apiserver's own webhook client (client-go's RESTClient with
-            // ContentConfig.ContentType=json always sends `Accept: application/json, */*`).
-            .header("Accept", "application/json, */*")
-            .body(body.clone())
-    })
+    let resp = send_webhook_request_with_retry(
+        std::time::Duration::from_secs(DEFAULT_WEBHOOK_TIMEOUT_SECS),
+        || {
+            wh_client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                // Real conversion webhooks (including the k8s conformance suite's sample
+                // webhook) content-negotiate their response body from the Accept header,
+                // falling back to an arbitrary (even non-JSON, e.g. YAML) encoding when it
+                // doesn't name a type explicitly. Without this, reqwest's default
+                // `Accept: */*` leaves that choice up to the webhook, and a response we can't
+                // parse as JSON below is indistinguishable from a broken one. This mirrors
+                // upstream apiserver's own webhook client (client-go's RESTClient with
+                // ContentConfig.ContentType=json always sends `Accept: application/json, */*`).
+                .header("Accept", "application/json, */*")
+                .body(body.clone())
+        },
+    )
     .await
     .map_err(|e| Status::internal(format!("conversion webhook call failed: {e}")))?;
 
@@ -638,16 +641,39 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
 /// A no-op (returns `obj` unchanged, no clone, no webhook call) when the request version
 /// already IS the storage version — same version-to-itself skip PR #830 established for the
 /// read path; see `object_needs_conversion`'s doc.
-async fn convert_cr_for_storage<S: Store>(
+pub(crate) async fn convert_cr_for_storage<S: Store>(
     state: &AppState<S>,
     ctx: &CrContext,
     group: &str,
     obj: serde_json::Value,
 ) -> Result<serde_json::Value, crate::status::StatusError> {
     let storage_api_version = format!("{group}/{}", ctx.storage_version);
+    convert_cr_to_api_version(state, ctx, obj, &storage_api_version).await
+}
+
+/// Read-side counterpart of `convert_cr_for_storage`: a stored object (at the storage
+/// version) is converted to the version the request names, so a subresource write
+/// (`/status`, `/scale`) mutates fields in the shape the client sent them in. The result
+/// is converted back with `convert_cr_for_storage` before persisting.
+pub(crate) async fn convert_cr_to_request_version<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    group: &str,
+    version: &str,
+    obj: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    convert_cr_to_api_version(state, ctx, obj, &format!("{group}/{version}")).await
+}
+
+async fn convert_cr_to_api_version<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    obj: serde_json::Value,
+    desired_api_version: &str,
+) -> Result<serde_json::Value, crate::status::StatusError> {
     if !object_needs_conversion(
         &obj,
-        &storage_api_version,
+        desired_api_version,
         ctx.conversion_webhook_client_config.as_deref(),
     ) {
         return Ok(obj);
@@ -658,8 +684,7 @@ async fn convert_cr_for_storage<S: Store>(
         .conversion_webhook_client_config
         .as_deref()
         .expect("object_needs_conversion returned true, so client_config must be Some");
-    let mut converted =
-        call_conversion_webhook(state, cfg, vec![obj], &storage_api_version).await?;
+    let mut converted = call_conversion_webhook(state, cfg, vec![obj], desired_api_version).await?;
     converted
         .pop()
         .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))
@@ -4741,10 +4766,11 @@ pub async fn put_cr_status<S: Store>(
         version: version.clone(),
         plural: plural.clone(),
     };
-    let (key, kind) = if let Some(meta) = state.resource_registry.get(&registry_key) {
+    let (key, kind, cr_ctx) = if let Some(meta) = state.resource_registry.get(&registry_key) {
         (
             group_object_key(&group, &plural, None, &name),
             meta.kind.clone(),
+            None,
         )
     } else {
         // CR fallback: find the CRD to get the kind name, use CR storage key.
@@ -4752,7 +4778,11 @@ pub async fn put_cr_status<S: Store>(
         if ctx.namespaced {
             return Err(Status::not_found(&name, &ctx.kind));
         }
-        (cr_store_key(&group, &plural, None, &name), ctx.kind)
+        (
+            cr_store_key(&group, &plural, None, &name),
+            ctx.kind.clone(),
+            Some(ctx),
+        )
     };
 
     let stored = state
@@ -4764,6 +4794,9 @@ pub async fn put_cr_status<S: Store>(
 
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(ctx) = &cr_ctx {
+        current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
+    }
 
     // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
     // Typed dispatch first: a registry-hit built-in kind with a registered status codec
@@ -4806,7 +4839,11 @@ pub async fn put_cr_status<S: Store>(
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&incoming["metadata"])
             .unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
-    let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
+    let storage_obj = match &cr_ctx {
+        Some(ctx) => convert_cr_for_storage(&state, ctx, &group, current.clone()).await?,
+        None => current.clone(),
+    };
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -4911,17 +4948,22 @@ pub async fn patch_cr_status<S: Store>(
         version: version.clone(),
         plural: plural.clone(),
     };
-    let (key, kind) = if let Some(meta) = state.resource_registry.get(&registry_key) {
+    let (key, kind, cr_ctx) = if let Some(meta) = state.resource_registry.get(&registry_key) {
         (
             group_object_key(&group, &plural, None, &name),
             meta.kind.clone(),
+            None,
         )
     } else {
         let ctx = find_crd(&state, &group, &version, &plural).await?;
         if ctx.namespaced {
             return Err(Status::not_found(&name, &ctx.kind));
         }
-        (cr_store_key(&group, &plural, None, &name), ctx.kind)
+        (
+            cr_store_key(&group, &plural, None, &name),
+            ctx.kind.clone(),
+            Some(ctx),
+        )
     };
 
     let stored = state
@@ -4933,6 +4975,9 @@ pub async fn patch_cr_status<S: Store>(
 
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(ctx) = &cr_ctx {
+        current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
+    }
 
     // apply-patch+yaml bodies are genuine YAML; every other patch type here is JSON.
     let patch: serde_json::Value = if is_ssa {
@@ -5001,7 +5046,11 @@ pub async fn patch_cr_status<S: Store>(
     }
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
-    let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
+    let storage_obj = match &cr_ctx {
+        Some(ctx) => convert_cr_for_storage(&state, ctx, &group, current.clone()).await?,
+        None => current.clone(),
+    };
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -5086,6 +5135,7 @@ fn scale_path_set_i64(obj: &mut serde_json::Value, path: &str, new_value: i64) {
 /// which groups arguments for the same reason.
 struct CrScaleTarget<'a> {
     group: &'a str,
+    version: &'a str,
     plural: &'a str,
     ns: Option<&'a str>,
     name: &'a str,
@@ -5112,6 +5162,7 @@ async fn cr_scale_get_impl<S: Store>(
         .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
     let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let obj = convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
 
     let spec_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
     let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
@@ -5163,8 +5214,10 @@ async fn cr_scale_put_impl<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
-    let mut obj: serde_json::Value = serde_json::from_slice(&stored.value)
+    let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let mut obj =
+        convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
 
     // Capture actual pod count and selector before changing spec so the response reflects
     // reality — same ordering apps/v1's scale_put_impl uses, for the same reason.
@@ -5195,7 +5248,8 @@ async fn cr_scale_put_impl<S: Store>(
     }
 
     let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    let storage_obj = convert_cr_for_storage(state, ctx, target.group, obj).await?;
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -5236,8 +5290,10 @@ async fn cr_scale_patch_impl<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
-    let mut obj: serde_json::Value = serde_json::from_slice(&stored.value)
+    let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let mut obj =
+        convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
 
     let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
     let selector = scale_cfg
@@ -5275,7 +5331,8 @@ async fn cr_scale_patch_impl<S: Store>(
     }
 
     let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    let storage_obj = convert_cr_for_storage(state, ctx, target.group, obj).await?;
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -5304,6 +5361,7 @@ pub async fn get_cr_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: None,
         name: &name,
@@ -5324,6 +5382,7 @@ pub async fn put_cr_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: None,
         name: &name,
@@ -5344,6 +5403,7 @@ pub async fn patch_cr_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: None,
         name: &name,
@@ -5362,6 +5422,7 @@ pub async fn get_cr_namespaced_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: Some(&ns),
         name: &name,
@@ -5382,6 +5443,7 @@ pub async fn put_cr_namespaced_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: Some(&ns),
         name: &name,
@@ -5402,6 +5464,7 @@ pub async fn patch_cr_namespaced_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: Some(&ns),
         name: &name,
@@ -8089,6 +8152,438 @@ mod tests {
             "the persisted body must reflect the patch's new port, merged back into v1's \
              hostPort shape by the write-path conversion (got: {stored_obj})"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Conversion coverage for the remaining write paths (replace, cluster-scoped, SSA
+    // create, webhook failure) and the /status + /scale subresources.
+    // ---------------------------------------------------------------------------
+
+    fn gizmo_crd_with_subresources_bytes(base_url: &str, scope: &str) -> Bytes {
+        let mut crd: serde_json::Value =
+            serde_json::from_slice(&hostport_crd_bytes(base_url)).unwrap();
+        crd["spec"]["scope"] = serde_json::Value::String(scope.to_string());
+        for v in crd["spec"]["versions"].as_array_mut().unwrap() {
+            v["subresources"] = serde_json::json!({
+                "status": {},
+                "scale": { "specReplicasPath": ".spec.replicas", "statusReplicasPath": ".status.replicas" }
+            });
+            v["schema"]["openAPIV3Schema"]["x-kubernetes-preserve-unknown-fields"] =
+                serde_json::json!(true);
+        }
+        Bytes::from(crd.to_string())
+    }
+
+    fn failing_conversion_router() -> axum::Router {
+        axum::Router::new().route(
+            "/convert",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "ConversionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "result": { "status": "Failed", "message": "boom" }
+                    }
+                }))
+            }),
+        )
+    }
+
+    async fn install_gizmo_crd(state: &AppState, bytes: Bytes) {
+        crate::handlers::crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            bytes,
+        )
+        .await
+        .expect("install gizmo CRD with conversion webhook");
+    }
+
+    async fn stored_gizmo(
+        state: &AppState,
+        ns: Option<&str>,
+        name: &str,
+    ) -> Option<serde_json::Value> {
+        let key = cr_store_key(HOSTPORT_CRD_GROUP, "gizmos", ns, name);
+        state
+            .store
+            .get(&key)
+            .await
+            .expect("store get must succeed")
+            .map(|s| serde_json::from_slice(&s.value).expect("stored bytes must be valid JSON"))
+    }
+
+    fn v2_path(ns: &str, name: &str) -> Path<(String, String, String, String, String)> {
+        Path((
+            HOSTPORT_CRD_GROUP.to_string(),
+            "v2".to_string(),
+            ns.to_string(),
+            "gizmos".to_string(),
+            name.to_string(),
+        ))
+    }
+
+    /// A namespaced full-object replace at v2 must be persisted at v1. Without write-path
+    /// conversion on replace, a `kubectl replace` via any non-storage version silently
+    /// re-shapes the stored object to that version's schema, so every other version's
+    /// reader (and the next storage-version read) sees fields it cannot interpret.
+    #[tokio::test]
+    async fn replace_cr_namespaced_at_non_storage_version_stores_storage_version() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, _h) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state();
+        install_gizmo_crd(&state, hostport_crd_bytes(&base_url)).await;
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.into(),
+                "v1".into(),
+                "default".into(),
+                "gizmos".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v1_body("g", "default", "host1:80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed create at v1: {e:?}"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+
+        replace_cr_namespaced(
+            State(state.clone()),
+            v2_path("default", "g"),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v2_body("g", "default", "host2", "9090"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("replace at v2 must succeed: {e:?}"));
+
+        let stored = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+        assert_eq!(
+            stored["apiVersion"].as_str(),
+            Some("fieldconv.example.com/v1"),
+            "replace at v2 must persist at the storage version (got: {stored})"
+        );
+        assert_eq!(
+            stored["hostPort"].as_str(),
+            Some("host2:9090"),
+            "replace at v2 must persist v1's shape, not v2's host/port (got: {stored})"
+        );
+        assert!(
+            stored.get("host").is_none() && stored.get("port").is_none(),
+            "v2-only fields must not leak into storage (got: {stored})"
+        );
+    }
+
+    /// Cluster-scoped CRs go through a separate handler pair from namespaced ones; a
+    /// create at v2 must be stored at v1 there too, or cluster-scoped CRDs (e.g. every
+    /// CSI/Gateway-style cluster resource with a converting webhook) still corrupt storage.
+    #[tokio::test]
+    async fn create_cr_cluster_scoped_at_non_storage_version_stores_storage_version() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, _h) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state();
+        install_gizmo_crd(
+            &state,
+            gizmo_crd_with_subresources_bytes(&base_url, "Cluster"),
+        )
+        .await;
+
+        create_cr(
+            State(state.clone()),
+            Path((HOSTPORT_CRD_GROUP.into(), "v2".into(), "gizmos".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v2_body("g", "", "host1", "80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("cluster-scoped create at v2 must succeed: {e:?}"));
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let stored = stored_gizmo(&state, None, "g").await.unwrap();
+        assert_eq!(
+            stored["apiVersion"].as_str(),
+            Some("fieldconv.example.com/v1")
+        );
+        assert_eq!(
+            stored["hostPort"].as_str(),
+            Some("host1:80"),
+            "cluster-scoped create at v2 must persist v1's shape (got: {stored})"
+        );
+    }
+
+    /// Server-side apply creating a not-yet-existing object at v2 takes a separate branch
+    /// from POST create in the patch handler; `kubectl apply --server-side` is how most
+    /// controllers first create CRs, so it must normalize to the storage version too.
+    #[tokio::test]
+    async fn ssa_create_cr_namespaced_at_non_storage_version_stores_storage_version() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, _h) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state();
+        install_gizmo_crd(&state, hostport_crd_bytes(&base_url)).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+        patch_cr_namespaced(
+            State(state.clone()),
+            v2_path("default", "g"),
+            test_user(),
+            headers,
+            gizmo_v2_body("g", "default", "host1", "80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SSA create at v2 must succeed: {e:?}"));
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let stored = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+        assert_eq!(
+            stored["apiVersion"].as_str(),
+            Some("fieldconv.example.com/v1")
+        );
+        assert_eq!(
+            stored["hostPort"].as_str(),
+            Some("host1:80"),
+            "SSA-create at v2 must persist v1's shape (got: {stored})"
+        );
+    }
+
+    /// If the conversion webhook fails, the write must fail and nothing may be persisted;
+    /// otherwise a broken webhook silently stores objects at a version the storage schema
+    /// never sees, and later reads fail to convert them.
+    #[tokio::test]
+    async fn create_cr_namespaced_fails_and_stores_nothing_when_conversion_webhook_fails() {
+        let (base_url, _h) = start_mock_conversion_server(failing_conversion_router()).await;
+        let state = make_state();
+        install_gizmo_crd(&state, hostport_crd_bytes(&base_url)).await;
+
+        let result = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.into(),
+                "v2".into(),
+                "default".into(),
+                "gizmos".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v2_body("g", "default", "host1", "80"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a failing conversion webhook must fail the write, not fall back to storing the \
+             unconverted object"
+        );
+        assert!(
+            stored_gizmo(&state, Some("default"), "g").await.is_none(),
+            "a failed conversion must leave nothing in the store"
+        );
+    }
+
+    /// A /status write at a non-storage version must round-trip through the webhook (to the
+    /// request version and back) and leave the object persisted at the storage version with
+    /// its spec fields still in storage-version shape. Without it, the status subtree
+    /// authored against v2's schema is spliced into the v1-shaped stored object unconverted.
+    #[tokio::test]
+    async fn put_namespaced_status_at_non_storage_version_round_trips_and_keeps_storage_version() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, _h) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state();
+        install_gizmo_crd(
+            &state,
+            gizmo_crd_with_subresources_bytes(&base_url, "Namespaced"),
+        )
+        .await;
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.into(),
+                "v1".into(),
+                "default".into(),
+                "gizmos".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v1_body("g", "default", "host1:80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed create at v1: {e:?}"));
+
+        let body = serde_json::json!({
+            "apiVersion": "fieldconv.example.com/v2", "kind": "Gizmo",
+            "metadata": { "name": "g", "namespace": "default" },
+            "status": { "ready": true }
+        });
+        let resp = crate::handlers::status::put_namespaced_resource_status(
+            State(state.clone()),
+            v2_path("default", "g"),
+            axum::http::HeaderMap::new(),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v2 status PUT must succeed: {e:?}"))
+        .into_response();
+        let resp: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "one conversion up to v2, one back to v1"
+        );
+        assert_eq!(
+            resp["host"].as_str(),
+            Some("host1"),
+            "response is v2-shaped (got: {resp})"
+        );
+        let stored = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+        assert_eq!(
+            stored["apiVersion"].as_str(),
+            Some("fieldconv.example.com/v1")
+        );
+        assert_eq!(stored["hostPort"].as_str(), Some("host1:80"));
+        assert_eq!(stored["status"]["ready"], serde_json::json!(true));
+    }
+
+    /// Cluster-scoped /status takes a different handler (`put_cr_status`); it must obey the
+    /// same rule as the namespaced one: never leave the object persisted at the request
+    /// version, and never splice request-version data into a storage-version object raw.
+    #[tokio::test]
+    async fn put_cluster_status_at_non_storage_version_round_trips_and_keeps_storage_version() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, _h) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state();
+        install_gizmo_crd(
+            &state,
+            gizmo_crd_with_subresources_bytes(&base_url, "Cluster"),
+        )
+        .await;
+        create_cr(
+            State(state.clone()),
+            Path((HOSTPORT_CRD_GROUP.into(), "v1".into(), "gizmos".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v1_body("g", "", "host1:80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed create at v1: {e:?}"));
+
+        let body = serde_json::json!({
+            "apiVersion": "fieldconv.example.com/v2", "kind": "Gizmo",
+            "metadata": { "name": "g" },
+            "status": { "ready": true }
+        });
+        put_cr_status(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.into(),
+                "v2".into(),
+                "gizmos".into(),
+                "g".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v2 status PUT must succeed: {e:?}"));
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "one conversion up to v2, one back to v1"
+        );
+        let stored = stored_gizmo(&state, None, "g").await.unwrap();
+        assert_eq!(
+            stored["apiVersion"].as_str(),
+            Some("fieldconv.example.com/v1")
+        );
+        assert_eq!(stored["hostPort"].as_str(), Some("host1:80"));
+        assert_eq!(stored["status"]["ready"], serde_json::json!(true));
+    }
+
+    /// A /scale write at a non-storage version resolves the CRD's scale paths against the
+    /// request-version shape, so the object must be converted up and back like /status.
+    #[tokio::test]
+    async fn put_namespaced_scale_at_non_storage_version_round_trips_and_keeps_storage_version() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, _h) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state();
+        install_gizmo_crd(
+            &state,
+            gizmo_crd_with_subresources_bytes(&base_url, "Namespaced"),
+        )
+        .await;
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.into(),
+                "v1".into(),
+                "default".into(),
+                "gizmos".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v1_body("g", "default", "host1:80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed create at v1: {e:?}"));
+
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1", "kind": "Scale",
+            "metadata": { "name": "g", "namespace": "default" },
+            "spec": { "replicas": 5 }
+        });
+        put_cr_namespaced_scale(
+            State(state.clone()),
+            v2_path("default", "g"),
+            {
+                let mut h = axum::http::HeaderMap::new();
+                h.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/json".parse().unwrap(),
+                );
+                h
+            },
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v2 scale PUT must succeed: {e:?}"));
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "one conversion up to v2, one back to v1"
+        );
+        let stored = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+        assert_eq!(
+            stored["apiVersion"].as_str(),
+            Some("fieldconv.example.com/v1")
+        );
+        assert_eq!(stored["hostPort"].as_str(), Some("host1:80"));
+        assert_eq!(stored["spec"]["replicas"], serde_json::json!(5));
     }
 
     // Delete then get must return 404.
