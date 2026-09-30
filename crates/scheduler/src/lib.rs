@@ -1870,6 +1870,7 @@ impl NodeTally {
         self.pods.clear();
         self.by_node.clear();
         self.reserved_victims.clear();
+        self.pvc_waiters.clear();
         self.waiters.clear()
     }
 
@@ -10373,6 +10374,58 @@ mod tests {
             ready.is_empty(),
             "a waiter registered before clear_pvc_cache must not still fire afterward — got \
              {ready:?}"
+        );
+    }
+
+    /// The pod watch reconnect (`NodeTally::clear`) can skip a pod's DELETED
+    /// event, so it must drop PVC waiters too; otherwise the orphaned entry
+    /// would re-drive a pod that no longer exists when its PVC finally appears.
+    #[test]
+    fn node_tally_clear_drops_registered_pvc_waiters() {
+        let mut tally = NodeTally::default();
+        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+
+        let _ = tally.clear();
+
+        let ready = tally.apply_pvc_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "prime-pvc", "namespace": "default" },
+                "spec": {}
+            }
+        }));
+        assert!(
+            ready.is_empty(),
+            "a pod-watch reconnect must not leave an orphaned PVC waiter behind — got {ready:?}"
+        );
+    }
+
+    /// A pod that got bound elsewhere can never be re-driven off its PVC
+    /// waiter; leaving the entry would re-drive an already-scheduled pod.
+    #[test]
+    fn apply_event_bound_pod_drops_its_pvc_waiter() {
+        let mut tally = NodeTally::default();
+        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+
+        let _ = tally.apply_event(&json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "populate-a", "namespace": "default" },
+                "spec": { "nodeName": "worker-0" },
+                "status": { "phase": "Running" }
+            }
+        }));
+
+        let ready = tally.apply_pvc_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "prime-pvc", "namespace": "default" },
+                "spec": {}
+            }
+        }));
+        assert!(
+            ready.is_empty(),
+            "a bound pod's PVC waiter must be removed — got {ready:?}"
         );
     }
 
