@@ -241,9 +241,9 @@ pub(crate) fn resolve_valid_name(
             e.1.message
                 .rsplit_once("': ")
                 .map_or(e.1.message.as_str(), |(_, r)| r);
-        let cause = format!("{field}: Invalid value: \"{value}\": {reason}");
+        let cause = format!("Invalid value: \"{value}\": {reason}");
         let mut err =
-            Status::unprocessable_entity(format!("{kind} \"{name}\" is invalid: {cause}"));
+            Status::unprocessable_entity(format!("{kind} \"{name}\" is invalid: {field}: {cause}"));
         err.1.details = Some(Box::new(serde_json::json!({
             "name": name,
             "group": group,
