@@ -440,36 +440,91 @@ pub struct ProtoEnvelope {
     pub api_version: String,
 }
 
-/// Attempt to decode the Kubernetes protobuf envelope and return both the raw payload and its
-/// declared content-type.
+/// Why `decode_k8s_proto_envelope_detailed` could not produce a `ProtoEnvelope`.
 ///
-/// Returns `Some(envelope)` when the body starts with the k8s magic prefix and contains a
-/// decodable `Unknown.raw` field (field 2). Returns `None` otherwise.
-pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
+/// `NoMagicPrefix` means the body was never detected as a k8s proto envelope in the first
+/// place — the caller may legitimately be looking at plain JSON (e.g. a body that was
+/// already decoded once and is being re-checked against a stale protobuf Content-Type
+/// header). The other variants mean the magic prefix *was* present — the body was
+/// genuinely detected as protobuf-encoded — but the envelope itself is corrupt; callers
+/// should treat these as real decode failures, not silent fallbacks.
+#[derive(Debug)]
+pub enum EnvelopeDecodeError {
+    NoMagicPrefix,
+    Oversized(usize),
+    Prost(prost::DecodeError),
+    EmptyRaw,
+}
+
+impl std::fmt::Display for EnvelopeDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnvelopeDecodeError::NoMagicPrefix => {
+                write!(f, "missing k8s protobuf magic prefix")
+            }
+            EnvelopeDecodeError::Oversized(n) => write!(
+                f,
+                "proto envelope payload ({n} bytes) exceeds the {MAX_PROTO_ENVELOPE_BYTES}-byte limit"
+            ),
+            EnvelopeDecodeError::Prost(e) => {
+                write!(f, "Unknown envelope prost decode failed: {e}")
+            }
+            EnvelopeDecodeError::EmptyRaw => write!(f, "Unknown.raw field is empty"),
+        }
+    }
+}
+
+/// Attempt to decode the Kubernetes protobuf envelope and return both the raw payload and its
+/// declared content-type, with a precise reason on failure.
+///
+/// Returns `Ok(envelope)` when the body starts with the k8s magic prefix and contains a
+/// decodable `Unknown.raw` field (field 2). See `EnvelopeDecodeError` for failure cases.
+pub fn decode_k8s_proto_envelope_detailed(
+    body: &[u8],
+) -> Result<ProtoEnvelope, EnvelopeDecodeError> {
     if body.len() < 4 || &body[..4] != K8S_PROTO_MAGIC {
-        return None;
+        return Err(EnvelopeDecodeError::NoMagicPrefix);
     }
     let proto_bytes = &body[4..];
     // Reject oversized envelopes before handing them to prost. A varint bomb can claim a
     // multi-GiB allocation from a tiny payload; this check prevents the allocation entirely.
     if proto_bytes.len() > MAX_PROTO_ENVELOPE_BYTES {
-        return None;
+        return Err(EnvelopeDecodeError::Oversized(proto_bytes.len()));
     }
-    let unknown = Unknown::decode(proto_bytes).ok()?;
+    let unknown = Unknown::decode(proto_bytes).map_err(EnvelopeDecodeError::Prost)?;
     // raw field must be non-empty — we require a payload
     if unknown.raw.is_empty() {
-        return None;
+        return Err(EnvelopeDecodeError::EmptyRaw);
     }
     let (api_version, kind) = unknown
         .type_meta
         .map(|t| (t.api_version, t.kind))
         .unwrap_or_default();
-    Some(ProtoEnvelope {
+    Ok(ProtoEnvelope {
         raw: unknown.raw,
         content_type: unknown.content_type,
         kind,
         api_version,
     })
+}
+
+/// Attempt to decode the Kubernetes protobuf envelope and return both the raw payload and its
+/// declared content-type.
+///
+/// Returns `Some(envelope)` when the body starts with the k8s magic prefix and contains a
+/// decodable `Unknown.raw` field (field 2). Returns `None` otherwise. Callers that need to
+/// distinguish *why* decoding failed (e.g. to report a precise error instead of silently
+/// falling back) should use `decode_k8s_proto_envelope_detailed` instead.
+pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
+    decode_k8s_proto_envelope_detailed(body).ok()
+}
+
+/// Whether `decode_proto_by_kind_and_version` has any decoder registered for `kind` at all,
+/// regardless of whether it would succeed on a given payload. Lets callers distinguish "no
+/// decoder exists for this kind" from "the registered decoder rejected this payload" when
+/// reporting why a protobuf body could not be decoded.
+pub(crate) fn has_registered_decoder(kind: &str) -> bool {
+    matches!(kind, "Event" | "HorizontalPodAutoscaler") || decoders().contains_key(kind)
 }
 
 /// Encode a Kubernetes protobuf response envelope: magic prefix + `Unknown` message wrapping

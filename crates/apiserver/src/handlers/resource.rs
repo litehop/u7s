@@ -17,7 +17,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::{DeleteOptions, Object, ObjectMeta, OwnerReference},
-    util::{content_type, extract_body, parse_resource_version},
+    util::{content_type, extract_body, extract_body_quiet, parse_resource_version},
 };
 
 use super::generic::{
@@ -477,7 +477,7 @@ pub(crate) async fn create_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let body = extract_body(&body, content_type(&headers));
+    let body = extract_body(&body, content_type(&headers))?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -773,7 +773,7 @@ pub(crate) async fn replace_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name_for_group("name", &name, &group, &plural)?;
-    let body = extract_body(&body, content_type(&headers));
+    let body = extract_body(&body, content_type(&headers))?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1105,7 +1105,11 @@ pub(crate) async fn delete_resource<S: Store>(
         )));
     }
     validate_name_for_group("name", &name, &group, &plural)?;
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -3053,7 +3057,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    let body = extract_body(&body, content_type(&headers));
+    let body = extract_body(&body, content_type(&headers))?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -3516,7 +3520,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
     validate_name_for_group("name", &name, &group, &plural)?;
-    let body = extract_body(&body, content_type(&headers));
+    let body = extract_body(&body, content_type(&headers))?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -4015,7 +4019,11 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
         )));
     }
     validate_name_for_group("name", &name, &group, &plural)?;
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -4502,7 +4510,11 @@ pub(crate) async fn delete_collection_resource<S: Store>(
     // handlers). client-go's typed DeleteCollection() sends DryRun in this body; a
     // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
     // inject_dry_run_header layer) — accept either.
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -4687,7 +4699,11 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
     // handlers). client-go's typed DeleteCollection() sends DryRun in this body; a
     // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
     // inject_dry_run_header layer) — accept either.
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {

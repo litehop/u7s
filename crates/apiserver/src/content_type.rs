@@ -27,6 +27,7 @@ use axum::http::{header, HeaderName, HeaderValue, Request, Response};
 use axum::response::IntoResponse;
 use tower::Layer;
 use tower_service::Service;
+use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
 // Response-side protobuf encoding for hot-path GET/LIST kinds
@@ -207,51 +208,59 @@ where
             .unwrap_or("")
             .to_string();
         let request_id = uuid::Uuid::new_v4();
+        // Entered around the whole handler call so that any `tracing::warn!`/`error!` fired
+        // deep inside a handler (e.g. util::extract_body's undecodable-protobuf-body warning)
+        // is automatically tagged with this request's id, without threading it through every
+        // handler signature.
+        let span = tracing::info_span!("request", request_id = %request_id);
         let start = std::time::Instant::now();
         let mut inner = self.inner.clone();
 
-        Box::pin(async move {
-            let mut resp = inner.call(req).await?;
+        Box::pin(
+            async move {
+                let mut resp = inner.call(req).await?;
 
-            // Single access-log point for every request — keeps the field set/level
-            // consistent and ensures the status logged is the one actually returned
-            // to the client, not an intermediate value.
-            let status = resp.status().as_u16();
-            let request_id_str = request_id.to_string();
+                // Single access-log point for every request — keeps the field set/level
+                // consistent and ensures the status logged is the one actually returned
+                // to the client, not an intermediate value.
+                let status = resp.status().as_u16();
+                let request_id_str = request_id.to_string();
 
-            // Watch/streaming responses (Transfer-Encoding: chunked) must be passed
-            // through with headers completely untouched: the response's `Body` here
-            // is a long-lived stream backed by a broadcast receiver that was subscribed
-            // before this middleware ever ran, so any per-response bookkeeping added
-            // here must not touch it. Mutating the header map is header-only and would
-            // never touch body bytes, but every other response class on this server is
-            // fully buffered by its handler by the time it reaches here, and watch is
-            // the one case where "the response" is still an in-progress operation
-            // rather than a finished value — so it gets the same "leave it alone"
-            // treatment.
-            let is_streaming = resp
-                .headers()
-                .get(header::TRANSFER_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .map(|te| te.eq_ignore_ascii_case("chunked"))
-                .unwrap_or(false);
-            if !is_streaming {
-                if let Ok(value) = HeaderValue::from_str(&request_id_str) {
-                    resp.headers_mut()
-                        .insert(HeaderName::from_static("x-request-id"), value);
+                // Watch/streaming responses (Transfer-Encoding: chunked) must be passed
+                // through with headers completely untouched: the response's `Body` here
+                // is a long-lived stream backed by a broadcast receiver that was subscribed
+                // before this middleware ever ran, so any per-response bookkeeping added
+                // here must not touch it. Mutating the header map is header-only and would
+                // never touch body bytes, but every other response class on this server is
+                // fully buffered by its handler by the time it reaches here, and watch is
+                // the one case where "the response" is still an in-progress operation
+                // rather than a finished value — so it gets the same "leave it alone"
+                // treatment.
+                let is_streaming = resp
+                    .headers()
+                    .get(header::TRANSFER_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|te| te.eq_ignore_ascii_case("chunked"))
+                    .unwrap_or(false);
+                if !is_streaming {
+                    if let Ok(value) = HeaderValue::from_str(&request_id_str) {
+                        resp.headers_mut()
+                            .insert(HeaderName::from_static("x-request-id"), value);
+                    }
                 }
+                tracing::info!(
+                    method = %method,
+                    uri = %uri,
+                    status,
+                    user_agent = %user_agent,
+                    latency_ms = start.elapsed().as_millis() as u64,
+                    request_id = %request_id_str,
+                    "request"
+                );
+                Ok(resp)
             }
-            tracing::info!(
-                method = %method,
-                uri = %uri,
-                status,
-                user_agent = %user_agent,
-                latency_ms = start.elapsed().as_millis() as u64,
-                request_id = %request_id_str,
-                "request"
-            );
-            Ok(resp)
-        })
+            .instrument(span),
+        )
     }
 }
 
@@ -1066,6 +1075,78 @@ mod tests {
         );
     }
 
+    /// Undecodable-protobuf-body warnings (fired deep inside a handler, e.g.
+    /// `util::extract_body`) need to be logged with the request id — but handlers have no
+    /// `request_id` in scope, only this middleware does. The mechanism relies on the tracing
+    /// span entered around the handler call: any event fired anywhere during that call inherits
+    /// the span's `request_id` field automatically. If the `.instrument(span)` wiring in `call`
+    /// were ever dropped, a handler's warn would go out with no `request_id` at all, silently
+    /// reintroducing the "which request was this?" gap this bead exists to close.
+    #[tokio::test]
+    async fn warn_fired_inside_handler_call_inherits_the_request_span_id() {
+        #[derive(Clone)]
+        struct WarningService;
+        impl Service<Request<Body>> for WarningService {
+            type Response = Response<Body>;
+            type Error = std::convert::Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                Box::pin(async move {
+                    // Simulates a handler deep-calling util::extract_body's undecodable-body
+                    // warning — no request_id in scope here, matching a real handler.
+                    tracing::warn!(
+                        detail = "simulated undecodable protobuf body",
+                        "test warning"
+                    );
+                    Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::empty())
+                        .unwrap())
+                })
+            }
+        }
+
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
+
+        let mut layer_svc = ContentTypeLayer.layer(WarningService);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/namespaces/my-namespace/persistentvolumeclaims")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = layer_svc.call(req).await.unwrap();
+        let request_id_header = resp
+            .headers()
+            .get("x-request-id")
+            .expect("response must carry x-request-id")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let log = captured_log(&buf);
+        let warning_line = log
+            .lines()
+            .find(|l| l.contains("test warning"))
+            .expect("the simulated handler warning must appear in the log");
+        assert!(
+            warning_line.contains(&request_id_header),
+            "a warn fired inside the handler call must be tagged with this request's id via \
+             the enclosing tracing span, so a handler's decode-failure warning can be \
+             correlated back to the exact failing request without threading request_id \
+             through every handler signature — checking the whole log buffer instead of just \
+             this line would pass even without span propagation, since the later access-log \
+             line logs request_id as its own field regardless; warning line was: {warning_line:?}"
+        );
+    }
+
     /// The access log must never contain the Authorization header value — logging a bearer
     /// token would leak credentials into log storage/shippers that operators and support staff
     /// can read, effectively handing out impersonation access to anyone with log access.
@@ -1179,9 +1260,14 @@ mod tests {
                  depending on which internal branch a request takes; log was: {log}"
             );
         }
-        let request_id_occurrences = log.matches("request_id").count();
+        // Counts lines, not raw substring occurrences: each line now carries "request_id"
+        // twice (once in the enclosing tracing span's `request{request_id=...}:` context,
+        // once in the access-log event's own field) — a substring count would need updating
+        // every time the span/field shape changes, even though the thing this test actually
+        // guards (one access-log line per request) hasn't.
+        let request_id_lines = log.lines().filter(|l| l.contains("request_id")).count();
         assert_eq!(
-            request_id_occurrences, 2,
+            request_id_lines, 2,
             "expected exactly one access-log line per request (2 requests made), each \
              carrying request_id — extra or missing lines mean the consolidation to a single \
              log point regressed; log was: {log}"
