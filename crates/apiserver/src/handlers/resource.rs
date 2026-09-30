@@ -972,6 +972,13 @@ pub(crate) async fn replace_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
+    if let (true, Some(old)) = (
+        group == "certificates.k8s.io" && plural == "clustertrustbundles",
+        old_object.as_ref(),
+    ) {
+        super::certificates::validate_cluster_trust_bundle_signer_immutable(old, &obj.body)
+            .map_err(Status::unprocessable_entity)?;
+    }
 
     // A PUT may only change the fields ValidatePersistentVolumeUpdate/ValidateStorageClassUpdate/
     // ValidateNodeUpdate leave mutable — see the doc comments on each validator. Runs after
@@ -2010,6 +2017,13 @@ pub(crate) async fn do_patch<S: Store>(
         super::defaults::apply_defaults(group, plural, &mut current.body);
         super::defaults::validate_resource(group, plural, &current.body)
             .map_err(Status::unprocessable_entity)?;
+        if group == "certificates.k8s.io" && plural == "clustertrustbundles" {
+            super::certificates::validate_cluster_trust_bundle_signer_immutable(
+                &old_object,
+                &current.body,
+            )
+            .map_err(Status::unprocessable_entity)?;
+        }
 
         // Escalation prevention: this PATCH merges into an existing Role/ClusterRole/
         // RoleBinding/ClusterRoleBinding, so the merged rules must be checked exactly like

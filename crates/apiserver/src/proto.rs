@@ -524,7 +524,10 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
 /// decoder exists for this kind" from "the registered decoder rejected this payload" when
 /// reporting why a protobuf body could not be decoded.
 pub(crate) fn has_registered_decoder(kind: &str) -> bool {
-    matches!(kind, "Event" | "HorizontalPodAutoscaler") || decoders().contains_key(kind)
+    matches!(
+        kind,
+        "Event" | "HorizontalPodAutoscaler" | "ClusterTrustBundle"
+    ) || decoders().contains_key(kind)
 }
 
 /// Encode a Kubernetes protobuf response envelope: magic prefix + `Unknown` message wrapping
@@ -810,10 +813,6 @@ fn decoders() -> &'static std::collections::HashMap<&'static str, DecoderFn> {
         m.insert(
             "CertificateSigningRequest",
             crate::net_disc_cert_policy_events_gen_adapter::decode_csr_proto_gen,
-        );
-        m.insert(
-            "ClusterTrustBundle",
-            crate::certificates_v1beta1_gen_adapter::decode_clustertrustbundle_proto_gen,
         );
         m.insert(
             "PodCertificateRequest",
@@ -11003,7 +11002,7 @@ mod tests {
     /// single-decoder `m.insert()` added to `decoders()`.
     #[test]
     fn decoders_registers_one_entry_per_kind_with_no_silent_shadowing() {
-        const EXPECTED_KINDS: usize = 65;
+        const EXPECTED_KINDS: usize = 64;
         assert_eq!(
             decoders().len(),
             EXPECTED_KINDS,
@@ -11045,7 +11044,8 @@ mod tests {
         // from `kind` alone (events.k8s.io/v1 vs. core/v1; autoscaling/v2 vs. autoscaling/v1),
         // so `decode_proto_by_kind_and_version` dispatches them explicitly before consulting
         // `decoders()` — their absence from the map is by design, not a gap.
-        const APIVERSION_DISPATCHED_KINDS: &[&str] = &["Event", "HorizontalPodAutoscaler"];
+        const APIVERSION_DISPATCHED_KINDS: &[&str] =
+            &["Event", "HorizontalPodAutoscaler", "ClusterTrustBundle"];
 
         for (key, meta) in crate::state::build_registry().iter() {
             if APIVERSION_DISPATCHED_KINDS.contains(&meta.kind.as_str()) {

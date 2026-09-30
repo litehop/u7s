@@ -88,43 +88,59 @@ pub(crate) fn validate_cluster_trust_bundle_spec(
 /// Upstream `ValidateClusterTrustBundle`: a signer-linked bundle must be named
 /// `<signerName with '/' replaced by ':'>:<suffix>` (so the name alone reveals the owning
 /// signer and signers cannot squat each other's names); a bundle without a signer must not
-/// use `:` at all, keeping that namespace exclusively signer-scoped. A missing
-/// `metadata.name` (generateName) is checked by the name-resolving create path instead.
+/// use `:` at all, keeping that namespace exclusively signer-scoped. Like upstream's
+/// `ValidateObjectMeta`, the rule applies to `metadata.generateName` (as a prefix) and to
+/// `metadata.name`, whichever are set.
 fn validate_name_matches_signer(
     body: &serde_json::Value,
     signer_name: &str,
 ) -> Result<(), crate::status::StatusError> {
-    let Some(name) = body["metadata"]["name"].as_str() else {
-        return Ok(());
-    };
-    if signer_name.is_empty() {
-        if name.contains(':') {
+    if !signer_name.is_empty() {
+        let mut parts = signer_name.split('/');
+        let well_formed = matches!(
+            (parts.next(), parts.next(), parts.next()),
+            (Some(d), Some(p), None) if !d.is_empty() && !p.is_empty()
+        );
+        if !well_formed || signer_name.len() > MAX_SIGNER_NAME_LENGTH {
             return Err(Status::unprocessable_entity(format!(
-                "metadata.name: Invalid value: {name:?}: ClusterTrustBundle without \
-                 spec.signerName must not contain ':'"
+                "spec.signerName: Invalid value: {signer_name:?}: must be of the form \
+                 <domain>/<path> and at most {MAX_SIGNER_NAME_LENGTH} characters"
             )));
         }
-        return Ok(());
-    }
-
-    let mut parts = signer_name.split('/');
-    let well_formed = matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(d), Some(p), None) if !d.is_empty() && !p.is_empty()
-    );
-    if !well_formed || signer_name.len() > MAX_SIGNER_NAME_LENGTH {
-        return Err(Status::unprocessable_entity(format!(
-            "spec.signerName: Invalid value: {signer_name:?}: must be of the form \
-             <domain>/<path> and at most {MAX_SIGNER_NAME_LENGTH} characters"
-        )));
     }
 
     let prefix = format!("{}:", signer_name.replace('/', ":"));
-    if !name.starts_with(&prefix) {
-        return Err(Status::unprocessable_entity(format!(
-            "metadata.name: Invalid value: {name:?}: ClusterTrustBundle for signerName \
-             {signer_name} must be named with prefix {prefix}"
-        )));
+    for field in ["generateName", "name"] {
+        let Some(value) = body["metadata"][field].as_str().filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        if signer_name.is_empty() {
+            if value.contains(':') {
+                return Err(Status::unprocessable_entity(format!(
+                    "metadata.{field}: Invalid value: {value:?}: ClusterTrustBundle without \
+                     spec.signerName must not contain ':'"
+                )));
+            }
+        } else if !value.starts_with(&prefix) {
+            return Err(Status::unprocessable_entity(format!(
+                "metadata.{field}: Invalid value: {value:?}: ClusterTrustBundle for signerName \
+                 {signer_name} must be named with prefix {prefix}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Upstream `ValidateClusterTrustBundleUpdate`: `spec.signerName` is immutable, otherwise a
+/// writer could re-home a bundle under another signer while its name (which consumers use to
+/// select by signer) still claims the original one.
+pub(crate) fn validate_cluster_trust_bundle_signer_immutable(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> Result<(), String> {
+    let signer = |v: &serde_json::Value| v["spec"]["signerName"].as_str().unwrap_or("").to_string();
+    if signer(old) != signer(new) {
+        return Err("spec.signerName: Invalid value: field is immutable".to_string());
     }
     Ok(())
 }
@@ -208,11 +224,7 @@ pub(crate) async fn create_cluster_trust_bundle<S: Store>(
 
     super::resource::create_resource(
         State(state),
-        Path((
-            GROUP.to_string(),
-            version,
-            CTB_PLURAL.to_string(),
-        )),
+        Path((GROUP.to_string(), version, CTB_PLURAL.to_string())),
         Query(create_query),
         Extension(user),
         headers,
@@ -237,11 +249,7 @@ pub(crate) async fn list_cluster_trust_bundles<S: Store>(
 ) -> Result<Response, crate::status::StatusError> {
     super::resource::list_resource(
         State(state),
-        Path((
-            GROUP.to_string(),
-            version,
-            CTB_PLURAL.to_string(),
-        )),
+        Path((GROUP.to_string(), version, CTB_PLURAL.to_string())),
         Query(query),
         headers,
         Extension(user),
@@ -260,11 +268,7 @@ pub(crate) async fn delete_collection_cluster_trust_bundles<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     super::resource::delete_collection_resource(
         State(state),
-        Path((
-            GROUP.to_string(),
-            version,
-            CTB_PLURAL.to_string(),
-        )),
+        Path((GROUP.to_string(), version, CTB_PLURAL.to_string())),
         Query(query),
         Extension(user),
         headers,
@@ -761,13 +765,17 @@ mod tests {
 
     #[test]
     fn validate_cluster_trust_bundle_signer_name_must_prefix_object_name() {
-        validate_cluster_trust_bundle_spec(&ctb_body("test.test:signer-one:0", "test.test/signer-one"))
-            .unwrap_or_else(|e| panic!("signer-scoped name must be accepted, got {}", e.0));
-        let err = validate_cluster_trust_bundle_spec(&ctb_body("other:name", "test.test/signer-one"))
-            .expect_err(
-                "a bundle whose name is not prefixed by its signer would let one signer \
+        validate_cluster_trust_bundle_spec(&ctb_body(
+            "test.test:signer-one:0",
+            "test.test/signer-one",
+        ))
+        .unwrap_or_else(|e| panic!("signer-scoped name must be accepted, got {}", e.0));
+        let err =
+            validate_cluster_trust_bundle_spec(&ctb_body("other:name", "test.test/signer-one"))
+                .expect_err(
+                    "a bundle whose name is not prefixed by its signer would let one signer \
                  squat another signer's bundle names",
-            );
+                );
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -810,6 +818,180 @@ mod tests {
         .await
         .unwrap_or_else(|e| panic!("v1 create must succeed, got status {}", e.0));
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[test]
+    fn validate_cluster_trust_bundle_generate_name_must_carry_signer_prefix_so_random_suffix_cannot_squat_another_signers_namespace(
+    ) {
+        let body = |generate: &str| {
+            serde_json::json!({
+                "metadata": {"generateName": generate},
+                "spec": {"signerName": "a.com/s", "trustBundle": valid_cert_pem()}
+            })
+        };
+        let err = validate_cluster_trust_bundle_spec(&body("b.com:s:"))
+            .expect_err("generateName outside the signer's prefix must be rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            err.1.message.contains("generateName"),
+            "got {}",
+            err.1.message
+        );
+        validate_cluster_trust_bundle_spec(&body("a.com:s:"))
+            .unwrap_or_else(|e| panic!("correct prefix must be accepted, got {}", e.1.message));
+
+        let signerless = serde_json::json!({
+            "metadata": {"generateName": "x:"},
+            "spec": {"trustBundle": valid_cert_pem()}
+        });
+        validate_cluster_trust_bundle_spec(&signerless)
+            .expect_err("signer-less bundle may not use ':' in generateName");
+    }
+
+    const OLD_SIGNER: &str = "a.com/s";
+    const OLD_NAME: &str = "a.com:s:x:y";
+
+    fn ctb_full(signer: &str, bundle: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "ClusterTrustBundle",
+            "metadata": {"name": OLD_NAME},
+            "spec": {"signerName": signer, "trustBundle": bundle}
+        })
+    }
+
+    async fn seeded_ctb_state() -> crate::state::AppState {
+        let state = make_state();
+        create_cluster_trust_bundle(
+            State(state.clone()),
+            Path("v1".to_string()),
+            Query(CreateQuery::default()),
+            Extension(test_user()),
+            json_headers(),
+            Bytes::from(serde_json::to_vec(&ctb_full(OLD_SIGNER, &valid_cert_pem())).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed create must succeed, got {}", e.0));
+        state
+    }
+
+    /// Returns the (status, message) of one update attempt, `mode` naming the write path.
+    async fn update_ctb(
+        state: &crate::state::AppState,
+        mode: &str,
+        signer: &str,
+        bundle: &str,
+    ) -> (StatusCode, String) {
+        let path = Path((
+            GROUP.to_string(),
+            "v1".to_string(),
+            CTB_PLURAL.to_string(),
+            OLD_NAME.to_string(),
+        ));
+        let full = serde_json::to_vec(&ctb_full(signer, bundle)).unwrap();
+        let partial = serde_json::to_vec(
+            &serde_json::json!({"spec": {"signerName": signer, "trustBundle": bundle}}),
+        )
+        .unwrap();
+        let json_patch = serde_json::to_vec(&serde_json::json!([
+            {"op": "replace", "path": "/spec/signerName", "value": signer},
+            {"op": "replace", "path": "/spec/trustBundle", "value": bundle},
+        ]))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        let content_type = match mode {
+            "put" => "application/json",
+            "merge" => "application/merge-patch+json",
+            "smp" => "application/strategic-merge-patch+json",
+            "json-patch" => "application/json-patch+json",
+            "apply" => "application/apply-patch+yaml",
+            _ => unreachable!(),
+        };
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        let result = match mode {
+            "put" => super::super::resource::replace_resource(
+                State(state.clone()),
+                path,
+                Query(super::super::json_patch::ReplaceQuery::default()),
+                Extension(test_user()),
+                headers,
+                Bytes::from(full),
+            )
+            .await
+            .map(IntoResponse::into_response),
+            _ => super::super::resource::patch_resource(
+                State(state.clone()),
+                path,
+                Query(PatchQuery::default()),
+                Extension(test_user()),
+                headers,
+                Bytes::from(match mode {
+                    "json-patch" => json_patch,
+                    "apply" => full,
+                    _ => partial,
+                }),
+            )
+            .await
+            .map(IntoResponse::into_response),
+        };
+        match result {
+            Ok(resp) => (resp.status(), String::new()),
+            Err(e) => (e.0, e.1.message),
+        }
+    }
+
+    /// Every write path must run the same name/signer, signer-immutability and PEM checks.
+    /// A path that skips them lets a client re-home a bundle under another signer's name
+    /// (or plant an unparseable bundle) that kubelets then mount into pods as a trust root.
+    #[tokio::test]
+    async fn clustertrustbundle_every_update_path_enforces_signer_immutability_name_prefix_and_pem_because_a_single_unguarded_path_defeats_them_all(
+    ) {
+        let state = seeded_ctb_state().await;
+        let mut guarded = 0;
+        let mut total = 0;
+        for mode in ["put", "merge", "smp", "json-patch", "apply"] {
+            // Name still matches the new signer's prefix, so only immutability can reject it.
+            let cases = [
+                (
+                    "signerName change",
+                    "a.com/s:x",
+                    valid_cert_pem(),
+                    "immutable",
+                ),
+                (
+                    "name/signer mismatch",
+                    "b.com/s",
+                    valid_cert_pem(),
+                    "must be named with prefix",
+                ),
+                (
+                    "invalid PEM",
+                    OLD_SIGNER,
+                    "garbage".to_string(),
+                    "trustBundle",
+                ),
+            ];
+            for (label, signer, bundle, expect) in cases {
+                total += 1;
+                let (status, message) = update_ctb(&state, mode, signer, &bundle).await;
+                if status == StatusCode::UNPROCESSABLE_ENTITY && message.contains(expect) {
+                    guarded += 1;
+                } else {
+                    eprintln!("UNGUARDED {mode} / {label}: {status} {message:?}");
+                }
+            }
+        }
+        eprintln!("sites: {guarded}/{total} guarded");
+        assert_eq!(
+            guarded, total,
+            "every update path must reject all three violations"
+        );
+
+        let (status, message) = update_ctb(&state, "merge", OLD_SIGNER, &valid_cert_pem()).await;
+        assert!(
+            status.is_success(),
+            "a legitimate no-op update must still succeed, got {status} {message}"
+        );
     }
 
     // -----------------------------------------------------------------------
