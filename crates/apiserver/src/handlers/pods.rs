@@ -537,7 +537,7 @@ pub(crate) async fn create_pod<S: Store>(
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = crate::handlers::generic::wants_generate_name(&obj);
-    let mut name = crate::handlers::generic::resolve_valid_name(&mut obj, "", "pods")?;
+    let mut name = crate::handlers::generic::resolve_valid_name(&mut obj, "", "pods", "Pod")?;
 
     // Ensure namespace is set in the stored object
     obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.as_str().to_owned());

@@ -283,6 +283,7 @@ pub async fn create_csr<S: Store>(
         &mut obj,
         "certificates.k8s.io",
         "certificatesigningrequests",
+        "CertificateSigningRequest",
     )?;
     stamp_metadata(&mut obj);
 

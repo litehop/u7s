@@ -787,30 +787,6 @@ fn stamp_cr_envelope(obj: &mut serde_json::Value, group: &str, version: &str, ki
     obj["kind"] = serde_json::Value::String(kind.to_string());
 }
 
-fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
-    if name.is_empty() {
-        return Err(Status::bad_request(
-            "metadata.name must not be empty".into(),
-        ));
-    }
-    // DNS label: lowercase alphanumeric and hyphens, must start/end with alphanumeric.
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
-    {
-        return Err(Status::bad_request(format!(
-            "metadata.name \"{name}\" contains invalid characters (must be a DNS label)"
-        )));
-    }
-    let is_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
-    if !name.starts_with(is_alnum) || !name.ends_with(is_alnum) {
-        return Err(Status::bad_request(format!(
-            "metadata.name \"{name}\" must start and end with an alphanumeric character"
-        )));
-    }
-    Ok(())
-}
-
 /// Reconcile server-owned metadata on a CR PUT (replace).
 ///
 /// uid is immutable identity, exactly like the built-in resource replace path
@@ -2513,9 +2489,9 @@ pub async fn create_cr<S: Store>(
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = crate::handlers::generic::wants_generate_name(&wrapped);
-    let mut name = crate::handlers::generic::resolve_name(&mut wrapped)?;
+    let mut name =
+        crate::handlers::generic::resolve_valid_name(&mut wrapped, &group, &plural, &ctx.kind)?;
     let mut obj = wrapped.body;
-    validate_cr_name(&name)?;
 
     let warn_header = apply_cr_field_validation(
         &mut obj,
@@ -3567,9 +3543,9 @@ pub async fn create_cr_namespaced<S: Store>(
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = crate::handlers::generic::wants_generate_name(&wrapped);
-    let mut name = crate::handlers::generic::resolve_name(&mut wrapped)?;
+    let mut name =
+        crate::handlers::generic::resolve_valid_name(&mut wrapped, &group, &plural, &ctx.kind)?;
     let mut obj = wrapped.body;
-    validate_cr_name(&name)?;
 
     let warn_header = apply_cr_field_validation(
         &mut obj,
@@ -5617,6 +5593,69 @@ mod tests {
             })
             .to_string(),
         )
+    }
+
+    /// A CR created with an uppercase name (explicit or generateName-derived) would be stored
+    /// under a name standard tooling and finalizer controllers can't address; both CR create
+    /// entry points must refuse it as 422 Invalid.
+    #[tokio::test]
+    async fn cr_create_rejects_names_the_read_path_would_reject() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+        install_namespaced_crd(&state).await;
+
+        for (meta, field) in [
+            (serde_json::json!({"name": "Bad-Name"}), "metadata.name"),
+            (
+                serde_json::json!({"generateName": "Bad-Prefix-"}),
+                "metadata.generateName",
+            ),
+        ] {
+            let widget = Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1", "kind": "Widget",
+                    "metadata": meta, "spec": {"color": "blue"}
+                })
+                .to_string(),
+            );
+            let err = create_cr(
+                State(state.clone()),
+                Path(("example.io".into(), "v1".into(), "widgets".into())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget,
+            )
+            .await
+            .err()
+            .expect("invalid cluster-scoped CR name must be refused");
+            crate::handlers::test_support::assert_invalid_name_field(&err, field);
+
+            let mut ns_meta = meta.clone();
+            ns_meta["namespace"] = "argocd".into();
+            let app = Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+                    "metadata": ns_meta, "spec": {}
+                })
+                .to_string(),
+            );
+            let err = create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".into(),
+                    "v1alpha1".into(),
+                    "argocd".into(),
+                    "applications".into(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app,
+            )
+            .await
+            .err()
+            .expect("invalid namespaced CR name must be refused");
+            crate::handlers::test_support::assert_invalid_name_field(&err, field);
+        }
     }
 
     // Create a namespaced CR then get it back — round-trip must return the stored object.
@@ -8970,70 +9009,6 @@ mod tests {
     fn object_needs_conversion_returns_false_without_webhook_config() {
         let obj = serde_json::json!({ "apiVersion": "example.io/v1" });
         assert!(!object_needs_conversion(&obj, "example.io/v2", None));
-    }
-
-    // validate_cr_name must reject empty names — empty string is not a valid
-    // Kubernetes resource name and must not be silently accepted.
-    #[test]
-    fn validate_cr_name_rejects_empty() {
-        let result = validate_cr_name("");
-        assert!(result.is_err(), "empty name must be rejected");
-    }
-
-    // validate_cr_name must accept a valid DNS label — the common case for CR names.
-    #[test]
-    fn validate_cr_name_accepts_valid_dns_label() {
-        assert!(
-            validate_cr_name("my-resource").is_ok(),
-            "valid DNS label must be accepted"
-        );
-        assert!(
-            validate_cr_name("foo123").is_ok(),
-            "alphanumeric name must be accepted"
-        );
-    }
-
-    // kube-apiserver rejects CR names whose first or last character is a hyphen or dot
-    // because they violate DNS label rules and break label-selector round-trips.
-    #[test]
-    fn validate_cr_name_rejects_leading_hyphen() {
-        let err = validate_cr_name("-foo").expect_err("leading hyphen in CR name must be rejected");
-        let json = serde_json::to_value(&err.1).unwrap();
-        assert_eq!(json["code"], 400, "leading hyphen must return 400");
-    }
-
-    #[test]
-    fn validate_cr_name_rejects_trailing_hyphen() {
-        let err =
-            validate_cr_name("foo-").expect_err("trailing hyphen in CR name must be rejected");
-        let json = serde_json::to_value(&err.1).unwrap();
-        assert_eq!(json["code"], 400, "trailing hyphen must return 400");
-    }
-
-    #[test]
-    fn validate_cr_name_rejects_leading_dot() {
-        let err = validate_cr_name(".bar").expect_err("leading dot in CR name must be rejected");
-        let json = serde_json::to_value(&err.1).unwrap();
-        assert_eq!(json["code"], 400, "leading dot must return 400");
-    }
-
-    // kube-apiserver rejects CR names with uppercase letters because DNS labels
-    // are case-insensitive by spec but Kubernetes requires lowercase to avoid
-    // objects that differ only by case, which would collide on case-insensitive filesystems.
-    #[test]
-    fn validate_cr_name_rejects_uppercase() {
-        let err = validate_cr_name("MyWidget")
-            .expect_err("uppercase letters in CR name must be rejected");
-        let json = serde_json::to_value(&err.1).unwrap();
-        assert_eq!(json["code"], 400, "uppercase name must return 400");
-    }
-
-    #[test]
-    fn validate_cr_name_accepts_lowercase_with_version() {
-        assert!(
-            validate_cr_name("widget-v2").is_ok(),
-            "lowercase name with digit suffix must be accepted"
-        );
     }
 
     // resolve_cr_metadata must copy uid from stored into incoming when incoming
@@ -13966,33 +13941,6 @@ mod tests {
 
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 404);
-    }
-
-    // ---------------------------------------------------------------------------
-    // Additional coverage for validate_cr_name and list_cr normal path
-    // ---------------------------------------------------------------------------
-
-    // validate_cr_name must reject names with invalid characters (e.g. spaces or underscores).
-    // Only ASCII alphanumeric, hyphens, and dots are permitted in CR names; other characters
-    // would create objects that can't be round-tripped through standard Kubernetes tooling.
-    #[test]
-    fn validate_cr_name_rejects_invalid_chars() {
-        let err = match validate_cr_name("invalid name!") {
-            Err(e) => e,
-            Ok(_) => panic!("expected Err for name with invalid chars"),
-        };
-        let json = serde_json::to_value(&err.1).unwrap();
-        assert_eq!(
-            json["code"], 400,
-            "invalid chars must return 400 Bad Request"
-        );
-        assert!(
-            json["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("invalid characters"),
-            "error message must mention invalid characters"
-        );
     }
 
     // list_cr (cluster-scoped, non-watch) must return an empty list when no CRs exist.

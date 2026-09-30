@@ -24,6 +24,17 @@ pub(crate) fn assert_invalid_name_field(err: &crate::status::StatusError, field:
     );
     assert_eq!(body["reason"], "Invalid", "{body}");
     assert_eq!(body["details"]["causes"][0]["field"], field, "{body}");
+    assert_eq!(
+        body["details"]["causes"][0]["reason"], "FieldValueInvalid",
+        "{body}"
+    );
+    for k in ["name", "kind"] {
+        assert!(
+            body["details"][k].as_str().is_some_and(|v| !v.is_empty()),
+            "details.{k} must be set like upstream: {body}"
+        );
+    }
+    assert!(body["details"]["group"].is_string(), "{body}");
 }
 
 /// Build a minimal in-memory `AppState` backed by a fresh `SqliteStore`.

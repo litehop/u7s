@@ -221,12 +221,14 @@ pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::St
 
 /// `resolve_name` plus the same name check every by-name read/write applies
 /// (`validate_name_for_group`), so a create can never persist a name the read path
-/// rejects. Failures are 422 Invalid with a `metadata.name` / `metadata.generateName`
-/// field cause, like upstream's ValidateObjectMeta.
+/// rejects. Failures are 422 Invalid shaped like upstream's ValidateObjectMeta error:
+/// a `metadata.name` / `metadata.generateName` FieldValueInvalid cause and
+/// `details.{name,group,kind}`.
 pub(crate) fn resolve_valid_name(
     obj: &mut Object,
     group: &str,
     plural: &str,
+    kind: &str,
 ) -> Result<String, crate::status::StatusError> {
     let generate_prefix = wants_generate_name(obj);
     let name = resolve_name(obj)?;
@@ -239,10 +241,14 @@ pub(crate) fn resolve_valid_name(
             e.1.message
                 .rsplit_once("': ")
                 .map_or(e.1.message.as_str(), |(_, r)| r);
-        let message = format!("{field}: Invalid value: \"{value}\": {reason}");
-        let mut err = Status::unprocessable_entity(message.clone());
+        let cause = format!("{field}: Invalid value: \"{value}\": {reason}");
+        let mut err =
+            Status::unprocessable_entity(format!("{kind} \"{name}\" is invalid: {cause}"));
         err.1.details = Some(Box::new(serde_json::json!({
-            "causes": [{"reason": "FieldValueInvalid", "message": message, "field": field}]
+            "name": name,
+            "group": group,
+            "kind": kind,
+            "causes": [{"reason": "FieldValueInvalid", "message": cause, "field": field}]
         })));
         err
     })?;

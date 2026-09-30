@@ -528,7 +528,7 @@ pub(crate) async fn create_resource<S: Store>(
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = wants_generate_name(&obj);
-    let mut name = resolve_valid_name(&mut obj, &group, &plural)?;
+    let mut name = resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
     stamp_metadata(&mut obj);
     if meta.kind == "VolumeAttributesClass" {
         add_vac_protection_finalizer(&mut obj);
@@ -3107,7 +3107,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = wants_generate_name(&obj);
-    let mut name = resolve_valid_name(&mut obj, &group, &plural)?;
+    let mut name = resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
 
     // Capture RS revision propagation info BEFORE ns_meta processing drops ownerReferences.
     // ObjectMeta serde drops unknown fields (including ownerReferences), so we must extract
