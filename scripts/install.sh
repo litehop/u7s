@@ -777,25 +777,41 @@ write_kubelet_config_yaml
 # $setElementOrder/conditions reordering, is condition-name-agnostic, so it
 # doesn't prove this specific condition is required), and the conservative
 # default is to keep an uncertain dependency on rather than prove it's safe
-# to cut. Disabling the other 15 drops the corresponding kubelet code paths
+# to cut. Disabling the other 14 (16 on 1.37+) drops the corresponding kubelet code paths
 # (checkpoint HTTP handler, credential-provider SA-token plumbing, CA/serving
 # -cert file watchers, pod/container-level resize bookkeeping, etc.) for zero
 # functional loss.
 #
-# cAdvisor trim: --application-metrics-count-limit=0 drops the
-# 100-slot-per-container legacy "application metrics" ring buffer (a
-# cadvisor flag mistakenly registered on kubelet, per its own --help
-# output) -- u7s has no container exposing that legacy annotation-based
-# metrics source, so the buffer is never populated. --housekeeping-interval
-# was tried and reverted: pkg/kubelet/kubelet.go's evictionMonitoringPeriod
-# is a hardcoded 10s constant with an explicit upstream comment to "keep
-# this in sync with internal cadvisor housekeeping" -- raising
-# --housekeeping-interval desyncs the two, so the eviction manager can act
-# on cAdvisor stats up to (new_interval - 10s) stale under real memory
-# pressure. That is a genuine behavior change under load, not the
-# zero-impact trim it looked like, and falls under the same
-# behavior-changing-knob restriction as --max-pods.
-KUBELET_ROUND2_FLAGS="--application-metrics-count-limit=0 --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,InPlacePodVerticalScalingInitContainers=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false"
+# --application-metrics-count-limit=0 (a cAdvisor trim: dropped the
+# 100-slot-per-container legacy "application metrics" ring buffer that u7s
+# never populated) used to live here too, but kubelet 1.37 removed the flag
+# entirely -- "unknown flag: --application-metrics-count-limit" is a
+# crash-loop, not a deprecation warning -- so it is dropped for every
+# kubelet version rather than version-gated. --housekeeping-interval was tried and reverted separately:
+# pkg/kubelet/kubelet.go's evictionMonitoringPeriod is a hardcoded 10s
+# constant with an explicit upstream comment to "keep this in sync with
+# internal cadvisor housekeeping" -- raising --housekeeping-interval desyncs
+# the two, so the eviction manager can act on cAdvisor stats up to
+# (new_interval - 10s) stale under real memory pressure. That is a genuine
+# behavior change under load, not a zero-impact trim, and falls under the
+# same behavior-changing-knob restriction as --max-pods.
+#
+# InPlacePodVerticalScalingInitContainers is no longer in this list: kubelet
+# 1.37 graduated it to GA + LockToDefault:true, so passing =false is now a
+# startup error ("feature is locked to true"), not a no-op; it is dropped for
+# every version (default-on Beta in 1.36, so the 1.36 trim is forfeited).
+# PodLevelResourcesFixDefaulting/PodLevelResourcesFixKubeletQOSClass are
+# added on 1.37+ only: both are new in 1.37, default true, and both hard-depend
+# on PodLevelResources per pkg/features/kube_features.go's dependency map, so
+# keeping PodLevelResources disabled requires disabling these two as well
+# or kubelet refuses to start ("is enabled, but depends on features that are
+# disabled").
+KUBELET_ROUND2_FLAGS="--feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false"
+# The two gates below only exist from 1.37; an older kubelet rejects them as
+# unrecognized, so they are appended only when the staged kubelet is >= 1.37.
+if [ "${KUBE_MINOR#*.}" -ge 37 ]; then
+  KUBELET_ROUND2_FLAGS="$KUBELET_ROUND2_FLAGS,PodLevelResourcesFixDefaulting=false,PodLevelResourcesFixKubeletQOSClass=false"
+fi
 
 if [ "$WORKER_MODE" -eq 1 ]; then
   # --- Join an existing cluster via the CSR API, or upgrade an
