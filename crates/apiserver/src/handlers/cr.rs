@@ -10,7 +10,7 @@ use u7s_store::{ListOptions, Store};
 use crate::{
     admission::{
         prepare_webhook_call, run_mutating_webhooks, run_validating_webhooks,
-        send_webhook_request_with_retry, AdmissionContext,
+        send_webhook_request_with_retry, AdmissionContext, DEFAULT_WEBHOOK_TIMEOUT_SECS,
     },
     auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
@@ -78,23 +78,26 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
     // in the first tens of milliseconds, before kube-proxy finishes programming its
     // IPVS/iptables NAT rule (see the function doc in admission.rs for the mechanism).
     // CRD conversion webhooks (unlike admission webhooks) have no `timeoutSeconds` field
-    // to read; 10s matches the default `prepare_webhook_call` already bakes into
+    // to read; the default matches what `prepare_webhook_call` already bakes into
     // `wh_client`'s own per-attempt timeout via `build_webhook_call_client`.
-    let resp = send_webhook_request_with_retry(std::time::Duration::from_secs(10), || {
-        wh_client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            // Real conversion webhooks (including the k8s conformance suite's sample
-            // webhook) content-negotiate their response body from the Accept header,
-            // falling back to an arbitrary (even non-JSON, e.g. YAML) encoding when it
-            // doesn't name a type explicitly. Without this, reqwest's default
-            // `Accept: */*` leaves that choice up to the webhook, and a response we can't
-            // parse as JSON below is indistinguishable from a broken one. This mirrors
-            // upstream apiserver's own webhook client (client-go's RESTClient with
-            // ContentConfig.ContentType=json always sends `Accept: application/json, */*`).
-            .header("Accept", "application/json, */*")
-            .body(body.clone())
-    })
+    let resp = send_webhook_request_with_retry(
+        std::time::Duration::from_secs(DEFAULT_WEBHOOK_TIMEOUT_SECS),
+        || {
+            wh_client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                // Real conversion webhooks (including the k8s conformance suite's sample
+                // webhook) content-negotiate their response body from the Accept header,
+                // falling back to an arbitrary (even non-JSON, e.g. YAML) encoding when it
+                // doesn't name a type explicitly. Without this, reqwest's default
+                // `Accept: */*` leaves that choice up to the webhook, and a response we can't
+                // parse as JSON below is indistinguishable from a broken one. This mirrors
+                // upstream apiserver's own webhook client (client-go's RESTClient with
+                // ContentConfig.ContentType=json always sends `Accept: application/json, */*`).
+                .header("Accept", "application/json, */*")
+                .body(body.clone())
+        },
+    )
     .await
     .map_err(|e| Status::internal(format!("conversion webhook call failed: {e}")))?;
 
@@ -638,16 +641,39 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
 /// A no-op (returns `obj` unchanged, no clone, no webhook call) when the request version
 /// already IS the storage version — same version-to-itself skip PR #830 established for the
 /// read path; see `object_needs_conversion`'s doc.
-async fn convert_cr_for_storage<S: Store>(
+pub(crate) async fn convert_cr_for_storage<S: Store>(
     state: &AppState<S>,
     ctx: &CrContext,
     group: &str,
     obj: serde_json::Value,
 ) -> Result<serde_json::Value, crate::status::StatusError> {
     let storage_api_version = format!("{group}/{}", ctx.storage_version);
+    convert_cr_to_api_version(state, ctx, obj, &storage_api_version).await
+}
+
+/// Read-side counterpart of `convert_cr_for_storage`: a stored object (at the storage
+/// version) is converted to the version the request names, so a subresource write
+/// (`/status`, `/scale`) mutates fields in the shape the client sent them in. The result
+/// is converted back with `convert_cr_for_storage` before persisting.
+pub(crate) async fn convert_cr_to_request_version<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    group: &str,
+    version: &str,
+    obj: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    convert_cr_to_api_version(state, ctx, obj, &format!("{group}/{version}")).await
+}
+
+async fn convert_cr_to_api_version<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    obj: serde_json::Value,
+    desired_api_version: &str,
+) -> Result<serde_json::Value, crate::status::StatusError> {
     if !object_needs_conversion(
         &obj,
-        &storage_api_version,
+        desired_api_version,
         ctx.conversion_webhook_client_config.as_deref(),
     ) {
         return Ok(obj);
@@ -658,8 +684,7 @@ async fn convert_cr_for_storage<S: Store>(
         .conversion_webhook_client_config
         .as_deref()
         .expect("object_needs_conversion returned true, so client_config must be Some");
-    let mut converted =
-        call_conversion_webhook(state, cfg, vec![obj], &storage_api_version).await?;
+    let mut converted = call_conversion_webhook(state, cfg, vec![obj], desired_api_version).await?;
     converted
         .pop()
         .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))
@@ -4741,10 +4766,11 @@ pub async fn put_cr_status<S: Store>(
         version: version.clone(),
         plural: plural.clone(),
     };
-    let (key, kind) = if let Some(meta) = state.resource_registry.get(&registry_key) {
+    let (key, kind, cr_ctx) = if let Some(meta) = state.resource_registry.get(&registry_key) {
         (
             group_object_key(&group, &plural, None, &name),
             meta.kind.clone(),
+            None,
         )
     } else {
         // CR fallback: find the CRD to get the kind name, use CR storage key.
@@ -4752,7 +4778,11 @@ pub async fn put_cr_status<S: Store>(
         if ctx.namespaced {
             return Err(Status::not_found(&name, &ctx.kind));
         }
-        (cr_store_key(&group, &plural, None, &name), ctx.kind)
+        (
+            cr_store_key(&group, &plural, None, &name),
+            ctx.kind.clone(),
+            Some(ctx),
+        )
     };
 
     let stored = state
@@ -4764,6 +4794,9 @@ pub async fn put_cr_status<S: Store>(
 
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(ctx) = &cr_ctx {
+        current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
+    }
 
     // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
     // Typed dispatch first: a registry-hit built-in kind with a registered status codec
@@ -4806,7 +4839,11 @@ pub async fn put_cr_status<S: Store>(
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&incoming["metadata"])
             .unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
-    let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
+    let storage_obj = match &cr_ctx {
+        Some(ctx) => convert_cr_for_storage(&state, ctx, &group, current.clone()).await?,
+        None => current.clone(),
+    };
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -4911,17 +4948,22 @@ pub async fn patch_cr_status<S: Store>(
         version: version.clone(),
         plural: plural.clone(),
     };
-    let (key, kind) = if let Some(meta) = state.resource_registry.get(&registry_key) {
+    let (key, kind, cr_ctx) = if let Some(meta) = state.resource_registry.get(&registry_key) {
         (
             group_object_key(&group, &plural, None, &name),
             meta.kind.clone(),
+            None,
         )
     } else {
         let ctx = find_crd(&state, &group, &version, &plural).await?;
         if ctx.namespaced {
             return Err(Status::not_found(&name, &ctx.kind));
         }
-        (cr_store_key(&group, &plural, None, &name), ctx.kind)
+        (
+            cr_store_key(&group, &plural, None, &name),
+            ctx.kind.clone(),
+            Some(ctx),
+        )
     };
 
     let stored = state
@@ -4933,6 +4975,9 @@ pub async fn patch_cr_status<S: Store>(
 
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(ctx) = &cr_ctx {
+        current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
+    }
 
     // apply-patch+yaml bodies are genuine YAML; every other patch type here is JSON.
     let patch: serde_json::Value = if is_ssa {
@@ -5001,7 +5046,11 @@ pub async fn patch_cr_status<S: Store>(
     }
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
-    let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
+    let storage_obj = match &cr_ctx {
+        Some(ctx) => convert_cr_for_storage(&state, ctx, &group, current.clone()).await?,
+        None => current.clone(),
+    };
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -5086,6 +5135,7 @@ fn scale_path_set_i64(obj: &mut serde_json::Value, path: &str, new_value: i64) {
 /// which groups arguments for the same reason.
 struct CrScaleTarget<'a> {
     group: &'a str,
+    version: &'a str,
     plural: &'a str,
     ns: Option<&'a str>,
     name: &'a str,
@@ -5112,6 +5162,7 @@ async fn cr_scale_get_impl<S: Store>(
         .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
     let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let obj = convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
 
     let spec_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
     let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
@@ -5163,8 +5214,10 @@ async fn cr_scale_put_impl<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
-    let mut obj: serde_json::Value = serde_json::from_slice(&stored.value)
+    let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let mut obj =
+        convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
 
     // Capture actual pod count and selector before changing spec so the response reflects
     // reality — same ordering apps/v1's scale_put_impl uses, for the same reason.
@@ -5195,7 +5248,8 @@ async fn cr_scale_put_impl<S: Store>(
     }
 
     let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    let storage_obj = convert_cr_for_storage(state, ctx, target.group, obj).await?;
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -5236,8 +5290,10 @@ async fn cr_scale_patch_impl<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
-    let mut obj: serde_json::Value = serde_json::from_slice(&stored.value)
+    let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let mut obj =
+        convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
 
     let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
     let selector = scale_cfg
@@ -5275,7 +5331,8 @@ async fn cr_scale_patch_impl<S: Store>(
     }
 
     let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
-    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    let storage_obj = convert_cr_for_storage(state, ctx, target.group, obj).await?;
+    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -5304,6 +5361,7 @@ pub async fn get_cr_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: None,
         name: &name,
@@ -5324,6 +5382,7 @@ pub async fn put_cr_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: None,
         name: &name,
@@ -5344,6 +5403,7 @@ pub async fn patch_cr_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: None,
         name: &name,
@@ -5362,6 +5422,7 @@ pub async fn get_cr_namespaced_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: Some(&ns),
         name: &name,
@@ -5382,6 +5443,7 @@ pub async fn put_cr_namespaced_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: Some(&ns),
         name: &name,
@@ -5402,6 +5464,7 @@ pub async fn patch_cr_namespaced_scale<S: Store>(
     }
     let target = CrScaleTarget {
         group: &group,
+        version: &version,
         plural: &plural,
         ns: Some(&ns),
         name: &name,

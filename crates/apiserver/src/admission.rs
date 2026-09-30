@@ -1092,6 +1092,9 @@ fn webhook_connect_timeout(request_timeout: std::time::Duration) -> std::time::D
     request_timeout
 }
 
+/// Default per-attempt webhook timeout when the webhook config declares none.
+pub(crate) const DEFAULT_WEBHOOK_TIMEOUT_SECS: u64 = 10;
+
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     proxy_addr: Option<&str>,
@@ -1100,8 +1103,9 @@ fn build_webhook_call_client(
     fallback: &reqwest::Client,
     timeout_seconds: Option<i64>,
 ) -> reqwest::Client {
-    let request_timeout =
-        std::time::Duration::from_secs(timeout_seconds.unwrap_or(10).max(1) as u64);
+    let request_timeout = std::time::Duration::from_secs(
+        timeout_seconds.map_or(DEFAULT_WEBHOOK_TIMEOUT_SECS, |s| s.max(1) as u64),
+    );
     let connect_timeout = webhook_connect_timeout(request_timeout);
 
     // Resolve the webhook CA certificate from caBundle. Failures are non-fatal:
