@@ -1316,6 +1316,13 @@ fn certificates_v1_resources() -> serde_json::Value {
         "groupVersion": "certificates.k8s.io/v1",
         "resources": [
             {
+                "name": "clustertrustbundles",
+                "singularName": "clustertrustbundle",
+                "namespaced": false,
+                "kind": "ClusterTrustBundle",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
                 "name": "certificatesigningrequests",
                 "singularName": "certificatesigningrequest",
                 "namespaced": false,

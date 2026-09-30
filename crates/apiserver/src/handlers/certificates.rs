@@ -1,5 +1,5 @@
-//! Dedicated create-validation for certificates.k8s.io/v1beta1 ClusterTrustBundle and
-//! PodCertificateRequest.
+//! Dedicated create-validation for certificates.k8s.io ClusterTrustBundle (v1 and v1beta1)
+//! and v1beta1 PodCertificateRequest.
 //!
 //! Both types are pure CRUD surfaces here (no signer/controller logic — a real signer
 //! implementation is a separate, later piece of work). Validation on create matters
@@ -47,6 +47,9 @@ const PCR_PLURAL: &str = "podcertificaterequests";
 /// kubelet that mounts this bundle to fetch and hold an unbounded blob.
 const MAX_TRUST_BUNDLE_SIZE: usize = 1024 * 1024;
 
+/// Upstream `ValidateSignerName`: 253 (domain) + '/' + 317 (path) characters.
+const MAX_SIGNER_NAME_LENGTH: usize = 571;
+
 // ---------------------------------------------------------------------------
 // ClusterTrustBundle
 // ---------------------------------------------------------------------------
@@ -79,6 +82,50 @@ pub(crate) fn validate_cluster_trust_bundle_spec(
         ));
     }
 
+    validate_name_matches_signer(body, &spec.signer_name)
+}
+
+/// Upstream `ValidateClusterTrustBundle`: a signer-linked bundle must be named
+/// `<signerName with '/' replaced by ':'>:<suffix>` (so the name alone reveals the owning
+/// signer and signers cannot squat each other's names); a bundle without a signer must not
+/// use `:` at all, keeping that namespace exclusively signer-scoped. A missing
+/// `metadata.name` (generateName) is checked by the name-resolving create path instead.
+fn validate_name_matches_signer(
+    body: &serde_json::Value,
+    signer_name: &str,
+) -> Result<(), crate::status::StatusError> {
+    let Some(name) = body["metadata"]["name"].as_str() else {
+        return Ok(());
+    };
+    if signer_name.is_empty() {
+        if name.contains(':') {
+            return Err(Status::unprocessable_entity(format!(
+                "metadata.name: Invalid value: {name:?}: ClusterTrustBundle without \
+                 spec.signerName must not contain ':'"
+            )));
+        }
+        return Ok(());
+    }
+
+    let mut parts = signer_name.split('/');
+    let well_formed = matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(d), Some(p), None) if !d.is_empty() && !p.is_empty()
+    );
+    if !well_formed || signer_name.len() > MAX_SIGNER_NAME_LENGTH {
+        return Err(Status::unprocessable_entity(format!(
+            "spec.signerName: Invalid value: {signer_name:?}: must be of the form \
+             <domain>/<path> and at most {MAX_SIGNER_NAME_LENGTH} characters"
+        )));
+    }
+
+    let prefix = format!("{}:", signer_name.replace('/', ":"));
+    if !name.starts_with(&prefix) {
+        return Err(Status::unprocessable_entity(format!(
+            "metadata.name: Invalid value: {name:?}: ClusterTrustBundle for signerName \
+             {signer_name} must be named with prefix {prefix}"
+        )));
+    }
     Ok(())
 }
 
@@ -142,12 +189,13 @@ fn parse_trust_bundle_pem(pem_text: &str) -> Result<usize, String> {
     Ok(count)
 }
 
-/// POST /apis/certificates.k8s.io/v1beta1/clustertrustbundles
+/// POST /apis/certificates.k8s.io/{version}/clustertrustbundles
 ///
 /// Validates `spec.trustBundle` before delegating to the generic cluster-scoped create
 /// handler for everything else (defaulting, admission, persistence).
 pub(crate) async fn create_cluster_trust_bundle<S: Store>(
     State(state): State<AppState<S>>,
+    Path(version): Path<String>,
     Query(create_query): Query<CreateQuery>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
@@ -162,7 +210,7 @@ pub(crate) async fn create_cluster_trust_bundle<S: Store>(
         State(state),
         Path((
             GROUP.to_string(),
-            VERSION.to_string(),
+            version,
             CTB_PLURAL.to_string(),
         )),
         Query(create_query),
@@ -174,7 +222,7 @@ pub(crate) async fn create_cluster_trust_bundle<S: Store>(
     .map(IntoResponse::into_response)
 }
 
-/// GET /apis/certificates.k8s.io/v1beta1/clustertrustbundles
+/// GET /apis/certificates.k8s.io/{version}/clustertrustbundles
 ///
 /// The collection route is a hardcoded literal (needed so POST can run the validation
 /// above), so GET/DELETE on the same literal path must also be registered here — axum
@@ -182,6 +230,7 @@ pub(crate) async fn create_cluster_trust_bundle<S: Store>(
 /// the generic `{group}/{version}/{resource}` template for the same concrete path.
 pub(crate) async fn list_cluster_trust_bundles<S: Store>(
     State(state): State<AppState<S>>,
+    Path(version): Path<String>,
     Query(query): Query<CollectionQuery>,
     headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
@@ -190,7 +239,7 @@ pub(crate) async fn list_cluster_trust_bundles<S: Store>(
         State(state),
         Path((
             GROUP.to_string(),
-            VERSION.to_string(),
+            version,
             CTB_PLURAL.to_string(),
         )),
         Query(query),
@@ -200,9 +249,10 @@ pub(crate) async fn list_cluster_trust_bundles<S: Store>(
     .await
 }
 
-/// DELETE /apis/certificates.k8s.io/v1beta1/clustertrustbundles (DeleteCollection)
+/// DELETE /apis/certificates.k8s.io/{version}/clustertrustbundles (DeleteCollection)
 pub(crate) async fn delete_collection_cluster_trust_bundles<S: Store>(
     State(state): State<AppState<S>>,
+    Path(version): Path<String>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
@@ -212,7 +262,7 @@ pub(crate) async fn delete_collection_cluster_trust_bundles<S: Store>(
         State(state),
         Path((
             GROUP.to_string(),
-            VERSION.to_string(),
+            version,
             CTB_PLURAL.to_string(),
         )),
         Query(query),
@@ -560,6 +610,7 @@ mod tests {
 
         let result = create_cluster_trust_bundle(
             State(state.clone()),
+            Path("v1beta1".to_string()),
             Query(CreateQuery::default()),
             Extension(test_user()),
             json_headers(),
@@ -594,7 +645,10 @@ mod tests {
     async fn clustertrustbundle_list_returns_all_bundles_because_multiple_signers_may_coexist() {
         let state = make_state();
         let pem = valid_cert_pem();
-        for (name, signer) in [("bundle-a", "example.com/a"), ("bundle-b", "example.com/b")] {
+        for (name, signer) in [
+            ("example.com:a:bundle-a", "example.com/a"),
+            ("example.com:b:bundle-b", "example.com/b"),
+        ] {
             let body = serde_json::json!({
                 "apiVersion": "certificates.k8s.io/v1beta1",
                 "kind": "ClusterTrustBundle",
@@ -603,6 +657,7 @@ mod tests {
             });
             create_cluster_trust_bundle(
                 State(state.clone()),
+                Path("v1beta1".to_string()),
                 Query(CreateQuery::default()),
                 Extension(test_user()),
                 json_headers(),
@@ -614,6 +669,7 @@ mod tests {
 
         let resp = list_cluster_trust_bundles(
             State(state),
+            Path("v1beta1".to_string()),
             Query(CollectionQuery {
                 watch: None,
                 resource_version: None,
@@ -694,6 +750,66 @@ mod tests {
                 err.0
             );
         }
+    }
+
+    fn ctb_body(name: &str, signer: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {"name": name},
+            "spec": {"signerName": signer, "trustBundle": valid_cert_pem()}
+        })
+    }
+
+    #[test]
+    fn validate_cluster_trust_bundle_signer_name_must_prefix_object_name() {
+        validate_cluster_trust_bundle_spec(&ctb_body("test.test:signer-one:0", "test.test/signer-one"))
+            .unwrap_or_else(|e| panic!("signer-scoped name must be accepted, got {}", e.0));
+        let err = validate_cluster_trust_bundle_spec(&ctb_body("other:name", "test.test/signer-one"))
+            .expect_err(
+                "a bundle whose name is not prefixed by its signer would let one signer \
+                 squat another signer's bundle names",
+            );
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validate_cluster_trust_bundle_without_signer_rejects_colon_in_name() {
+        let err = validate_cluster_trust_bundle_spec(&ctb_body("a:b", ""))
+            .expect_err("colon names are reserved for signer-linked bundles");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        validate_cluster_trust_bundle_spec(&ctb_body("plain-name", ""))
+            .unwrap_or_else(|e| panic!("signerless plain name must be accepted, got {}", e.0));
+    }
+
+    #[test]
+    fn validate_cluster_trust_bundle_rejects_malformed_signer_name() {
+        for signer in ["no-slash", "/path", "domain/", "a/b/c"] {
+            let name = format!("{}:x", signer.replace('/', ":"));
+            let err = validate_cluster_trust_bundle_spec(&ctb_body(&name, signer))
+                .expect_err("signerName must be <domain>/<path>");
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY, "signer {signer}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clustertrustbundle_v1_create_is_served_because_ga_clients_use_v1() {
+        let state = make_state();
+        let body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "ClusterTrustBundle",
+            "metadata": {"name": "v1-bundle", "labels": {"k": "v"}},
+            "spec": {"trustBundle": valid_cert_pem()}
+        });
+        let resp = create_cluster_trust_bundle(
+            State(state.clone()),
+            Path("v1".to_string()),
+            Query(CreateQuery::default()),
+            Extension(test_user()),
+            json_headers(),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v1 create must succeed, got status {}", e.0));
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
     // -----------------------------------------------------------------------
