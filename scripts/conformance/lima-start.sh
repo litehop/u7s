@@ -549,7 +549,7 @@ ExecStart=/usr/bin/kubelet \\\\
 # why --housekeeping-interval was tried and reverted (desyncs from
 # kubelet's hardcoded eviction-monitoring period), why
 # --application-metrics-count-limit=0 (the prior cAdvisor trim flag here)
-# was dropped -- kubelet 1.37 removed it entirely ("unknown flag", a
+# was dropped -- kubelet 1.37 removed it entirely (unknown flag, a
 # crash-loop, not a deprecation) -- and why InPlacePodVerticalScalingInitContainers
 # is no longer in this list (kubelet 1.37 graduated it to GA + LockToDefault:true,
 # so passing =false is now a startup error, not a no-op) while
