@@ -26,6 +26,12 @@ const MAX_WEBHOOK_RESPONSE_BYTES: usize = 1024 * 1024; // 1 MiB
 /// connection-reset error. Total budget is capped at 300ms: kube-proxy normally finishes
 /// programming a freshly created Service's ClusterIP -> PodIP NAT rule well within that
 /// window, and the apiserver still owes its own request-timeout budget to the caller.
+/// This is deliberately short and bounded by `send_webhook_request_with_retry`'s
+/// `deadline` parameter (see below) rather than extended further: upstream's own
+/// admission/conversion webhook dispatch has no connect-refused retry at all, and a
+/// cold Service that stays unroutable for close to a second under iptables-mode
+/// kube-proxy's sync cadence is a kube-proxy timing race this retry is not meant to
+/// fully absorb.
 const WEBHOOK_CONNECT_RETRY_BACKOFFS_MS: &[u64] = &[100, 200];
 
 /// True when `err`'s source chain bottoms out in an OS-level connection-refused or
@@ -50,7 +56,18 @@ const WEBHOOK_CONNECT_RETRY_BACKOFFS_MS: &[u64] = &[100, 200];
 /// against hyper-util 0.1.20) is the only signal available. If hyper-util changes this
 /// wording, the retry silently stops firing for the proxied path — it does not panic or
 /// misclassify anything else, so this is a safe (if fragile) degradation.
+///
+/// Gated on `err.is_connect()` first: an `io::Error::ConnectionReset` can also surface
+/// mid-stream, after the request body was already sent over a previously-good connection
+/// (e.g. the webhook process restarting between two requests). That is not the connect-
+/// phase race this function targets, and retrying it risks resending an already-processed,
+/// non-idempotent AdmissionReview/ConversionReview to the webhook. `is_connect()` itself is
+/// still broader than this function's contract (it also covers TLS handshake failures), so
+/// the io_err/tunnel-message checks below still run to exclude those.
 fn is_connect_refused_or_reset(err: &reqwest::Error) -> bool {
+    if !err.is_connect() {
+        return false;
+    }
     use std::error::Error as _;
     let mut source = err.source();
     while let Some(e) = source {
@@ -74,6 +91,14 @@ fn is_connect_refused_or_reset(err: &reqwest::Error) -> bool {
 /// Send a webhook POST, retrying with the `WEBHOOK_CONNECT_RETRY_BACKOFFS_MS` backoff
 /// schedule when the connection was refused or reset — see `is_connect_refused_or_reset`.
 ///
+/// `deadline` bounds the *entire* call, backoffs included, to the same wall-clock budget
+/// the caller already applied to each individual attempt's own `reqwest` timeout (the
+/// webhook's configured or defaulted `timeoutSeconds`) — matching upstream's single-
+/// deadline model for a webhook call. Without this, a webhook configured with the API's
+/// minimum `timeoutSeconds: 1` could see its 1s budget blown past by backoff sleeps alone,
+/// let alone repeated per-attempt timeouts. Once the remaining budget can no longer fit the
+/// next backoff, this gives up immediately rather than oversleeping past the deadline.
+///
 /// `build_request` must build a fresh, independent `RequestBuilder` on every call:
 /// `RequestBuilder` is consumed by `send()`, so the same one cannot be reused across
 /// attempts. Any other outcome — a TLS failure, a timeout, or a response that was
@@ -82,11 +107,13 @@ fn is_connect_refused_or_reset(err: &reqwest::Error) -> bool {
 /// network race to paper over. Shared by both admission webhook calls (`call_webhook`
 /// below) and CRD conversion webhook calls (`handlers::cr::call_conversion_webhook`).
 pub(crate) async fn send_webhook_request_with_retry<F>(
+    deadline: std::time::Duration,
     build_request: F,
 ) -> Result<reqwest::Response, reqwest::Error>
 where
     F: Fn() -> reqwest::RequestBuilder,
 {
+    let start = std::time::Instant::now();
     let mut attempt = 0;
     loop {
         match build_request().send().await {
@@ -97,14 +124,23 @@ where
                 {
                     return Err(err);
                 }
-                let backoff_ms = WEBHOOK_CONNECT_RETRY_BACKOFFS_MS[attempt];
+                let backoff =
+                    std::time::Duration::from_millis(WEBHOOK_CONNECT_RETRY_BACKOFFS_MS[attempt]);
+                if start.elapsed() + backoff >= deadline {
+                    tracing::debug!(
+                        attempt,
+                        "webhook: giving up on connect-refused/reset retry — the next \
+                         backoff would exceed the webhook's own deadline"
+                    );
+                    return Err(err);
+                }
                 tracing::debug!(
                     attempt,
-                    backoff_ms,
+                    backoff_ms = backoff.as_millis() as u64,
                     "webhook: retrying after connect-refused/reset \
                      (kube-proxy Service NAT rule likely not yet programmed)"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                tokio::time::sleep(backoff).await;
                 attempt += 1;
             }
         }
@@ -1187,12 +1223,13 @@ async fn call_webhook(
     client: &reqwest::Client,
     url: &str,
     review: &AdmissionReview,
+    deadline: std::time::Duration,
 ) -> (Option<AdmissionResponse>, bool) {
     let Ok(body) = serde_json::to_vec(review) else {
         return (None, false);
     };
     let start = std::time::Instant::now();
-    let send_result = send_webhook_request_with_retry(|| {
+    let send_result = send_webhook_request_with_retry(deadline, || {
         client
             .post(url)
             .header("Content-Type", "application/json")
@@ -1413,7 +1450,13 @@ async fn invoke_mutating_webhook<S: Store>(
         &state.webhook_client,
         webhook.timeout_seconds,
     );
-    let (response, timed_out) = call_webhook(&wh_client, &call_url, &review).await;
+    let (response, timed_out) = call_webhook(
+        &wh_client,
+        &call_url,
+        &review,
+        std::time::Duration::from_secs(secs as u64),
+    )
+    .await;
 
     match response {
         Some(resp) => {
@@ -4148,7 +4191,13 @@ pub async fn run_validating_webhooks<S: Store>(
                 &state.webhook_client,
                 webhook.timeout_seconds,
             );
-            let (response, timed_out) = call_webhook(&wh_client, &call_url, &review).await;
+            let (response, timed_out) = call_webhook(
+                &wh_client,
+                &call_url,
+                &review,
+                std::time::Duration::from_secs(secs as u64),
+            )
+            .await;
 
             match response {
                 Some(resp) => {
@@ -5866,7 +5915,7 @@ mod tests {
         let attempts_for_closure = attempts.clone();
         let start = std::time::Instant::now();
 
-        let result = send_webhook_request_with_retry(|| {
+        let result = send_webhook_request_with_retry(std::time::Duration::from_secs(10), || {
             attempts_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             client.get("http://127.0.0.1:1/")
         })
@@ -5898,6 +5947,91 @@ mod tests {
         );
     }
 
+    /// `deadline` must cap the *total* retry time, not just document a hoped-for budget:
+    /// once the remaining time can no longer fit the next backoff, the loop must give up
+    /// immediately rather than sleep past it. A webhook configured with `timeoutSeconds: 1`
+    /// (the API's minimum) relies on this — without it, backoff sleeps alone could blow
+    /// past a caller's 1s deadline before the retry loop ever notices.
+    #[tokio::test]
+    async fn send_webhook_request_with_retry_stops_at_deadline_instead_of_exhausting_backoffs() {
+        let client = reqwest::Client::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+        let start = std::time::Instant::now();
+
+        // WEBHOOK_CONNECT_RETRY_BACKOFFS_MS is [100, 200] (300ms total): a 150ms deadline
+        // permits the first 100ms backoff (cumulative 100ms < 150ms) but not the second
+        // 200ms one (cumulative 300ms >= 150ms), so this must stop after exactly 2 attempts.
+        let result = send_webhook_request_with_retry(std::time::Duration::from_millis(150), || {
+            attempts_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client.get("http://127.0.0.1:1/")
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a permanently-refused connection must still surface as Err"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "must give up before the 3rd attempt: sleeping its 200ms backoff would push \
+             cumulative elapsed time past the 150ms deadline"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "must not sleep past its deadline just because a backoff step was already \
+             about to run, got {elapsed:?}"
+        );
+    }
+
+    /// A connection reset that arrives *after* the request was already sent over a
+    /// previously-established connection (e.g. the webhook process restarting between two
+    /// otherwise-unrelated requests) is not the connect-phase NAT race this retry targets.
+    /// Retrying it risks resending an already-processed, non-idempotent AdmissionReview/
+    /// ConversionReview to the webhook — so it must fail fast instead.
+    #[tokio::test]
+    async fn send_webhook_request_with_retry_does_not_retry_post_connect_reset() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Read the request, then force an RST instead of a graceful close —
+                // this happens strictly after the connect phase already succeeded.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.set_zero_linger();
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+
+        let result = send_webhook_request_with_retry(std::time::Duration::from_secs(5), || {
+            attempts_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client
+                .post(format!("http://{addr}/webhook"))
+                .body("payload")
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a mid-stream connection reset must surface as an error, not silently succeed"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a reset that happens after the connect phase already succeeded must not be \
+             retried — retrying could resend an already-processed request to the webhook"
+        );
+    }
+
     /// A webhook that responds — even with a 5xx status — is not a network error:
     /// reqwest returns `Ok`, and the caller (not this retry loop) is responsible for
     /// inspecting the AdmissionReview/ConversionReview body. Retrying an application-level
@@ -5925,7 +6059,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_closure = attempts.clone();
 
-        let result = send_webhook_request_with_retry(|| {
+        let result = send_webhook_request_with_retry(std::time::Duration::from_secs(10), || {
             attempts_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             client.post(format!("http://{addr}/webhook"))
         })
@@ -5972,7 +6106,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_closure = attempts.clone();
 
-        let result = send_webhook_request_with_retry(|| {
+        let result = send_webhook_request_with_retry(std::time::Duration::from_secs(10), || {
             attempts_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             client.get(format!("http://{addr}/slow"))
         })
@@ -12356,7 +12490,13 @@ mod tests {
         let review = build_review("uid-proxy-test", &ctx, &obj, None);
         let webhook_url = format!("{base_url}/webhook");
 
-        let (response, _timed_out) = call_webhook(&client, &webhook_url, &review).await;
+        let (response, _timed_out) = call_webhook(
+            &client,
+            &webhook_url,
+            &review,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
 
         assert!(
             response.is_none(),
