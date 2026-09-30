@@ -270,7 +270,7 @@ pub async fn create_csr<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let body = extract_body(&body, content_type(&headers));
+    let body = extract_body(&body, content_type(&headers))?;
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 

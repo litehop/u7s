@@ -542,15 +542,23 @@ ExecStart=/usr/bin/kubelet \\\\
   --hostname-override=${VM_NAME} \\\\
   --node-ip=${LIMA_VM_IP},${NODE_IPV6} \\\\
   --v=${KUBELET_V} \\\\
-  --application-metrics-count-limit=0 \\\\
-  --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,InPlacePodVerticalScalingInitContainers=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false
-# Round-2 tuning: feature-gate audit + cAdvisor trim -- see the
-# matching kubelet.service comment in scripts/install.sh for the full
-# per-gate/-flag rationale (mirrored here so the conformance run exercises
-# what production ships), including why --housekeeping-interval was tried
-# and reverted (desyncs from kubelet's hardcoded eviction-monitoring
-# period). --max-pods/ChangeDetectionStrategy intentionally untouched --
-# operator scope narrowing.
+  --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,PodLevelResourcesFixDefaulting=false,PodLevelResourcesFixKubeletQOSClass=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false
+# Round-2 tuning: feature-gate audit -- see the matching kubelet.service
+# comment in scripts/install.sh for the full per-gate rationale (mirrored
+# here so the conformance run exercises what production ships), including
+# why --housekeeping-interval was tried and reverted (desyncs from
+# kubelet's hardcoded eviction-monitoring period), why
+# --application-metrics-count-limit=0 (the prior cAdvisor trim flag here)
+# was dropped -- kubelet 1.37 removed it entirely ("unknown flag", a
+# crash-loop, not a deprecation) -- and why InPlacePodVerticalScalingInitContainers
+# is no longer in this list (kubelet 1.37 graduated it to GA + LockToDefault:true,
+# so passing =false is now a startup error, not a no-op) while
+# PodLevelResourcesFixDefaulting/PodLevelResourcesFixKubeletQOSClass were added
+# (new in 1.37, default true, both hard-depend on PodLevelResources per
+# pkg/features/kube_features.go's dependency map, so keeping PodLevelResources
+# disabled now requires disabling these two as well or kubelet refuses to start).
+# --max-pods/ChangeDetectionStrategy intentionally untouched -- operator scope
+# narrowing.
 # Matches kube-proxy.service's LimitNOFILE below — sustained conformance load
 # (one FD per container log/exec/attach stream) can exceed the systemd default
 # well before kube-proxy's own limit would ever be hit.

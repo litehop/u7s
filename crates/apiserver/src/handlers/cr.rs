@@ -19,7 +19,10 @@ use crate::{
     state::AppState,
     status::Status,
     types::{DeleteOptions, Object},
-    util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
+    util::{
+        content_type, extract_body, extract_body_quiet, extract_body_recheck,
+        parse_resource_version, utc_now_rfc3339,
+    },
 };
 
 const CRD_LIST_PREFIX: &str = "/registry/apiextensions.k8s.io/customresourcedefinitions/";
@@ -2404,7 +2407,10 @@ pub async fn create_cr<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    // extract_body_recheck, not extract_body: create_resource already ran extract_body on this
+    // body before falling back here on a lookup miss, so it's already JSON under a stale
+    // protobuf Content-Type header — see extract_body_recheck's doc comment.
+    let body = extract_body_recheck(&body, ct)?;
     let obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -2540,7 +2546,10 @@ pub async fn replace_cr<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    // extract_body_recheck, not extract_body: replace_resource already ran extract_body on
+    // this body before falling back here on a lookup miss, so it's already JSON under a stale
+    // protobuf Content-Type header — see extract_body_recheck's doc comment.
+    let body = extract_body_recheck(&body, ct)?;
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -2799,7 +2808,11 @@ pub async fn delete_cr<S: Store>(
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
 
     // Parse DeleteOptions from the request body (same pattern as built-in delete handlers).
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -2928,7 +2941,11 @@ pub async fn delete_collection_cr<S: Store>(
     // handlers). client-go's typed DeleteCollection() sends DryRun in this body; a
     // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
     // inject_dry_run_header layer) — accept either.
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -3436,7 +3453,10 @@ pub async fn create_cr_namespaced<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    // extract_body_recheck, not extract_body: create_namespaced_resource already ran
+    // extract_body on this body before falling back here on a lookup miss, so it's already
+    // JSON under a stale protobuf Content-Type header — see extract_body_recheck's doc comment.
+    let body = extract_body_recheck(&body, ct)?;
     let obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -3610,7 +3630,10 @@ pub async fn replace_cr_namespaced<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    // extract_body_recheck, not extract_body: replace_namespaced_resource already ran
+    // extract_body on this body before falling back here on a lookup miss, so it's already
+    // JSON under a stale protobuf Content-Type header — see extract_body_recheck's doc comment.
+    let body = extract_body_recheck(&body, ct)?;
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -3769,7 +3792,11 @@ pub async fn delete_cr_namespaced<S: Store>(
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
 
     // Parse DeleteOptions from the request body (same pattern as built-in delete handlers).
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -3912,7 +3939,11 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
     // handlers). client-go's typed DeleteCollection() sends DryRun in this body; a
     // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
     // inject_dry_run_header layer) — accept either.
-    let body = extract_body(&body, content_type(&headers));
+    // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
+    // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
+    // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
+    // warning — this path is hit by every real client's protobuf DELETE.
+    let body = extract_body_quiet(&body, content_type(&headers)).unwrap_or_else(|_| body.clone());
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -4561,7 +4592,7 @@ pub async fn put_cr_status<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, ct)?;
     let incoming: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 

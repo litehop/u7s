@@ -52,7 +52,7 @@ pub async fn put_approval<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("name", &name)?;
-    let body = extract_body(&body, content_type(&headers));
+    let body = extract_body(&body, content_type(&headers))?;
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
