@@ -386,10 +386,8 @@ pub async fn put_namespaced_resource_status<S: Store>(
             // version-independent, matching cr_store_key (a CR's storage location must not
             // depend on which served version this request names).
             let cr_key = format!("/registry/cr/{group}/{plural}/{ns}/{name}");
-            let ctx = super::cr::find_crd(&state, &group, &version, &plural)
-                .await
-                .ok();
-            (cr_key, plural.clone(), ctx)
+            let ctx = super::cr::find_crd(&state, &group, &version, &plural).await?;
+            (cr_key, plural.clone(), Some(ctx))
         }
     };
 
@@ -474,13 +472,11 @@ pub async fn patch_namespaced_resource_status<S: Store>(
             // CR fallback: CRs are stored under /registry/cr/<group>/<plural>/<ns>/<name> —
             // version-independent, matching cr_store_key (a CR's storage location must not
             // depend on which served version this request names).
-            let ctx = super::cr::find_crd(&state, &group, &version, &plural)
-                .await
-                .ok();
+            let ctx = super::cr::find_crd(&state, &group, &version, &plural).await?;
             (
                 format!("/registry/cr/{group}/{plural}/{ns}/{name}"),
                 plural.clone(),
-                ctx,
+                Some(ctx),
             )
         }
     };
@@ -2680,6 +2676,14 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::install_namespaced_crd(
+            &state,
+            "cert-manager.io",
+            "v1",
+            "certificates",
+            "Certificate",
+        )
+        .await;
 
         let put_body = serde_json::json!({
             "apiVersion": "cert-manager.io/v1",
@@ -2747,6 +2751,14 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::install_namespaced_crd(
+            &state,
+            "cert-manager.io",
+            "v1",
+            "certificates",
+            "Certificate",
+        )
+        .await;
 
         let patch =
             serde_json::json!({"status": {"conditions": [{"type": "Issued", "status": "True"}]}});

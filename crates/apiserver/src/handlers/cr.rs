@@ -4839,11 +4839,12 @@ pub async fn put_cr_status<S: Store>(
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&incoming["metadata"])
             .unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
-    let storage_obj = match &cr_ctx {
-        Some(ctx) => convert_cr_for_storage(&state, ctx, &group, current.clone()).await?,
-        None => current.clone(),
+    let converted = match &cr_ctx {
+        Some(ctx) => Some(convert_cr_for_storage(&state, ctx, &group, current.clone()).await?),
+        None => None,
     };
-    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
+    let bytes = serde_json::to_vec(converted.as_ref().unwrap_or(&current))
+        .map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -5046,11 +5047,12 @@ pub async fn patch_cr_status<S: Store>(
     }
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
-    let storage_obj = match &cr_ctx {
-        Some(ctx) => convert_cr_for_storage(&state, ctx, &group, current.clone()).await?,
-        None => current.clone(),
+    let converted = match &cr_ctx {
+        Some(ctx) => Some(convert_cr_for_storage(&state, ctx, &group, current.clone()).await?),
+        None => None,
     };
-    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
+    let bytes = serde_json::to_vec(converted.as_ref().unwrap_or(&current))
+        .map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
@@ -8584,6 +8586,272 @@ mod tests {
         );
         assert_eq!(stored["hostPort"].as_str(), Some("host1:80"));
         assert_eq!(stored["spec"]["replicas"], serde_json::json!(5));
+    }
+
+    async fn seed_gizmo_with_subresources(base_url: &str) -> AppState {
+        let state = make_state();
+        install_gizmo_crd(
+            &state,
+            gizmo_crd_with_subresources_bytes(base_url, "Namespaced"),
+        )
+        .await;
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.into(),
+                "v1".into(),
+                "default".into(),
+                "gizmos".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            gizmo_v1_body("g", "default", "host1:80"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed create at v1: {e:?}"));
+        state
+    }
+
+    fn gizmo_version_path(
+        version: &str,
+        ns: &str,
+        name: &str,
+    ) -> Path<(String, String, String, String, String)> {
+        Path((
+            HOSTPORT_CRD_GROUP.to_string(),
+            version.to_string(),
+            ns.to_string(),
+            "gizmos".to_string(),
+            name.to_string(),
+        ))
+    }
+
+    fn json_content_type(ct: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::CONTENT_TYPE, ct.parse().unwrap());
+        h
+    }
+
+    fn gizmo_status_put_body(version: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": format!("{HOSTPORT_CRD_GROUP}/{version}"), "kind": "Gizmo",
+                "metadata": { "name": "g", "namespace": "default" },
+                "status": { "ready": true }
+            })
+            .to_string(),
+        )
+    }
+
+    fn gizmo_scale_put_body() -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "autoscaling/v1", "kind": "Scale",
+                "metadata": { "name": "g", "namespace": "default" },
+                "spec": { "replicas": 5 }
+            })
+            .to_string(),
+        )
+    }
+
+    /// A CRD lookup ERROR on a /status PUT must fail the write. Swallowing it would skip
+    /// conversion and persist the request-version object raw into a storage-version slot,
+    /// which every later reader then misdecodes. The unserved version makes find_crd error
+    /// while the CR itself exists in the store.
+    #[tokio::test]
+    async fn put_namespaced_status_fails_and_persists_nothing_when_crd_lookup_errors() {
+        let (base_url, _h) = start_mock_conversion_server(hostport_conversion_router(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )))
+        .await;
+        let state = seed_gizmo_with_subresources(&base_url).await;
+        let before = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+
+        let result = crate::handlers::status::put_namespaced_resource_status(
+            State(state.clone()),
+            gizmo_version_path("v9", "default", "g"),
+            axum::http::HeaderMap::new(),
+            gizmo_status_put_body("v9"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a failed CRD lookup must fail the status write, not store it unconverted"
+        );
+        assert_eq!(
+            stored_gizmo(&state, Some("default"), "g").await.unwrap(),
+            before,
+            "a failed lookup must leave the stored object untouched"
+        );
+    }
+
+    /// Same contract as the PUT above, for the PATCH /status handler (a separate call site).
+    #[tokio::test]
+    async fn patch_namespaced_status_fails_and_persists_nothing_when_crd_lookup_errors() {
+        let (base_url, _h) = start_mock_conversion_server(hostport_conversion_router(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )))
+        .await;
+        let state = seed_gizmo_with_subresources(&base_url).await;
+        let before = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+
+        let result = crate::handlers::status::patch_namespaced_resource_status(
+            State(state.clone()),
+            gizmo_version_path("v9", "default", "g"),
+            json_content_type("application/merge-patch+json"),
+            Bytes::from(r#"{"status":{"ready":true}}"#),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a failed CRD lookup must fail the status patch, not store it unconverted"
+        );
+        assert_eq!(
+            stored_gizmo(&state, Some("default"), "g").await.unwrap(),
+            before,
+            "a failed lookup must leave the stored object untouched"
+        );
+    }
+
+    /// /scale resolves the CRD before touching the object; a lookup error must fail the write
+    /// and leave the stored object as it was.
+    #[tokio::test]
+    async fn put_namespaced_scale_fails_and_persists_nothing_when_crd_lookup_errors() {
+        let (base_url, _h) = start_mock_conversion_server(hostport_conversion_router(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )))
+        .await;
+        let state = seed_gizmo_with_subresources(&base_url).await;
+        let before = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+
+        let result = put_cr_namespaced_scale(
+            State(state.clone()),
+            gizmo_version_path("v9", "default", "g"),
+            json_content_type("application/json"),
+            gizmo_scale_put_body(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a failed CRD lookup must fail the scale write"
+        );
+        assert_eq!(
+            stored_gizmo(&state, Some("default"), "g").await.unwrap(),
+            before
+        );
+    }
+
+    /// A /status write at the storage version has nothing to convert and must not dial the
+    /// webhook: real webhooks reject a version-to-itself ConversionReview, so dialing would
+    /// break every controller status update on a webhook CRD.
+    #[tokio::test]
+    async fn put_namespaced_status_at_storage_version_makes_zero_webhook_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, _h) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+        let state = seed_gizmo_with_subresources(&base_url).await;
+
+        crate::handlers::status::put_namespaced_resource_status(
+            State(state.clone()),
+            gizmo_version_path("v1", "default", "g"),
+            axum::http::HeaderMap::new(),
+            gizmo_status_put_body("v1"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v1 status PUT must succeed: {e:?}"));
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "a /status write at the storage version must skip the conversion webhook"
+        );
+        let stored = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+        assert_eq!(stored["status"]["ready"], serde_json::json!(true));
+    }
+
+    /// Same version-to-itself skip for /scale.
+    #[tokio::test]
+    async fn put_namespaced_scale_at_storage_version_makes_zero_webhook_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, _h) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+        let state = seed_gizmo_with_subresources(&base_url).await;
+
+        put_cr_namespaced_scale(
+            State(state.clone()),
+            gizmo_version_path("v1", "default", "g"),
+            json_content_type("application/json"),
+            gizmo_scale_put_body(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v1 scale PUT must succeed: {e:?}"));
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "a /scale write at the storage version must skip the conversion webhook"
+        );
+        let stored = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+        assert_eq!(stored["spec"]["replicas"], serde_json::json!(5));
+    }
+
+    /// A failing conversion webhook on a /status write must fail it and persist nothing;
+    /// otherwise a broken webhook lets status writes land at a version the storage schema
+    /// never sees.
+    #[tokio::test]
+    async fn put_namespaced_status_fails_and_persists_nothing_when_conversion_webhook_fails() {
+        let (base_url, _h) = start_mock_conversion_server(failing_conversion_router()).await;
+        let state = seed_gizmo_with_subresources(&base_url).await;
+        let before = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+
+        let result = crate::handlers::status::put_namespaced_resource_status(
+            State(state.clone()),
+            v2_path("default", "g"),
+            axum::http::HeaderMap::new(),
+            gizmo_status_put_body("v2"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a failing webhook must fail the /status write"
+        );
+        assert_eq!(
+            stored_gizmo(&state, Some("default"), "g").await.unwrap(),
+            before,
+            "a failed conversion must leave the stored object untouched"
+        );
+    }
+
+    /// Same contract for a /scale write.
+    #[tokio::test]
+    async fn put_namespaced_scale_fails_and_persists_nothing_when_conversion_webhook_fails() {
+        let (base_url, _h) = start_mock_conversion_server(failing_conversion_router()).await;
+        let state = seed_gizmo_with_subresources(&base_url).await;
+        let before = stored_gizmo(&state, Some("default"), "g").await.unwrap();
+
+        let result = put_cr_namespaced_scale(
+            State(state.clone()),
+            v2_path("default", "g"),
+            json_content_type("application/json"),
+            gizmo_scale_put_body(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a failing webhook must fail the /scale write"
+        );
+        assert_eq!(
+            stored_gizmo(&state, Some("default"), "g").await.unwrap(),
+            before,
+            "a failed conversion must leave the stored object untouched"
+        );
     }
 
     // Delete then get must return 404.
