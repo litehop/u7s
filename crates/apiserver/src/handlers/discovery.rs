@@ -20,11 +20,12 @@ use crate::types::{
     GroupVersionForDiscovery,
 };
 
+// Must track the Kubernetes release the conformance suite and CI target.
 pub async fn version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "major": "1",
-        "minor": "36",
-        "gitVersion": "v1.36.0",
+        "minor": "37",
+        "gitVersion": "v1.37.1",
         "gitCommit": "0000000000000000000000000000000000000000",
         "gitTreeState": "clean",
         "buildDate": "1970-01-01T00:00:00Z",
@@ -2705,6 +2706,20 @@ mod tests {
 
     use crate::handlers::crd::{create_crd, delete_crd};
     use crate::handlers::test_support::make_state;
+
+    #[tokio::test]
+    async fn version_reports_conformance_target_minor() {
+        let Json(v) = version().await;
+        assert_eq!(v["major"], "1");
+        assert_eq!(
+            v["minor"], "37",
+            "clients gate features on /version; it must match the targeted k8s minor"
+        );
+        assert!(
+            v["gitVersion"].as_str().unwrap().starts_with("v1.37."),
+            "gitVersion must agree with minor"
+        );
+    }
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
         axum::Extension(crate::auth::UserInfo {
