@@ -328,6 +328,23 @@ struct StatusEnvelope {
 
 // -- namespaced --
 
+/// The object to persist for a namespaced `/status` write: for a CR, `current` (at the
+/// request version) converted back to the CRD's storage version; otherwise `current` as is.
+async fn to_storage_object<S: Store>(
+    state: &AppState<S>,
+    cr_ctx: Option<&super::cr::CrContext>,
+    group: &str,
+    current: &Object,
+) -> Result<Object, crate::status::StatusError> {
+    let body = match cr_ctx {
+        Some(ctx) => {
+            super::cr::convert_cr_for_storage(state, ctx, group, current.body.clone()).await?
+        }
+        None => current.body.clone(),
+    };
+    Ok(Object { body })
+}
+
 pub async fn get_namespaced_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
@@ -358,17 +375,21 @@ pub async fn put_namespaced_resource_status<S: Store>(
     // CR fallback: if the resource is not in the registry (e.g. Gateway API CRDs), fall back
     // to the CR storage key. This allows Gateway/GatewayClass controllers to PUT status on
     // their custom resources using the same /status route as built-in types.
-    let (key, kind_fallback) = match lookup(&state, &group, &version, &plural) {
+    let (key, kind_fallback, cr_ctx) = match lookup(&state, &group, &version, &plural) {
         Ok(meta) => (
             group_object_key(&group, &plural, Some(&ns), &name),
             meta.kind.clone(),
+            None,
         ),
         Err(_) => {
             // CR fallback: CRs are stored under /registry/cr/<group>/<plural>/<ns>/<name> —
             // version-independent, matching cr_store_key (a CR's storage location must not
             // depend on which served version this request names).
             let cr_key = format!("/registry/cr/{group}/{plural}/{ns}/{name}");
-            (cr_key, plural.clone())
+            let ctx = super::cr::find_crd(&state, &group, &version, &plural)
+                .await
+                .ok();
+            (cr_key, plural.clone(), ctx)
         }
     };
 
@@ -381,6 +402,11 @@ pub async fn put_namespaced_resource_status<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    if let Some(ctx) = &cr_ctx {
+        current.body =
+            super::cr::convert_cr_to_request_version(&state, ctx, &group, &version, current.body)
+                .await?;
+    }
 
     let kind = StatusEnvelope::deserialize(&current.body)
         .map(|e| e.kind)
@@ -415,9 +441,10 @@ pub async fn put_namespaced_resource_status<S: Store>(
     }
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
+    let storage_obj = to_storage_object(&state, cr_ctx.as_ref(), &group, &current).await?;
     let new_rv = state
         .store
-        .put(&key, current.to_bytes(), expected_rv)
+        .put(&key, storage_obj.to_bytes(), expected_rv)
         .await
         .map_err(|e| store_err(e, &name, &kind))?;
 
@@ -437,18 +464,23 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
-    let (key, kind_fallback) = match lookup(&state, &group, &version, &plural) {
+    let (key, kind_fallback, cr_ctx) = match lookup(&state, &group, &version, &plural) {
         Ok(meta) => (
             group_object_key(&group, &plural, Some(&ns), &name),
             meta.kind.clone(),
+            None,
         ),
         Err(_) => {
             // CR fallback: CRs are stored under /registry/cr/<group>/<plural>/<ns>/<name> —
             // version-independent, matching cr_store_key (a CR's storage location must not
             // depend on which served version this request names).
+            let ctx = super::cr::find_crd(&state, &group, &version, &plural)
+                .await
+                .ok();
             (
                 format!("/registry/cr/{group}/{plural}/{ns}/{name}"),
                 plural.clone(),
+                ctx,
             )
         }
     };
@@ -462,6 +494,11 @@ pub async fn patch_namespaced_resource_status<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    if let Some(ctx) = &cr_ctx {
+        current.body =
+            super::cr::convert_cr_to_request_version(&state, ctx, &group, &version, current.body)
+                .await?;
+    }
 
     let kind = StatusEnvelope::deserialize(&current.body)
         .map(|e| e.kind)
@@ -540,9 +577,10 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     }
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
+    let storage_obj = to_storage_object(&state, cr_ctx.as_ref(), &group, &current).await?;
     let new_rv = state
         .store
-        .put(&key, current.to_bytes(), expected_rv)
+        .put(&key, storage_obj.to_bytes(), expected_rv)
         .await
         .map_err(|e| store_err(e, &name, &kind))?;
 
