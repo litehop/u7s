@@ -34,7 +34,7 @@ use crate::{
     handlers::{
         generic::{
             apply_label_selector, build_list_response, decode_continue, generate_suffix, lookup,
-            parse_field_selector, parse_label_selector, resolve_name, stamp_metadata,
+            parse_field_selector, parse_label_selector, resolve_valid_name, stamp_metadata,
             validate_name, wants_generate_name, CollectionQuery, MAX_GENERATE_NAME_CREATE_ATTEMPTS,
         },
         json_patch::is_dry_run_header,
@@ -279,7 +279,11 @@ pub async fn create_csr<S: Store>(
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = wants_generate_name(&obj);
-    let mut name = resolve_name(&mut obj)?;
+    let mut name = resolve_valid_name(
+        &mut obj,
+        "certificates.k8s.io",
+        "certificatesigningrequests",
+    )?;
     stamp_metadata(&mut obj);
 
     let admission_ctx = AdmissionContext {
@@ -648,6 +652,53 @@ mod tests {
             axum::http::StatusCode::NOT_FOUND,
             "get_csr on non-existent CSR must return 404"
         );
+    }
+
+    /// A CSR stored under an uppercase name (explicit or generateName-derived) could never be
+    /// approved or read by name: get_csr and the approval/status subresources 400 on it.
+    #[tokio::test]
+    async fn create_csr_rejects_names_the_read_path_would_reject() {
+        let state = make_state();
+        let b64 = valid_csr_b64();
+
+        for (meta, field) in [
+            (serde_json::json!({"name": "Bad-CSR"}), "metadata.name"),
+            (
+                serde_json::json!({"generateName": "Bad-CSR-"}),
+                "metadata.generateName",
+            ),
+        ] {
+            let csr_body = serde_json::json!({
+                "apiVersion": "certificates.k8s.io/v1",
+                "kind": "CertificateSigningRequest",
+                "metadata": meta,
+                "spec": {
+                    "request": b64,
+                    "signerName": "kubernetes.io/kube-apiserver-client",
+                    "usages": ["client auth"]
+                }
+            });
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            let err = create_csr(
+                axum::extract::State(state.clone()),
+                axum::Extension(crate::auth::UserInfo {
+                    username: "admin".into(),
+                    uid: String::new(),
+                    groups: vec![],
+                    extra: Default::default(),
+                }),
+                headers,
+                bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+            )
+            .await
+            .err()
+            .expect("invalid CSR name must be refused at create");
+            crate::handlers::test_support::assert_invalid_name_field(&err, field);
+        }
     }
 
     /// create_csr with a valid CSR body must return 201 and store the object.

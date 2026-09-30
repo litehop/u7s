@@ -14,6 +14,18 @@ use u7s_store::SqliteStore;
 
 use crate::state::AppState;
 
+/// Assert a create was refused as 422 Invalid with a FieldValueInvalid cause on `field`.
+pub(crate) fn assert_invalid_name_field(err: &crate::status::StatusError, field: &str) {
+    let body = serde_json::to_value(&err.1).unwrap();
+    assert_eq!(
+        err.0,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{body}"
+    );
+    assert_eq!(body["reason"], "Invalid", "{body}");
+    assert_eq!(body["details"]["causes"][0]["field"], field, "{body}");
+}
+
 /// Build a minimal in-memory `AppState` backed by a fresh `SqliteStore`.
 pub(crate) fn make_state() -> AppState {
     make_state_with_store(Arc::new(

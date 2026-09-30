@@ -24,7 +24,7 @@ use super::generic::{
     apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
     check_crb_escalation, check_rb_escalation, check_role_escalation, clear_create_status,
     decode_continue, generate_suffix, lookup, parse_field_selector, parse_label_selector,
-    resolve_name, stamp_metadata, store_err, validate_name, validate_name_for_group,
+    resolve_valid_name, stamp_metadata, store_err, validate_name, validate_name_for_group,
     wants_generate_name, CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS,
     RBAC_GROUP,
 };
@@ -528,7 +528,7 @@ pub(crate) async fn create_resource<S: Store>(
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = wants_generate_name(&obj);
-    let mut name = resolve_name(&mut obj)?;
+    let mut name = resolve_valid_name(&mut obj, &group, &plural)?;
     stamp_metadata(&mut obj);
     if meta.kind == "VolumeAttributesClass" {
         add_vac_protection_finalizer(&mut obj);
@@ -3107,7 +3107,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = wants_generate_name(&obj);
-    let mut name = resolve_name(&mut obj)?;
+    let mut name = resolve_valid_name(&mut obj, &group, &plural)?;
 
     // Capture RS revision propagation info BEFORE ns_meta processing drops ownerReferences.
     // ObjectMeta serde drops unknown fields (including ownerReferences), so we must extract
@@ -8982,6 +8982,122 @@ mod tests {
 
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/node-a";
         assert!(store.get(key).await.unwrap().is_some());
+    }
+
+    /// A namespaced create that persisted an uppercase name (explicit or from generateName)
+    /// would be unreadable by name forever: every GET/PUT/DELETE 400s in validate_name, so
+    /// controllers retry finalizer updates endlessly and namespace deletion wedges.
+    #[tokio::test]
+    async fn namespaced_create_rejects_names_the_read_path_would_reject() {
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        for (meta, field) in [
+            (
+                serde_json::json!({"name": "Bad-Name", "namespace": "kube-node-lease"}),
+                "metadata.name",
+            ),
+            (
+                serde_json::json!({"generateName": "Bad-Prefix-", "namespace": "kube-node-lease"}),
+                "metadata.generateName",
+            ),
+        ] {
+            let lease = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": meta,
+                "spec": {"holderIdentity": "x"}
+            });
+            let err = create_namespaced_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "kube-node-lease".into(),
+                    "leases".into(),
+                )),
+                axum::extract::Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+            )
+            .await
+            .err()
+            .expect("invalid name must be refused at create");
+            crate::handlers::test_support::assert_invalid_name_field(&err, field);
+        }
+
+        let stored = store
+            .list("/registry/coordination.k8s.io/leases/", Default::default())
+            .await
+            .unwrap();
+        assert!(stored.items.is_empty(), "rejected creates must not persist");
+    }
+
+    /// Same wedge for cluster-scoped resources: an uppercase PriorityClass name stored by
+    /// create could never be fetched or deleted by name.
+    #[tokio::test]
+    async fn cluster_create_rejects_names_the_read_path_would_reject() {
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        for (meta, field) in [
+            (serde_json::json!({"name": "Bad_Name"}), "metadata.name"),
+            (
+                serde_json::json!({"generateName": "Bad_Prefix-"}),
+                "metadata.generateName",
+            ),
+        ] {
+            let pc = serde_json::json!({
+                "apiVersion": "scheduling.k8s.io/v1",
+                "kind": "PriorityClass",
+                "metadata": meta,
+                "value": 10
+            });
+            let err = create_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "scheduling.k8s.io".into(),
+                    "v1".into(),
+                    "priorityclasses".into(),
+                )),
+                axum::extract::Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&pc).unwrap()),
+            )
+            .await
+            .err()
+            .expect("invalid name must be refused at create");
+            crate::handlers::test_support::assert_invalid_name_field(&err, field);
+        }
+
+        let stored = store
+            .list(
+                "/registry/scheduling.k8s.io/priorityclasses/",
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(stored.items.is_empty(), "rejected creates must not persist");
     }
 
     /// delete_namespaced_resource must hard-delete objects without finalizers and return 200 Status.
