@@ -1146,12 +1146,12 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::approval::put_approval)
                 .patch(handlers::approval::patch_approval),
         )
-        // ClusterTrustBundle (certificates.k8s.io/v1beta1) — dedicated POST handler
+        // ClusterTrustBundle (certificates.k8s.io v1 and v1beta1) — dedicated POST handler
         // validates spec.trustBundle (PEM X.509 CA certs) before storing; every kubelet
         // that mounts it via a clusterTrustBundle projected volume trusts its contents.
         // Must be registered before the generic cluster-scoped catch-all.
         .route(
-            "/apis/certificates.k8s.io/v1beta1/clustertrustbundles",
+            "/apis/certificates.k8s.io/{version}/clustertrustbundles",
             get(handlers::certificates::list_cluster_trust_bundles)
                 .post(handlers::certificates::create_cluster_trust_bundle)
                 .delete(handlers::certificates::delete_collection_cluster_trust_bundles),
