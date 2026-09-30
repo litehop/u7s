@@ -506,6 +506,16 @@ and running it with a default/omitted `--port` risks matching whatever's
 running on `6443` instead of safely doing nothing.
 ```
 
+## Final step — evacuate referenceable test results
+
+If your return, bead notes, or PR body will cite test results as evidence
+beyond "my fix passes" (baseline or full-suite runs, timing data, a flake's
+only reproduction), `cp -R` the run archive (`temp/e2e/<run-dir>` and its
+`.tar.gz`, or other `temp/` test output) into `<MAYOR_CHECKOUT>/temp/e2e/`
+before ending, and cite that path. This gitignored copy is the one permitted
+write to the mayor checkout; never write anything tracked. Why: worktree
+`temp/` is destroyed when the mayor reaps the worktree.
+
 ## Worktree path convention
 
 Per project policy, worker worktrees live under:
@@ -945,6 +955,8 @@ When a worker returns from a VM/sonobuoy-touching bead:
 - If absent: **do not merge**. Send back: "Your return contains no VM execution
   evidence. Run `sonobuoy delete --all --wait` in your assigned VM and show the output."
 - The hook pre-checks cargo quality gates. VM verification is the mayor's gate.
+- If the return cites a run archive, confirm it is under the mayor checkout's
+  `temp/e2e/`; a worktree `temp/` path will not survive reaping.
 
 ---
 
