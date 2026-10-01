@@ -396,8 +396,23 @@ pub struct APISubresourceDiscovery {
 // Namespace domain type
 // ---------------------------------------------------------------------------
 
-/// Validated namespace name. Only `[a-z0-9-]+` is accepted.
-/// In Phase 1, only `"default"` is a valid namespace.
+/// Upstream's `IsDNS1123Label` (1-63 chars, `[a-z0-9]([-a-z0-9]*[a-z0-9])?`): the single
+/// definition of a valid Namespace name, shared by the create guard, the by-name validator
+/// and `Namespace::parse` so they cannot drift. Returns the violation text, or `None`.
+pub(crate) fn dns1123_label_violation(value: &str) -> Option<&'static str> {
+    if value.len() > 63 {
+        return Some("must be no more than 63 characters");
+    }
+    let is_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let valid = value.starts_with(is_alnum)
+        && value.ends_with(is_alnum)
+        && value.chars().all(|c| is_alnum(c) || c == '-');
+    (!valid).then_some(
+        "a lowercase RFC 1123 label must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character (e.g. 'my-name',  or '123-abc', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?')",
+    )
+}
+
+/// Validated namespace name (DNS-1123 label).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Namespace(pub String);
 
@@ -405,14 +420,8 @@ impl Namespace {
     /// Parse and validate a raw namespace string.
     /// Returns `Err` with a human-readable message on failure.
     pub fn parse(raw: &str) -> Result<Self, String> {
-        if raw.is_empty()
-            || !raw
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        {
-            return Err(format!(
-                "invalid namespace name '{raw}': must match [a-z0-9-]+"
-            ));
+        if let Some(reason) = dns1123_label_violation(raw) {
+            return Err(format!("invalid namespace name '{raw}': {reason}"));
         }
         Ok(Namespace(raw.to_owned()))
     }
@@ -2683,6 +2692,9 @@ mod tests {
         assert!(Namespace::parse("my_ns").is_err());
         assert!(Namespace::parse("my.ns").is_err());
         assert!(Namespace::parse("my ns").is_err());
+        assert!(Namespace::parse("-a").is_err());
+        assert!(Namespace::parse("a-").is_err());
+        assert!(Namespace::parse(&"a".repeat(64)).is_err());
     }
 
     // Namespace::fmt must produce the bare string (used in log messages and error text)
