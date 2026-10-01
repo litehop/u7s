@@ -30,25 +30,6 @@ use crate::{
     },
 };
 
-/// Validate a namespace name: lowercase alphanumeric + hyphens, 1–63 chars.
-/// Returns Err with 422 if invalid.
-fn validate_namespace_name(name: &str) -> Result<(), crate::status::StatusError> {
-    if name.is_empty() || name.len() > 63 {
-        return Err(Status::unprocessable_entity(format!(
-            "invalid namespace name '{name}': must be 1–63 characters"
-        )));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Err(Status::unprocessable_entity(format!(
-            "invalid namespace name '{name}': must match [a-z0-9-]+"
-        )));
-    }
-    Ok(())
-}
-
 fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusError {
     match err {
         StoreError::NotFound { .. } => Status::not_found(name, "Namespace"),
@@ -179,26 +160,8 @@ pub(crate) async fn create_namespace<S: Store>(
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?
     };
 
-    let name = {
-        match obj.name().filter(|n| !n.is_empty()) {
-            Some(n) => n.to_string(),
-            None => {
-                let meta: ObjectMeta =
-                    ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
-                let gen = meta.generate_name.as_deref().unwrap_or("");
-                if gen.is_empty() {
-                    return Err(Status::bad_request(
-                        "metadata.name or metadata.generateName is required".into(),
-                    ));
-                }
-                let generated = format!("{}{}", gen, crate::handlers::generic::generate_suffix());
-                obj.body["metadata"]["name"] = serde_json::Value::String(generated.clone());
-                generated
-            }
-        }
-    };
-
-    validate_namespace_name(&name)?;
+    let name =
+        crate::handlers::generic::resolve_valid_name(&mut obj, "", "namespaces", "Namespace")?;
 
     // Ensure kind/apiVersion are set
     if obj.body.get("kind").is_none() {
@@ -1618,38 +1581,96 @@ pub(crate) async fn delete_namespace<S: Store>(
 mod tests {
     use super::*;
 
-    use crate::handlers::test_support::make_state;
+    use crate::handlers::test_support::{assert_invalid_name_field, make_state};
 
-    #[test]
-    fn valid_namespace_names() {
-        assert!(validate_namespace_name("default").is_ok());
-        assert!(validate_namespace_name("kube-system").is_ok());
-        assert!(validate_namespace_name("a").is_ok());
-        assert!(validate_namespace_name(&"a".repeat(63)).is_ok());
+    fn generate_name_body(prefix: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "generateName": prefix }
+            })
+            .to_string(),
+        )
     }
 
-    #[test]
-    fn invalid_namespace_names() {
-        // empty
-        assert!(validate_namespace_name("").is_err());
-        // too long
-        assert!(validate_namespace_name(&"a".repeat(64)).is_err());
-        // uppercase rejected
-        assert!(validate_namespace_name("Default").is_err());
-        // underscore rejected
-        assert!(validate_namespace_name("my_ns").is_err());
-        // dot rejected
-        assert!(validate_namespace_name("my.ns").is_err());
+    async fn create_ns(
+        state: &crate::state::AppState,
+        body: Bytes,
+    ) -> Result<(), crate::status::StatusError> {
+        create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .map(|_| ())
     }
 
-    #[test]
-    fn invalid_returns_422() {
-        let result = validate_namespace_name("Bad_Name");
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("expected error"),
-        };
-        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    // A namespace created with a name the read path rejects can never be addressed again, so
+    // it can never be deleted or drained and wedges forever. Create must refuse every such
+    // name with upstream's 422 Invalid, for explicit names and generateName prefixes alike.
+    #[tokio::test]
+    async fn create_namespace_refuses_names_the_read_path_rejects() {
+        let state = make_state();
+        let too_long = "a".repeat(64);
+        let bad = [
+            "Bad-NS",
+            too_long.as_str(),
+            "-lead",
+            "trail-",
+            "has.dot",
+            "under_score",
+        ];
+        for name in bad {
+            assert!(
+                crate::types::Namespace::parse(name).is_err(),
+                "read path must reject {name:?}"
+            );
+            let err = create_ns(&state, namespace_body(name))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("create of {name:?} must be refused"));
+            assert_invalid_name_field(&err, "metadata.name");
+            let body = serde_json::to_value(&err.1).unwrap();
+            assert_eq!(body["details"]["kind"], "Namespace");
+
+            // A trailing '-' is a legal generateName prefix (the suffix follows it).
+            if name.len() <= 40 && !name.ends_with('-') {
+                let err = create_ns(&state, generate_name_body(name))
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("generateName {name:?} must be refused"));
+                assert_invalid_name_field(&err, "metadata.generateName");
+            }
+        }
+    }
+
+    // A generateName prefix that fills the 63-char budget leaves no room for the suffix, so
+    // the generated name overflows the label limit and must be refused, not stored.
+    #[tokio::test]
+    async fn create_namespace_refuses_generate_name_that_overflows_label_limit() {
+        let state = make_state();
+        let err = create_ns(&state, generate_name_body(&"a".repeat(62)))
+            .await
+            .expect_err("62-char prefix + 5-char suffix exceeds 63");
+        assert_invalid_name_field(&err, "metadata.generateName");
+    }
+
+    // The guard must not reject legitimate names, including a 63-char boundary name.
+    #[tokio::test]
+    async fn create_namespace_accepts_valid_label_names() {
+        let state = make_state();
+        for name in ["default", "kube-system", "a", "ns-1-x", &"a".repeat(63)] {
+            assert!(
+                create_ns(&state, namespace_body(name)).await.is_ok(),
+                "{name:?} is a valid DNS-1123 label"
+            );
+            assert!(crate::types::Namespace::parse(name).is_ok());
+        }
+        let resp = create_ns(&state, generate_name_body("gen-")).await;
+        assert!(resp.is_ok(), "valid generateName must round-trip");
     }
 
     // When ?watch=true, list_namespaces must route to the watch stream (chunked transfer)

@@ -133,6 +133,14 @@ pub(crate) fn validate_name_for_group(
         }
         return Ok(());
     }
+    if group.is_empty() && plural == "namespaces" {
+        return match crate::types::dns1123_label_violation(value) {
+            Some(reason) => Err(Status::bad_request(format!(
+                "invalid {label} '{value}': {reason}"
+            ))),
+            None => Ok(()),
+        };
+    }
     if group == CERTIFICATES_GROUP && plural == CLUSTER_TRUST_BUNDLES_PLURAL && value.contains(':')
     {
         return validate_cluster_trust_bundle_name(label, value);
