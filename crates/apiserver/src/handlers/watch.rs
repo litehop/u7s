@@ -187,6 +187,7 @@ fn defaults_may_mutate(group: &str, plural: &str) -> bool {
                 | ("networking.k8s.io", "networkpolicies")
                 | ("resource.k8s.io", "resourceclaims")
                 | ("resource.k8s.io", "resourceclaimtemplates")
+                | ("resource.k8s.io", "devicetaintrules")
         )
         || (plural == "events" && (group.is_empty() || group == "events.k8s.io"))
         || (group == "rbac.authorization.k8s.io"

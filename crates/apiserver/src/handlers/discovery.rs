@@ -1219,6 +1219,20 @@ fn resource_v1_resources() -> serde_json::Value {
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
+                "name": "devicetaintrules",
+                "singularName": "devicetaintrule",
+                "namespaced": false,
+                "kind": "DeviceTaintRule",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "devicetaintrules/status",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "DeviceTaintRule",
+                "verbs": ["get", "patch", "update"]
+            },
+            {
                 "name": "resourceclaims",
                 "singularName": "resourceclaim",
                 "namespaced": true,
