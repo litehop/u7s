@@ -14,6 +14,10 @@ podSpec:
     secret:
       secretName: e2e-ssh
       defaultMode: 0600
+      # Only the Lima rig creates this Secret; without optional the pod
+      # never starts on runs (CI) that lack it. The e2e framework reads the
+      # key lazily, only when a spec SSHes to a node.
+      optional: true
   serviceAccountName: sonobuoy-serviceaccount
   tolerations:
   - effect: NoSchedule

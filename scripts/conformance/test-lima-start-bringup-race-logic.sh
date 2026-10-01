@@ -42,6 +42,10 @@ grep -qF 'KUBE_SSH_KEY_PATH' "$PLUGIN" && grep -qF 'secretName: e2e-ssh' "$PLUGI
 check "the e2e plugin mounts the SSH key Secret 0600 and points KUBE_SSH_KEY_PATH at it, so [Disruptive] specs can SSH to nodes instead of failing on a missing /root/.ssh/id_rsa" "$ok"
 
 ok=0
+grep -qF 'optional: true' "$PLUGIN" && ok=1
+check "the e2e-ssh Secret volume is optional, so CI (which never creates the rig-only Secret) still starts the plugin pod instead of hanging in ContainerCreating" "$ok"
+
+ok=0
 grep -qF 'create secret generic e2e-ssh' "$RUN" && grep -qF 'KUBE_SSH_USER=' "$RUN" && ok=1
 check "06-run-sonobuoy.sh creates the e2e-ssh Secret and sets KUBE_SSH_USER, so the pod's SSH login matches the VM user that authorizes the key" "$ok"
 
