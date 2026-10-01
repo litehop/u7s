@@ -2073,6 +2073,23 @@ mod tests {
         );
     }
 
+    /// Kubelet copies an unset pod-level `maxExpirationSeconds` straight into the request, so
+    /// the apiserver must default it to 24h; rejecting it leaves the pod's volume (and the pod)
+    /// stuck forever.
+    #[tokio::test]
+    async fn podcertificaterequest_create_without_max_expiration_defaults_to_24h_because_kubelet_forwards_the_unset_pod_value(
+    ) {
+        let state = make_state();
+        let mut spec = valid_pcr_spec();
+        spec.as_object_mut().unwrap().remove("maxExpirationSeconds");
+        let (status, message) = create_pcr_as(&state, test_user(), "v1", spec).await;
+        assert!(status.is_success(), "got {status} {message}");
+        assert_eq!(
+            stored_pcr(&state).await["spec"]["maxExpirationSeconds"],
+            86400
+        );
+    }
+
     fn signer_user() -> UserInfo {
         UserInfo {
             username: "signer".into(),
