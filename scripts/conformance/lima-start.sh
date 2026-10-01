@@ -611,6 +611,18 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent
   --dry-run=client -o yaml | \
   kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f -
 
+# Rig-only SSH credential for the e2e framework's SSH-to-node helpers ([Disruptive]
+# kubelet-down specs). One keypair per workdir, never committed; its public half is
+# authorized for the VM user, which has passwordless sudo. 06-run-sonobuoy.sh ships the
+# private half to the e2e pod.
+SSH_KEY="$WORKDIR/e2e-ssh/id_ed25519"
+if [ ! -f "$SSH_KEY" ]; then
+  mkdir -p "$WORKDIR/e2e-ssh"
+  ssh-keygen -q -t ed25519 -N "" -C "u7s-rig-e2e" -f "$SSH_KEY"
+fi
+SSH_PUBKEY="$(cat "$SSH_KEY.pub")"
+limactl shell "$VM_NAME" bash -c "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && grep -qxF '$SSH_PUBKEY' ~/.ssh/authorized_keys || echo '$SSH_PUBKEY' >> ~/.ssh/authorized_keys"
+
 # Resolve the Mac host IP so the agent pod can reach the konnectivity-server.
 # CoreDNS inside the pod does not know host.lima.internal; inject it as a hostAlias.
 # 192.168.5.x (Lima's old default network) used to be hardcoded here as a fallback,
@@ -789,7 +801,7 @@ fi
 # wait for the pull, then extract the binary.
 if ! limactl shell "$VM_NAME" test -x /usr/local/bin/kube-proxy 2>/dev/null; then
   echo "Pulling kube-proxy image via static pod (first run)..."
-  limactl shell "$VM_NAME" sudo bash -c "cat > /tmp/kubelet-pods/kube-proxy-pull.yaml" <<PULLEOF
+  limactl shell "$VM_NAME" sudo bash -c "mkdir -p /tmp/kubelet-pods && cat > /tmp/kubelet-pods/kube-proxy-pull.yaml" <<PULLEOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -825,8 +837,8 @@ fi
 # storage conformance test, even once the PV/PVC bind itself succeeds. No output
 # suppression / `|| true` here: let `set -euo pipefail` fail the script loudly
 # if either command fails, rather than continuing with a half-provisioned VM.
-limactl shell "$VM_NAME" sudo apt-get update
-limactl shell "$VM_NAME" sudo apt-get install -y ipset conntrack nfs-common
+limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 update
+limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 install -y ipset conntrack nfs-common
 
 # Load IPVS and bridge netfilter kernel modules.
 # br_netfilter is required so that bridge traffic (pod-to-pod) passes through

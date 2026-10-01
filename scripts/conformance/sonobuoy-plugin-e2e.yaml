@@ -9,6 +9,15 @@ podSpec:
   # pressure that triggers the NotReady flap below.
   priorityClassName: system-cluster-critical
   restartPolicy: Never
+  volumes:
+  - name: e2e-ssh
+    secret:
+      secretName: e2e-ssh
+      defaultMode: 0600
+      # Only the Lima rig creates this Secret; without optional the pod
+      # never starts on runs (CI) that lack it. The e2e framework reads the
+      # key lazily, only when a spec SSHes to a node.
+      optional: true
   serviceAccountName: sonobuoy-serviceaccount
   tolerations:
   - effect: NoSchedule
@@ -48,6 +57,8 @@ spec:
     value: "false"
   - name: E2E_SKIP
     value: \[Disruptive\]|NoExecuteTaintManager
+  - name: KUBE_SSH_KEY_PATH
+    value: /etc/e2e-ssh/id_ed25519
   - name: E2E_USE_GO_RUNNER
     value: "true"
   - name: RESULTS_DIR
@@ -77,3 +88,6 @@ spec:
   volumeMounts:
   - mountPath: /tmp/sonobuoy/results
     name: results
+  - mountPath: /etc/e2e-ssh
+    name: e2e-ssh
+    readOnly: true
