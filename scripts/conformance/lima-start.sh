@@ -516,6 +516,10 @@ if [ -f "$CA_CERT" ]; then
   limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-tls.crt
   limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-tls.key
 
+  # A golden baked before lima/kubelet.yaml set a kubeadm-style resolvConf still carries
+  # `resolvConf: ""`, which gives CoreDNS nameserver 127.0.0.1 (self-forward loop). Idempotent.
+  limactl shell "$VM_NAME" sudo bash -c "if systemctl is-active --quiet systemd-resolved; then rc=/run/systemd/resolve/resolv.conf; else rc=/etc/resolv.conf; fi; sed -i \"s|^resolvConf: .*|resolvConf: \$rc|\" /etc/kubelet-config.yaml"
+
   # Write --client-ca-file and --tls-cert-file into the kubelet drop-in (idempotent: overwrite each run).
   limactl shell "$VM_NAME" sudo bash -c "mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
 [Service]

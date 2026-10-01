@@ -1070,6 +1070,38 @@ else
     "$([ "$mutated_persist_status" -eq 0 ] && printf '%s' "$mutated_persist_out" | grep -q '^IFACE=eth1$' && echo 1 || echo 0)"
 fi
 
+# ---------------------------------------------------------------------------
+# kubelet resolvConf: "" gives dnsPolicy Default pods (CoreDNS) nameserver
+# 127.0.0.1, so CoreDNS forwards every external query to itself. kubeadm's
+# rule: systemd-resolved active -> its non-stub file, else /etc/resolv.conf.
+# ---------------------------------------------------------------------------
+RESOLV_WORK="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK" "$WORKER_MODE_WORK" "$MANIFEST_WORK" "$PERSIST_WORK" "$RESOLV_WORK"' EXIT
+mkdir -p "$RESOLV_WORK/bin-active" "$RESOLV_WORK/bin-inactive"
+printf '#!/bin/sh\nexit 0\n' > "$RESOLV_WORK/bin-active/systemctl"
+printf '#!/bin/sh\nexit 3\n' > "$RESOLV_WORK/bin-inactive/systemctl"
+chmod +x "$RESOLV_WORK/bin-active/systemctl" "$RESOLV_WORK/bin-inactive/systemctl"
+{
+  echo 'STATE_DIR="$1"'
+  awk '/^write_kubelet_config_yaml\(\) \{$/,/^}$/' "$INSTALL"
+  echo 'write_kubelet_config_yaml'
+} > "$RESOLV_WORK/runner.sh"
+mkdir -p "$RESOLV_WORK/out-active" "$RESOLV_WORK/out-inactive"
+PATH="$RESOLV_WORK/bin-active:$PATH" bash "$RESOLV_WORK/runner.sh" "$RESOLV_WORK/out-active"
+PATH="$RESOLV_WORK/bin-inactive:$PATH" bash "$RESOLV_WORK/runner.sh" "$RESOLV_WORK/out-inactive"
+assert_true "with systemd-resolved active, kubelet resolvConf is its non-stub file so pods (and CoreDNS) get the real upstream, not the 127.0.0.53 stub" \
+  grep -qxF 'resolvConf: /run/systemd/resolve/resolv.conf' "$RESOLV_WORK/out-active/kubelet-config.yaml"
+assert_true "without systemd-resolved, kubelet resolvConf is /etc/resolv.conf (already the real upstream list)" \
+  grep -qxF 'resolvConf: /etc/resolv.conf' "$RESOLV_WORK/out-inactive/kubelet-config.yaml"
+assert_false "kubelet resolvConf must never be empty: CoreDNS would get nameserver 127.0.0.1 and forward queries to itself" \
+  grep -qxF 'resolvConf: ""' "$RESOLV_WORK/out-active/kubelet-config.yaml" "$RESOLV_WORK/out-inactive/kubelet-config.yaml"
+
+COREDNS_MANIFEST="$ROOT_DIR/manifests/coredns.yaml"
+assert_true "CoreDNS forward block caps max_concurrent so a loop or upstream stall cannot spawn unbounded goroutines (OOM)" \
+  awk '/forward \. \/etc\/resolv.conf \{/{f=1} f&&/max_concurrent 1000/{ok=1} /\}/{f=0} END{exit !ok}' "$COREDNS_MANIFEST"
+assert_true "CoreDNS Corefile keeps the loop plugin (kubeadm default) so a self-forward config fails loudly instead of silently melting down" \
+  grep -qE '^\s+loop$' "$COREDNS_MANIFEST"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
