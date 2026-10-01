@@ -564,7 +564,7 @@ runs:
           --cluster-signing-key-file="$WORKDIR/ca.key" \
           --service-account-private-key-file="$WORKDIR/sa.key" \
           --root-ca-file="$WORKDIR/ca.pem" \
-          --controllers='*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller' \
+          --controllers='*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller,-storage-version-migrator-controller' \
           --allocate-node-cidrs=true \
           --cluster-cidr=10.244.0.0/16 \
           --node-cidr-mask-size=24 \

@@ -157,7 +157,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
   --service-account-private-key-file="\$WORKDIR/sa.key" \\
   --root-ca-file="\$CA_CERT" \\
-  --controllers='*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller' \\
+  --controllers='*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller,-storage-version-migrator-controller' \\
   --cluster-cidr=10.244.0.0/16 \\
   --allocate-node-cidrs=true \\
   --node-cidr-mask-size=24 \\
