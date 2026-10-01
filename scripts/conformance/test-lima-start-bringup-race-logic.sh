@@ -35,4 +35,14 @@ ok=0
 [ -z "$unlocked" ] && ok=1
 check "every apt-get waits (bounded) for the dpkg lock, so unattended-upgrades on a fresh clone does not abort bring-up" "$ok"
 
+PLUGIN="$DIR/sonobuoy-plugin-e2e.yaml"
+RUN="$DIR/06-run-sonobuoy.sh"
+ok=0
+grep -qF 'KUBE_SSH_KEY_PATH' "$PLUGIN" && grep -qF 'secretName: e2e-ssh' "$PLUGIN" && grep -qF 'defaultMode: 0600' "$PLUGIN" && ok=1
+check "the e2e plugin mounts the SSH key Secret 0600 and points KUBE_SSH_KEY_PATH at it, so [Disruptive] specs can SSH to nodes instead of failing on a missing /root/.ssh/id_rsa" "$ok"
+
+ok=0
+grep -qF 'create secret generic e2e-ssh' "$RUN" && grep -qF 'KUBE_SSH_USER=' "$RUN" && ok=1
+check "06-run-sonobuoy.sh creates the e2e-ssh Secret and sets KUBE_SSH_USER, so the pod's SSH login matches the VM user that authorizes the key" "$ok"
+
 exit "$FAIL"

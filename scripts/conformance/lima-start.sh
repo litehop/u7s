@@ -607,6 +607,18 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent
   --dry-run=client -o yaml | \
   kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f -
 
+# Rig-only SSH credential for the e2e framework's SSH-to-node helpers ([Disruptive]
+# kubelet-down specs). One keypair per workdir, never committed; its public half is
+# authorized for the VM user, which has passwordless sudo. 06-run-sonobuoy.sh ships the
+# private half to the e2e pod.
+SSH_KEY="$WORKDIR/e2e-ssh/id_ed25519"
+if [ ! -f "$SSH_KEY" ]; then
+  mkdir -p "$WORKDIR/e2e-ssh"
+  ssh-keygen -q -t ed25519 -N "" -C "u7s-rig-e2e" -f "$SSH_KEY"
+fi
+SSH_PUBKEY="$(cat "$SSH_KEY.pub")"
+limactl shell "$VM_NAME" bash -c "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && grep -qxF '$SSH_PUBKEY' ~/.ssh/authorized_keys || echo '$SSH_PUBKEY' >> ~/.ssh/authorized_keys"
+
 # Resolve the Mac host IP so the agent pod can reach the konnectivity-server.
 # CoreDNS inside the pod does not know host.lima.internal; inject it as a hostAlias.
 # 192.168.5.x (Lima's old default network) used to be hardcoded here as a fallback,
