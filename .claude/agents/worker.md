@@ -47,7 +47,8 @@ call, so Step 0's one-time guard below does not catch it.
 
 Your dispatch brief supplies two absolute paths: `<ASSIGNED_WORKTREE>` (yours
 — matches Step 0's `git rev-parse --show-toplevel`) and `<MAYOR_CHECKOUT>`
-(the mayor's own checkout — never edit it).
+(the mayor's own checkout — never edit it; the one exception is the
+session-end copy into its gitignored `temp/e2e/`, see "Session close").
 
 Before every file edit: `pwd; git rev-parse --show-toplevel; git status --short --branch`
 — only proceed if the toplevel path is exactly `<ASSIGNED_WORKTREE>`. Use
@@ -139,3 +140,11 @@ Work is NOT done until:
 - [ ] Branch pushed to remote
 - [ ] PR opened
 - [ ] Bead closed with PR reference
+- [ ] Referenceable test results evacuated (below)
+
+Evacuate referenceable results: if you cite test output beyond "my fix
+passes" (baseline or full-suite runs, timing data, a flake's only
+reproduction), `cp -R` the run dir and its `.tar.gz` (or other `temp/` output)
+into `<MAYOR_CHECKOUT>/temp/e2e/` before ending and cite that path. This is
+the only sanctioned write to the mayor checkout (gitignored path, Bash `cp`
+only). Why: worktree `temp/` is destroyed when the worktree is reaped.

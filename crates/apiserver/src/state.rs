@@ -1893,8 +1893,12 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("CertificateSigningRequest", false, true),
     );
 
-    // certificates.k8s.io/v1beta1 — cluster-scoped; no status field on this type at all
+    // certificates.k8s.io ClusterTrustBundle — cluster-scoped; no status field on this type at all
     // (kubelet reads spec.trustBundle directly via the clusterTrustBundle projection).
+    m.insert(
+        rk("certificates.k8s.io", "v1", "clustertrustbundles"),
+        rm("ClusterTrustBundle", false, false),
+    );
     m.insert(
         rk("certificates.k8s.io", "v1beta1", "clustertrustbundles"),
         rm("ClusterTrustBundle", false, false),

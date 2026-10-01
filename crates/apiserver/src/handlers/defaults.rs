@@ -1000,6 +1000,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if group == "batch" && plural == "cronjobs" {
         validate_cronjob_timezone(obj)?;
     }
+    if group == "certificates.k8s.io" && plural == "clustertrustbundles" {
+        super::certificates::validate_cluster_trust_bundle_spec(obj).map_err(|e| e.1.message)?;
+    }
     Ok(())
 }
 

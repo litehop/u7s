@@ -55,3 +55,48 @@ pub(crate) fn make_state_with_store(store: Arc<SqliteStore>) -> AppState {
         "https://localhost:6443".into(),
     )
 }
+
+/// Install a minimal single-version (storage) namespaced CRD so CR requests resolve
+/// through `find_crd` the way they do against a live cluster.
+pub(crate) async fn install_namespaced_crd(
+    state: &AppState,
+    group: &str,
+    version: &str,
+    plural: &str,
+    kind: &str,
+) {
+    let crd = serde_json::json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": { "name": format!("{plural}.{group}") },
+        "spec": {
+            "group": group,
+            "names": {
+                "plural": plural,
+                "singular": plural,
+                "kind": kind,
+                "listKind": format!("{kind}List")
+            },
+            "scope": "Namespaced",
+            "versions": [{
+                "name": version, "served": true, "storage": true,
+                "schema": { "openAPIV3Schema": {
+                    "type": "object", "x-kubernetes-preserve-unknown-fields": true
+                } }
+            }]
+        }
+    });
+    crate::handlers::crd::create_crd(
+        axum::extract::State(state.clone()),
+        axum::Extension(crate::auth::UserInfo {
+            username: "test-user".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        }),
+        axum::http::HeaderMap::new(),
+        bytes::Bytes::from(crd.to_string()),
+    )
+    .await
+    .expect("install CRD");
+}
