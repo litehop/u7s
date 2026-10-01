@@ -360,12 +360,30 @@ pub async fn get_namespaced_resource_status<S: Store>(
     .await
 }
 
+/// Called with `(stored object, would-be object)` right before a status write is persisted
+/// (and before the dry-run early return); an `Err` aborts the write. Lets a kind enforce
+/// status-write rules that need the stored object, at the one point every PUT/PATCH flavor
+/// converges on.
+pub(crate) type StatusWriteGuard<'a> = dyn Fn(&serde_json::Value, &serde_json::Value) -> Result<(), crate::status::StatusError>
+    + Sync
+    + 'a;
+
 pub async fn put_namespaced_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(path): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    put_namespaced_resource_status_guarded(State(state), Path(path), headers, body, None).await
+}
+
+pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
+    guard: Option<&StatusWriteGuard<'_>>,
+) -> Result<Response, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
     validate_name("name", &name)?;
     let body = extract_body(&body, content_type(&headers))?;
@@ -409,6 +427,7 @@ pub async fn put_namespaced_resource_status<S: Store>(
     let kind = StatusEnvelope::deserialize(&current.body)
         .map(|e| e.kind)
         .unwrap_or(kind_fallback);
+    let stored_body = guard.map(|_| current.body.clone());
 
     // Typed dispatch first: a registered built-in kind (see status_dispatch.rs's table for
     // the full list) fails a scalar or wrong-typed status at typed decode (400). A dispatch
@@ -431,11 +450,15 @@ pub async fn put_namespaced_resource_status<S: Store>(
     }
     merge_incoming_metadata(&mut current.body, &incoming.body, &kind);
 
+    if let (Some(guard), Some(stored_body)) = (guard, &stored_body) {
+        guard(stored_body, &current.body)?;
+    }
+
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return above.
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &kind);
-        return Ok(Json(current.body));
+        return Ok(Json(current.body).into_response());
     }
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
@@ -448,15 +471,25 @@ pub async fn put_namespaced_resource_status<S: Store>(
 
     current.set_resource_version(new_rv);
     inject_type_meta(&mut current.body, &group, &version, &kind);
-    Ok(Json(current.body))
+    Ok(Json(current.body).into_response())
 }
 
 pub async fn patch_namespaced_resource_status<S: Store>(
     State(state): State<AppState<S>>,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    Path(path): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    patch_namespaced_resource_status_guarded(State(state), Path(path), headers, body, None).await
+}
+
+pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+    guard: Option<&StatusWriteGuard<'_>>,
+) -> Result<Response, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
     validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
@@ -499,6 +532,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     let kind = StatusEnvelope::deserialize(&current.body)
         .map(|e| e.kind)
         .unwrap_or(kind_fallback);
+    let stored_body = guard.map(|_| current.body.clone());
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
     // every other patch type here is JSON.
@@ -565,11 +599,15 @@ pub async fn patch_namespaced_resource_status<S: Store>(
         }
     }
 
+    if let (Some(guard), Some(stored_body)) = (guard, &stored_body) {
+        guard(stored_body, &current.body)?;
+    }
+
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &kind);
-        return Ok(Json(current.body));
+        return Ok(Json(current.body).into_response());
     }
 
     let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
@@ -582,7 +620,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
 
     current.set_resource_version(new_rv);
     inject_type_meta(&mut current.body, &group, &version, &kind);
-    Ok(Json(current.body))
+    Ok(Json(current.body).into_response())
 }
 
 /// A resource's `status` is always a message/object type in the Kubernetes API — never a
@@ -5818,7 +5856,15 @@ mod tests {
         // (`decode_status_put` -> `serde_json::from_value::<T>` then `serde_json::to_value`)
         // before ever assigning it back, so a scalar/array status is structurally impossible
         // to produce there — `to_value` on a struct always yields a JSON object.
-        const TYPED_SAFE: &[&str] = &["put_namespace_status", "replace_pod_status"];
+        //
+        // put_namespaced_resource_status and put_pod_certificate_request_status are thin
+        // delegates to `put_namespaced_resource_status_guarded`, which is scanned itself.
+        const TYPED_SAFE: &[&str] = &[
+            "put_namespace_status",
+            "replace_pod_status",
+            "put_namespaced_resource_status",
+            "put_pod_certificate_request_status",
+        ];
 
         let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
         let mut checked = Vec::new();

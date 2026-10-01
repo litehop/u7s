@@ -526,7 +526,7 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
 pub(crate) fn has_registered_decoder(kind: &str) -> bool {
     matches!(
         kind,
-        "Event" | "HorizontalPodAutoscaler" | "ClusterTrustBundle"
+        "Event" | "HorizontalPodAutoscaler" | "ClusterTrustBundle" | "PodCertificateRequest"
     ) || decoders().contains_key(kind)
 }
 
@@ -815,10 +815,6 @@ fn decoders() -> &'static std::collections::HashMap<&'static str, DecoderFn> {
             crate::net_disc_cert_policy_events_gen_adapter::decode_csr_proto_gen,
         );
         m.insert(
-            "PodCertificateRequest",
-            crate::certificates_v1beta1_gen_adapter::decode_podcertificaterequest_proto_gen,
-        );
-        m.insert(
             "PriorityClass",
             crate::storage_node_flow_gen_adapter::decode_priorityclass_proto_gen,
         );
@@ -872,16 +868,20 @@ pub fn decode_proto_by_kind_and_version(
                 crate::autoscaling_gen_adapter::decode_hpa_v1_proto_gen(raw)
             }
         }
-        // Same wire layout in v1 and v1beta1; only the apiVersion differs.
-        "ClusterTrustBundle" => {
-            crate::certificates_v1beta1_gen_adapter::decode_clustertrustbundle_proto_gen(raw).map(
-                |mut v| {
-                    if !api_version.is_empty() {
-                        v["apiVersion"] = api_version.into();
-                    }
-                    v
-                },
-            )
+        // Same wire layout in v1 and v1beta1 (PodCertificateRequest v1 merely lacks the
+        // v1beta1-only tags 9/10); only the apiVersion differs.
+        "ClusterTrustBundle" | "PodCertificateRequest" => {
+            let decoded = if kind == "ClusterTrustBundle" {
+                crate::certificates_v1beta1_gen_adapter::decode_clustertrustbundle_proto_gen(raw)
+            } else {
+                crate::certificates_v1beta1_gen_adapter::decode_podcertificaterequest_proto_gen(raw)
+            };
+            decoded.map(|mut v| {
+                if !api_version.is_empty() {
+                    v["apiVersion"] = api_version.into();
+                }
+                v
+            })
         }
         _ => decoders().get(kind).and_then(|f| f(raw)),
     }
@@ -11002,7 +11002,7 @@ mod tests {
     /// single-decoder `m.insert()` added to `decoders()`.
     #[test]
     fn decoders_registers_one_entry_per_kind_with_no_silent_shadowing() {
-        const EXPECTED_KINDS: usize = 64;
+        const EXPECTED_KINDS: usize = 63;
         assert_eq!(
             decoders().len(),
             EXPECTED_KINDS,
@@ -11030,6 +11030,24 @@ mod tests {
         }
     }
 
+    /// Same as the ClusterTrustBundle case: a kubelet's protobuf create against the v1
+    /// endpoint must be stored as v1, not stamped with the decoder's v1beta1 default.
+    #[test]
+    fn pod_certificate_request_proto_decode_keeps_envelope_api_version() {
+        let name = encode_length_delimited(1, b"pcr");
+        let mut wire = encode_length_delimited(1, &name);
+        wire.extend_from_slice(&encode_length_delimited(
+            2,
+            &encode_length_delimited(1, b"example.com/signer"),
+        ));
+        for av in ["certificates.k8s.io/v1", "certificates.k8s.io/v1beta1"] {
+            let v = decode_proto_by_kind_and_version("PodCertificateRequest", av, &wire)
+                .expect("PodCertificateRequest must decode");
+            assert_eq!(v["apiVersion"], av);
+            assert_eq!(v["spec"]["signerName"], "example.com/signer");
+        }
+    }
+
     /// `state::build_registry()` is production code's real GVK routing table: every kind it
     /// lists is routed for full CRUD through the generic handlers in `handlers/resource.rs`,
     /// which call `extract_body` -> `decode_proto_by_kind_and_version` unconditionally. A kind
@@ -11044,8 +11062,12 @@ mod tests {
         // from `kind` alone (events.k8s.io/v1 vs. core/v1; autoscaling/v2 vs. autoscaling/v1),
         // so `decode_proto_by_kind_and_version` dispatches them explicitly before consulting
         // `decoders()` — their absence from the map is by design, not a gap.
-        const APIVERSION_DISPATCHED_KINDS: &[&str] =
-            &["Event", "HorizontalPodAutoscaler", "ClusterTrustBundle"];
+        const APIVERSION_DISPATCHED_KINDS: &[&str] = &[
+            "Event",
+            "HorizontalPodAutoscaler",
+            "ClusterTrustBundle",
+            "PodCertificateRequest",
+        ];
 
         for (key, meta) in crate::state::build_registry().iter() {
             if APIVERSION_DISPATCHED_KINDS.contains(&meta.kind.as_str()) {

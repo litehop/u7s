@@ -1903,8 +1903,12 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rk("certificates.k8s.io", "v1beta1", "clustertrustbundles"),
         rm("ClusterTrustBundle", false, false),
     );
-    // certificates.k8s.io/v1beta1 — namespaced; has_status=true: spec is immutable after
-    // create, status.certificateChain is written by the signer via /status.
+    // certificates.k8s.io PodCertificateRequest — namespaced; has_status=true: spec is immutable
+    // after create, status.certificateChain is written by the signer via /status.
+    m.insert(
+        rk("certificates.k8s.io", "v1", "podcertificaterequests"),
+        rm("PodCertificateRequest", true, true),
+    );
     m.insert(
         rk("certificates.k8s.io", "v1beta1", "podcertificaterequests"),
         rm("PodCertificateRequest", true, true),

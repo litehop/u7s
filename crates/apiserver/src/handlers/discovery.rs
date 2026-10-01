@@ -1324,6 +1324,20 @@ fn certificates_v1_resources() -> serde_json::Value {
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
+                "name": "podcertificaterequests",
+                "singularName": "podcertificaterequest",
+                "namespaced": true,
+                "kind": "PodCertificateRequest",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "podcertificaterequests/status",
+                "singularName": "",
+                "namespaced": true,
+                "kind": "PodCertificateRequest",
+                "verbs": ["get", "patch", "update"]
+            },
+            {
                 "name": "certificatesigningrequests",
                 "singularName": "certificatesigningrequest",
                 "namespaced": false,

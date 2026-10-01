@@ -1583,6 +1583,9 @@ pub(crate) async fn do_patch<S: Store>(
                 } else {
                     None
                 };
+                let pcr_before = (group == "certificates.k8s.io"
+                    && plural == "podcertificaterequests")
+                    .then(|| current.body.clone());
                 let mut patch: serde_json::Value = ssa_body_to_json(&body)?;
                 strip_managed_fields(&mut patch);
                 // The winner of the create race already persisted this object, so from here
@@ -1604,6 +1607,13 @@ pub(crate) async fn do_patch<S: Store>(
                 super::defaults::apply_defaults(group, plural, &mut current.body);
                 super::defaults::validate_resource(group, plural, &current.body)
                     .map_err(Status::unprocessable_entity)?;
+                if let Some(before) = &pcr_before {
+                    super::certificates::validate_pod_certificate_request_spec_immutable(
+                        before,
+                        &current.body,
+                    )
+                    .map_err(Status::unprocessable_entity)?;
+                }
                 // Escalation prevention: same rationale as the primary create path above —
                 // this branch is still creating the object from the caller's perspective
                 // (it lost a create/create race and fell back to a merge), so it must not
@@ -2019,6 +2029,13 @@ pub(crate) async fn do_patch<S: Store>(
             .map_err(Status::unprocessable_entity)?;
         if group == "certificates.k8s.io" && plural == "clustertrustbundles" {
             super::certificates::validate_cluster_trust_bundle_signer_immutable(
+                &old_object,
+                &current.body,
+            )
+            .map_err(Status::unprocessable_entity)?;
+        }
+        if group == "certificates.k8s.io" && plural == "podcertificaterequests" {
+            super::certificates::validate_pod_certificate_request_spec_immutable(
                 &old_object,
                 &current.body,
             )
@@ -3836,6 +3853,13 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
+    if let (true, Some(old)) = (
+        group == "certificates.k8s.io" && plural == "podcertificaterequests",
+        old_object.as_ref(),
+    ) {
+        super::certificates::validate_pod_certificate_request_spec_immutable(old, &obj.body)
+            .map_err(Status::unprocessable_entity)?;
+    }
 
     // A PUT may only change spec.resources on a PVC — see validate_pvc_spec_immutable. Runs
     // after apply_defaults (above) so both sides are defaulted the same way — see

@@ -55,6 +55,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "secrets") = (group, plural) {
         default_secret(obj);
     }
+    if let ("certificates.k8s.io", "podcertificaterequests") = (group, plural) {
+        default_pod_certificate_request(obj);
+    }
     if let ("storage.k8s.io", "csidrivers") = (group, plural) {
         default_csidriver(obj);
     }
@@ -1003,6 +1006,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if group == "certificates.k8s.io" && plural == "clustertrustbundles" {
         super::certificates::validate_cluster_trust_bundle_spec(obj).map_err(|e| e.1.message)?;
     }
+    if group == "certificates.k8s.io" && plural == "podcertificaterequests" {
+        super::certificates::validate_pod_certificate_request_spec(obj).map_err(|e| e.1.message)?;
+    }
     Ok(())
 }
 
@@ -1153,6 +1159,19 @@ fn validate_network_policy_ports(obj: &serde_json::Value) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+/// Upstream's generated PodCertificateRequest defaulting (certificates/v1 and v1beta1):
+/// `spec.maxExpirationSeconds` is 86400 when omitted. Kubelet copies a pod's unset
+/// `maxExpirationSeconds` verbatim into the request, so without this default every
+/// podCertificate volume that leaves it out is rejected as "must be set" and its pod never
+/// starts.
+fn default_pod_certificate_request(obj: &mut serde_json::Value) {
+    if let Some(spec) = obj["spec"].as_object_mut() {
+        if spec.get("maxExpirationSeconds").is_none_or(|v| v.is_null()) {
+            spec.insert("maxExpirationSeconds".into(), 86400.into());
+        }
+    }
 }
 
 /// Merges `Secret.stringData` (the write-only plaintext convenience map clients like
