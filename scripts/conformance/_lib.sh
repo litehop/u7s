@@ -61,3 +61,20 @@ node_suffix_for() {
     *) echo "${override:-}" ;;
   esac
 }
+
+# Rig-only SSH credential for the e2e framework's SSH-to-node helpers
+# ([Disruptive] kubelet-down specs). Both lima-start.sh (generates + authorizes)
+# and 06-run-sonobuoy.sh (ships to the e2e pod) derive the path from the
+# kubeconfig's directory so the two can never diverge on --workdir.
+e2e_ssh_key_path() {
+  echo "$(dirname "$1")/e2e-ssh/id_ed25519"
+}
+
+# Shell command, run as the VM user, that leaves ~/.ssh/authorized_keys holding
+# exactly one rig key: earlier rig keys (identified by the key comment) are
+# dropped so a wiped workdir with a kept VM doesn't accumulate stale entries.
+E2E_SSH_KEY_COMMENT="u7s-rig-e2e"
+authorized_keys_replace_cmd() {
+  local pubkey="$1"
+  echo "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && { grep -v ' ${E2E_SSH_KEY_COMMENT}\$' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.new || true; } && echo '${pubkey}' >> ~/.ssh/authorized_keys.new && cat ~/.ssh/authorized_keys.new > ~/.ssh/authorized_keys && rm -f ~/.ssh/authorized_keys.new"
+}
