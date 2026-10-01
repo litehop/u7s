@@ -11006,7 +11006,7 @@ mod tests {
     /// single-decoder `m.insert()` added to `decoders()`.
     #[test]
     fn decoders_registers_one_entry_per_kind_with_no_silent_shadowing() {
-        const EXPECTED_KINDS: usize = 63;
+        const EXPECTED_KINDS: usize = 64;
         assert_eq!(
             decoders().len(),
             EXPECTED_KINDS,
