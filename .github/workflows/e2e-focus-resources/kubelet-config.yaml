@@ -3,7 +3,7 @@ kind: KubeletConfiguration
 containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
 registerNode: true
 failSwapOn: false
-resolvConf: ""
+resolvConf: /etc/resolv.conf
 staticPodPath: /tmp/kubelet-pods
 authentication:
   x509:

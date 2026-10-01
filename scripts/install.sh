@@ -261,9 +261,11 @@ stage_binaries() {
 # apiserver's default --service-cluster-ip-range (10.96.0.0/12), and four
 # settings that are not obvious:
 #
-# resolvConf: "" -- Ubuntu's systemd-resolved points /etc/resolv.conf at the
-# 127.0.0.53 stub, unreachable from inside a pod netns; passing it through
-# would give every pod an unusable resolver.
+# resolvConf -- chosen as kubeadm does: when systemd-resolved is active,
+# /run/systemd/resolve/resolv.conf (the real upstreams), because
+# /etc/resolv.conf is the 127.0.0.53 stub, unreachable from a pod netns;
+# otherwise /etc/resolv.conf. "" is wrong: dnsPolicy Default pods (CoreDNS)
+# then get nameserver 127.0.0.1 and CoreDNS forwards to itself.
 #
 # tlsCertFile/tlsPrivateKeyFile -- a serving cert signed by the cluster CA,
 # minted by kubelet.service's ExecStartPre or delivered in the join artifact.
@@ -282,13 +284,17 @@ stage_binaries() {
 # --cert-dir CLI flag on kubelet.service's ExecStart -- see the flag there
 # for why it must live under $STATE_DIR.
 write_kubelet_config_yaml() {
+  local resolv_conf=/etc/resolv.conf
+  if systemctl is-active --quiet systemd-resolved; then
+    resolv_conf=/run/systemd/resolve/resolv.conf
+  fi
   cat > "$STATE_DIR/kubelet-config.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
 registerNode: true
 failSwapOn: false
-resolvConf: ""
+resolvConf: $resolv_conf
 staticPodPath: /etc/u7s/static-pods
 clusterDNS:
   - 10.96.0.10
