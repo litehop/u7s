@@ -657,6 +657,10 @@ fn decoders() -> &'static std::collections::HashMap<&'static str, DecoderFn> {
             crate::net_disc_cert_policy_events_gen_adapter::decode_servicecidr_proto_gen,
         );
         m.insert(
+            "StorageVersionMigration",
+            crate::storagemigration_gen_adapter::decode_storageversionmigration_proto_gen,
+        );
+        m.insert(
             "CSINode",
             crate::storage_node_flow_gen_adapter::decode_csinode_proto_gen,
         );
@@ -11006,7 +11010,7 @@ mod tests {
     /// single-decoder `m.insert()` added to `decoders()`.
     #[test]
     fn decoders_registers_one_entry_per_kind_with_no_silent_shadowing() {
-        const EXPECTED_KINDS: usize = 64;
+        const EXPECTED_KINDS: usize = 65;
         assert_eq!(
             decoders().len(),
             EXPECTED_KINDS,

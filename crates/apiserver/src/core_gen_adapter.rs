@@ -1936,7 +1936,7 @@ fn json_to_load_balancer_status_proto(v: &serde_json::Value) -> core_v1::LoadBal
 /// `ServiceStatus.conditions` is the only core/v1 user of it. Used by
 /// `gen_service_status_to_json`'s `conditions` delegate; see
 /// `build/codegen.rs::service_status_delegated_field`.
-fn gen_meta_condition_to_json(c: meta_v1::Condition) -> serde_json::Value {
+pub(crate) fn gen_meta_condition_to_json(c: meta_v1::Condition) -> serde_json::Value {
     let mut cond = serde_json::json!({
         "type": c.r#type.unwrap_or_default(),
         "status": c.status.unwrap_or_default(),

@@ -33,8 +33,8 @@ use crate::types::{
     PodCertificateRequestStatus, PodDisruptionBudgetStatus, PodStatus,
     PriorityLevelConfigurationStatus, ReplicaSetStatus, ReplicationControllerStatus,
     ResourceClaimStatus, ResourceQuotaStatus, ServiceCidrStatus, StatefulSetStatus,
-    ValidatingAdmissionPolicyBindingStatus, ValidatingAdmissionPolicyStatus,
-    VolumeAttachmentStatus,
+    StorageVersionMigrationStatus, ValidatingAdmissionPolicyBindingStatus,
+    ValidatingAdmissionPolicyStatus, VolumeAttachmentStatus,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -108,6 +108,10 @@ fn status_codecs() -> &'static HashMap<(&'static str, &'static str), StatusCodec
         m.insert(
             ("networking.k8s.io/v1", "ServiceCIDR"),
             codec::<ServiceCidrStatus>,
+        );
+        m.insert(
+            ("storagemigration.k8s.io/v1", "StorageVersionMigration"),
+            codec::<StorageVersionMigrationStatus>,
         );
         // storage.k8s.io/v1
         m.insert(

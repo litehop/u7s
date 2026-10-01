@@ -1754,6 +1754,12 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("ServiceCIDR", false, true),
     );
 
+    // storagemigration.k8s.io/v1 — cluster-scoped
+    m.insert(
+        rk("storagemigration.k8s.io", "v1", "storageversionmigrations"),
+        rm("StorageVersionMigration", false, true),
+    );
+
     // events.k8s.io/v1
     m.insert(rk("events.k8s.io", "v1", "events"), rm_cou("Event", true));
 
@@ -2840,6 +2846,24 @@ mod tests {
             .expect("servicecidrs must be in build_registry");
         assert!(!meta.namespaced, "ServiceCIDR is cluster-scoped");
         assert_eq!(meta.kind, "ServiceCIDR");
+    }
+
+    /// StorageVersionMigration must be a cluster-scoped kind with a /status subresource: the
+    /// migrator controller writes progress via /status, and has_status_subresource is what
+    /// makes the main resource ignore client-supplied status.
+    #[test]
+    fn storageversionmigrations_registered_as_cluster_scoped_with_status() {
+        let registry = build_registry();
+        let key = rk("storagemigration.k8s.io", "v1", "storageversionmigrations");
+        let meta = registry
+            .get(&key)
+            .expect("storageversionmigrations must be in build_registry");
+        assert!(
+            !meta.namespaced,
+            "StorageVersionMigration is cluster-scoped"
+        );
+        assert!(meta.has_status_subresource);
+        assert_eq!(meta.kind, "StorageVersionMigration");
     }
 
     /// DRA types must be registered under resource.k8s.io/v1 (GA since k8s 1.32).

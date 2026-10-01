@@ -980,6 +980,13 @@ pub(crate) async fn replace_resource<S: Store>(
             .map_err(Status::unprocessable_entity)?;
     }
     if let (true, Some(old)) = (
+        group == "storagemigration.k8s.io" && plural == "storageversionmigrations",
+        old_object.as_ref(),
+    ) {
+        super::storagemigration::validate_spec_immutable(old, &obj.body)
+            .map_err(Status::unprocessable_entity)?;
+    }
+    if let (true, Some(old)) = (
         group == "resource.k8s.io" && plural == "devicetaintrules",
         old_object.as_ref(),
     ) {
@@ -1592,6 +1599,9 @@ pub(crate) async fn do_patch<S: Store>(
                 let pcr_before = (group == "certificates.k8s.io"
                     && plural == "podcertificaterequests")
                     .then(|| current.body.clone());
+                let svm_before = (group == "storagemigration.k8s.io"
+                    && plural == "storageversionmigrations")
+                    .then(|| current.body.clone());
                 let dtr_before = (group == "resource.k8s.io" && plural == "devicetaintrules")
                     .then(|| current.body.clone());
                 let mut patch: serde_json::Value = ssa_body_to_json(&body)?;
@@ -1621,6 +1631,10 @@ pub(crate) async fn do_patch<S: Store>(
                         &current.body,
                     )
                     .map_err(Status::unprocessable_entity)?;
+                }
+                if let Some(before) = &svm_before {
+                    super::storagemigration::validate_spec_immutable(before, &current.body)
+                        .map_err(Status::unprocessable_entity)?;
                 }
                 if let Some(before) = &dtr_before {
                     super::device_taint_rule::prepare_device_taint_rule_update(
@@ -2054,6 +2068,10 @@ pub(crate) async fn do_patch<S: Store>(
                 &current.body,
             )
             .map_err(Status::unprocessable_entity)?;
+        }
+        if group == "storagemigration.k8s.io" && plural == "storageversionmigrations" {
+            super::storagemigration::validate_spec_immutable(&old_object, &current.body)
+                .map_err(Status::unprocessable_entity)?;
         }
         if group == "resource.k8s.io" && plural == "devicetaintrules" {
             super::device_taint_rule::prepare_device_taint_rule_update(

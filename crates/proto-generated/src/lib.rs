@@ -133,6 +133,14 @@ pub mod k8s {
                     include!(concat!(env!("OUT_DIR"), "/k8s.io.api.node.v1.rs"));
                 }
             }
+            pub mod storagemigration {
+                pub mod v1 {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/k8s.io.api.storagemigration.v1.rs"
+                    ));
+                }
+            }
             pub mod flowcontrol {
                 pub mod v1 {
                     include!(concat!(env!("OUT_DIR"), "/k8s.io.api.flowcontrol.v1.rs"));

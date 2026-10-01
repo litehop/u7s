@@ -1852,6 +1852,22 @@ pub struct ServiceCidrStatus {
     pub rest: serde_json::Value,
 }
 
+/// Typed status for a StorageVersionMigration object. Source:
+/// `storagemigration/v1/generated.proto`'s `StorageVersionMigrationStatus`: `conditions` is a
+/// plain `metav1.Condition` list and `resourceVersion` a string.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageVersionMigrationStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<Condition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_version: Option<String>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
 // ---------------------------------------------------------------------------
 // storage.k8s.io/v1 — VolumeAttachment
 // ---------------------------------------------------------------------------
