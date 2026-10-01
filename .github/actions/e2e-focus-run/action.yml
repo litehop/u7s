@@ -284,6 +284,11 @@ runs:
         sudo cp "$WORKDIR/kubeconfig" /etc/kubelet-kubeconfig
         sudo chmod 644 /etc/kubelet-kubeconfig
         sudo cp .github/workflows/e2e-focus-resources/kubelet-config.yaml /etc/kubelet-config.yaml
+        # kubeadm-style resolvConf: the runner's /etc/resolv.conf is the
+        # systemd-resolved stub (127.0.0.53); "" gives CoreDNS a self-forward loop.
+        RESOLV_CONF=/etc/resolv.conf
+        systemctl is-active --quiet systemd-resolved && RESOLV_CONF=/run/systemd/resolve/resolv.conf
+        sudo sed -i "s|^resolvConf: .*|resolvConf: $RESOLV_CONF|" /etc/kubelet-config.yaml
         sudo "$HOME/bin/kubelet" \
           --config=/etc/kubelet-config.yaml \
           --kubeconfig=/etc/kubelet-kubeconfig \
