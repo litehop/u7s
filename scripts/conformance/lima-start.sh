@@ -785,7 +785,7 @@ fi
 # wait for the pull, then extract the binary.
 if ! limactl shell "$VM_NAME" test -x /usr/local/bin/kube-proxy 2>/dev/null; then
   echo "Pulling kube-proxy image via static pod (first run)..."
-  limactl shell "$VM_NAME" sudo bash -c "cat > /tmp/kubelet-pods/kube-proxy-pull.yaml" <<PULLEOF
+  limactl shell "$VM_NAME" sudo bash -c "mkdir -p /tmp/kubelet-pods && cat > /tmp/kubelet-pods/kube-proxy-pull.yaml" <<PULLEOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -821,8 +821,8 @@ fi
 # storage conformance test, even once the PV/PVC bind itself succeeds. No output
 # suppression / `|| true` here: let `set -euo pipefail` fail the script loudly
 # if either command fails, rather than continuing with a half-provisioned VM.
-limactl shell "$VM_NAME" sudo apt-get update
-limactl shell "$VM_NAME" sudo apt-get install -y ipset conntrack nfs-common
+limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 update
+limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 install -y ipset conntrack nfs-common
 
 # Load IPVS and bridge netfilter kernel modules.
 # br_netfilter is required so that bridge traffic (pod-to-pod) passes through
