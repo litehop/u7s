@@ -16,6 +16,9 @@
 # Part of the scripts/conformance/ orchestration sequence.
 set -euo pipefail
 
+# shellcheck source=scripts/conformance/_lib.sh
+source "$(dirname "$0")/_lib.sh"
+
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 FOCUS="${SONOBUOY_FOCUS:-}"
 ALL_E2E=0
@@ -46,8 +49,16 @@ UNSAFE_FOCUS=0
 # these two in sync.
 K8S_VERSION="1.37.1"
 
+# "all" (default) runs two child passes of this script: "disruptive" (--procs 1,
+# only [Disruptive] specs) and "parallel" (everything else). [Disruptive] specs
+# restart kubelets and break exec/logs of concurrently running specs, and ginkgo
+# only serializes [Serial]-labelled specs, so they cannot share the parallel pool.
+PASS="all"
+ORIG_ARGS=("$@")
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --pass) PASS="$2"; shift 2 ;;
     --focus) FOCUS="$2"; shift 2 ;;
     --all-e2e) ALL_E2E=1; shift ;;
     --unsafe-focus) UNSAFE_FOCUS=1; shift ;;
@@ -62,7 +73,39 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-echo "=== [06] Run sonobuoy ==="
+case "$PASS" in
+  all|parallel|disruptive) ;;
+  *) echo "error: --pass must be all, parallel or disruptive (got '$PASS')" >&2; exit 1 ;;
+esac
+
+if [ "$PASS" = "all" ]; then
+  # Disruptive pass first: run-all.sh resolves "this run's dir" as the newest
+  # temp/e2e/ entry, which should be the main parallel pass. A selection with no
+  # [Disruptive] specs just runs 0 specs in its pass (cheaper than a dry-run).
+  PASS_LOG_DIR=$(mktemp -d)
+  trap 'rm -rf "$PASS_LOG_DIR"' EXIT
+  OVERALL_EXIT=0
+  for P in disruptive parallel; do
+    echo "=== [06] pass: $P ==="
+    P_EXIT=0
+    bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} --pass "$P" 2>&1 | tee "$PASS_LOG_DIR/$P.log" || P_EXIT=$?
+    [ "$P_EXIT" -ne 0 ] && [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=$P_EXIT
+  done
+  echo ""
+  echo "=== Combined results (both passes) ==="
+  TOTAL_FAILED=0
+  for P in disruptive parallel; do
+    echo "  [$P] $(grep -E '^  (Ran|Passed|Failed):' "$PASS_LOG_DIR/$P.log" | sed 's/^ *//' | tr -s ' ' | tr '\n' ' ')"
+    F=$(sed -n 's/^  Failed: *//p' "$PASS_LOG_DIR/$P.log" | head -1)
+    TOTAL_FAILED=$(( TOTAL_FAILED + ${F:-0} ))
+  done
+  echo "  Total failed across passes: $TOTAL_FAILED"
+  exit "$OVERALL_EXIT"
+fi
+
+if [ "$PASS" = "disruptive" ]; then PROCS=1; fi
+
+echo "=== [06] Run sonobuoy ($PASS pass) ==="
 
 if ! command -v limactl &>/dev/null; then
   echo "error: limactl not found — install with: brew install lima" >&2; exit 1
@@ -210,7 +253,7 @@ kubectl --kubeconfig="$KUBECONFIG" apply -f scripts/conformance/sonobuoy-namespa
 # must exist before the plugin pod, and `sonobuoy delete` above removes the
 # namespace, so it is (re)created here.
 kubectl --kubeconfig="$KUBECONFIG" -n sonobuoy create secret generic e2e-ssh \
-  --from-file=id_ed25519="$WORKDIR/e2e-ssh/id_ed25519" \
+  --from-file=id_ed25519="$(e2e_ssh_key_path "$KUBECONFIG")" \
   --dry-run=client -o yaml | kubectl --kubeconfig="$KUBECONFIG" apply -f -
 SSH_USER="$(limactl shell "$VM_NAME" id -un)"
 
@@ -262,14 +305,28 @@ JSON_REPORT_PATH="/tmp/sonobuoy/results/report.json"
 # in the apply=0 shape (which never overrides the default space-splitting).
 build_filter_args() {
   local apply="$1"
+  # The disruptive pass selects by ginkgo label (ANDed with the plugin's focus)
+  # because RE2 focus/skip regexes cannot express "focus X and also [Disruptive]";
+  # the parallel pass skips by text tag.
   if [ "$apply" -eq 1 ]; then
+    local label="$FEATUREGATE_LABEL_FILTER" skip='\[Flaky\]'
+    if [ "$PASS" = "disruptive" ]; then
+      label="(${FEATUREGATE_LABEL_FILTER}) && Disruptive"
+    else
+      skip='\[Flaky\]|\[Disruptive\]'
+    fi
     FILTER_ARGS=(
-      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${FEATUREGATE_LABEL_FILTER}|--json-report=${JSON_REPORT_PATH}"
+      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${label}|--json-report=${JSON_REPORT_PATH}"
       "--plugin-env=e2e.E2E_EXTRA_ARGS_SEP=|"
-      "--e2e-skip=\[Flaky\]"
+      "--e2e-skip=${skip}"
     )
   else
-    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}")
+    local extra=""
+    [ "$PASS" = "disruptive" ] && extra=" --label-filter=Disruptive"
+    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${extra}")
+    if [ "$PASS" = "parallel" ]; then
+      FILTER_ARGS+=('--e2e-skip=\[Disruptive\]')
+    fi
   fi
 }
 
@@ -499,6 +556,10 @@ else
   SLUG_INPUT="${FOCUS:-conformance}"
 fi
 FOCUS_SLUG=$(echo "$SLUG_INPUT" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')
+# Cap before the pass suffix: a long alternation focus otherwise overflows the
+# 255-byte filename limit and limactl copy fails.
+FOCUS_SLUG="${FOCUS_SLUG:0:100}"
+if [ "$PASS" = "disruptive" ]; then FOCUS_SLUG="${FOCUS_SLUG}-disruptive"; fi
 OUTFILE="$WORKDIR/../e2e/${TIMESTAMP}-${FOCUS_SLUG}.tar.gz"
 mkdir -p "$WORKDIR/../e2e"
 if ! run_with_timeout "limactl copy results tarball from $FOUND_NODE" "$CALL_TIMEOUT" 0 \
