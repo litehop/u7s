@@ -1156,16 +1156,23 @@ fn build_router(state: AppState) -> Router {
                 .post(handlers::certificates::create_cluster_trust_bundle)
                 .delete(handlers::certificates::delete_collection_cluster_trust_bundles),
         )
-        // PodCertificateRequest (certificates.k8s.io/v1beta1) — dedicated POST handler
-        // validates the +required spec fields and strips any client-supplied status
-        // (status is the signer's exclusive right, written only via /status). Must be
-        // registered before the generic namespaced catch-all.
+        // PodCertificateRequest (certificates.k8s.io v1 and v1beta1) — dedicated POST handler
+        // applies NodeRestriction and strips any client-supplied status (status is the
+        // signer's exclusive right, written only via /status); the dedicated /status handlers
+        // add the signer/terminal-condition guard. Must be registered before the generic
+        // namespaced catch-alls.
         .route(
-            "/apis/certificates.k8s.io/v1beta1/namespaces/{ns}/podcertificaterequests",
+            "/apis/certificates.k8s.io/{version}/namespaces/{ns}/podcertificaterequests",
             get(handlers::certificates::list_pod_certificate_requests)
                 .post(handlers::certificates::create_pod_certificate_request)
                 .delete(handlers::certificates::delete_collection_pod_certificate_requests)
                 .patch(handlers::certificates::patch_collection_pod_certificate_requests),
+        )
+        .route(
+            "/apis/certificates.k8s.io/{version}/namespaces/{ns}/podcertificaterequests/{name}/status",
+            get(handlers::certificates::get_pod_certificate_request_status)
+                .put(handlers::certificates::put_pod_certificate_request_status)
+                .patch(handlers::certificates::patch_pod_certificate_request_status),
         )
         // Generic cluster-scoped resources — collection
         .route(
@@ -1500,7 +1507,11 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // this, a joined node has no permission to even submit its own self-renewal CSR,
             // regardless of whether the selfnodeclient ClusterRole/binding (which only governs
             // KCM's SAR-based auto-approval) exists.
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests"], "verbs": ["create","get","list","watch"] }
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests"], "verbs": ["create","get","list","watch"] },
+            // podCertificate projected volumes: kubelet creates and watches its own
+            // PodCertificateRequests; create is narrowed to the node's own pods by the
+            // NodeRestriction-equivalent check in the create handler.
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["podcertificaterequests"], "verbs": ["create","get","list","watch"] }
         ]
     });
     put!(key, body, "system:node", "ClusterRole");

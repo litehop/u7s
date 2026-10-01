@@ -149,6 +149,10 @@ fn status_codecs() -> &'static HashMap<(&'static str, &'static str), StatusCodec
             ("resource.k8s.io/v1", "DeviceClass"),
             codec::<DeviceClassStatus>,
         );
+        m.insert(
+            ("certificates.k8s.io/v1", "PodCertificateRequest"),
+            codec::<PodCertificateRequestStatus>,
+        );
         // certificates.k8s.io/v1beta1
         m.insert(
             ("certificates.k8s.io/v1beta1", "PodCertificateRequest"),

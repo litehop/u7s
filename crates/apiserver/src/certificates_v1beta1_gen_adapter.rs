@@ -15,10 +15,7 @@
 //! Because these structs never go through `build.rs`'s prost-build/protoc step, they never
 //! enter the `k8s_descriptors.bin` `FileDescriptorSet` either -- so the descriptor-driven
 //! field-completeness tests in `proto_descriptor.rs`/`proto_exceptions.rs` (which walk that
-//! descriptor set) cannot see or enforce coverage of this group. Deliberately-unhandled
-//! fields with no bearing on this bead's validation (`unverifiedUserAnnotations`,
-//! `pkixPublicKey`, `proofOfPossession`, `stubPKCS10Request`) are simply omitted below
-//! rather than registered anywhere.
+//! descriptor set) cannot see or enforce coverage of this group.
 
 use prost::Message;
 
@@ -121,6 +118,15 @@ struct PodCertificateRequestSpecProto {
     node_uid: Option<String>,
     #[prost(int32, optional, tag = "8")]
     max_expiration_seconds: Option<i32>,
+    // Tags 9 and 10 exist on v1beta1 only; v1 dropped both.
+    #[prost(bytes = "vec", optional, tag = "9")]
+    pkix_public_key: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "10")]
+    proof_of_possession: Option<Vec<u8>>,
+    #[prost(btree_map = "string, string", tag = "11")]
+    unverified_user_annotations: std::collections::BTreeMap<String, String>,
+    #[prost(bytes = "vec", optional, tag = "12")]
+    stub_pkcs10_request: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -175,6 +181,25 @@ pub fn decode_podcertificaterequest_proto_gen(data: &[u8]) -> Option<serde_json:
     put_str!(spec.node_uid, "nodeUID");
     if let Some(v) = spec.max_expiration_seconds {
         spec_json.insert("maxExpirationSeconds".to_string(), v.into());
+    }
+    use base64::Engine as _;
+    for (bytes, key) in [
+        (spec.pkix_public_key, "pkixPublicKey"),
+        (spec.proof_of_possession, "proofOfPossession"),
+        (spec.stub_pkcs10_request, "stubPKCS10Request"),
+    ] {
+        if let Some(v) = bytes.filter(|b| !b.is_empty()) {
+            spec_json.insert(
+                key.to_string(),
+                base64::engine::general_purpose::STANDARD.encode(v).into(),
+            );
+        }
+    }
+    if !spec.unverified_user_annotations.is_empty() {
+        spec_json.insert(
+            "unverifiedUserAnnotations".to_string(),
+            serde_json::to_value(spec.unverified_user_annotations).ok()?,
+        );
     }
     out["spec"] = serde_json::Value::Object(spec_json);
 
@@ -279,5 +304,36 @@ mod tests {
         assert_eq!(result["spec"]["serviceAccountUID"], "sa-uid-1");
         assert_eq!(result["spec"]["nodeName"], "node-1");
         assert_eq!(result["spec"]["nodeUID"], "node-uid-1");
+    }
+
+    /// kubelet creates PodCertificateRequests over protobuf; dropping `stubPKCS10Request` or
+    /// the user annotations would make every kubelet request fail key validation (or lose the
+    /// SPIFFE path the pod author asked for) while JSON clients keep working.
+    #[test]
+    fn decode_podcertificaterequest_proto_gen_keeps_csr_and_user_annotations() {
+        use base64::Engine as _;
+        let entry = {
+            let mut e = encode_length_delimited(1, b"example.com/path");
+            e.extend_from_slice(&encode_length_delimited(2, b"/custom"));
+            e
+        };
+        let spec = {
+            let mut s = encode_length_delimited(1, b"example.com/signer");
+            s.extend_from_slice(&encode_length_delimited(11, &entry)); // unverifiedUserAnnotations
+            s.extend_from_slice(&encode_length_delimited(12, b"\x30\x00")); // stubPKCS10Request
+            s
+        };
+        let mut wire = encode_length_delimited(1, &encode_length_delimited(1, b"req-1"));
+        wire.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result = decode_podcertificaterequest_proto_gen(&wire).expect("must decode");
+        assert_eq!(
+            result["spec"]["stubPKCS10Request"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x30\x00")
+        );
+        assert_eq!(
+            result["spec"]["unverifiedUserAnnotations"]["example.com/path"],
+            "/custom"
+        );
     }
 }

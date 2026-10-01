@@ -837,6 +837,15 @@ pub struct PodCertificateRequestSpec {
     /// error instead of the generic "required field" deserialization failure the other
     /// (string) fields above produce.
     pub max_expiration_seconds: Option<i64>,
+    /// Base64 (Go `[]byte`); `pkixPublicKey`/`proofOfPossession` exist on v1beta1 only.
+    #[serde(default)]
+    pub pkix_public_key: Option<String>,
+    #[serde(default)]
+    pub proof_of_possession: Option<String>,
+    #[serde(default, rename = "stubPKCS10Request")]
+    pub stub_pkcs10_request: Option<String>,
+    #[serde(default)]
+    pub unverified_user_annotations: Option<std::collections::BTreeMap<String, String>>,
     /// Remaining fields preserved opaquely.
     #[serde(flatten)]
     #[schemars(skip)]
