@@ -831,6 +831,10 @@ fn decoders() -> &'static std::collections::HashMap<&'static str, DecoderFn> {
             crate::resource_gen_adapter::decode_deviceclass_proto_gen,
         );
         m.insert(
+            "DeviceTaintRule",
+            crate::resource_gen_adapter::decode_devicetaintrule_proto_gen,
+        );
+        m.insert(
             "ResourceClaim",
             crate::resource_gen_adapter::decode_resourceclaim_proto_gen,
         );

@@ -94,7 +94,10 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
         default_resourceclaimtemplate(obj);
     }
 
-    if is_workload_resource(group, plural) || is_endpointslice(group, plural) {
+    if is_workload_resource(group, plural)
+        || is_endpointslice(group, plural)
+        || (group == "resource.k8s.io" && plural == "devicetaintrules")
+    {
         initialize_workload_generation(obj);
     }
 
@@ -1008,6 +1011,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     }
     if group == "certificates.k8s.io" && plural == "podcertificaterequests" {
         super::certificates::validate_pod_certificate_request_spec(obj).map_err(|e| e.1.message)?;
+    }
+    if group == "resource.k8s.io" && plural == "devicetaintrules" {
+        super::device_taint_rule::validate_device_taint_rule(obj)?;
     }
     Ok(())
 }
