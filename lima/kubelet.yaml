@@ -297,7 +297,11 @@ provision:
       # still needs a signer to approve/issue (tracked separately) — enabling it here
       # only gets kubelet as far as creating the PodCertificateRequest object, which is
       # real kubelet-side behavior this bead is scoped to.
-      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: ""\nstaticPodPath: /tmp/kubelet-pods\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\nserializeImagePulls: false\nmaxParallelImagePulls: 10\nregistryPullQPS: 0\nfeatureGates:\n  ClusterTrustBundle: true\n  ClusterTrustBundleProjection: true\n  PodCertificateRequest: true\n' > /etc/kubelet-config.yaml
+      # kubeadm-style resolvConf: with systemd-resolved, /etc/resolv.conf is the
+      # 127.0.0.53 stub; "" would hand CoreDNS nameserver 127.0.0.1 (self-forward loop).
+      RESOLV_CONF=/etc/resolv.conf
+      systemctl is-active --quiet systemd-resolved && RESOLV_CONF=/run/systemd/resolve/resolv.conf
+      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: '"$RESOLV_CONF"'\nstaticPodPath: /tmp/kubelet-pods\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\nserializeImagePulls: false\nmaxParallelImagePulls: 10\nregistryPullQPS: 0\nfeatureGates:\n  ClusterTrustBundle: true\n  ClusterTrustBundleProjection: true\n  PodCertificateRequest: true\n' > /etc/kubelet-config.yaml
       printf '[Service]\nExecStart=\nExecStart=/usr/bin/kubelet \\\n  --config=/etc/kubelet-config.yaml \\\n  --kubeconfig=/etc/kubelet-kubeconfig \\\n  --hostname-override=lima-node \\\n  --v=2\n' > /etc/systemd/system/kubelet.service.d/u7s.conf
       systemctl daemon-reload
 
