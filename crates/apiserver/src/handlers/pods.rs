@@ -537,7 +537,7 @@ pub(crate) async fn create_pod<S: Store>(
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = crate::handlers::generic::wants_generate_name(&obj);
-    let mut name = crate::handlers::generic::resolve_name(&mut obj)?;
+    let mut name = crate::handlers::generic::resolve_valid_name(&mut obj, "", "pods", "Pod")?;
 
     // Ensure namespace is set in the stored object
     obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.as_str().to_owned());
@@ -22065,6 +22065,57 @@ mod admission_tests {
             claim_missing_result.is_err(),
             "a user with no matching extra claim must be denied by the VAP"
         );
+    }
+
+    /// A pod created with an uppercase name (explicit or generateName-derived) would be
+    /// unreadable by name forever — kubelet status PUTs and pod deletion would 400 and the
+    /// namespace could never finish terminating.
+    #[tokio::test]
+    async fn create_pod_rejects_names_the_read_path_would_reject() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+
+        for (meta, field) in [
+            (
+                serde_json::json!({"name": "Bad-Pod", "namespace": "default"}),
+                "metadata.name",
+            ),
+            (
+                serde_json::json!({"generateName": "Bad-Pod-", "namespace": "default"}),
+                "metadata.generateName",
+            ),
+        ] {
+            let pod = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": meta,
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            });
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            let err = create_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(),)),
+                axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+                test_user(),
+                headers,
+                Bytes::from(pod.to_string()),
+            )
+            .await
+            .err()
+            .expect("invalid pod name must be refused at create");
+            crate::handlers::test_support::assert_invalid_name_field(&err, field);
+        }
+
+        let stored = store
+            .list("/registry/pods/", Default::default())
+            .await
+            .unwrap();
+        assert!(stored.items.is_empty(), "rejected creates must not persist");
     }
 
     /// create_pod must default a container a mutating webhook injects, not just the
