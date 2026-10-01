@@ -48,8 +48,6 @@ Caveats: single run on one VM; OOM reproduced twice, thrash once; aarch64 not
 x86_64 (mayor-ed4dv); probe scripts added ~18 MB transient load and may have
 contributed to the first OOM. Full write-up: `git show
 archive/mayor-g0qp7-findings:ai/findings/2026-10-01-mayor-g0qp7-1gib-vps-fit.md`
-(tag created at bead close).
-
 ## Go-runtime tuning (kubelet / KCM / kube-proxy)
 
 Round-1 tuple `GOMEMLIMIT=200MiB GOGC=50 GOMAXPROCS=2` (set via each unit's
