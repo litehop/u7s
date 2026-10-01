@@ -127,6 +127,10 @@ fn main() {
                     .join("k8s.io/api/resource/v1/generated.proto")
                     .to_str()
                     .unwrap(),
+                include_dir
+                    .join("k8s.io/api/storagemigration/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
             ],
             &[include_dir.to_str().unwrap()],
         )

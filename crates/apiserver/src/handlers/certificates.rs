@@ -292,7 +292,7 @@ fn is_dns1123_label(s: &str) -> bool {
 }
 
 /// Upstream `IsDNS1123Subdomain`: at most 253 chars, dot-separated DNS labels.
-fn is_dns1123_subdomain(s: &str) -> bool {
+pub(super) fn is_dns1123_subdomain(s: &str) -> bool {
     s.len() <= 253 && s.split('.').all(is_dns1123_label)
 }
 

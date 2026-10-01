@@ -486,6 +486,7 @@ mod tests {
         use crate::apps_gen::k8s::io::api::resource::v1 as rv1;
         use crate::apps_gen::k8s::io::api::scheduling::v1 as scheduling_v1;
         use crate::apps_gen::k8s::io::api::storage::v1 as storage_v1;
+        use crate::apps_gen::k8s::io::api::storagemigration::v1 as svm_v1;
         use crate::apps_gen::k8s::io::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiext_v1;
         use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
         use crate::apps_gen::k8s::io::kube_aggregator::pkg::apis::apiregistration::v1 as apiregistration_v1;
@@ -782,6 +783,12 @@ mod tests {
             networking_v1::ServiceCidr,
             ".k8s.io.api.networking.v1.ServiceCIDR",
             crate::net_disc_cert_policy_events_gen_adapter::decode_servicecidr_proto_gen
+        );
+        survey!(
+            "storagemigration/StorageVersionMigration",
+            svm_v1::StorageVersionMigration,
+            ".k8s.io.api.storagemigration.v1.StorageVersionMigration",
+            crate::storagemigration_gen_adapter::decode_storageversionmigration_proto_gen
         );
         survey!(
             "net_disc/EndpointSlice",

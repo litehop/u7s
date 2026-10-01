@@ -178,6 +178,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("resource.k8s.io", "v1"),
     ("scheduling.k8s.io", "v1"),
     ("storage.k8s.io", "v1"),
+    ("storagemigration.k8s.io", "v1"),
 ];
 
 pub async fn api_group_list<S: Store>(
@@ -865,6 +866,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("resource.k8s.io", "v1") => Some(resource_v1_resources()),
         ("scheduling.k8s.io", "v1") => Some(scheduling_v1_resources()),
         ("storage.k8s.io", "v1") => Some(storage_v1_resources()),
+        ("storagemigration.k8s.io", "v1") => Some(storagemigration_v1_resources()),
         _ => None,
     }
 }
@@ -1584,6 +1586,30 @@ fn autoscaling_v2_resources() -> serde_json::Value {
                 "kind": "HorizontalPodAutoscaler",
                 "shortNames": ["hpa"],
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn storagemigration_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "storagemigration.k8s.io/v1",
+        "resources": [
+            {
+                "name": "storageversionmigrations",
+                "singularName": "storageversionmigration",
+                "namespaced": false,
+                "kind": "StorageVersionMigration",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "storageversionmigrations/status",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "StorageVersionMigration",
+                "verbs": ["get", "patch", "update"]
             }
         ]
     })
@@ -3908,6 +3934,46 @@ mod tests {
         assert!(
             names.contains(&"priorityclasses"),
             "priorityclasses must be in scheduling.k8s.io/v1 — kube-scheduler requires it; got: {names:?}"
+        );
+    }
+
+    // The StorageVersionMigration conformance spec fails at its first call ("the server could
+    // not find the requested resource") unless the group is advertised and its resource list
+    // carries both the resource and its /status subresource.
+    #[tokio::test]
+    async fn storagemigration_group_serves_storageversionmigrations_with_status() {
+        let state = make_state();
+        let list = api_group_list_inner(&state).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"storagemigration.k8s.io"),
+            "storagemigration.k8s.io must appear in /apis; got: {names:?}"
+        );
+
+        let resp = api_group_resources(
+            State(state),
+            Path(("storagemigration.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let svm = resources
+            .iter()
+            .find(|r| r["name"] == "storageversionmigrations")
+            .expect("storageversionmigrations must be listed");
+        assert_eq!(
+            svm["namespaced"], false,
+            "StorageVersionMigration is cluster-scoped"
+        );
+        assert!(
+            resources
+                .iter()
+                .any(|r| r["name"] == "storageversionmigrations/status"),
+            "the conformance spec updates /status; got: {resources:?}"
         );
     }
 

@@ -93,6 +93,10 @@ pub(crate) fn merge_incoming_metadata(
 
 // -- cluster-scoped --
 
+fn is_storage_version_migration(group: &str, plural: &str) -> bool {
+    group == "storagemigration.k8s.io" && plural == "storageversionmigrations"
+}
+
 pub async fn get_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
@@ -141,6 +145,7 @@ pub async fn put_resource_status<S: Store>(
     } else {
         None
     };
+    let svm_before = is_storage_version_migration(&group, &plural).then(|| current.body.clone());
 
     // Replace status and merge metadata; leave spec and identity fields untouched.
     // Typed dispatch first: a registered built-in kind (see status_dispatch.rs's table for
@@ -172,6 +177,10 @@ pub async fn put_resource_status<S: Store>(
             &current.body,
         )
         .map_err(Status::forbidden)?;
+    }
+    if let Some(ref old) = svm_before {
+        super::storagemigration::validate_status_update(old, &current.body)
+            .map_err(Status::unprocessable_entity)?;
     }
 
     // Dry-run: validation and node-restriction checks passed; return the would-be
@@ -222,6 +231,7 @@ pub async fn patch_resource_status<S: Store>(
     } else {
         None
     };
+    let svm_before = is_storage_version_migration(&group, &plural).then(|| current.body.clone());
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
     // every other patch type here is JSON.
@@ -297,6 +307,10 @@ pub async fn patch_resource_status<S: Store>(
             &current.body,
         )
         .map_err(Status::forbidden)?;
+    }
+    if let Some(ref old) = svm_before {
+        super::storagemigration::validate_status_update(old, &current.body)
+            .map_err(Status::unprocessable_entity)?;
     }
 
     // Dry-run: same convergence point as reject_non_object_status above — return the

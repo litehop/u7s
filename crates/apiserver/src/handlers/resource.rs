@@ -979,6 +979,13 @@ pub(crate) async fn replace_resource<S: Store>(
         super::certificates::validate_cluster_trust_bundle_signer_immutable(old, &obj.body)
             .map_err(Status::unprocessable_entity)?;
     }
+    if let (true, Some(old)) = (
+        group == "storagemigration.k8s.io" && plural == "storageversionmigrations",
+        old_object.as_ref(),
+    ) {
+        super::storagemigration::validate_spec_immutable(old, &obj.body)
+            .map_err(Status::unprocessable_entity)?;
+    }
 
     // A PUT may only change the fields ValidatePersistentVolumeUpdate/ValidateStorageClassUpdate/
     // ValidateNodeUpdate leave mutable — see the doc comments on each validator. Runs after
@@ -1586,6 +1593,9 @@ pub(crate) async fn do_patch<S: Store>(
                 let pcr_before = (group == "certificates.k8s.io"
                     && plural == "podcertificaterequests")
                     .then(|| current.body.clone());
+                let svm_before = (group == "storagemigration.k8s.io"
+                    && plural == "storageversionmigrations")
+                    .then(|| current.body.clone());
                 let mut patch: serde_json::Value = ssa_body_to_json(&body)?;
                 strip_managed_fields(&mut patch);
                 // The winner of the create race already persisted this object, so from here
@@ -1613,6 +1623,10 @@ pub(crate) async fn do_patch<S: Store>(
                         &current.body,
                     )
                     .map_err(Status::unprocessable_entity)?;
+                }
+                if let Some(before) = &svm_before {
+                    super::storagemigration::validate_spec_immutable(before, &current.body)
+                        .map_err(Status::unprocessable_entity)?;
                 }
                 // Escalation prevention: same rationale as the primary create path above —
                 // this branch is still creating the object from the caller's perspective
@@ -2040,6 +2054,10 @@ pub(crate) async fn do_patch<S: Store>(
                 &current.body,
             )
             .map_err(Status::unprocessable_entity)?;
+        }
+        if group == "storagemigration.k8s.io" && plural == "storageversionmigrations" {
+            super::storagemigration::validate_spec_immutable(&old_object, &current.body)
+                .map_err(Status::unprocessable_entity)?;
         }
 
         // Escalation prevention: this PATCH merges into an existing Role/ClusterRole/

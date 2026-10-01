@@ -1009,6 +1009,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if group == "certificates.k8s.io" && plural == "podcertificaterequests" {
         super::certificates::validate_pod_certificate_request_spec(obj).map_err(|e| e.1.message)?;
     }
+    if group == "storagemigration.k8s.io" && plural == "storageversionmigrations" {
+        super::storagemigration::validate_spec(obj)?;
+    }
     Ok(())
 }
 

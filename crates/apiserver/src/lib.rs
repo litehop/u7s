@@ -36,6 +36,7 @@ mod state;
 mod status;
 mod status_dispatch;
 mod storage_node_flow_gen_adapter;
+mod storagemigration_gen_adapter;
 #[cfg(test)]
 mod test_utils;
 mod tls;
