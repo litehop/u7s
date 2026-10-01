@@ -1,13 +1,54 @@
 ---
-as_of: 2026-08-28
+as_of: 2026-10-01
 kind: initiative-state
 ---
 
 # Memory management state
 
-**AS OF 2026-08-28** — refreshed by a dispatched worker after Round-1 Go-runtime
-tuning verification landed (see `ai/extended-context/README.md` for how this
-doc's audit/refresh cycle works). Prior refresh: 2026-08-17.
+**AS OF 2026-10-01** (see `ai/extended-context/README.md` for the refresh
+cycle).
+
+## 1 GiB VPS fit (measured 2026-10-01, mayor-g0qp7)
+
+**The shipped install fits a real 1 GiB / 1 vCPU VM at idle and with one small
+app; pod bursts on a workload cause OOM kills and CPU thrash. A KCM/kubelet
+Rust rewrite saves ~17-50 MB each and does not fix that failure mode.**
+
+Setup: Lima aarch64 VM, 947 MiB `MemTotal`, no swap, unmodified
+`scripts/install.sh`, k8s 1.36.4; node Ready in 57 s.
+
+Idle PSS (MB): KCM 62, kubelet 61, cri-o 34, kube-proxy 23, CoreDNS 22,
+flanneld 21, u7s apiserver+scheduler 17; stack 240. OS userspace ~163, kernel
+slab 76.
+
+`MemAvailable`: idle 462 MiB (49%) -> +WordPress/MariaDB 319 -> after churn
+262 -> 80-pod burst 187 -> run minimum 103. Each extra pod costs ~1.7 MB of
+slab/page tables/cgroups, plus kubelet and cri-o growth. Below ~150-200 MiB
+the single vCPU re-faults code pages (sys 93-97%; an 80-pod rollout took
+4.5 min), and BestEffort pods including CoreDNS are OOM-killed. Control-plane
+units were never killed.
+
+Levers, ranked: (1) swapfile (`failSwapOn: false` already set); (2) memory
+requests on CoreDNS so it is not first to die; (3) trim the OS baseline
+(udisksd, multipathd, ModemManager, unattended-upgrades, ~100 MB; tracked in
+mayor-elrly). Flannel+kube-proxy+CoreDNS alone (65 MB) outweigh the rewrite
+gain.
+
+CoreDNS: its earlier ~145 MiB footprint was a self-forward loop (kubelet
+resolvConf detection fed CoreDNS its own address), fixed in PR #1706
+(mayor-rtx3q, mayor-0e1gr): 58 MiB idle, <80 MiB under load. `GOMEMLIMIT`
+tuning did not help; the plateau was hard-consumed memory, not lazily freed
+(MADV_FREE refuted).
+
+Rewrite decision (mayor-vc844): Phase 1 verdict was KCM plausible, kubelet not.
+Phase 2 is OPEN, awaiting operator decision; the mayor recommends no-go for the
+1 GiB goal.
+
+Caveats: single run on one VM; OOM reproduced twice, thrash once; aarch64 not
+x86_64 (mayor-ed4dv); probe scripts added ~18 MB transient load and may have
+contributed to the first OOM. Full write-up: `git show
+archive/mayor-g0qp7-findings:ai/findings/2026-10-01-mayor-g0qp7-1gib-vps-fit.md`
+(tag created at bead close).
 
 ## Go-runtime tuning (kubelet / KCM / kube-proxy)
 
