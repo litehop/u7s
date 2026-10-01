@@ -615,13 +615,13 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent
 # kubelet-down specs). One keypair per workdir, never committed; its public half is
 # authorized for the VM user, which has passwordless sudo. 06-run-sonobuoy.sh ships the
 # private half to the e2e pod.
-SSH_KEY="$WORKDIR/e2e-ssh/id_ed25519"
+SSH_KEY="$(e2e_ssh_key_path "$KUBECONFIG_PATH")"
 if [ ! -f "$SSH_KEY" ]; then
-  mkdir -p "$WORKDIR/e2e-ssh"
-  ssh-keygen -q -t ed25519 -N "" -C "u7s-rig-e2e" -f "$SSH_KEY"
+  mkdir -p "$(dirname "$SSH_KEY")"
+  ssh-keygen -q -t ed25519 -N "" -C "$E2E_SSH_KEY_COMMENT" -f "$SSH_KEY"
 fi
 SSH_PUBKEY="$(cat "$SSH_KEY.pub")"
-limactl shell "$VM_NAME" bash -c "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && grep -qxF '$SSH_PUBKEY' ~/.ssh/authorized_keys || echo '$SSH_PUBKEY' >> ~/.ssh/authorized_keys"
+limactl shell "$VM_NAME" bash -c "$(authorized_keys_replace_cmd "$SSH_PUBKEY")"
 
 # Resolve the Mac host IP so the agent pod can reach the konnectivity-server.
 # CoreDNS inside the pod does not know host.lima.internal; inject it as a hostAlias.
