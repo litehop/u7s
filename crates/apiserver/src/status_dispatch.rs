@@ -27,12 +27,13 @@
 use crate::status::{Status, StatusError};
 use crate::types::{
     ApiServiceStatus, CertificateSigningRequestStatus, CronJobStatus, DaemonSetStatus,
-    DeploymentStatus, DeviceClassStatus, FlowSchemaStatus, HorizontalPodAutoscalerStatusV1,
-    HorizontalPodAutoscalerStatusV2, IngressStatus, JobStatus, NamespaceStatus, NodeStatus,
-    PersistentVolumeClaimStatus, PersistentVolumeStatus, PodCertificateRequestStatus,
-    PodDisruptionBudgetStatus, PodStatus, PriorityLevelConfigurationStatus, ReplicaSetStatus,
-    ReplicationControllerStatus, ResourceClaimStatus, ResourceQuotaStatus, ServiceCidrStatus,
-    StatefulSetStatus, StorageVersionMigrationStatus, ValidatingAdmissionPolicyBindingStatus,
+    DeploymentStatus, DeviceClassStatus, DeviceTaintRuleStatus, FlowSchemaStatus,
+    HorizontalPodAutoscalerStatusV1, HorizontalPodAutoscalerStatusV2, IngressStatus, JobStatus,
+    NamespaceStatus, NodeStatus, PersistentVolumeClaimStatus, PersistentVolumeStatus,
+    PodCertificateRequestStatus, PodDisruptionBudgetStatus, PodStatus,
+    PriorityLevelConfigurationStatus, ReplicaSetStatus, ReplicationControllerStatus,
+    ResourceClaimStatus, ResourceQuotaStatus, ServiceCidrStatus, StatefulSetStatus,
+    StorageVersionMigrationStatus, ValidatingAdmissionPolicyBindingStatus,
     ValidatingAdmissionPolicyStatus, VolumeAttachmentStatus,
 };
 use serde_json::Value;
@@ -152,6 +153,10 @@ fn status_codecs() -> &'static HashMap<(&'static str, &'static str), StatusCodec
         m.insert(
             ("resource.k8s.io/v1", "DeviceClass"),
             codec::<DeviceClassStatus>,
+        );
+        m.insert(
+            ("resource.k8s.io/v1", "DeviceTaintRule"),
+            codec::<DeviceTaintRuleStatus>,
         );
         m.insert(
             ("certificates.k8s.io/v1", "PodCertificateRequest"),

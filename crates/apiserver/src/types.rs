@@ -1986,6 +1986,17 @@ pub struct DeviceClassStatus {
     pub rest: serde_json::Value,
 }
 
+/// Typed status for a DeviceTaintRule. Source: `resource/v1/generated.proto`'s
+/// `DeviceTaintRuleStatus`, whose only field is `conditions`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DeviceTaintRuleStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<Condition>>,
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
 // ---------------------------------------------------------------------------
 // certificates.k8s.io/v1beta1 — PodCertificateRequest
 // ---------------------------------------------------------------------------

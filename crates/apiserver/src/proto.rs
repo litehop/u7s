@@ -835,6 +835,10 @@ fn decoders() -> &'static std::collections::HashMap<&'static str, DecoderFn> {
             crate::resource_gen_adapter::decode_deviceclass_proto_gen,
         );
         m.insert(
+            "DeviceTaintRule",
+            crate::resource_gen_adapter::decode_devicetaintrule_proto_gen,
+        );
+        m.insert(
             "ResourceClaim",
             crate::resource_gen_adapter::decode_resourceclaim_proto_gen,
         );
@@ -11006,7 +11010,7 @@ mod tests {
     /// single-decoder `m.insert()` added to `decoders()`.
     #[test]
     fn decoders_registers_one_entry_per_kind_with_no_silent_shadowing() {
-        const EXPECTED_KINDS: usize = 64;
+        const EXPECTED_KINDS: usize = 65;
         assert_eq!(
             decoders().len(),
             EXPECTED_KINDS,

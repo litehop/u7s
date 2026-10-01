@@ -7,6 +7,7 @@ pub mod cr;
 pub mod crd;
 pub mod csr;
 pub mod defaults;
+pub mod device_taint_rule;
 pub mod discovery;
 pub mod generic;
 pub mod json_patch;

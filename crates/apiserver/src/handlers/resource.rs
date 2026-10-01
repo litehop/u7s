@@ -986,6 +986,12 @@ pub(crate) async fn replace_resource<S: Store>(
         super::storagemigration::validate_spec_immutable(old, &obj.body)
             .map_err(Status::unprocessable_entity)?;
     }
+    if let (true, Some(old)) = (
+        group == "resource.k8s.io" && plural == "devicetaintrules",
+        old_object.as_ref(),
+    ) {
+        super::device_taint_rule::prepare_device_taint_rule_update(old, &mut obj.body);
+    }
 
     // A PUT may only change the fields ValidatePersistentVolumeUpdate/ValidateStorageClassUpdate/
     // ValidateNodeUpdate leave mutable — see the doc comments on each validator. Runs after
@@ -1596,6 +1602,8 @@ pub(crate) async fn do_patch<S: Store>(
                 let svm_before = (group == "storagemigration.k8s.io"
                     && plural == "storageversionmigrations")
                     .then(|| current.body.clone());
+                let dtr_before = (group == "resource.k8s.io" && plural == "devicetaintrules")
+                    .then(|| current.body.clone());
                 let mut patch: serde_json::Value = ssa_body_to_json(&body)?;
                 strip_managed_fields(&mut patch);
                 // The winner of the create race already persisted this object, so from here
@@ -1627,6 +1635,12 @@ pub(crate) async fn do_patch<S: Store>(
                 if let Some(before) = &svm_before {
                     super::storagemigration::validate_spec_immutable(before, &current.body)
                         .map_err(Status::unprocessable_entity)?;
+                }
+                if let Some(before) = &dtr_before {
+                    super::device_taint_rule::prepare_device_taint_rule_update(
+                        before,
+                        &mut current.body,
+                    );
                 }
                 // Escalation prevention: same rationale as the primary create path above —
                 // this branch is still creating the object from the caller's perspective
@@ -2058,6 +2072,12 @@ pub(crate) async fn do_patch<S: Store>(
         if group == "storagemigration.k8s.io" && plural == "storageversionmigrations" {
             super::storagemigration::validate_spec_immutable(&old_object, &current.body)
                 .map_err(Status::unprocessable_entity)?;
+        }
+        if group == "resource.k8s.io" && plural == "devicetaintrules" {
+            super::device_taint_rule::prepare_device_taint_rule_update(
+                &old_object,
+                &mut current.body,
+            );
         }
 
         // Escalation prevention: this PATCH merges into an existing Role/ClusterRole/

@@ -1938,6 +1938,10 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("DeviceClass", false, true),
     );
     m.insert(
+        rk("resource.k8s.io", "v1", "devicetaintrules"),
+        rm("DeviceTaintRule", false, true),
+    );
+    m.insert(
         rk("resource.k8s.io", "v1", "resourceclaims"),
         rm("ResourceClaim", true, true),
     );

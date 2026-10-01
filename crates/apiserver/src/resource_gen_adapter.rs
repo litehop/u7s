@@ -152,6 +152,54 @@ pub fn decode_deviceclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     Some(out)
 }
 
+// ---- Decoder A: DeviceTaintRule ----------------------------------------------
+
+pub fn decode_devicetaintrule_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = resource_v1::DeviceTaintRule::decode(data).ok()?;
+    let mut out = serde_json::Map::new();
+    out.insert("apiVersion".into(), "resource.k8s.io/v1".into());
+    out.insert("kind".into(), "DeviceTaintRule".into());
+    out.insert(
+        "metadata".into(),
+        gen_object_meta_to_json(obj.metadata.unwrap_or_default()),
+    );
+    if let Some(spec) = obj.spec {
+        let mut s = serde_json::Map::new();
+        if let Some(sel) = spec.device_selector {
+            let mut m = serde_json::Map::new();
+            for (k, v) in [
+                ("driver", sel.driver),
+                ("pool", sel.pool),
+                ("device", sel.device),
+            ] {
+                if let Some(v) = v {
+                    m.insert(k.into(), v.into());
+                }
+            }
+            s.insert("deviceSelector".into(), m.into());
+        }
+        if let Some(taint) = spec.taint {
+            s.insert("taint".into(), gen_device_taint_to_json(taint));
+        }
+        out.insert("spec".into(), s.into());
+    }
+    if let Some(status) = obj.status {
+        if !status.conditions.is_empty() {
+            out.insert(
+                "status".into(),
+                serde_json::json!({
+                    "conditions": status
+                        .conditions
+                        .into_iter()
+                        .map(gen_meta_condition_to_json)
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+    }
+    Some(out.into())
+}
+
 // ---- Decoder A: ResourceClaim ------------------------------------------------
 
 pub fn decode_resourceclaim_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
@@ -187,6 +235,50 @@ pub fn decode_resourceslice_proto_gen(data: &[u8]) -> Option<serde_json::Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typed clients (the DRA eviction e2e creates DeviceTaintRules through the Go clientset)
+    /// post protobuf; losing the taint or selector on decode would create a rule that taints
+    /// every device, or none, instead of what the client asked for.
+    #[test]
+    fn decode_devicetaintrule_proto_gen_round_trips_taint_selector_and_conditions() {
+        let rule = resource_v1::DeviceTaintRule {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("rule".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(resource_v1::DeviceTaintRuleSpec {
+                device_selector: Some(resource_v1::DeviceTaintSelector {
+                    driver: Some("gpu.example.com".to_string()),
+                    pool: Some("node-1".to_string()),
+                    device: Some("gpu-0".to_string()),
+                }),
+                taint: Some(resource_v1::DeviceTaint {
+                    key: Some("example.com/unhealthy".to_string()),
+                    value: Some("true".to_string()),
+                    effect: Some("NoExecute".to_string()),
+                    ..Default::default()
+                }),
+            }),
+            status: Some(resource_v1::DeviceTaintRuleStatus {
+                conditions: vec![meta_v1::Condition {
+                    r#type: Some("EvictionInProgress".to_string()),
+                    status: Some("True".to_string()),
+                    ..Default::default()
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        rule.encode(&mut buf).unwrap();
+
+        let v = decode_devicetaintrule_proto_gen(&buf).expect("DeviceTaintRule must decode");
+        assert_eq!(v["kind"], "DeviceTaintRule");
+        assert_eq!(v["apiVersion"], "resource.k8s.io/v1");
+        assert_eq!(v["spec"]["taint"]["effect"], "NoExecute");
+        assert_eq!(v["spec"]["taint"]["key"], "example.com/unhealthy");
+        assert_eq!(v["spec"]["deviceSelector"]["pool"], "node-1");
+        assert_eq!(v["spec"]["deviceSelector"]["device"], "gpu-0");
+        assert_eq!(v["status"]["conditions"][0]["type"], "EvictionInProgress");
+    }
 
     /// DeviceClass is the simplest DRA top-level kind; before this decoder existed there was
     /// no protobuf path for it at all, so a protobuf-encoded create (the default for typed

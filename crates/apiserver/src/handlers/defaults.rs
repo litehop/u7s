@@ -94,7 +94,10 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
         default_resourceclaimtemplate(obj);
     }
 
-    if is_workload_resource(group, plural) || is_endpointslice(group, plural) {
+    if is_workload_resource(group, plural)
+        || is_endpointslice(group, plural)
+        || (group == "resource.k8s.io" && plural == "devicetaintrules")
+    {
         initialize_workload_generation(obj);
     }
 
@@ -1011,6 +1014,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     }
     if group == "storagemigration.k8s.io" && plural == "storageversionmigrations" {
         super::storagemigration::validate_spec(obj)?;
+    }
+    if group == "resource.k8s.io" && plural == "devicetaintrules" {
+        super::device_taint_rule::validate_device_taint_rule(obj)?;
     }
     Ok(())
 }

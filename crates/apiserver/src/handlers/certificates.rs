@@ -281,7 +281,7 @@ pub(crate) async fn delete_collection_cluster_trust_bundles<S: Store>(
 // ---------------------------------------------------------------------------
 
 /// Upstream `IsDNS1123Label`: 1-63 chars of `[a-z0-9-]`, alphanumeric at both ends.
-fn is_dns1123_label(s: &str) -> bool {
+pub(crate) fn is_dns1123_label(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
         && b.len() <= 63
@@ -292,7 +292,7 @@ fn is_dns1123_label(s: &str) -> bool {
 }
 
 /// Upstream `IsDNS1123Subdomain`: at most 253 chars, dot-separated DNS labels.
-pub(super) fn is_dns1123_subdomain(s: &str) -> bool {
+pub(crate) fn is_dns1123_subdomain(s: &str) -> bool {
     s.len() <= 253 && s.split('.').all(is_dns1123_label)
 }
 
