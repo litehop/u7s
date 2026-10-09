@@ -233,6 +233,61 @@ assert "'git stash pop' on main is blocked -- pop removes uncommitted changes fr
   "$(blocked "git stash pop" "$MAIN")"
 
 # ---------------------------------------------------------------------------
+# 12. bd regenerates .beads/issues.jsonl + interactions.jsonl in the mayor
+#     checkout on every write; after a bead-snapshot PR merges they block
+#     `git pull --ff-only`. Discarding exactly those two files is safe (Dolt
+#     DB is authoritative); every other discard stays protected.
+# ---------------------------------------------------------------------------
+J=".beads/issues.jsonl"
+I=".beads/interactions.jsonl"
+mkdir -p "$MAIN/.beads"
+: > "$MAIN/$J"
+: > "$MAIN/$I"
+declare -a BEAD_ALLOWED=(
+  "git restore --staged --worktree $J $I"
+  "git restore --worktree $J"
+  "git restore $I"
+  "git restore --staged --worktree -- $J $I"
+  "git checkout -- $J $I"
+  "git -C $MAIN restore --staged --worktree $J $I"
+)
+for cmd in "${BEAD_ALLOWED[@]}"; do
+  assert "'$cmd' on the mayor checkout is allowed -- the mayor must be able to discard regenerated bead exports to unblock git pull --ff-only after a bead snapshot merges" \
+    "$(allowed "$cmd" "$MAIN")"
+done
+
+declare -a BEAD_BLOCKED=(
+  "git restore --staged --worktree $J $I .beads/config.yaml"
+  "git restore --staged --worktree $J a.txt"
+  "git restore --staged --worktree .beads/*"
+  "git restore --worktree *.jsonl"
+  "git restore --worktree .beads"
+  "git restore --worktree ."
+  "git restore --worktree :/"
+  "git restore --worktree :(glob)$J"
+  "git restore --source=HEAD~1 --worktree $J"
+  "git restore -p $J"
+  "git restore --worktree"
+  "git restore --worktree -- --staged"
+  "git checkout -- $J a.txt"
+  "git checkout -- .beads"
+  "git checkout -- ."
+  "git checkout HEAD~1 -- $J"
+  "git checkout other -- $J $I"
+  "git checkout $J"
+  "git reset --hard HEAD"
+  "git clean -fd .beads"
+  "git stash push -- $J"
+  "git stash drop"
+)
+for cmd in "${BEAD_BLOCKED[@]}"; do
+  assert "'$cmd' on the mayor checkout stays blocked -- the bead-export exception covers only the two JSONL files, other discards stay protected" \
+    "$(blocked "$cmd" "$MAIN")"
+done
+assert "'git restore --staged --worktree $J $I' stays blocked when chained after a blocked command -- the exception is per command segment" \
+  "$(blocked "git reset --hard HEAD && git restore --staged --worktree $J $I" "$MAIN")"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
