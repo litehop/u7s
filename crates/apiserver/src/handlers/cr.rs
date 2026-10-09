@@ -11717,12 +11717,14 @@ mod tests {
     fn cel_numbers_compare_by_value_across_int_uint_double_like_cel_go() {
         assert!(
             eval_cel_bool(
-                "1 == 1.0 && 1u == 1 && 1u == 1.0 && 1 != 2.5 && 1 < 2.5 && 2u > 1.5 \
-                 && 3 >= 3u && 1.5 <= 2"
+                "dyn(1) == dyn(1.0) && dyn(1u) == dyn(1) && dyn(1u) == dyn(1.0) \
+                 && dyn(1) != dyn(2.5) && dyn(1) < dyn(2.5) && dyn(2u) > dyn(1.5) \
+                 && dyn(3) >= dyn(3u) && dyn(1.5) <= dyn(2)"
             ),
-            "cel-go (heterogeneous equality/ordering) compares numbers by mathematical \
-             value; a type-strict compare would make `self.replicas == 1.0` style rules \
-             reject valid CRs"
+            "runtime semantics only (cel-spec wraps these in dyn(); the literal forms are \
+             not claimed to type-check as CRD rules): cel-go compares numbers by \
+             mathematical value, and a type-strict compare would make dyn-typed \
+             numeric rules reject valid CRs"
         );
     }
 
@@ -11732,13 +11734,15 @@ mod tests {
             "type": "object",
             "properties": { "n": { "type": "integer" } },
             "x-kubernetes-validations": [{
-                "rule": "self.n == 1 && self.n == 1.0 && self.n < 2.5",
+                "rule": "self.n == 1 && dyn(self.n) == 1.0 && dyn(self.n) < 2.5",
                 "message": "n must compare equal to int and double literals"
             }]
         });
         assert!(
             check_schema(&serde_json::json!({ "n": 1 }), schema.clone()).is_ok(),
-            "an integer field must equal int/double literals regardless of how JSON ints bind"
+            "an integer field must equal int/double values regardless of how JSON ints \
+             bind (runtime semantics; the dyn() form is used because a bare \
+             `self.n == 1.0` is not verified to type-check in Kubernetes)"
         );
         assert!(
             check_schema(&serde_json::json!({ "n": 2 }), schema).is_err(),
@@ -11793,13 +11797,37 @@ mod tests {
     #[test]
     fn cel_list_index_by_whole_number_double_works_and_fractional_double_errors() {
         assert!(
-            eval_cel_bool("[10, 20, 30][1.0] == 20"),
-            "cel-go accepts a double index that is a whole number (e.g. from JSON numbers \
-             bound as doubles), so `self.items[1.0]` rules must not error"
+            eval_cel_bool("[10, 20, 30][dyn(1.0)] == 20"),
+            "runtime semantics only (cel-spec lists.textproto wraps the index in dyn()): \
+             cel-go accepts a whole-number double index, so numbers bound as doubles must \
+             not error"
         );
         assert!(
-            eval_cel("[10, 20, 30][1.5]", &[]).is_err(),
+            eval_cel("[10, 20, 30][dyn(1.5)]", &[]).is_err(),
             "a fractional double index is an error in cel-go, not a truncation"
+        );
+    }
+
+    #[test]
+    fn cel_has_on_map_keys_reports_key_presence_so_optional_map_entries_can_be_guarded() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "m": { "type": "object", "additionalProperties": { "type": "string" } }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "has(self.m) && has(self.m.k) && !has(self.m.z)",
+                "message": "has() must test map key presence"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "m": { "k": "v" } }), schema.clone()).is_ok(),
+            "has() must report presence of a map key under additionalProperties; \
+             otherwise `has(self.labels.foo)` guards would error or always fail"
+        );
+        assert!(
+            check_schema(&serde_json::json!({ "m": { "z": "v" } }), schema).is_err(),
+            "has() must be false for an absent key and true for a present one, not constant"
         );
     }
 
