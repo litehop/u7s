@@ -17,7 +17,7 @@ use crate::{
     util::{content_type, extract_body, parse_resource_version},
 };
 
-use super::generic::{lookup, store_err, validate_name};
+use super::generic::{lookup, store_err, validate_path_segment};
 use super::json_patch::{
     apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
 };
@@ -119,7 +119,7 @@ pub async fn put_resource_status<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
+    validate_path_segment("name", &name)?;
     let meta = lookup(&state, &group, &version, &plural)?.clone();
     let body = extract_body(&body, content_type(&headers))?;
     let incoming =
@@ -210,7 +210,7 @@ pub async fn patch_resource_status<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
+    validate_path_segment("name", &name)?;
     let meta = lookup(&state, &group, &version, &plural)?.clone();
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
@@ -398,8 +398,8 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
     body: Bytes,
     guard: Option<&StatusWriteGuard<'_>>,
 ) -> Result<Response, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let body = extract_body(&body, content_type(&headers))?;
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -504,8 +504,8 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
     body: Bytes,
     guard: Option<&StatusWriteGuard<'_>>,
 ) -> Result<Response, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 

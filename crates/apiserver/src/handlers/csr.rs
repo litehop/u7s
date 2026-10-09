@@ -35,7 +35,8 @@ use crate::{
         generic::{
             apply_label_selector, build_list_response, decode_continue, generate_suffix, lookup,
             parse_field_selector, parse_label_selector, resolve_valid_name, stamp_metadata,
-            validate_name, wants_generate_name, CollectionQuery, MAX_GENERATE_NAME_CREATE_ATTEMPTS,
+            validate_path_segment, wants_generate_name, CollectionQuery,
+            MAX_GENERATE_NAME_CREATE_ATTEMPTS,
         },
         json_patch::is_dry_run_header,
         watch::{fetch_initial_events, watch_generic, WatchConfig},
@@ -243,7 +244,7 @@ pub async fn get_csr<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
 ) -> Result<Response, crate::status::StatusError> {
-    validate_name("name", &name)?;
+    validate_path_segment("name", &name)?;
     let key = group_object_key(GROUP, PLURAL, None, &name);
     let stored = state
         .store
