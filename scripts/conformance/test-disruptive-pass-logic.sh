@@ -58,10 +58,17 @@ filter_args() {
 
 for apply in 1 0; do
   P_ARGS="$(filter_args parallel "$apply" 16)"
-  assert "parallel pass (apply=$apply) skips [Disruptive] so kubelet restarts cannot hit the pool" \
-    "$(contains "$P_ARGS" '--e2e-skip=\[')"
-  assert "parallel pass (apply=$apply) skip regex names [Disruptive]" \
-    "$(contains "$P_ARGS" '\[Disruptive\]')"
+  if [ "$apply" = 1 ]; then
+    assert "parallel pass (apply=1) skips [Disruptive] so kubelet restarts cannot hit the pool" \
+      "$(contains "$P_ARGS" '--e2e-skip=\[')"
+    assert "parallel pass (apply=1) skip regex names [Disruptive]" \
+      "$(contains "$P_ARGS" '\[Disruptive\]')"
+  else
+    assert "parallel pass (apply=0) excludes Disruptive by label so kubelet restarts cannot hit the pool" \
+      "$(contains "$P_ARGS" '--label-filter=!Disruptive')"
+    assert "parallel pass (apply=0) passes no --e2e-skip: sonobuoy rejects it alongside --mode and the pass runs 0 specs" \
+      "$(contains "$P_ARGS" '--e2e-skip' | tr 01 10)"
+  fi
   assert "parallel pass (apply=$apply) keeps --procs=16" \
     "$(contains "$P_ARGS" '--procs=16')"
   assert "parallel pass (apply=$apply) has no Disruptive label selection" \
@@ -89,7 +96,7 @@ cat > "$FAKEBIN/bash" <<'EOF'
 echo "$*" >> "$FAKE_BASH_LOG"
 case "$*" in
   *"--pass disruptive"*) echo "  Ran:    11"; echo "  Passed: 11"; echo "  Failed: 0"; exit "${FAKE_DISRUPTIVE_EXIT:-0}" ;;
-  *"--pass parallel"*) echo "  Ran:    96"; echo "  Passed: 94"; echo "  Failed: 2"; exit "${FAKE_PARALLEL_EXIT:-0}" ;;
+  *"--pass parallel"*) [ -n "${FAKE_PARALLEL_NO_SUMMARY:-}" ] && exit "${FAKE_PARALLEL_EXIT:-0}"; echo "  Ran:    ${FAKE_PARALLEL_RAN:-96}"; echo "  Passed: $(( ${FAKE_PARALLEL_RAN:-96} - ${FAKE_PARALLEL_FAILED:-0} ))"; echo "  Failed: ${FAKE_PARALLEL_FAILED:-0}"; exit "${FAKE_PARALLEL_EXIT:-0}" ;;
 esac
 EOF
 chmod +x "$FAKEBIN/bash"
@@ -100,7 +107,7 @@ run_wrapper() {
 }
 
 RC=0
-run_wrapper env FAKE_DISRUPTIVE_EXIT=0 FAKE_PARALLEL_EXIT=0 /bin/bash "$SCRIPT" --focus csi-hostpath --port 6444 || RC=$?
+run_wrapper env FAKE_DISRUPTIVE_EXIT=0 FAKE_PARALLEL_EXIT=0 FAKE_PARALLEL_FAILED=2 /bin/bash "$SCRIPT" --focus csi-hostpath --port 6444 || RC=$?
 CALLS="$(cat "$TMP/calls.log")"
 assert "wrapper invokes exactly two child passes" \
   "$([ "$(wc -l < "$TMP/calls.log" | tr -d ' ')" = "2" ] && echo 1 || echo 0)"
@@ -117,7 +124,13 @@ assert "combined summary reports the parallel pass counts" \
   "$(contains "$OUT" '[parallel] Ran: 96 Passed: 94 Failed: 2')"
 assert "combined summary totals failures across both passes" \
   "$(contains "$OUT" 'Total failed across passes: 2')"
-assert "clean children -> exit 0" "$([ "$RC" = 0 ] && echo 1 || echo 0)"
+# sonobuoy exits 0 even when specs failed (a 1-failed-spec run once exited 0),
+# so a child that exited 0 but reported failures must still fail the script.
+assert "specs failed in a pass whose child exited 0 -> script exits non-zero" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)"
+RC=0
+run_wrapper env FAKE_DISRUPTIVE_EXIT=0 FAKE_PARALLEL_EXIT=0 /bin/bash "$SCRIPT" --focus csi-hostpath || RC=$?
+assert "all passes report 0 failed and exit 0 -> script exits 0" "$([ "$RC" = 0 ] && echo 1 || echo 0)"
 
 RC=0
 run_wrapper env FAKE_DISRUPTIVE_EXIT=3 FAKE_PARALLEL_EXIT=0 /bin/bash "$SCRIPT" --focus x || RC=$?
@@ -128,6 +141,42 @@ assert "a failing disruptive pass does not prevent the parallel pass from runnin
 RC=0
 run_wrapper env FAKE_DISRUPTIVE_EXIT=0 FAKE_PARALLEL_EXIT=4 /bin/bash "$SCRIPT" --focus x || RC=$?
 assert "a failing parallel pass fails the script" "$([ "$RC" = 4 ] && echo 1 || echo 0)"
+
+# A pass that never ran specs must not read as "failed 0": the sonobuoy
+# --mode/--e2e-skip conflict made the parallel pass exit before running anything
+# and the run still looked green in the summary.
+RC=0
+run_wrapper env FAKE_PARALLEL_NO_SUMMARY=1 /bin/bash "$SCRIPT" --port 6444 || RC=$?
+OUT="$(cat "$TMP/out.log")"
+assert "a pass that produced no results is flagged in the summary" \
+  "$(contains "$OUT" '[parallel] NO RESULTS')"
+assert "a pass that produced no results counts as a failure in the total" \
+  "$(contains "$OUT" 'Total failed across passes: 1')"
+assert "a pass that produced no results fails the script even if its child exited 0" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)"
+RC=0
+run_wrapper env FAKE_PARALLEL_RAN=0 /bin/bash "$SCRIPT" --port 6444 || RC=$?
+OUT="$(cat "$TMP/out.log")"
+assert "a bare certified-conformance pass that ran 0 specs is flagged" \
+  "$(contains "$OUT" '[parallel] RAN 0 SPECS')"
+assert "a bare certified-conformance pass that ran 0 specs fails the script" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)"
+RC=0
+run_wrapper env FAKE_PARALLEL_RAN=0 /bin/bash "$SCRIPT" --focus only-disruptive-specs || RC=$?
+OUT="$(cat "$TMP/out.log")"
+assert "a --focus pass that legitimately selects 0 specs is not flagged" \
+  "$(contains "$OUT" 'RAN 0 SPECS' | tr 01 10)"
+
+# sonobuoy refuses --mode together with --e2e-focus/--e2e-skip. The bare path
+# (apply=0) appends --mode=certified-conformance, so its filter args must never
+# carry either flag, in any pass.
+assert "bare path appends --mode=certified-conformance after build_filter_args 0" \
+  "$(grep -A3 'build_filter_args 0' "$SCRIPT" | grep -q -- '--mode=certified-conformance' && echo 1 || echo 0)"
+for pass in parallel disruptive; do
+  A="$(filter_args "$pass" 0 4)"
+  assert "bare path ($pass) filter args never carry --e2e-skip/--e2e-focus that sonobuoy rejects with --mode" \
+    "$(( $(contains "$A" '--e2e-skip') + $(contains "$A" '--e2e-focus') == 0 ? 1 : 0 ))"
+done
 
 # ---------------------------------------------------------------------------
 # 3. Results-dir naming: the disruptive pass gets its own dir, and the slug is

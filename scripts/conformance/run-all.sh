@@ -397,6 +397,7 @@ fi
 
 DHAT_HEAP_FILE=""
 DHAT_HEAP_MISMATCH=0
+SONOBUOY_RC=0
 if [ "$PROFILE" -eq 1 ]; then
   banner "Profile: rebuilding u7s-apiserver with --features dhat"
   # 01-build.sh builds u7s-apiserver and u7s-scheduler together with no
@@ -542,8 +543,9 @@ if [ "$STACK_ONLY" -eq 1 ]; then
 else
   banner "Step 6/6: Run sonobuoy"
   export SONOBUOY_FOCUS="$FOCUS"
+  # Captured, not fatal: provenance, sampler teardown and monitoring copy below must still run after a failing pass; the exit is re-raised at the end.
   # shellcheck disable=SC2086
-  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG} ${_PROCS_ARG} ${_K8S_VERSION_ARG}
+  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG} ${_PROCS_ARG} ${_K8S_VERSION_ARG} || SONOBUOY_RC=$?
 
   # Build provenance: record what was actually tested (git SHA, dhat feature/
   # depth, node topology, exact invocation) into this run's own meta/build.json
@@ -737,4 +739,8 @@ banner "Done"
 if [ "$DHAT_HEAP_MISMATCH" -eq 1 ]; then
   echo "ERROR: this run's dhat allocation profile is missing or could not be verified — see the ERROR above" >&2
   exit 1
+fi
+if [ "$SONOBUOY_RC" -ne 0 ]; then
+  echo "ERROR: sonobuoy run failed (exit $SONOBUOY_RC) — see the results summary above" >&2
+  exit "$SONOBUOY_RC"
 fi
