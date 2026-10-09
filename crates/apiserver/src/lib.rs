@@ -1695,6 +1695,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // hangs in ContainerCreating, live-confirmed via kcm.log's "system:kube-controller-manager
             // is not allowed to create volumeattachments" before this fix.
             { "apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments"], "verbs": ["get","list","watch","create","delete"] },
+            // kube-apiserver-serving ClusterTrustBundle publisher: with
+            // --use-service-account-credentials=false this identity runs it, so upstream's
+            // per-controller system:controller:kube-apiserver-serving-clustertrustbundle-publisher
+            // rules live here. `create` is not covered by the generic wildcard rule below.
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "verbs": ["attest"] },
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create","update","delete","list","watch"] },
             // namespace-controller needs these two subresources specifically (the base
             // "namespaces" rule above doesn't cover them) to record deletion-progress
             // conditions and clear the "kubernetes" finalizer once a namespace's contents
@@ -3083,6 +3089,72 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         body,
         "system:controller:root-ca-cert-publisher",
         "ClusterRole"
+    );
+
+    // system:controller:kube-apiserver-serving-clustertrustbundle-publisher
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterroles",
+        None,
+        "system:controller:kube-apiserver-serving-clustertrustbundle-publisher",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": "system:controller:kube-apiserver-serving-clustertrustbundle-publisher", "uid": "00000000-0000-0000-0000-000000000080", "creationTimestamp": TS },
+        "rules": [
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "verbs": ["attest"] },
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create","update","delete","list","watch"] },
+            { "apiGroups": ["", "events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] }
+        ]
+    });
+    put!(
+        key,
+        body,
+        "system:controller:kube-apiserver-serving-clustertrustbundle-publisher",
+        "ClusterRole"
+    );
+
+    // ClusterRole system:cluster-trust-bundle-discovery + binding to system:serviceaccounts:
+    // workloads may read ClusterTrustBundles (e.g. clusterTrustBundle projected volumes).
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterroles",
+        None,
+        "system:cluster-trust-bundle-discovery",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": "system:cluster-trust-bundle-discovery", "uid": "00000000-0000-0000-0000-000000000081", "creationTimestamp": TS },
+        "rules": [
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["get","list","watch"] }
+        ]
+    });
+    put!(
+        key,
+        body,
+        "system:cluster-trust-bundle-discovery",
+        "ClusterRole"
+    );
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterrolebindings",
+        None,
+        "system:cluster-trust-bundle-discovery",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:cluster-trust-bundle-discovery", "uid": "00000000-0000-0000-0000-000000000082", "creationTimestamp": TS },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:serviceaccounts" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:cluster-trust-bundle-discovery" }
+    });
+    put!(
+        key,
+        body,
+        "system:cluster-trust-bundle-discovery",
+        "ClusterRoleBinding"
     );
 
     // -----------------------------------------------------------------------
@@ -7300,6 +7372,124 @@ mod tests {
              attach-detach controller never creates a CSIDriver, only volumeattachments needed \
              a new grant for this fix"
         );
+    }
+
+    /// Regression test: KCM's kube-apiserver-serving ClusterTrustBundle publisher runs as
+    /// system:kube-controller-manager and must create/update/delete ClusterTrustBundles and
+    /// hold `attest` on exactly its own signer. Without it KCM logs "is not allowed to create
+    /// clustertrustbundles", the root CA bundle is never published, and workloads relying on
+    /// clusterTrustBundle projection break. Grants must match upstream release-1.37's
+    /// system:controller:kube-apiserver-serving-clustertrustbundle-publisher and nothing wider.
+    #[tokio::test]
+    async fn kcm_identity_can_publish_cluster_trust_bundles_but_only_for_its_own_signer() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        let allowed =
+            |user: &str, groups: &[String], verb: &str, resource: &str, name: Option<&str>| {
+                state.rbac_index.is_allowed(&rbac::AuthzRequest {
+                    username: user,
+                    groups,
+                    verb,
+                    api_group: "certificates.k8s.io",
+                    resource,
+                    subresource: "",
+                    namespace: None,
+                    name,
+                    non_resource_url: None,
+                })
+            };
+        let kcm = "system:kube-controller-manager";
+
+        for verb in ["create", "update", "delete", "list", "watch"] {
+            assert!(
+                allowed(kcm, &groups, verb, "clustertrustbundles", None),
+                "KCM must be allowed to {verb} clustertrustbundles — otherwise the root CA \
+                 bundle is never published and CTB-projecting workloads break"
+            );
+        }
+        assert!(
+            allowed(
+                kcm,
+                &groups,
+                "attest",
+                "signers",
+                Some("kubernetes.io/kube-apiserver-serving")
+            ),
+            "KCM must hold attest on kubernetes.io/kube-apiserver-serving to publish signer-bound bundles"
+        );
+
+        assert!(
+            !allowed(
+                kcm,
+                &groups,
+                "attest",
+                "signers",
+                Some("kubernetes.io/kubelet-serving")
+            ),
+            "attest must be limited to the kube-apiserver-serving signer, not any signer"
+        );
+        assert!(
+            !allowed(kcm, &groups, "attest", "signers", Some("example.com/other")),
+            "attest must not extend to arbitrary signers"
+        );
+        assert!(
+            !allowed(kcm, &groups, "attest", "signers", None),
+            "attest without a signer name must be denied (resourceNames-restricted)"
+        );
+        assert!(
+            !allowed(kcm, &groups, "create", "podcertificaterequests", None),
+            "the CTB publisher grant must not leak create on other certificates.k8s.io resources"
+        );
+        assert!(
+            !allowed(kcm, &groups, "create", "certificatesigningrequests", None),
+            "KCM must not gain CSR create from the CTB publisher grant"
+        );
+
+        let sa = vec![
+            "system:serviceaccounts".to_owned(),
+            "system:authenticated".to_owned(),
+        ];
+        for verb in ["get", "list", "watch"] {
+            assert!(
+                allowed(
+                    "system:serviceaccount:default:app",
+                    &sa,
+                    verb,
+                    "clustertrustbundles",
+                    None
+                ),
+                "service accounts must be able to {verb} ClusterTrustBundles \
+                 (system:cluster-trust-bundle-discovery) so pods can consume projected bundles"
+            );
+        }
+        assert!(
+            !allowed(
+                "system:serviceaccount:default:app",
+                &sa,
+                "create",
+                "clustertrustbundles",
+                None
+            ),
+            "read-only discovery must not let workloads publish trust bundles"
+        );
+        let human = vec!["system:authenticated".to_owned()];
+        for verb in ["get", "list", "watch"] {
+            assert!(
+                !allowed("someone", &human, verb, "clustertrustbundles", None),
+                "bundles are readable only by workloads as upstream binds discovery to \
+                 system:serviceaccounts; a plain authenticated user must not {verb} them"
+            );
+        }
     }
 
     /// Regression test: the scheduler must be able to PATCH pods/binding and pods/status
