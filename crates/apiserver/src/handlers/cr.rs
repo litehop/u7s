@@ -764,6 +764,7 @@ pub(crate) fn is_cr_store_key(key: &str) -> bool {
 /// let it forge object identity just as easily as on a built-in resource: matching a
 /// stale/foreign `ownerReference.uid` to manipulate GC's owner-liveness check, or defeating
 /// controllers' "same name, different uid ⇒ different object" recreate-detection.
+/// `generation` is likewise forced to 1, as upstream's customResourceStrategy.PrepareForCreate does.
 fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind: &str) {
     let api_version = format!("{group}/{version}");
     obj["apiVersion"] = serde_json::Value::String(api_version);
@@ -771,6 +772,7 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.uid = Some(new_cr_uid());
+    meta.generation = Some(1);
     if meta
         .creation_timestamp
         .as_deref()
@@ -9198,6 +9200,92 @@ mod tests {
             !ts.is_empty(),
             "creationTimestamp must be assigned when absent"
         );
+    }
+
+    // Upstream's customResourceStrategy.PrepareForCreate sets generation to 1 whatever the
+    // client sent. Controllers for custom resources compare status.observedGeneration with
+    // metadata.generation, so a client-chosen 7 would never be observed.
+    #[test]
+    fn stamp_cr_fields_forces_generation_1_over_client_value() {
+        let mut obj = serde_json::json!({ "metadata": { "generation": 7 } });
+        stamp_cr_fields(&mut obj, "example.io", "v1", "Widget");
+        assert_eq!(obj["metadata"]["generation"], 1);
+    }
+
+    // End to end through create_cr_namespaced for a CRD with the status subresource: the
+    // stored and returned CR must carry generation 1, not the client's 7.
+    #[tokio::test]
+    async fn create_cr_namespaced_with_status_subresource_stores_generation_1_over_client_value() {
+        use axum::response::IntoResponse;
+        let state = make_state();
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "widgets", "singular": "widget",
+                               "kind": "Widget", "listKind": "WidgetList" },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1", "served": true, "storage": true,
+                        "schema": { "openAPIV3Schema": { "type": "object",
+                            "x-kubernetes-preserve-unknown-fields": true } },
+                        "subresources": { "status": {} }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        assert!(
+            crate::handlers::crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                crd_bytes
+            )
+            .await
+            .is_ok(),
+            "install CRD"
+        );
+
+        let resp = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1", "kind": "Widget",
+                    "metadata": { "name": "w", "namespace": "default", "generation": 7 },
+                    "spec": {}
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create CR must succeed, got: {e:?}"))
+        .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["metadata"]["generation"], 1);
+
+        let stored = state
+            .store
+            .get(&cr_store_key("example.io", "widgets", Some("default"), "w"))
+            .await
+            .unwrap()
+            .expect("CR stored");
+        let stored: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(stored["metadata"]["generation"], 1);
     }
 
     // stamp_cr_fields is only ever called on create (create_cr/create_cr_namespaced and
