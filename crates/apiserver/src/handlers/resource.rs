@@ -24,9 +24,8 @@ use super::generic::{
     apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
     check_crb_escalation, check_rb_escalation, check_role_escalation, clear_create_status,
     decode_continue, generate_suffix, lookup, parse_field_selector, parse_label_selector,
-    resolve_valid_name, stamp_metadata, store_err, validate_name, validate_name_for_group,
-    wants_generate_name, CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS,
-    RBAC_GROUP,
+    resolve_valid_name, stamp_metadata, store_err, validate_path_segment, wants_generate_name,
+    CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
@@ -403,7 +402,7 @@ pub(crate) async fn get_resource<S: Store>(
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    validate_name_for_group("name", &name, &group, &plural)?;
+    validate_path_segment("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -773,7 +772,7 @@ pub(crate) async fn replace_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name_for_group("name", &name, &group, &plural)?;
+    validate_path_segment("name", &name)?;
     let body = extract_body(&body, content_type(&headers))?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -970,6 +969,9 @@ pub(crate) async fn replace_resource<S: Store>(
         }
     }
 
+    if old_object.is_none() {
+        resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
+    }
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -1125,7 +1127,7 @@ pub(crate) async fn delete_resource<S: Store>(
             "cannot delete bootstrap RBAC object {name}"
         )));
     }
-    validate_name_for_group("name", &name, &group, &plural)?;
+    validate_path_segment("name", &name)?;
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
     // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
     // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
@@ -1457,6 +1459,7 @@ pub(crate) async fn do_patch<S: Store>(
         }
         obj.body["metadata"] =
             serde_json::to_value(obj_meta).map_err(|e| Status::internal(e.to_string()))?;
+        resolve_valid_name(&mut obj, group, plural, &meta.kind)?;
         stamp_metadata(&mut obj);
         // An SSA apply-create is a create just like create_resource/create_namespaced_resource
         // — without this, `kubectl apply --server-side` on a not-yet-existing built-in with a
@@ -2754,7 +2757,7 @@ pub(crate) async fn patch_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name_for_group("name", &name, &group, &plural)?;
+    validate_path_segment("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -2822,7 +2825,7 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
     headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
+    validate_path_segment("namespace", &ns)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -3048,8 +3051,8 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name_for_group("name", &name, &group, &plural)?;
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -3127,7 +3130,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
+    validate_path_segment("namespace", &ns)?;
     let body = extract_body(&body, content_type(&headers))?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -3590,8 +3593,8 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name_for_group("name", &name, &group, &plural)?;
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let body = extract_body(&body, content_type(&headers))?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -3891,6 +3894,9 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         .await?;
     }
 
+    if !object_existed {
+        resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
+    }
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -4089,7 +4095,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
+    validate_path_segment("namespace", &ns)?;
     // Guard before validate_name_for_group so colon-names in RBAC don't fail the charset check.
     // Namespaced system: objects don't exist today but blocking them prevents future surprises.
     if is_seeded_rbac_object(&group, &name) {
@@ -4097,7 +4103,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             "cannot delete bootstrap RBAC object {name}"
         )));
     }
-    validate_name_for_group("name", &name, &group, &plural)?;
+    validate_path_segment("name", &name)?;
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
     // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
     // (matching the pre-existing serde_json::from_slice(...).unwrap_or_default() below) without
@@ -4377,8 +4383,8 @@ pub(crate) async fn patch_namespaced_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name_for_group("name", &name, &group, &plural)?;
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -4453,7 +4459,7 @@ pub(crate) async fn patch_collection_namespaced_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
+    validate_path_segment("namespace", &ns)?;
     let meta = lookup(&state, &group, &version, &plural)
         .cloned()
         .map_err(|_| Status::not_found(&plural, &format!("{group}/{version}/{plural}")))?;
@@ -4756,7 +4762,7 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
+    validate_path_segment("namespace", &ns)?;
     // Resources not in the static registry are CRD-backed; fall back to CR handling exactly
     // like every other namespaced verb dispatched from this file (list_namespaced_resource ->
     // cr::list_cr_namespaced, delete_namespaced_resource -> cr::delete_cr_namespaced, ...) —
@@ -9185,6 +9191,201 @@ mod tests {
             .await
             .unwrap();
         assert!(stored.items.is_empty(), "rejected creates must not persist");
+    }
+
+    fn ip_address_body(name: &str) -> bytes::Bytes {
+        bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "IPAddress",
+                "metadata": {"name": name},
+                "spec": {"parentRef": {"group": "", "resource": "services", "name": "svc", "namespace": "default"}}
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn ip_address_path(name: &str) -> axum::extract::Path<(String, String, String, String)> {
+        axum::extract::Path((
+            "networking.k8s.io".into(),
+            "v1".into(),
+            "ipaddresses".into(),
+            name.into(),
+        ))
+    }
+
+    /// The conformance spec creates an IPv6 IPAddress, then reads and deletes it by name. IPv6
+    /// names contain ':', which a DNS-charset check rejects, so every IPv6 ServiceCIDR address
+    /// would be unmanageable.
+    #[tokio::test]
+    async fn ipv6_ip_address_can_be_created_read_and_deleted_by_name() {
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "fe80::42:1dff:fe84:f9e2";
+
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "networking.k8s.io".into(),
+                "v1".into(),
+                "ipaddresses".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            ip_address_body(name),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("IPv6 IPAddress create must succeed: {}", e.1.message));
+
+        assert!(store
+            .get("/registry/networking.k8s.io/ipaddresses/fe80::42:1dff:fe84:f9e2")
+            .await
+            .unwrap()
+            .is_some());
+
+        get_resource(
+            axum::extract::State(state.clone()),
+            ip_address_path(name),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("IPv6 IPAddress GET must succeed: {}", e.1.message));
+
+        delete_resource(
+            axum::extract::State(state.clone()),
+            ip_address_path(name),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("IPv6 IPAddress DELETE must succeed: {}", e.1.message));
+
+        assert!(store
+            .get("/registry/networking.k8s.io/ipaddresses/fe80::42:1dff:fe84:f9e2")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// IPAddress names must be canonical IPs, otherwise two spellings of one address
+    /// (`FE80::1` / `fe80::1`) become distinct objects and the allocator's uniqueness guarantee
+    /// is lost.
+    #[tokio::test]
+    async fn ip_address_create_rejects_non_canonical_names_with_invalid_422() {
+        let state = make_state();
+        for name in [
+            "FE80::1",
+            "fe80:0:0:0:0:0:0:1",
+            "::ffff:1.2.3.4",
+            "010.0.0.1",
+            "not-an-ip",
+            "fe80::1%eth0",
+        ] {
+            let err = create_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "networking.k8s.io".into(),
+                    "v1".into(),
+                    "ipaddresses".into(),
+                )),
+                axum::extract::Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                ip_address_body(name),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{name} must be refused at create"));
+            crate::handlers::test_support::assert_invalid_name_field(&err, "metadata.name");
+        }
+    }
+
+    /// By-name requests accept any name upstream's path-segment rule accepts (a DNS-invalid
+    /// name is a plain 404), but names that could escape the store key (`.`, `..`, `/`, `%`)
+    /// are still refused with 400.
+    #[tokio::test]
+    async fn by_name_path_validation_follows_path_segment_rule_and_blocks_traversal() {
+        let state = make_state();
+        for name in ["..", ".", "a/b", "%2F", "a%b"] {
+            let err = get_resource(
+                axum::extract::State(state.clone()),
+                ip_address_path(name),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{name} must be refused by name"));
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{name}");
+        }
+        let err = get_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "Not_DNS:Name".into(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .expect_err("missing object");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::NOT_FOUND,
+            "a DNS-invalid but path-safe name is simply not found upstream, not a 400"
+        );
+    }
+
+    /// The KCM storage-version-migrator probes LIST in a namespace named `@fake:svm_ns!` and
+    /// expects an empty 200 like upstream, which never validates the namespace segment beyond
+    /// the path-segment rule; a 400 here breaks that controller.
+    #[tokio::test]
+    async fn list_in_non_dns_namespace_returns_empty_200_not_400() {
+        use axum::body::to_bytes;
+        let resp = list_namespaced_resource(
+            axum::extract::State(make_state()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "@fake:svm_ns!".into(),
+                "configmaps".into(),
+            )),
+            axum::extract::Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: Some(1),
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            axum::http::HeaderMap::new(),
+            axum::Extension(crate::auth::UserInfo {
+                username: "test".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("list must succeed: {}", e.1.message));
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["items"].as_array().map(Vec::len), Some(0));
     }
 
     /// delete_namespaced_resource must hard-delete objects without finalizers and return 200 Status.
@@ -30527,6 +30728,189 @@ mod tests {
             state.store.get(&key).await.unwrap().is_none(),
             "the rejected SSA-create must not persist the Node object it just denied"
         );
+    }
+
+    fn admin_ext() -> Extension<crate::auth::UserInfo> {
+        Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+            extra: Default::default(),
+        })
+    }
+
+    fn apply_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        h
+    }
+
+    async fn ssa_create_cluster(
+        state: &AppState<u7s_store::SqliteStore>,
+        group: &str,
+        plural: &str,
+        name: &str,
+        body: serde_json::Value,
+    ) -> axum::http::StatusCode {
+        use axum::response::IntoResponse;
+        match patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((group.into(), "v1".into(), plural.into(), name.into())),
+            axum::extract::Query(PatchQuery::default()),
+            admin_ext(),
+            apply_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        {
+            Ok(r) => r.into_response().status(),
+            Err(e) => e.0,
+        }
+    }
+
+    /// `kubectl apply --server-side` onto a missing name is a create, so it must get the same
+    /// per-kind name validation as POST; otherwise any kind accepts names its POST rejects.
+    #[tokio::test]
+    async fn ssa_create_validates_names_like_post() {
+        use axum::http::StatusCode;
+        let state = make_state();
+        let csinode = |n: &str| {
+            serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+                "metadata": {"name": n}, "spec": {"drivers": []}
+            })
+        };
+        assert_eq!(
+            ssa_create_cluster(
+                &state,
+                "storage.k8s.io",
+                "csinodes",
+                "Bad_Name:x",
+                csinode("Bad_Name:x")
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "SSA-create must reject a non-DNS name with 422 like POST does"
+        );
+        let key = crate::keys::group_object_key("storage.k8s.io", "csinodes", None, "Bad_Name:x");
+        assert!(state.store.get(&key).await.unwrap().is_none());
+
+        let ip = |n: &str| {
+            serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1", "kind": "IPAddress",
+                "metadata": {"name": n},
+                "spec": {"parentRef": {"group": "networking.k8s.io", "resource": "servicecidrs", "name": "kubernetes"}}
+            })
+        };
+        assert_eq!(
+            ssa_create_cluster(
+                &state,
+                "networking.k8s.io",
+                "ipaddresses",
+                "not-an-ip",
+                ip("not-an-ip")
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "IPAddress names must be valid IPs on SSA-create"
+        );
+        assert_eq!(
+            ssa_create_cluster(
+                &state,
+                "networking.k8s.io",
+                "ipaddresses",
+                "2001:db8::1",
+                ip("2001:db8::1")
+            )
+            .await,
+            StatusCode::CREATED,
+            "a canonical IPv6 IPAddress name must still be creatable via SSA"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssa_create_namespaced_validates_names_like_post() {
+        let state = make_state();
+        let cm = serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "Bad_Name", "namespace": "default"}
+        });
+        let err = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "Bad_Name".into(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            admin_ext(),
+            apply_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await
+        .err()
+        .expect("invalid name must be rejected");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "namespaced SSA-create must reject non-DNS names like POST"
+        );
+    }
+
+    /// PUT-create-on-missing is the other create surface besides POST and SSA.
+    #[tokio::test]
+    async fn put_create_validates_names_like_post() {
+        use axum::http::StatusCode;
+        let state = make_state();
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+            "metadata": {"name": "Bad_Name"}, "spec": {"drivers": []}
+        });
+        let err = replace_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "Bad_Name".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            admin_ext(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+        )
+        .await
+        .err()
+        .expect("invalid name must be rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "Bad_Name", "namespace": "default"}
+        });
+        let err = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "Bad_Name".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            admin_ext(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await
+        .err()
+        .expect("invalid name must be rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     // -- streaming LIST path must match the pre-optimization materializing path --

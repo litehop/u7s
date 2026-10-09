@@ -24,7 +24,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::{
-    handlers::generic::{store_err, validate_name},
+    handlers::generic::{store_err, validate_path_segment},
     handlers::json_patch::{
         apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
     },
@@ -51,7 +51,7 @@ pub async fn put_approval<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
+    validate_path_segment("name", &name)?;
     let body = extract_body(&body, content_type(&headers))?;
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -104,7 +104,7 @@ pub async fn patch_approval<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
+    validate_path_segment("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 

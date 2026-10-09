@@ -101,6 +101,73 @@ pub(crate) fn validate_name(label: &str, value: &str) -> Result<(), crate::statu
     Ok(())
 }
 
+/// Validate a by-name request path segment (namespace or object name) the way upstream's
+/// `IsPathSegmentName` does: only `.`, `..`, and names containing `/` or `%` are rejected.
+/// Per-kind `metadata.name` rules apply at create (`validate_name_for_group`), not here, so
+/// kinds whose names are not DNS labels (IPAddress, RBAC, ClusterTrustBundle) stay addressable.
+/// `/` is the store-key delimiter, so rejecting it keeps every name inside its own key.
+/// Empty is rejected too: an empty segment would address the collection prefix.
+pub(crate) fn validate_path_segment(
+    label: &str,
+    value: &str,
+) -> Result<(), crate::status::StatusError> {
+    let reason = if value.is_empty() {
+        "must not be empty"
+    } else if value == "." || value == ".." {
+        "may not be '.' or '..'"
+    } else if value.contains('/') {
+        "may not contain '/'"
+    } else if value.contains('%') {
+        "may not contain '%'"
+    } else if value.contains('\\') {
+        "may not contain '\\'"
+    } else if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        "may not contain control characters or whitespace"
+    } else {
+        return Ok(());
+    };
+    Err(Status::bad_request(format!(
+        "invalid {label} '{value}': {reason}"
+    )))
+}
+
+/// Upstream `ValidateIPAddressName`: the name must be a strictly valid IP in canonical form
+/// (`IsValidIP`: no leading zeros, no IPv4-mapped IPv6, canonical `netip` string).
+fn ip_address_name_violation(value: &str) -> Option<String> {
+    const NOT_AN_IP: &str = "must be a valid IP address, (e.g. 10.9.8.7 or 2001:db8::ffff)";
+    let Ok(ip) = value.parse::<std::net::IpAddr>() else {
+        let octets: Vec<&str> = value.split('.').collect();
+        let sloppy_ipv4 = octets.len() == 4
+            && octets
+                .iter()
+                .all(|o| !o.is_empty() && o.bytes().all(|b| b.is_ascii_digit()))
+            && octets
+                .iter()
+                .map(|o| o.trim_start_matches('0'))
+                .map(|o| if o.is_empty() { "0" } else { o })
+                .collect::<Vec<_>>()
+                .join(".")
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok();
+        return Some(
+            if sloppy_ipv4 {
+                "must not have leading 0s"
+            } else {
+                NOT_AN_IP
+            }
+            .to_string(),
+        );
+    };
+    if matches!(ip, std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some()) {
+        return Some("must not be an IPv4-mapped IPv6 address".to_string());
+    }
+    let canonical = ip.to_string();
+    (value != canonical).then(|| format!("must be in canonical form ({canonical:?})"))
+}
+
+const NETWORKING_GROUP: &str = "networking.k8s.io";
+const IP_ADDRESSES_PLURAL: &str = "ipaddresses";
+
 /// Validate a resource name, allowing colons for RBAC resources and for
 /// signer-scoped ClusterTrustBundle names.
 ///
@@ -135,6 +202,14 @@ pub(crate) fn validate_name_for_group(
     }
     if group.is_empty() && plural == "namespaces" {
         return match crate::types::dns1123_label_violation(value) {
+            Some(reason) => Err(Status::bad_request(format!(
+                "invalid {label} '{value}': {reason}"
+            ))),
+            None => Ok(()),
+        };
+    }
+    if group == NETWORKING_GROUP && plural == IP_ADDRESSES_PLURAL {
+        return match ip_address_name_violation(value) {
             Some(reason) => Err(Status::bad_request(format!(
                 "invalid {label} '{value}': {reason}"
             ))),
@@ -2569,6 +2644,108 @@ mod resolve_name_tests {
         let err = resolve_name(&mut obj).expect_err("must fail when no name and no generateName");
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 400, "must return 400 Bad Request");
+    }
+
+    // -- validate_path_segment / IPAddress names --
+
+    /// Store keys are '/'-delimited, so '/', '.', '..' and '%' (upstream's reject set) must
+    /// never reach a key; ':' is not a delimiter and must be accepted for IPv6 names.
+    #[test]
+    fn validate_path_segment_matches_upstream_reject_set() {
+        for bad in ["", ".", "..", "a/b", "../x", "%2F", "a%b"] {
+            assert!(
+                validate_path_segment("name", bad).is_err(),
+                "{bad:?} could escape or collide in the store key"
+            );
+        }
+        for ok in [
+            "fe80::1",
+            "system:node",
+            "Upper_Case",
+            "a..b",
+            "-x-",
+            ".hidden",
+        ] {
+            assert!(
+                validate_path_segment("name", ok).is_ok(),
+                "{ok:?} is a valid upstream path segment"
+            );
+        }
+    }
+
+    /// axum percent-decodes the path before handlers run, so %00/%0a/%20/%5c arrive as raw
+    /// bytes; they must not reach store keys, logs or audit lines.
+    #[test]
+    fn validate_path_segment_rejects_decoded_control_chars_and_whitespace() {
+        for (class, bad) in [
+            ("NUL", "a\0b"),
+            ("newline", "a\nb"),
+            ("CR", "a\rb"),
+            ("tab", "a\tb"),
+            ("ESC", "a\x1bb"),
+            ("DEL", "a\x7fb"),
+            ("space", "a b"),
+            ("trailing space", "ab "),
+            ("backslash", "a\\b"),
+            ("unicode whitespace", "a\u{a0}b"),
+        ] {
+            assert!(
+                validate_path_segment("name", bad).is_err(),
+                "{class} segment {bad:?} would poison store keys/logs/audit"
+            );
+        }
+    }
+
+    /// A ':' name must produce exactly one store key under its own kind prefix, so IPv6
+    /// IPAddress names cannot alias another object.
+    #[test]
+    fn colon_names_cannot_collide_across_store_keys() {
+        use crate::keys::group_object_key;
+        let a = group_object_key("networking.k8s.io", "ipaddresses", None, "fe80::1");
+        assert_eq!(a, "/registry/networking.k8s.io/ipaddresses/fe80::1");
+        assert!(!a["/registry/networking.k8s.io/ipaddresses/".len()..].contains('/'));
+        assert_ne!(
+            a,
+            group_object_key("networking.k8s.io", "ipaddresses", None, "fe80:")
+        );
+        assert!(a.starts_with(&crate::keys::group_list_prefix(
+            "networking.k8s.io",
+            "ipaddresses",
+            None
+        )));
+    }
+
+    /// Upstream `ValidateIPAddressName` accepts only canonical, non-mapped IPs.
+    #[test]
+    fn ip_address_names_must_be_canonical_ips() {
+        for ok in [
+            "10.0.0.1",
+            "fe80::42:1dff:fe84:f9e2",
+            "2001:db8::ffff",
+            "::1",
+        ] {
+            assert!(
+                validate_name_for_group("name", ok, NETWORKING_GROUP, IP_ADDRESSES_PLURAL).is_ok(),
+                "{ok}"
+            );
+        }
+        for (bad, why) in [
+            ("FE80::1", "canonical form"),
+            ("fe80:0:0:0:0:0:0:1", "canonical form"),
+            ("::ffff:1.2.3.4", "IPv4-mapped"),
+            ("010.0.0.1", "leading 0s"),
+            ("1.2.3", "valid IP address"),
+            ("fe80::1%eth0", "valid IP address"),
+            ("my-ip", "valid IP address"),
+        ] {
+            let err = validate_name_for_group("name", bad, NETWORKING_GROUP, IP_ADDRESSES_PLURAL)
+                .expect_err(bad);
+            assert!(err.1.message.contains(why), "{bad}: {}", err.1.message);
+        }
+        assert!(
+            validate_name_for_group("name", "fe80::1", NETWORKING_GROUP, "servicecidrs").is_err(),
+            "the IP-name rule must not leak to other kinds"
+        );
     }
 
     // -- validate_name (path traversal regression) --
