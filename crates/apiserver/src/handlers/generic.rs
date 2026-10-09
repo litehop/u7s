@@ -119,6 +119,10 @@ pub(crate) fn validate_path_segment(
         "may not contain '/'"
     } else if value.contains('%') {
         "may not contain '%'"
+    } else if value.contains('\\') {
+        "may not contain '\\'"
+    } else if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        "may not contain control characters or whitespace"
     } else {
         return Ok(());
     };
@@ -2665,6 +2669,29 @@ mod resolve_name_tests {
             assert!(
                 validate_path_segment("name", ok).is_ok(),
                 "{ok:?} is a valid upstream path segment"
+            );
+        }
+    }
+
+    /// axum percent-decodes the path before handlers run, so %00/%0a/%20/%5c arrive as raw
+    /// bytes; they must not reach store keys, logs or audit lines.
+    #[test]
+    fn validate_path_segment_rejects_decoded_control_chars_and_whitespace() {
+        for (class, bad) in [
+            ("NUL", "a\0b"),
+            ("newline", "a\nb"),
+            ("CR", "a\rb"),
+            ("tab", "a\tb"),
+            ("ESC", "a\x1bb"),
+            ("DEL", "a\x7fb"),
+            ("space", "a b"),
+            ("trailing space", "ab "),
+            ("backslash", "a\\b"),
+            ("unicode whitespace", "a\u{a0}b"),
+        ] {
+            assert!(
+                validate_path_segment("name", bad).is_err(),
+                "{class} segment {bad:?} would poison store keys/logs/audit"
             );
         }
     }

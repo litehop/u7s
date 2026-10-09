@@ -968,6 +968,9 @@ pub(crate) async fn replace_resource<S: Store>(
         }
     }
 
+    if old_object.is_none() {
+        resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
+    }
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -1455,6 +1458,7 @@ pub(crate) async fn do_patch<S: Store>(
         }
         obj.body["metadata"] =
             serde_json::to_value(obj_meta).map_err(|e| Status::internal(e.to_string()))?;
+        resolve_valid_name(&mut obj, group, plural, &meta.kind)?;
         stamp_metadata(&mut obj);
         // An SSA apply-create is a create just like create_resource/create_namespaced_resource
         // — without this, `kubectl apply --server-side` on a not-yet-existing built-in with a
@@ -3887,6 +3891,9 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         .await?;
     }
 
+    if !object_existed {
+        resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
+    }
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -30552,6 +30559,189 @@ mod tests {
             state.store.get(&key).await.unwrap().is_none(),
             "the rejected SSA-create must not persist the Node object it just denied"
         );
+    }
+
+    fn admin_ext() -> Extension<crate::auth::UserInfo> {
+        Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+            extra: Default::default(),
+        })
+    }
+
+    fn apply_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        h
+    }
+
+    async fn ssa_create_cluster(
+        state: &AppState<u7s_store::SqliteStore>,
+        group: &str,
+        plural: &str,
+        name: &str,
+        body: serde_json::Value,
+    ) -> axum::http::StatusCode {
+        use axum::response::IntoResponse;
+        match patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((group.into(), "v1".into(), plural.into(), name.into())),
+            axum::extract::Query(PatchQuery::default()),
+            admin_ext(),
+            apply_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        {
+            Ok(r) => r.into_response().status(),
+            Err(e) => e.0,
+        }
+    }
+
+    /// `kubectl apply --server-side` onto a missing name is a create, so it must get the same
+    /// per-kind name validation as POST; otherwise any kind accepts names its POST rejects.
+    #[tokio::test]
+    async fn ssa_create_validates_names_like_post() {
+        use axum::http::StatusCode;
+        let state = make_state();
+        let csinode = |n: &str| {
+            serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+                "metadata": {"name": n}, "spec": {"drivers": []}
+            })
+        };
+        assert_eq!(
+            ssa_create_cluster(
+                &state,
+                "storage.k8s.io",
+                "csinodes",
+                "Bad_Name:x",
+                csinode("Bad_Name:x")
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "SSA-create must reject a non-DNS name with 422 like POST does"
+        );
+        let key = crate::keys::group_object_key("storage.k8s.io", "csinodes", None, "Bad_Name:x");
+        assert!(state.store.get(&key).await.unwrap().is_none());
+
+        let ip = |n: &str| {
+            serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1", "kind": "IPAddress",
+                "metadata": {"name": n},
+                "spec": {"parentRef": {"group": "networking.k8s.io", "resource": "servicecidrs", "name": "kubernetes"}}
+            })
+        };
+        assert_eq!(
+            ssa_create_cluster(
+                &state,
+                "networking.k8s.io",
+                "ipaddresses",
+                "not-an-ip",
+                ip("not-an-ip")
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "IPAddress names must be valid IPs on SSA-create"
+        );
+        assert_eq!(
+            ssa_create_cluster(
+                &state,
+                "networking.k8s.io",
+                "ipaddresses",
+                "2001:db8::1",
+                ip("2001:db8::1")
+            )
+            .await,
+            StatusCode::CREATED,
+            "a canonical IPv6 IPAddress name must still be creatable via SSA"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssa_create_namespaced_validates_names_like_post() {
+        let state = make_state();
+        let cm = serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "Bad_Name", "namespace": "default"}
+        });
+        let err = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "Bad_Name".into(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            admin_ext(),
+            apply_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await
+        .err()
+        .expect("invalid name must be rejected");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "namespaced SSA-create must reject non-DNS names like POST"
+        );
+    }
+
+    /// PUT-create-on-missing is the other create surface besides POST and SSA.
+    #[tokio::test]
+    async fn put_create_validates_names_like_post() {
+        use axum::http::StatusCode;
+        let state = make_state();
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+            "metadata": {"name": "Bad_Name"}, "spec": {"drivers": []}
+        });
+        let err = replace_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "Bad_Name".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            admin_ext(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+        )
+        .await
+        .err()
+        .expect("invalid name must be rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "Bad_Name", "namespace": "default"}
+        });
+        let err = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "Bad_Name".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            admin_ext(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await
+        .err()
+        .expect("invalid name must be rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     // -- streaming LIST path must match the pre-optimization materializing path --
