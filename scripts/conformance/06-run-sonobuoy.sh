@@ -98,6 +98,17 @@ if [ "$PASS" = "all" ]; then
     echo "  [$P] $(grep -E '^  (Ran|Passed|Failed):' "$PASS_LOG_DIR/$P.log" | sed 's/^ *//' | tr -s ' ' | tr '\n' ' ')"
     F=$(sed -n 's/^  Failed: *//p' "$PASS_LOG_DIR/$P.log" | head -1)
     TOTAL_FAILED=$(( TOTAL_FAILED + ${F:-0} ))
+    R=$(sed -n 's/^  Ran: *//p' "$PASS_LOG_DIR/$P.log" | head -1)
+    # A pass that printed no summary never produced results; with no
+    # --focus/--all-e2e both passes must run specs (certified-conformance has
+    # [Disruptive] specs), so 0 there means the filter or sonobuoy invocation broke.
+    if [ -z "$R" ]; then
+      echo "  [$P] NO RESULTS: pass did not complete (counted as failure)"
+      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=1
+    elif [ "$R" -eq 0 ] && [ -z "$FOCUS" ] && [ "$ALL_E2E" -eq 0 ]; then
+      echo "  [$P] RAN 0 SPECS: certified-conformance pass selected nothing (counted as failure)"
+      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=1
+    fi
   done
   echo "  Total failed across passes: $TOTAL_FAILED"
   exit "$OVERALL_EXIT"
@@ -321,12 +332,11 @@ build_filter_args() {
       "--e2e-skip=${skip}"
     )
   else
-    local extra=""
+    # sonobuoy rejects --e2e-skip/--e2e-focus combined with --mode, so both
+    # passes split on the ginkgo label instead -- complementary by construction.
+    local extra=" --label-filter=!Disruptive"
     [ "$PASS" = "disruptive" ] && extra=" --label-filter=Disruptive"
     FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${extra}")
-    if [ "$PASS" = "parallel" ]; then
-      FILTER_ARGS+=('--e2e-skip=\[Disruptive\]')
-    fi
   fi
 }
 
