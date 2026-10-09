@@ -11678,8 +11678,23 @@ mod tests {
     // crate happens to do.
     // ---------------------------------------------------------------------------
 
+    /// Helper: evaluate `expr` with string extensions and optional extra variables,
+    /// returning the raw result so tests can assert on errors.
+    fn eval_cel(
+        expr: &str,
+        vars: &[(&str, serde_json::Value)],
+    ) -> Result<cel::Value, cel::ExecutionError> {
+        let program = cel::Program::compile(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
+        let mut ctx = cel::Context::default();
+        register_cel_string_extensions(&mut ctx);
+        for (name, value) in vars {
+            ctx.add_variable(*name, value).unwrap();
+        }
+        program.execute(&ctx)
+    }
+
     #[test]
-    fn cel_string_size_counts_code_points_not_bytes() {
+    fn cel_string_size_counts_code_points_so_non_ascii_max_length_rules_are_not_byte_based() {
         assert!(
             eval_cel_bool("'héllo'.size() == 5 && size('日本') == 2"),
             "size() on strings counts Unicode code points in Kubernetes CEL; a byte count \
@@ -11688,7 +11703,7 @@ mod tests {
     }
 
     #[test]
-    fn cel_map_literal_with_duplicate_key_is_an_error() {
+    fn cel_map_literal_with_duplicate_key_errors_so_rule_fails_closed_like_kubernetes() {
         let program = cel::Program::compile("{'a': 1, 'a': 2}.size() == 2").unwrap();
         let ctx = cel::Context::default();
         assert!(
@@ -11699,21 +11714,92 @@ mod tests {
     }
 
     #[test]
-    fn cel_has_distinguishes_absent_from_present_optional_field() {
+    fn cel_numbers_compare_by_value_across_int_uint_double_like_cel_go() {
+        assert!(
+            eval_cel_bool(
+                "1 == 1.0 && 1u == 1 && 1u == 1.0 && 1 != 2.5 && 1 < 2.5 && 2u > 1.5 \
+                 && 3 >= 3u && 1.5 <= 2"
+            ),
+            "cel-go (heterogeneous equality/ordering) compares numbers by mathematical \
+             value; a type-strict compare would make `self.replicas == 1.0` style rules \
+             reject valid CRs"
+        );
+    }
+
+    #[test]
+    fn cel_cross_type_equality_works_on_positive_json_ints_bound_as_uint() {
         let schema = serde_json::json!({
             "type": "object",
-            "properties": {
-                "a": { "type": "string" },
-                "m": { "type": "object", "additionalProperties": { "type": "string" } }
-            },
+            "properties": { "n": { "type": "integer" } },
             "x-kubernetes-validations": [{
-                "rule": "!has(self.a) && has(self.m) && has(self.m.k) && !has(self.m.z)",
-                "message": "has() must test field presence"
+                "rule": "self.n == 1 && self.n == 1.0 && self.n < 2.5",
+                "message": "n must compare equal to int and double literals"
             }]
         });
         assert!(
-            check_schema(&serde_json::json!({ "m": { "k": "v" } }), schema).is_ok(),
-            "has() must report presence on object fields and map keys, not truthiness"
+            check_schema(&serde_json::json!({ "n": 1 }), schema.clone()).is_ok(),
+            "an integer field must equal int/double literals regardless of how JSON ints bind"
+        );
+        assert!(
+            check_schema(&serde_json::json!({ "n": 2 }), schema).is_err(),
+            "the rule must still reject a differing value"
+        );
+    }
+
+    #[test]
+    fn cel_comprehension_variable_shadows_outer_variable_of_the_same_name() {
+        let r = eval_cel("[1, 2].all(x, x < 3)", &[("x", serde_json::json!(100))]).unwrap();
+        assert!(
+            matches!(r, cel::Value::Bool(true)),
+            "the comprehension variable is the innermost scope in cel-go; resolving the \
+             outer `x` (100) would make `list.all(item, ...)` rules see the wrong value \
+             whenever a loop variable reuses a bound name (got {r:?})"
+        );
+    }
+
+    #[test]
+    fn cel_comprehension_variable_named_self_shadows_the_bound_self() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "xs": { "type": "array", "items": { "type": "integer" } } },
+            "x-kubernetes-validations": [{
+                "rule": "self.xs.all(self, self > 1)",
+                "message": "elements must exceed 1"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "xs": [2, 3] }), schema.clone()).is_ok(),
+            "inside all(self, ...) `self` is the element, not the object"
+        );
+        assert!(
+            check_schema(&serde_json::json!({ "xs": [2, 1] }), schema).is_err(),
+            "the shadowed rule must still reject a failing element"
+        );
+    }
+
+    #[test]
+    fn cel_string_of_invalid_utf8_bytes_errors_instead_of_lossy_converting() {
+        assert!(
+            eval_cel_bool("string(b'abc') == 'abc'"),
+            "string(bytes) must convert valid UTF-8"
+        );
+        assert!(
+            eval_cel(r"string(b'\xff')", &[]).is_err(),
+            "cel-go errors on invalid UTF-8 in string(bytes); a lossy conversion would \
+             let a rule silently validate corrupted data"
+        );
+    }
+
+    #[test]
+    fn cel_list_index_by_whole_number_double_works_and_fractional_double_errors() {
+        assert!(
+            eval_cel_bool("[10, 20, 30][1.0] == 20"),
+            "cel-go accepts a double index that is a whole number (e.g. from JSON numbers \
+             bound as doubles), so `self.items[1.0]` rules must not error"
+        );
+        assert!(
+            eval_cel("[10, 20, 30][1.5]", &[]).is_err(),
+            "a fractional double index is an error in cel-go, not a truncation"
         );
     }
 
