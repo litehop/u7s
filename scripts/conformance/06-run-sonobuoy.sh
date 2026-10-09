@@ -111,6 +111,8 @@ if [ "$PASS" = "all" ]; then
     fi
   done
   echo "  Total failed across passes: $TOTAL_FAILED"
+  # sonobuoy exits 0 even when specs failed, so the failure count is the signal.
+  [ "$TOTAL_FAILED" -gt 0 ] && [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=1
   exit "$OVERALL_EXIT"
 fi
 
@@ -317,8 +319,8 @@ JSON_REPORT_PATH="/tmp/sonobuoy/results/report.json"
 build_filter_args() {
   local apply="$1"
   # The disruptive pass selects by ginkgo label (ANDed with the plugin's focus)
-  # because RE2 focus/skip regexes cannot express "focus X and also [Disruptive]";
-  # the parallel pass skips by text tag.
+  # because RE2 focus/skip regexes cannot express "focus X and also [Disruptive]".
+  # The parallel pass skips by text tag only when apply=1; apply=0 uses labels.
   if [ "$apply" -eq 1 ]; then
     local label="$FEATUREGATE_LABEL_FILTER" skip='\[Flaky\]'
     if [ "$PASS" = "disruptive" ]; then

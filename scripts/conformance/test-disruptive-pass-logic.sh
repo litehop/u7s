@@ -96,7 +96,7 @@ cat > "$FAKEBIN/bash" <<'EOF'
 echo "$*" >> "$FAKE_BASH_LOG"
 case "$*" in
   *"--pass disruptive"*) echo "  Ran:    11"; echo "  Passed: 11"; echo "  Failed: 0"; exit "${FAKE_DISRUPTIVE_EXIT:-0}" ;;
-  *"--pass parallel"*) [ -n "${FAKE_PARALLEL_NO_SUMMARY:-}" ] && exit "${FAKE_PARALLEL_EXIT:-0}"; echo "  Ran:    ${FAKE_PARALLEL_RAN:-96}"; echo "  Passed: 94"; echo "  Failed: 2"; exit "${FAKE_PARALLEL_EXIT:-0}" ;;
+  *"--pass parallel"*) [ -n "${FAKE_PARALLEL_NO_SUMMARY:-}" ] && exit "${FAKE_PARALLEL_EXIT:-0}"; echo "  Ran:    ${FAKE_PARALLEL_RAN:-96}"; echo "  Passed: $(( ${FAKE_PARALLEL_RAN:-96} - ${FAKE_PARALLEL_FAILED:-0} ))"; echo "  Failed: ${FAKE_PARALLEL_FAILED:-0}"; exit "${FAKE_PARALLEL_EXIT:-0}" ;;
 esac
 EOF
 chmod +x "$FAKEBIN/bash"
@@ -107,7 +107,7 @@ run_wrapper() {
 }
 
 RC=0
-run_wrapper env FAKE_DISRUPTIVE_EXIT=0 FAKE_PARALLEL_EXIT=0 /bin/bash "$SCRIPT" --focus csi-hostpath --port 6444 || RC=$?
+run_wrapper env FAKE_DISRUPTIVE_EXIT=0 FAKE_PARALLEL_EXIT=0 FAKE_PARALLEL_FAILED=2 /bin/bash "$SCRIPT" --focus csi-hostpath --port 6444 || RC=$?
 CALLS="$(cat "$TMP/calls.log")"
 assert "wrapper invokes exactly two child passes" \
   "$([ "$(wc -l < "$TMP/calls.log" | tr -d ' ')" = "2" ] && echo 1 || echo 0)"
@@ -124,7 +124,13 @@ assert "combined summary reports the parallel pass counts" \
   "$(contains "$OUT" '[parallel] Ran: 96 Passed: 94 Failed: 2')"
 assert "combined summary totals failures across both passes" \
   "$(contains "$OUT" 'Total failed across passes: 2')"
-assert "clean children -> exit 0" "$([ "$RC" = 0 ] && echo 1 || echo 0)"
+# sonobuoy exits 0 even when specs failed (a 1-failed-spec run once exited 0),
+# so a child that exited 0 but reported failures must still fail the script.
+assert "specs failed in a pass whose child exited 0 -> script exits non-zero" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)"
+RC=0
+run_wrapper env FAKE_DISRUPTIVE_EXIT=0 FAKE_PARALLEL_EXIT=0 /bin/bash "$SCRIPT" --focus csi-hostpath || RC=$?
+assert "all passes report 0 failed and exit 0 -> script exits 0" "$([ "$RC" = 0 ] && echo 1 || echo 0)"
 
 RC=0
 run_wrapper env FAKE_DISRUPTIVE_EXIT=3 FAKE_PARALLEL_EXIT=0 /bin/bash "$SCRIPT" --focus x || RC=$?
