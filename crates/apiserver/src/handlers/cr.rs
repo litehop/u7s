@@ -1356,7 +1356,7 @@ enum CelEvalOverBudget {
 /// (which every concurrently-running request's CEL evaluation also relies on).
 fn execute_cel_with_budget(
     program: &std::sync::Arc<cel::Program>,
-    cel_ctx: cel::Context<'static>,
+    cel_ctx: cel::Context<'static, 'static>,
     budget: std::time::Duration,
     gate: &'static ConcurrencyGate,
 ) -> Result<Result<cel::Value, cel::ExecutionError>, CelEvalOverBudget> {
@@ -1556,11 +1556,16 @@ fn evaluate_message_expression(
 /// Crossplane's `self.plural == self.plural.lowerAscii()` would fail every CR write with an
 /// "undeclared reference" CEL error instead of evaluating as the CRD author intended.
 fn register_cel_string_extensions(ctx: &mut cel::Context) {
-    ctx.add_function("split", cel_split);
-    ctx.add_function("lowerAscii", cel_lower_ascii);
-    ctx.add_function("upperAscii", cel_upper_ascii);
-    ctx.add_function("replace", cel_replace);
-    ctx.add_function("join", cel_join);
+    ctx.add_function("split", cel_split)
+        .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("lowerAscii", cel_lower_ascii)
+        .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("upperAscii", cel_upper_ascii)
+        .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("replace", cel_replace)
+        .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("join", cel_join)
+        .expect("string extension name must not collide with a cel builtin");
 }
 
 fn cel_split(
@@ -11664,6 +11669,51 @@ mod tests {
             eval_cel_bool("['a', 'b', 'c'].join() == 'abc'"),
             "join() with no argument must concatenate list elements with no delimiter, \
              matching Kubernetes' CEL strings library's zero-arg join overload"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Evaluation semantics pinned across the cel 0.14 -> 0.15 bump, where each
+    // behaviour must match Kubernetes' CEL (cel-go) rather than whatever the
+    // crate happens to do.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn cel_string_size_counts_code_points_not_bytes() {
+        assert!(
+            eval_cel_bool("'héllo'.size() == 5 && size('日本') == 2"),
+            "size() on strings counts Unicode code points in Kubernetes CEL; a byte count \
+             would let maxLength-style rules accept or reject the wrong non-ASCII values"
+        );
+    }
+
+    #[test]
+    fn cel_map_literal_with_duplicate_key_is_an_error() {
+        let program = cel::Program::compile("{'a': 1, 'a': 2}.size() == 2").unwrap();
+        let ctx = cel::Context::default();
+        assert!(
+            program.execute(&ctx).is_err(),
+            "a map literal repeating a key is an evaluation error in cel-go; silently \
+             keeping one entry would make such a rule pass where Kubernetes rejects it"
+        );
+    }
+
+    #[test]
+    fn cel_has_distinguishes_absent_from_present_optional_field() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "string" },
+                "m": { "type": "object", "additionalProperties": { "type": "string" } }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "!has(self.a) && has(self.m) && has(self.m.k) && !has(self.m.z)",
+                "message": "has() must test field presence"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "m": { "k": "v" } }), schema).is_ok(),
+            "has() must report presence on object fields and map keys, not truthiness"
         );
     }
 
