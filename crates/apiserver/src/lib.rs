@@ -3105,7 +3105,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "rules": [
             { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "verbs": ["attest"] },
             { "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create","update","delete","list","watch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
+            { "apiGroups": ["", "events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] }
         ]
     });
     put!(
@@ -3115,8 +3115,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "ClusterRole"
     );
 
-    // ClusterRole system:cluster-trust-bundle-discovery + binding to system:authenticated:
-    // any workload may read ClusterTrustBundles (e.g. clusterTrustBundle projected volumes).
+    // ClusterRole system:cluster-trust-bundle-discovery + binding to system:serviceaccounts:
+    // workloads may read ClusterTrustBundles (e.g. clusterTrustBundle projected volumes).
     let key = keys::group_object_key(
         GROUP,
         "clusterroles",
@@ -3147,7 +3147,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
         "metadata": { "name": "system:cluster-trust-bundle-discovery", "uid": "00000000-0000-0000-0000-000000000082", "creationTimestamp": TS },
-        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:authenticated" }],
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:serviceaccounts" }],
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:cluster-trust-bundle-discovery" }
     });
     put!(
@@ -7455,18 +7455,41 @@ mod tests {
             "KCM must not gain CSR create from the CTB publisher grant"
         );
 
-        let authed = vec!["system:authenticated".to_owned()];
+        let sa = vec![
+            "system:serviceaccounts".to_owned(),
+            "system:authenticated".to_owned(),
+        ];
         for verb in ["get", "list", "watch"] {
             assert!(
-                allowed("someone", &authed, verb, "clustertrustbundles", None),
-                "any authenticated user must be able to {verb} ClusterTrustBundles \
+                allowed(
+                    "system:serviceaccount:default:app",
+                    &sa,
+                    verb,
+                    "clustertrustbundles",
+                    None
+                ),
+                "service accounts must be able to {verb} ClusterTrustBundles \
                  (system:cluster-trust-bundle-discovery) so pods can consume projected bundles"
             );
         }
         assert!(
-            !allowed("someone", &authed, "create", "clustertrustbundles", None),
-            "read-only discovery must not let ordinary users publish trust bundles"
+            !allowed(
+                "system:serviceaccount:default:app",
+                &sa,
+                "create",
+                "clustertrustbundles",
+                None
+            ),
+            "read-only discovery must not let workloads publish trust bundles"
         );
+        let human = vec!["system:authenticated".to_owned()];
+        for verb in ["get", "list", "watch"] {
+            assert!(
+                !allowed("someone", &human, verb, "clustertrustbundles", None),
+                "bundles are readable only by workloads as upstream binds discovery to \
+                 system:serviceaccounts; a plain authenticated user must not {verb} them"
+            );
+        }
     }
 
     /// Regression test: the scheduler must be able to PATCH pods/binding and pods/status
