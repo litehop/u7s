@@ -64,6 +64,37 @@ is_target_protected() {
   return 1
 }
 
+is_bead_export_discard() {
+  # is_bead_export_discard <args> -- true only for `restore [--staged]
+  # [--worktree] [--] <paths>` or `checkout -- <paths>` where every path is
+  # exactly one of the two bd-generated JSONL exports. Safe to discard: the
+  # embedded Dolt DB is authoritative and the next bd write regenerates both
+  # files; discarding them unblocks `git pull --ff-only` after a bead
+  # snapshot merges. Anything else (other paths, globs, dirs, --source, -p,
+  # a ref before `--`) is not covered.
+  local -a toks
+  local tok sub npaths=0 seen_dd=0
+  read -ra toks <<< "$1"
+  sub="${toks[0]:-}"
+  case "$sub" in
+    restore|checkout) ;;
+    *) return 1 ;;
+  esac
+  toks=("${toks[@]:1}")
+  [ "$sub" = checkout ] && { [ "${toks[0]:-}" = "--" ] || return 1; }
+  for tok in "${toks[@]}"; do
+    case "$tok" in
+      --) seen_dd=1 ;;
+      --staged|--worktree)
+        [ "$sub" = restore ] && [ "$seen_dd" = 0 ] || return 1
+        ;;
+      .beads/issues.jsonl|.beads/interactions.jsonl) npaths=$(( npaths + 1 )) ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$npaths" -gt 0 ]
+}
+
 is_destructive_git_args() {
   # is_destructive_git_args <args> <target-dir> -- <args> is everything
   # after `git` (and after any leading `-C <dir>` has been stripped by the
@@ -71,6 +102,7 @@ is_destructive_git_args() {
   # whether a bare argument names an existing path.
   local args="$1" target_dir="$2" first second tok
   first=$(printf '%s\n' "$args" | awk '{print $1}')
+  is_bead_export_discard "$args" && return 1
   case "$first" in
     reset)
       printf '%s' "$args" | grep -qE '(^|[[:space:]])--hard([[:space:]]|$)'
