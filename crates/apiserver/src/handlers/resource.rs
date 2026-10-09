@@ -595,6 +595,7 @@ pub(crate) async fn create_resource<S: Store>(
         &mut obj.body,
     )?;
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
+    super::defaults::force_generation_on_create(&group, &plural, &mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // Dry-run: validation and admission passed; return the would-be created object without persisting.
@@ -1551,6 +1552,7 @@ pub(crate) async fn do_patch<S: Store>(
             &mut obj.body,
         )?;
         super::defaults::apply_defaults(group, plural, &mut obj.body);
+        super::defaults::force_generation_on_create(group, plural, &mut obj.body);
         run_validating_webhooks(state, &obj.body, None, &admission_ctx).await?;
 
         if dry_run {
@@ -3255,6 +3257,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         &mut obj.body,
     )?;
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
+    super::defaults::force_generation_on_create(&group, &plural, &mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // LimitRange: inject defaults then validate min/max bounds (pods only).
@@ -19566,6 +19569,172 @@ mod tests {
              changes via a PUT that omits metadata.generation — resetting to 1-based counting \
              (e.g. landing at 2) desyncs status.observedGeneration from the real change history"
         );
+    }
+
+    /// Response body of a 201 create.
+    async fn created_body(resp: axum::response::Response) -> serde_json::Value {
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn post_namespaced(
+        group: &str,
+        version: &str,
+        plural: &str,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        let resp = create_namespaced_resource(
+            State(make_state()),
+            Path((
+                group.into(),
+                version.into(),
+                "default".into(),
+                plural.into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create {plural} must succeed, got: {e:?}"))
+        .into_response();
+        created_body(resp).await
+    }
+
+    /// Controllers compare status.observedGeneration to metadata.generation; a client-chosen
+    /// starting generation (7) on create makes them wait for generations that never exist.
+    /// Upstream's deploymentStrategy.PrepareForCreate overwrites it with 1.
+    #[tokio::test]
+    async fn create_namespaced_workload_forces_generation_1_over_client_value() {
+        let v = post_namespaced(
+            "apps",
+            "v1",
+            "deployments",
+            serde_json::json!({
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": { "name": "gen7", "generation": 7 },
+                "spec": {
+                    "selector": { "matchLabels": { "app": "a" } },
+                    "template": {
+                        "metadata": { "labels": { "app": "a" } },
+                        "spec": { "containers": [{ "name": "c", "image": "pause" }] }
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            v["metadata"]["generation"], 1,
+            "client-supplied generation must be overwritten on create"
+        );
+    }
+
+    /// Non-workload kinds upstream also tracks (NetworkPolicy's PrepareForCreate sets
+    /// Generation = 1) go through the same create path and must not keep the client value.
+    #[tokio::test]
+    async fn create_namespaced_networkpolicy_forces_generation_1_over_client_value() {
+        let v = post_namespaced(
+            "networking.k8s.io",
+            "v1",
+            "networkpolicies",
+            serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+                "metadata": { "name": "np-gen7", "generation": 7 },
+                "spec": { "podSelector": {} }
+            }),
+        )
+        .await;
+        assert_eq!(v["metadata"]["generation"], 1);
+    }
+
+    /// Same for cluster-scoped kinds (create_resource).
+    #[tokio::test]
+    async fn create_cluster_scoped_priorityclass_forces_generation_1_over_client_value() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        let resp = create_resource(
+            State(make_state()),
+            Path((
+                "scheduling.k8s.io".into(),
+                "v1".into(),
+                "priorityclasses".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass",
+                    "metadata": { "name": "pc-gen7", "generation": 7 },
+                    "value": 100
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create priorityclass must succeed, got: {e:?}"))
+        .into_response();
+        let v = created_body(resp).await;
+        assert_eq!(v["metadata"]["generation"], 1);
+    }
+
+    /// `kubectl apply --server-side` onto a missing object is a create and must get the same
+    /// generation as a POST.
+    #[tokio::test]
+    async fn ssa_create_forces_generation_1_over_client_value() {
+        use axum::response::IntoResponse;
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        let patch = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+            "metadata": { "name": "np-ssa", "namespace": "default", "generation": 7 },
+            "spec": { "podSelector": {} }
+        });
+        let resp = patch_namespaced_resource(
+            axum::extract::State(make_state()),
+            axum::extract::Path((
+                "networking.k8s.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "networkpolicies".to_string(),
+                "np-ssa".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SSA create must succeed, got: {e:?}"))
+        .into_response();
+        let v = created_body(resp).await;
+        assert_eq!(v["metadata"]["generation"], 1);
+    }
+
+    /// Kinds upstream does not track generation for are left alone: upstream's generic
+    /// BeforeCreate never touches generation, so forcing 1 here would diverge.
+    #[tokio::test]
+    async fn create_untracked_kind_leaves_client_generation_alone() {
+        let v = post_namespaced(
+            "",
+            "v1",
+            "configmaps",
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": { "name": "cm-gen7", "generation": 7 }
+            }),
+        )
+        .await;
+        assert_eq!(v["metadata"]["generation"], 7);
     }
 
     /// Seeds a Deployment via the generic PATCH path (do_patch, via

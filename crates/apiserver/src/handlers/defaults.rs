@@ -165,6 +165,69 @@ pub fn is_endpointslice(group: &str, plural: &str) -> bool {
     matches!((group, plural), ("discovery.k8s.io", "endpointslices"))
 }
 
+/// Built-in kinds whose upstream strategy `PrepareForCreate` sets `Generation = 1`
+/// (release-1.37 `pkg/registry/**/strategy.go`; HPA via the beta-on `HPAGeneration` gate).
+/// Pods are excluded: `create_pod` has its own path (`initialize_pod_generation`).
+pub fn sets_generation_on_create(group: &str, plural: &str) -> bool {
+    matches!(
+        (group, plural),
+        ("", "podtemplates")
+            | ("", "replicationcontrollers")
+            | ("apps", "deployments")
+            | ("apps", "replicasets")
+            | ("apps", "statefulsets")
+            | ("apps", "daemonsets")
+            | ("batch", "jobs")
+            | ("batch", "cronjobs")
+            | ("policy", "poddisruptionbudgets")
+            | ("discovery.k8s.io", "endpointslices")
+            | ("networking.k8s.io", "ingresses")
+            | ("networking.k8s.io", "ingressclasses")
+            | ("networking.k8s.io", "networkpolicies")
+            | ("autoscaling", "horizontalpodautoscalers")
+            | ("scheduling.k8s.io", "priorityclasses")
+            | ("flowcontrol.apiserver.k8s.io", "flowschemas")
+            | (
+                "flowcontrol.apiserver.k8s.io",
+                "prioritylevelconfigurations"
+            )
+            | (
+                "admissionregistration.k8s.io",
+                "mutatingwebhookconfigurations"
+            )
+            | (
+                "admissionregistration.k8s.io",
+                "validatingwebhookconfigurations"
+            )
+            | ("admissionregistration.k8s.io", "mutatingadmissionpolicies")
+            | (
+                "admissionregistration.k8s.io",
+                "mutatingadmissionpolicybindings"
+            )
+            | (
+                "admissionregistration.k8s.io",
+                "validatingadmissionpolicies"
+            )
+            | (
+                "admissionregistration.k8s.io",
+                "validatingadmissionpolicybindings"
+            )
+            | ("resource.k8s.io", "deviceclasses")
+            | ("resource.k8s.io", "devicetaintrules")
+            | ("resource.k8s.io", "resourceslices")
+    )
+}
+
+/// Overwrite `metadata.generation` with 1 on a newly created object of a kind for which
+/// `sets_generation_on_create`. Unlike `initialize_workload_generation` this must only run on
+/// create paths: controllers compare `status.observedGeneration` to `metadata.generation`, so a
+/// client-chosen starting value (e.g. 7) would make them wait on generations that never exist.
+pub fn force_generation_on_create(group: &str, plural: &str, obj: &mut serde_json::Value) {
+    if sets_generation_on_create(group, plural) {
+        obj["metadata"]["generation"] = serde_json::json!(1i64);
+    }
+}
+
 /// Set `metadata.generation = 1` on a newly created workload object if absent or null.
 ///
 /// KCM's deployment controller reads metadata.generation to decide whether to
@@ -3823,6 +3886,76 @@ mod tests {
                 obj["metadata"]["generation"].is_null(),
                 "metadata.generation must not be set for {group}/{plural} — \
                  generation is only meaningful for workload resources reconciled by KCM"
+            );
+        }
+    }
+
+    /// Every kind upstream's PrepareForCreate gives Generation = 1 must have a client-chosen
+    /// value overwritten on create, and kinds upstream leaves alone must keep theirs.
+    /// A stale starting generation makes controllers wait for observedGeneration to reach
+    /// a value that never arrives.
+    #[test]
+    fn force_generation_on_create_overwrites_client_value_for_tracked_kinds_only() {
+        let tracked = [
+            ("", "podtemplates"),
+            ("", "replicationcontrollers"),
+            ("apps", "deployments"),
+            ("apps", "replicasets"),
+            ("apps", "statefulsets"),
+            ("apps", "daemonsets"),
+            ("batch", "jobs"),
+            ("batch", "cronjobs"),
+            ("policy", "poddisruptionbudgets"),
+            ("discovery.k8s.io", "endpointslices"),
+            ("networking.k8s.io", "ingresses"),
+            ("networking.k8s.io", "ingressclasses"),
+            ("networking.k8s.io", "networkpolicies"),
+            ("autoscaling", "horizontalpodautoscalers"),
+            ("scheduling.k8s.io", "priorityclasses"),
+            ("flowcontrol.apiserver.k8s.io", "flowschemas"),
+            (
+                "flowcontrol.apiserver.k8s.io",
+                "prioritylevelconfigurations",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "mutatingwebhookconfigurations",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "validatingwebhookconfigurations",
+            ),
+            ("admissionregistration.k8s.io", "mutatingadmissionpolicies"),
+            (
+                "admissionregistration.k8s.io",
+                "mutatingadmissionpolicybindings",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "validatingadmissionpolicies",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "validatingadmissionpolicybindings",
+            ),
+            ("resource.k8s.io", "deviceclasses"),
+            ("resource.k8s.io", "devicetaintrules"),
+            ("resource.k8s.io", "resourceslices"),
+        ];
+        for (group, plural) in tracked {
+            let mut obj = serde_json::json!({ "metadata": { "generation": 7 } });
+            force_generation_on_create(group, plural, &mut obj);
+            assert_eq!(
+                obj["metadata"]["generation"], 1,
+                "{group}/{plural}: upstream sets Generation = 1 on create"
+            );
+        }
+        for (group, plural) in [("", "configmaps"), ("", "services"), ("", "namespaces")] {
+            let mut obj = serde_json::json!({ "metadata": { "generation": 7 } });
+            force_generation_on_create(group, plural, &mut obj);
+            assert_eq!(
+                obj["metadata"]["generation"], 7,
+                "{group}/{plural}: upstream does not touch generation on create"
             );
         }
     }
