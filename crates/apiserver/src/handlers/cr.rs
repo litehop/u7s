@@ -1356,7 +1356,7 @@ enum CelEvalOverBudget {
 /// (which every concurrently-running request's CEL evaluation also relies on).
 fn execute_cel_with_budget(
     program: &std::sync::Arc<cel::Program>,
-    cel_ctx: cel::Context<'static>,
+    cel_ctx: cel::Context<'static, 'static>,
     budget: std::time::Duration,
     gate: &'static ConcurrencyGate,
 ) -> Result<Result<cel::Value, cel::ExecutionError>, CelEvalOverBudget> {
@@ -1556,11 +1556,16 @@ fn evaluate_message_expression(
 /// Crossplane's `self.plural == self.plural.lowerAscii()` would fail every CR write with an
 /// "undeclared reference" CEL error instead of evaluating as the CRD author intended.
 fn register_cel_string_extensions(ctx: &mut cel::Context) {
-    ctx.add_function("split", cel_split);
-    ctx.add_function("lowerAscii", cel_lower_ascii);
-    ctx.add_function("upperAscii", cel_upper_ascii);
-    ctx.add_function("replace", cel_replace);
-    ctx.add_function("join", cel_join);
+    ctx.add_function("split", cel_split)
+        .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("lowerAscii", cel_lower_ascii)
+        .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("upperAscii", cel_upper_ascii)
+        .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("replace", cel_replace)
+        .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("join", cel_join)
+        .expect("string extension name must not collide with a cel builtin");
 }
 
 fn cel_split(
@@ -11664,6 +11669,165 @@ mod tests {
             eval_cel_bool("['a', 'b', 'c'].join() == 'abc'"),
             "join() with no argument must concatenate list elements with no delimiter, \
              matching Kubernetes' CEL strings library's zero-arg join overload"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Evaluation semantics pinned across the cel 0.14 -> 0.15 bump, where each
+    // behaviour must match Kubernetes' CEL (cel-go) rather than whatever the
+    // crate happens to do.
+    // ---------------------------------------------------------------------------
+
+    /// Helper: evaluate `expr` with string extensions and optional extra variables,
+    /// returning the raw result so tests can assert on errors.
+    fn eval_cel(
+        expr: &str,
+        vars: &[(&str, serde_json::Value)],
+    ) -> Result<cel::Value, cel::ExecutionError> {
+        let program = cel::Program::compile(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
+        let mut ctx = cel::Context::default();
+        register_cel_string_extensions(&mut ctx);
+        for (name, value) in vars {
+            ctx.add_variable(*name, value).unwrap();
+        }
+        program.execute(&ctx)
+    }
+
+    #[test]
+    fn cel_string_size_counts_code_points_so_non_ascii_max_length_rules_are_not_byte_based() {
+        assert!(
+            eval_cel_bool("'héllo'.size() == 5 && size('日本') == 2"),
+            "size() on strings counts Unicode code points in Kubernetes CEL; a byte count \
+             would let maxLength-style rules accept or reject the wrong non-ASCII values"
+        );
+    }
+
+    #[test]
+    fn cel_map_literal_with_duplicate_key_errors_so_rule_fails_closed_like_kubernetes() {
+        let program = cel::Program::compile("{'a': 1, 'a': 2}.size() == 2").unwrap();
+        let ctx = cel::Context::default();
+        assert!(
+            program.execute(&ctx).is_err(),
+            "a map literal repeating a key is an evaluation error in cel-go; silently \
+             keeping one entry would make such a rule pass where Kubernetes rejects it"
+        );
+    }
+
+    #[test]
+    fn cel_numbers_compare_by_value_across_int_uint_double_like_cel_go() {
+        assert!(
+            eval_cel_bool(
+                "dyn(1) == dyn(1.0) && dyn(1u) == dyn(1) && dyn(1u) == dyn(1.0) \
+                 && dyn(1) != dyn(2.5) && dyn(1) < dyn(2.5) && dyn(2u) > dyn(1.5) \
+                 && dyn(3) >= dyn(3u) && dyn(1.5) <= dyn(2)"
+            ),
+            "runtime semantics only (cel-spec wraps these in dyn(); the literal forms are \
+             not claimed to type-check as CRD rules): cel-go compares numbers by \
+             mathematical value, and a type-strict compare would make dyn-typed \
+             numeric rules reject valid CRs"
+        );
+    }
+
+    #[test]
+    fn cel_cross_type_equality_works_on_positive_json_ints_bound_as_uint() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer" } },
+            "x-kubernetes-validations": [{
+                "rule": "self.n == 1 && dyn(self.n) == 1.0 && dyn(self.n) < 2.5",
+                "message": "n must compare equal to int and double literals"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "n": 1 }), schema.clone()).is_ok(),
+            "an integer field must equal int/double values regardless of how JSON ints \
+             bind (runtime semantics; the dyn() form is used because a bare \
+             `self.n == 1.0` is not verified to type-check in Kubernetes)"
+        );
+        assert!(
+            check_schema(&serde_json::json!({ "n": 2 }), schema).is_err(),
+            "the rule must still reject a differing value"
+        );
+    }
+
+    #[test]
+    fn cel_comprehension_variable_shadows_outer_variable_of_the_same_name() {
+        let r = eval_cel("[1, 2].all(x, x < 3)", &[("x", serde_json::json!(100))]).unwrap();
+        assert!(
+            matches!(r, cel::Value::Bool(true)),
+            "the comprehension variable is the innermost scope in cel-go; resolving the \
+             outer `x` (100) would make `list.all(item, ...)` rules see the wrong value \
+             whenever a loop variable reuses a bound name (got {r:?})"
+        );
+    }
+
+    #[test]
+    fn cel_comprehension_variable_named_self_shadows_the_bound_self() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "xs": { "type": "array", "items": { "type": "integer" } } },
+            "x-kubernetes-validations": [{
+                "rule": "self.xs.all(self, self > 1)",
+                "message": "elements must exceed 1"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "xs": [2, 3] }), schema.clone()).is_ok(),
+            "inside all(self, ...) `self` is the element, not the object"
+        );
+        assert!(
+            check_schema(&serde_json::json!({ "xs": [2, 1] }), schema).is_err(),
+            "the shadowed rule must still reject a failing element"
+        );
+    }
+
+    #[test]
+    fn cel_string_of_invalid_utf8_bytes_errors_instead_of_lossy_converting() {
+        assert!(
+            eval_cel_bool("string(b'abc') == 'abc'"),
+            "string(bytes) must convert valid UTF-8"
+        );
+        assert!(
+            eval_cel(r"string(b'\xff')", &[]).is_err(),
+            "cel-go errors on invalid UTF-8 in string(bytes); a lossy conversion would \
+             let a rule silently validate corrupted data"
+        );
+    }
+
+    #[test]
+    fn cel_list_index_by_whole_number_double_works_and_fractional_double_errors() {
+        assert!(
+            eval_cel_bool("[10, 20, 30][dyn(1.0)] == 20"),
+            "runtime semantics only (cel-spec lists.textproto wraps the index in dyn()): \
+             cel-go accepts a whole-number double index, so numbers bound as doubles must \
+             not error"
+        );
+        assert!(
+            eval_cel("[10, 20, 30][dyn(1.5)]", &[]).is_err(),
+            "a fractional double index is an error in cel-go, not a truncation"
+        );
+    }
+
+    #[test]
+    fn cel_has_on_map_keys_reports_key_presence_so_optional_map_entries_can_be_guarded() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "m": { "type": "object", "additionalProperties": { "type": "string" } }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "has(self.m) && has(self.m.k) && !has(self.m.z)",
+                "message": "has() must test map key presence"
+            }]
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "m": { "k": "v" } }), schema.clone()).is_ok(),
+            "has() must report presence of a map key under additionalProperties; \
+             otherwise `has(self.labels.foo)` guards would error or always fail"
+        );
+        assert!(
+            check_schema(&serde_json::json!({ "m": { "z": "v" } }), schema).is_err(),
+            "has() must be false for an absent key and true for a present one, not constant"
         );
     }
 
