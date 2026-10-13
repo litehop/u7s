@@ -1193,10 +1193,18 @@ fn cel_escape_ident(ident: &str) -> Option<String> {
     Some(out)
 }
 
-/// Recursively renames `value`'s object keys that `schema` declares under a structural
-/// `properties` map to their CEL-escaped form (`cel_escape_ident`), so binding `value`
-/// as a CEL `self`/`oldSelf` variable lets a rule reach a reserved-word or special-char
-/// field the way its author wrote it — e.g. upstream external-snapshotter's
+/// Converts `value` into the `cel::Value` bound as `self`/`oldSelf`, driven by `schema`
+/// the way upstream's `common.UnstructuredToVal` is: `type: integer` and
+/// `x-kubernetes-int-or-string` integers bind as CEL `int`, `type: number` as `double`
+/// (regardless of whether the JSON literal looks integral). Binding through serde would
+/// instead turn every positive JSON integer into `uint`, making `self.n + 1` fail with
+/// `UnsupportedBinaryOperator(add, UInt, Int)`. Unschemaed values (preserve-unknown-fields
+/// data) bind integers as `int` too, matching Go's int64 unstructured numbers; a value
+/// above `i64::MAX` has no CEL `int` form and stays `uint` rather than wrapping.
+///
+/// Object keys that `schema` declares under a structural `properties` map are renamed to
+/// their CEL-escaped form (`cel_escape_ident`), so a rule can reach a reserved-word or
+/// special-char field the way its author wrote it — e.g. upstream external-snapshotter's
 /// VolumeSnapshotContent CRD ships `rule: has(self.name) && has(self.__namespace__)` on
 /// a field literally named `namespace`. Without this, `self.__namespace__` can never
 /// resolve (the bound object only ever has a `namespace` key), so `has()` is always
@@ -1208,55 +1216,65 @@ fn cel_escape_ident(ident: &str) -> Option<String> {
 /// unescapes when `schema.Properties() != nil`) — a map key literally named `namespace`
 /// is reachable only via index syntax (`self.m['namespace']`), which needs no escaping
 /// since it's a string literal, not an identifier.
-fn cel_escape_self_keys(
-    schema: &serde_json::Value,
-    value: &serde_json::Value,
-) -> serde_json::Value {
-    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
-        let Some(map) = value.as_object() else {
-            return value.clone();
-        };
-        let mut out = serde_json::Map::with_capacity(map.len());
-        for (key, v) in map {
-            match props.get(key) {
-                Some(sub_schema) => {
-                    if let Some(escaped) = cel_escape_ident(key) {
-                        out.insert(escaped, cel_escape_self_keys(sub_schema, v));
-                    }
-                    // else: unescapable field name — omit, matching upstream (see doc
-                    // comment above): such a field is never declared in the CEL type.
-                }
-                // Not a declared property (e.g. data kept only via
-                // x-kubernetes-preserve-unknown-fields) — untyped, so not reachable
-                // from a CEL rule either way; keep it verbatim rather than drop data.
-                None => {
-                    out.insert(key.clone(), v.clone());
-                }
+fn json_to_cel_value(schema: &serde_json::Value, value: &serde_json::Value) -> cel::Value {
+    use serde_json::Value as J;
+    match value {
+        J::Null => cel::Value::Null,
+        J::Bool(b) => cel::Value::Bool(*b),
+        J::String(s) => cel::Value::String(std::sync::Arc::new(s.clone())),
+        J::Number(n) => {
+            if schema.get("type").and_then(|t| t.as_str()) == Some("number") {
+                return cel::Value::Float(n.as_f64().unwrap_or_default());
+            }
+            if let Some(i) = n.as_i64() {
+                cel::Value::Int(i)
+            } else if let Some(u) = n.as_u64() {
+                cel::Value::UInt(u)
+            } else {
+                cel::Value::Float(n.as_f64().unwrap_or_default())
             }
         }
-        return serde_json::Value::Object(out);
-    }
-    if let Some(items_schema) = schema.get("items") {
-        return match value.as_array() {
-            Some(arr) => serde_json::Value::Array(
+        J::Array(arr) => {
+            let items_schema = schema.get("items").unwrap_or(&J::Null);
+            cel::Value::from(
                 arr.iter()
-                    .map(|item| cel_escape_self_keys(items_schema, item))
-                    .collect(),
-            ),
-            None => value.clone(),
-        };
+                    .map(|item| json_to_cel_value(items_schema, item))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        J::Object(map) => {
+            let mut out: std::collections::HashMap<String, cel::Value> =
+                std::collections::HashMap::with_capacity(map.len());
+            let props = schema.get("properties").and_then(|p| p.as_object());
+            let ap_schema = schema.get("additionalProperties").filter(|v| v.is_object());
+            for (key, v) in map {
+                match props {
+                    Some(props) => match props.get(key) {
+                        Some(sub_schema) => {
+                            // An unescapable field name is omitted, matching upstream: such
+                            // a field is never declared in the CEL type.
+                            if let Some(escaped) = cel_escape_ident(key) {
+                                out.insert(escaped, json_to_cel_value(sub_schema, v));
+                            }
+                        }
+                        // Not a declared property (e.g. data kept only via
+                        // x-kubernetes-preserve-unknown-fields) — untyped, so not reachable
+                        // from a CEL rule either way; keep it rather than drop data.
+                        None => {
+                            out.insert(key.clone(), json_to_cel_value(&J::Null, v));
+                        }
+                    },
+                    None => {
+                        out.insert(
+                            key.clone(),
+                            json_to_cel_value(ap_schema.unwrap_or(&J::Null), v),
+                        );
+                    }
+                }
+            }
+            cel::Value::from(out)
+        }
     }
-    if let Some(ap_schema) = schema.get("additionalProperties").filter(|v| v.is_object()) {
-        return match value.as_object() {
-            Some(map) => serde_json::Value::Object(
-                map.iter()
-                    .map(|(k, v)| (k.clone(), cel_escape_self_keys(ap_schema, v)))
-                    .collect(),
-            ),
-            None => value.clone(),
-        };
-    }
-    value.clone()
 }
 
 /// Wall-clock budget for evaluating a single CEL rule or `messageExpression`. Upstream
@@ -1381,9 +1399,10 @@ fn execute_cel_with_budget(
 /// messageExpression, reason, fieldPath, optionalOldSelf}`, per the CRD-storage
 /// round-trip in `apiextensions_gen_adapter.rs`) against `self_value`, optionally
 /// binding `oldSelf` to `old_self_value`. `schema` is the schema node `self_value` was
-/// validated against (i.e. `self`'s own type) — used to escape reserved-word/special-char
-/// property names (`cel_escape_self_keys`) before binding, so a rule can reach a field
-/// like `namespace` as `self.__namespace__`, matching how the CRD author wrote it.
+/// validated against (i.e. `self`'s own type) — used by `json_to_cel_value` to bind
+/// integers as `int` and to escape reserved-word/special-char property names, so a rule
+/// can reach a field like `namespace` as `self.__namespace__`, matching how the CRD
+/// author wrote it.
 fn evaluate_cel_rule(
     rule: &serde_json::Value,
     schema: &serde_json::Value,
@@ -1402,18 +1421,14 @@ fn evaluate_cel_rule(
         ))
     })?;
 
-    let escaped_self = cel_escape_self_keys(schema, self_value);
-    let escaped_old_self = old_self_value.map(|v| cel_escape_self_keys(schema, v));
+    let escaped_self = json_to_cel_value(schema, self_value);
+    let escaped_old_self = old_self_value.map(|v| json_to_cel_value(schema, v));
 
     let mut cel_ctx = cel::Context::default();
     register_cel_string_extensions(&mut cel_ctx);
-    cel_ctx
-        .add_variable("self", &escaped_self)
-        .map_err(|e| Status::internal(format!("CEL: failed to bind self: {e}")))?;
+    cel_ctx.add_variable_from_value("self", escaped_self.clone());
     if let Some(old) = &escaped_old_self {
-        cel_ctx
-            .add_variable("oldSelf", old)
-            .map_err(|e| Status::internal(format!("CEL: failed to bind oldSelf: {e}")))?;
+        cel_ctx.add_variable_from_value("oldSelf", old.clone());
     }
 
     let result = match execute_cel_with_budget(
@@ -1491,8 +1506,8 @@ fn evaluate_cel_rule(
 fn cel_rule_failure_detail(
     rule: &serde_json::Value,
     rule_text: &str,
-    self_value: &serde_json::Value,
-    old_self_value: Option<&serde_json::Value>,
+    self_value: &cel::Value,
+    old_self_value: Option<&cel::Value>,
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> String {
     if let Some(msg) = rule
@@ -1521,16 +1536,16 @@ fn cel_rule_failure_detail(
 /// breaks".
 fn evaluate_message_expression(
     expr: &str,
-    self_value: &serde_json::Value,
-    old_self_value: Option<&serde_json::Value>,
+    self_value: &cel::Value,
+    old_self_value: Option<&cel::Value>,
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> Option<String> {
     let program = resolve_cel_program(programs, expr).ok()?;
     let mut cel_ctx = cel::Context::default();
     register_cel_string_extensions(&mut cel_ctx);
-    cel_ctx.add_variable("self", self_value).ok()?;
+    cel_ctx.add_variable_from_value("self", self_value.clone());
     if let Some(old) = old_self_value {
-        cel_ctx.add_variable("oldSelf", old).ok()?;
+        cel_ctx.add_variable_from_value("oldSelf", old.clone());
     }
     match execute_cel_with_budget(
         &program,
@@ -11817,7 +11832,7 @@ mod tests {
     }
 
     #[test]
-    fn cel_cross_type_equality_works_on_positive_json_ints_bound_as_uint() {
+    fn cel_cross_type_equality_works_on_integer_fields() {
         let schema = serde_json::json!({
             "type": "object",
             "properties": { "n": { "type": "integer" } },
@@ -11835,6 +11850,137 @@ mod tests {
         assert!(
             check_schema(&serde_json::json!({ "n": 2 }), schema).is_err(),
             "the rule must still reject a differing value"
+        );
+    }
+
+    fn int_rule_schema(rule: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "n": { "type": "integer" },
+                "d": { "type": "number" },
+                "obj": {
+                    "type": "object",
+                    "properties": { "m": { "type": "integer" } }
+                },
+                "arr": { "type": "array", "items": { "type": "integer" } },
+                "mp": {
+                    "type": "object",
+                    "additionalProperties": { "type": "integer" }
+                },
+                "ios": { "x-kubernetes-int-or-string": true }
+            },
+            "x-kubernetes-validations": [{ "rule": rule, "message": "rule failed" }]
+        })
+    }
+
+    #[test]
+    fn cel_integer_field_binds_as_int_so_int_arithmetic_rule_accepts_valid_cr() {
+        let schema = int_rule_schema("self.n + 1 > 0 && self.n - 1 == 4 && self.n * 2 == 10");
+        assert!(
+            check_schema(&serde_json::json!({ "n": 5 }), schema).is_ok(),
+            "valid CR with int-arithmetic rule is rejected: positive JSON integers must bind \
+             as CEL int, not uint (UnsupportedBinaryOperator(add, UInt, Int))"
+        );
+    }
+
+    #[test]
+    fn cel_integer_field_compares_against_negative_literal() {
+        let schema = int_rule_schema("self.n > -1");
+        assert!(
+            check_schema(&serde_json::json!({ "n": 0 }), schema.clone()).is_ok(),
+            "valid CR with `self.n > -1` is rejected: uint vs int comparison must not error"
+        );
+        assert!(
+            check_schema(&serde_json::json!({ "n": -5 }), schema).is_err(),
+            "the rule must still reject a value that violates it"
+        );
+    }
+
+    #[test]
+    fn cel_integer_field_at_int64_max_stays_int_and_does_not_wrap() {
+        let schema = int_rule_schema("self.n == 9223372036854775807 && self.n - 1 > 0");
+        assert!(
+            check_schema(&serde_json::json!({ "n": i64::MAX }), schema).is_ok(),
+            "i64::MAX is the largest CEL int and must still bind as int"
+        );
+    }
+
+    // Above i64::MAX there is no CEL int; binding stays uint (never wraps negative), so a
+    // rule mixing it with int arithmetic errors and the CR is rejected, fail-closed.
+    #[test]
+    fn cel_integer_above_int64_max_binds_as_uint_instead_of_wrapping_negative() {
+        let schema = int_rule_schema("dyn(self.n) > 0 && type(self.n) == uint");
+        assert!(
+            check_schema(&serde_json::json!({ "n": u64::MAX }), schema).is_ok(),
+            "a value above int64 max must stay uint, not wrap to a negative int"
+        );
+    }
+
+    #[test]
+    fn cel_nested_integer_fields_in_objects_arrays_and_maps_bind_as_int() {
+        let schema = int_rule_schema(
+            "self.obj.m + 1 == 8 && self.arr.all(x, x + 1 > 0) && self.arr[0] + 1 == 2 \
+             && self.mp['a'] + 1 == 4",
+        );
+        assert!(
+            check_schema(
+                &serde_json::json!({
+                    "obj": { "m": 7 }, "arr": [1, 2], "mp": { "a": 3 }
+                }),
+                schema
+            )
+            .is_ok(),
+            "valid CR with int-arithmetic rule over nested object/array/map integers is \
+             rejected: every nested integer must bind as int"
+        );
+    }
+
+    #[test]
+    fn cel_int_or_string_integer_binds_as_int() {
+        let schema = int_rule_schema("type(self.ios) == int && self.ios + 1 == 81");
+        assert!(
+            check_schema(&serde_json::json!({ "ios": 80 }), schema).is_ok(),
+            "an int-or-string holding an integer must bind as CEL int like upstream"
+        );
+    }
+
+    #[test]
+    fn cel_old_self_integer_binds_as_int_in_transition_rules() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "n": {
+                    "type": "integer",
+                    "x-kubernetes-validations": [{
+                        "rule": "self >= oldSelf + 1",
+                        "message": "n must increase"
+                    }]
+                }
+            }
+        });
+        let old = serde_json::json!({ "n": 3 });
+        assert!(
+            check_schema_with_old(&serde_json::json!({ "n": 4 }), schema.clone(), Some(&old))
+                .is_ok(),
+            "valid update with `self >= oldSelf + 1` is rejected: oldSelf integer must bind as int"
+        );
+        assert!(
+            check_schema_with_old(&serde_json::json!({ "n": 3 }), schema, Some(&old)).is_err(),
+            "the transition rule must still reject a non-increasing update"
+        );
+    }
+
+    #[test]
+    fn cel_number_field_still_binds_as_double_even_for_whole_json_literal() {
+        let schema = int_rule_schema("type(self.d) == double && self.d + 0.5 == 3.5");
+        assert!(
+            check_schema(&serde_json::json!({ "d": 3 }), schema.clone()).is_ok(),
+            "type: number must bind as double (upstream), even when the JSON literal is 3"
+        );
+        assert!(
+            check_schema(&serde_json::json!({ "d": 3.0 }), schema).is_ok(),
+            "type: number with a fractional-form literal must bind as double"
         );
     }
 
