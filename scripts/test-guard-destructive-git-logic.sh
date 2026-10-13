@@ -327,6 +327,75 @@ assert "'\$(git reset --hard)' in the worker worktree is allowed -- worker branc
   "$(allowed 'echo $(git reset --hard)' "$WORKER")"
 
 # ---------------------------------------------------------------------------
+# 14. A ref name that is also a repo path resolves as a ref, not a path.
+# ---------------------------------------------------------------------------
+mkdir -p "$MAIN/main" "$MAIN/dirnotref"
+echo x > "$MAIN/main/f"
+echo x > "$MAIN/dirnotref/f"
+assert "'git checkout main' on main with a main/ dir is allowed -- it is a branch switch, blocking it trains agents to route around the guard" \
+  "$(allowed "git checkout main" "$MAIN")"
+assert "'git checkout dirnotref' on main stays blocked -- a path that is not a ref is restored from the index" \
+  "$(blocked "git checkout dirnotref" "$MAIN")"
+assert "'git checkout main -- .' on main stays blocked -- an explicit -- is always a path restore" \
+  "$(blocked "git checkout main -- ." "$MAIN")"
+
+# ---------------------------------------------------------------------------
+# 15. mayor_root() fallback: CLAUDE_PROJECT_DIR is unset in subagent Bash
+#     envs, so the first `git worktree list` entry must identify the mayor.
+# ---------------------------------------------------------------------------
+mkdir -p "$WORKER/scripts"
+cp "$SCRIPT" "$WORKER/scripts/guard-destructive-git.sh"
+RC=0
+FALLBACK_ROOT=$(CLAUDE_PROJECT_DIR= bash "$WORKER/scripts/guard-destructive-git.sh" __call mayor_root)
+assert "mayor_root with CLAUDE_PROJECT_DIR unset, run from a worker worktree's copy, returns the main worktree -- subagents have no CLAUDE_PROJECT_DIR" \
+  "$([ "$FALLBACK_ROOT" = "$MAIN" ] && echo 1 || echo 0)"
+rm -rf "$WORKER/scripts"
+
+# ---------------------------------------------------------------------------
+# 16. env / VAR= prefixes, --config-env, quoted -c values, substitution args.
+# ---------------------------------------------------------------------------
+assert "'env git reset --hard' on main is blocked -- env prefix must not hide git" \
+  "$(blocked "env git reset --hard" "$MAIN")"
+assert "'env -u X FOO=1 git reset --hard' on main is blocked" \
+  "$(blocked "env -u X FOO=1 git reset --hard" "$MAIN")"
+assert "'FOO=1 git reset --hard' on main is blocked -- VAR= prefix must not hide git" \
+  "$(blocked "FOO=1 git reset --hard" "$MAIN")"
+assert "'FOO=\"a b\" BAR= git reset --hard' on main is blocked -- quoted/empty VAR values" \
+  "$(blocked 'FOO="a b" BAR= git reset --hard' "$MAIN")"
+assert "'env FOO=1 git status' on main is allowed -- read-only" \
+  "$(allowed "env FOO=1 git status" "$MAIN")"
+assert "'FOO=1 git reset --hard' in worker is allowed" \
+  "$(allowed "FOO=1 git reset --hard" "$WORKER")"
+assert "'git --config-env=alias.x=VAR x' on main is blocked -- alias via env" \
+  "$(blocked "git --config-env=alias.x=VAR x" "$MAIN")"
+assert "'git --config-env alias.x=VAR x' on main is blocked" \
+  "$(blocked "git --config-env alias.x=VAR x" "$MAIN")"
+assert "'git --config-env=core.x=VAR status' on main is allowed -- not an alias" \
+  "$(allowed "git --config-env=core.x=VAR status" "$MAIN")"
+assert "'git -c core.x=\"a b\" reset --hard' on main is blocked -- a quoted -c value with a space must not eat the verb" \
+  "$(blocked 'git -c core.x="a b" reset --hard' "$MAIN")"
+assert "'git -c core.x=\"a b\" status' on main is allowed" \
+  "$(allowed 'git -c core.x="a b" status' "$MAIN")"
+assert "'git checkout \$(echo .)' on main is blocked -- substitution can expand to a path" \
+  "$(blocked 'git checkout $(echo .)' "$MAIN")"
+assert "'git reset \$(echo --hard)' on main is blocked" \
+  "$(blocked 'git reset $(echo --hard)' "$MAIN")"
+assert "'git reset \`echo --hard\`' on main is blocked" \
+  "$(blocked 'git reset `echo --hard`' "$MAIN")"
+assert "'git reset \$(echo --hard)' in worker is allowed" \
+  "$(allowed 'git reset $(echo --hard)' "$WORKER")"
+assert "'cd \$(pwd) && git reset --hard' on main is blocked -- an unresolvable cd target must not unprotect later commands" \
+  "$(blocked 'cd $(pwd) && git reset --hard' "$MAIN")"
+assert "'git commit -m \"x (git reset --hard HEAD)\"' on main is blocked -- known over-block, intended: prose is indistinguishable from a subshell" \
+  "$(blocked 'git commit -m "x (git reset --hard HEAD)"' "$MAIN")"
+assert "'gh pr view 1 --json title | jq \".title\"' on main is allowed" \
+  "$(allowed 'gh pr view 1 --json title | jq ".title"' "$MAIN")"
+assert "'gh pr create --body \"fix (parens)\" ' on main is allowed" \
+  "$(allowed 'gh pr create --body "fix (parens) here"' "$MAIN")"
+assert "'jq \"(.a | .b)\" f.json' on main is allowed" \
+  "$(allowed 'jq "(.a | .b)" f.json' "$MAIN")"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
