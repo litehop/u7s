@@ -297,6 +297,21 @@ call is_live_agent_branch 'main' 'main' || RC=$?
 assert "a non-worker/agent-* branch name never matches, even if it coincidentally equals a --live-agents entry" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
+# --live-agents entries given as agent-<id> or worker/agent-<id> must still
+# protect the worker: a mismatch silently strips protection from the
+# destructive steps.
+for LIVE_FORM in 'abc123' 'agent-abc123' 'worker/agent-abc123' 'xyz999, agent-abc123' 'xyz999, worker/agent-abc123'; do
+  RC=0
+  call is_live_agent_branch 'worker/agent-abc123' "$LIVE_FORM" || RC=$?
+  assert "--live-agents entry form '${LIVE_FORM}' protects worker/agent-abc123 -- a prefixed id must not leave a live worker reapable" \
+    "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+done
+
+RC=0
+call is_live_agent_branch 'worker/agent-gone999' 'agent-abc123,worker/agent-def456' || RC=$?
+assert "prefixed --live-agents entries still do not protect an unrelated worker branch" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 3e. Whitespace-tolerant --live-agents membership match. A comma-space-
 #    joined list (e.g. "a, b, c") must protect EVERY id, not just the
