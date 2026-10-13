@@ -3,7 +3,7 @@ use std::hint::black_box;
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use serde_json::json;
-use u7s_apiserver::handlers::watch::prepare_live_event;
+use u7s_apiserver::handlers::{field_selector::FieldSelector, watch::prepare_live_event};
 
 /// A ConfigMap-shaped ADDED event body — the same parse+filter+default+serialize cost profile
 /// as every other builtin-resource live watch event.
@@ -43,7 +43,7 @@ fn bench_recompute_per_watcher(c: &mut Criterion) {
                         "ConfigMap",
                         false,
                         "",
-                        "",
+                        &FieldSelector::default(),
                     ));
                 }
             });
@@ -75,7 +75,7 @@ fn bench_prepare_once_share_bytes(c: &mut Criterion) {
                     "ConfigMap",
                     false,
                     "",
-                    "",
+                    &FieldSelector::default(),
                 )
                 .unwrap();
                 for _ in 0..n {

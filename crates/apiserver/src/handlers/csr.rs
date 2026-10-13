@@ -32,11 +32,11 @@ use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     handlers::{
+        field_selector::FieldSelector,
         generic::{
             apply_label_selector, build_list_response, decode_continue, generate_suffix, lookup,
-            parse_field_selector, parse_label_selector, resolve_valid_name, stamp_metadata,
-            validate_path_segment, wants_generate_name, CollectionQuery,
-            MAX_GENERATE_NAME_CREATE_ATTEMPTS,
+            parse_label_selector, resolve_valid_name, stamp_metadata, validate_path_segment,
+            wants_generate_name, CollectionQuery, MAX_GENERATE_NAME_CREATE_ATTEMPTS,
         },
         json_patch::is_dry_run_header,
         watch::{fetch_initial_events, watch_generic, WatchConfig},
@@ -146,6 +146,7 @@ pub async fn list_csr<S: Store>(
     let meta = lookup(&state, GROUP, VERSION, PLURAL)?;
     let kind = meta.kind.clone();
     let prefix = group_list_prefix(GROUP, PLURAL, None);
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref(), GROUP, PLURAL)?;
 
     if query.watch == Some(true) {
         let from_rv = query.resource_version.unwrap_or(0);
@@ -178,11 +179,6 @@ pub async fn list_csr<S: Store>(
         .await;
     }
 
-    let field_selector = query
-        .field_selector
-        .as_deref()
-        .map(parse_field_selector)
-        .transpose()?;
     // Decode BEFORE listing: on a continuation request this pins the resourceVersion this
     // response (and every later page) must report — see decode_continue's doc for why.
     let continue_decoded = query
@@ -197,7 +193,7 @@ pub async fn list_csr<S: Store>(
         .list(
             &prefix,
             ListOptions {
-                field_selector,
+                field_selector: field_selector.store_selector(),
                 limit: query.limit,
                 continue_key,
             },
@@ -212,6 +208,7 @@ pub async fn list_csr<S: Store>(
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(v);
     }
+    let items = field_selector.filter(items);
 
     let items = if let Some(ref sel) = query.label_selector {
         let pairs = parse_label_selector(sel)?;

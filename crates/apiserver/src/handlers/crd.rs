@@ -475,6 +475,11 @@ pub async fn list_crds<S: Store>(
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let prefix = list_prefix();
+    let field_selector = super::field_selector::FieldSelector::parse(
+        query.field_selector.as_deref(),
+        GROUP,
+        PLURAL,
+    )?;
 
     if query.watch == Some(true) {
         let accept = headers
@@ -519,17 +524,12 @@ pub async fn list_crds<S: Store>(
         .await;
     }
 
-    let store_field_selector = query
-        .field_selector
-        .as_deref()
-        .map(super::generic::parse_field_selector)
-        .transpose()?;
     let resp = state
         .store
         .list(
             &prefix,
             ListOptions {
-                field_selector: store_field_selector,
+                field_selector: field_selector.store_selector(),
                 ..ListOptions::default()
             },
         )
@@ -542,6 +542,7 @@ pub async fn list_crds<S: Store>(
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(v);
     }
+    let items = field_selector.filter(items);
 
     let items = if let Some(ref sel) = query.label_selector {
         let pairs = super::generic::parse_label_selector(sel)?;
@@ -978,6 +979,11 @@ pub async fn delete_collection_crds<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let prefix = list_prefix();
+    let field_selector = super::field_selector::FieldSelector::parse(
+        query.field_selector.as_deref(),
+        GROUP,
+        PLURAL,
+    )?;
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -998,7 +1004,7 @@ pub async fn delete_collection_crds<S: Store>(
             .as_str()
             .unwrap_or("")
             .to_string();
-        if name.is_empty() {
+        if name.is_empty() || !field_selector.matches(&parsed) {
             continue;
         }
         if let Some(ref pairs) = label_pairs {

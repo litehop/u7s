@@ -16,6 +16,7 @@ use u7s_store::{ListOptions, Store};
 
 use crate::{auth::UserInfo, state::AppState, status::Status};
 
+use super::field_selector::FieldSelector;
 use super::generic::{
     apply_label_selector, build_list_response, decode_continue, parse_label_selector,
     CollectionQuery,
@@ -66,6 +67,7 @@ pub(crate) async fn core_list_resource<S: Store>(
         let table = super::table::wants_table(accept);
 
         let prefix = crate::keys::cluster_list_prefix("pods");
+        let field_selector = FieldSelector::parse(query.field_selector.as_deref(), "", "pods")?;
         if query.watch == Some(true) {
             let (watch_api_version, watch_kind) = if pom {
                 (
@@ -76,21 +78,16 @@ pub(crate) async fn core_list_resource<S: Store>(
                 ("v1".to_string(), "Pod".to_string())
             };
             let from_rv = query.resource_version.unwrap_or(0);
-            // Fetch initial events with field-selector filtering applied.
-            // Without filtering, kubelet (which watches with fieldSelector=spec.nodeName=<node>)
-            // would receive ADDED events for pods on other nodes during the initial snapshot phase.
+            // Initial snapshot narrowed by the store; watch_generic applies the full selectors
+            // to it, so kubelet (fieldSelector=spec.nodeName=<node>) never receives ADDED
+            // events for pods on other nodes.
             let initial = if query.send_initial_events == Some(true) {
-                use super::pods::{filter_pods_by_field_selector, pod_store_field_selector};
-                let store_fs = query
-                    .field_selector
-                    .as_deref()
-                    .and_then(pod_store_field_selector);
                 let resp = state
                     .store
                     .list(
                         &prefix,
                         ListOptions {
-                            field_selector: store_fs,
+                            field_selector: field_selector.store_selector(),
                             ..Default::default()
                         },
                     )
@@ -101,9 +98,6 @@ pub(crate) async fn core_list_resource<S: Store>(
                     .iter()
                     .filter_map(|o| serde_json::from_slice(&o.value).ok())
                     .collect();
-                if let Some(ref sel) = query.field_selector {
-                    pods = filter_pods_by_field_selector(pods, sel);
-                }
                 if let Some(ref sel) = query.label_selector {
                     pods.retain(|pod| super::watch::object_matches_label_selector(pod, sel));
                 }
@@ -132,11 +126,6 @@ pub(crate) async fn core_list_resource<S: Store>(
             .await
             .map(IntoResponse::into_response);
         }
-        use super::pods::{filter_pods_by_field_selector, pod_store_field_selector};
-        let field_selector = query
-            .field_selector
-            .as_deref()
-            .and_then(pod_store_field_selector);
         // Decode BEFORE listing: on a continuation request this pins the resourceVersion this
         // response (and every later page) must report — see decode_continue's doc for why.
         let continue_decoded = query
@@ -151,7 +140,7 @@ pub(crate) async fn core_list_resource<S: Store>(
             .list(
                 &prefix,
                 ListOptions {
-                    field_selector,
+                    field_selector: field_selector.store_selector(),
                     limit: query.limit,
                     continue_key,
                 },
@@ -172,7 +161,6 @@ pub(crate) async fn core_list_resource<S: Store>(
             .map(parse_label_selector)
             .transpose()?
             .unwrap_or_default();
-        let pod_field_selector = query.field_selector.as_deref().unwrap_or("");
 
         // See list_resource's identically-shaped guard for why this checks has_encoder rather
         // than wants_protobuf alone; Pod/PodList has a registered encoder, so this only takes
@@ -188,8 +176,7 @@ pub(crate) async fn core_list_resource<S: Store>(
                 list_revision,
                 &resp.items,
                 &label_pairs,
-                pod_field_selector,
-                filter_pods_by_field_selector,
+                &field_selector,
                 None,
                 resp.continue_key,
                 resp.remaining_count,
@@ -209,7 +196,7 @@ pub(crate) async fn core_list_resource<S: Store>(
                 serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
             items.push(v);
         }
-        let items = filter_pods_by_field_selector(items, pod_field_selector);
+        let items = field_selector.filter(items);
         let items = apply_label_selector(items, &label_pairs);
         tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
@@ -583,7 +570,7 @@ pub(crate) async fn core_patch_namespaced_resource_status<S: Store>(
 
 #[cfg(test)]
 mod tests {
-    use crate::handlers::pods::{filter_pods_by_field_selector, pod_store_field_selector};
+    use crate::handlers::field_selector::FieldSelector;
     use std::sync::Arc;
     use u7s_store::{SqliteStore, Store};
 
@@ -634,14 +621,14 @@ mod tests {
             .expect("create other-pod");
 
         // Replicate the fixed path in core_list_resource: list all pods, filter by nodeName.
-        let field_selector_str = "spec.nodeName=lima-node";
-        let store_fs = pod_store_field_selector(field_selector_str);
+        let field_selector = FieldSelector::parse(Some("spec.nodeName=lima-node"), "", "pods")
+            .unwrap_or_else(|e| panic!("selector must parse: {}", e.1.message));
         let prefix = crate::keys::cluster_list_prefix("pods");
         let resp = store
             .list(
                 &prefix,
                 u7s_store::ListOptions {
-                    field_selector: store_fs,
+                    field_selector: field_selector.store_selector(),
                     ..Default::default()
                 },
             )
@@ -653,7 +640,7 @@ mod tests {
             .iter()
             .filter_map(|o| serde_json::from_slice(&o.value).ok())
             .collect();
-        pods = filter_pods_by_field_selector(pods, field_selector_str);
+        pods = field_selector.filter(pods);
 
         // Only the pod on lima-node must appear in the initial snapshot.
         assert_eq!(
