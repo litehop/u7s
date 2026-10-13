@@ -53,6 +53,12 @@
 //! exact thrashing behavior. A `VecDeque` insertion-order queue is a fraction of the code a
 //! true access-order LRU (or the `hashlink` dependency) would need for no observable benefit
 //! at the current cardinality.
+//!
+//! # Single issuer only
+//!
+//! The key carries no issuer or signing-key identity, which is safe only while u7s has one
+//! issuer and one key. Multi-issuer support must scope a cache per (issuer, key); sharing
+//! this one could let a hit verified under key A be served for key B.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;

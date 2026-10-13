@@ -74,3 +74,9 @@ field (PR #1079, mayor-0bd14.2), so the `serde_json::from_value::<ObjectMeta>` /
 used to document (`create_namespaced_resource`, `object_meta_to_json`, `stamp_cr_fields`) were
 all removed once the type-level fix landed (PR #1081). Kept as a pointer to why `ObjectMeta`
 looks the way it does — do not reintroduce a save/restore workaround for this field.
+
+## Default both sides before comparing specs
+A stored spec is already defaulted; an incoming update body is not. Comparing them as raw JSON reports "changed" on no-op updates (`dnsPolicy`, `enableServiceLinks`, volume `defaultMode`, ...). Default both sides, or compare typed values, before any change detection (generation bumps, immutability checks), else a no-op update bumps `metadata.generation`.
+
+## Stale read-after-write in microseconds is the client's informer cache
+If a client reads stale state within ~5-12 µs of its own write (observed 5.8-12.7 µs syncs vs 1-2 ms for a real PUT), it read its watch-fed informer cache, not the apiserver: no server round trip is that fast. Use the timing as the diagnostic before suspecting a store or handler bug.

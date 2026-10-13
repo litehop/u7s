@@ -510,6 +510,14 @@ stop a named test from accidentally re-triggering a known-crashing Beta spec; se
 
 ---
 
+## Known behaviours (not bugs)
+
+- DaemonSet pod soft delete to hard delete takes ~2.2 s: kubelet's 2 s minimum grace period plus housekeeping cadence. Not a store bug; do not "fix" it in the apiserver.
+- Under the full conformance suite, kube-proxy `syncProxyRules` grows from 45-70 ms to ~39 s, with 90 s+ windows of no progress. Cause is guest CPU starvation, not the algorithm.
+- The Lima fleet is 6 VMs x 8 vCPU = 48 vCPU on 12 physical host cores (4x oversubscribed; host load average 13-18 under concurrent use), so expect scheduling pressure when several slots run at once.
+
+---
+
 ## Logs
 
 | Component           | Where                                                          |
