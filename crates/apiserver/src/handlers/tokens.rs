@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use u7s_store::Store;
 
 use crate::{
+    handlers::generic::validate_path_segment,
     keys::{cluster_object_key, object_key},
     proto::{decode_k8s_proto_envelope, decode_token_request},
     state::AppState,
@@ -126,6 +127,8 @@ pub async fn create_token<S: Store>(
     Path((raw_ns, sa_name)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", &raw_ns)?;
+    validate_path_segment("name", &sa_name)?;
     // 1. Validate namespace exists.
     let ns = crate::types::Namespace::parse(&raw_ns).map_err(Status::bad_request)?;
     let ns_key = cluster_object_key("namespaces", ns.as_str());
@@ -207,7 +210,10 @@ pub async fn create_token<S: Store>(
     let mut node_ref: Option<ClaimRef> = None;
     if let Some(bor) = spec.bound_object_ref.as_ref() {
         if bor["kind"].as_str() == Some("Pod") {
-            if let Some(pod_name) = bor["name"].as_str() {
+            if let Some(pod_name) = bor["name"]
+                .as_str()
+                .filter(|n| validate_path_segment("name", n).is_ok())
+            {
                 let pod_key = object_key("pods", ns.as_str(), pod_name);
                 if let Ok(Some(pod_obj)) = state.store.get(&pod_key).await {
                     if let Ok(pod_val) = serde_json::from_slice::<serde_json::Value>(&pod_obj.value)
@@ -600,6 +606,38 @@ mod handler_tests {
     // -----------------------------------------------------------------------
     // create_token — error paths
     // -----------------------------------------------------------------------
+
+    /// Path-traversal segments ('.', '..', '%', '/') in either the namespace or the
+    /// ServiceAccount name must be a 400 (upstream IsPathSegmentName) rather than reaching the
+    /// store lookup, which would answer 404 and let a caller probe for keys outside the SA's own.
+    #[tokio::test]
+    async fn create_token_rejects_path_segment_names_with_400() {
+        for (ns, sa) in [
+            ("default", ".."),
+            ("default", "."),
+            ("default", "a%b"),
+            ("default", "a/b"),
+            ("..", "my-sa"),
+            ("a%b", "my-sa"),
+        ] {
+            let (state, _store) = make_state_no_key();
+            let result = create_token(
+                State(state),
+                Path((ns.to_owned(), sa.to_owned())),
+                Bytes::new(),
+            )
+            .await;
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("{ns}/{sa} must be rejected"),
+            };
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "namespaces/{ns}/serviceaccounts/{sa}/token must yield 400"
+            );
+        }
+    }
 
     /// An invalid namespace name (e.g. containing uppercase) must return 400 BadRequest.
     /// create_token calls Namespace::parse which rejects names that violate DNS label rules.
