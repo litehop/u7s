@@ -144,13 +144,16 @@ LIVE_AGENTS="${LIVE_AGENTS:-}"
 # without this, a comma-space-joined --live-agents value leaves a leading
 # space on every id after the first, which then never matches the exact
 # ",${agent_id}," substring check below and under-protects every live
-# worker but the first in the list.
+# worker but the first in the list. A leading worker/agent- or agent- is also
+# stripped so branch-style ids match the bare hex id callers compare against.
 normalize_live_agents() {
   local live_agents="$1"
   local out="" tok
   while IFS= read -r tok; do
     tok="${tok#"${tok%%[![:space:]]*}"}"
     tok="${tok%"${tok##*[![:space:]]}"}"
+    tok="${tok#worker/agent-}"
+    tok="${tok#agent-}"
     [ -n "$tok" ] || continue
     out="${out:+${out},}${tok}"
   done <<< "$(printf '%s' "$live_agents" | tr ',' '\n')"

@@ -119,8 +119,9 @@ Queue config: MERGE method, all-green grouping, min 1 / max 5,
 tests THAT, so also requiring the PR branch itself to be current would only cost
 a redundant CI cycle per PR.
 
-1. Call `ListAgents`, extract the `worker/agent-*` ids of currently running
-   subagents, and run `scripts/mayor-tick.sh --live-agents <comma-separated
+1. Call `ListAgents`, extract the bare hex ids of currently running
+   subagents (`worker/agent-<hex>` -> `<hex>`; prefixed forms are also
+   accepted), and run `scripts/mayor-tick.sh --live-agents <comma-separated
    ids>` (omit the flag if none are running). This is the only reliable
    liveness signal for an in-process worker sub-agent — a sub-agent cannot
    call `ListAgents` on itself, and `claude agents --json` doesn't
@@ -213,7 +214,8 @@ host-side `u7s-apiserver`/`u7s-scheduler`/`konnectivity-server` processes
 (STEP A), `git worktree prune` (STEP B), and stale worker/non-worker branch
 cleanup (STEPs C–D) — lives in `scripts/worktree-hygiene.sh`; the cron loop
 runs that script directly. Before running it, call `ListAgents` and extract
-the `worker/agent-*` ids of currently running subagents. If that list is
+the bare hex ids of currently running subagents (prefixed `agent-<hex>` /
+`worker/agent-<hex>` forms are also accepted). If that list is
 non-empty, pass it as `--live-agents <comma-separated ids>`; if ListAgents
 shows ZERO running workers (the idle state), pass `--no-live-workers`
 instead — an affirmative "nothing to protect" declaration, distinct from
