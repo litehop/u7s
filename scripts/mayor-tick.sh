@@ -708,8 +708,8 @@ cleanup_merged_worktrees() {
         run_cmd git -C "$REPO_ROOT" remote prune origin
         did_pull=1
       fi
-      run_cmd git worktree remove "$path"
-      run_cmd git branch -D "$branch"
+      run_cmd git -C "$REPO_ROOT" worktree remove "$path"
+      run_cmd git -C "$REPO_ROOT" branch -D "$branch"
       MERGED_PRS+=("$num")
     fi
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
