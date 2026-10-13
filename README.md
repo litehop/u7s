@@ -42,6 +42,35 @@ apply upstream's release manifest:
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 ```
 
+## Running on a 1 GiB host
+
+On a 1 vCPU / 1 GiB Ubuntu host the stack boots to Ready in about a minute
+and leaves roughly 450 MiB of `MemAvailable` idle, and about 320 MiB with a
+small app (WordPress + MariaDB) running. Large pod bursts on top of that
+push the host into page-cache thrash. `install.sh` deliberately does not
+touch the host OS, so these node-level mitigations are yours to apply:
+
+- Add a swapfile (kubelet is configured with `failSwapOn: false`):
+
+  ```bash
+  sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile
+  sudo mkswap /swapfile && sudo swapon /swapfile
+  echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+  ```
+
+- Disable cloud-image services that u7s does not need. On Ubuntu cloud
+  images, `udisksd`, `multipathd`, `ModemManager`, `unattended-upgrades`,
+  `networkd-dispatcher`, `polkitd` and `rsyslog` together hold roughly
+  100 MB:
+
+  ```bash
+  sudo systemctl disable --now udisks2 multipathd ModemManager \
+    unattended-upgrades networkd-dispatcher polkit rsyslog
+  ```
+
+  Only disable what you do not rely on (for example, keep
+  `unattended-upgrades` if you want automatic security updates).
+
 ## Architecture
 
 u7s implements the Kubernetes REST API surface natively rather than
