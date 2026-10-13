@@ -1080,6 +1080,11 @@ fn resolve_cel_program(
 ///
 /// A rule under a property that is absent from `obj` is not evaluated — matches
 /// upstream: `self` must exist for a rule to run at all.
+///
+/// Like upstream, a failing rule does not stop the others: every failure is reported
+/// together, so one rule erroring on a missing key cannot mask another's verdict. Only a
+/// failure whose message says no further rules will run (cost or time limit exceeded)
+/// ends the walk.
 fn validate_cel_rules(
     schema: &serde_json::Value,
     obj: &serde_json::Value,
@@ -1087,12 +1092,63 @@ fn validate_cel_rules(
     field_path: &str,
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> Result<(), crate::status::StatusError> {
+    let mut errors = Vec::new();
+    collect_cel_rule_errors(schema, obj, old_node, field_path, programs, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::unprocessable_entity(errors.join("; ")))
+    }
+}
+
+/// Upstream's wording for a failure after which the remaining rules are not run.
+const CEL_NO_FURTHER_RULES: &str = "no further validation rules will be run";
+
+/// A failed rule, and whether the failure ends the rule walk (cost or time limit).
+struct RuleFailure {
+    error: Box<crate::status::StatusError>,
+    halts_rules: bool,
+}
+
+impl RuleFailure {
+    fn halting(error: crate::status::StatusError) -> Self {
+        Self {
+            error: Box::new(error),
+            halts_rules: true,
+        }
+    }
+}
+
+impl From<crate::status::StatusError> for RuleFailure {
+    fn from(error: crate::status::StatusError) -> Self {
+        Self {
+            error: Box::new(error),
+            halts_rules: false,
+        }
+    }
+}
+
+/// Appends each failure under `schema`/`obj` to `errors`; returns `false` once a failure
+/// that halts the walk was recorded.
+fn collect_cel_rule_errors(
+    schema: &serde_json::Value,
+    obj: &serde_json::Value,
+    old_node: Option<&serde_json::Value>,
+    field_path: &str,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+    errors: &mut Vec<String>,
+) -> bool {
     if let Some(rules) = schema
         .get("x-kubernetes-validations")
         .and_then(|v| v.as_array())
     {
         for rule in rules {
-            evaluate_cel_rule(rule, schema, obj, old_node, field_path, programs)?;
+            if let Err(e) = evaluate_cel_rule(rule, schema, obj, old_node, field_path, programs) {
+                errors.push(e.error.1.message);
+                if e.halts_rules {
+                    return false;
+                }
+            }
         }
     }
 
@@ -1101,13 +1157,16 @@ fn validate_cel_rules(
             for (key, sub_schema) in props {
                 if let Some(child) = map.get(key) {
                     let child_old = old_node.and_then(|o| o.get(key));
-                    validate_cel_rules(
+                    if !collect_cel_rule_errors(
                         sub_schema,
                         child,
                         child_old,
                         &join_cr_field_path(field_path, key),
                         programs,
-                    )?;
+                        errors,
+                    ) {
+                        return false;
+                    }
                 }
             }
         }
@@ -1115,13 +1174,16 @@ fn validate_cel_rules(
         if let Some(arr) = obj.as_array() {
             for (i, item) in arr.iter().enumerate() {
                 let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
-                validate_cel_rules(
+                if !collect_cel_rule_errors(
                     items_schema,
                     item,
                     item_old,
                     &format!("{field_path}[{i}]"),
                     programs,
-                )?;
+                    errors,
+                ) {
+                    return false;
+                }
             }
         }
     }
@@ -1135,19 +1197,23 @@ fn validate_cel_rules(
     // "no such key" CEL error), not produce a meaningful pass/fail.
     if let Some(branches) = schema.get("allOf").and_then(|v| v.as_array()) {
         for branch in branches {
-            validate_cel_rules(branch, obj, old_node, field_path, programs)?;
+            if !collect_cel_rule_errors(branch, obj, old_node, field_path, programs, errors) {
+                return false;
+            }
         }
     }
     for combinator in ["oneOf", "anyOf"] {
         if let Some(branches) = schema.get(combinator).and_then(|v| v.as_array()) {
             for branch in branches {
-                if schema_branch_structurally_matches(branch, obj) {
-                    validate_cel_rules(branch, obj, old_node, field_path, programs)?;
+                if schema_branch_structurally_matches(branch, obj)
+                    && !collect_cel_rule_errors(branch, obj, old_node, field_path, programs, errors)
+                {
+                    return false;
                 }
             }
         }
     }
-    Ok(())
+    true
 }
 
 /// Best-effort check for whether `obj` conforms to `branch`, used to pick which
@@ -1231,7 +1297,7 @@ const CEL_RESERVED_WORDS: &[&str] = &[
 /// `[a-zA-Z0-9_.\-/]`) — such a field is simply unreachable from any CEL rule, matching
 /// upstream's `common.SchemaDeclType`, which silently omits it from the generated CEL
 /// struct type rather than exposing it under some fallback name.
-fn cel_escape_ident(ident: &str) -> Option<String> {
+pub(crate) fn cel_escape_ident(ident: &str) -> Option<String> {
     if ident.as_bytes().first().is_some_and(u8::is_ascii_digit) {
         return None;
     }
@@ -1270,8 +1336,10 @@ fn cel_escape_ident(ident: &str) -> Option<String> {
 /// (regardless of whether the JSON literal looks integral). Binding through serde would
 /// instead turn every positive JSON integer into `uint`, making `self.n + 1` fail with
 /// `UnsupportedBinaryOperator(add, UInt, Int)`. Unschemaed values (preserve-unknown-fields
-/// data) bind integers as `int` too, matching Go's int64 unstructured numbers; a value
-/// above `i64::MAX` has no CEL `int` form and stays `uint` rather than wrapping.
+/// data) bind integers as `int` too, matching Go's int64 unstructured numbers. A value
+/// under a declared integer schema that is not an int64 (above `i64::MAX`, or float-form
+/// like `5.0`) is an invalid-data error, as upstream's `valuesunstructured.go`; unschemaed
+/// values keep the `uint`/`double` fallback.
 ///
 /// Object keys that `schema` declares under a structural `properties` map are renamed to
 /// their CEL-escaped form (`cel_escape_ident`), so a rule can reach a reserved-word or
@@ -1287,18 +1355,28 @@ fn cel_escape_ident(ident: &str) -> Option<String> {
 /// unescapes when `schema.Properties() != nil`) — a map key literally named `namespace`
 /// is reachable only via index syntax (`self.m['namespace']`), which needs no escaping
 /// since it's a string literal, not an identifier.
-fn json_to_cel_value(schema: &serde_json::Value, value: &serde_json::Value) -> cel::Value {
+pub(crate) fn json_to_cel_value(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<cel::Value, String> {
     use serde_json::Value as J;
-    match value {
+    Ok(match value {
         J::Null => cel::Value::Null,
         J::Bool(b) => cel::Value::Bool(*b),
         J::String(s) => cel::Value::String(std::sync::Arc::new(s.clone())),
         J::Number(n) => {
-            if schema.get("type").and_then(|t| t.as_str()) == Some("number") {
-                return cel::Value::Float(n.as_f64().unwrap_or_default());
+            let schema_type = schema.get("type").and_then(|t| t.as_str());
+            if schema_type == Some("number") {
+                return Ok(cel::Value::Float(n.as_f64().unwrap_or_default()));
             }
+            let declared_integer = schema_type == Some("integer")
+                || schema.get("x-kubernetes-int-or-string") == Some(&J::Bool(true));
             if let Some(i) = n.as_i64() {
                 cel::Value::Int(i)
+            } else if declared_integer {
+                return Err(format!(
+                    "integer value {n} is not representable as a CEL int"
+                ));
             } else if let Some(u) = n.as_u64() {
                 cel::Value::UInt(u)
             } else {
@@ -1310,7 +1388,7 @@ fn json_to_cel_value(schema: &serde_json::Value, value: &serde_json::Value) -> c
             cel::Value::from(
                 arr.iter()
                     .map(|item| json_to_cel_value(items_schema, item))
-                    .collect::<Vec<_>>(),
+                    .collect::<Result<Vec<_>, _>>()?,
             )
         }
         J::Object(map) => {
@@ -1325,27 +1403,27 @@ fn json_to_cel_value(schema: &serde_json::Value, value: &serde_json::Value) -> c
                             // An unescapable field name is omitted, matching upstream: such
                             // a field is never declared in the CEL type.
                             if let Some(escaped) = cel_escape_ident(key) {
-                                out.insert(escaped, json_to_cel_value(sub_schema, v));
+                                out.insert(escaped, json_to_cel_value(sub_schema, v)?);
                             }
                         }
                         // Not a declared property (e.g. data kept only via
                         // x-kubernetes-preserve-unknown-fields) — untyped, so not reachable
                         // from a CEL rule either way; keep it rather than drop data.
                         None => {
-                            out.insert(key.clone(), json_to_cel_value(&J::Null, v));
+                            out.insert(key.clone(), json_to_cel_value(&J::Null, v)?);
                         }
                     },
                     None => {
                         out.insert(
                             key.clone(),
-                            json_to_cel_value(ap_schema.unwrap_or(&J::Null), v),
+                            json_to_cel_value(ap_schema.unwrap_or(&J::Null), v)?,
                         );
                     }
                 }
             }
             cel::Value::from(out)
         }
-    }
+    })
 }
 
 /// Wall-clock budget for evaluating a single CEL rule or `messageExpression`. Upstream
@@ -1451,19 +1529,41 @@ fn execute_cel_with_budget(
     budget: std::time::Duration,
     gate: &'static ConcurrencyGate,
 ) -> Result<Result<cel::Value, cel::ExecutionError>, CelEvalOverBudget> {
+    let program = std::sync::Arc::clone(program);
+    run_within_budget(budget, gate, move || program.execute(&cel_ctx))
+}
+
+/// Runs `work` on a dedicated thread under the same wall-clock and concurrency bounds as
+/// `execute_cel_with_budget`.
+fn run_within_budget<T: Send + 'static>(
+    budget: std::time::Duration,
+    gate: &'static ConcurrencyGate,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, CelEvalOverBudget> {
     if !gate.try_acquire() {
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
 
-    let program = std::sync::Arc::clone(program);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _guard = GateGuard(gate);
-        let result = program.execute(&cel_ctx);
-        let _ = tx.send(result);
+        let _ = tx.send(work());
     });
     rx.recv_timeout(budget)
         .map_err(|_| CelEvalOverBudget::TimedOut)
+}
+
+/// Wall-clock backstop for the cost replay, 20x the plain budget: replay work is already
+/// bounded by the counted limit, so a timeout must only fire on a stuck replay, never on a
+/// slow host or debug build (a 725-item quadratic replay takes ~750ms unoptimised).
+const CEL_COST_REPLAY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(20 * CEL_RULE_EVAL_BUDGET.as_millis() as u64);
+
+fn replay_within_budget(
+    gate: &'static ConcurrencyGate,
+    work: impl FnOnce() -> bool + Send + 'static,
+) -> Result<bool, CelEvalOverBudget> {
+    run_within_budget(CEL_COST_REPLAY_BUDGET, gate, work)
 }
 
 /// Evaluate a single `x-kubernetes-validations` entry (`{rule, message,
@@ -1481,7 +1581,7 @@ fn evaluate_cel_rule(
     old_self_value: Option<&serde_json::Value>,
     field_path: &str,
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
-) -> Result<(), crate::status::StatusError> {
+) -> Result<(), RuleFailure> {
     let Some(rule_text) = rule.get("rule").and_then(|v| v.as_str()) else {
         return Ok(());
     };
@@ -1492,35 +1592,98 @@ fn evaluate_cel_rule(
         ))
     })?;
 
-    let escaped_self = json_to_cel_value(schema, self_value);
-    let escaped_old_self = old_self_value.map(|v| json_to_cel_value(schema, v));
+    let invalid_data = |e: String| {
+        Status::unprocessable_entity(format!(
+            "{field_path}: x-kubernetes-validations rule failed to evaluate: invalid data: {e} \
+             (rule: {rule_text})"
+        ))
+    };
+    let escaped_self = json_to_cel_value(schema, self_value).map_err(invalid_data)?;
+    let escaped_old_self = old_self_value
+        .map(|v| json_to_cel_value(schema, v))
+        .transpose()
+        .map_err(invalid_data)?;
 
-    let mut cel_ctx = cel::Context::default();
-    register_cel_string_extensions(&mut cel_ctx);
-    cel_ctx.add_variable_from_value("self", escaped_self.clone());
-    if let Some(old) = &escaped_old_self {
-        cel_ctx.add_variable_from_value("oldSelf", old.clone());
+    let data_node = |value| crate::handlers::cel_cost::Node::Data {
+        value,
+        schema: Some(schema),
+    };
+    let upper_bound_cost = crate::handlers::cel_cost::estimate(
+        &program,
+        data_node(self_value),
+        old_self_value.map(data_node),
+        None,
+    );
+
+    let build_ctx = || {
+        let mut cel_ctx = cel::Context::default();
+        register_cel_extensions(&mut cel_ctx);
+        cel_ctx.add_variable_from_value("self", escaped_self.clone());
+        if let Some(old) = &escaped_old_self {
+            cel_ctx.add_variable_from_value("oldSelf", old.clone());
+        }
+        cel_ctx
+    };
+    let too_many_in_flight = || {
+        Status::unprocessable_entity(format!(
+            "{field_path}: too many x-kubernetes-validations rules are currently \
+             exceeding their evaluation time budget — rejecting to bound concurrent CEL \
+             evaluation cost, {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
+        ))
+    };
+
+    // The upper bound bills every branch and iteration, so it can exceed what the
+    // evaluator runs once `&&`, `exists` and friends stop early. Only then is the rule
+    // replayed against the real values, on a budgeted thread since a replay does the work
+    // it is measuring. A replay that cannot finish in time is itself the evidence of a
+    // runaway rule.
+    if upper_bound_cost > crate::handlers::cel_cost::CALL_COST_LIMIT {
+        let replay = (self_value.clone(), old_self_value.cloned(), schema.clone());
+        let replay_ctx = build_ctx();
+        let rule_program = std::sync::Arc::clone(&program);
+        let within_limit = replay_within_budget(&CEL_EVAL_THREAD_GATE, move || {
+            let (self_json, old_json, schema) = &replay;
+            let node = |value| crate::handlers::cel_cost::Node::Data {
+                value,
+                schema: Some(schema),
+            };
+            crate::handlers::cel_cost::estimate(
+                &rule_program,
+                node(self_json),
+                old_json.as_ref().map(node),
+                Some(&replay_ctx),
+            ) <= crate::handlers::cel_cost::CALL_COST_LIMIT
+        });
+        match within_limit {
+            Ok(true) => {}
+            Ok(false) | Err(CelEvalOverBudget::TimedOut) => {
+                return Err(RuleFailure::halting(Status::unprocessable_entity(format!(
+                    "{field_path}: Invalid value: operation cancelled: actual cost limit \
+                     exceeded: {CEL_NO_FURTHER_RULES} due to call cost exceeds limit for rule: \
+                     {rule_text}"
+                ))));
+            }
+            Err(CelEvalOverBudget::TooManyInFlight) => {
+                return Err(RuleFailure::halting(too_many_in_flight()))
+            }
+        }
     }
 
     let result = match execute_cel_with_budget(
         &program,
-        cel_ctx,
+        build_ctx(),
         CEL_RULE_EVAL_BUDGET,
         &CEL_EVAL_THREAD_GATE,
     ) {
         Err(CelEvalOverBudget::TimedOut) => {
-            return Err(Status::unprocessable_entity(format!(
+            return Err(RuleFailure::halting(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule exceeded its evaluation time \
-                 budget of {CEL_RULE_EVAL_BUDGET:?} — rejecting to bound CEL evaluation cost \
-                 (rule: {rule_text})"
-            )));
+                 budget of {CEL_RULE_EVAL_BUDGET:?} — rejecting to bound CEL evaluation cost, \
+                 {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
+            ))));
         }
         Err(CelEvalOverBudget::TooManyInFlight) => {
-            return Err(Status::unprocessable_entity(format!(
-                "{field_path}: too many x-kubernetes-validations rules are currently \
-                 exceeding their evaluation time budget — rejecting to bound concurrent CEL \
-                 evaluation cost (rule: {rule_text})"
-            )));
+            return Err(RuleFailure::halting(too_many_in_flight()))
         }
         Ok(Ok(v)) => v,
         // `oldSelf` is only meaningful on UPDATE, when the field being validated also
@@ -1537,7 +1700,8 @@ fn evaluate_cel_rule(
         Ok(Err(e)) => {
             return Err(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule failed to evaluate: {e} (rule: {rule_text})"
-            )));
+            ))
+            .into());
         }
     };
 
@@ -1547,7 +1711,8 @@ fn evaluate_cel_rule(
             return Err(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule must evaluate to a bool \
                  (rule: {rule_text}, got: {other:?})"
-            )));
+            ))
+            .into());
         }
     };
     if passed {
@@ -1567,7 +1732,8 @@ fn evaluate_cel_rule(
     };
     Err(Status::unprocessable_entity(format!(
         "{field_path}: Invalid value: {value_prefix}{detail}"
-    )))
+    ))
+    .into())
 }
 
 /// The message to report for a failed CEL rule: the CRD-declared `message`, or the
@@ -1613,7 +1779,7 @@ fn evaluate_message_expression(
 ) -> Option<String> {
     let program = resolve_cel_program(programs, expr).ok()?;
     let mut cel_ctx = cel::Context::default();
-    register_cel_string_extensions(&mut cel_ctx);
+    register_cel_extensions(&mut cel_ctx);
     cel_ctx.add_variable_from_value("self", self_value.clone());
     if let Some(old) = old_self_value {
         cel_ctx.add_variable_from_value("oldSelf", old.clone());
@@ -1643,7 +1809,7 @@ fn evaluate_message_expression(
 /// (`self.split("/")[0].size() < 253`, `gateway.networking.k8s.io_gateways.yaml` L262) or
 /// Crossplane's `self.plural == self.plural.lowerAscii()` would fail every CR write with an
 /// "undeclared reference" CEL error instead of evaluating as the CRD author intended.
-fn register_cel_string_extensions(ctx: &mut cel::Context) {
+fn register_cel_extensions(ctx: &mut cel::Context) {
     ctx.add_function("split", cel_split)
         .expect("string extension name must not collide with a cel builtin");
     ctx.add_function("lowerAscii", cel_lower_ascii)
@@ -1654,6 +1820,137 @@ fn register_cel_string_extensions(ctx: &mut cel::Context) {
         .expect("string extension name must not collide with a cel builtin");
     ctx.add_function("join", cel_join)
         .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("isSorted", cel_is_sorted)
+        .expect("list extension name must not collide with a cel builtin");
+    ctx.add_function("sum", cel_sum)
+        .expect("list extension name must not collide with a cel builtin");
+    ctx.add_function("min", cel_min)
+        .expect("list extension name must not collide with a cel builtin");
+    ctx.add_function("max", cel_max)
+        .expect("list extension name must not collide with a cel builtin");
+}
+
+fn cel_list_receiver(
+    this: cel::Value,
+    function: &str,
+) -> Result<std::sync::Arc<Vec<cel::Value>>, cel::ExecutionError> {
+    match this {
+        cel::Value::List(items) => Ok(items),
+        _ => Err(cel::ExecutionError::function_error(
+            function,
+            "target is not a list",
+        )),
+    }
+}
+
+/// Orders two list elements of the same comparable CEL type, as cel-go's `<` does.
+fn cel_cmp_elements(
+    a: &cel::Value,
+    b: &cel::Value,
+    function: &str,
+) -> Result<std::cmp::Ordering, cel::ExecutionError> {
+    use cel::Value as V;
+    let ord = match (a, b) {
+        (V::Int(a), V::Int(b)) => a.partial_cmp(b),
+        (V::UInt(a), V::UInt(b)) => a.partial_cmp(b),
+        (V::Float(a), V::Float(b)) => a.partial_cmp(b),
+        (V::String(a), V::String(b)) => a.partial_cmp(b),
+        (V::Bytes(a), V::Bytes(b)) => a.partial_cmp(b),
+        (V::Bool(a), V::Bool(b)) => a.partial_cmp(b),
+        (V::Duration(a), V::Duration(b)) => a.partial_cmp(b),
+        (V::Timestamp(a), V::Timestamp(b)) => a.partial_cmp(b),
+        _ => None,
+    };
+    ord.ok_or_else(|| {
+        cel::ExecutionError::function_error(
+            function,
+            format!("list elements are not mutually comparable: {a:?}, {b:?}"),
+        )
+    })
+}
+
+/// `list.isSorted()` — Kubernetes' CEL lists library: true when elements are in
+/// non-decreasing order; empty and single-element lists are sorted.
+fn cel_is_sorted(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    let items = cel_list_receiver(this, "isSorted")?;
+    for pair in items.windows(2) {
+        if cel_cmp_elements(&pair[0], &pair[1], "isSorted")?.is_gt() {
+            return Ok(cel::Value::Bool(false));
+        }
+    }
+    Ok(cel::Value::Bool(true))
+}
+
+/// `list.sum()` over ints, uints, doubles or durations; the sum of an empty list is 0.
+fn cel_sum(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    use cel::Value as V;
+    let items = cel_list_receiver(this, "sum")?;
+    let overflow = || cel::ExecutionError::function_error("sum", "return error for overflow");
+    let mut iter = items.iter();
+    let Some(first) = iter.next() else {
+        return Ok(V::Int(0));
+    };
+    let mut acc = first.clone();
+    for item in iter {
+        acc = match (&acc, item) {
+            (V::Int(a), V::Int(b)) => V::Int(a.checked_add(*b).ok_or_else(overflow)?),
+            (V::UInt(a), V::UInt(b)) => V::UInt(a.checked_add(*b).ok_or_else(overflow)?),
+            (V::Float(a), V::Float(b)) => V::Float(a + b),
+            (V::Duration(a), V::Duration(b)) => V::Duration(a.checked_add(b).ok_or_else(overflow)?),
+            _ => {
+                return Err(cel::ExecutionError::function_error(
+                    "sum",
+                    format!("cannot sum {acc:?} and {item:?}"),
+                ));
+            }
+        };
+    }
+    if !matches!(acc, V::Int(_) | V::UInt(_) | V::Float(_) | V::Duration(_)) {
+        return Err(cel::ExecutionError::function_error(
+            "sum",
+            "list elements must be numbers or durations",
+        ));
+    }
+    Ok(acc)
+}
+
+fn cel_extremum(
+    this: cel::Value,
+    function: &str,
+    keep_candidate: fn(std::cmp::Ordering) -> bool,
+) -> Result<cel::Value, cel::ExecutionError> {
+    let items = cel_list_receiver(this, function)?;
+    let mut iter = items.iter();
+    let Some(mut best) = iter.next() else {
+        return Err(cel::ExecutionError::function_error(
+            function,
+            format!("{function} called on empty list"),
+        ));
+    };
+    for item in iter {
+        if keep_candidate(cel_cmp_elements(item, best, function)?) {
+            best = item;
+        }
+    }
+    Ok(best.clone())
+}
+
+/// `list.min()` — Kubernetes' CEL lists library; an empty list is an error.
+fn cel_min(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    cel_extremum(this, "min", std::cmp::Ordering::is_lt)
+}
+
+/// `list.max()` — Kubernetes' CEL lists library; an empty list is an error.
+fn cel_max(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    cel_extremum(this, "max", std::cmp::Ordering::is_gt)
 }
 
 fn cel_split(
@@ -11855,7 +12152,7 @@ mod tests {
     fn eval_cel_bool(expr: &str) -> bool {
         let program = cel::Program::compile(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
         let mut ctx = cel::Context::default();
-        register_cel_string_extensions(&mut ctx);
+        register_cel_extensions(&mut ctx);
         match program.execute(&ctx) {
             Ok(cel::Value::Bool(b)) => b,
             other => panic!("{expr} did not evaluate to a bool: {other:?}"),
@@ -11913,6 +12210,248 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cel_lists_library_is_sorted_and_sum_evaluate_the_upstream_crd_validation_rule() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "firstArray": { "type": "array", "maxItems": 1000, "items": { "type": "integer" } },
+                "secondArray": { "type": "array", "maxItems": 1000, "items": { "type": "integer" } }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "self.firstArray.isSorted() && self.secondArray.isSorted() && \
+                         ((self.firstArray.sum() + self.secondArray.sum()) % 2 == 0)"
+            }]
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "firstArray": [3, 4], "secondArray": [5, 10] }),
+                schema.clone()
+            )
+            .is_ok(),
+            "isSorted()/sum() must resolve, or every CR using the k8s lists library is rejected \
+             with 'Undeclared reference'"
+        );
+        assert!(
+            check_schema(
+                &serde_json::json!({ "firstArray": [4, 3], "secondArray": [5, 10] }),
+                schema
+            )
+            .is_err(),
+            "an unsorted list must still fail the rule"
+        );
+    }
+
+    fn quadratic_rule_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [
+                    { "rule": "self.x + self.y > 0" },
+                    { "rule": "self.largeArray.all(x, self.largeArray.all(y, y == x))" }
+                ],
+                "properties": {
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "largeArray": { "type": "array", "maxItems": 725, "items": { "type": "integer" } }
+                }
+            } }
+        })
+    }
+
+    #[test]
+    fn cel_rule_over_large_data_is_rejected_with_call_cost_exceeds_limit_not_only_a_missing_key() {
+        let obj = serde_json::json!({ "spec": { "largeArray": vec![20; 725] } });
+        let err = check_schema(&obj, quadratic_rule_schema()).unwrap_err();
+        assert!(
+            err.1.message.contains("call cost exceeds limit"),
+            "an O(n^2) rule over 725 items must trip the runtime cost limit so a hostile CR \
+             cannot burn CPU on every write: {}",
+            err.1.message
+        );
+        assert!(
+            err.1.message.contains("No such key: x"),
+            "every failing rule is reported, as upstream aggregates errors: {}",
+            err.1.message
+        );
+    }
+
+    /// The 725-item rule must be rejected by the counted verdict, not the wall-clock
+    /// backstop, or the verdict would depend on host speed.
+    #[test]
+    fn replay_of_725_item_quadratic_rule_is_over_limit_by_count_not_by_timeout() {
+        let schema = quadratic_rule_schema();
+        let spec = &schema["properties"]["spec"];
+        let data = serde_json::json!({ "largeArray": vec![20; 725] });
+        let program = std::sync::Arc::new(
+            cel::Program::compile("self.largeArray.all(x, self.largeArray.all(y, y == x))")
+                .unwrap(),
+        );
+        let mut ctx = cel::Context::default();
+        register_cel_extensions(&mut ctx);
+        ctx.add_variable_from_value("self", json_to_cel_value(spec, &data).unwrap());
+        let (data, spec) = (data.clone(), spec.clone());
+        let verdict = replay_within_budget(&CEL_EVAL_THREAD_GATE, move || {
+            let node = crate::handlers::cel_cost::Node::Data {
+                value: &data,
+                schema: Some(&spec),
+            };
+            crate::handlers::cel_cost::estimate(&program, node, None, Some(&ctx))
+                <= crate::handlers::cel_cost::CALL_COST_LIMIT
+        });
+        assert!(
+            matches!(verdict, Ok(false)),
+            "an over-limit rule must be decided by the counted cost, not a timeout"
+        );
+    }
+
+    /// A replay slower than the plain evaluation budget but under its own must not be
+    /// reported as over the cost limit, or a slow host rejects CRs whose counted cost is fine.
+    #[test]
+    fn replay_slower_than_plain_budget_is_not_misreported_as_over_cost_limit() {
+        let verdict = replay_within_budget(&CEL_EVAL_THREAD_GATE, || {
+            std::thread::sleep(CEL_RULE_EVAL_BUDGET + std::time::Duration::from_millis(100));
+            true
+        });
+        assert!(matches!(verdict, Ok(true)));
+    }
+
+    #[test]
+    fn cel_rule_over_small_data_with_the_same_quadratic_rule_still_evaluates() {
+        let obj = serde_json::json!({ "spec": { "x": 1, "y": 0, "largeArray": [2, 2] } });
+        assert!(
+            check_schema(&obj, quadratic_rule_schema()).is_ok(),
+            "the runtime cost limit must depend on the actual list size, not the schema bound"
+        );
+    }
+
+    fn grid_schema(rule: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [{ "rule": rule }],
+                "properties": {
+                    "skip": { "type": "boolean" },
+                    "rows": {
+                        "type": "array", "maxItems": 1000,
+                        "items": {
+                            "type": "array", "maxItems": 1000,
+                            "items": { "type": "string", "maxLength": 4 }
+                        }
+                    }
+                }
+            } }
+        })
+    }
+
+    fn grid(first_cell: &str) -> Vec<Vec<String>> {
+        (0..1000)
+            .map(|_| {
+                std::iter::once(first_cell.to_string())
+                    .chain((1..1000).map(|_| "y".to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Upstream bills only the iterations an `exists` actually runs, so a CR whose match
+    /// is found immediately must not be refused for the million cells it never visits.
+    #[test]
+    fn exists_that_finds_its_match_on_the_first_row_is_not_billed_for_the_whole_grid() {
+        let obj = serde_json::json!({ "spec": { "rows": grid("x") } });
+        let schema = grid_schema("self.rows.exists(r, r.exists(c, c == 'x'))");
+        let result = check_schema(&obj, schema);
+        assert!(
+            result.is_ok(),
+            "a rule upstream evaluates in a handful of steps must not hit the call cost limit: {:?}",
+            result.err().map(|e| e.1.message)
+        );
+    }
+
+    /// The same rule with no match visits every cell, which is over the limit upstream too;
+    /// accepting early exits must not turn into accepting everything.
+    #[test]
+    fn exists_that_scans_the_whole_grid_still_exceeds_the_call_cost_limit() {
+        let obj = serde_json::json!({ "spec": { "rows": grid("z") } });
+        let schema = grid_schema("self.rows.exists(r, r.exists(c, c == 'x'))");
+        let err = check_schema(&obj, schema).unwrap_err();
+        assert!(
+            err.1.message.contains("call cost exceeds limit"),
+            "{}",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn short_circuited_or_does_not_bill_the_expensive_right_hand_side() {
+        let obj = serde_json::json!({ "spec": { "skip": true, "rows": grid("z") } });
+        let schema = grid_schema("self.skip || self.rows.all(r, r.all(c, c == 'x'))");
+        assert!(
+            check_schema(&obj, schema).is_ok(),
+            "upstream never evaluates the right side of a true `||`, so it costs nothing"
+        );
+    }
+
+    #[test]
+    fn ternary_bills_only_the_branch_taken() {
+        let obj = serde_json::json!({ "spec": { "skip": true, "rows": grid("z") } });
+        let schema = grid_schema("self.skip ? true : self.rows.all(r, r.all(c, c == 'x'))");
+        assert!(check_schema(&obj, schema).is_ok());
+    }
+
+    /// The failure text embeds the author's rule and message; a rule that merely quotes
+    /// upstream's stop phrase must not end the walk and hide later violations.
+    #[test]
+    fn rule_text_quoting_the_stop_phrase_does_not_halt_later_rules() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "x-kubernetes-validations": [
+                { "rule": "self.a == 'no further validation rules will be run'" },
+                { "rule": "self.b > 0", "message": "b must be positive" }
+            ],
+            "properties": { "a": { "type": "string" }, "b": { "type": "integer" } }
+        });
+        let err = check_schema(&serde_json::json!({ "a": "x", "b": 0 }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("b must be positive"),
+            "an ordinary failing rule must not suppress the rules after it: {}",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn cel_rule_failures_across_rules_are_all_reported_in_one_422() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "x-kubernetes-validations": [
+                { "rule": "self.a > 0", "message": "a must be positive" },
+                { "rule": "self.b > 0", "message": "b must be positive" }
+            ],
+            "properties": { "a": { "type": "integer" }, "b": { "type": "integer" } }
+        });
+        let err = check_schema(&serde_json::json!({ "a": 0, "b": 0 }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("a must be positive")
+                && err.1.message.contains("b must be positive"),
+            "a user fixing one violation must see the others in the same response: {}",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn cel_lists_library_min_max_and_empty_list_semantics_match_kubernetes() {
+        assert!(eval_cel_bool(
+            "[3, 1, 2].min() == 1 && [3, 1, 2].max() == 3 && ['b', 'a'].min() == 'a' \
+             && [].isSorted() && [1.5, 2.5].sum() == 4.0 && [].sum() == 0 && ![2, 1].isSorted()"
+        ));
+        assert!(
+            eval_cel("[].min()", &[]).is_err(),
+            "min() of an empty list is an error in the k8s lists library, not a silent default"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Evaluation semantics pinned across the cel 0.14 -> 0.15 bump, where each
     // behaviour must match Kubernetes' CEL (cel-go) rather than whatever the
@@ -11927,7 +12466,7 @@ mod tests {
     ) -> Result<cel::Value, cel::ExecutionError> {
         let program = cel::Program::compile(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
         let mut ctx = cel::Context::default();
-        register_cel_string_extensions(&mut ctx);
+        register_cel_extensions(&mut ctx);
         for (name, value) in vars {
             ctx.add_variable(*name, value).unwrap();
         }
@@ -12044,14 +12583,25 @@ mod tests {
         );
     }
 
-    // Above i64::MAX there is no CEL int; binding stays uint (never wraps negative), so a
-    // rule mixing it with int arithmetic errors and the CR is rejected, fail-closed.
     #[test]
-    fn cel_integer_above_int64_max_binds_as_uint_instead_of_wrapping_negative() {
+    fn cel_integer_above_int64_max_is_invalid_data_not_a_uint_binding() {
         let schema = int_rule_schema("dyn(self.n) > 0 && type(self.n) == uint");
+        let err = check_schema(&serde_json::json!({ "n": u64::MAX }), schema)
+            .expect_err("a schema-integer above int64 max must fail like upstream, not bind uint");
         assert!(
-            check_schema(&serde_json::json!({ "n": u64::MAX }), schema).is_ok(),
-            "a value above int64 max must stay uint, not wrap to a negative int"
+            format!("{err:?}").contains("invalid data"),
+            "the failure must be the invalid-data error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cel_integer_field_with_float_form_literal_is_invalid_data_not_a_double_binding() {
+        let schema = int_rule_schema("type(self.n) == double");
+        let err = check_schema(&serde_json::json!({ "n": 5.0 }), schema)
+            .expect_err("a schema-integer given as 5.0 must fail like upstream, not bind double");
+        assert!(
+            format!("{err:?}").contains("invalid data"),
+            "the failure must be the invalid-data error, got {err:?}"
         );
     }
 
@@ -12650,11 +13200,13 @@ mod tests {
                     "type": "array",
                     "items": { "type": "integer" },
                     "x-kubernetes-validations": [
-                        { "rule": "self.all(x, self.all(y, x + y >= 0))" }
+                        { "rule": "(self + []).all(x, (self + []).all(y, x + y >= 0))" }
                     ]
                 }
             }
         });
+        // The `(self + [])` ranges hide the list from the static cost estimator, so this
+        // exercises the wall-clock backstop for rules the estimator cannot size.
         // Calibrated to take ~4s to run to completion uninstrumented (n=2000, 4,000,000
         // comprehension steps) — comfortably over CEL_RULE_EVAL_BUDGET (250ms) even on
         // slower CI hardware, while the abandoned evaluation thread never blocks this test.
