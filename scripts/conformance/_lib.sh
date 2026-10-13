@@ -62,6 +62,21 @@ node_suffix_for() {
   esac
 }
 
+# Fail loud when an EXISTING VM's baked kubelet hostPort forward differs from
+# the requested kubelet port. The forward is fixed at VM creation; a mismatch
+# leaves watch/list/get working while kubectl exec/logs/attach silently reach
+# the wrong (or no) kubelet. A VM that doesn't exist yet is fine: first
+# provision bakes the requested port in.
+assert_kubelet_port_matches_vm() {
+  local vm="$1" requested="$2" live
+  [ -d "${LIMA_HOME:-$HOME/.lima}/$vm" ] || return 0
+  live=$("$(dirname "${BASH_SOURCE[0]}")/lima-kubelet-port.sh" "$vm") || return 1
+  if [ "$live" != "$requested" ]; then
+    echo "error: $vm forwards guest 10250 to host $live, but --kubelet-port=$requested was passed; pass --kubelet-port $live or reprovision" >&2
+    return 1
+  fi
+}
+
 # Rig-only SSH credential for the e2e framework's SSH-to-node helpers
 # ([Disruptive] kubelet-down specs). Both lima-start.sh (generates + authorizes)
 # and 06-run-sonobuoy.sh (ships to the e2e pod) derive the path from the
