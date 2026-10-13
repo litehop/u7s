@@ -561,6 +561,30 @@ fn default_storageclass(obj: &mut serde_json::Value) {
 ///
 /// Idempotent: an existing status.phase (e.g. "Terminating", stamped by delete) is
 /// never overwritten.
+/// Create-time Namespace preparation shared by POST, SSA apply-create and seeding: appends the
+/// `kubernetes` finalizer to `spec.finalizers` when absent, mirroring upstream's
+/// `namespaceStrategy.PrepareForCreate`. It must not live in `apply_defaults` (which also runs
+/// on reads) because the finalizer is removed over the object's life. Without it, DELETE on a
+/// finalizer-less namespace hard-deletes and orphans its content.
+pub fn prepare_namespace_for_create(obj: &mut serde_json::Value) -> Result<(), String> {
+    let mut spec: crate::types::NamespaceSpec =
+        crate::types::NamespaceSpec::deserialize(&obj["spec"]).unwrap_or_default();
+    let has_k8s = spec
+        .finalizers
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .any(|f| f == "kubernetes");
+    if !has_k8s {
+        spec.finalizers
+            .get_or_insert_with(Vec::new)
+            .push("kubernetes".to_owned());
+        obj["spec"] = serde_json::to_value(spec)
+            .map_err(|e| format!("failed to serialize NamespaceSpec: {e}"))?;
+    }
+    Ok(())
+}
+
 fn default_namespace(obj: &mut serde_json::Value) {
     let mut status: crate::types::NamespaceStatus =
         crate::types::NamespaceStatus::deserialize(std::mem::take(&mut obj["status"]))

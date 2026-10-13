@@ -1471,6 +1471,10 @@ pub(crate) async fn do_patch<S: Store>(
             &mut obj.body,
         )?;
         super::defaults::apply_defaults(group, plural, &mut obj.body);
+        if group.is_empty() && plural == "namespaces" {
+            super::defaults::prepare_namespace_for_create(&mut obj.body)
+                .map_err(Status::internal)?;
+        }
         super::defaults::validate_resource(group, plural, &obj.body)
             .map_err(Status::unprocessable_entity)?;
         // Escalation prevention: SSA-create is a create just like create_resource /

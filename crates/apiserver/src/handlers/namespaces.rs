@@ -178,30 +178,8 @@ pub(crate) async fn create_namespace<S: Store>(
     crate::handlers::generic::clear_create_status(true, "v1", "Namespace", &mut obj.body)?;
     crate::handlers::defaults::apply_defaults("", "namespaces", &mut obj.body);
 
-    // Stamp the "kubernetes" finalizer into spec.finalizers at creation time.
-    //
-    // Kubernetes namespace finalizers live in spec.finalizers, not metadata.finalizers.
-    // The upstream KCM namespace controller reads spec.finalizers to decide whether to
-    // drain a namespace before hard-deleting it. Stamping at creation (rather than
-    // relying on an async controller ADDED event) ensures every namespace always goes
-    // through the drain lifecycle even if the controller is behind.
-    {
-        let mut spec: NamespaceSpec =
-            NamespaceSpec::deserialize(&obj.body["spec"]).unwrap_or_default();
-        let has_k8s = spec
-            .finalizers
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .any(|f| f == "kubernetes");
-        if !has_k8s {
-            spec.finalizers
-                .get_or_insert_with(Vec::new)
-                .push("kubernetes".to_owned());
-            obj.body["spec"] = serde_json::to_value(spec)
-                .map_err(|e| Status::internal(format!("failed to serialize NamespaceSpec: {e}")))?;
-        }
-    }
+    crate::handlers::defaults::prepare_namespace_for_create(&mut obj.body)
+        .map_err(Status::internal)?;
 
     // Assign a UID if none provided — required for owner references and garbage collection.
     {
@@ -3520,7 +3498,10 @@ mod tests {
         let body = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Namespace",
-            "metadata": { "name": "no-cascade-ns", "uid": "u-1", "resourceVersion": "1" },
+            "metadata": {
+                "name": "no-cascade-ns", "uid": "u-1", "resourceVersion": "1", "finalizers": []
+            },
+            "spec": { "finalizers": [] },
             "status": { "phase": "Active" }
         });
         state
@@ -3558,7 +3539,8 @@ mod tests {
 
         assert!(
             state.store.get(&ns_key).await.unwrap().is_none(),
-            "the namespace itself is removed at once when it carries no spec.finalizers"
+            "the namespace itself is removed at once when both spec.finalizers and \
+             metadata.finalizers are empty"
         );
         assert!(
             state.store.get(cm_key).await.unwrap().is_some(),
@@ -5800,6 +5782,67 @@ mod tests {
             "conditions must be durably persisted to the store, not merely echoed back \
              in the PUT response"
         );
+    }
+
+    // `kubectl apply --server-side` on a new namespace goes through the SSA create-on-missing
+    // path, not create_namespace. If that path skips the "kubernetes" finalizer, a later DELETE
+    // hard-deletes the namespace and orphans every object in it, because no namespace
+    // controller ever sees a Terminating phase to drain.
+    #[tokio::test]
+    async fn ssa_apply_created_namespace_soft_deletes_so_controller_can_drain_it() {
+        use u7s_store::Store;
+        let state = make_state();
+
+        let patch = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "ssa-new-ns" }
+        });
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+        patch_namespace(
+            State(state.clone()),
+            Path("ssa-new-ns".to_string()),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("kubectl".to_string()),
+                _field_validation: None,
+                dry_run: None,
+            }),
+            test_user(),
+            ssa_headers,
+            Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SSA apply-create of a Namespace must succeed: {:?}", e.0));
+
+        let key = crate::keys::cluster_object_key("namespaces", "ssa-new-ns");
+        let stored = state.store.get(&key).await.unwrap().expect("created");
+        let created: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            created["spec"]["finalizers"],
+            serde_json::json!(["kubernetes"]),
+            "SSA apply-create must stamp spec.finalizers like POST does"
+        );
+
+        delete_namespace(
+            State(state.clone()),
+            Path("ssa-new-ns".to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
+
+        let stored = state.store.get(&key).await.unwrap().expect(
+            "namespace must still exist (Terminating) so the namespace controller can drain it",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["status"]["phase"], "Terminating");
+        assert!(v["metadata"]["deletionTimestamp"].is_string());
     }
 
     // SSA PATCH on Namespace must return a non-empty JSON body with the full object.

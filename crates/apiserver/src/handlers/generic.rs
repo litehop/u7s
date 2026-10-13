@@ -802,14 +802,14 @@ pub(crate) fn build_list_response(
 pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
     let is_namespace = obj.body["kind"].as_str() == Some("Namespace");
 
-    // Namespace finalizers live in spec.finalizers; all other resources use metadata.finalizers.
-    let has_finalizers = if is_namespace {
+    let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
+    let mut has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+    // Namespaces additionally carry spec.finalizers; upstream's namespace Delete removes
+    // immediately only when both lists are empty.
+    if is_namespace {
         let spec: NamespaceSpec = NamespaceSpec::deserialize(&obj.body["spec"]).unwrap_or_default();
-        spec.finalizers.as_ref().is_some_and(|f| !f.is_empty())
-    } else {
-        let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
-        meta.finalizers.as_ref().is_some_and(|f| !f.is_empty())
-    };
+        has_finalizers |= spec.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+    }
 
     if has_finalizers {
         // Soft delete: stamp deletionTimestamp, but only if it isn't already set. Real
@@ -4409,6 +4409,29 @@ mod apply_delete_policy_tests {
         assert!(
             body["metadata"]["deletionTimestamp"].as_str().is_some(),
             "deletionTimestamp must also be stamped on soft-delete"
+        );
+    }
+
+    /// A Namespace carrying only metadata.finalizers must still soft-delete: upstream removes a
+    /// namespace immediately only when BOTH finalizer lists are empty, and hard-deleting here
+    /// would orphan content and bypass whichever controller owns that finalizer.
+    #[test]
+    fn namespace_with_only_metadata_finalizers_is_soft_deleted_and_both_empty_is_not() {
+        let mut obj = Object {
+            body: serde_json::json!({
+                "kind": "Namespace", "apiVersion": "v1",
+                "metadata": { "name": "t", "finalizers": ["x.io/keep"] },
+                "spec": { "finalizers": [] }
+            }),
+        };
+        let body = apply_delete_policy(&mut obj)
+            .expect("metadata.finalizers alone must force a soft-delete");
+        assert_eq!(body["status"]["phase"].as_str(), Some("Terminating"));
+
+        let mut empty = make_obj("Namespace", &[]);
+        assert!(
+            apply_delete_policy(&mut empty).is_none(),
+            "namespace with both finalizer lists empty is removed immediately"
         );
     }
 
