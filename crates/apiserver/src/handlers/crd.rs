@@ -272,16 +272,8 @@ fn validate_crd_schema(
         };
         let path = format!("spec.versions[{}].schema.openAPIV3Schema", version.name);
         walk_schema_dos_bounds(schema, &path)?;
-        let old_schema = stored.and_then(|s| {
-            s["spec"]["versions"]
-                .as_array()?
-                .iter()
-                .find(|v| v["name"] == version.name.as_str())
-                .map(|v| &v["schema"])
-        });
         let ratchet = crate::handlers::cel_rules::Ratchet {
             preexisting: stored.map(|_| &preexisting),
-            suppress_rule_cost: old_schema.is_some() && old_schema == version.schema.as_ref(),
         };
         crate::handlers::cel_rules::check_schema_rules(schema, &path, true, &ratchet)?;
     }
@@ -4812,12 +4804,29 @@ mod ratchet_tests {
         assert!(!put(&state, body).await);
     }
 
-    /// Per-rule cost is only suppressed for an unchanged schema; a new expensive rule is refused.
+    /// Editing one rule must not re-reject a different stored over-limit rule in the same
+    /// version, or an operator cannot fix a small thing in a CRD that already shipped.
+    #[tokio::test]
+    async fn editing_another_rule_keeps_stored_over_limit_rule() {
+        let state = make_state();
+        let rv = seed_with_legacy_rules(&state, legacy_schema()).await;
+        let edited = schema_with_rules(
+            json!([{ "rule": "self.nope == 1" }, { "rule": "true" }]),
+            json!([expensive_rule()]),
+        );
+        let body = crd_body(&rv, json!({}), json!([version("v1", edited)]));
+        assert!(put(&state, body).await);
+    }
+
+    /// A new over-limit rule is refused even when the version also carries a stored one.
     #[tokio::test]
     async fn newly_added_expensive_rule_is_still_rejected_on_update() {
         let state = make_state();
-        let rv = seed_with_legacy_rules(&state, schema_with_rules(json!([]), json!([]))).await;
-        let costly = schema_with_rules(json!([]), json!([expensive_rule()]));
+        let rv = seed_with_legacy_rules(&state, legacy_schema()).await;
+        let costly = schema_with_rules(
+            json!([{ "rule": "self.nope == 1" }]),
+            json!([expensive_rule(), { "rule": "self.all(s, s == 'another constant')" }]),
+        );
         let body = crd_body(&rv, json!({}), json!([version("v1", costly)]));
         assert!(!put(&state, body).await);
     }

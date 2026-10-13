@@ -259,12 +259,10 @@ pub(crate) fn collect_expressions(value: &J, out: &mut std::collections::HashSet
 }
 
 /// What an update inherits from the stored CRD: expressions already present are not
-/// re-failed on compile errors, and a version whose schema is unchanged is exempt from the
-/// per-rule cost limit. The CRD-wide total still applies.
+/// re-failed on compile errors or the per-rule cost limit. The CRD-wide total still applies.
 #[derive(Default)]
 pub(crate) struct Ratchet<'a> {
     pub preexisting: Option<&'a std::collections::HashSet<String>>,
-    pub suppress_rule_cost: bool,
 }
 
 /// Rejects a CRD `openAPIV3Schema` whose `x-kubernetes-validations` rules or
@@ -327,7 +325,9 @@ fn check_node(
                 let cost =
                     cel_cost::estimate(&program, node, Some(node), None).saturating_mul(instances);
                 *total_cost = total_cost.saturating_add(cost);
-                if cost > cel_cost::STATIC_COST_LIMIT && !ratchet.suppress_rule_cost {
+                if cost > cel_cost::STATIC_COST_LIMIT
+                    && !ratchet.preexisting.is_some_and(|p| p.contains(src))
+                {
                     let name = if key == "rule" {
                         "estimated rule cost"
                     } else {

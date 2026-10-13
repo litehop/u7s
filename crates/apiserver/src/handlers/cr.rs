@@ -1553,6 +1553,19 @@ fn run_within_budget<T: Send + 'static>(
         .map_err(|_| CelEvalOverBudget::TimedOut)
 }
 
+/// Wall-clock backstop for the cost replay, a multiple of `CEL_RULE_EVAL_BUDGET` because the
+/// replay's per-level work in nested comprehensions is about double a plain evaluation;
+/// the counted cost verdict, not this timeout, is what decides a rule is over the limit.
+const CEL_COST_REPLAY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(4 * CEL_RULE_EVAL_BUDGET.as_millis() as u64);
+
+fn replay_within_budget(
+    gate: &'static ConcurrencyGate,
+    work: impl FnOnce() -> bool + Send + 'static,
+) -> Result<bool, CelEvalOverBudget> {
+    run_within_budget(CEL_COST_REPLAY_BUDGET, gate, work)
+}
+
 /// Evaluate a single `x-kubernetes-validations` entry (`{rule, message,
 /// messageExpression, reason, fieldPath, optionalOldSelf}`, per the CRD-storage
 /// round-trip in `apiextensions_gen_adapter.rs`) against `self_value`, optionally
@@ -1628,20 +1641,19 @@ fn evaluate_cel_rule(
         let replay = (self_value.clone(), old_self_value.cloned(), schema.clone());
         let replay_ctx = build_ctx();
         let rule_program = std::sync::Arc::clone(&program);
-        let within_limit =
-            run_within_budget(CEL_RULE_EVAL_BUDGET, &CEL_EVAL_THREAD_GATE, move || {
-                let (self_json, old_json, schema) = &replay;
-                let node = |value| crate::handlers::cel_cost::Node::Data {
-                    value,
-                    schema: Some(schema),
-                };
-                crate::handlers::cel_cost::estimate(
-                    &rule_program,
-                    node(self_json),
-                    old_json.as_ref().map(node),
-                    Some(&replay_ctx),
-                ) <= crate::handlers::cel_cost::CALL_COST_LIMIT
-            });
+        let within_limit = replay_within_budget(&CEL_EVAL_THREAD_GATE, move || {
+            let (self_json, old_json, schema) = &replay;
+            let node = |value| crate::handlers::cel_cost::Node::Data {
+                value,
+                schema: Some(schema),
+            };
+            crate::handlers::cel_cost::estimate(
+                &rule_program,
+                node(self_json),
+                old_json.as_ref().map(node),
+                Some(&replay_ctx),
+            ) <= crate::handlers::cel_cost::CALL_COST_LIMIT
+        });
         match within_limit {
             Ok(true) => {}
             Ok(false) | Err(CelEvalOverBudget::TimedOut) => {
@@ -12263,6 +12275,46 @@ mod tests {
             "every failing rule is reported, as upstream aggregates errors: {}",
             err.1.message
         );
+    }
+
+    /// The 725-item rule must be rejected by the counted verdict, not the wall-clock
+    /// backstop, or the verdict would depend on host speed.
+    #[test]
+    fn replay_of_725_item_quadratic_rule_is_over_limit_by_count_not_by_timeout() {
+        let schema = quadratic_rule_schema();
+        let spec = &schema["properties"]["spec"];
+        let data = serde_json::json!({ "largeArray": vec![20; 725] });
+        let program = std::sync::Arc::new(
+            cel::Program::compile("self.largeArray.all(x, self.largeArray.all(y, y == x))")
+                .unwrap(),
+        );
+        let mut ctx = cel::Context::default();
+        register_cel_extensions(&mut ctx);
+        ctx.add_variable_from_value("self", json_to_cel_value(spec, &data).unwrap());
+        let (data, spec) = (data.clone(), spec.clone());
+        let verdict = replay_within_budget(&CEL_EVAL_THREAD_GATE, move || {
+            let node = crate::handlers::cel_cost::Node::Data {
+                value: &data,
+                schema: Some(&spec),
+            };
+            crate::handlers::cel_cost::estimate(&program, node, None, Some(&ctx))
+                <= crate::handlers::cel_cost::CALL_COST_LIMIT
+        });
+        assert!(
+            matches!(verdict, Ok(false)),
+            "an over-limit rule must be decided by the counted cost, not a timeout"
+        );
+    }
+
+    /// A replay slower than the plain evaluation budget but under its own must not be
+    /// reported as over the cost limit, or a slow host rejects CRs whose counted cost is fine.
+    #[test]
+    fn replay_slower_than_plain_budget_is_not_misreported_as_over_cost_limit() {
+        let verdict = replay_within_budget(&CEL_EVAL_THREAD_GATE, || {
+            std::thread::sleep(CEL_RULE_EVAL_BUDGET + std::time::Duration::from_millis(100));
+            true
+        });
+        assert!(matches!(verdict, Ok(true)));
     }
 
     #[test]
