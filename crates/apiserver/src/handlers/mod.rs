@@ -9,6 +9,9 @@ pub mod csr;
 pub mod defaults;
 pub mod device_taint_rule;
 pub mod discovery;
+pub mod field_selector;
+#[cfg(test)]
+mod field_selector_tests;
 pub mod generic;
 pub mod json_patch;
 pub mod metrics;

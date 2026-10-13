@@ -14,7 +14,7 @@ use crate::{
         LabelSelector,
     },
     auth::UserInfo,
-    handlers::generic::validate_path_segment,
+    handlers::{field_selector::FieldSelector, generic::validate_path_segment},
     keys::{cluster_object_key, group_list_prefix, group_object_key, list_prefix, object_key},
     limit_range::parse_quantity,
     state::AppState,
@@ -49,29 +49,6 @@ pub struct CollectionQuery {
     pub timeout_seconds: Option<u64>,
 }
 
-/// Extract a store-level FieldSelector from a raw field selector string.
-/// Picks the first equality (`=`) term that is not a negation (`!=`).
-/// Returns None if no equality term is present or the string is empty.
-pub(crate) fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
-    sel.split(',').find_map(|term| {
-        let term = term.trim();
-        if !term.contains("!=") {
-            term.split_once('=').and_then(|(field, value)| {
-                if field.is_empty() {
-                    return None;
-                }
-                Some(u7s_store::FieldSelector {
-                    field: field.to_string(),
-                    value: value.to_string(),
-                    negated: false,
-                })
-            })
-        } else {
-            None
-        }
-    })
-}
-
 /// Comma-joined `spec.containers[].image` for a pod, used by the list_pods debug signal so an
 /// operator can see which image(s) a pod is running without pulling the full spec.
 fn pod_container_images(pod: &serde_json::Value) -> String {
@@ -102,162 +79,6 @@ fn log_pod_list_entry(pod: &serde_json::Value) {
         image = %pod_container_images(pod),
         "pod list entry"
     );
-}
-
-/// Parse a `fieldSelector` query string and test a pod JSON value against it.
-///
-/// Supported selectors (comma-separated), matching upstream's SelectableFields
-/// in pkg/registry/core/pod/strategy.go:
-///   spec.nodeName=<value>              spec.nodeName!=<value>
-///   status.phase=<value>               status.phase!=<value>
-///   status.podIP=<value>               status.podIP!=<value>
-///   spec.restartPolicy=<value>         spec.restartPolicy!=<value>
-///   spec.serviceAccountName=<value>    spec.serviceAccountName!=<value>
-///   spec.schedulerName=<value>         spec.schedulerName!=<value>
-///   status.nominatedNodeName=<value>   status.nominatedNodeName!=<value>
-///
-/// An empty or absent selector matches everything (pass-through).
-/// Unknown selector terms are ignored (conservative: don't drop pods on unrecognised fields).
-pub(crate) fn filter_pods_by_field_selector(
-    pods: Vec<serde_json::Value>,
-    selector: &str,
-) -> Vec<serde_json::Value> {
-    if selector.is_empty() {
-        return pods;
-    }
-    pods.into_iter()
-        .filter(|pod| pod_matches_field_selector(pod, selector))
-        .collect()
-}
-
-fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
-    let node_name = pod["spec"]["nodeName"].as_str().unwrap_or("");
-    let phase = pod["status"]["phase"].as_str().unwrap_or("");
-    let pod_ip = pod["status"]["podIP"].as_str().unwrap_or("");
-    let restart_policy = pod["spec"]["restartPolicy"].as_str().unwrap_or("");
-    let service_account_name = pod["spec"]["serviceAccountName"].as_str().unwrap_or("");
-    let scheduler_name = pod["spec"]["schedulerName"].as_str().unwrap_or("");
-    let nominated_node_name = pod["status"]["nominatedNodeName"].as_str().unwrap_or("");
-    for term in selector.split(',') {
-        let term = term.trim();
-        if term.is_empty() {
-            continue;
-        }
-        if let Some((field, value)) = term.split_once("!=") {
-            if field == "spec.nodeName" && node_name == value {
-                return false;
-            }
-            if field == "status.phase" && phase == value {
-                return false;
-            }
-            if field == "status.podIP" && pod_ip == value {
-                return false;
-            }
-            if field == "spec.restartPolicy" && restart_policy == value {
-                return false;
-            }
-            if field == "spec.serviceAccountName" && service_account_name == value {
-                return false;
-            }
-            if field == "spec.schedulerName" && scheduler_name == value {
-                return false;
-            }
-            if field == "status.nominatedNodeName" && nominated_node_name == value {
-                return false;
-            }
-            // Unknown fields: ignore (don't filter out)
-        } else if let Some((field, value)) = term.split_once('=') {
-            if field == "spec.nodeName" && node_name != value {
-                return false;
-            }
-            if field == "status.phase" && phase != value {
-                return false;
-            }
-            if field == "status.podIP" && pod_ip != value {
-                return false;
-            }
-            if field == "spec.restartPolicy" && restart_policy != value {
-                return false;
-            }
-            if field == "spec.serviceAccountName" && service_account_name != value {
-                return false;
-            }
-            if field == "spec.schedulerName" && scheduler_name != value {
-                return false;
-            }
-            if field == "status.nominatedNodeName" && nominated_node_name != value {
-                return false;
-            }
-            // Unknown fields: ignore (don't filter out)
-        }
-        // Unparseable term: ignore
-    }
-    true
-}
-
-/// Filter a list of Event JSON values by a comma-separated field selector.
-///
-/// Supported fields (all equality, no negation):
-///   involvedObject.name, involvedObject.kind, involvedObject.namespace,
-///   involvedObject.uid, reason, source, reportingController
-///
-/// `source` reads core/v1 Event's `source.component`, falling back to
-/// events.k8s.io/v1's `reportingController` when `source.component` is empty —
-/// matching upstream's `ToSelectableFields` (pkg/registry/core/event/strategy.go),
-/// which applies the identical fallback so a core/v1 `fieldSelector=source=X`
-/// query still matches an Event whose only reporter identity was set via the
-/// events.k8s.io/v1 API (client-go's EventsV1 recorder never sets `source`).
-/// `reportingController` reads events.k8s.io/v1 Event's top-level field
-/// directly (no fallback — that field is defined only in that group).
-///
-/// All supplied terms are AND-evaluated: an event must match every term.
-/// An unknown field is ignored (pass-through). An event missing a constrained
-/// field does not match.
-pub(crate) fn filter_events_by_field_selector(
-    events: Vec<serde_json::Value>,
-    selector: &str,
-) -> Vec<serde_json::Value> {
-    if selector.is_empty() {
-        return events;
-    }
-    events
-        .into_iter()
-        .filter(|ev| event_matches_field_selector(ev, selector))
-        .collect()
-}
-
-fn event_matches_field_selector(ev: &serde_json::Value, selector: &str) -> bool {
-    for term in selector.split(',') {
-        let term = term.trim();
-        if term.is_empty() {
-            continue;
-        }
-        if let Some((field, expected)) = term.split_once('=') {
-            let actual = match field {
-                "involvedObject.name" => ev["involvedObject"]["name"].as_str().unwrap_or(""),
-                "involvedObject.kind" => ev["involvedObject"]["kind"].as_str().unwrap_or(""),
-                "involvedObject.namespace" => {
-                    ev["involvedObject"]["namespace"].as_str().unwrap_or("")
-                }
-                "involvedObject.uid" => ev["involvedObject"]["uid"].as_str().unwrap_or(""),
-                "reason" => ev["reason"].as_str().unwrap_or(""),
-                "source" => {
-                    let component = ev["source"]["component"].as_str().unwrap_or("");
-                    if component.is_empty() {
-                        ev["reportingController"].as_str().unwrap_or("")
-                    } else {
-                        component
-                    }
-                }
-                "reportingController" => ev["reportingController"].as_str().unwrap_or(""),
-                _ => continue,
-            };
-            if actual != expected {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// Validate a raw namespace string: format check then store lookup.
@@ -315,6 +136,7 @@ pub(crate) async fn list_pods<S: Store>(
 
     let ns = parse_namespace(&raw_ns, &state).await?;
     let prefix = list_prefix("pods", ns.as_str());
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref(), "", "pods")?;
 
     // metrics-server's per-namespace Pod-metadata informer (and kcm's GC) negotiate this
     // Accept header on LIST+WATCH; without honoring it here, their metadata-only decoder
@@ -335,17 +157,14 @@ pub(crate) async fn list_pods<S: Store>(
         };
         let from_rv = query.resource_version.unwrap_or(0);
         let initial_pods = if query.send_initial_events == Some(true) {
-            // Collect existing pods under this namespace prefix and filter by field selector.
-            let store_fs = query
-                .field_selector
-                .as_deref()
-                .and_then(pod_store_field_selector);
+            // Existing pods under this namespace prefix, narrowed by the store; watch_generic
+            // applies the full field/label selectors to these initial items.
             let resp = state
                 .store
                 .list(
                     &prefix,
                     ListOptions {
-                        field_selector: store_fs,
+                        field_selector: field_selector.store_selector(),
                         ..Default::default()
                     },
                 )
@@ -356,9 +175,6 @@ pub(crate) async fn list_pods<S: Store>(
                 .iter()
                 .filter_map(|o| serde_json::from_slice(&o.value).ok())
                 .collect();
-            if let Some(ref sel) = query.field_selector {
-                pods = filter_pods_by_field_selector(pods, sel);
-            }
             if let Some(ref sel) = query.label_selector {
                 pods.retain(|pod| super::watch::object_matches_label_selector(pod, sel));
             }
@@ -387,17 +203,13 @@ pub(crate) async fn list_pods<S: Store>(
         .await;
     }
 
-    let store_field_selector = query
-        .field_selector
-        .as_deref()
-        .and_then(pod_store_field_selector);
     let list_start = std::time::Instant::now();
     let resp = state
         .store
         .list(
             &prefix,
             ListOptions {
-                field_selector: store_field_selector,
+                field_selector: field_selector.store_selector(),
                 ..Default::default()
             },
         )
@@ -416,7 +228,6 @@ pub(crate) async fn list_pods<S: Store>(
         .map(super::generic::parse_label_selector)
         .transpose()?
         .unwrap_or_default();
-    let pod_field_selector = query.field_selector.as_deref().unwrap_or("");
 
     // See resource.rs's list_resource for why this checks has_encoder rather than
     // wants_protobuf alone; Pod/PodList has a registered encoder, so this only takes the
@@ -432,8 +243,7 @@ pub(crate) async fn list_pods<S: Store>(
             resp.revision,
             &resp.items,
             &label_pairs,
-            pod_field_selector,
-            filter_pods_by_field_selector,
+            &field_selector,
             Some(log_pod_list_entry),
             resp.continue_key,
             resp.remaining_count,
@@ -454,7 +264,7 @@ pub(crate) async fn list_pods<S: Store>(
         items.push(parsed);
     }
 
-    let items = filter_pods_by_field_selector(items, pod_field_selector);
+    let items = field_selector.filter(items);
     let items = super::generic::apply_label_selector(items, &label_pairs);
     tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
@@ -1277,10 +1087,17 @@ pub(crate) async fn delete_collection_pods<S: Store>(
     // inject_dry_run_header layer) — accept either.
     let dry_run = delete_opts.is_dry_run() || super::json_patch::is_dry_run_header(&headers);
     let prefix = list_prefix("pods", ns.as_str());
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref(), "", "pods")?;
 
     let resp = state
         .store
-        .list(&prefix, ListOptions::default())
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector: field_selector.store_selector(),
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -1306,6 +1123,9 @@ pub(crate) async fn delete_collection_pods<S: Store>(
         // status.used for every namespace-wide pod purge (e.g. OrderedNamespaceDeletion).
         let mut hard_delete_pod: Option<serde_json::Value> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+            if !field_selector.matches(&parsed) {
+                continue;
+            }
             if let Some(ref pairs) = label_pairs {
                 let kept = super::generic::apply_label_selector(vec![parsed.clone()], pairs);
                 if kept.is_empty() {
@@ -2542,574 +2362,6 @@ mod watch_tests {
             Some(false),
             "?watch=0 must resolve to watch:Some(false) so the request stays on the \
              normal list path, not the watch stream"
-        );
-    }
-}
-
-#[cfg(test)]
-mod field_selector_tests {
-    use super::*;
-
-    fn pod_with_node(node_name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {"nodeName": node_name}
-        })
-    }
-
-    fn pod_without_node() -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {}
-        })
-    }
-
-    fn pod_with_phase(phase: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {},
-            "status": {"phase": phase}
-        })
-    }
-
-    fn pod_with_pod_ip(pod_ip: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {},
-            "status": {"podIP": pod_ip}
-        })
-    }
-
-    fn pod_with_restart_policy(restart_policy: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {"restartPolicy": restart_policy}
-        })
-    }
-
-    fn pod_with_service_account_name(service_account_name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {"serviceAccountName": service_account_name}
-        })
-    }
-
-    fn pod_with_scheduler_name(scheduler_name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {"schedulerName": scheduler_name}
-        })
-    }
-
-    fn pod_with_nominated_node_name(nominated_node_name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {},
-            "status": {"nominatedNodeName": nominated_node_name}
-        })
-    }
-
-    /// Empty selector is a pass-through: all pods must be returned.
-    /// Kubelet depends on this when fieldSelector is absent.
-    #[test]
-    fn empty_selector_passes_all() {
-        let pods = vec![
-            pod_with_node("worker-1"),
-            pod_with_node("worker-2"),
-            pod_without_node(),
-        ];
-        let result = filter_pods_by_field_selector(pods.clone(), "");
-        assert_eq!(result.len(), pods.len());
-    }
-
-    /// spec.nodeName=worker-1 must include only pods scheduled to worker-1.
-    /// This is the primary kubelet query: it must receive only its own pods.
-    #[test]
-    fn eq_filter_matches_correct_node() {
-        let pods = vec![
-            pod_with_node("worker-1"),
-            pod_with_node("worker-2"),
-            pod_without_node(),
-        ];
-        let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["spec"]["nodeName"], "worker-1");
-    }
-
-    /// spec.nodeName=worker-1 must not match a pod on a different node.
-    /// If this fails, kubelet on worker-2 receives worker-1's pods and tries to run them.
-    #[test]
-    fn eq_filter_excludes_wrong_node() {
-        let pods = vec![pod_with_node("worker-2"), pod_without_node()];
-        let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1");
-        assert!(result.is_empty());
-    }
-
-    /// spec.nodeName!=worker-1 must exclude pods on worker-1 and include everything else.
-    #[test]
-    fn ne_filter_excludes_matching_node() {
-        let pods = vec![
-            pod_with_node("worker-1"),
-            pod_with_node("worker-2"),
-            pod_without_node(),
-        ];
-        let result = filter_pods_by_field_selector(pods, "spec.nodeName!=worker-1");
-        assert_eq!(result.len(), 2);
-        for pod in &result {
-            assert_ne!(pod["spec"]["nodeName"].as_str().unwrap_or(""), "worker-1");
-        }
-    }
-
-    /// A pod with no spec.nodeName (empty string) must NOT match spec.nodeName=worker-1.
-    /// Kubelet must not receive unscheduled pods — that was the original bug.
-    #[test]
-    fn eq_filter_excludes_unscheduled_pods() {
-        let pods = vec![pod_without_node()];
-        let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1");
-        assert!(
-            result.is_empty(),
-            "unscheduled pods must not reach the kubelet"
-        );
-    }
-
-    /// spec.nodeName holding a non-string JSON value (malformed stored data) must be
-    /// treated the same as absent, matching the typed decode this replaced. The selector
-    /// value here ("1") equals the *stringified* form of the stored value (the number 1),
-    /// so a naive read that coerced nodeName via to_string() instead of requiring a real
-    /// string would match here — proving this test actually distinguishes "requires a
-    /// string" from "stringifies whatever is stored". Without that distinction, a
-    /// malformed pod could match a nodeName selector and get delivered to the wrong
-    /// kubelet.
-    #[test]
-    fn eq_filter_treats_non_string_node_name_as_absent() {
-        let pod = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {"nodeName": 1}
-        });
-        let result = filter_pods_by_field_selector(vec![pod], "spec.nodeName=1");
-        assert!(
-            result.is_empty(),
-            "a pod with a malformed (non-string) nodeName must not match a selector \
-             value equal to its stringified form"
-        );
-    }
-
-    /// A Failed pod must be excluded by status.phase!=Failed,status.phase!=Succeeded —
-    /// DaemonSet/Deployment rollout controllers and the "should rollback without
-    /// unnecessary restarts" conformance test rely on this exclusion to know a
-    /// terminating pod is gone without waiting for its physical removal.
-    #[test]
-    fn ne_filter_excludes_failed_phase() {
-        let pods = vec![pod_with_phase("Failed")];
-        let result =
-            filter_pods_by_field_selector(pods, "status.phase!=Failed,status.phase!=Succeeded");
-        assert!(
-            result.is_empty(),
-            "a Failed pod must not be returned by status.phase!=Failed,!=Succeeded"
-        );
-    }
-
-    /// A Running pod must still pass status.phase!=Failed,status.phase!=Succeeded.
-    /// The exclusion must be precise: it must not over-filter healthy pods out of
-    /// a rollout controller's view of its managed pods.
-    #[test]
-    fn ne_filter_includes_running_phase() {
-        let pods = vec![pod_with_phase("Running")];
-        let result =
-            filter_pods_by_field_selector(pods, "status.phase!=Failed,status.phase!=Succeeded");
-        assert_eq!(result.len(), 1, "a Running pod must not be excluded");
-    }
-
-    /// status.phase=Running must match a Running pod — the positive-equality form
-    /// of the same phase selector must work, not just the negation form.
-    #[test]
-    fn eq_filter_matches_correct_phase() {
-        let pods = vec![pod_with_phase("Running")];
-        let result = filter_pods_by_field_selector(pods, "status.phase=Running");
-        assert_eq!(result.len(), 1);
-    }
-
-    /// status.phase=Running must not match a Pending pod.
-    #[test]
-    fn eq_filter_excludes_wrong_phase() {
-        let pods = vec![pod_with_phase("Pending")];
-        let result = filter_pods_by_field_selector(pods, "status.phase=Running");
-        assert!(result.is_empty());
-    }
-
-    /// status.podIP=<ip> must select only the pod with that IP — kube-proxy's
-    /// endpoint reconciliation queries pods by podIP, and a missing match arm
-    /// here would make it silently see every pod as a match.
-    #[test]
-    fn eq_filter_matches_correct_pod_ip() {
-        let pods = vec![pod_with_pod_ip("10.0.0.1"), pod_with_pod_ip("10.0.0.2")];
-        let result = filter_pods_by_field_selector(pods, "status.podIP=10.0.0.1");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["status"]["podIP"], "10.0.0.1");
-    }
-
-    /// status.podIP!=<ip> must exclude the pod with that IP and keep the rest —
-    /// the negated form must not fall through to the unknown-field passthrough.
-    #[test]
-    fn ne_filter_excludes_matching_pod_ip() {
-        let pods = vec![pod_with_pod_ip("10.0.0.1"), pod_with_pod_ip("10.0.0.2")];
-        let result = filter_pods_by_field_selector(pods, "status.podIP!=10.0.0.1");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["status"]["podIP"], "10.0.0.2");
-    }
-
-    /// spec.restartPolicy=<policy> must select only matching pods — controllers
-    /// that distinguish Job pods (restartPolicy=Never/OnFailure) from Deployment
-    /// pods (Always) rely on this filter, not a client-side scan of every pod.
-    #[test]
-    fn eq_filter_matches_correct_restart_policy() {
-        let pods = vec![
-            pod_with_restart_policy("Never"),
-            pod_with_restart_policy("Always"),
-        ];
-        let result = filter_pods_by_field_selector(pods, "spec.restartPolicy=Never");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["spec"]["restartPolicy"], "Never");
-    }
-
-    /// spec.restartPolicy!=<policy> must exclude the matching pod, proving the
-    /// negation arm (not just equality) is wired for this field.
-    #[test]
-    fn ne_filter_excludes_matching_restart_policy() {
-        let pods = vec![
-            pod_with_restart_policy("Never"),
-            pod_with_restart_policy("Always"),
-        ];
-        let result = filter_pods_by_field_selector(pods, "spec.restartPolicy!=Never");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["spec"]["restartPolicy"], "Always");
-    }
-
-    /// spec.serviceAccountName=<name> must select only pods running as that
-    /// service account — RBAC auditing/debugging tools query pods this way to
-    /// find everything a given identity can affect.
-    #[test]
-    fn eq_filter_matches_correct_service_account_name() {
-        let pods = vec![
-            pod_with_service_account_name("sa-a"),
-            pod_with_service_account_name("sa-b"),
-        ];
-        let result = filter_pods_by_field_selector(pods, "spec.serviceAccountName=sa-a");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["spec"]["serviceAccountName"], "sa-a");
-    }
-
-    /// spec.serviceAccountName!=<name> must exclude the matching pod.
-    #[test]
-    fn ne_filter_excludes_matching_service_account_name() {
-        let pods = vec![
-            pod_with_service_account_name("sa-a"),
-            pod_with_service_account_name("sa-b"),
-        ];
-        let result = filter_pods_by_field_selector(pods, "spec.serviceAccountName!=sa-a");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["spec"]["serviceAccountName"], "sa-b");
-    }
-
-    /// spec.schedulerName=<name> must select only pods assigned to that
-    /// scheduler — a custom scheduler polling for its own pending/bound pods
-    /// would otherwise see pods owned by other schedulers.
-    #[test]
-    fn eq_filter_matches_correct_scheduler_name() {
-        let pods = vec![
-            pod_with_scheduler_name("custom-scheduler"),
-            pod_with_scheduler_name("default-scheduler"),
-        ];
-        let result = filter_pods_by_field_selector(pods, "spec.schedulerName=custom-scheduler");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["spec"]["schedulerName"], "custom-scheduler");
-    }
-
-    /// spec.schedulerName!=<name> must exclude the matching pod.
-    #[test]
-    fn ne_filter_excludes_matching_scheduler_name() {
-        let pods = vec![
-            pod_with_scheduler_name("custom-scheduler"),
-            pod_with_scheduler_name("default-scheduler"),
-        ];
-        let result = filter_pods_by_field_selector(pods, "spec.schedulerName!=custom-scheduler");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["spec"]["schedulerName"], "default-scheduler");
-    }
-
-    /// status.nominatedNodeName=<node> must select only pods nominated for that
-    /// node — preemption logic reads this to find pods already reserved on a
-    /// node before deciding to preempt further victims there.
-    #[test]
-    fn eq_filter_matches_correct_nominated_node_name() {
-        let pods = vec![
-            pod_with_nominated_node_name("node-a"),
-            pod_with_nominated_node_name("node-b"),
-        ];
-        let result = filter_pods_by_field_selector(pods, "status.nominatedNodeName=node-a");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["status"]["nominatedNodeName"], "node-a");
-    }
-
-    /// status.nominatedNodeName!=<node> must exclude the matching pod.
-    #[test]
-    fn ne_filter_excludes_matching_nominated_node_name() {
-        let pods = vec![
-            pod_with_nominated_node_name("node-a"),
-            pod_with_nominated_node_name("node-b"),
-        ];
-        let result = filter_pods_by_field_selector(pods, "status.nominatedNodeName!=node-a");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["status"]["nominatedNodeName"], "node-b");
-    }
-
-    /// Unknown selector fields must be ignored (pass-through) rather than dropping pods.
-    /// This is the safe default: conservative filtering prevents silent data loss.
-    #[test]
-    fn unknown_field_is_ignored() {
-        let pods = vec![pod_with_node("worker-1"), pod_with_node("worker-2")];
-        let result = filter_pods_by_field_selector(pods.clone(), "metadata.unknown=foo");
-        assert_eq!(result.len(), pods.len());
-    }
-
-    /// Multiple comma-separated selectors are ANDed together.
-    #[test]
-    fn multiple_terms_are_anded() {
-        // Only worker-1 pods should pass spec.nodeName=worker-1,spec.nodeName!=worker-2
-        // (worker-1 != worker-2 is true, so worker-1 passes both)
-        let pods = vec![pod_with_node("worker-1"), pod_with_node("worker-2")];
-        let result =
-            filter_pods_by_field_selector(pods, "spec.nodeName=worker-1,spec.nodeName!=worker-2");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["spec"]["nodeName"], "worker-1");
-    }
-
-    // -- pod_store_field_selector: the extracted helper must behave correctly --
-
-    /// Equality term is picked up as a FieldSelector.
-    /// This helper is used in both the list and watch paths — if it's wrong,
-    /// kubelet receives pods scheduled to other nodes.
-    #[test]
-    fn pod_store_field_selector_eq_term() {
-        let fs = pod_store_field_selector("spec.nodeName=worker-1");
-        let fs = fs.expect("equality term must produce Some");
-        assert_eq!(fs.field, "spec.nodeName");
-        assert_eq!(fs.value, "worker-1");
-    }
-
-    /// Negation-only selector returns None — store FieldSelector only supports equality.
-    #[test]
-    fn pod_store_field_selector_ne_only_returns_none() {
-        let fs = pod_store_field_selector("spec.nodeName!=worker-1");
-        assert!(fs.is_none(), "ne-only selector must return None");
-    }
-
-    /// Mixed selector: equality term wins, negation is skipped.
-    #[test]
-    fn pod_store_field_selector_mixed_returns_eq_term() {
-        let fs = pod_store_field_selector("spec.nodeName!=bad,spec.nodeName=worker-1");
-        let fs = fs.expect("must return the equality term");
-        assert_eq!(fs.value, "worker-1");
-    }
-
-    /// Empty string returns None.
-    #[test]
-    fn pod_store_field_selector_empty_returns_none() {
-        assert!(pod_store_field_selector("").is_none());
-    }
-}
-
-#[cfg(test)]
-mod event_field_selector_tests {
-    use super::*;
-
-    fn event(name: &str, kind: &str, ns: &str, uid: &str, reason: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Event",
-            "metadata": {"name": "ev", "namespace": ns},
-            "involvedObject": {
-                "name": name,
-                "kind": kind,
-                "namespace": ns,
-                "uid": uid
-            },
-            "reason": reason
-        })
-    }
-
-    /// kubectl describe sends multi-term involvedObject selectors; all terms must be AND-evaluated.
-    /// Without AND logic, a selector with involvedObject.kind=Pod returns events for every kind,
-    /// making kubectl describe show unrelated events or none at all.
-    #[test]
-    fn multi_term_involved_object_selectors_are_and_evaluated() {
-        let pod_event = event("coredns-xxx", "Pod", "kube-system", "uid-1", "Started");
-        let node_event = event("node-1", "Node", "kube-system", "uid-2", "Started");
-        let events = vec![pod_event.clone(), node_event];
-
-        let result = filter_events_by_field_selector(
-            events,
-            "involvedObject.name=coredns-xxx,involvedObject.kind=Pod",
-        );
-
-        assert_eq!(
-            result.len(),
-            1,
-            "kubectl describe relies on multi-term involvedObject selectors being AND-evaluated; \
-             without AND logic involvedObject.kind is ignored and all events for any kind are returned, \
-             making kubectl describe show wrong events or always show Events: <none>"
-        );
-        assert_eq!(result[0]["involvedObject"]["kind"], "Pod");
-        assert_eq!(result[0]["involvedObject"]["name"], "coredns-xxx");
-    }
-
-    /// A single-term selector still works after the change.
-    #[test]
-    fn single_term_involved_object_name_still_filters() {
-        let ev1 = event("coredns-xxx", "Pod", "kube-system", "uid-1", "Started");
-        let ev2 = event("other-pod", "Pod", "kube-system", "uid-2", "Pulled");
-        let events = vec![ev1, ev2];
-
-        let result = filter_events_by_field_selector(events, "involvedObject.name=coredns-xxx");
-        assert_eq!(
-            result.len(),
-            1,
-            "single-term involvedObject.name selector must still filter correctly; \
-             if this regresses kubectl get events --field-selector involvedObject.name=X stops working"
-        );
-        assert_eq!(result[0]["involvedObject"]["name"], "coredns-xxx");
-    }
-
-    /// A selector that matches no event must return empty — not all events.
-    #[test]
-    fn selector_matching_no_event_returns_empty() {
-        let ev = event("pod-a", "Pod", "default", "uid-1", "Started");
-        let result = filter_events_by_field_selector(vec![ev], "involvedObject.name=nonexistent");
-        assert!(
-            result.is_empty(),
-            "a selector term with no match must return empty; returning all events would cause \
-             kubectl describe to show events for unrelated objects"
-        );
-    }
-
-    /// An empty selector is a pass-through — all events are returned.
-    #[test]
-    fn empty_selector_passes_all_events() {
-        let ev1 = event("pod-a", "Pod", "default", "uid-1", "Started");
-        let ev2 = event("pod-b", "Deployment", "default", "uid-2", "Scaled");
-        let events = vec![ev1, ev2];
-        let result = filter_events_by_field_selector(events.clone(), "");
-        assert_eq!(result.len(), events.len());
-    }
-
-    /// reason= field selector filters by event reason.
-    #[test]
-    fn reason_field_selector_filters_by_reason() {
-        let ev1 = event("pod-a", "Pod", "default", "uid-1", "Pulled");
-        let ev2 = event("pod-b", "Pod", "default", "uid-2", "Started");
-        let events = vec![ev1, ev2];
-        let result = filter_events_by_field_selector(events, "reason=Pulled");
-        assert_eq!(
-            result.len(),
-            1,
-            "reason= field selector must return only events with matching reason; \
-             without this, kubectl get events --field-selector reason=X returns unrelated events"
-        );
-        assert_eq!(result[0]["reason"], "Pulled");
-    }
-
-    /// source= field selector filters by core/v1 Event's source.component.
-    ///
-    /// Without this, `kubectl get events --field-selector source=kubelet` (used to isolate
-    /// events emitted by a specific controller) silently returns every event instead of
-    /// just the kubelet's, because the field was previously unrecognized and ignored.
-    #[test]
-    fn source_field_selector_filters_by_source_component() {
-        let mut ev1 = event("pod-a", "Pod", "default", "uid-1", "Pulled");
-        ev1["source"] = serde_json::json!({"component": "kubelet"});
-        let mut ev2 = event("pod-b", "Pod", "default", "uid-2", "Scheduled");
-        ev2["source"] = serde_json::json!({"component": "default-scheduler"});
-        let events = vec![ev1, ev2];
-
-        let result = filter_events_by_field_selector(events, "source=kubelet");
-        assert_eq!(
-            result.len(),
-            1,
-            "source= selector must filter by source.component; without this, \
-             kubectl get events --field-selector source=X returns all events"
-        );
-        assert_eq!(result[0]["source"]["component"], "kubelet");
-    }
-
-    /// reportingController= field selector filters by events.k8s.io/v1 Event's top-level
-    /// reportingController field.
-    ///
-    /// events.k8s.io/v1 Event has no `source` object — reporting identity moved to
-    /// `reportingController`. Without this selector, clients using the newer events/v1
-    /// event recorder (client-go's EventBroadcaster) cannot filter events by reporter,
-    /// silently getting every event back.
-    #[test]
-    fn reporting_controller_field_selector_filters_events_k8s_io_events() {
-        let mut ev1 = event("pod-a", "Pod", "default", "uid-1", "Pulled");
-        ev1["reportingController"] = serde_json::json!("kubelet");
-        let mut ev2 = event("pod-b", "Pod", "default", "uid-2", "Scheduled");
-        ev2["reportingController"] = serde_json::json!("default-scheduler");
-        let events = vec![ev1, ev2];
-
-        let result = filter_events_by_field_selector(events, "reportingController=kubelet");
-        assert_eq!(
-            result.len(),
-            1,
-            "reportingController= selector must filter events.k8s.io/v1 events by reporter; \
-             without this, kubectl get events.events.k8s.io --field-selector \
-             reportingController=X returns all events"
-        );
-        assert_eq!(result[0]["reportingController"], "kubelet");
-    }
-
-    /// source= field selector must fall back to reportingController when source.component
-    /// is absent — matching upstream's ToSelectableFields fallback
-    /// (pkg/registry/core/event/strategy.go).
-    ///
-    /// An Event created via the events.k8s.io/v1 API (client-go's EventsV1 recorder) never
-    /// sets `source`, only `reportingController`. The sig-instrumentation Events API
-    /// conformance test creates such an event, then queries the CORE/v1 events endpoint with
-    /// `fieldSelector=source=<controller>`. Without this fallback the query matches nothing
-    /// even though the event's reporter identity is present under a different field name,
-    /// so "should ensure that an event can be fetched, patched, deleted, and listed" fails
-    /// with "expected single event, got []v1.Event{}".
-    #[test]
-    fn source_field_selector_falls_back_to_reporting_controller() {
-        let mut ev = event("pod-a", "Pod", "default", "uid-1", "Test");
-        ev["reportingController"] = serde_json::json!("test-controller");
-        // No "source" key at all — this is what an events.k8s.io/v1-only Event looks like.
-
-        let result = filter_events_by_field_selector(vec![ev], "source=test-controller");
-
-        assert_eq!(
-            result.len(),
-            1,
-            "source= selector must fall back to reportingController when source.component \
-             is absent, or an event reported only via events.k8s.io/v1 is invisible to a \
-             core/v1 fieldSelector=source query"
         );
     }
 }
