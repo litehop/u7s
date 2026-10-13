@@ -350,6 +350,11 @@ pub(crate) async fn replace_namespace<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+    // Upstream disallows create-on-update for Namespace; creating here would skip the create
+    // preparation (spec.finalizers), so a later delete would orphan the namespace's content.
+    if stored_obj.is_none() {
+        return Err(Status::not_found(&name, "Namespace"));
+    }
     let stored_status = stored_obj.as_ref().map(|v| v["status"].clone());
     match stored_status {
         Some(ref s) if !s.is_null() => {
@@ -3099,6 +3104,33 @@ mod tests {
             err.0,
             StatusCode::BAD_REQUEST,
             "name mismatch between URL and body must return 400"
+        );
+    }
+
+    // Upstream disallows create-on-update for Namespace. A PUT that created one would bypass the
+    // create preparation (spec.finalizers), so deleting it later would orphan its content.
+    #[tokio::test]
+    async fn put_to_a_missing_namespace_returns_404_and_creates_nothing() {
+        use u7s_store::Store;
+        let state = make_state();
+
+        let result = replace_namespace(
+            State(state.clone()),
+            Path("ghost-ns".to_string()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            namespace_body("ghost-ns"),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("PUT to a missing namespace must fail"),
+        };
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let key = crate::keys::cluster_object_key("namespaces", "ghost-ns");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "a failed PUT must not leave a namespace behind"
         );
     }
 

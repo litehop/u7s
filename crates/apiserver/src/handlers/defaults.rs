@@ -549,18 +549,6 @@ fn default_storageclass(obj: &mut serde_json::Value) {
     *obj = serde_json::to_value(&fields).expect("StorageClassFields is always serializable");
 }
 
-/// Set status.phase to "Active" for a newly created Namespace, matching upstream
-/// `NamespaceStrategy.PrepareForCreate` (pkg/registry/core/namespace/strategy.go), which
-/// the real kube-apiserver runs for both plain `POST` create AND `PATCH`-based
-/// server-side-apply create — u7s previously only ran the equivalent of this in the
-/// plain-create handler, so an SSA-created (`kubectl apply`) namespace was persisted
-/// with `status: {}`. KCM's ServiceAccount controller skips reconciling the `default`
-/// ServiceAccount for any namespace whose `status.phase != Active`, so a pod created in
-/// such a namespace with the pod-spec default `automountServiceAccountToken: true`
-/// sticks in ContainerCreating forever.
-///
-/// Idempotent: an existing status.phase (e.g. "Terminating", stamped by delete) is
-/// never overwritten.
 /// Create-time Namespace preparation shared by POST, SSA apply-create and seeding: appends the
 /// `kubernetes` finalizer to `spec.finalizers` when absent, mirroring upstream's
 /// `namespaceStrategy.PrepareForCreate`. It must not live in `apply_defaults` (which also runs
@@ -585,6 +573,18 @@ pub fn prepare_namespace_for_create(obj: &mut serde_json::Value) -> Result<(), S
     Ok(())
 }
 
+/// Set status.phase to "Active" for a newly created Namespace, matching upstream
+/// `NamespaceStrategy.PrepareForCreate` (pkg/registry/core/namespace/strategy.go), which
+/// the real kube-apiserver runs for both plain `POST` create AND `PATCH`-based
+/// server-side-apply create — u7s previously only ran the equivalent of this in the
+/// plain-create handler, so an SSA-created (`kubectl apply`) namespace was persisted
+/// with `status: {}`. KCM's ServiceAccount controller skips reconciling the `default`
+/// ServiceAccount for any namespace whose `status.phase != Active`, so a pod created in
+/// such a namespace with the pod-spec default `automountServiceAccountToken: true`
+/// sticks in ContainerCreating forever.
+///
+/// Idempotent: an existing status.phase (e.g. "Terminating", stamped by delete) is
+/// never overwritten.
 fn default_namespace(obj: &mut serde_json::Value) {
     let mut status: crate::types::NamespaceStatus =
         crate::types::NamespaceStatus::deserialize(std::mem::take(&mut obj["status"]))
