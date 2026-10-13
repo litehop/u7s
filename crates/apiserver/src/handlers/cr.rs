@@ -1009,6 +1009,11 @@ fn resolve_cel_program(
 ///
 /// A rule under a property that is absent from `obj` is not evaluated — matches
 /// upstream: `self` must exist for a rule to run at all.
+///
+/// Like upstream, a failing rule does not stop the others: every failure is reported
+/// together, so one rule erroring on a missing key cannot mask another's verdict. Only a
+/// failure whose message says no further rules will run (cost or time limit exceeded)
+/// ends the walk.
 fn validate_cel_rules(
     schema: &serde_json::Value,
     obj: &serde_json::Value,
@@ -1016,12 +1021,40 @@ fn validate_cel_rules(
     field_path: &str,
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> Result<(), crate::status::StatusError> {
+    let mut errors = Vec::new();
+    collect_cel_rule_errors(schema, obj, old_node, field_path, programs, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::unprocessable_entity(errors.join("; ")))
+    }
+}
+
+/// Marker phrase (upstream's own wording) in a rule failure that must end the rule walk.
+const CEL_NO_FURTHER_RULES: &str = "no further validation rules will be run";
+
+/// Appends each failure under `schema`/`obj` to `errors`; returns `false` once a failure
+/// carrying `CEL_NO_FURTHER_RULES` was recorded.
+fn collect_cel_rule_errors(
+    schema: &serde_json::Value,
+    obj: &serde_json::Value,
+    old_node: Option<&serde_json::Value>,
+    field_path: &str,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+    errors: &mut Vec<String>,
+) -> bool {
     if let Some(rules) = schema
         .get("x-kubernetes-validations")
         .and_then(|v| v.as_array())
     {
         for rule in rules {
-            evaluate_cel_rule(rule, schema, obj, old_node, field_path, programs)?;
+            if let Err(e) = evaluate_cel_rule(rule, schema, obj, old_node, field_path, programs) {
+                let stop = e.1.message.contains(CEL_NO_FURTHER_RULES);
+                errors.push(e.1.message);
+                if stop {
+                    return false;
+                }
+            }
         }
     }
 
@@ -1030,13 +1063,16 @@ fn validate_cel_rules(
             for (key, sub_schema) in props {
                 if let Some(child) = map.get(key) {
                     let child_old = old_node.and_then(|o| o.get(key));
-                    validate_cel_rules(
+                    if !collect_cel_rule_errors(
                         sub_schema,
                         child,
                         child_old,
                         &join_cr_field_path(field_path, key),
                         programs,
-                    )?;
+                        errors,
+                    ) {
+                        return false;
+                    }
                 }
             }
         }
@@ -1044,13 +1080,16 @@ fn validate_cel_rules(
         if let Some(arr) = obj.as_array() {
             for (i, item) in arr.iter().enumerate() {
                 let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
-                validate_cel_rules(
+                if !collect_cel_rule_errors(
                     items_schema,
                     item,
                     item_old,
                     &format!("{field_path}[{i}]"),
                     programs,
-                )?;
+                    errors,
+                ) {
+                    return false;
+                }
             }
         }
     }
@@ -1064,19 +1103,23 @@ fn validate_cel_rules(
     // "no such key" CEL error), not produce a meaningful pass/fail.
     if let Some(branches) = schema.get("allOf").and_then(|v| v.as_array()) {
         for branch in branches {
-            validate_cel_rules(branch, obj, old_node, field_path, programs)?;
+            if !collect_cel_rule_errors(branch, obj, old_node, field_path, programs, errors) {
+                return false;
+            }
         }
     }
     for combinator in ["oneOf", "anyOf"] {
         if let Some(branches) = schema.get(combinator).and_then(|v| v.as_array()) {
             for branch in branches {
-                if schema_branch_structurally_matches(branch, obj) {
-                    validate_cel_rules(branch, obj, old_node, field_path, programs)?;
+                if schema_branch_structurally_matches(branch, obj)
+                    && !collect_cel_rule_errors(branch, obj, old_node, field_path, programs, errors)
+                {
+                    return false;
                 }
             }
         }
     }
-    Ok(())
+    true
 }
 
 /// Best-effort check for whether `obj` conforms to `branch`, used to pick which
@@ -1445,6 +1488,22 @@ fn evaluate_cel_rule(
         .transpose()
         .map_err(invalid_data)?;
 
+    let data_node = |value| crate::handlers::cel_cost::Node::Data {
+        value,
+        schema: Some(schema),
+    };
+    let rule_cost = crate::handlers::cel_cost::estimate(
+        &program,
+        data_node(self_value),
+        old_self_value.map(data_node),
+    );
+    if rule_cost > crate::handlers::cel_cost::CALL_COST_LIMIT {
+        return Err(Status::unprocessable_entity(format!(
+            "{field_path}: Invalid value: operation cancelled: actual cost limit exceeded: \
+             {CEL_NO_FURTHER_RULES} due to call cost exceeds limit for rule: {rule_text}"
+        )));
+    }
+
     let mut cel_ctx = cel::Context::default();
     register_cel_extensions(&mut cel_ctx);
     cel_ctx.add_variable_from_value("self", escaped_self.clone());
@@ -1461,15 +1520,15 @@ fn evaluate_cel_rule(
         Err(CelEvalOverBudget::TimedOut) => {
             return Err(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule exceeded its evaluation time \
-                 budget of {CEL_RULE_EVAL_BUDGET:?} — rejecting to bound CEL evaluation cost \
-                 (rule: {rule_text})"
+                 budget of {CEL_RULE_EVAL_BUDGET:?} — rejecting to bound CEL evaluation cost, \
+                 {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
             )));
         }
         Err(CelEvalOverBudget::TooManyInFlight) => {
             return Err(Status::unprocessable_entity(format!(
                 "{field_path}: too many x-kubernetes-validations rules are currently \
                  exceeding their evaluation time budget — rejecting to bound concurrent CEL \
-                 evaluation cost (rule: {rule_text})"
+                 evaluation cost, {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
             )));
         }
         Ok(Ok(v)) => v,
@@ -11959,6 +12018,69 @@ mod tests {
         );
     }
 
+    fn quadratic_rule_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [
+                    { "rule": "self.x + self.y > 0" },
+                    { "rule": "self.largeArray.all(x, self.largeArray.all(y, y == x))" }
+                ],
+                "properties": {
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "largeArray": { "type": "array", "maxItems": 725, "items": { "type": "integer" } }
+                }
+            } }
+        })
+    }
+
+    #[test]
+    fn cel_rule_over_large_data_is_rejected_with_call_cost_exceeds_limit_not_only_a_missing_key() {
+        let obj = serde_json::json!({ "spec": { "largeArray": vec![20; 725] } });
+        let err = check_schema(&obj, quadratic_rule_schema()).unwrap_err();
+        assert!(
+            err.1.message.contains("call cost exceeds limit"),
+            "an O(n^2) rule over 725 items must trip the runtime cost limit so a hostile CR \
+             cannot burn CPU on every write: {}",
+            err.1.message
+        );
+        assert!(
+            err.1.message.contains("No such key: x"),
+            "every failing rule is reported, as upstream aggregates errors: {}",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn cel_rule_over_small_data_with_the_same_quadratic_rule_still_evaluates() {
+        let obj = serde_json::json!({ "spec": { "x": 1, "y": 0, "largeArray": [2, 2] } });
+        assert!(
+            check_schema(&obj, quadratic_rule_schema()).is_ok(),
+            "the runtime cost limit must depend on the actual list size, not the schema bound"
+        );
+    }
+
+    #[test]
+    fn cel_rule_failures_across_rules_are_all_reported_in_one_422() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "x-kubernetes-validations": [
+                { "rule": "self.a > 0", "message": "a must be positive" },
+                { "rule": "self.b > 0", "message": "b must be positive" }
+            ],
+            "properties": { "a": { "type": "integer" }, "b": { "type": "integer" } }
+        });
+        let err = check_schema(&serde_json::json!({ "a": 0, "b": 0 }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("a must be positive")
+                && err.1.message.contains("b must be positive"),
+            "a user fixing one violation must see the others in the same response: {}",
+            err.1.message
+        );
+    }
+
     #[test]
     fn cel_lists_library_min_max_and_empty_list_semantics_match_kubernetes() {
         assert!(eval_cel_bool(
@@ -12719,11 +12841,13 @@ mod tests {
                     "type": "array",
                     "items": { "type": "integer" },
                     "x-kubernetes-validations": [
-                        { "rule": "self.all(x, self.all(y, x + y >= 0))" }
+                        { "rule": "(self + []).all(x, (self + []).all(y, x + y >= 0))" }
                     ]
                 }
             }
         });
+        // The `(self + [])` ranges hide the list from the static cost estimator, so this
+        // exercises the wall-clock backstop for rules the estimator cannot size.
         // Calibrated to take ~4s to run to completion uninstrumented (n=2000, 4,000,000
         // comprehension steps) — comfortably over CEL_RULE_EVAL_BUDGET (250ms) even on
         // slower CI hardware, while the abandoned evaluation thread never blocks this test.
