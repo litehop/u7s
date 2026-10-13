@@ -1043,6 +1043,9 @@ pub(crate) async fn replace_resource<S: Store>(
         dry_run: replace_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+    if let Some(old) = old_object.as_ref() {
+        super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
+    }
     run_validating_webhooks(&state, &obj.body, old_object.as_ref(), &admission_ctx).await?;
 
     // Restore the stored status: controllers write status via /status; a full PUT on
@@ -2166,6 +2169,12 @@ pub(crate) async fn do_patch<S: Store>(
             meta.has_status_subresource,
             &mut current.body,
             &stored_status,
+        );
+        super::defaults::prepare_generation_for_update(
+            group,
+            plural,
+            &old_object,
+            &mut current.body,
         );
         run_validating_webhooks(state, &current.body, Some(&old_object), &admission_ctx).await?;
 
@@ -3952,6 +3961,9 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         dry_run: replace_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+    if let Some(old) = old_object.as_ref() {
+        super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
+    }
     run_validating_webhooks(&state, &obj.body, old_object.as_ref(), &admission_ctx).await?;
 
     if let Some(ref spec_before) = spec_before_replace {
@@ -19852,6 +19864,208 @@ mod tests {
         )
         .await;
         assert_eq!(v["metadata"]["generation"], 1);
+    }
+
+    async fn ok_body(resp: axum::response::Response) -> serde_json::Value {
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A NetworkPolicy spec change through PUT and PATCH must bump metadata.generation from the
+    /// stored value (upstream networkPolicyStrategy.PrepareForUpdate): without it, policy
+    /// controllers keyed on generation never see the new rules, and a PUT that omits or forges
+    /// generation would rewind it.
+    #[tokio::test]
+    async fn networkpolicy_update_bumps_generation_on_spec_change_via_put_and_patch() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        let state = make_state();
+        let np = |spec: serde_json::Value, generation: Option<i64>| {
+            let mut meta = serde_json::json!({ "name": "np", "namespace": "default" });
+            if let Some(g) = generation {
+                meta["generation"] = serde_json::json!(g);
+            }
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+                    "metadata": meta, "spec": spec
+                }))
+                .unwrap(),
+            )
+        };
+        let path = || {
+            Path((
+                "networking.k8s.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "networkpolicies".to_string(),
+                "np".to_string(),
+            ))
+        };
+        let created = create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "networking.k8s.io".into(),
+                "v1".into(),
+                "default".into(),
+                "networkpolicies".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            np(serde_json::json!({ "podSelector": {} }), None),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(created_body(created).await["metadata"]["generation"], 1);
+
+        let put = |spec, generation| {
+            replace_namespaced_resource(
+                State(state.clone()),
+                path(),
+                axum::extract::Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                np(spec, generation),
+            )
+        };
+        let v = ok_body(
+            put(
+                serde_json::json!({ "podSelector": { "matchLabels": { "a": "b" } } }),
+                None,
+            )
+            .await
+            .unwrap()
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            v["metadata"]["generation"], 2,
+            "spec change on a PUT that omits generation must bump 1 -> 2, not drop it"
+        );
+        let v = ok_body(
+            put(
+                serde_json::json!({ "podSelector": { "matchLabels": { "a": "b" } } }),
+                Some(40),
+            )
+            .await
+            .unwrap()
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            v["metadata"]["generation"], 2,
+            "unchanged spec must not bump and a client-chosen generation must be discarded"
+        );
+
+        let mut mp = axum::http::HeaderMap::new();
+        mp.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let v = ok_body(
+            patch_namespaced_resource(
+                State(state.clone()),
+                path(),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                mp,
+                bytes::Bytes::from(
+                    r#"{"metadata":{"generation":1},"spec":{"podSelector":{"matchLabels":{"c":"d"}}}}"#,
+                ),
+            )
+            .await
+            .unwrap()
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            v["metadata"]["generation"], 3,
+            "PATCH spec change bumps from the stored 2, ignoring the smuggled 1"
+        );
+    }
+
+    /// Cluster-scoped kinds go through replace_resource/patch_resource; IngressClass bumps on a
+    /// spec change upstream.
+    #[tokio::test]
+    async fn ingressclass_update_bumps_generation_on_spec_change_via_put_and_patch() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        let state = make_state();
+        let ic = |controller: &str| {
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "networking.k8s.io/v1", "kind": "IngressClass",
+                    "metadata": { "name": "ic" }, "spec": { "controller": controller }
+                }))
+                .unwrap(),
+            )
+        };
+        let path = || {
+            Path((
+                "networking.k8s.io".to_string(),
+                "v1".to_string(),
+                "ingressclasses".to_string(),
+                "ic".to_string(),
+            ))
+        };
+        let created = create_resource(
+            State(state.clone()),
+            Path((
+                "networking.k8s.io".into(),
+                "v1".into(),
+                "ingressclasses".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            ic("example.com/a"),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(created_body(created).await["metadata"]["generation"], 1);
+
+        let v = ok_body(
+            replace_resource(
+                State(state.clone()),
+                path(),
+                axum::extract::Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                ic("example.com/b"),
+            )
+            .await
+            .unwrap()
+            .into_response(),
+        )
+        .await;
+        assert_eq!(v["metadata"]["generation"], 2);
+
+        let mut mp = axum::http::HeaderMap::new();
+        mp.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let v = ok_body(
+            patch_resource(
+                State(state.clone()),
+                path(),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                mp,
+                bytes::Bytes::from(r#"{"spec":{"controller":"example.com/c"}}"#),
+            )
+            .await
+            .unwrap()
+            .into_response(),
+        )
+        .await;
+        assert_eq!(v["metadata"]["generation"], 3);
     }
 
     /// Same for cluster-scoped kinds (create_resource).

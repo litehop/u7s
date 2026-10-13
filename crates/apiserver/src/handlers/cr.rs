@@ -785,6 +785,63 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
 }
 
+/// Re-force `generation` to 1 after mutating webhooks on create: upstream runs
+/// `PrepareForCreate` after admission, so a webhook patch to `/metadata/generation` must not
+/// persist.
+fn force_cr_generation_on_create(obj: &mut serde_json::Value) {
+    obj["metadata"]["generation"] = serde_json::json!(1i64);
+}
+
+/// Anything outside `metadata` (`apiVersion`/`kind` are envelope, not content) differing
+/// between `old` and `new`, as upstream `customResourceStrategy.PrepareForUpdate` compares.
+fn cr_content_changed(old: &serde_json::Value, new: &serde_json::Value) -> bool {
+    let (Some(o), Some(n)) = (old.as_object(), new.as_object()) else {
+        return old != new;
+    };
+    let content = |k: &str| !matches!(k, "metadata" | "apiVersion" | "kind");
+    o.iter().any(|(k, v)| content(k) && n.get(k) != Some(v))
+        || n.keys().any(|k| content(k) && !o.contains_key(k))
+}
+
+/// Server-owned `metadata.generation` on a CR update: the stored value always wins over
+/// whatever the client or a webhook sent, and any content change bumps it by one. `old` and
+/// `new` must be at the same apiVersion and `new` already pruned/status-restored.
+fn apply_cr_generation_on_update(old: &serde_json::Value, new: &mut serde_json::Value) {
+    let stored = old["metadata"]["generation"].as_i64().unwrap_or(0);
+    let generation = if cr_content_changed(old, new) {
+        stored.saturating_add(1)
+    } else {
+        stored
+    };
+    if generation == 0 {
+        if let Some(meta) = new["metadata"].as_object_mut() {
+            meta.remove("generation");
+        }
+    } else {
+        new["metadata"]["generation"] = serde_json::json!(generation);
+    }
+}
+
+/// `apply_cr_generation_on_update` for a stored object that may sit at a different apiVersion
+/// than the request (written under an older storage version): compare in the request version.
+async fn prepare_cr_generation_for_update<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    request_api_version: &str,
+    existing: &serde_json::Value,
+    obj: &mut serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    if existing["apiVersion"].as_str() == Some(request_api_version) {
+        apply_cr_generation_on_update(existing, obj);
+    } else {
+        let mut converted =
+            convert_cr_to_api_version(state, ctx, existing.clone(), request_api_version).await?;
+        converted["metadata"]["generation"] = existing["metadata"]["generation"].clone();
+        apply_cr_generation_on_update(&converted, obj);
+    }
+    Ok(())
+}
+
 fn stamp_cr_envelope(obj: &mut serde_json::Value, group: &str, version: &str, kind: &str) {
     obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
     obj["kind"] = serde_json::Value::String(kind.to_string());
@@ -2548,6 +2605,7 @@ pub async fn create_cr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    force_cr_generation_on_create(&mut obj);
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -2765,6 +2823,14 @@ pub async fn replace_cr<S: Store>(
     );
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    prepare_cr_generation_for_update(
+        &state,
+        &ctx,
+        &format!("{group}/{version}"),
+        &existing,
+        &mut obj,
+    )
+    .await?;
 
     // Dry-run: validation and admission passed; return the would-be replaced object without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -3609,6 +3675,7 @@ pub async fn create_cr_namespaced<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    force_cr_generation_on_create(&mut obj);
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -3863,6 +3930,14 @@ pub async fn replace_cr_namespaced<S: Store>(
     );
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    prepare_cr_generation_for_update(
+        &state,
+        &ctx,
+        &format!("{group}/{version}"),
+        &existing,
+        &mut obj,
+    )
+    .await?;
 
     // Dry-run: validation and admission passed; return the would-be replaced object without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -4258,6 +4333,7 @@ pub async fn patch_cr<S: Store>(
             dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+        force_cr_generation_on_create(&mut obj);
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -4414,6 +4490,7 @@ pub async fn patch_cr<S: Store>(
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    apply_cr_generation_on_update(&old, &mut obj);
 
     // Dry-run: validation and admission passed; return the would-be patched object without
     // persisting — mirrors do_patch's dry-run early-return in resource.rs.
@@ -4519,6 +4596,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+        force_cr_generation_on_create(&mut obj);
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -4709,6 +4787,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    apply_cr_generation_on_update(&old, &mut obj);
 
     // Dry-run: validation and admission passed; return the would-be patched object without
     // persisting — mirrors do_patch's dry-run early-return in resource.rs.
@@ -5249,7 +5328,9 @@ async fn cr_scale_put_impl<S: Store>(
         .map(|p| scale_path_get_str(&obj, p).to_string())
         .unwrap_or_default();
 
+    let before = obj.clone();
     scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas as i64);
+    apply_cr_generation_on_update(&before, &mut obj);
 
     let old_rv = obj["metadata"]["resourceVersion"]
         .as_str()
@@ -5326,6 +5407,7 @@ async fn cr_scale_patch_impl<S: Store>(
     // Mirrors apps/v1's scale_patch_impl: extract replicas from the patch body if present,
     // otherwise leave the stored value unchanged (a patch that doesn't touch spec.replicas
     // is a no-op write, not an error).
+    let before = obj.clone();
     let new_replicas = match scale_body.spec.replicas {
         Some(r) => {
             scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, r as i64);
@@ -5333,6 +5415,7 @@ async fn cr_scale_patch_impl<S: Store>(
         }
         None => scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
     };
+    apply_cr_generation_on_update(&before, &mut obj);
 
     let old_rv = obj["metadata"]["resourceVersion"]
         .as_str()
@@ -23341,6 +23424,222 @@ mod tests {
         );
     }
 
+    /// Upstream runs customResourceStrategy.PrepareForCreate after admission, so a mutating
+    /// webhook patching /metadata/generation must not persist: a CR created with generation 99
+    /// would make controllers wait on an observedGeneration that never arrives.
+    #[tokio::test]
+    async fn create_cr_ignores_mutating_webhook_patch_to_generation() {
+        use axum::routing::post;
+        use axum::Router;
+        use bytes::Bytes as AxumBytes;
+        use u7s_store::Store;
+
+        let router = Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/metadata/generation", "value": 99}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "uid-mutate",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+
+        let state = make_state();
+        install_cluster_crd_with_schema(
+            &state,
+            serde_json::json!({
+                "type": "object",
+                "properties": { "data": { "type": "object",
+                    "x-kubernetes-preserve-unknown-fields": true } }
+            }),
+        )
+        .await;
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "cr-gen-mwc"},
+            "webhooks": [{
+                "name": "cr.generation.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/cr-gen-mwc",
+                AxumBytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1", "kind": "Widget",
+                    "metadata": { "name": "w" }, "data": {}
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("create must succeed");
+        let bytes = axum::body::to_bytes(
+            axum::response::IntoResponse::into_response(resp).into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            obj["metadata"]["generation"], 1,
+            "webhook-patched generation must be overwritten after admission"
+        );
+        let stored = state
+            .store
+            .get(&cr_store_key("example.io", "widgets", None, "w"))
+            .await
+            .unwrap()
+            .expect("stored");
+        let stored: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(stored["metadata"]["generation"], 1);
+    }
+
+    /// Controllers detect "spec changed since I last reconciled" via metadata.generation; a CR
+    /// whose generation never bumps on update (or is dropped by a PUT that omits it) makes
+    /// every controller-owned CRD miss spec changes.
+    #[tokio::test]
+    async fn cr_update_bumps_generation_on_content_change_and_restores_stored_value() {
+        let state = make_state();
+        install_cluster_crd_with_schema(
+            &state,
+            serde_json::json!({
+                "type": "object",
+                "properties": { "data": { "type": "object",
+                    "x-kubernetes-preserve-unknown-fields": true } }
+            }),
+        )
+        .await;
+        let path = || {
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "w".to_string(),
+            ))
+        };
+        async fn to_json(r: impl axum::response::IntoResponse) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(r.into_response().into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let put = |data: serde_json::Value, generation: Option<i64>| {
+            let mut meta = serde_json::json!({ "name": "w" });
+            if let Some(g) = generation {
+                meta["generation"] = serde_json::json!(g);
+            }
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1", "kind": "Widget",
+                    "metadata": meta, "data": data
+                })
+                .to_string(),
+            )
+        };
+
+        let created = create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            put(serde_json::json!({"a": 1}), None),
+        )
+        .await
+        .expect("create");
+        assert_eq!(to_json(created).await["metadata"]["generation"], 1);
+
+        let replace = |data, generation| {
+            replace_cr(
+                State(state.clone()),
+                path(),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                put(data, generation),
+            )
+        };
+        let v = to_json(
+            replace(serde_json::json!({"a": 2}), None)
+                .await
+                .expect("replace changed content"),
+        )
+        .await;
+        assert_eq!(
+            v["metadata"]["generation"], 2,
+            "content change must bump generation (and a PUT omitting it must not drop it)"
+        );
+        let v = to_json(
+            replace(serde_json::json!({"a": 2}), Some(50))
+                .await
+                .expect("replace identical content"),
+        )
+        .await;
+        assert_eq!(
+            v["metadata"]["generation"], 2,
+            "an unchanged PUT must not bump, and a client-chosen generation must be ignored"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let v = to_json(
+            patch_cr(
+                State(state.clone()),
+                path(),
+                test_user(),
+                headers.clone(),
+                Bytes::from(r#"{"data":{"a":3},"metadata":{"generation":1}}"#),
+            )
+            .await
+            .expect("patch changed content"),
+        )
+        .await;
+        assert_eq!(
+            v["metadata"]["generation"], 3,
+            "PATCH changing content bumps from the stored value, not the smuggled one"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // CRD structural-schema defaulting (apply_crd_schema_defaults)
     //
@@ -24080,6 +24379,11 @@ mod tests {
             "PUT /scale must write the new replica count at the CRD-declared \
              specReplicasPath (.spec.desiredReplicas) — an HPA scale-up that landed anywhere \
              else would never actually resize the workload"
+        );
+        assert_eq!(
+            obj["metadata"]["generation"], 2,
+            "a /scale write that changes spec.replicas is a spec change (upstream routes it \
+             through the CR strategy), so controllers must observe generation 1 -> 2"
         );
     }
 
