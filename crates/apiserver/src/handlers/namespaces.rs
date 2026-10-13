@@ -386,7 +386,7 @@ pub(crate) async fn replace_namespace<S: Store>(
     // path (resource.rs): a blank incoming uid is restored from the stored object, but a
     // non-blank incoming uid that mismatches the stored one is identity forgery, not a
     // legitimate update — allowing it would let a client forge a match against a stale/foreign
-    // ownerReference (corrupting owner_ref_is_live's cascade-GC decision) or defeat
+    // ownerReference (corrupting the garbage collector's cascade-GC decision) or defeat
     // controllers' "same name, different uid ⇒ different object" recreate-detection. Namespace
     // routes around the generic path entirely (bespoke handler), so it never got 2pzru's fix.
     let stored_uid = stored_obj.as_ref().map(|v| v["metadata"]["uid"].clone());
@@ -562,7 +562,7 @@ pub(crate) async fn patch_namespace<S: Store>(
     // branch applies the merge-patch directly to the full stored object body (including
     // metadata.uid) with no other uid handling, so without this a caller holding only
     // ordinary namespace `patch` rights could forge uid to match a stale/foreign
-    // ownerReference and corrupt owner_ref_is_live's cascade-GC decision.
+    // ownerReference and corrupt the garbage collector's cascade-GC decision.
     let stored_uid = current.body["metadata"]["uid"].clone();
 
     // Snapshot .status before applying the patch: Namespace has a dedicated /status
@@ -2279,7 +2279,7 @@ mod tests {
     // patch_namespace's merge-patch branch applies the patch directly to the full stored
     // object body (including metadata.uid) and used to persist the result with zero uid
     // handling. A caller holding only ordinary namespace `patch` rights could forge uid to
-    // match a stale/foreign ownerReference, corrupting owner_ref_is_live's cascade-GC
+    // match a stale/foreign ownerReference, corrupting the garbage collector's cascade-GC
     // decision. Fails on revert: without restoring the pre-patch uid after merge_patch, the
     // forged uid below would be persisted and this assertion would fail.
     #[tokio::test]
@@ -3998,7 +3998,7 @@ mod tests {
     // replace_namespace never touched metadata.uid at all — a non-blank, mismatched
     // client-supplied uid was silently persisted, unlike the generic replace_resource path
     // (resource.rs), which 409s on exactly this. Letting it through would let a client forge
-    // a match against a stale/foreign ownerReference, corrupting owner_ref_is_live's
+    // a match against a stale/foreign ownerReference, corrupting the garbage collector's
     // cascade-GC decision. Fails on revert: without the uid-mismatch check, this PUT (valid
     // resourceVersion, forged uid) would succeed with 200 instead of 409.
     #[tokio::test]

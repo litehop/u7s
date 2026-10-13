@@ -946,7 +946,7 @@ pub(crate) async fn replace_pod<S: Store>(
     // non-blank incoming uid that mismatches the stored one is identity forgery, not a
     // legitimate update — allowing it would let a caller holding only `update pods` (not
     // `create`/`delete pods`) forge a match against a stale/foreign ownerReference, corrupting
-    // owner_ref_is_live's cascade-GC decision for ReplicaSet/Job/DaemonSet controllers.
+    // the garbage collector's cascade-GC decision for ReplicaSet/Job/DaemonSet controllers.
     let stored_uid = stored_obj.body["metadata"]["uid"].clone();
     let incoming_uid_blank = obj.body["metadata"]["uid"]
         .as_str()
@@ -1680,7 +1680,7 @@ pub(crate) async fn patch_pod<S: Store>(
         // Save the stored uid: metadata.uid is immutable identity, restored unconditionally
         // after the patch is applied, exactly like do_patch (resource.rs) already does for the
         // generic path. Without this, a caller holding only `patch pods` rights could forge
-        // uid to match a stale/foreign ownerReference and corrupt owner_ref_is_live's
+        // uid to match a stale/foreign ownerReference and corrupt the garbage collector's
         // cascade-GC decision for ReplicaSet/Job/DaemonSet controllers, for ANY patch type
         // (Merge, StrategicMerge, JSON Patch).
         let stored_uid = current_obj.body["metadata"]["uid"].clone();
@@ -15326,7 +15326,7 @@ mod handler_tests {
 
     /// metadata.uid must survive every PATCH content-type on the main pod endpoint. A caller
     /// holding only `patch pods` RBAC (not `create`/`delete pods`) must not be able to forge
-    /// a pod's uid to match a stale/foreign ownerReference — owner_ref_is_live keys purely on
+    /// a pod's uid to match a stale/foreign ownerReference — the garbage collector keys purely on
     /// uid equality, so a forged match would hijack ReplicaSet/Job/DaemonSet cascade-GC,
     /// letting the attacker's pod either escape deletion or get someone else's pod deleted in
     /// its place. Fails on revert: without restoring the pre-patch uid, each patch below would
@@ -17099,7 +17099,7 @@ mod handler_tests {
 
     /// A PUT whose body carries a non-blank uid that mismatches the stored one must be
     /// rejected with 409, and the stored pod must be left untouched. metadata.uid is
-    /// immutable identity: owner_ref_is_live determines cascade-GC purely by comparing
+    /// immutable identity: the garbage collector determines cascade-GC purely by comparing
     /// stored uid == ownerRef.uid, so silently accepting a forged uid here would let a
     /// caller holding only `update pods` RBAC (not `create`/`delete pods`) rewrite an
     /// existing pod's identity to match a stale/foreign ownerReference and hijack

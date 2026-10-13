@@ -2091,7 +2091,7 @@ mod tests {
         // metadata.uid must be server-generated and immutable identity, never
         // client-chosen. A client that could set an arbitrary uid on create could
         // forge object identity to match a stale/foreign ownerReference.uid, tricking
-        // GC's owner-liveness check (owner_ref_is_live compares stored uid ==
+        // GC's owner-liveness check (the garbage collector compares stored uid ==
         // ownerRef.uid) into treating a dead owner as live or vice versa, and would
         // defeat controllers' "same name, different uid means a different object"
         // recreate-detection.
