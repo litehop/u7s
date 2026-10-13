@@ -257,10 +257,9 @@ fn validate_crd_schema(
         else {
             continue;
         };
-        walk_schema_dos_bounds(
-            schema,
-            &format!("spec.versions[{}].schema.openAPIV3Schema", version.name),
-        )?;
+        let path = format!("spec.versions[{}].schema.openAPIV3Schema", version.name);
+        walk_schema_dos_bounds(schema, &path)?;
+        crate::handlers::cel_rules::check_schema_rules(schema, &path, true)?;
     }
     Ok(())
 }
@@ -3779,6 +3778,46 @@ mod tests {
                 .contains("patternProperties is not supported"),
             "error must echo upstream's exact wording so K8s clients parse it identically: {json}"
         );
+    }
+
+    /// A rule naming a property the schema never declared can never hold; accepting the
+    /// CRD would turn a typo into a 422 on every CR write instead of at install time.
+    #[tokio::test]
+    async fn create_crd_rejects_validation_rule_referencing_undeclared_property() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [{ "rule": "self.z == 100" }],
+                "properties": { "x": { "type": "integer" } }
+            } }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
+        assert_eq!(err.1.code, 422);
+        assert!(
+            err.1.message.contains("undefined field 'z'"),
+            "{}",
+            err.1.message
+        );
+    }
+
+    /// A rule that does not parse must be refused at install time for the same reason.
+    #[tokio::test]
+    async fn create_crd_rejects_validation_rule_with_syntax_error() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [{ "rule": "self = 42" }]
+            } }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
+        assert_eq!(err.1.code, 422);
+        assert!(err.1.message.contains("Syntax error"), "{}", err.1.message);
     }
 
     /// patternProperties nested inside a `properties` map entry (not just the schema

@@ -1160,7 +1160,7 @@ const CEL_RESERVED_WORDS: &[&str] = &[
 /// `[a-zA-Z0-9_.\-/]`) — such a field is simply unreachable from any CEL rule, matching
 /// upstream's `common.SchemaDeclType`, which silently omits it from the generated CEL
 /// struct type rather than exposing it under some fallback name.
-fn cel_escape_ident(ident: &str) -> Option<String> {
+pub(crate) fn cel_escape_ident(ident: &str) -> Option<String> {
     if ident.as_bytes().first().is_some_and(u8::is_ascii_digit) {
         return None;
     }
