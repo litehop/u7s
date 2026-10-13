@@ -1449,11 +1449,28 @@ FF_BEFORE=$(git -C "$SCRATCH_REPO" rev-parse HEAD)
 FF_ORIGIN_SHA=$(git -C "$FF_ADVANCER" rev-parse HEAD)
 # Local origin/main is still the OLD sha here, so only the tick's own fetch
 # can make the fast-forward possible.
-# The script's `git worktree remove` / `git branch -D` act on the CWD repo, so
-# the tick must run from inside the scratch repo, never this dev checkout.
-pushd "$SCRATCH_REPO" >/dev/null
-invoke_tick "$STUB_MERGED_BIN" "$SCRATCH_REPO" 0
+# Run from a DIFFERENT repo (a decoy holding a same-named worker branch and
+# worktree): every git mutation must target the script's own REPO_ROOT, never
+# the caller's CWD.
+FF_REPO="$SCRATCH_REPO"
+FF_WORKTREE="$(dirname "$FF_REPO")/worker-worktree"
+build_scratch_repo "merged-ff"
+DECOY_REPO="$SCRATCH_REPO"
+DECOY_WORKTREE="$(dirname "$DECOY_REPO")/worker-worktree"
+SCRATCH_REPO="$FF_REPO"
+pushd "$DECOY_REPO" >/dev/null
+invoke_tick "$STUB_MERGED_BIN" "$FF_REPO" 0
 popd >/dev/null
+assert "cleanup removes the REPO_ROOT's merged worker worktree even when run from another repo" \
+  "$([ ! -d "$FF_WORKTREE" ] && echo 1 || echo 0)"
+assert "...and deletes the merged worker branch in REPO_ROOT, not just somewhere" \
+  "$(! git -C "$FF_REPO" rev-parse --verify -q refs/heads/worker/agent-merged-ff >/dev/null && echo 1 || echo 0)"
+assert "the caller's CWD repo keeps its same-named worker worktree: a wrong-repo remove would destroy unrelated work" \
+  "$([ -d "$DECOY_WORKTREE" ] && echo 1 || echo 0)"
+assert "...and keeps its same-named worker branch (no wrong-repo branch -D)" \
+  "$(git -C "$DECOY_REPO" rev-parse --verify -q refs/heads/worker/agent-merged-ff >/dev/null && echo 1 || echo 0)"
+assert "the tick exits normally (a wrong-repo worktree remove fails and aborts under set -e)" \
+  "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
 assert "fixture sanity: origin is ahead of the checkout before the tick" \
   "$([ "$FF_BEFORE" != "$FF_ORIGIN_SHA" ] && echo 1 || echo 0)"
 assert "after a MERGED worker PR the checkout fast-forwards to origin's new main (fetch + merge --ff-only both ran)" \
