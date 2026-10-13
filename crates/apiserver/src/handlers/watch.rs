@@ -678,14 +678,15 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
 /// see `label_selector_matches`'s doc comment for why this is shared rather than duplicated
 /// between `object_matches_field_selector` and the projection-based pre-filter below.
 ///
-/// Supports `metadata.name`, `metadata.namespace` (equality only), and `spec.nodeName`
-/// (equality and inequality). Returns true if the selector is empty (pass-through) or all
+/// Supports `metadata.name`, `metadata.namespace` (equality only), and `spec.nodeName` /
+/// `spec.signerName` (equality and inequality). Returns true if the selector is empty (pass-through) or all
 /// terms match. Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
 fn field_selector_matches_parts(
     selector: &str,
     name: Option<&str>,
     namespace: Option<&str>,
     node_name: Option<&str>,
+    signer_name: Option<&str>,
 ) -> bool {
     if selector.is_empty() {
         return true;
@@ -702,6 +703,9 @@ fn field_selector_matches_parts(
             if field == "spec.nodeName" && node_name.unwrap_or("") == value {
                 return false;
             }
+            if field == "spec.signerName" && signer_name.unwrap_or("") == value {
+                return false;
+            }
             // Unknown fields: ignore (conservative).
         } else if let Some((field, value)) = part.split_once('=') {
             let field = field.trim();
@@ -710,6 +714,7 @@ fn field_selector_matches_parts(
                 "metadata.name" if name.unwrap_or("") != value => return false,
                 "metadata.namespace" if namespace.unwrap_or("") != value => return false,
                 "spec.nodeName" if node_name.unwrap_or("") != value => return false,
+                "spec.signerName" if signer_name.unwrap_or("") != value => return false,
                 // Unknown fields (or a value that already matches): ignore (conservative).
                 _ => {}
             }
@@ -730,6 +735,7 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
         obj["metadata"]["name"].as_str(),
         obj["metadata"]["namespace"].as_str(),
         obj["spec"]["nodeName"].as_str(),
+        obj["spec"]["signerName"].as_str(),
     )
 }
 
@@ -766,6 +772,8 @@ struct SelectorProjectionMetadata<'a> {
 struct SelectorProjectionSpec<'a> {
     #[serde(default, rename = "nodeName", borrow)]
     node_name: Option<&'a str>,
+    #[serde(default, rename = "signerName", borrow)]
+    signer_name: Option<&'a str>,
 }
 
 impl SelectorProjection<'_> {
@@ -779,6 +787,7 @@ impl SelectorProjection<'_> {
             self.metadata.name,
             self.metadata.namespace,
             self.spec.node_name,
+            self.spec.signer_name,
         )
     }
 }
@@ -4365,6 +4374,33 @@ mod tests {
         ));
         // node-a != node-b → true (they differ)
         assert!(object_matches_field_selector(&obj, "spec.nodeName!=node-b"));
+    }
+
+    /// KCM's ClusterTrustBundle publisher watches `spec.signerName=kubernetes.io/kube-apiserver-serving`
+    /// and deletes every bundle it sees that it did not build. If the selector is ignored it
+    /// deletes other signers' bundles (e.g. a pod-certificate signer's) moments after creation.
+    #[test]
+    fn field_selector_spec_signer_name_filters_other_signers_bundles() {
+        let obj = serde_json::json!({
+            "metadata": {"name": "e2e.example.com:ns:primary-bundle"},
+            "spec": {"signerName": "e2e.example.com/signer"}
+        });
+        let sel = "spec.signerName=kubernetes.io/kube-apiserver-serving";
+        assert!(!object_matches_field_selector(&obj, sel));
+        assert!(object_matches_field_selector(
+            &obj,
+            "spec.signerName=e2e.example.com/signer"
+        ));
+        assert!(object_matches_field_selector(
+            &obj,
+            "spec.signerName!=kubernetes.io/kube-apiserver-serving"
+        ));
+        let raw = obj.to_string();
+        let projection: SelectorProjection = serde_json::from_str(&raw).expect("must deserialize");
+        assert!(
+            !projection.matches("", sel),
+            "the watch fast pre-filter must agree with the full-object matcher"
+        );
     }
 
     /// Unknown field is ignored (conservative: don't drop events for unrecognised selectors).
