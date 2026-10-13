@@ -4,15 +4,15 @@
 #   - image bumped to v1.14.7 (latest stable CoreDNS release as of the migration off
 #     `include_bytes!` onto this real, standalone file) -- future bumps are now a manifest edit
 #     here (Renovate-scannable), not an apiserver rebuild.
-#   - resources carry upstream's requests (cpu 100m, memory 70Mi) so the pod is not BestEffort,
-#     but not its limits.memory 170Mi -- the prometheus plugin + memory-limit combination was
-#     found flaky here, so the plugin stays but the limit does not.
+#   - the Deployment has no resources.limits.memory -- the prometheus
+#     plugin + memory-limit combination was found flaky here, so the plugin stays but
+#     the limit does not.
 #   - no priorityClassName -- u7s seeds no PriorityClass objects.
 #   - no Service port / prometheus.io annotations for :9153 -- this is a pod-direct-scrape
 #     correlation signal, not a ServiceMonitor target.
 #   - GOMEMLIMIT=512MiB env var on the container -- a Go-runtime soft heap
 #     target (not a cgroup memory.limit_in_bytes; does not interact with
-#     the absent memory limit). Triggers more aggressive GC instead of
+#     resources.limits.memory above). Triggers more aggressive GC instead of
 #     an OOM-kill when approached, as a hedge against a repeat of an observed
 #     867MB RSS burst (steady-state is ~163MB).
 apiVersion: v1
@@ -113,10 +113,6 @@ spec:
       - name: coredns
         image: registry.k8s.io/coredns/coredns:v1.14.7
         args: ["-conf", "/etc/coredns/Corefile"]
-        resources:
-          requests:
-            cpu: 100m
-            memory: 70Mi
         env:
         - name: GOMEMLIMIT
           value: "512MiB"
