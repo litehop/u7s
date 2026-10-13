@@ -1446,7 +1446,7 @@ fn evaluate_cel_rule(
         .map_err(invalid_data)?;
 
     let mut cel_ctx = cel::Context::default();
-    register_cel_string_extensions(&mut cel_ctx);
+    register_cel_extensions(&mut cel_ctx);
     cel_ctx.add_variable_from_value("self", escaped_self.clone());
     if let Some(old) = &escaped_old_self {
         cel_ctx.add_variable_from_value("oldSelf", old.clone());
@@ -1563,7 +1563,7 @@ fn evaluate_message_expression(
 ) -> Option<String> {
     let program = resolve_cel_program(programs, expr).ok()?;
     let mut cel_ctx = cel::Context::default();
-    register_cel_string_extensions(&mut cel_ctx);
+    register_cel_extensions(&mut cel_ctx);
     cel_ctx.add_variable_from_value("self", self_value.clone());
     if let Some(old) = old_self_value {
         cel_ctx.add_variable_from_value("oldSelf", old.clone());
@@ -1593,7 +1593,7 @@ fn evaluate_message_expression(
 /// (`self.split("/")[0].size() < 253`, `gateway.networking.k8s.io_gateways.yaml` L262) or
 /// Crossplane's `self.plural == self.plural.lowerAscii()` would fail every CR write with an
 /// "undeclared reference" CEL error instead of evaluating as the CRD author intended.
-fn register_cel_string_extensions(ctx: &mut cel::Context) {
+fn register_cel_extensions(ctx: &mut cel::Context) {
     ctx.add_function("split", cel_split)
         .expect("string extension name must not collide with a cel builtin");
     ctx.add_function("lowerAscii", cel_lower_ascii)
@@ -1604,6 +1604,137 @@ fn register_cel_string_extensions(ctx: &mut cel::Context) {
         .expect("string extension name must not collide with a cel builtin");
     ctx.add_function("join", cel_join)
         .expect("string extension name must not collide with a cel builtin");
+    ctx.add_function("isSorted", cel_is_sorted)
+        .expect("list extension name must not collide with a cel builtin");
+    ctx.add_function("sum", cel_sum)
+        .expect("list extension name must not collide with a cel builtin");
+    ctx.add_function("min", cel_min)
+        .expect("list extension name must not collide with a cel builtin");
+    ctx.add_function("max", cel_max)
+        .expect("list extension name must not collide with a cel builtin");
+}
+
+fn cel_list_receiver(
+    this: cel::Value,
+    function: &str,
+) -> Result<std::sync::Arc<Vec<cel::Value>>, cel::ExecutionError> {
+    match this {
+        cel::Value::List(items) => Ok(items),
+        _ => Err(cel::ExecutionError::function_error(
+            function,
+            "target is not a list",
+        )),
+    }
+}
+
+/// Orders two list elements of the same comparable CEL type, as cel-go's `<` does.
+fn cel_cmp_elements(
+    a: &cel::Value,
+    b: &cel::Value,
+    function: &str,
+) -> Result<std::cmp::Ordering, cel::ExecutionError> {
+    use cel::Value as V;
+    let ord = match (a, b) {
+        (V::Int(a), V::Int(b)) => a.partial_cmp(b),
+        (V::UInt(a), V::UInt(b)) => a.partial_cmp(b),
+        (V::Float(a), V::Float(b)) => a.partial_cmp(b),
+        (V::String(a), V::String(b)) => a.partial_cmp(b),
+        (V::Bytes(a), V::Bytes(b)) => a.partial_cmp(b),
+        (V::Bool(a), V::Bool(b)) => a.partial_cmp(b),
+        (V::Duration(a), V::Duration(b)) => a.partial_cmp(b),
+        (V::Timestamp(a), V::Timestamp(b)) => a.partial_cmp(b),
+        _ => None,
+    };
+    ord.ok_or_else(|| {
+        cel::ExecutionError::function_error(
+            function,
+            format!("list elements are not mutually comparable: {a:?}, {b:?}"),
+        )
+    })
+}
+
+/// `list.isSorted()` — Kubernetes' CEL lists library: true when elements are in
+/// non-decreasing order; empty and single-element lists are sorted.
+fn cel_is_sorted(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    let items = cel_list_receiver(this, "isSorted")?;
+    for pair in items.windows(2) {
+        if cel_cmp_elements(&pair[0], &pair[1], "isSorted")?.is_gt() {
+            return Ok(cel::Value::Bool(false));
+        }
+    }
+    Ok(cel::Value::Bool(true))
+}
+
+/// `list.sum()` over ints, uints, doubles or durations; the sum of an empty list is 0.
+fn cel_sum(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    use cel::Value as V;
+    let items = cel_list_receiver(this, "sum")?;
+    let overflow = || cel::ExecutionError::function_error("sum", "return error for overflow");
+    let mut iter = items.iter();
+    let Some(first) = iter.next() else {
+        return Ok(V::Int(0));
+    };
+    let mut acc = first.clone();
+    for item in iter {
+        acc = match (&acc, item) {
+            (V::Int(a), V::Int(b)) => V::Int(a.checked_add(*b).ok_or_else(overflow)?),
+            (V::UInt(a), V::UInt(b)) => V::UInt(a.checked_add(*b).ok_or_else(overflow)?),
+            (V::Float(a), V::Float(b)) => V::Float(a + b),
+            (V::Duration(a), V::Duration(b)) => V::Duration(a.checked_add(b).ok_or_else(overflow)?),
+            _ => {
+                return Err(cel::ExecutionError::function_error(
+                    "sum",
+                    format!("cannot sum {acc:?} and {item:?}"),
+                ));
+            }
+        };
+    }
+    if !matches!(acc, V::Int(_) | V::UInt(_) | V::Float(_) | V::Duration(_)) {
+        return Err(cel::ExecutionError::function_error(
+            "sum",
+            "list elements must be numbers or durations",
+        ));
+    }
+    Ok(acc)
+}
+
+fn cel_extremum(
+    this: cel::Value,
+    function: &str,
+    keep_candidate: fn(std::cmp::Ordering) -> bool,
+) -> Result<cel::Value, cel::ExecutionError> {
+    let items = cel_list_receiver(this, function)?;
+    let mut iter = items.iter();
+    let Some(mut best) = iter.next() else {
+        return Err(cel::ExecutionError::function_error(
+            function,
+            format!("{function} called on empty list"),
+        ));
+    };
+    for item in iter {
+        if keep_candidate(cel_cmp_elements(item, best, function)?) {
+            best = item;
+        }
+    }
+    Ok(best.clone())
+}
+
+/// `list.min()` — Kubernetes' CEL lists library; an empty list is an error.
+fn cel_min(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    cel_extremum(this, "min", std::cmp::Ordering::is_lt)
+}
+
+/// `list.max()` — Kubernetes' CEL lists library; an empty list is an error.
+fn cel_max(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    cel_extremum(this, "max", std::cmp::Ordering::is_gt)
 }
 
 fn cel_split(
@@ -11738,7 +11869,7 @@ mod tests {
     fn eval_cel_bool(expr: &str) -> bool {
         let program = cel::Program::compile(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
         let mut ctx = cel::Context::default();
-        register_cel_string_extensions(&mut ctx);
+        register_cel_extensions(&mut ctx);
         match program.execute(&ctx) {
             Ok(cel::Value::Bool(b)) => b,
             other => panic!("{expr} did not evaluate to a bool: {other:?}"),
@@ -11796,6 +11927,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cel_lists_library_is_sorted_and_sum_evaluate_the_upstream_crd_validation_rule() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "firstArray": { "type": "array", "maxItems": 1000, "items": { "type": "integer" } },
+                "secondArray": { "type": "array", "maxItems": 1000, "items": { "type": "integer" } }
+            },
+            "x-kubernetes-validations": [{
+                "rule": "self.firstArray.isSorted() && self.secondArray.isSorted() && \
+                         ((self.firstArray.sum() + self.secondArray.sum()) % 2 == 0)"
+            }]
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "firstArray": [3, 4], "secondArray": [5, 10] }),
+                schema.clone()
+            )
+            .is_ok(),
+            "isSorted()/sum() must resolve, or every CR using the k8s lists library is rejected \
+             with 'Undeclared reference'"
+        );
+        assert!(
+            check_schema(
+                &serde_json::json!({ "firstArray": [4, 3], "secondArray": [5, 10] }),
+                schema
+            )
+            .is_err(),
+            "an unsorted list must still fail the rule"
+        );
+    }
+
+    #[test]
+    fn cel_lists_library_min_max_and_empty_list_semantics_match_kubernetes() {
+        assert!(eval_cel_bool(
+            "[3, 1, 2].min() == 1 && [3, 1, 2].max() == 3 && ['b', 'a'].min() == 'a' \
+             && [].isSorted() && [1.5, 2.5].sum() == 4.0 && [].sum() == 0 && ![2, 1].isSorted()"
+        ));
+        assert!(
+            eval_cel("[].min()", &[]).is_err(),
+            "min() of an empty list is an error in the k8s lists library, not a silent default"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Evaluation semantics pinned across the cel 0.14 -> 0.15 bump, where each
     // behaviour must match Kubernetes' CEL (cel-go) rather than whatever the
@@ -11810,7 +11985,7 @@ mod tests {
     ) -> Result<cel::Value, cel::ExecutionError> {
         let program = cel::Program::compile(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
         let mut ctx = cel::Context::default();
-        register_cel_string_extensions(&mut ctx);
+        register_cel_extensions(&mut ctx);
         for (name, value) in vars {
             ctx.add_variable(*name, value).unwrap();
         }
