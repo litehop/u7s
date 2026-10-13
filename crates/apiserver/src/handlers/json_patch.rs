@@ -2466,7 +2466,6 @@ mod tests {
         "complete_finalizer_drain",
         "complete_cr_finalizer_drain",
         "delete_finalized_namespace",
-        "cascade_delete_cr_dependents",
         "delete_namespace_scoped_crds",
         "delete_pods_owned_by",
         "delete_replicasets_owned_by",
