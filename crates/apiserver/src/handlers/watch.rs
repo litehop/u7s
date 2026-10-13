@@ -677,9 +677,14 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
 }
 
 /// Field labels `SelectorProjection` carries. Defaulting never alters these (names are
-/// user-supplied; `spec.nodeName` is only ever set by the scheduler/binding), so evaluating
-/// them on the raw stored bytes agrees with evaluating them on the defaulted object.
-const PROJECTED_FIELD_LABELS: [&str; 3] = ["metadata.name", "metadata.namespace", "spec.nodeName"];
+/// user-supplied; `spec.nodeName` and `spec.signerName` are only ever set by the writer), so
+/// evaluating them on the raw stored bytes agrees with evaluating them on the defaulted object.
+const PROJECTED_FIELD_LABELS: [&str; 4] = [
+    "metadata.name",
+    "metadata.namespace",
+    "spec.nodeName",
+    "spec.signerName",
+];
 
 /// Minimal metadata/spec projection covering exactly `PROJECTED_FIELD_LABELS` plus
 /// `metadata.labels`. Serde skips every other key (spec.containers, status, ...) without ever
@@ -713,6 +718,8 @@ struct SelectorProjectionMetadata<'a> {
 struct SelectorProjectionSpec<'a> {
     #[serde(default, rename = "nodeName", borrow)]
     node_name: Option<&'a str>,
+    #[serde(default, rename = "signerName", borrow)]
+    signer_name: Option<&'a str>,
 }
 
 impl SelectorProjection<'_> {
@@ -722,7 +729,10 @@ impl SelectorProjection<'_> {
                 "name": self.metadata.name,
                 "namespace": self.metadata.namespace,
             },
-            "spec": { "nodeName": self.spec.node_name },
+            "spec": {
+                "nodeName": self.spec.node_name,
+                "signerName": self.spec.signer_name,
+            },
         })
     }
 
@@ -4259,6 +4269,32 @@ mod tests {
         assert_eq!(
             result[0]["metadata"]["labels"]["env"], "staging",
             "the remaining object must be the staging one"
+        );
+    }
+
+    /// KCM's ClusterTrustBundle publisher watches
+    /// `spec.signerName=kubernetes.io/kube-apiserver-serving` and deletes every bundle it sees
+    /// that it did not build. If the selector is ignored it deletes other signers' bundles
+    /// (e.g. a test signer's) moments after creation.
+    #[test]
+    fn field_selector_spec_signer_name_filters_other_signers_bundles() {
+        let obj = serde_json::json!({
+            "metadata": {"name": "e2e.example.com:ns:primary-bundle"},
+            "spec": {"signerName": "e2e.example.com/signer"}
+        });
+        let parse = |raw: &str| {
+            FieldSelector::parse(Some(raw), "certificates.k8s.io", "clustertrustbundles")
+                .unwrap_or_else(|e| panic!("{raw:?} must parse: {}", e.1.message))
+        };
+        let others = parse("spec.signerName=kubernetes.io/kube-apiserver-serving");
+        assert!(!others.matches(&obj));
+        assert!(parse("spec.signerName=e2e.example.com/signer").matches(&obj));
+        assert!(parse("spec.signerName!=kubernetes.io/kube-apiserver-serving").matches(&obj));
+        let raw = obj.to_string();
+        let projection: SelectorProjection = serde_json::from_str(&raw).expect("must deserialize");
+        assert!(
+            !projection.may_match("", &others),
+            "the watch fast pre-filter must agree with the full-object matcher"
         );
     }
 

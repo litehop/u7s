@@ -1500,6 +1500,16 @@ pub(crate) async fn do_patch<S: Store>(
             )
             .map_err(Status::forbidden)?;
         }
+        // An SSA apply-create of a PodCertificateRequest is a create like the POST path, so it
+        // must pass the same NodeRestriction.
+        if let (Some(namespace), "certificates.k8s.io", "podcertificaterequests") =
+            (ns, group, plural)
+        {
+            super::certificates::restrict_node_pod_certificate_request_create(
+                state, user, namespace, &obj.body,
+            )
+            .await?;
+        }
         // ResourceQuota: an SSA apply-create is a create just like create_resource /
         // create_namespaced_resource, so it must be checked against count/* and compute
         // quotas too — otherwise `kubectl apply --server-side` on a not-yet-existing name
@@ -3775,6 +3785,12 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             None, None, None, None, None, None, None, None, None, false, None,
         )
     };
+
+    // PodCertificateRequest forbids create-on-update (upstream AllowCreateOnUpdate=false): a
+    // PUT must not bypass the POST-only NodeRestriction by creating the object.
+    if !object_existed && group == "certificates.k8s.io" && plural == "podcertificaterequests" {
+        return Err(Status::not_found(&name, &meta.kind));
+    }
 
     // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
     // omits metadata.generation. Restamp the stored value onto the incoming body before
