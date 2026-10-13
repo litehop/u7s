@@ -6186,7 +6186,7 @@ mod tests {
     }
 
     /// `list_namespace_objects` is the hottest LIST path in the conformance samply trace
-    /// (ai/findings/samply-triage-2026-08-06.md) — it must reuse a cached prepared statement
+    /// — it must reuse a cached prepared statement
     /// across calls instead of re-parsing the same SQL text from scratch on every request.
     ///
     /// This is checked via SQLite's per-statement `Run` status counter rather than timing:
