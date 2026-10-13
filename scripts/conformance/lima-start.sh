@@ -206,6 +206,7 @@ echo "u7s is reachable."
 # cause the provisioning branch to run and hit "instance already exists".
 VM_DIR="${HOME}/.lima/${VM_NAME}"
 if [ -d "$VM_DIR" ]; then
+  [ -z "$_KUBELET_PORT_OVERRIDE" ] || assert_kubelet_port_matches_vm "$VM_NAME" "$KUBELET_PORT" || exit 1
   STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${VM_NAME} / {print \$2}")
   if [ "$STATUS" != "Running" ]; then
     check_port_free "$KUBELET_PORT" "kubelet"
