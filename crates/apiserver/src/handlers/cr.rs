@@ -1199,8 +1199,10 @@ fn cel_escape_ident(ident: &str) -> Option<String> {
 /// (regardless of whether the JSON literal looks integral). Binding through serde would
 /// instead turn every positive JSON integer into `uint`, making `self.n + 1` fail with
 /// `UnsupportedBinaryOperator(add, UInt, Int)`. Unschemaed values (preserve-unknown-fields
-/// data) bind integers as `int` too, matching Go's int64 unstructured numbers; a value
-/// above `i64::MAX` has no CEL `int` form and stays `uint` rather than wrapping.
+/// data) bind integers as `int` too, matching Go's int64 unstructured numbers. A value
+/// under a declared integer schema that is not an int64 (above `i64::MAX`, or float-form
+/// like `5.0`) is an invalid-data error, as upstream's `valuesunstructured.go`; unschemaed
+/// values keep the `uint`/`double` fallback.
 ///
 /// Object keys that `schema` declares under a structural `properties` map are renamed to
 /// their CEL-escaped form (`cel_escape_ident`), so a rule can reach a reserved-word or
@@ -1216,18 +1218,28 @@ fn cel_escape_ident(ident: &str) -> Option<String> {
 /// unescapes when `schema.Properties() != nil`) — a map key literally named `namespace`
 /// is reachable only via index syntax (`self.m['namespace']`), which needs no escaping
 /// since it's a string literal, not an identifier.
-fn json_to_cel_value(schema: &serde_json::Value, value: &serde_json::Value) -> cel::Value {
+fn json_to_cel_value(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<cel::Value, String> {
     use serde_json::Value as J;
-    match value {
+    Ok(match value {
         J::Null => cel::Value::Null,
         J::Bool(b) => cel::Value::Bool(*b),
         J::String(s) => cel::Value::String(std::sync::Arc::new(s.clone())),
         J::Number(n) => {
-            if schema.get("type").and_then(|t| t.as_str()) == Some("number") {
-                return cel::Value::Float(n.as_f64().unwrap_or_default());
+            let schema_type = schema.get("type").and_then(|t| t.as_str());
+            if schema_type == Some("number") {
+                return Ok(cel::Value::Float(n.as_f64().unwrap_or_default()));
             }
+            let declared_integer = schema_type == Some("integer")
+                || schema.get("x-kubernetes-int-or-string") == Some(&J::Bool(true));
             if let Some(i) = n.as_i64() {
                 cel::Value::Int(i)
+            } else if declared_integer {
+                return Err(format!(
+                    "integer value {n} is not representable as a CEL int"
+                ));
             } else if let Some(u) = n.as_u64() {
                 cel::Value::UInt(u)
             } else {
@@ -1239,7 +1251,7 @@ fn json_to_cel_value(schema: &serde_json::Value, value: &serde_json::Value) -> c
             cel::Value::from(
                 arr.iter()
                     .map(|item| json_to_cel_value(items_schema, item))
-                    .collect::<Vec<_>>(),
+                    .collect::<Result<Vec<_>, _>>()?,
             )
         }
         J::Object(map) => {
@@ -1254,27 +1266,27 @@ fn json_to_cel_value(schema: &serde_json::Value, value: &serde_json::Value) -> c
                             // An unescapable field name is omitted, matching upstream: such
                             // a field is never declared in the CEL type.
                             if let Some(escaped) = cel_escape_ident(key) {
-                                out.insert(escaped, json_to_cel_value(sub_schema, v));
+                                out.insert(escaped, json_to_cel_value(sub_schema, v)?);
                             }
                         }
                         // Not a declared property (e.g. data kept only via
                         // x-kubernetes-preserve-unknown-fields) — untyped, so not reachable
                         // from a CEL rule either way; keep it rather than drop data.
                         None => {
-                            out.insert(key.clone(), json_to_cel_value(&J::Null, v));
+                            out.insert(key.clone(), json_to_cel_value(&J::Null, v)?);
                         }
                     },
                     None => {
                         out.insert(
                             key.clone(),
-                            json_to_cel_value(ap_schema.unwrap_or(&J::Null), v),
+                            json_to_cel_value(ap_schema.unwrap_or(&J::Null), v)?,
                         );
                     }
                 }
             }
             cel::Value::from(out)
         }
-    }
+    })
 }
 
 /// Wall-clock budget for evaluating a single CEL rule or `messageExpression`. Upstream
@@ -1421,8 +1433,17 @@ fn evaluate_cel_rule(
         ))
     })?;
 
-    let escaped_self = json_to_cel_value(schema, self_value);
-    let escaped_old_self = old_self_value.map(|v| json_to_cel_value(schema, v));
+    let invalid_data = |e: String| {
+        Status::unprocessable_entity(format!(
+            "{field_path}: x-kubernetes-validations rule failed to evaluate: invalid data: {e} \
+             (rule: {rule_text})"
+        ))
+    };
+    let escaped_self = json_to_cel_value(schema, self_value).map_err(invalid_data)?;
+    let escaped_old_self = old_self_value
+        .map(|v| json_to_cel_value(schema, v))
+        .transpose()
+        .map_err(invalid_data)?;
 
     let mut cel_ctx = cel::Context::default();
     register_cel_string_extensions(&mut cel_ctx);
@@ -11906,14 +11927,25 @@ mod tests {
         );
     }
 
-    // Above i64::MAX there is no CEL int; binding stays uint (never wraps negative), so a
-    // rule mixing it with int arithmetic errors and the CR is rejected, fail-closed.
     #[test]
-    fn cel_integer_above_int64_max_binds_as_uint_instead_of_wrapping_negative() {
+    fn cel_integer_above_int64_max_is_invalid_data_not_a_uint_binding() {
         let schema = int_rule_schema("dyn(self.n) > 0 && type(self.n) == uint");
+        let err = check_schema(&serde_json::json!({ "n": u64::MAX }), schema)
+            .expect_err("a schema-integer above int64 max must fail like upstream, not bind uint");
         assert!(
-            check_schema(&serde_json::json!({ "n": u64::MAX }), schema).is_ok(),
-            "a value above int64 max must stay uint, not wrap to a negative int"
+            format!("{err:?}").contains("invalid data"),
+            "the failure must be the invalid-data error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cel_integer_field_with_float_form_literal_is_invalid_data_not_a_double_binding() {
+        let schema = int_rule_schema("type(self.n) == double");
+        let err = check_schema(&serde_json::json!({ "n": 5.0 }), schema)
+            .expect_err("a schema-integer given as 5.0 must fail like upstream, not bind double");
+        assert!(
+            format!("{err:?}").contains("invalid data"),
+            "the failure must be the invalid-data error, got {err:?}"
         );
     }
 
