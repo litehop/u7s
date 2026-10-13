@@ -1030,11 +1030,35 @@ fn validate_cel_rules(
     }
 }
 
-/// Marker phrase (upstream's own wording) in a rule failure that must end the rule walk.
+/// Upstream's wording for a failure after which the remaining rules are not run.
 const CEL_NO_FURTHER_RULES: &str = "no further validation rules will be run";
 
+/// A failed rule, and whether the failure ends the rule walk (cost or time limit).
+struct RuleFailure {
+    error: crate::status::StatusError,
+    halts_rules: bool,
+}
+
+impl RuleFailure {
+    fn halting(error: crate::status::StatusError) -> Self {
+        Self {
+            error,
+            halts_rules: true,
+        }
+    }
+}
+
+impl From<crate::status::StatusError> for RuleFailure {
+    fn from(error: crate::status::StatusError) -> Self {
+        Self {
+            error,
+            halts_rules: false,
+        }
+    }
+}
+
 /// Appends each failure under `schema`/`obj` to `errors`; returns `false` once a failure
-/// carrying `CEL_NO_FURTHER_RULES` was recorded.
+/// that halts the walk was recorded.
 fn collect_cel_rule_errors(
     schema: &serde_json::Value,
     obj: &serde_json::Value,
@@ -1049,9 +1073,8 @@ fn collect_cel_rule_errors(
     {
         for rule in rules {
             if let Err(e) = evaluate_cel_rule(rule, schema, obj, old_node, field_path, programs) {
-                let stop = e.1.message.contains(CEL_NO_FURTHER_RULES);
-                errors.push(e.1.message);
-                if stop {
+                errors.push(e.error.1.message);
+                if e.halts_rules {
                     return false;
                 }
             }
@@ -1474,7 +1497,7 @@ fn evaluate_cel_rule(
     old_self_value: Option<&serde_json::Value>,
     field_path: &str,
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
-) -> Result<(), crate::status::StatusError> {
+) -> Result<(), RuleFailure> {
     let Some(rule_text) = rule.get("rule").and_then(|v| v.as_str()) else {
         return Ok(());
     };
@@ -1551,13 +1574,15 @@ fn evaluate_cel_rule(
         match within_limit {
             Ok(true) => {}
             Ok(false) | Err(CelEvalOverBudget::TimedOut) => {
-                return Err(Status::unprocessable_entity(format!(
+                return Err(RuleFailure::halting(Status::unprocessable_entity(format!(
                     "{field_path}: Invalid value: operation cancelled: actual cost limit \
                      exceeded: {CEL_NO_FURTHER_RULES} due to call cost exceeds limit for rule: \
                      {rule_text}"
-                )));
+                ))));
             }
-            Err(CelEvalOverBudget::TooManyInFlight) => return Err(too_many_in_flight()),
+            Err(CelEvalOverBudget::TooManyInFlight) => {
+                return Err(RuleFailure::halting(too_many_in_flight()))
+            }
         }
     }
 
@@ -1568,13 +1593,15 @@ fn evaluate_cel_rule(
         &CEL_EVAL_THREAD_GATE,
     ) {
         Err(CelEvalOverBudget::TimedOut) => {
-            return Err(Status::unprocessable_entity(format!(
+            return Err(RuleFailure::halting(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule exceeded its evaluation time \
                  budget of {CEL_RULE_EVAL_BUDGET:?} — rejecting to bound CEL evaluation cost, \
                  {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
-            )));
+            ))));
         }
-        Err(CelEvalOverBudget::TooManyInFlight) => return Err(too_many_in_flight()),
+        Err(CelEvalOverBudget::TooManyInFlight) => {
+            return Err(RuleFailure::halting(too_many_in_flight()))
+        }
         Ok(Ok(v)) => v,
         // `oldSelf` is only meaningful on UPDATE, when the field being validated also
         // existed in the previous object — upstream skips (does not fail) a rule that
@@ -1590,7 +1617,8 @@ fn evaluate_cel_rule(
         Ok(Err(e)) => {
             return Err(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule failed to evaluate: {e} (rule: {rule_text})"
-            )));
+            ))
+            .into());
         }
     };
 
@@ -1600,7 +1628,8 @@ fn evaluate_cel_rule(
             return Err(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule must evaluate to a bool \
                  (rule: {rule_text}, got: {other:?})"
-            )));
+            ))
+            .into());
         }
     };
     if passed {
@@ -1620,7 +1649,8 @@ fn evaluate_cel_rule(
     };
     Err(Status::unprocessable_entity(format!(
         "{field_path}: Invalid value: {value_prefix}{detail}"
-    )))
+    ))
+    .into())
 }
 
 /// The message to report for a failed CEL rule: the CRD-declared `message`, or the
@@ -12179,6 +12209,26 @@ mod tests {
         let obj = serde_json::json!({ "spec": { "skip": true, "rows": grid("z") } });
         let schema = grid_schema("self.skip ? true : self.rows.all(r, r.all(c, c == 'x'))");
         assert!(check_schema(&obj, schema).is_ok());
+    }
+
+    /// The failure text embeds the author's rule and message; a rule that merely quotes
+    /// upstream's stop phrase must not end the walk and hide later violations.
+    #[test]
+    fn rule_text_quoting_the_stop_phrase_does_not_halt_later_rules() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "x-kubernetes-validations": [
+                { "rule": "self.a == 'no further validation rules will be run'" },
+                { "rule": "self.b > 0", "message": "b must be positive" }
+            ],
+            "properties": { "a": { "type": "string" }, "b": { "type": "integer" } }
+        });
+        let err = check_schema(&serde_json::json!({ "a": "x", "b": 0 }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("b must be positive"),
+            "an ordinary failing rule must not suppress the rules after it: {}",
+            err.1.message
+        );
     }
 
     #[test]
