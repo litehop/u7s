@@ -1553,11 +1553,11 @@ fn run_within_budget<T: Send + 'static>(
         .map_err(|_| CelEvalOverBudget::TimedOut)
 }
 
-/// Wall-clock backstop for the cost replay, a multiple of `CEL_RULE_EVAL_BUDGET` because the
-/// replay's per-level work in nested comprehensions is about double a plain evaluation;
-/// the counted cost verdict, not this timeout, is what decides a rule is over the limit.
+/// Wall-clock backstop for the cost replay, 20x the plain budget: replay work is already
+/// bounded by the counted limit, so a timeout must only fire on a stuck replay, never on a
+/// slow host or debug build (a 725-item quadratic replay takes ~750ms unoptimised).
 const CEL_COST_REPLAY_BUDGET: std::time::Duration =
-    std::time::Duration::from_millis(4 * CEL_RULE_EVAL_BUDGET.as_millis() as u64);
+    std::time::Duration::from_millis(20 * CEL_RULE_EVAL_BUDGET.as_millis() as u64);
 
 fn replay_within_budget(
     gate: &'static ConcurrencyGate,
