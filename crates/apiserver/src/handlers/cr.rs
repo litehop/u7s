@@ -1093,14 +1093,14 @@ const CEL_NO_FURTHER_RULES: &str = "no further validation rules will be run";
 
 /// A failed rule, and whether the failure ends the rule walk (cost or time limit).
 struct RuleFailure {
-    error: crate::status::StatusError,
+    error: Box<crate::status::StatusError>,
     halts_rules: bool,
 }
 
 impl RuleFailure {
     fn halting(error: crate::status::StatusError) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             halts_rules: true,
         }
     }
@@ -1109,7 +1109,7 @@ impl RuleFailure {
 impl From<crate::status::StatusError> for RuleFailure {
     fn from(error: crate::status::StatusError) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             halts_rules: false,
         }
     }
