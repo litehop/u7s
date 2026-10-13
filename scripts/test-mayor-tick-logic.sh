@@ -675,7 +675,28 @@ STATE_E2E="$(dirname "$SCRATCH_REPO")/state-repo-state-ts.json"
 # "placeholder" fixture text. Safe against this isolated scratch repo (no
 # queue files, gh/bd stubbed to fail) the same way the dispatch-marker
 # lifecycle test above uses dry_run=0 to observe a real on-disk effect.
-PATH="$STUB_EMPTY_BIN:$PATH" \
+# `date` is shadowed so every ISO-stamp call returns a strictly later second
+# than the previous one: with independent `date -u` calls the dashboard and
+# state-file stamps then ALWAYS differ, instead of agreeing by luck whenever
+# both calls land in the same wall-clock second. Non-stamp formats (+%s)
+# pass through to the real date.
+STUB_DATE_BIN="$WORKDIR/stub-date-bin"
+mkdir -p "$STUB_DATE_BIN"
+cp "$STUB_EMPTY_BIN"/* "$STUB_DATE_BIN/"
+cat > "$STUB_DATE_BIN/date" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *%Y-%m-%dT%H:%M:%SZ*)
+    n=\$(cat "$WORKDIR/date-stub-counter" 2>/dev/null || echo 0)
+    n=\$(( n + 1 ))
+    echo "\$n" > "$WORKDIR/date-stub-counter"
+    printf '2026-01-01T00:%02d:%02dZ\n' \$(( n / 60 )) \$(( n % 60 ))
+    ;;
+  *) exec "$(command -v date)" "\$@" ;;
+esac
+EOF
+chmod +x "$STUB_DATE_BIN/date"
+PATH="$STUB_DATE_BIN:$PATH" \
   MAYOR_TICK_QUEUE_DIR="$SCRATCH_REPO/.claude/review-queue" \
   MAYOR_TICK_STATE_FILE="$STATE_E2E" \
   MAYOR_TICK_DASHBOARD_FILE="$DASH_E2E" \
@@ -685,6 +706,8 @@ DASH_TS=$(grep -oE "$ISO_RE" "$DASH_E2E" | head -1 || true)
 STATE_TS=$(jq -r '.timestamp' "$STATE_E2E" 2>/dev/null || true)
 assert "dashboard's spliced repo-state timestamp matches the state file's .timestamp from the SAME tick run (single source of truth, not independently-drifting clocks)" \
   "$([ -n "$DASH_TS" ] && [ "$DASH_TS" = "$STATE_TS" ] && echo 1 || echo 0)"
+assert "...and the stubbed clock was actually the source of both stamps (guards against the stub being bypassed and the equality passing by wall-clock luck)" \
+  "$([ "${DASH_TS:0:10}" = "2026-01-01" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 10. process_review_queue dtype routing, end-to-end through the REAL
