@@ -125,7 +125,7 @@ run_full_tick() {
 }
 
 WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+trap 'rc=$?; [ "$rc" -ne 0 ] && echo "FATAL: aborted (exit $rc) at line ${LINENO}: $BASH_COMMAND" >&2; rm -rf "$WORKDIR"; exit "$rc"' EXIT
 
 # ---------------------------------------------------------------------------
 # 1. Queue-drain detection.
@@ -1436,11 +1436,11 @@ chmod +x "$STUB_MERGED_BIN/gh" "$STUB_MERGED_BIN/bd"
 build_scratch_repo "merged-ff"
 FF_ORIGIN="$(dirname "$SCRATCH_REPO")/origin.git"
 FF_ADVANCER="$(dirname "$SCRATCH_REPO")/advancer"
-git init -q --bare "$FF_ORIGIN"
+git init -q --bare -b main "$FF_ORIGIN"
 git -C "$SCRATCH_REPO" branch -M main
 git -C "$SCRATCH_REPO" remote add origin "$FF_ORIGIN"
 git -C "$SCRATCH_REPO" push -q -u origin main 2>/dev/null
-git clone -q "$FF_ORIGIN" "$FF_ADVANCER" 2>/dev/null
+git clone -q -b main "$FF_ORIGIN" "$FF_ADVANCER" 2>/dev/null
 git -C "$FF_ADVANCER" config user.email test@example.com
 git -C "$FF_ADVANCER" config user.name "Test"
 git -C "$FF_ADVANCER" commit -q --allow-empty -m "merged worker PR lands on origin main"
