@@ -237,6 +237,36 @@ fn child_cardinality(card: Cardinality, schema: &J) -> Cardinality {
     Some(card?.saturating_mul(factor?))
 }
 
+/// Every `rule` and `messageExpression` under the `x-kubernetes-validations` of a stored
+/// schema value; an update must not start failing on text the CRD already carried.
+pub(crate) fn collect_expressions(value: &J, out: &mut std::collections::HashSet<String>) {
+    match value {
+        J::Object(map) => {
+            if let Some(rules) = map.get("x-kubernetes-validations").and_then(J::as_array) {
+                for rule in rules {
+                    for key in ["rule", "messageExpression"] {
+                        if let Some(s) = rule.get(key).and_then(J::as_str) {
+                            out.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+            map.values().for_each(|v| collect_expressions(v, out));
+        }
+        J::Array(items) => items.iter().for_each(|v| collect_expressions(v, out)),
+        _ => {}
+    }
+}
+
+/// What an update inherits from the stored CRD: expressions already present are not
+/// re-failed on compile errors, and a version whose schema is unchanged is exempt from the
+/// per-rule cost limit. The CRD-wide total still applies.
+#[derive(Default)]
+pub(crate) struct Ratchet<'a> {
+    pub preexisting: Option<&'a std::collections::HashSet<String>>,
+    pub suppress_rule_cost: bool,
+}
+
 /// Rejects a CRD `openAPIV3Schema` whose `x-kubernetes-validations` rules or
 /// `messageExpression`s do not compile, or whose estimated cost exceeds the budgets,
 /// formatted like upstream's field errors.
@@ -244,9 +274,10 @@ pub(crate) fn check_schema_rules(
     schema: &J,
     path: &str,
     is_root: bool,
+    ratchet: &Ratchet,
 ) -> Result<(), crate::status::StatusError> {
     let mut total_cost = 0u64;
-    check_node(schema, path, is_root, Some(1), &mut total_cost)?;
+    check_node(schema, path, is_root, Some(1), ratchet, &mut total_cost)?;
     if total_cost > cel_cost::STATIC_CRD_COST_LIMIT {
         return Err(crate::status::Status::unprocessable_entity(format!(
             "{path}: Forbidden: {}",
@@ -265,6 +296,7 @@ fn check_node(
     path: &str,
     is_root: bool,
     card: Cardinality,
+    ratchet: &Ratchet,
     total_cost: &mut u64,
 ) -> Result<(), crate::status::StatusError> {
     if let Some(rules) = schema
@@ -281,16 +313,20 @@ fn check_node(
                 else {
                     continue;
                 };
-                let program = compile_rule(src, schema, is_root).map_err(|e| {
-                    crate::status::Status::unprocessable_entity(format!(
-                        "{path}.x-kubernetes-validations[{i}].{key}: Invalid value: \
-                         \"{src}\": compilation failed: {e}"
-                    ))
-                })?;
+                let program = match compile_rule(src, schema, is_root) {
+                    Ok(p) => p,
+                    Err(_) if ratchet.preexisting.is_some_and(|p| p.contains(src)) => continue,
+                    Err(e) => {
+                        return Err(crate::status::Status::unprocessable_entity(format!(
+                            "{path}.x-kubernetes-validations[{i}].{key}: Invalid value: \
+                             \"{src}\": compilation failed: {e}"
+                        )))
+                    }
+                };
                 let node = cel_cost::Node::Schema(schema);
                 let cost = cel_cost::estimate(&program, node, Some(node)).saturating_mul(instances);
                 *total_cost = total_cost.saturating_add(cost);
-                if cost > cel_cost::STATIC_COST_LIMIT {
+                if cost > cel_cost::STATIC_COST_LIMIT && !ratchet.suppress_rule_cost {
                     let name = if key == "rule" {
                         "estimated rule cost"
                     } else {
@@ -308,7 +344,7 @@ fn check_node(
     if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
         for (name, sub) in props {
             let sub_path = format!("{path}.properties[{name}]");
-            check_node(sub, &sub_path, false, child_card, total_cost)?;
+            check_node(sub, &sub_path, false, child_card, ratchet, total_cost)?;
         }
     }
     if let Some(items) = schema.get("items").filter(|v| v.is_object()) {
@@ -317,12 +353,13 @@ fn check_node(
             &format!("{path}.items"),
             false,
             child_card,
+            ratchet,
             total_cost,
         )?;
     }
     if let Some(ap) = schema.get("additionalProperties").filter(|v| v.is_object()) {
         let sub_path = format!("{path}.additionalProperties");
-        check_node(ap, &sub_path, false, child_card, total_cost)?;
+        check_node(ap, &sub_path, false, child_card, ratchet, total_cost)?;
     }
     Ok(())
 }
@@ -441,7 +478,8 @@ mod tests {
                 } }
             } }
         });
-        let err = check_schema_rules(&schema, "openAPIV3Schema", true).unwrap_err();
+        let err =
+            check_schema_rules(&schema, "openAPIV3Schema", true, &Ratchet::default()).unwrap_err();
         assert!(
             err.1.message.contains("exceeds budget"),
             "a rule that can cost billions per CR must be refused at CRD create, not at every \
@@ -471,7 +509,7 @@ mod tests {
             } }
         });
         assert!(
-            check_schema_rules(&schema, "openAPIV3Schema", true).is_ok(),
+            check_schema_rules(&schema, "openAPIV3Schema", true, &Ratchet::default()).is_ok(),
             "bounding the collections is the documented remedy; it must make the rule acceptable"
         );
     }
@@ -491,7 +529,7 @@ mod tests {
             } }
         });
         assert!(
-            check_schema_rules(&schema, "openAPIV3Schema", true).is_ok(),
+            check_schema_rules(&schema, "openAPIV3Schema", true, &Ratchet::default()).is_ok(),
             "the O(n^2) rule is within the static budget; only its runtime cost must trip"
         );
     }
@@ -506,7 +544,8 @@ mod tests {
                 "properties": { "x": { "type": "integer" } }
             } }
         });
-        let err = check_schema_rules(&schema, "openAPIV3Schema", true).unwrap_err();
+        let err =
+            check_schema_rules(&schema, "openAPIV3Schema", true, &Ratchet::default()).unwrap_err();
         assert!(
             err.1.message.contains(
                 "openAPIV3Schema.properties[spec].x-kubernetes-validations[0].rule: \
