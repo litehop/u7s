@@ -92,6 +92,8 @@ is_bead_export_discard() {
   [ "$npaths" -gt 0 ]
 }
 
+SUBST_MARK=__U7S_SUBST__
+
 is_destructive_git_args() {
   # is_destructive_git_args <args> <target-dir> -- <args> is everything
   # after `git` (and after any leading `-C <dir>` has been stripped by the
@@ -100,6 +102,13 @@ is_destructive_git_args() {
   local args="$1" target_dir="$2" first second tok
   first=$(printf '%s\n' "$args" | awk '{print $1}')
   is_bead_export_discard "$args" && return 1
+  # A non-read-only substitution in an argument can expand to anything
+  # (`reset $(echo --hard)`, `checkout $(echo .)`); check_command marks it.
+  case "$first" in
+    reset|checkout|restore|clean)
+      [[ " $args " == *" $SUBST_MARK "* ]] && return 0
+      ;;
+  esac
   case "$first" in
     reset)
       printf '%s' "$args" | grep -qE '(^|[[:space:]])--hard([[:space:]]|$)'
@@ -110,14 +119,25 @@ is_destructive_git_args() {
       # discard worktree changes; only `-B <branch> <ref>` and plain
       # branch switches (whose args never resolve to an existing path)
       # must stay allowed.
+      local seen_pos=0 skip=1
       for tok in $args; do
+        if [ "$skip" = 1 ]; then
+          skip=0
+          continue
+        fi
         if [ "$tok" = "." ] || [ "$tok" = "--" ]; then
           return 0
         fi
         case "$tok" in
+          -b|-B|--orphan) skip=1; continue ;;
           -*) continue ;;
         esac
-        [ -e "$target_dir/$tok" ] && return 0
+        if [ -e "$target_dir/$tok" ]; then
+          # Only the first positional can be a ref; any later one is a pathspec.
+          [ "$seen_pos" = 1 ] && return 0
+          git -C "$target_dir" rev-parse --verify --quiet "$tok" >/dev/null 2>&1 || return 0
+        fi
+        seen_pos=1
       done
       return 1
       ;;
@@ -166,6 +186,9 @@ check_command() {
   # if any segment is a destructive git command against a protected repo.
   local cmd="$1" cwd="$2" current_dir seg raw_seg cdarg rest target_dir has_alias
   local alias_re='^-c[[:space:]]*["'"'"']?[aA][lL][iI][aA][sS]\.'
+  local tok_re='(("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]"'"'"'])+)'
+  local cfgenv_alias_re='^--config-env(=|[[:space:]]+)["'"'"']?[aA][lL][iI][aA][sS]\.'
+  local env_seen next
 
   MAIN_ROOT=$(mayor_root)
   current_dir="$cwd"
@@ -178,9 +201,25 @@ check_command() {
 
     if [[ "$seg" =~ ^cd[[:space:]]+(.+)$ ]]; then
       cdarg=$(printf '%s' "${BASH_REMATCH[1]}" | sed -E "s/^[\"']//; s/[\"']\$//")
-      current_dir=$(resolve_dir "$current_dir" "$cdarg")
+      [[ "$cdarg" == *"$SUBST_MARK"* ]] || current_dir=$(resolve_dir "$current_dir" "$cdarg")
       continue
     fi
+
+    env_seen=0
+    while :; do
+      if [[ "$seg" =~ ^env[[:space:]]+(.*)$ ]]; then
+        env_seen=1
+      elif [[ "$seg" =~ ^[A-Za-z_][A-Za-z0-9_]*=${tok_re}?[[:space:]]+(.*)$ ]]; then
+        :
+      elif [ "$env_seen" = 1 ] && [[ "$seg" =~ ^-[uCS][[:space:]]+[^[:space:]]+[[:space:]]+(.*)$ ]]; then
+        :
+      elif [ "$env_seen" = 1 ] && [[ "$seg" =~ ^-[^[:space:]]*[[:space:]]+(.*)$ ]]; then
+        :
+      else
+        break
+      fi
+      seg="${BASH_REMATCH[$(( ${#BASH_REMATCH[@]} - 1 ))]}"
+    done
 
     [[ "$seg" == git\ * ]] || continue
 
@@ -191,10 +230,14 @@ check_command() {
       if [[ "$rest" =~ ^-C[[:space:]]+([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
         target_dir=$(resolve_dir "$target_dir" "${BASH_REMATCH[1]}")
         rest="${BASH_REMATCH[2]}"
-      elif [[ "$rest" =~ ^-c[[:space:]]*([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
+      elif [[ "$rest" =~ ^-c[[:space:]]*${tok_re}[[:space:]]+(.*)$ ]]; then
+        next="${BASH_REMATCH[$(( ${#BASH_REMATCH[@]} - 1 ))]}"
         [[ "$rest" =~ $alias_re ]] && has_alias=1
-        [[ "$rest" =~ ^-c[[:space:]]*[^[:space:]]+[[:space:]]+(.*)$ ]]
-        rest="${BASH_REMATCH[1]}"
+        rest="$next"
+      elif [[ "$rest" =~ ^--config-env(=|[[:space:]]+)${tok_re}[[:space:]]+(.*)$ ]]; then
+        next="${BASH_REMATCH[$(( ${#BASH_REMATCH[@]} - 1 ))]}"
+        [[ "$rest" =~ $cfgenv_alias_re ]] && has_alias=1
+        rest="$next"
       else
         break
       fi
@@ -206,7 +249,10 @@ check_command() {
       printf "$BLOCK_MSG_TEMPLATE" "$seg" "$target_dir" >&2
       return 2
     fi
-  done <<< "$(printf '%s' "$cmd" | sed -E 's/(&&|\|\||;|\||\$\(|`|\(|\))/\n/g')"
+  done <<< "$(printf '%s' "$cmd" | sed -E "s/(\\\$\\(|\`)[[:space:]]*(git[[:space:]]+(rev-parse|rev-list|describe|merge-base))/\\
+\\2/g; s/(\\\$\\(|\`)/ $SUBST_MARK\\
+/g; s/(&&|\\|\\||;|\\||\\(|\\))/\\
+/g")"
 
   return 0
 }
