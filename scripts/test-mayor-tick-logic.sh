@@ -1330,6 +1330,35 @@ assert "a draft PR is never enqueued via gh pr merge, even with a CLEAN mergeSta
 assert "...and the tick exits with a normal in-contract code (not an unhandled error from a rejected draft-merge attempt)" \
   "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
 
+# Dry-run above masks GitHub's real rejection, so repeat with dry-run OFF and
+# a gh whose `pr merge` fails exactly like GitHub does for a draft. If the
+# draft guard regresses, the real merge call runs, exits 1 and (under set -e)
+# aborts the tick outside the 0/10/20/30 contract.
+STUB_PR_DRAFT_REAL_BIN="$WORKDIR/stub-pr-draft-real-bin"
+MERGE_CALLS="$WORKDIR/draft-real-merge-calls"
+mkdir -p "$STUB_PR_DRAFT_REAL_BIN"
+: > "$MERGE_CALLS"
+cp "$STUB_PR_DRAFT_BIN/bd" "$STUB_PR_DRAFT_REAL_BIN/bd"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'if [[ " $* " == *" pr merge "* ]]; then'
+  echo "  echo \"\$*\" >> \"$MERGE_CALLS\""
+  echo '  echo "Pull request is a draft and cannot be merged" >&2'
+  echo '  exit 1'
+  echo 'fi'
+  tail -n +2 "$STUB_PR_DRAFT_BIN/gh"
+} > "$STUB_PR_DRAFT_REAL_BIN/gh"
+chmod +x "$STUB_PR_DRAFT_REAL_BIN/gh" "$STUB_PR_DRAFT_REAL_BIN/bd"
+
+build_scratch_repo
+pushd "$SCRATCH_REPO" >/dev/null
+invoke_tick "$STUB_PR_DRAFT_REAL_BIN" "$SCRATCH_REPO" 0
+popd >/dev/null
+assert "a draft PR never reaches a real gh pr merge call (non-dry-run)" \
+  "$([ ! -s "$MERGE_CALLS" ] && echo 1 || echo 0)"
+assert "...so GitHub's draft rejection cannot abort the tick: exit stays inside the 0/10/20/30 contract (non-dry-run)" \
+  "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 21. Draft-PR skip in reconcile_missing_queue_entries specifically -- the
 #     sibling gap section 20 doesn't cover. gate_and_merge_prs's isDraft
@@ -1377,6 +1406,60 @@ assert "a draft PR with no queue entry and no review is NOT synthesized into pen
   "$([ "$(jq -r '.pending_reviews | index(5555) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
 assert "...and reconcile never even logs the synthesizing message for it" \
   "$(! printf '%s' "$TICK_OUT" | grep -q 'synthesizing pending_reviews entry' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 22. Post-merge checkout refresh in cleanup_merged_worktrees against a REAL
+#     remote: after a worker's PR is MERGED the tick must fetch origin main
+#     and fast-forward the mayor's checkout to it. If either step regresses
+#     the checkout silently stays behind origin and every later worker
+#     worktree branches off stale main.
+# ---------------------------------------------------------------------------
+
+STUB_MERGED_BIN="$WORKDIR/stub-merged-bin"
+mkdir -p "$STUB_MERGED_BIN"
+# Only `gh pr list --head <branch>` answers, reporting that branch's PR as
+# MERGED; every other gh query sees no open PRs.
+cat > "$STUB_MERGED_BIN/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" --head "* ]]; then
+  printf '{"number":7777,"state":"MERGED"}'
+else
+  printf '[]'
+fi
+EOF
+cat > "$STUB_MERGED_BIN/bd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$STUB_MERGED_BIN/gh" "$STUB_MERGED_BIN/bd"
+
+build_scratch_repo "merged-ff"
+FF_ORIGIN="$(dirname "$SCRATCH_REPO")/origin.git"
+FF_ADVANCER="$(dirname "$SCRATCH_REPO")/advancer"
+git init -q --bare "$FF_ORIGIN"
+git -C "$SCRATCH_REPO" branch -M main
+git -C "$SCRATCH_REPO" remote add origin "$FF_ORIGIN"
+git -C "$SCRATCH_REPO" push -q -u origin main 2>/dev/null
+git clone -q "$FF_ORIGIN" "$FF_ADVANCER" 2>/dev/null
+git -C "$FF_ADVANCER" config user.email test@example.com
+git -C "$FF_ADVANCER" config user.name "Test"
+git -C "$FF_ADVANCER" commit -q --allow-empty -m "merged worker PR lands on origin main"
+git -C "$FF_ADVANCER" push -q origin HEAD:main 2>/dev/null
+FF_BEFORE=$(git -C "$SCRATCH_REPO" rev-parse HEAD)
+FF_ORIGIN_SHA=$(git -C "$FF_ADVANCER" rev-parse HEAD)
+# Local origin/main is still the OLD sha here, so only the tick's own fetch
+# can make the fast-forward possible.
+# The script's `git worktree remove` / `git branch -D` act on the CWD repo, so
+# the tick must run from inside the scratch repo, never this dev checkout.
+pushd "$SCRATCH_REPO" >/dev/null
+invoke_tick "$STUB_MERGED_BIN" "$SCRATCH_REPO" 0
+popd >/dev/null
+assert "fixture sanity: origin is ahead of the checkout before the tick" \
+  "$([ "$FF_BEFORE" != "$FF_ORIGIN_SHA" ] && echo 1 || echo 0)"
+assert "after a MERGED worker PR the checkout fast-forwards to origin's new main (fetch + merge --ff-only both ran)" \
+  "$([ "$(git -C "$SCRATCH_REPO" rev-parse HEAD)" = "$FF_ORIGIN_SHA" ] && echo 1 || echo 0)"
+assert "...and the merged PR is recorded in merged_prs, proving the cleanup path (not some other step) did the pull" \
+  "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
