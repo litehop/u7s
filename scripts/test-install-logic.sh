@@ -1100,7 +1100,15 @@ COREDNS_MANIFEST="$ROOT_DIR/manifests/coredns.yaml"
 assert_true "CoreDNS forward block caps max_concurrent so a loop or upstream stall cannot spawn unbounded goroutines (OOM)" \
   awk '/forward \. \/etc\/resolv.conf \{/{f=1} f&&/max_concurrent 1000/{ok=1} /\}/{f=0} END{exit !ok}' "$COREDNS_MANIFEST"
 assert_true "CoreDNS Corefile keeps the loop plugin (kubeadm default) so a self-forward config fails loudly instead of silently melting down" \
-  grep -qE '^\s+loop$' "$COREDNS_MANIFEST"
+  awk '/^  Corefile: \|/{f=1; next} f&&/^[^ ]|^  [^ ]/{f=0} f&&/^ +loop$/{ok=1} END{exit !ok}' "$COREDNS_MANIFEST"
+
+SET_RC="$ROOT_DIR/scripts/set-kubelet-resolvconf.sh"
+printf 'address: 0.0.0.0\nresolvConf: ""\n' > "$RESOLV_WORK/kc-ok.yaml"
+printf 'address: 0.0.0.0\n' > "$RESOLV_WORK/kc-missing.yaml"
+assert_true "set-kubelet-resolvconf rewrites an existing resolvConf line so a golden image baked with \"\" stops self-forwarding" \
+  bash -c 'PATH="$1/bin-inactive:$PATH" "$2" "$1/kc-ok.yaml" && grep -qxF "resolvConf: /etc/resolv.conf" "$1/kc-ok.yaml"' _ "$RESOLV_WORK" "$SET_RC"
+assert_false "set-kubelet-resolvconf must exit non-zero when the config has no resolvConf line, else the sed no-ops silently and CoreDNS self-forwards" \
+  env PATH="$RESOLV_WORK/bin-inactive:$PATH" "$SET_RC" "$RESOLV_WORK/kc-missing.yaml"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
