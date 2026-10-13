@@ -119,17 +119,25 @@ is_destructive_git_args() {
       # discard worktree changes; only `-B <branch> <ref>` and plain
       # branch switches (whose args never resolve to an existing path)
       # must stay allowed.
+      local seen_pos=0 skip=1
       for tok in $args; do
+        if [ "$skip" = 1 ]; then
+          skip=0
+          continue
+        fi
         if [ "$tok" = "." ] || [ "$tok" = "--" ]; then
           return 0
         fi
         case "$tok" in
+          -b|-B|--orphan) skip=1; continue ;;
           -*) continue ;;
         esac
         if [ -e "$target_dir/$tok" ]; then
-          # A name that is also a branch/tag/commit resolves as a ref, not a path.
+          # Only the first positional can be a ref; any later one is a pathspec.
+          [ "$seen_pos" = 1 ] && return 0
           git -C "$target_dir" rev-parse --verify --quiet "$tok" >/dev/null 2>&1 || return 0
         fi
+        seen_pos=1
       done
       return 1
       ;;
@@ -241,7 +249,7 @@ check_command() {
       printf "$BLOCK_MSG_TEMPLATE" "$seg" "$target_dir" >&2
       return 2
     fi
-  done <<< "$(printf '%s' "$cmd" | sed -E "s/(\\\$\\(|\`)[[:space:]]*(git[[:space:]]+(rev-parse|rev-list|describe))/\\
+  done <<< "$(printf '%s' "$cmd" | sed -E "s/(\\\$\\(|\`)[[:space:]]*(git[[:space:]]+(rev-parse|rev-list|describe|merge-base))/\\
 \\2/g; s/(\\\$\\(|\`)/ $SUBST_MARK\\
 /g; s/(&&|\\|\\||;|\\||\\(|\\))/\\
 /g")"

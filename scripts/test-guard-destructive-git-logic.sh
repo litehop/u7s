@@ -323,6 +323,10 @@ assert "'git checkout \$(git rev-parse HEAD)' on main is allowed -- a read-only 
   "$(allowed 'git checkout $(git rev-parse HEAD)' "$MAIN")"
 assert "'echo \$(git rev-parse HEAD)' on main is allowed -- read-only git inside a substitution" \
   "$(allowed 'echo $(git rev-parse HEAD)' "$MAIN")"
+assert "'git reset --soft \$(git merge-base HEAD main)' on main is allowed -- merge-base is read-only and soft reset keeps the worktree" \
+  "$(allowed 'git reset --soft $(git merge-base HEAD main)' "$MAIN")"
+assert "'git checkout -b x \$(git merge-base HEAD main)' on main is allowed -- merge-base is a read-only start-point" \
+  "$(allowed 'git checkout -b x $(git merge-base HEAD main)' "$MAIN")"
 assert "'\$(git reset --hard)' in the worker worktree is allowed -- worker branches are unprotected" \
   "$(allowed 'echo $(git reset --hard)' "$WORKER")"
 
@@ -338,6 +342,16 @@ assert "'git checkout dirnotref' on main stays blocked -- a path that is not a r
   "$(blocked "git checkout dirnotref" "$MAIN")"
 assert "'git checkout main -- .' on main stays blocked -- an explicit -- is always a path restore" \
   "$(blocked "git checkout main -- ." "$MAIN")"
+git -C "$MAIN" tag v1
+echo x > "$MAIN/v1"
+assert "'git checkout HEAD a.txt' on main is blocked -- the second positional is a pathspec and overwrites the file even though the first is a ref" \
+  "$(blocked "git checkout HEAD a.txt" "$MAIN")"
+assert "'git checkout HEAD main' on main is blocked -- a later positional that names a path is a pathspec even if it is also a branch" \
+  "$(blocked "git checkout HEAD main" "$MAIN")"
+assert "'git checkout v1 v1' on main is blocked -- tag then same-named file restores the file" \
+  "$(blocked "git checkout v1 v1" "$MAIN")"
+assert "'git checkout -b x main' on main is allowed -- the start-point is the first positional after the new branch name" \
+  "$(allowed "git checkout -b x main" "$MAIN")"
 
 # ---------------------------------------------------------------------------
 # 15. mayor_root() fallback: CLAUDE_PROJECT_DIR is unset in subagent Bash
