@@ -14,6 +14,7 @@ use crate::{
     },
     auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
+    handlers::generic::validate_path_segment,
     handlers::json_patch::is_dry_run_header,
     keys::cluster_object_key,
     state::AppState,
@@ -2371,6 +2372,7 @@ pub async fn get_cr<S: Store>(
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
@@ -2634,6 +2636,7 @@ pub async fn replace_cr<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
@@ -2893,6 +2896,7 @@ pub async fn delete_cr<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
@@ -3173,6 +3177,7 @@ pub async fn list_cr_namespaced<S: Store>(
     query: super::generic::CollectionQuery,
     username: String,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -3425,6 +3430,8 @@ pub async fn get_cr_namespaced<S: Store>(
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
@@ -3541,6 +3548,7 @@ pub async fn create_cr_namespaced<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
@@ -3726,6 +3734,8 @@ pub async fn replace_cr_namespaced<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
@@ -3885,6 +3895,8 @@ pub async fn delete_cr_namespaced<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
@@ -4035,6 +4047,7 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
     query: super::generic::CollectionQuery,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
@@ -4189,6 +4202,7 @@ pub async fn patch_cr<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let patch_type = crate::handlers::json_patch::detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let field_validation = field_validation_mode(&headers);
@@ -4449,6 +4463,8 @@ pub async fn patch_cr_namespaced<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let patch_type = crate::handlers::json_patch::detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let field_validation = field_validation_mode(&headers);
@@ -4747,6 +4763,7 @@ pub async fn put_cr_status<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     use crate::{keys::group_object_key, types::ResourceKey, util::parse_resource_version};
 
     let ct = headers
@@ -4872,6 +4889,8 @@ pub async fn get_cr_status<S: Store>(
 ) -> Result<Response, crate::status::StatusError> {
     use crate::types::ResourceKey;
 
+    validate_path_segment("name", &name)?;
+
     let registry_key = ResourceKey {
         group: group.clone(),
         version: version.clone(),
@@ -4936,6 +4955,8 @@ pub async fn patch_cr_status<S: Store>(
         apply_json_patch, detect_patch_type, ssa_body_to_json, PatchType,
     };
     use crate::{keys::group_object_key, types::ResourceKey, util::parse_resource_version};
+
+    validate_path_segment("name", &name)?;
 
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
@@ -5355,6 +5376,7 @@ pub async fn get_cr_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
@@ -5376,6 +5398,7 @@ pub async fn put_cr_scale<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
@@ -5397,6 +5420,7 @@ pub async fn patch_cr_scale<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
@@ -5416,6 +5440,8 @@ pub async fn get_cr_namespaced_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if !ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
@@ -5437,6 +5463,8 @@ pub async fn put_cr_namespaced_scale<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if !ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
@@ -5458,6 +5486,8 @@ pub async fn patch_cr_namespaced_scale<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", &ns)?;
+    validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if !ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
@@ -23741,6 +23771,155 @@ mod tests {
             .is_ok(),
             "install namespaced CRD with scale subresource"
         );
+    }
+
+    /// Every CR handler that takes a name or namespace segment must answer 400 for '.', '..',
+    /// '%' (upstream IsPathSegmentName). No CRD is installed, so without the guard each call
+    /// would fall through to find_crd and answer 404 — the traversal name would be treated as
+    /// a legitimate lookup instead of a client error.
+    #[tokio::test]
+    async fn cr_handlers_reject_path_segment_names_with_400() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let state = make_state();
+        let user = crate::auth::UserInfo {
+            username: "test".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let app = Router::new()
+            .route(
+                "/apis/{g}/{v}/{plural}/{name}",
+                get(get_cr)
+                    .put(replace_cr)
+                    .delete(delete_cr)
+                    .patch(patch_cr),
+            )
+            .route(
+                "/apis/{g}/{v}/namespaces/{ns}/{plural}/{name}",
+                get(get_cr_namespaced)
+                    .put(replace_cr_namespaced)
+                    .delete(delete_cr_namespaced)
+                    .patch(patch_cr_namespaced),
+            )
+            .route(
+                "/apis/{g}/{v}/namespaces/{ns}/{plural}",
+                axum::routing::post(create_cr_namespaced),
+            )
+            .route(
+                "/apis/{g}/{v}/{plural}/{name}/status",
+                get(get_cr_status).put(put_cr_status).patch(patch_cr_status),
+            )
+            .route(
+                "/apis/{g}/{v}/{plural}/{name}/scale",
+                get(get_cr_scale).put(put_cr_scale).patch(patch_cr_scale),
+            )
+            .route(
+                "/apis/{g}/{v}/namespaces/{ns}/{plural}/{name}/scale",
+                get(get_cr_namespaced_scale)
+                    .put(put_cr_namespaced_scale)
+                    .patch(patch_cr_namespaced_scale),
+            )
+            .layer(axum::Extension(user.clone()))
+            .with_state(state.clone());
+
+        let name_paths = [
+            "/apis/example.io/v1/widgets/{n}",
+            "/apis/example.io/v1/namespaces/default/widgets/{n}",
+            "/apis/example.io/v1/widgets/{n}/status",
+            "/apis/example.io/v1/widgets/{n}/scale",
+            "/apis/example.io/v1/namespaces/default/widgets/{n}/scale",
+        ];
+        for path in name_paths {
+            for n in ["..", ".", "a%25b", "a%2Fb"] {
+                for method in ["GET", "PUT", "PATCH", "DELETE"] {
+                    let is_unrouted = method == "DELETE"
+                        && (path.ends_with("/status") || path.ends_with("/scale"));
+                    if is_unrouted {
+                        continue;
+                    }
+                    let uri = path.replace("{n}", n);
+                    let req = Request::builder()
+                        .method(method)
+                        .uri(&uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap();
+                    let resp = app.clone().oneshot(req).await.unwrap();
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::BAD_REQUEST,
+                        "{method} {uri} must be a 400 invalid path segment"
+                    );
+                }
+            }
+        }
+        for bad_ns in ["..", "a%25b"] {
+            let uri = format!("/apis/example.io/v1/namespaces/{bad_ns}/widgets/ok");
+            for method in ["GET", "PUT", "PATCH", "DELETE"] {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{method} {uri} must be a 400 invalid namespace segment"
+                );
+            }
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/apis/example.io/v1/namespaces/{bad_ns}/widgets"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "POST create in {bad_ns}"
+            );
+        }
+
+        let query =
+            || serde_json::from_str::<super::super::generic::CollectionQuery>("{}").unwrap();
+        let err = list_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "..".into(),
+                "widgets".into(),
+            )),
+            HeaderMap::new(),
+            query(),
+            "test".into(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST, "LIST in namespace '..'");
+        let err = delete_collection_cr_namespaced(
+            State(state),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "a%b".into(),
+                "widgets".into(),
+            )),
+            Extension(user),
+            HeaderMap::new(),
+            query(),
+            Bytes::new(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST, "DELETE collection in 'a%b'");
     }
 
     // GET /scale for a CRD-backed resource must succeed and resolve the CRD's own declared
