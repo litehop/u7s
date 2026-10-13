@@ -803,6 +803,19 @@ fn cr_content_changed(old: &serde_json::Value, new: &serde_json::Value) -> bool 
         || n.keys().any(|k| content(k) && !o.contains_key(k))
 }
 
+/// Put the stored `.status` back on `obj` (or drop it when none is stored). Upstream runs
+/// `PrepareForUpdate` after mutating admission, so a webhook-written `.status` must not
+/// survive a main-endpoint update of a CR with a status subresource.
+fn restore_stored_cr_status(stored_status: &serde_json::Value, obj: &mut serde_json::Value) {
+    if stored_status.is_null() {
+        if let Some(map) = obj.as_object_mut() {
+            map.remove("status");
+        }
+    } else {
+        obj["status"] = stored_status.clone();
+    }
+}
+
 /// Server-owned `metadata.generation` on a CR update: the stored value always wins over
 /// whatever the client or a webhook sent, and any content change bumps it by one. `old` and
 /// `new` must be at the same apiVersion and `new` already pruned/status-restored.
@@ -2816,6 +2829,9 @@ pub async fn replace_cr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
+    if ctx.has_status_subresource {
+        restore_stored_cr_status(&existing["status"], &mut obj);
+    }
     debug_assert_eq!(
         existing["metadata"]["uid"], obj["metadata"]["uid"],
         "old_object passed to run_validating_webhooks must be the same resource's pre-update \
@@ -3923,6 +3939,9 @@ pub async fn replace_cr_namespaced<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
+    if ctx.has_status_subresource {
+        restore_stored_cr_status(&existing["status"], &mut obj);
+    }
     debug_assert_eq!(
         existing["metadata"]["uid"], obj["metadata"]["uid"],
         "old_object passed to run_validating_webhooks must be the same resource's pre-update \
@@ -4478,6 +4497,9 @@ pub async fn patch_cr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, Some(&old), &admission_ctx).await?;
+    if ctx.has_status_subresource {
+        restore_stored_cr_status(&old["status"], &mut obj);
+    }
     // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
     // (stored) value here, after both the patch body and any mutating webhook have had a
     // chance to touch it — this used to be a debug_assert_eq! that panicked in debug builds
@@ -4775,6 +4797,9 @@ pub async fn patch_cr_namespaced<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, Some(&old), &admission_ctx).await?;
+    if ctx.has_status_subresource {
+        restore_stored_cr_status(&old["status"], &mut obj);
+    }
     // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
     // (stored) value here, after both the patch body and any mutating webhook have had a
     // chance to touch it — this used to be a debug_assert_eq! that panicked in debug builds
@@ -23638,6 +23663,394 @@ mod tests {
             v["metadata"]["generation"], 3,
             "PATCH changing content bumps from the stored value, not the smuggled one"
         );
+    }
+
+    /// With a status subresource, `.status` is owned by `/status`: a main-endpoint PUT/PATCH
+    /// that sends or (via a mutating webhook) injects status must leave stored status alone and
+    /// must not bump generation, otherwise controllers see phantom spec changes and a
+    /// namespace-scoped user without `<crd>/status` rights could write status. A `/status`
+    /// write itself must not bump generation either.
+    #[tokio::test]
+    async fn cr_with_status_subresource_main_endpoint_never_changes_status_or_generation() {
+        use axum::routing::post;
+        use axum::Router;
+        use u7s_store::Store;
+
+        let router = Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/status", "value": {"phase": "webhook"}}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "uid-mutate", "allowed": true,
+                        "patch": patch_b64, "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+
+        let state = make_state();
+        crate::handlers::crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "CustomResourceDefinition",
+                    "metadata": { "name": "widgets.example.io" },
+                    "spec": {
+                        "group": "example.io",
+                        "names": { "plural": "widgets", "singular": "widget",
+                                   "kind": "Widget", "listKind": "WidgetList" },
+                        "scope": "Cluster",
+                        "versions": [{
+                            "name": "v1", "served": true, "storage": true,
+                            "subresources": { "status": {} },
+                            "schema": { "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "data": { "type": "object",
+                                              "x-kubernetes-preserve-unknown-fields": true },
+                                    "status": { "type": "object",
+                                                "x-kubernetes-preserve-unknown-fields": true }
+                                }
+                            }}
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("install CRD with status subresource");
+        let path = || {
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "w".to_string(),
+            ))
+        };
+        let body = |data: serde_json::Value, status: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "apiVersion": "example.io/v1", "kind": "Widget",
+                "metadata": { "name": "w" }, "data": data
+            });
+            if !status.is_null() {
+                v["status"] = status;
+            }
+            Bytes::from(v.to_string())
+        };
+        let stored = || async {
+            let s = state
+                .store
+                .get(&cr_store_key("example.io", "widgets", None, "w"))
+                .await
+                .unwrap()
+                .expect("stored");
+            serde_json::from_slice::<serde_json::Value>(&s.value).unwrap()
+        };
+
+        create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body(serde_json::json!({"a": 1}), serde_json::Value::Null),
+        )
+        .await
+        .expect("create");
+
+        put_cr_status(
+            State(state.clone()),
+            path(),
+            axum::http::HeaderMap::new(),
+            body(
+                serde_json::json!({"a": 1}),
+                serde_json::json!({"phase": "real"}),
+            ),
+        )
+        .await
+        .expect("status write");
+        let s = stored().await;
+        assert_eq!(s["status"]["phase"], "real");
+        assert_eq!(
+            s["metadata"]["generation"], 1,
+            "a /status write must not bump generation"
+        );
+
+        let replace = |data, status| {
+            replace_cr(
+                State(state.clone()),
+                path(),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body(data, status),
+            )
+        };
+        replace(
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"phase": "put"}),
+        )
+        .await
+        .expect("status-only PUT");
+        let s = stored().await;
+        assert_eq!(
+            s["status"]["phase"], "real",
+            "a status-only PUT on the main endpoint must not change status"
+        );
+        assert_eq!(
+            s["metadata"]["generation"], 1,
+            "a status-only PUT must not bump generation"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        patch_cr(
+            State(state.clone()),
+            path(),
+            test_user(),
+            headers.clone(),
+            Bytes::from(r#"{"status":{"phase":"patch"}}"#),
+        )
+        .await
+        .expect("status-only PATCH");
+        let s = stored().await;
+        assert_eq!(s["status"]["phase"], "real");
+        assert_eq!(s["metadata"]["generation"], 1);
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "cr-status-mwc"},
+            "webhooks": [{
+                "name": "cr.status.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"],
+                           "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail",
+                "sideEffects": "None",
+                "admissionReviewVersions": ["v1"]
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/cr-status-mwc",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        replace(
+            serde_json::json!({"a": 2}),
+            serde_json::json!({"phase": "put"}),
+        )
+        .await
+        .expect("PUT through status-writing webhook");
+        let s = stored().await;
+        assert_eq!(
+            s["status"]["phase"], "real",
+            "upstream restores status after mutating admission, so a webhook cannot write it"
+        );
+        assert_eq!(
+            s["metadata"]["generation"], 2,
+            "only the spec change bumps generation; the webhook-written status must not"
+        );
+
+        patch_cr(
+            State(state.clone()),
+            path(),
+            test_user(),
+            headers,
+            Bytes::from(r#"{"data":{"a":3}}"#),
+        )
+        .await
+        .expect("PATCH through status-writing webhook");
+        let s = stored().await;
+        assert_eq!(s["status"]["phase"], "real");
+        assert_eq!(s["metadata"]["generation"], 3);
+    }
+
+    /// Namespaced counterpart of the cluster-scoped test: the namespaced PUT/PATCH handlers
+    /// are separate code paths, and each must discard a status injected by a mutating webhook.
+    #[tokio::test]
+    async fn namespaced_cr_with_status_subresource_discards_webhook_written_status() {
+        use axum::routing::post;
+        use axum::Router;
+        use u7s_store::Store;
+
+        let router = Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/status", "value": {"phase": "webhook"}}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "uid-mutate", "allowed": true,
+                        "patch": patch_b64, "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state();
+        crate::handlers::crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "CustomResourceDefinition",
+                    "metadata": { "name": "widgets.example.io" },
+                    "spec": {
+                        "group": "example.io",
+                        "names": { "plural": "widgets", "singular": "widget",
+                                   "kind": "Widget", "listKind": "WidgetList" },
+                        "scope": "Namespaced",
+                        "versions": [{
+                            "name": "v1", "served": true, "storage": true,
+                            "subresources": { "status": {} },
+                            "schema": { "openAPIV3Schema": {
+                                "type": "object",
+                                "x-kubernetes-preserve-unknown-fields": true
+                            }}
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("install CRD with status subresource");
+        let path = || {
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "widgets".to_string(),
+                "w".to_string(),
+            ))
+        };
+        let body = |a: i64| {
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1", "kind": "Widget",
+                    "metadata": { "name": "w", "namespace": "default" }, "data": {"a": a}
+                })
+                .to_string(),
+            )
+        };
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body(1),
+        )
+        .await
+        .expect("create");
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "cr-ns-status-mwc"},
+            "webhooks": [{
+                "name": "cr.nsstatus.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"],
+                           "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail",
+                "sideEffects": "None",
+                "admissionReviewVersions": ["v1"]
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/cr-ns-status-mwc",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let stored = || async {
+            let s = state
+                .store
+                .get(&cr_store_key("example.io", "widgets", Some("default"), "w"))
+                .await
+                .unwrap()
+                .expect("stored");
+            serde_json::from_slice::<serde_json::Value>(&s.value).unwrap()
+        };
+
+        replace_cr_namespaced(
+            State(state.clone()),
+            path(),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body(2),
+        )
+        .await
+        .expect("PUT through status-writing webhook");
+        let s = stored().await;
+        assert!(
+            s.get("status").is_none(),
+            "namespaced PUT must discard a webhook-written status (got {s})"
+        );
+        assert_eq!(s["metadata"]["generation"], 2);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        patch_cr_namespaced(
+            State(state.clone()),
+            path(),
+            test_user(),
+            headers,
+            Bytes::from(r#"{"data":{"a":3}}"#),
+        )
+        .await
+        .expect("PATCH through status-writing webhook");
+        let s = stored().await;
+        assert!(
+            s.get("status").is_none(),
+            "namespaced PATCH must discard a webhook-written status (got {s})"
+        );
+        assert_eq!(s["metadata"]["generation"], 3);
     }
 
     // ---------------------------------------------------------------------------
