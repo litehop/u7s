@@ -12180,7 +12180,7 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // Regression fixtures: real-world CRD CEL rules from the audit
-    // (ai/findings/cel-cr-admission-audit-2026-08-25.md), verifying enforcement
+    // verifying enforcement
     // against the workloads that actually motivated it, not just synthetic rules.
     //
     // cert-manager ClusterIssuer's has()+ternary exactly-one-of rule and

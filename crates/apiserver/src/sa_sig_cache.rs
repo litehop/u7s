@@ -2,8 +2,7 @@
 //! JWTs — added because every Bearer-token request re-runs the full RSA modular
 //! exponentiation (`num_bigint_dig::biguint::monty::montgomery`, 4.4% of apiserver
 //! self-time per the 2026-08-06 samply triage), even when the exact same token is
-//! presented hundreds of times per minute by the same client (see
-//! `ai/findings/jwt-signature-verify-cache-scoping-2026-08-06.md`).
+//! presented hundreds of times per minute by the same client.
 //!
 //! # What is cached
 //!
@@ -33,7 +32,7 @@
 //! it safe for a hit to skip re-running `exp` validation entirely (a live hit is proof the
 //! real `exp` hasn't passed yet). This is stricter than upstream Kubernetes' unioned
 //! token-authenticator cache, which uses a flat 10s TTL uncorrelated with the token's own
-//! `exp` (see the scoping doc, section 3).
+//! `exp`.
 //!
 //! # No negative caching
 //!
@@ -83,9 +82,8 @@ struct Entry {
     signature_valid: bool,
     /// Reserved for a future SA-key-rotation scheme keyed by JWT `kid`. Always `None` today:
     /// u7s has exactly one `sa_decoding_key` (`state.rs`) and never sets a `kid` header
-    /// (`oidc.rs`), so there is nothing to key rotation-invalidation on yet (finding #6
-    /// in the cache-scoping doc above). Not read anywhere today — kept only so adding rotation later doesn't
-    /// require an `Entry` shape change.
+    /// (`oidc.rs`), so there is nothing to key rotation-invalidation on yet. Not read anywhere
+    /// today — kept only so adding rotation later doesn't require an `Entry` shape change.
     #[allow(dead_code)]
     kid: Option<String>,
     /// Monotonic instant at which this entry stops being servable. Computed once at insert
