@@ -46,10 +46,35 @@ pub(crate) fn min_serialized_size(schema: &J) -> u64 {
         return 1;
     }
     match schema.get("type").and_then(|t| t.as_str()) {
-        Some("string" | "array" | "object") => 2,
+        Some("string" | "array") => 2,
+        Some("object") => {
+            let is_map = schema.get("additionalProperties").is_some_and(J::is_object);
+            let (Some(props), false) = (schema.get("properties").and_then(J::as_object), is_map)
+            else {
+                return 2;
+            };
+            let required = schema.get("required").and_then(J::as_array);
+            let is_required = |name: &str| required.is_some_and(|r| r.iter().any(|n| n == name));
+            props
+                .iter()
+                .filter(|(name, p)| is_required(name) && p.get("default").is_none() && is_typed(p))
+                .fold(2u64, |acc, (name, p)| {
+                    acc.saturating_add(name.len() as u64 + min_serialized_size(p) + 4)
+                })
+        }
         Some("boolean") => 4,
         _ => 1,
     }
+}
+
+/// Whether upstream gives the schema a CEL type; untyped nodes are opaque to its estimator.
+fn is_typed(schema: &J) -> bool {
+    schema.get("x-kubernetes-int-or-string") == Some(&J::Bool(true))
+        || match schema.get("type").and_then(|t| t.as_str()) {
+            Some("array") => schema.get("items").is_some_and(is_typed),
+            Some("object" | "string" | "boolean" | "number" | "integer") => true,
+            _ => false,
+        }
 }
 
 /// How many times a value of this schema can appear in one request.
@@ -58,16 +83,19 @@ pub(crate) fn unbounded_cardinality(schema: &J) -> u64 {
 }
 
 fn max_elements(schema: &J) -> u64 {
-    let (limit_key, elem) = match schema.get("type").and_then(|t| t.as_str()) {
-        Some("array") => ("maxItems", schema.get("items")),
-        Some("object") => ("maxProperties", schema.get("additionalProperties")),
+    let (limit_key, elem, per_element_overhead) = match schema.get("type").and_then(|t| t.as_str())
+    {
+        Some("array") => ("maxItems", schema.get("items"), 1),
+        Some("object") => ("maxProperties", schema.get("additionalProperties"), 6),
         _ => return 0,
     };
     if let Some(n) = schema.get(limit_key).and_then(J::as_u64) {
         return n;
     }
-    elem.filter(|e| e.is_object())
-        .map_or(0, |e| MAX_REQUEST_BYTES / (min_serialized_size(e) + 4))
+    elem.filter(|e| e.is_object() && is_typed(e))
+        .map_or(0, |e| {
+            (MAX_REQUEST_BYTES - 2) / (min_serialized_size(e) + per_element_overhead)
+        })
 }
 
 fn weight(v: &J) -> usize {
@@ -169,7 +197,13 @@ impl<'a> Coster<'a> {
                 (c.saturating_add(1), node)
             }
             Expr::Call(call) => {
-                let mut total = 1u64;
+                let func = call.func_name.as_str();
+                let is_conditional = func == operators::CONDITIONAL;
+                let mut total = match func {
+                    operators::CONDITIONAL | operators::LOGICAL_AND | operators::LOGICAL_OR => 0,
+                    _ => 1u64,
+                };
+                let mut branch_max = 0u64;
                 let mut target_node = Node::Unknown;
                 if let Some(target) = &call.target {
                     let namespace = matches!(&target.expr, Expr::Ident(n)
@@ -181,11 +215,16 @@ impl<'a> Coster<'a> {
                     }
                 }
                 let mut arg_nodes = Vec::with_capacity(call.args.len());
-                for arg in &call.args {
+                for (i, arg) in call.args.iter().enumerate() {
                     let (c, n) = self.cost(arg);
-                    total = total.saturating_add(c);
+                    if is_conditional && i > 0 {
+                        branch_max = branch_max.max(c);
+                    } else {
+                        total = total.saturating_add(c);
+                    }
                     arg_nodes.push(n);
                 }
+                total = total.saturating_add(branch_max);
                 let result = match call.func_name.as_str() {
                     operators::INDEX => arg_nodes.first().map_or(Node::Unknown, |n| n.elem()),
                     "isSorted" | "sum" | "min" | "max" => {
@@ -217,7 +256,7 @@ impl<'a> Coster<'a> {
                 let (result, _) = self.cost(&c.result);
                 self.scope.truncate(depth);
                 let n = range.len();
-                let per_iteration = cond.saturating_add(step).saturating_add(1);
+                let per_iteration = cond.saturating_add(step);
                 let total = range_cost
                     .saturating_add(init_cost)
                     .saturating_add(n.saturating_mul(per_iteration))
@@ -229,7 +268,10 @@ impl<'a> Coster<'a> {
                 };
                 (total, node)
             }
-            Expr::List(l) => (self.sum(l.elements.iter()), Node::Unknown),
+            Expr::List(l) => (
+                self.sum(l.elements.iter()).saturating_add(10),
+                Node::Unknown,
+            ),
             Expr::Map(m) => {
                 let mut total = 0u64;
                 for entry in &m.entries {
@@ -239,7 +281,7 @@ impl<'a> Coster<'a> {
                             .saturating_add(self.cost(&me.value).0);
                     }
                 }
-                (total, Node::Unknown)
+                (total.saturating_add(30), Node::Unknown)
             }
             Expr::Struct(s) => {
                 let mut total = 0u64;
@@ -248,7 +290,7 @@ impl<'a> Coster<'a> {
                         total = total.saturating_add(self.cost(&f.value).0);
                     }
                 }
-                (total, Node::Unknown)
+                (total.saturating_add(40), Node::Unknown)
             }
         }
     }
@@ -355,6 +397,65 @@ mod tests {
         let free =
             serde_json::json!({ "type": "object", "x-kubernetes-preserve-unknown-fields": true });
         assert!(cost_of("self.anything.all(x, x > 0)", &free) < 10);
+    }
+
+    #[test]
+    fn ternary_costs_condition_plus_the_costlier_branch_not_both_branches() {
+        let schema = int_list(Some(1000));
+        let one = cost_of("self.all(x, x > 0)", &schema);
+        let ternary = cost_of(
+            "self.size() > 0 ? self.all(x, x > 0) : self.all(x, x > 1)",
+            &schema,
+        );
+        assert!(
+            ternary < one + one / 10,
+            "summing both branches would roughly double the estimate and falsely reject a rule \
+             upstream accepts near the 10M budget: {ternary} vs single branch {one}"
+        );
+    }
+
+    #[test]
+    fn comprehension_cost_is_step_plus_loop_condition_per_element_without_extra_overhead() {
+        let c = cost_of("self.all(x, x > 0)", &int_list(Some(1000)));
+        assert!(
+            (5_000..5_100).contains(&c),
+            "cel-go bills 5 units per element for all(): loop condition 2 + step 3; an extra \
+             per-element unit would falsely reject borderline rules: {c}"
+        );
+    }
+
+    #[test]
+    fn logical_operators_add_no_call_overhead_of_their_own() {
+        let schema = int_list(None);
+        let one = cost_of("self.size() > 0", &schema);
+        let and = cost_of("self.size() > 0 && self.size() > 0", &schema);
+        assert_eq!(and, one * 2, "cel-go costs && as lhs + rhs only");
+    }
+
+    #[test]
+    fn list_of_objects_with_required_fields_fits_fewer_elements_per_request() {
+        let items = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "type": "string" }, "opt": { "type": "string" } }
+        });
+        assert_eq!(min_serialized_size(&items), 2 + 4 + 2 + 4);
+        let list = serde_json::json!({ "type": "array", "items": items });
+        assert_eq!(max_elements(&list), (3 * 1024 * 1024 - 2) / (12 + 1));
+    }
+
+    #[test]
+    fn unbounded_map_entries_account_for_quotes_colon_and_comma() {
+        let map = serde_json::json!({
+            "type": "object", "additionalProperties": { "type": "integer" }
+        });
+        assert_eq!(max_elements(&map), (3 * 1024 * 1024 - 2) / (1 + 6));
+    }
+
+    #[test]
+    fn untyped_items_are_opaque_to_the_estimator_like_upstream() {
+        let list = serde_json::json!({ "type": "array", "items": {} });
+        assert_eq!(max_elements(&list), 0);
     }
 
     #[test]
