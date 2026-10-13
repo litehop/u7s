@@ -1261,7 +1261,7 @@ pub(crate) fn cel_escape_ident(ident: &str) -> Option<String> {
 /// unescapes when `schema.Properties() != nil`) — a map key literally named `namespace`
 /// is reachable only via index syntax (`self.m['namespace']`), which needs no escaping
 /// since it's a string literal, not an identifier.
-fn json_to_cel_value(
+pub(crate) fn json_to_cel_value(
     schema: &serde_json::Value,
     value: &serde_json::Value,
 ) -> Result<cel::Value, String> {
@@ -1435,16 +1435,25 @@ fn execute_cel_with_budget(
     budget: std::time::Duration,
     gate: &'static ConcurrencyGate,
 ) -> Result<Result<cel::Value, cel::ExecutionError>, CelEvalOverBudget> {
+    let program = std::sync::Arc::clone(program);
+    run_within_budget(budget, gate, move || program.execute(&cel_ctx))
+}
+
+/// Runs `work` on a dedicated thread under the same wall-clock and concurrency bounds as
+/// `execute_cel_with_budget`.
+fn run_within_budget<T: Send + 'static>(
+    budget: std::time::Duration,
+    gate: &'static ConcurrencyGate,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, CelEvalOverBudget> {
     if !gate.try_acquire() {
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
 
-    let program = std::sync::Arc::clone(program);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _guard = GateGuard(gate);
-        let result = program.execute(&cel_ctx);
-        let _ = tx.send(result);
+        let _ = tx.send(work());
     });
     rx.recv_timeout(budget)
         .map_err(|_| CelEvalOverBudget::TimedOut)
@@ -1492,28 +1501,69 @@ fn evaluate_cel_rule(
         value,
         schema: Some(schema),
     };
-    let rule_cost = crate::handlers::cel_cost::estimate(
+    let upper_bound_cost = crate::handlers::cel_cost::estimate(
         &program,
         data_node(self_value),
         old_self_value.map(data_node),
+        None,
     );
-    if rule_cost > crate::handlers::cel_cost::CALL_COST_LIMIT {
-        return Err(Status::unprocessable_entity(format!(
-            "{field_path}: Invalid value: operation cancelled: actual cost limit exceeded: \
-             {CEL_NO_FURTHER_RULES} due to call cost exceeds limit for rule: {rule_text}"
-        )));
-    }
 
-    let mut cel_ctx = cel::Context::default();
-    register_cel_extensions(&mut cel_ctx);
-    cel_ctx.add_variable_from_value("self", escaped_self.clone());
-    if let Some(old) = &escaped_old_self {
-        cel_ctx.add_variable_from_value("oldSelf", old.clone());
+    let build_ctx = || {
+        let mut cel_ctx = cel::Context::default();
+        register_cel_extensions(&mut cel_ctx);
+        cel_ctx.add_variable_from_value("self", escaped_self.clone());
+        if let Some(old) = &escaped_old_self {
+            cel_ctx.add_variable_from_value("oldSelf", old.clone());
+        }
+        cel_ctx
+    };
+    let too_many_in_flight = || {
+        Status::unprocessable_entity(format!(
+            "{field_path}: too many x-kubernetes-validations rules are currently \
+             exceeding their evaluation time budget — rejecting to bound concurrent CEL \
+             evaluation cost, {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
+        ))
+    };
+
+    // The upper bound bills every branch and iteration, so it can exceed what the
+    // evaluator runs once `&&`, `exists` and friends stop early. Only then is the rule
+    // replayed against the real values, on a budgeted thread since a replay does the work
+    // it is measuring. A replay that cannot finish in time is itself the evidence of a
+    // runaway rule.
+    if upper_bound_cost > crate::handlers::cel_cost::CALL_COST_LIMIT {
+        let replay = (self_value.clone(), old_self_value.cloned(), schema.clone());
+        let replay_ctx = build_ctx();
+        let rule_program = std::sync::Arc::clone(&program);
+        let within_limit =
+            run_within_budget(CEL_RULE_EVAL_BUDGET, &CEL_EVAL_THREAD_GATE, move || {
+                let (self_json, old_json, schema) = &replay;
+                let node = |value| crate::handlers::cel_cost::Node::Data {
+                    value,
+                    schema: Some(schema),
+                };
+                crate::handlers::cel_cost::estimate(
+                    &rule_program,
+                    node(self_json),
+                    old_json.as_ref().map(node),
+                    Some(&replay_ctx),
+                ) <= crate::handlers::cel_cost::CALL_COST_LIMIT
+            });
+        match within_limit {
+            Ok(true) => {}
+            Ok(false) | Err(CelEvalOverBudget::TimedOut) => {
+                return Err(Status::unprocessable_entity(format!(
+                    "{field_path}: Invalid value: operation cancelled: actual cost limit \
+                     exceeded: {CEL_NO_FURTHER_RULES} due to call cost exceeds limit for rule: \
+                     {rule_text}"
+                )));
+            }
+            Err(CelEvalOverBudget::TooManyInFlight) => return Err(too_many_in_flight()),
+        }
     }
 
     let result = match execute_cel_with_budget(
         &program,
-        cel_ctx,
+        build_ctx(),
         CEL_RULE_EVAL_BUDGET,
         &CEL_EVAL_THREAD_GATE,
     ) {
@@ -1524,13 +1574,7 @@ fn evaluate_cel_rule(
                  {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
             )));
         }
-        Err(CelEvalOverBudget::TooManyInFlight) => {
-            return Err(Status::unprocessable_entity(format!(
-                "{field_path}: too many x-kubernetes-validations rules are currently \
-                 exceeding their evaluation time budget — rejecting to bound concurrent CEL \
-                 evaluation cost, {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
-            )));
-        }
+        Err(CelEvalOverBudget::TooManyInFlight) => return Err(too_many_in_flight()),
         Ok(Ok(v)) => v,
         // `oldSelf` is only meaningful on UPDATE, when the field being validated also
         // existed in the previous object — upstream skips (does not fail) a rule that
@@ -12060,6 +12104,81 @@ mod tests {
             check_schema(&obj, quadratic_rule_schema()).is_ok(),
             "the runtime cost limit must depend on the actual list size, not the schema bound"
         );
+    }
+
+    fn grid_schema(rule: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [{ "rule": rule }],
+                "properties": {
+                    "skip": { "type": "boolean" },
+                    "rows": {
+                        "type": "array", "maxItems": 1000,
+                        "items": {
+                            "type": "array", "maxItems": 1000,
+                            "items": { "type": "string", "maxLength": 4 }
+                        }
+                    }
+                }
+            } }
+        })
+    }
+
+    fn grid(first_cell: &str) -> Vec<Vec<String>> {
+        (0..1000)
+            .map(|_| {
+                std::iter::once(first_cell.to_string())
+                    .chain((1..1000).map(|_| "y".to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Upstream bills only the iterations an `exists` actually runs, so a CR whose match
+    /// is found immediately must not be refused for the million cells it never visits.
+    #[test]
+    fn exists_that_finds_its_match_on_the_first_row_is_not_billed_for_the_whole_grid() {
+        let obj = serde_json::json!({ "spec": { "rows": grid("x") } });
+        let schema = grid_schema("self.rows.exists(r, r.exists(c, c == 'x'))");
+        let result = check_schema(&obj, schema);
+        assert!(
+            result.is_ok(),
+            "a rule upstream evaluates in a handful of steps must not hit the call cost limit: {:?}",
+            result.err().map(|e| e.1.message)
+        );
+    }
+
+    /// The same rule with no match visits every cell, which is over the limit upstream too;
+    /// accepting early exits must not turn into accepting everything.
+    #[test]
+    fn exists_that_scans_the_whole_grid_still_exceeds_the_call_cost_limit() {
+        let obj = serde_json::json!({ "spec": { "rows": grid("z") } });
+        let schema = grid_schema("self.rows.exists(r, r.exists(c, c == 'x'))");
+        let err = check_schema(&obj, schema).unwrap_err();
+        assert!(
+            err.1.message.contains("call cost exceeds limit"),
+            "{}",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn short_circuited_or_does_not_bill_the_expensive_right_hand_side() {
+        let obj = serde_json::json!({ "spec": { "skip": true, "rows": grid("z") } });
+        let schema = grid_schema("self.skip || self.rows.all(r, r.all(c, c == 'x'))");
+        assert!(
+            check_schema(&obj, schema).is_ok(),
+            "upstream never evaluates the right side of a true `||`, so it costs nothing"
+        );
+    }
+
+    #[test]
+    fn ternary_bills_only_the_branch_taken() {
+        let obj = serde_json::json!({ "spec": { "skip": true, "rows": grid("z") } });
+        let schema = grid_schema("self.skip ? true : self.rows.all(r, r.all(c, c == 'x'))");
+        assert!(check_schema(&obj, schema).is_ok());
     }
 
     #[test]

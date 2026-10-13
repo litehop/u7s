@@ -324,7 +324,8 @@ fn check_node(
                     }
                 };
                 let node = cel_cost::Node::Schema(schema);
-                let cost = cel_cost::estimate(&program, node, Some(node)).saturating_mul(instances);
+                let cost =
+                    cel_cost::estimate(&program, node, Some(node), None).saturating_mul(instances);
                 *total_cost = total_cost.saturating_add(cost);
                 if cost > cel_cost::STATIC_COST_LIMIT && !ratchet.suppress_rule_cost {
                     let name = if key == "rule" {

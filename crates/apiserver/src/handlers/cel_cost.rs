@@ -6,9 +6,10 @@
 //! The same walk serves two callers. With a schema it yields the worst-case cost of a rule
 //! (collection sizes from `maxItems`/`maxProperties`, or the most elements that fit in a
 //! request when unbounded); with the object being validated it yields the cost for that
-//! object's real collection sizes. It assumes no short-circuiting, so it never undercounts
-//! work the evaluator does, and it counts a value whose size it cannot trace as empty so a
-//! rule is never rejected for a collection the walk cannot see.
+//! object's real collection sizes. Both assume no short-circuiting, so they never undercount
+//! work the evaluator does, and count a value whose size they cannot trace as empty so a
+//! rule is never rejected for a collection the walk cannot see. Given a context holding the
+//! real values, the walk instead replays the rule and follows its short-circuits.
 
 use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr};
 use serde_json::Value as J;
@@ -170,12 +171,103 @@ impl<'a> Node<'a> {
     }
 }
 
+type Ctx<'c, 'p> = Option<&'c cel::Context<'p, 'static>>;
+
+static NULL: J = J::Null;
+
+/// One pass of a comprehension: the key (or index) and element it visits, as sizes and,
+/// when they come from an evaluated value rather than the data, as values.
+struct Pass<'a> {
+    key: (Node<'a>, Option<cel::Value>),
+    elem: (Node<'a>, Option<cel::Value>),
+}
+
+impl Pass<'_> {
+    /// The element's value; built from the data on demand, so a loop that exits early
+    /// never converts the elements it does not reach.
+    fn elem_value(&self) -> Option<cel::Value> {
+        self.elem.1.clone().or_else(|| match self.elem.0 {
+            Node::Data { value, schema } => {
+                crate::handlers::cr::json_to_cel_value(schema.unwrap_or(&NULL), value).ok()
+            }
+            _ => None,
+        })
+    }
+}
+
+/// The passes a comprehension makes over `range`, and whether it ranges over a map. The
+/// data says how many; failing that, when replaying, the value the range evaluates to.
+fn passes<'a>(
+    range: Node<'a>,
+    live: Ctx<'_, '_>,
+    expr: &IdedExpr,
+) -> Option<(Vec<Pass<'a>>, bool)> {
+    let elem_of = |value: &'a J, schema: Option<&'a J>| Node::Data { value, schema };
+    match range {
+        Node::Data { value, schema } => match value {
+            J::Array(a) => {
+                let items = schema.and_then(|s| s.get("items"));
+                Some((
+                    a.iter()
+                        .enumerate()
+                        .map(|(i, v)| Pass {
+                            key: (Node::Unknown, Some(cel::Value::Int(i as i64))),
+                            elem: (elem_of(v, items), None),
+                        })
+                        .collect(),
+                    false,
+                ))
+            }
+            J::Object(o) => {
+                let values =
+                    schema.and_then(|s| s.get("additionalProperties").filter(|v| v.is_object()));
+                Some((
+                    o.iter()
+                        .map(|(k, v)| Pass {
+                            key: (Node::Unknown, Some(cel::Value::from(k.as_str()))),
+                            elem: (elem_of(v, values), None),
+                        })
+                        .collect(),
+                    true,
+                ))
+            }
+            _ => None,
+        },
+        _ => match live?.resolve(expr).ok()? {
+            cel::Value::List(l) => Some((
+                l.iter()
+                    .enumerate()
+                    .map(|(i, v)| Pass {
+                        key: (Node::Unknown, Some(cel::Value::Int(i as i64))),
+                        elem: (Node::Unknown, Some(v.clone())),
+                    })
+                    .collect(),
+                false,
+            )),
+            cel::Value::Map(m) => Some((
+                m.map
+                    .iter()
+                    .map(|(k, v)| Pass {
+                        key: (Node::Unknown, Some(k.into())),
+                        elem: (Node::Unknown, Some(v.clone())),
+                    })
+                    .collect(),
+                true,
+            )),
+            _ => None,
+        },
+    }
+}
+
 struct Coster<'a> {
     scope: Vec<(String, Node<'a>)>,
+    /// A comprehension stops iterating once its cost passes this: the caller only needs to
+    /// know the limit was crossed.
+    limit: u64,
 }
 
 impl<'a> Coster<'a> {
-    fn cost(&mut self, e: &IdedExpr) -> (u64, Node<'a>) {
+    fn cost(&mut self, e: &IdedExpr, ctx: Ctx<'_, '_>) -> (u64, Node<'a>) {
         match &e.expr {
             Expr::Ident(name) => {
                 let node = self
@@ -188,7 +280,7 @@ impl<'a> Coster<'a> {
             }
             Expr::Literal(_) | Expr::Unspecified => (0, Node::Unknown),
             Expr::Select(sel) => {
-                let (c, operand) = self.cost(&sel.operand);
+                let (c, operand) = self.cost(&sel.operand, ctx);
                 let node = if sel.test {
                     Node::Unknown
                 } else {
@@ -198,6 +290,37 @@ impl<'a> Coster<'a> {
             }
             Expr::Call(call) => {
                 let func = call.func_name.as_str();
+                if let (Some(ctx), true) = (
+                    ctx,
+                    call.target.is_none()
+                        && matches!(
+                            func,
+                            operators::CONDITIONAL | operators::LOGICAL_AND | operators::LOGICAL_OR
+                        ),
+                ) {
+                    let (head, _) = self.cost(&call.args[0], Some(ctx));
+                    let head_value = ctx.resolve(&call.args[0]).ok();
+                    let branch = match (func, head_value) {
+                        (operators::LOGICAL_AND, Some(cel::Value::Bool(false)))
+                        | (operators::LOGICAL_OR, Some(cel::Value::Bool(true))) => {
+                            return (head, Node::Unknown)
+                        }
+                        (operators::CONDITIONAL, Some(cel::Value::Bool(b))) => {
+                            Some(&call.args[if b { 1 } else { 2 }])
+                        }
+                        _ => None,
+                    };
+                    let rest = match branch {
+                        Some(arm) => self.cost(arm, Some(ctx)).0,
+                        None if func == operators::CONDITIONAL => call.args[1..]
+                            .iter()
+                            .map(|a| self.cost(a, Some(ctx)).0)
+                            .max()
+                            .unwrap_or(0),
+                        None => self.cost(&call.args[1], Some(ctx)).0,
+                    };
+                    return (head.saturating_add(rest), Node::Unknown);
+                }
                 let is_conditional = func == operators::CONDITIONAL;
                 let mut total = match func {
                     operators::CONDITIONAL | operators::LOGICAL_AND | operators::LOGICAL_OR => 0,
@@ -209,14 +332,14 @@ impl<'a> Coster<'a> {
                     let namespace = matches!(&target.expr, Expr::Ident(n)
                         if !self.scope.iter().any(|(s, _)| s == n));
                     if !namespace {
-                        let (c, n) = self.cost(target);
+                        let (c, n) = self.cost(target, ctx);
                         total = total.saturating_add(c);
                         target_node = n;
                     }
                 }
                 let mut arg_nodes = Vec::with_capacity(call.args.len());
                 for (i, arg) in call.args.iter().enumerate() {
-                    let (c, n) = self.cost(arg);
+                    let (c, n) = self.cost(arg, ctx);
                     if is_conditional && i > 0 {
                         branch_max = branch_max.max(c);
                     } else {
@@ -240,36 +363,111 @@ impl<'a> Coster<'a> {
                 (total, result)
             }
             Expr::Comprehension(c) => {
-                let (range_cost, range) = self.cost(&c.iter_range);
-                let (init_cost, _) = self.cost(&c.accu_init);
+                let (range_cost, range) = self.cost(&c.iter_range, ctx);
+                let (init_cost, _) = self.cost(&c.accu_init, ctx);
+                let mut total = range_cost.saturating_add(init_cost);
                 let depth = self.scope.len();
                 self.scope.push((c.accu_var.clone(), Node::Unknown));
-                match &c.iter_var2 {
-                    Some(v2) => {
-                        self.scope.push((c.iter_var.clone(), Node::Unknown));
-                        self.scope.push((v2.clone(), range.elem()));
+                let mut accu = ctx.and_then(|ctx| ctx.resolve(&c.accu_init).ok());
+                // `map` and `filter` loop unconditionally and nothing in them reads the
+                // accumulator, so only a conditional loop (`all`, `exists`) needs it tracked.
+                let track_accu = !matches!(c.loop_cond.expr, Expr::Literal(_));
+                let n = match passes(range, ctx, &c.iter_range) {
+                    Some((passes, is_map)) => {
+                        let mut ran = 0u64;
+                        let mut child = ctx.map(|ctx| ctx.new_inner_scope());
+                        for pass in passes {
+                            let first_is_elem = c.iter_var2.is_none() && !is_map;
+                            self.scope.truncate(depth + 1);
+                            self.scope.push((
+                                c.iter_var.clone(),
+                                if first_is_elem {
+                                    pass.elem.0
+                                } else {
+                                    pass.key.0
+                                },
+                            ));
+                            if let Some(name) = &c.iter_var2 {
+                                self.scope.push((name.clone(), pass.elem.0));
+                            }
+                            if let Some(child) = child.as_mut() {
+                                if let Some(accu) = &accu {
+                                    child.add_variable_from_value(c.accu_var.clone(), accu.clone());
+                                }
+                                let first_value = if first_is_elem {
+                                    pass.elem_value()
+                                } else {
+                                    pass.key.1.clone()
+                                };
+                                if let Some(value) = first_value {
+                                    child.add_variable_from_value(c.iter_var.clone(), value);
+                                }
+                                if let (Some(name), Some(value)) = (&c.iter_var2, pass.elem_value())
+                                {
+                                    child.add_variable_from_value(name.clone(), value);
+                                }
+                            }
+                            let pass_ctx = child.as_ref();
+                            let (cond, _) = self.cost(&c.loop_cond, pass_ctx);
+                            total = total.saturating_add(cond);
+                            if track_accu
+                                && pass_ctx.is_some_and(|ctx| {
+                                    !matches!(ctx.resolve(&c.loop_cond), Ok(cel::Value::Bool(true)))
+                                })
+                            {
+                                break;
+                            }
+                            let (step, _) = self.cost(&c.loop_step, pass_ctx);
+                            total = total.saturating_add(step);
+                            ran += 1;
+                            if total > self.limit {
+                                break;
+                            }
+                            if track_accu {
+                                if let Some(next) =
+                                    pass_ctx.and_then(|ctx| ctx.resolve(&c.loop_step).ok())
+                                {
+                                    accu = Some(next);
+                                }
+                            }
+                        }
+                        ran
                     }
-                    None => self.scope.push((c.iter_var.clone(), range.elem())),
+                    None => {
+                        let n = range.len();
+                        let elem = range.elem();
+                        match &c.iter_var2 {
+                            Some(v2) => {
+                                self.scope.push((c.iter_var.clone(), Node::Unknown));
+                                self.scope.push((v2.clone(), elem));
+                            }
+                            None => self.scope.push((c.iter_var.clone(), elem)),
+                        }
+                        let (cond, _) = self.cost(&c.loop_cond, ctx);
+                        let (step, _) = self.cost(&c.loop_step, ctx);
+                        total = total.saturating_add(n.saturating_mul(cond.saturating_add(step)));
+                        n
+                    }
+                };
+                self.scope.truncate(depth + 1);
+                let mut result_ctx = ctx.map(|ctx| ctx.new_inner_scope());
+                if let (Some(child), Some(accu)) = (result_ctx.as_mut(), &accu) {
+                    child.add_variable_from_value(c.accu_var.clone(), accu.clone());
                 }
-                let (cond, _) = self.cost(&c.loop_cond);
-                let (step, _) = self.cost(&c.loop_step);
-                let (result, _) = self.cost(&c.result);
+                let (result, _) = self.cost(&c.result, result_ctx.as_ref());
                 self.scope.truncate(depth);
-                let n = range.len();
-                let per_iteration = cond.saturating_add(step);
-                let total = range_cost
-                    .saturating_add(init_cost)
-                    .saturating_add(n.saturating_mul(per_iteration))
-                    .saturating_add(result);
-                let node = if matches!(c.accu_init.expr, Expr::List(_)) {
-                    Node::Sized(n)
-                } else {
+                total = total.saturating_add(result);
+                let node = if !matches!(c.accu_init.expr, Expr::List(_)) {
                     Node::Unknown
+                } else if let Some(cel::Value::List(l)) = &accu {
+                    Node::Sized(l.len() as u64)
+                } else {
+                    Node::Sized(n)
                 };
                 (total, node)
             }
             Expr::List(l) => (
-                self.sum(l.elements.iter()).saturating_add(10),
+                self.sum(l.elements.iter(), ctx).saturating_add(10),
                 Node::Unknown,
             ),
             Expr::Map(m) => {
@@ -277,8 +475,8 @@ impl<'a> Coster<'a> {
                 for entry in &m.entries {
                     if let EntryExpr::MapEntry(me) = &entry.expr {
                         total = total
-                            .saturating_add(self.cost(&me.key).0)
-                            .saturating_add(self.cost(&me.value).0);
+                            .saturating_add(self.cost(&me.key, ctx).0)
+                            .saturating_add(self.cost(&me.value, ctx).0);
                     }
                 }
                 (total.saturating_add(30), Node::Unknown)
@@ -287,7 +485,7 @@ impl<'a> Coster<'a> {
                 let mut total = 0u64;
                 for entry in &s.entries {
                     if let EntryExpr::StructField(f) = &entry.expr {
-                        total = total.saturating_add(self.cost(&f.value).0);
+                        total = total.saturating_add(self.cost(&f.value, ctx).0);
                     }
                 }
                 (total.saturating_add(40), Node::Unknown)
@@ -295,22 +493,34 @@ impl<'a> Coster<'a> {
         }
     }
 
-    fn sum<'e>(&mut self, exprs: impl Iterator<Item = &'e IdedExpr>) -> u64 {
-        exprs.fold(0u64, |acc, e| acc.saturating_add(self.cost(e).0))
+    fn sum<'e>(&mut self, exprs: impl Iterator<Item = &'e IdedExpr>, ctx: Ctx<'_, '_>) -> u64 {
+        exprs.fold(0u64, |acc, e| acc.saturating_add(self.cost(e, ctx).0))
     }
 }
 
 /// Cost of evaluating `program` with `self` (and, when given, `oldSelf`) sized by the nodes.
+///
+/// Without `ctx` every branch and loop iteration is billed, an upper bound on the work
+/// done. With a context holding the real `self`/`oldSelf` values, the rule is replayed:
+/// the branch taken, the `&&`/`||`/ternary short-circuits and the early exit of `all` and
+/// `exists` follow the data, as in the evaluator's own cost accounting. Iterating stops
+/// once [`CALL_COST_LIMIT`] is crossed.
 pub(crate) fn estimate(
     program: &cel::Program,
     self_node: Node<'_>,
     old_self_node: Option<Node<'_>>,
+    ctx: Ctx<'_, '_>,
 ) -> u64 {
     let mut scope = vec![("self".to_string(), self_node)];
     if let Some(old) = old_self_node {
         scope.push(("oldSelf".to_string(), old));
     }
-    Coster { scope }.cost(program.expression()).0
+    Coster {
+        scope,
+        limit: CALL_COST_LIMIT,
+    }
+    .cost(program.expression(), ctx)
+    .0
 }
 
 /// The `exceeds budget` detail upstream reports for an over-limit estimate.
@@ -335,7 +545,7 @@ mod tests {
 
     fn cost_of(rule: &str, self_schema: &J) -> u64 {
         let program = cel::Program::compile(rule).unwrap();
-        estimate(&program, Node::Schema(self_schema), None)
+        estimate(&program, Node::Schema(self_schema), None, None)
     }
 
     fn int_list(max_items: Option<u64>) -> J {
@@ -387,6 +597,7 @@ mod tests {
                 value: &data,
                 schema: Some(&schema),
             },
+            None,
             None,
         );
         assert!(actual < 100, "3 elements must cost little, got {actual}");
@@ -456,6 +667,38 @@ mod tests {
     fn untyped_items_are_opaque_to_the_estimator_like_upstream() {
         let list = serde_json::json!({ "type": "array", "items": {} });
         assert_eq!(max_elements(&list), 0);
+    }
+
+    #[test]
+    fn replay_stops_where_exists_finds_its_match_while_the_upper_bound_bills_every_cell() {
+        let schema = serde_json::json!({
+            "type": "array", "maxItems": 1000,
+            "items": { "type": "array", "maxItems": 1000, "items": { "type": "string" } }
+        });
+        let row: Vec<&str> = std::iter::once("x")
+            .chain(std::iter::repeat_n("y", 999))
+            .collect();
+        let data = serde_json::json!(vec![row; 1000]);
+        let program = cel::Program::compile("self.exists(r, r.exists(c, c == 'x'))").unwrap();
+        let node = Node::Data {
+            value: &data,
+            schema: Some(&schema),
+        };
+        let upper = estimate(&program, node, None, None);
+        let mut ctx = cel::Context::default();
+        ctx.add_variable_from_value(
+            "self",
+            crate::handlers::cr::json_to_cel_value(&schema, &data).unwrap(),
+        );
+        let replayed = estimate(&program, node, None, Some(&ctx));
+        assert!(
+            upper > CALL_COST_LIMIT,
+            "the no-short-circuit bound must see a million cells: {upper}"
+        );
+        assert!(
+            replayed < 100,
+            "upstream stops at the first cell, so replaying must too: {replayed}"
+        );
     }
 
     #[test]
