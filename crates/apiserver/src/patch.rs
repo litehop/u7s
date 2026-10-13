@@ -761,6 +761,11 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
 /// list already got, instead of two elements sharing only their first key field being wrongly
 /// treated as the same element.
 fn crd_merge_key_for_path(schema: &serde_json::Value, path: &str) -> MergeKeyKind {
+    // metadata is the apiserver's own ObjectMeta, not part of the CRD's schema; the garbage
+    // collector orphans a CR's dependents with a `$patch:delete` keyed by ownerReference uid.
+    if path == "metadata.ownerReferences" {
+        return MergeKeyKind::Key(vec!["uid".to_string()]);
+    }
     let Some(node) = find_schema_node(schema, path) else {
         return MergeKeyKind::Unknown;
     };
@@ -3623,6 +3628,32 @@ mod tests {
              didn't touch, violating upstream kubectl-apply parity — \"a\" and \"c\" must \
              survive since the patch never mentioned removing them, \"b\" must not be \
              duplicated since it was already present, and \"d\" must be appended; got: {tags:?}"
+        );
+    }
+
+    // KCM's garbage collector orphans a CR's dependents by sending
+    // `ownerReferences: [{$patch: delete, uid}]`. Without a merge key for
+    // metadata.ownerReferences the patch fails with 400, the owner's `orphan` finalizer is
+    // never removed, and the owner stays Terminating forever.
+    #[test]
+    fn cr_strategic_merge_patch_deletes_owner_reference_by_uid() {
+        let schema = json!({ "type": "object", "properties": { "spec": { "type": "object" } } });
+        let mut target = json!({
+            "metadata": { "ownerReferences": [
+                { "uid": "owner-1", "name": "a" },
+                { "uid": "owner-2", "name": "b" }
+            ]}
+        });
+        let patch = json!({
+            "metadata": { "ownerReferences": [{ "$patch": "delete", "uid": "owner-1" }] }
+        });
+
+        strategic_merge_patch_for_cr(&mut target, &patch, Some(&schema)).unwrap();
+
+        assert_eq!(
+            target["metadata"]["ownerReferences"],
+            json!([{ "uid": "owner-2", "name": "b" }]),
+            "only the orphaned owner's reference may be removed"
         );
     }
 }

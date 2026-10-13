@@ -549,6 +549,30 @@ fn default_storageclass(obj: &mut serde_json::Value) {
     *obj = serde_json::to_value(&fields).expect("StorageClassFields is always serializable");
 }
 
+/// Create-time Namespace preparation shared by POST, SSA apply-create and seeding: appends the
+/// `kubernetes` finalizer to `spec.finalizers` when absent, mirroring upstream's
+/// `namespaceStrategy.PrepareForCreate`. It must not live in `apply_defaults` (which also runs
+/// on reads) because the finalizer is removed over the object's life. Without it, DELETE on a
+/// finalizer-less namespace hard-deletes and orphans its content.
+pub fn prepare_namespace_for_create(obj: &mut serde_json::Value) -> Result<(), String> {
+    let mut spec: crate::types::NamespaceSpec =
+        crate::types::NamespaceSpec::deserialize(&obj["spec"]).unwrap_or_default();
+    let has_k8s = spec
+        .finalizers
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .any(|f| f == "kubernetes");
+    if !has_k8s {
+        spec.finalizers
+            .get_or_insert_with(Vec::new)
+            .push("kubernetes".to_owned());
+        obj["spec"] = serde_json::to_value(spec)
+            .map_err(|e| format!("failed to serialize NamespaceSpec: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Set status.phase to "Active" for a newly created Namespace, matching upstream
 /// `NamespaceStrategy.PrepareForCreate` (pkg/registry/core/namespace/strategy.go), which
 /// the real kube-apiserver runs for both plain `POST` create AND `PATCH`-based

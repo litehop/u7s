@@ -1312,18 +1312,19 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
     ];
     for (name, uid) in NS {
         let key = keys::cluster_object_key("namespaces", name);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Namespace",
             "metadata": {
                 "name": name,
                 "uid": uid,
                 "creationTimestamp": boot_timestamp(),
-                "labels": { "kubernetes.io/metadata.name": name },
-                "finalizers": ["kubernetes"]
+                "labels": { "kubernetes.io/metadata.name": name }
             },
             "status": { "phase": "Active" }
         });
+        handlers::defaults::prepare_namespace_for_create(&mut body)
+            .map_err(|e| anyhow::anyhow!("seed namespace {name}: {e}"))?;
         let bytes = Bytes::from(body.to_string());
         match store.put(&key, bytes, Some(0)).await {
             Ok(_) => tracing::info!("seeded namespace: {name}"),
@@ -4741,6 +4742,12 @@ mod tests {
             assert_eq!(parsed["kind"].as_str(), Some("Namespace"));
             assert_eq!(parsed["metadata"]["name"].as_str(), Some(name));
             assert_eq!(parsed["status"]["phase"].as_str(), Some("Active"));
+            assert_eq!(
+                parsed["spec"]["finalizers"],
+                serde_json::json!(["kubernetes"]),
+                "seeded namespace '{name}' needs spec.finalizers so deleting it soft-deletes and \
+                 the namespace controller drains its content instead of orphaning it"
+            );
         }
     }
 
