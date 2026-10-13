@@ -1035,12 +1035,9 @@ pub(crate) async fn replace_pod<S: Store>(
         // Same per-namespace lock the create path holds across its check-then-write —
         // without it here, this decrement can interleave with a concurrent
         // create/delete/resize's read-modify-write of the same quota's status.used and lose
-        // an update. Dropped before maybe_finalize_terminating_namespace below, which may
-        // itself need this same namespace's lock while purging remaining pods.
+        // an update.
         let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
         crate::quota::record_pod_removed(&state, ns.as_str(), &obj.body).await;
-        drop(_quota_lock);
-        super::namespaces::maybe_finalize_terminating_namespace(&state, ns.as_str()).await;
         return Ok(Json(obj.body));
     }
 
@@ -1789,15 +1786,9 @@ pub(crate) async fn patch_pod<S: Store>(
             // Same per-namespace lock the create path holds across its check-then-write —
             // without it here, this decrement can interleave with a concurrent
             // create/delete/resize's read-modify-write of the same quota's status.used and
-            // lose an update. Dropped before maybe_finalize_terminating_namespace below, which
-            // may itself need this same namespace's lock while purging remaining pods.
+            // lose an update.
             let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
             crate::quota::record_pod_removed(&state, ns.as_str(), &current_obj.body).await;
-            drop(_quota_lock);
-            // After hard-deleting a pod, check if its namespace is ready to complete deletion.
-            // This handles OrderedNamespaceDeletion: once all finalizer'd pods are cleared,
-            // the Terminating namespace hard-deletes.
-            super::namespaces::maybe_finalize_terminating_namespace(&state, ns.as_str()).await;
             return Ok(Json(current_obj.body));
         }
 

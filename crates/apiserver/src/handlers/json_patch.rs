@@ -2465,10 +2465,7 @@ mod tests {
     const SAFE_NO_DRY_RUN_SIGNAL: &[&str] = &[
         "complete_finalizer_drain",
         "complete_cr_finalizer_drain",
-        "maybe_finalize_terminating_namespace",
-        "purge_namespace_object",
-        "cascade_delete_namespace_resources",
-        "stamp_terminating_and_recheck_completion",
+        "delete_finalized_namespace",
         "cascade_delete_cr_dependents",
         "delete_namespace_scoped_crds",
         "delete_pods_owned_by",
