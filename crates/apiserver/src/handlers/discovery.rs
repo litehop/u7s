@@ -2974,6 +2974,7 @@ mod tests {
                 resource_version: String::new(),
                 uid: "test-uid".to_string(),
                 creation_timestamp: "2024-01-01T00:00:00Z".to_string(),
+                generation: 0,
             },
             spec: CustomResourceDefinitionSpec {
                 group: "apps".to_string(),

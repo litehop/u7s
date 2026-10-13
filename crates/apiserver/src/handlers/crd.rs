@@ -116,6 +116,12 @@ pub struct CrdMetadata {
     pub uid: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub creation_timestamp: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: i64,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +347,23 @@ fn stamp_server_fields(crd: &mut CustomResourceDefinition) {
     }
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
+}
+
+/// Upstream `crdStrategy.PrepareForUpdate`: the stored generation always wins over the
+/// client/webhook value, and any `spec` change bumps it by one.
+fn prepare_crd_generation_for_update(
+    existing: &serde_json::Value,
+    crd: &mut CustomResourceDefinition,
+) {
+    let stored = existing["metadata"]["generation"].as_i64().unwrap_or(0);
+    let spec_changed = serde_json::to_value(&crd.spec)
+        .map(|spec| spec != existing["spec"])
+        .unwrap_or(false);
+    crd.metadata.generation = if spec_changed {
+        stored.saturating_add(1)
+    } else {
+        stored
+    };
 }
 
 fn new_uid() -> String {
@@ -581,6 +604,7 @@ async fn build_new_crd<S: Store>(
         crd = serde_json::from_value(mutated)
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
+    crd.metadata.generation = 1;
 
     // Stamp status.conditions so controllers and conformance tests see the CRD
     // as ready immediately after creation (no separate status update loop).
@@ -774,6 +798,7 @@ pub async fn replace_crd<S: Store>(
         crd = serde_json::from_value(mutated)
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
+    prepare_crd_generation_for_update(&existing, &mut crd);
 
     // Dry-run: validation and admission passed; return the would-be replaced CRD without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -1140,6 +1165,7 @@ pub async fn patch_crd<S: Store>(
         crd = serde_json::from_value(mutated)
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
+    prepare_crd_generation_for_update(&existing, &mut crd);
 
     // Dry-run: validation and admission passed; return the would-be patched CRD without
     // persisting — mirrors do_patch's dry-run early-return in resource.rs.
@@ -1473,6 +1499,123 @@ mod tests {
 
         assert_eq!(crd.metadata.uid, "my-uid");
         assert_eq!(crd.metadata.creation_timestamp, "2024-01-01T00:00:00Z");
+    }
+
+    fn crd_with_versions(
+        name: &str,
+        versions: serde_json::Value,
+        generation: Option<i64>,
+    ) -> Bytes {
+        let mut meta = serde_json::json!({ "name": name });
+        if let Some(g) = generation {
+            meta["generation"] = serde_json::json!(g);
+        }
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": meta,
+                "spec": {
+                    "group": "argoproj.io",
+                    "names": { "plural": "applications", "singular": "application",
+                               "kind": "Application", "listKind": "ApplicationList" },
+                    "scope": "Namespaced",
+                    "versions": versions
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    async fn stored_crd_generation(state: &AppState, name: &str) -> serde_json::Value {
+        let stored = state
+            .store
+            .get(&store_key(name))
+            .await
+            .unwrap()
+            .expect("stored CRD");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        v["metadata"]["generation"].clone()
+    }
+
+    /// Upstream sets CRD generation to 1 on create and bumps it on spec change; the typed
+    /// CrdMetadata used to drop the field entirely, so nothing observing a CRD's generation
+    /// (e.g. a status.observedGeneration comparison) could ever tell a spec change happened.
+    #[tokio::test]
+    async fn crd_generation_is_1_on_create_and_bumps_on_spec_change_only() {
+        let state = make_state();
+        let name = "applications.argoproj.io";
+        let one = serde_json::json!([{ "name": "v1alpha1", "served": true, "storage": true }]);
+        let two = serde_json::json!([
+            { "name": "v1alpha1", "served": true, "storage": true },
+            { "name": "v1beta1", "served": true, "storage": false }
+        ]);
+
+        assert!(create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            crd_with_versions(name, one.clone(), Some(9)),
+        )
+        .await
+        .is_ok());
+        assert_eq!(
+            stored_crd_generation(&state, name).await,
+            1,
+            "create must stamp generation 1 over the client's 9"
+        );
+
+        let replace = |versions: serde_json::Value, generation: Option<i64>| {
+            replace_crd(
+                State(state.clone()),
+                Path(name.to_string()),
+                test_user(),
+                HeaderMap::new(),
+                crd_with_versions(name, versions, generation),
+            )
+        };
+        assert!(replace(two.clone(), None).await.is_ok());
+        assert_eq!(
+            stored_crd_generation(&state, name).await,
+            2,
+            "spec change must bump, and a PUT omitting generation must not drop it"
+        );
+        assert!(replace(two.clone(), Some(77)).await.is_ok());
+        assert_eq!(
+            stored_crd_generation(&state, name).await,
+            2,
+            "unchanged spec must not bump and a client-chosen generation is ignored"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        assert!(patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers.clone(),
+            Bytes::from(r#"{"metadata":{"labels":{"k":"v"},"generation":1}}"#),
+        )
+        .await
+        .is_ok());
+        assert_eq!(
+            stored_crd_generation(&state, name).await,
+            2,
+            "a metadata-only PATCH must neither bump nor accept the smuggled generation"
+        );
+        assert!(patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            Bytes::from(serde_json::json!({ "spec": { "versions": one } }).to_string()),
+        )
+        .await
+        .is_ok());
+        assert_eq!(stored_crd_generation(&state, name).await, 3);
     }
 
     // create_crd → 201; get_crd → 200 with stored object.

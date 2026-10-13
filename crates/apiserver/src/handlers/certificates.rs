@@ -367,9 +367,6 @@ const API_VERSION_V1: &str = "certificates.k8s.io/v1";
 /// every PATCH flavor, apply) via `defaults::validate_resource`: the spec names the exact
 /// pod/node/service-account identity a signer binds an issued certificate to, so a write
 /// path that skips these checks would let a request for a nonsense identity through.
-///
-/// Not implemented (no crypto backend in this crate): the stub PKCS#10 self-signature check
-/// and the v1beta1 `proofOfPossession` signature check. Key type and size are validated.
 pub(crate) fn validate_pod_certificate_request_spec(
     body: &serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
@@ -493,8 +490,13 @@ fn validate_pod_certificate_request_keys(
             let req = x509_cert::request::CertReq::from_der(&stub).map_err(|_| {
                 "spec.stubPKCS10Request: Invalid value: must be a valid PKCS#10 CSR".to_string()
             })?;
-            validate_spki_key_type(&req.info.public_key)
-                .map_err(|e| format!("spec.stubPKCS10Request: Invalid value: {e}"))
+            let kind = validate_spki_key_type(&req.info.public_key)
+                .map_err(|e| format!("spec.stubPKCS10Request: Invalid value: {e}"))?;
+            verify_csr_signature(&req, kind)
+                .then_some(())
+                .ok_or_else(|| {
+                    "spec.stubPKCS10Request: Invalid value: invalid signature".to_string()
+                })
         }
         (false, true, true) => {
             let spki =
@@ -502,8 +504,15 @@ fn validate_pod_certificate_request_keys(
                     "spec.pkixPublicKey: Invalid value: must be a valid PKIX-serialized public key"
                         .to_string()
                 })?;
-            validate_spki_key_type(&spki)
-                .map_err(|e| format!("spec.pkixPublicKey: Invalid value: {e}"))
+            let kind = validate_spki_key_type(&spki)
+                .map_err(|e| format!("spec.pkixPublicKey: Invalid value: {e}"))?;
+            verify_pod_uid_proof_of_possession(&spki, kind, spec.pod_uid.as_bytes(), &pop)
+                .then_some(())
+                .ok_or_else(|| {
+                    "spec.proofOfPossession: Invalid value: could not verify \
+                     proof-of-possession signature"
+                        .to_string()
+                })
         }
         _ => Err(
             "spec: Invalid value: exactly one of (stubPKCS10Request) or (pkixPublicKey, \
@@ -513,15 +522,25 @@ fn validate_pod_certificate_request_keys(
     }
 }
 
+#[derive(Clone, Copy)]
+enum KeyKind {
+    Ed25519,
+    EcP256,
+    EcP384,
+    EcP521,
+    Rsa,
+}
+
 /// Supported key types: Ed25519, ECDSA P-256/P-384/P-521, RSA 3072/4096 (upstream's set).
-fn validate_spki_key_type(spki: &x509_cert::spki::SubjectPublicKeyInfoOwned) -> Result<(), String> {
+fn validate_spki_key_type(
+    spki: &x509_cert::spki::SubjectPublicKeyInfoOwned,
+) -> Result<KeyKind, String> {
     const ED25519: &str = "1.3.101.112";
     const EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
     const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
-    const EC_CURVES: [&str; 3] = ["1.2.840.10045.3.1.7", "1.3.132.0.34", "1.3.132.0.35"];
 
     match spki.algorithm.oid.to_string().as_str() {
-        ED25519 => Ok(()),
+        ED25519 => Ok(KeyKind::Ed25519),
         EC_PUBLIC_KEY => {
             let curve = spki
                 .algorithm
@@ -529,8 +548,10 @@ fn validate_spki_key_type(spki: &x509_cert::spki::SubjectPublicKeyInfoOwned) -> 
                 .as_ref()
                 .and_then(|p| p.decode_as::<x509_cert::der::asn1::ObjectIdentifier>().ok())
                 .map(|oid| oid.to_string());
-            match curve {
-                Some(c) if EC_CURVES.contains(&c.as_str()) => Ok(()),
+            match curve.as_deref() {
+                Some("1.2.840.10045.3.1.7") => Ok(KeyKind::EcP256),
+                Some("1.3.132.0.34") => Ok(KeyKind::EcP384),
+                Some("1.3.132.0.35") => Ok(KeyKind::EcP521),
                 _ => Err("elliptic public keys must use curve P256, P384, or P521".into()),
             }
         }
@@ -539,7 +560,7 @@ fn validate_spki_key_type(spki: &x509_cert::spki::SubjectPublicKeyInfoOwned) -> 
                 .map_err(|_| "invalid RSA public key".to_string())?;
             let bits = key.modulus.as_bytes().len() * 8;
             if bits == 3072 || bits == 4096 {
-                Ok(())
+                Ok(KeyKind::Rsa)
             } else {
                 Err(format!(
                     "{bits}-bit modulus: RSA keys must have modulus size 3072 or 4096"
@@ -548,6 +569,118 @@ fn validate_spki_key_type(spki: &x509_cert::spki::SubjectPublicKeyInfoOwned) -> 
         }
         _ => Err("unknown public key type; supported types are Ed25519, ECDSA, and RSA".into()),
     }
+}
+
+/// v1beta1 proof of possession: the requester signs `spec.podUID` with the private key behind
+/// `pkixPublicKey` (Ed25519 pure; ECDSA over SHA-256 of the UID, ASN.1 signature; RSA-PSS
+/// SHA-256). Without it a requester could name a public key it does not hold.
+fn verify_pod_uid_proof_of_possession(
+    spki: &x509_cert::spki::SubjectPublicKeyInfoOwned,
+    kind: KeyKind,
+    pod_uid: &[u8],
+    signature: &[u8],
+) -> bool {
+    use aws_lc_rs::signature as sig;
+    let alg: &'static dyn sig::VerificationAlgorithm = match kind {
+        KeyKind::Ed25519 => &sig::ED25519,
+        KeyKind::EcP256 => &sig::ECDSA_P256_SHA256_ASN1,
+        KeyKind::EcP384 => &sig::ECDSA_P384_SHA256_ASN1,
+        KeyKind::EcP521 => &sig::ECDSA_P521_SHA256_ASN1,
+        KeyKind::Rsa => {
+            return verify_rsa_pss_sha256(spki.subject_public_key.raw_bytes(), pod_uid, signature)
+        }
+    };
+    sig::UnparsedPublicKey::new(alg, spki.subject_public_key.raw_bytes())
+        .verify(pod_uid, signature)
+        .is_ok()
+}
+
+/// RSASSA-PSS (SHA-256, MGF1-SHA-256) verification accepting any salt length, like Go's
+/// `rsa.VerifyPSS` with nil options. Go's `SignPSS` with nil options uses the largest salt,
+/// which fixed-salt verifiers (aws-lc-rs, ring) reject.
+fn verify_rsa_pss_sha256(pkcs1_public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    use rsa::{pkcs1::DecodeRsaPublicKey as _, traits::PublicKeyParts as _, BigUint};
+    use sha2::{Digest as _, Sha256};
+    const H_LEN: usize = 32;
+
+    let Ok(key) = rsa::RsaPublicKey::from_pkcs1_der(pkcs1_public_key) else {
+        return false;
+    };
+    let k = key.size();
+    let s = BigUint::from_bytes_be(signature);
+    if signature.len() != k || s >= *key.n() {
+        return false;
+    }
+    let m = s.modpow(key.e(), key.n()).to_bytes_be();
+    let mut em_full = vec![0u8; k - m.len()];
+    em_full.extend_from_slice(&m);
+
+    let em_bits = key.n().bits() - 1;
+    let em_len = em_bits.div_ceil(8);
+    let em = &em_full[k - em_len..];
+    if em_len < H_LEN + 2 || em[em_len - 1] != 0xbc {
+        return false;
+    }
+    let (masked_db, h) = em[..em_len - 1].split_at(em_len - H_LEN - 1);
+    let unused_bits = 8 * em_len - em_bits;
+    if masked_db[0] & 0xffu8.checked_shl(8 - unused_bits as u32).unwrap_or(0) != 0 {
+        return false;
+    }
+
+    let mut db = masked_db.to_vec();
+    for (counter, chunk) in db.chunks_mut(H_LEN).enumerate() {
+        let mask = Sha256::new()
+            .chain_update(h)
+            .chain_update((counter as u32).to_be_bytes())
+            .finalize();
+        chunk.iter_mut().zip(mask).for_each(|(b, m)| *b ^= m);
+    }
+    db[0] &= 0xffu8 >> unused_bits;
+
+    let Some(sep) = db.iter().position(|&b| b != 0) else {
+        return false;
+    };
+    if db[sep] != 0x01 {
+        return false;
+    }
+    let salt = &db[sep + 1..];
+    let expected = Sha256::new()
+        .chain_update([0u8; 8])
+        .chain_update(Sha256::digest(message))
+        .chain_update(salt)
+        .finalize();
+    expected.as_slice() == h
+}
+
+/// The stub CSR's self-signature must verify under its own public key, as upstream's
+/// `CertificateRequest.CheckSignature` does; otherwise the key is not proven held. Only the
+/// signature algorithms Go's `CreateCertificateRequest` emits by default are accepted.
+fn verify_csr_signature(req: &x509_cert::request::CertReq, kind: KeyKind) -> bool {
+    use aws_lc_rs::signature as sig;
+    use x509_cert::der::Encode as _;
+    let alg: &'static dyn sig::VerificationAlgorithm =
+        match (req.algorithm.oid.to_string().as_str(), kind) {
+            ("1.3.101.112", KeyKind::Ed25519) => &sig::ED25519,
+            ("1.2.840.10045.4.3.2", KeyKind::EcP256) => &sig::ECDSA_P256_SHA256_ASN1,
+            ("1.2.840.10045.4.3.3", KeyKind::EcP256) => &sig::ECDSA_P256_SHA384_ASN1,
+            ("1.2.840.10045.4.3.4", KeyKind::EcP256) => &sig::ECDSA_P256_SHA512_ASN1,
+            ("1.2.840.10045.4.3.2", KeyKind::EcP384) => &sig::ECDSA_P384_SHA256_ASN1,
+            ("1.2.840.10045.4.3.3", KeyKind::EcP384) => &sig::ECDSA_P384_SHA384_ASN1,
+            ("1.2.840.10045.4.3.4", KeyKind::EcP384) => &sig::ECDSA_P384_SHA512_ASN1,
+            ("1.2.840.10045.4.3.2", KeyKind::EcP521) => &sig::ECDSA_P521_SHA256_ASN1,
+            ("1.2.840.10045.4.3.3", KeyKind::EcP521) => &sig::ECDSA_P521_SHA384_ASN1,
+            ("1.2.840.10045.4.3.4", KeyKind::EcP521) => &sig::ECDSA_P521_SHA512_ASN1,
+            ("1.2.840.113549.1.1.11", KeyKind::Rsa) => &sig::RSA_PKCS1_2048_8192_SHA256,
+            ("1.2.840.113549.1.1.12", KeyKind::Rsa) => &sig::RSA_PKCS1_2048_8192_SHA384,
+            ("1.2.840.113549.1.1.13", KeyKind::Rsa) => &sig::RSA_PKCS1_2048_8192_SHA512,
+            _ => return false,
+        };
+    let Ok(tbs) = req.info.to_der() else {
+        return false;
+    };
+    sig::UnparsedPublicKey::new(alg, req.info.public_key.subject_public_key.raw_bytes())
+        .verify(&tbs, req.signature.raw_bytes())
+        .is_ok()
 }
 
 /// Validate `spec.maxExpirationSeconds`, mirroring upstream's
@@ -603,6 +736,10 @@ pub(crate) fn validate_pod_certificate_request_spec_immutable(
     old: &serde_json::Value,
     new: &serde_json::Value,
 ) -> Result<(), String> {
+    // Upstream defaults the stored object on decode, so an object persisted before a field
+    // was defaulted compares equal to its defaulted update.
+    let mut old = old.clone();
+    super::defaults::apply_defaults("certificates.k8s.io", "podcertificaterequests", &mut old);
     if old["spec"] != new["spec"] {
         return Err("spec: Invalid value: field is immutable".to_string());
     }
@@ -780,6 +917,54 @@ pub(crate) fn validate_pod_certificate_request_status_update(
     }
 }
 
+/// Approximates Go's `mail.ParseAddress`: an RFC 5322 `addr-spec`, optionally wrapped as
+/// `[display-name] <addr-spec>`. The local part is a dot-atom or quoted string; the domain is
+/// a dot-atom or a bracketed literal. Non-ASCII is permitted like Go (SMTPUTF8).
+fn is_valid_mail_address(s: &str) -> bool {
+    let s = s.trim();
+    let addr = match (s.rfind('<'), s.strip_suffix('>')) {
+        (Some(i), Some(inner)) => {
+            let display = s[..i].trim();
+            if display.contains(['<', '>']) {
+                return false;
+            }
+            &inner[i + 1..]
+        }
+        _ => s,
+    };
+    let is_atext = |c: char| {
+        c.is_alphanumeric() || !c.is_ascii() && !c.is_control() || "!#$%&'*+-/=?^_`{|}~".contains(c)
+    };
+    let dot_atom = |a: &str| {
+        !a.is_empty()
+            && a.split('.')
+                .all(|p| !p.is_empty() && p.chars().all(is_atext))
+    };
+    let Some(at) = addr.rfind('@') else {
+        return false;
+    };
+    let (local, domain) = (&addr[..at], &addr[at + 1..]);
+    let local_ok = if local.len() >= 2 && local.starts_with('"') && local.ends_with('"') {
+        let mut chars = local[1..local.len() - 1].chars();
+        loop {
+            match chars.next() {
+                None => break true,
+                Some('\\') if chars.next().is_none() => break false,
+                Some('"') => break false,
+                Some(_) => {}
+            }
+        }
+    } else {
+        dot_atom(local)
+    };
+    let domain_ok = if domain.starts_with('[') && domain.ends_with(']') {
+        !domain[1..domain.len() - 1].contains(['[', ']', '\\'])
+    } else {
+        dot_atom(domain)
+    };
+    local_ok && domain_ok
+}
+
 fn validate_issued_pcr_status(
     old: &serde_json::Value,
     status: &serde_json::Value,
@@ -816,6 +1001,15 @@ fn validate_issued_pcr_status(
                     return Err(format!(
                         "status.certificateChain: Invalid value: {d:?}: leaf certificate has a \
                          malformed DNSName"
+                    ));
+                }
+            }
+            if let x509_cert::ext::pkix::name::GeneralName::Rfc822Name(e) = name {
+                if !is_valid_mail_address(e.as_str()) {
+                    return Err(format!(
+                        "status.certificateChain: Invalid value: {:?}: leaf certificate should \
+                         not contain invalid EmailAddress",
+                        e.as_str()
                     ));
                 }
             }
@@ -925,16 +1119,15 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// The guard every `/status` write on a PodCertificateRequest passes through: content
-/// validation, then the signer authorization check when the status actually changes.
+/// The guard every `/status` write on a PodCertificateRequest passes through: the signer
+/// authorization check when the status actually changes (so an unauthorized caller gets 403
+/// without learning content-validation detail), then content validation.
 fn guard_pod_certificate_request_status_write<S: Store>(
     state: &AppState<S>,
     user: &UserInfo,
     old: &serde_json::Value,
     new: &serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
-    validate_pod_certificate_request_status_update(old, new, now_unix_secs())
-        .map_err(Status::unprocessable_entity)?;
     if !pcr_status_eq(&old["status"], &new["status"]) {
         let signer = old["spec"]["signerName"].as_str().unwrap_or("");
         if !user_may_sign(state, user, signer) {
@@ -944,7 +1137,8 @@ fn guard_pod_certificate_request_status_write<S: Store>(
             )));
         }
     }
-    Ok(())
+    validate_pod_certificate_request_status_update(old, new, now_unix_secs())
+        .map_err(Status::unprocessable_entity)
 }
 
 async fn fetch_json<S: Store>(
@@ -969,7 +1163,7 @@ async fn fetch_json<S: Store>(
 /// a `podCertificate` volume for (or that RBAC explicitly allows for that service account).
 /// Without it any kubelet could obtain a certificate for any pod's identity in the cluster.
 /// A no-op for non-node callers.
-async fn restrict_node_pod_certificate_request_create<S: Store>(
+pub(crate) async fn restrict_node_pod_certificate_request_create<S: Store>(
     state: &AppState<S>,
     user: &UserInfo,
     ns: &str,
@@ -1955,15 +2149,15 @@ mod tests {
     }
 
     /// A create carrying a nonsense identity must be refused on every route that can create:
-    /// POST, PUT-on-missing and apply-on-missing. The spec names the pod/node/SA a signer
-    /// binds a certificate to, so one unvalidated create route would let a client mint
+    /// POST and apply-on-missing (PUT-on-missing is a 404). The spec names the pod/node/SA a
+    /// signer binds a certificate to, so one unvalidated create route would let a client mint
     /// requests for an identity that cannot exist.
     #[tokio::test]
     async fn podcertificaterequest_every_create_path_validates_spec_because_a_signer_trusts_its_identity_fields(
     ) {
         let mut guarded = 0;
         let mut total = 0;
-        for mode in ["post", "put-create", "apply-create"] {
+        for mode in ["post", "apply-create"] {
             let state = make_state();
             for (label, field, bad) in [
                 ("signerName without domain", "signerName", "nodomain"),
@@ -2547,13 +2741,8 @@ mod tests {
             "pkixPublicKey without proofOfPossession proves nothing about key ownership"
         );
 
-        let mut beta_pair = valid_pcr_spec();
-        beta_pair
-            .as_object_mut()
-            .unwrap()
-            .remove("stubPKCS10Request");
-        beta_pair["pkixPublicKey"] = pkix.clone().into();
-        beta_pair["proofOfPossession"] = b64(b"sig").into();
+        let (ed_spki, ed_sig) = ed25519_pop(POP_UID);
+        let beta_pair = beta_pop_spec(&ed_spki, &ed_sig);
         assert!(spec_error(beta_pair.clone(), beta).is_none());
         assert!(
             spec_error(beta_pair, v1).unwrap().contains("v1"),
@@ -2852,6 +3041,383 @@ mod tests {
             panic!(
                 "exactly 3600s (the minimum) must be accepted, got status={}",
                 err.0
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PodCertificateRequest: CSR signature and proof of possession
+    // -----------------------------------------------------------------------
+
+    const POP_UID: &str = "0f5c9c7e-1d0a-4f7e-9d63-2f1f6a1b7c11";
+
+    // openssl-generated: SPKI plus a signature over SHA-256(POP_UID), the digest upstream's
+    // `ecdsa.VerifyASN1` / `rsa.VerifyPSS` receive. P-384/P-521 cannot be produced with
+    // aws-lc-rs signing (it pairs each curve with one fixed hash).
+    const P384_SPKI: &str = "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEj+FInaO73abswF2/W+HffIGNYlBPFDk1g3nCy48/Ro4mz/upDyi7WEXqmZ5nuSGxhd4R5BpYNbTFq7kH5SQjpv1qaSLIccDyFJao9kIFurMc5a1onxxgO4YRaKm1Az6c";
+    const P384_SIG: &str = "MGQCMHEJ/owwvc275m020AsYyBOz8Ws3DRZZ4DBg6QfHNzR/kQg6hcGT+NQIr/MVhZHQdgIwPRCt4rP87MwNueQomKISYWggzMcapxdvVXfWO1/amPWQht+qhkU4IV5Y1FLBKlvY";
+    const P521_SPKI: &str = "MIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQAZo3LFJWWPVUbRmrnaRy7Ckd6+MablNmUpZggZzyFamV4AT4a4WtSf0r6fbVuybFQy4Tw4pK25XAGb8/oDGpWygcBOW2ROZ575dB99xH97Qg2g1iVNxKQfxNDURklgCwZ7naX/5F3rbfMBcpRBuXNClmFVL2IivL1lj74H/Y3wAR9qN8=";
+    const P521_SIG: &str = "MIGHAkIBnDV+pWMVdHagYyvYZBrZDluKJSnVn1pCV3qOPuFjYQJoPtceF5sYNe4v/TuPpSNwH76SS+53o1qwazzG24SFIAICQQMRQKouljxHnM6MxHPgBP9V5nkGRuPTSq0sNUnuKiFVz5BxAnxDXMH/VZ0oebEC3LU+6mIetIRodj90IMRw+hsF";
+    const RSA_SPKI: &str = "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA0XYJKCc89ZG1adq4GpJ/e1ZMpQNQastWGPCQjsqibOte/fzd8hy1UQhdkU5OmRo8t6K47HKIO0kCl/s3vzHcYvXtHcFtX6umvyuNvl0XuCAqLH8HtG3goG/z8mrMsYkWK4++lnFN4bnGcYd/8TC/BPHaMFpcgiuhv0ZyLAIWHPpCz4+zp5MajOf2Pfl1P+EYxWMcsoMMkV4HLT4r/QSidGpx4ruRrN7/ZKcIJ8kZJK0av81ab2LyzbgHIDr583fEggZWLZLNduO3tZUoeMYJen5O799z/LbDCk2ENHSy7AYdgYjoRUyTPx+NHJrPHNCyMPVrzT9TfGvWnf1Uq2FfzV3QLAShsoU7XCPyzdOLv7ZQUyO0hsbzuVKXKLjnzVkcfncJZDn1fIzPG/A0eO+4qU2TZvABzz66zo7Nc4KPivMky3zpME1wEqn8h3k3BYbEZUfaguJVEZuAH2fF9mRZHUIJJZd/U8Bukb6/6054lVUAsRRSSaluBNj8wEW5cj0pAgMBAAE=";
+    const RSA_SIG_DIGEST_SALT: &str = "n9oykFoQz7o0ZIe9m8KydKhLw4e3o/o3aQuijpFZ18zLCGpwUbBzMBkTH2vqQCNn3cIiK2VoFIWCvrwZ77Vx1qRHM+KzcE5m112jCgICISxDQbtruLlj59kD1t0d03cQ+5CSs8unN3bfbVI1cSrRTeV+ztWAI+PYp80gs9uGTRLMzW9NQO0o14v6hQVytYhYIFKUTOYXPvMGwix73qcnXrdS/bTFcUKcId9LdfQ0ygIe5tgJGQGjiZAjMHtcPIW6oV8aezFCAAeiRy5Qsq10tQ9Nt73Bk56Lm+fCQyWVafv/mz+e7WLCkg/p3y1HUSe07ujyKVgRRep6FKa3jIFojMj3Xhfy8k6x487f7lcWKBGgFgGJ09mV70WmhkXGXWhJRBfHzjt0LHv/9jxB+zYoGuNiO+vl5Q1FgWt3475ZiYubj4+zSvdVMKXay+9iHmZncipX1dqtsLiJGlxDebwTYSqUoYqtTo5UtTHHQfE1mqV1sE3OfDffch2AuWcKn04g";
+    // Salt as large as the key allows: what Go's `rsa.SignPSS` with nil options (kubelet) emits.
+    const RSA_SIG_MAX_SALT: &str = "afPhAxRhCVd4jP5MkR4TBaiekjVrWE8pl0WWBxYrDNDBXet5tJM4R9AJEV4Z2Y1of7IQOK9EW3O7GPkG2I8nJmlPEkQxurvr1Sj7pw37NcS41vlf5FdF78XJU5dfRiIw1a8cwUoR4DYPj7lF2fGGyHMPmv3K7ovb19WX6S7I7CJ+acKd2A6F2sGzmomzLxiMolDkbRuo1Jfg5wqH3TlZCzaQYM65qIsl2rj3KTWSGfIuEYnJdF+mHnClqTbl4mH7o1eECrAAI4DIFxZ2zFMSkKWekQrhDrlEE0DQlwxHJ8bpjxd+ksYqujhgPIEJLilR/VVSdLXfdHC6kKaRoVyiQJgSoMKcEKFGBXUnp5326/19Wh+yiNYQGfdzwH2sSxi/FB1Sgi4KWqnrmz5J0cUlJol7Q6T85tmPoAjIUa7Gg5sBpyi1C9lAeHj1rvZRnoziHFeiqGTsnhGJsFD5DGcfSfY3WcyAejxMz5PTpDERhtfG7sSpJ6Szg9XsGeW3ha6g";
+
+    fn b64_decode(s: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    }
+
+    fn b64_encode(b: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    /// A v1beta1 spec using `pkixPublicKey` + `proofOfPossession` for `POP_UID`.
+    fn beta_pop_spec(spki: &[u8], sig: &[u8]) -> serde_json::Value {
+        let mut spec = valid_pcr_spec();
+        let map = spec.as_object_mut().unwrap();
+        map.remove("stubPKCS10Request");
+        spec["podUID"] = POP_UID.into();
+        spec["pkixPublicKey"] = b64_encode(spki).into();
+        spec["proofOfPossession"] = b64_encode(sig).into();
+        spec
+    }
+
+    fn ed25519_pop(uid: &str) -> (Vec<u8>, Vec<u8>) {
+        use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
+        let pair = Ed25519KeyPair::generate().unwrap();
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(pair.public_key().as_ref());
+        (spki, pair.sign(uid.as_bytes()).as_ref().to_vec())
+    }
+
+    fn p256_pop(uid: &str) -> (Vec<u8>, Vec<u8>) {
+        use aws_lc_rs::{
+            rand::SystemRandom,
+            signature::{EcdsaKeyPair, KeyPair as _, ECDSA_P256_SHA256_ASN1_SIGNING},
+        };
+        let pair = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING).unwrap();
+        let mut spki = vec![
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+        ];
+        spki.extend_from_slice(pair.public_key().as_ref());
+        let sig = pair.sign(&SystemRandom::new(), uid.as_bytes()).unwrap();
+        (spki, sig.as_ref().to_vec())
+    }
+
+    #[test]
+    fn proof_of_possession_is_accepted_for_every_supported_key_type_because_kubelet_signs_with_any_of_them(
+    ) {
+        let beta = "certificates.k8s.io/v1beta1";
+        let (ed_spki, ed_sig) = ed25519_pop(POP_UID);
+        let (p256_spki, p256_sig) = p256_pop(POP_UID);
+        let cases: [(&str, Vec<u8>, Vec<u8>); 6] = [
+            ("Ed25519", ed_spki, ed_sig),
+            ("ECDSA P-256", p256_spki, p256_sig),
+            ("ECDSA P-384", b64_decode(P384_SPKI), b64_decode(P384_SIG)),
+            ("ECDSA P-521", b64_decode(P521_SPKI), b64_decode(P521_SIG)),
+            (
+                "RSA-3072 PSS, digest-length salt",
+                b64_decode(RSA_SPKI),
+                b64_decode(RSA_SIG_DIGEST_SALT),
+            ),
+            (
+                "RSA-3072 PSS, maximum salt (Go default)",
+                b64_decode(RSA_SPKI),
+                b64_decode(RSA_SIG_MAX_SALT),
+            ),
+        ];
+        for (label, spki, sig) in cases {
+            assert_eq!(
+                spec_error(beta_pop_spec(&spki, &sig), beta),
+                None,
+                "{label}: a genuine proof of possession must be accepted or kubelet's pod hangs"
+            );
+        }
+    }
+
+    #[test]
+    fn requester_cannot_obtain_a_pod_cert_for_a_key_it_does_not_hold_because_proof_of_possession_must_verify(
+    ) {
+        let beta = "certificates.k8s.io/v1beta1";
+        let (victim_spki, _) = p256_pop(POP_UID);
+        let (_, attacker_sig) = p256_pop(POP_UID);
+        let err = spec_error(beta_pop_spec(&victim_spki, &attacker_sig), beta)
+            .expect("a signature from a different key must be rejected");
+        assert!(
+            err.contains("spec.proofOfPossession") && err.contains("could not verify"),
+            "got: {err}"
+        );
+
+        let (spki, sig_for_other_pod) = p256_pop("another-pod-uid");
+        assert!(
+            spec_error(beta_pop_spec(&spki, &sig_for_other_pod), beta).is_some(),
+            "a signature over another pod's UID must not be replayable for this pod"
+        );
+
+        let (ed_spki, ed_sig) = ed25519_pop(POP_UID);
+        let mut truncated = ed_sig.clone();
+        truncated.pop();
+        assert!(spec_error(beta_pop_spec(&ed_spki, &truncated), beta).is_some());
+        let mut rsa_garbage = b64_decode(RSA_SIG_DIGEST_SALT);
+        rsa_garbage[0] ^= 1;
+        assert!(
+            spec_error(beta_pop_spec(&b64_decode(RSA_SPKI), &rsa_garbage), beta).is_some(),
+            "a corrupted RSA-PSS signature must be rejected"
+        );
+        assert!(
+            spec_error(
+                beta_pop_spec(&b64_decode(P384_SPKI), &b64_decode(P521_SIG)),
+                beta
+            )
+            .is_some(),
+            "a P-521 signature must not verify under a P-384 key"
+        );
+    }
+
+    fn csr_with_subject(alg: &'static rcgen::SignatureAlgorithm, cn: &str) -> Vec<u8> {
+        let key = rcgen::KeyPair::generate_for(alg).unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.serialize_request(&key).unwrap().der().to_vec()
+    }
+
+    fn v1_csr_spec(der: &[u8]) -> serde_json::Value {
+        pcr_spec(&b64_encode(der))
+    }
+
+    #[test]
+    fn stub_csr_signature_is_verified_for_each_key_type_because_a_csr_is_the_only_proof_of_key_possession_in_v1(
+    ) {
+        for alg in [
+            &rcgen::PKCS_ED25519,
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            &rcgen::PKCS_ECDSA_P384_SHA384,
+        ] {
+            let der = csr_with_subject(alg, "AAAAAAAA");
+            assert_eq!(
+                spec_error(v1_csr_spec(&der), "certificates.k8s.io/v1"),
+                None
+            );
+
+            let mut bad_sig = der.clone();
+            *bad_sig.last_mut().unwrap() ^= 1;
+            let err = spec_error(v1_csr_spec(&bad_sig), "certificates.k8s.io/v1")
+                .expect("a CSR with a corrupted signature must be rejected");
+            assert!(err.contains("invalid signature"), "got: {err}");
+
+            let at = der.windows(8).position(|w| w == b"AAAAAAAA").unwrap();
+            let mut swapped = der.clone();
+            swapped[at..at + 8].copy_from_slice(b"BBBBBBBB");
+            let err = spec_error(v1_csr_spec(&swapped), "certificates.k8s.io/v1")
+                .expect("content changed after signing must be rejected");
+            assert!(err.contains("invalid signature"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn stub_csr_with_a_foreign_public_key_is_rejected_because_the_signature_does_not_match_the_embedded_key(
+    ) {
+        let a = csr_with_subject(&rcgen::PKCS_ECDSA_P256_SHA256, "AAAAAAAA");
+        let b = csr_with_subject(&rcgen::PKCS_ECDSA_P256_SHA256, "AAAAAAAA");
+        let req_a = x509_cert::request::CertReq::from_der(&a).unwrap();
+        let req_b = x509_cert::request::CertReq::from_der(&b).unwrap();
+        let point_a = req_a
+            .info
+            .public_key
+            .subject_public_key
+            .raw_bytes()
+            .to_vec();
+        let point_b = req_b
+            .info
+            .public_key
+            .subject_public_key
+            .raw_bytes()
+            .to_vec();
+        let at = a.windows(point_a.len()).position(|w| w == point_a).unwrap();
+        let mut forged = a.clone();
+        forged[at..at + point_a.len()].copy_from_slice(&point_b);
+        let err = spec_error(v1_csr_spec(&forged), "certificates.k8s.io/v1")
+            .expect("a CSR signed by key A but naming key B must be rejected");
+        assert!(err.contains("invalid signature"), "got: {err}");
+    }
+
+    #[test]
+    fn mail_address_check_matches_go_parseaddress_for_certificate_email_sans() {
+        for ok in [
+            "a@example.com",
+            "first.last+tag@sub.example.com",
+            "Bob <bob@example.com>",
+            "\"quoted local\"@example.com",
+            "ü@例え.jp",
+        ] {
+            assert!(is_valid_mail_address(ok), "{ok:?} must be accepted");
+        }
+        for bad in [
+            "",
+            "no-at-sign",
+            "@example.com",
+            "a@",
+            "a@@example.com",
+            "a b@example.com",
+            "a..b@example.com",
+            ".a@example.com",
+            "a@example..com",
+            "a@example.com.",
+            "<a@example.com",
+            "Bob <bob@example.com> junk>",
+        ] {
+            assert!(!is_valid_mail_address(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn issued_certificate_with_invalid_email_san_is_rejected_because_signers_must_not_mint_malformed_identities(
+    ) {
+        let (key, csr) = stub_csr();
+        let pem_with = |email: &str| {
+            let mut params =
+                rcgen::CertificateParams::new(vec!["example.com".to_string()]).unwrap();
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2020, 1, 2);
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::Rfc822Name(email.try_into().unwrap()));
+            params.self_signed(&key).unwrap().pem()
+        };
+        let (old, good) = pcr_with_status(&csr, 86400, issued_status(&pem_with("a@example.com")));
+        assert!(
+            validate_pod_certificate_request_status_update(&old, &good, t0_secs() + 60).is_ok()
+        );
+        let (old, bad) = pcr_with_status(&csr, 86400, issued_status(&pem_with("not an email")));
+        let err = validate_pod_certificate_request_status_update(&old, &bad, t0_secs() + 60)
+            .expect_err("malformed rfc822Name SAN must be rejected");
+        assert!(err.contains("EmailAddress"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn put_on_a_missing_podcertificaterequest_is_404_because_it_must_not_bypass_create_time_node_restriction(
+    ) {
+        let state = make_state();
+        let full = pcr_object("v1", "req-new", valid_pcr_spec());
+        let (status, message) = send_main(
+            &state,
+            "put-create",
+            "req-new",
+            &full,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "got {message}");
+        let key = "/registry/certificates.k8s.io/podcertificaterequests/default/req-new";
+        assert!(
+            state.store.get(key).await.unwrap().is_none(),
+            "a rejected PUT must not leave an object behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_create_of_a_podcertificaterequest_by_a_node_is_restricted_because_apply_must_not_bypass_post_node_restriction(
+    ) {
+        let state = node_restriction_state(serde_json::json!({})).await;
+        let body = pcr_object("v1", "req-new", valid_pcr_spec());
+        let apply_as = |user: UserInfo| {
+            let state = state.clone();
+            let body = body.clone();
+            async move {
+                outcome(
+                    super::super::resource::patch_namespaced_resource(
+                        State(state),
+                        Path((
+                            GROUP.to_string(),
+                            "v1".to_string(),
+                            "default".to_string(),
+                            PCR_PLURAL.to_string(),
+                            "req-new".to_string(),
+                        )),
+                        Query(PatchQuery::default()),
+                        Extension(user),
+                        headers_for("apply-create"),
+                        Bytes::from(serde_json::to_vec(&body).unwrap()),
+                    )
+                    .await
+                    .map(IntoResponse::into_response),
+                )
+            }
+        };
+        let (status, message) = apply_as(node_user("node-2")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "node-2 must not create a request for node-1's pod via apply: {message}"
+        );
+        let (status, message) = apply_as(node_user("node-1")).await;
+        assert!(
+            status.is_success(),
+            "the pod's own node must still be able to apply-create: {status} {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn podcertificaterequest_stored_without_max_expiration_still_takes_a_label_only_put_because_the_default_must_not_look_like_a_spec_change(
+    ) {
+        let state = make_state();
+        let (_key, csr) = stub_csr();
+        let mut spec = pcr_spec(&csr);
+        spec.as_object_mut().unwrap().remove("maxExpirationSeconds");
+        let mut legacy = pcr_object("v1", PCR_NAME, spec);
+        legacy["metadata"]["namespace"] = "default".into();
+        legacy["metadata"]["uid"] = "legacy-uid".into();
+        put_raw(
+            &state,
+            &format!("/registry/certificates.k8s.io/podcertificaterequests/default/{PCR_NAME}"),
+            legacy.clone(),
+        )
+        .await;
+        let mut relabel = legacy.clone();
+        relabel["metadata"]["labels"] = serde_json::json!({"a": "b"});
+        let (status, message) = send_main(
+            &state,
+            "put",
+            PCR_NAME,
+            &relabel,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "an object stored before the maxExpirationSeconds default must keep accepting \
+             metadata-only updates, got {status} {message}"
+        );
+    }
+
+    /// Without authorization first, any caller holding `podcertificaterequests/status` could
+    /// probe a PodCertificateRequest's issued-certificate rules from the 422 text before ever
+    /// being told it may not sign.
+    #[tokio::test]
+    async fn status_write_without_sign_permission_is_403_not_422_because_authorization_precedes_validation(
+    ) {
+        for mode in UPDATE_MODES {
+            let (state, _key) = seeded_pcr_state().await;
+            let seeded = stored_pcr(&state).await;
+            let mut body = pcr_object("v1", PCR_NAME, seeded["spec"].clone());
+            body["status"] = serde_json::json!({"conditions": [{
+                "type": "Issued", "status": "True", "reason": "Ok",
+                "lastTransitionTime": "2020-01-01T00:00:00Z"
+            }], "certificateChain": "not a certificate"});
+            let (status, message) = send_status(&state, test_user(), mode, &body).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{mode}: unauthorized signer must get 403 before any 422 detail: {message}"
             );
         }
     }

@@ -17,7 +17,7 @@ use crate::{
     util::{content_type, extract_body_quiet},
 };
 
-use super::generic::store_err;
+use super::generic::{store_err, validate_path_segment};
 use super::json_patch::is_dry_run_header;
 
 // ---------------------------------------------------------------------------
@@ -382,6 +382,8 @@ async fn scale_get_impl<S: Store>(
     ns: &str,
     name: &str,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("namespace", ns)?;
+    validate_path_segment("name", name)?;
     let key = group_object_key(group, resource, Some(ns), name);
     let stored = state
         .store
@@ -449,6 +451,8 @@ async fn scale_put_impl<S: Store>(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", ns)?;
+    validate_path_segment("name", name)?;
     let scale = decode_scale_body(body, headers)?;
 
     let new_replicas = scale
@@ -515,6 +519,8 @@ async fn scale_patch_impl<S: Store>(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("namespace", ns)?;
+    validate_path_segment("name", name)?;
     // Accept both JSON and proto bodies; extract spec.replicas from whichever.
     // extract_body_quiet's Err is expected and ignored here — see decode_scale_body's comment
     // on why Scale has no registered proto decoder of its own.
@@ -1201,6 +1207,50 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Every scale verb (apps/v1 and ReplicationController) must reject '.', '..', '%' in the
+    /// namespace or name segment with 400 (upstream IsPathSegmentName) instead of answering 404
+    /// from a store lookup built out of the raw segment.
+    #[tokio::test]
+    async fn scale_verbs_reject_path_segment_names_with_400() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                get(get_scale).put(put_scale).patch(patch_scale),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/replicationcontrollers/{name}/scale",
+                get(get_rc_scale).put(put_rc_scale).patch(patch_rc_scale),
+            )
+            .with_state(state);
+
+        let bases = [
+            "/apis/apps/v1/namespaces/{ns}/deployments/{name}/scale",
+            "/api/v1/namespaces/{ns}/replicationcontrollers/{name}/scale",
+        ];
+        let segments = [("default", ".."), ("default", "a%25b"), ("..", "web")];
+        for base in bases {
+            for method in ["GET", "PUT", "PATCH"] {
+                for (ns, name) in segments {
+                    let uri = base.replace("{ns}", ns).replace("{name}", name);
+                    let req = Request::builder()
+                        .method(method)
+                        .uri(&uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"spec":{"replicas":1}}"#))
+                        .unwrap();
+                    let resp = app.clone().oneshot(req).await.unwrap();
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::BAD_REQUEST,
+                        "{method} {uri} must be 400 invalid path segment"
+                    );
+                }
+            }
+        }
     }
 
     /// GET scale for a workload that does not exist must return 404.

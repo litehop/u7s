@@ -24,6 +24,7 @@ use u7s_store::{ListOptions, Store};
 
 use crate::{
     admission::{run_validating_webhooks, AdmissionContext},
+    handlers::generic::validate_path_segment,
     handlers::stream::{
         splice, AxumWs, BiStream, BiStreamReader, BiStreamWriter, RawStream, TungsteniteWs,
     },
@@ -151,6 +152,8 @@ async fn resolve_log_target<S: Store>(
     pod_name: &str,
     query: &LogQuery,
 ) -> Result<String, crate::status::StatusError> {
+    validate_path_segment("namespace", raw_ns)?;
+    validate_path_segment("name", pod_name)?;
     // 1. Look up the pod.
     let pod_key = object_key("pods", raw_ns, pod_name);
     let stored = state
@@ -380,6 +383,8 @@ pub async fn resolve_attach_target<S: Store>(
     pod_name: &str,
     query: &AttachQuery,
 ) -> Result<AttachTarget, crate::status::StatusError> {
+    validate_path_segment("namespace", raw_ns)?;
+    validate_path_segment("name", pod_name)?;
     // Look up the pod.
     let pod_key = object_key("pods", raw_ns, pod_name);
     let stored = state
@@ -856,6 +861,8 @@ pub async fn resolve_exec_target<S: Store>(
     container_override: Option<&str>,
     raw_query: &str,
 ) -> Result<ExecTarget, crate::status::StatusError> {
+    validate_path_segment("namespace", raw_ns)?;
+    validate_path_segment("name", pod_name)?;
     // Look up the pod.
     let pod_key = object_key("pods", raw_ns, pod_name);
     let stored = state
@@ -1366,6 +1373,8 @@ pub(crate) async fn validate_portforward<S: Store>(
     pod_name: &str,
     ports: Option<&str>,
 ) -> Result<PortforwardParams, crate::status::StatusError> {
+    validate_path_segment("namespace", ns)?;
+    validate_path_segment("name", pod_name)?;
     // `ports` is interpolated verbatim into `kubelet_url` below, which
     // `dial_kubelet_portforward` then hand-rolls into a raw HTTP/1.1 request line
     // written directly to kubelet's socket — unlike /exec, /attach, and the v4
@@ -1940,6 +1949,7 @@ pub async fn resolve_node_proxy_target<S: Store>(
     node_name: &str,
     path_suffix: &str,
 ) -> Result<(String, reqwest::Client), crate::status::StatusError> {
+    validate_path_segment("name", node_name)?;
     let bare_name = strip_node_port(node_name);
     let node_key = cluster_object_key("nodes", bare_name);
     let node_stored = state
@@ -2272,6 +2282,8 @@ pub async fn resolve_pod_proxy_target<S: Store>(
     ns: &str,
     pod_name: &str,
 ) -> Result<(String, u16, Option<String>, bool), crate::status::StatusError> {
+    validate_path_segment("namespace", ns)?;
+    validate_path_segment("name", pod_name)?;
     // Strip an optional scheme prefix and :<port-or-portName> suffix — kubectl and
     // client-go address pod proxy targets as `pods/[<scheme>:]<name>[:<port>]/proxy/`,
     // the same convention the service proxy subresource uses.
@@ -2895,6 +2907,8 @@ pub async fn resolve_service_proxy_target<S: Store>(
     ns: &str,
     svc_name: &str,
 ) -> Result<(String, u16, Option<String>, bool), crate::status::StatusError> {
+    validate_path_segment("namespace", ns)?;
+    validate_path_segment("name", svc_name)?;
     // Strip optional :<port-or-portName> suffix; Service names are DNS-1123 (no colons).
     let (bare_name, port_spec) = split_service_port(svc_name);
 
@@ -6101,6 +6115,68 @@ mod tests {
     // resolve_pod_proxy_target handles the pre-flight checks. We test it directly
     // because the handler is a thin wrapper around this function.
     // -----------------------------------------------------------------------
+
+    /// Every pod/service/node subresource resolver must reject names that upstream's
+    /// `IsPathSegmentName` rejects with 400: `%` or `/` in a name would otherwise reach the
+    /// store key and answer 404 (or address another object) instead of a clear client error.
+    #[tokio::test]
+    async fn subresource_resolvers_reject_invalid_path_segments_with_400() {
+        let state = make_state();
+        let log_q: LogQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        let attach_q: AttachQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        for (ns, name) in [
+            ("default", "bad%name"),
+            ("default", "a/b"),
+            ("bad%ns", "pod"),
+        ] {
+            let errs = [
+                (
+                    "log",
+                    resolve_log_target(&state, ns, name, &log_q).await.err(),
+                ),
+                (
+                    "attach",
+                    resolve_attach_target(&state, ns, name, &attach_q)
+                        .await
+                        .err(),
+                ),
+                (
+                    "exec",
+                    resolve_exec_target(&state, ns, name, None, "").await.err(),
+                ),
+                (
+                    "portforward",
+                    validate_portforward(&state, ns, name, Some("80"))
+                        .await
+                        .err(),
+                ),
+                (
+                    "pod proxy",
+                    resolve_pod_proxy_target(&state, ns, name).await.err(),
+                ),
+                (
+                    "service proxy",
+                    resolve_service_proxy_target(&state, ns, name).await.err(),
+                ),
+            ];
+            for (what, err) in errs {
+                let err = err.unwrap_or_else(|| panic!("{what} accepted {ns}/{name}"));
+                assert_eq!(
+                    err.0.as_u16(),
+                    400,
+                    "{what} must answer 400 for invalid segment {ns}/{name}, not a store-miss 404"
+                );
+            }
+        }
+        let err = resolve_node_proxy_target(&state, "bad%node", "")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            400,
+            "node proxy must reject '%' in the node name"
+        );
+    }
 
     /// pod proxy must return 404 when the pod does not exist.
     ///
