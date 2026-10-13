@@ -1101,6 +1101,11 @@ assert_true "CoreDNS forward block caps max_concurrent so a loop or upstream sta
   awk '/forward \. \/etc\/resolv.conf \{/{f=1} f&&/max_concurrent 1000/{ok=1} /\}/{f=0} END{exit !ok}' "$COREDNS_MANIFEST"
 assert_true "CoreDNS Corefile keeps the loop plugin (kubeadm default) so a self-forward config fails loudly instead of silently melting down" \
   grep -qE '^\s+loop$' "$COREDNS_MANIFEST"
+assert_true "CoreDNS container sets resources.requests so it is Burstable, not the first OOM victim on a 1 GiB host" \
+  awk '/^        resources:$/{r=1} r&&/^          requests:$/{q=1} r&&q&&/memory: 70Mi/{ok=1} END{exit !ok}' "$COREDNS_MANIFEST"
+
+assert_false "install.sh unquoted heredoc bodies must not contain backticks: bash command-substitutes them and prints 'command not found' at install time" \
+  awk '/<<-?[A-Za-z_]+$/{h=1; next} /^EOF$/{h=0} h&&/`/{bad=1} END{exit !bad}' "$INSTALL"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"

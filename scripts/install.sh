@@ -849,8 +849,8 @@ Environment=GOMEMLIMIT=200MiB
 Environment=GOGC=50
 Environment=GOMAXPROCS=2
 # --cert-dir: kubelet's compiled-in default (/var/lib/kubelet/pki) lives
-# outside $STATE_DIR, so it survives the documented reset procedure's `rm -rf
-# $STATE_DIR` untouched. A reset that regenerates the CA then leaves kubelet
+# outside $STATE_DIR, so it survives the documented reset procedure's "rm -rf
+# $STATE_DIR" untouched. A reset that regenerates the CA then leaves kubelet
 # presenting a rotated client cert signed by the deleted CA, an infinite
 # UnknownIssuer reconnect loop with no node ever registering. This is a
 # --cert-dir CLI flag, not a KubeletConfiguration yaml field -- kubelet has
@@ -1035,7 +1035,7 @@ Environment=GOMAXPROCS=2
 # time (KEP-2395 log line: "no cloud provider functionality is available in
 # kube-controller-manager ... will not configure ..."), and KCM 1.37 removed
 # them from its known-controllers registry entirely -- excluding a name KCM
-# no longer knows about is a hard `--controllers` validation error ("is not
+# no longer knows about is a hard --controllers validation error ("is not
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
 ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
