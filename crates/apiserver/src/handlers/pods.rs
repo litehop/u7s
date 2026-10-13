@@ -14,6 +14,7 @@ use crate::{
         LabelSelector,
     },
     auth::UserInfo,
+    handlers::generic::validate_path_segment,
     keys::{cluster_object_key, group_list_prefix, group_object_key, list_prefix, object_key},
     limit_range::parse_quantity,
     state::AppState,
@@ -776,6 +777,7 @@ pub(crate) async fn get_pod<S: Store>(
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     // Same as list_pods: reject an unsupported Table version before namespace validation,
     // since the format is not implementable regardless of whether the namespace exists.
     let accept = headers
@@ -874,6 +876,7 @@ pub(crate) async fn replace_pod<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -1436,6 +1439,7 @@ pub(crate) async fn delete_pod<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
     // block a DELETE, so extract_body_quiet's Err falls back to the original bytes here
@@ -1630,6 +1634,7 @@ pub(crate) async fn patch_pod<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let patch_type = super::json_patch::detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
@@ -1850,6 +1855,7 @@ pub(crate) async fn evict_pod<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
     let key = object_key("pods", ns.as_str(), &name);
 
@@ -3257,6 +3263,7 @@ pub(crate) async fn get_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
@@ -3281,6 +3288,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     // Skip namespace existence check: KCM's pod-GC calls PUT /status to mark a pod
     // Failed after the namespace is already deleted. Checking namespace existence here
     // would return "Namespace not found" 404, which KCM treats as retryable — trapping
@@ -3561,6 +3569,7 @@ pub(crate) async fn patch_pod_status<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -4055,6 +4064,7 @@ pub(crate) async fn patch_pod_resize<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -4123,6 +4133,7 @@ pub(crate) async fn get_pod_resize<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
@@ -4189,6 +4200,7 @@ pub(crate) async fn get_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
@@ -4213,6 +4225,7 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -4261,6 +4274,7 @@ pub(crate) async fn put_ephemeral_containers<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -8857,6 +8871,7 @@ pub(crate) async fn bind_pod<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -18655,6 +18670,93 @@ mod handler_tests {
             "invalid namespace format must return 400 or 404, got {}",
             resp.status()
         );
+    }
+
+    /// Every by-name pod verb must reject path-traversal names ('.', '..', '%') with 400 the way
+    /// upstream's IsPathSegmentName does, before any store lookup; otherwise a client can
+    /// address store keys outside the pod's own key (404 or worse instead of 400) and the
+    /// conformance expectation that invalid names are a client error breaks.
+    #[tokio::test]
+    async fn by_name_pod_verbs_reject_path_segment_names_with_400() {
+        use axum::http::method::Method;
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let user = crate::auth::UserInfo {
+            username: "test".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}",
+                get(get_pod)
+                    .put(replace_pod)
+                    .delete(delete_pod)
+                    .patch(patch_pod),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                get(get_pod_status)
+                    .put(replace_pod_status)
+                    .patch(patch_pod_status),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                get(get_pod_resize).patch(patch_pod_resize),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
+                get(get_ephemeral_containers)
+                    .patch(patch_ephemeral_containers)
+                    .put(put_ephemeral_containers),
+            )
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let verbs: &[(Method, &str)] = &[
+            (Method::GET, ""),
+            (Method::PUT, ""),
+            (Method::DELETE, ""),
+            (Method::PATCH, ""),
+            (Method::POST, "/eviction"),
+            (Method::POST, "/binding"),
+            (Method::GET, "/status"),
+            (Method::PUT, "/status"),
+            (Method::PATCH, "/status"),
+            (Method::GET, "/resize"),
+            (Method::PATCH, "/resize"),
+            (Method::GET, "/ephemeralcontainers"),
+            (Method::PATCH, "/ephemeralcontainers"),
+            (Method::PUT, "/ephemeralcontainers"),
+        ];
+        for bad in ["..", ".", "a%25b", "a%2Fb"] {
+            for (method, suffix) in verbs {
+                let req = Request::builder()
+                    .method(method.clone())
+                    .uri(format!("/api/v1/namespaces/default/pods/{bad}{suffix}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{method} pods/{bad}{suffix} must be a 400 invalid path segment"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

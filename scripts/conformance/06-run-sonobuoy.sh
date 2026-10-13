@@ -278,8 +278,7 @@ SSH_USER="$(limactl shell "$VM_NAME" id -un)"
 # regex; a curated ginkgo --label-filter allow-set is the correct shape.
 # VolumeAttributesClass is GA-since-1.34 and the ONLY FeatureGate-labeled
 # spec that overlaps [Conformance] at release-1.36 -- the label itself is
-# stale test metadata upstream hasn't removed yet (see
-# ai/findings/featuregate-conformance-resolution-2026-08-06.md). Ginkgo's
+# stale test metadata upstream hasn't removed yet. Ginkgo's
 # isSubsetOf semantics: a spec with no FeatureGate label always matches (the
 # empty set), a spec tagged [FeatureGate:VolumeAttributesClass] matches, any
 # OTHER [FeatureGate:X] is skipped -- this is what stops a Beta-gated spec

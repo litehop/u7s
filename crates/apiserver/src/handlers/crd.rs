@@ -116,6 +116,12 @@ pub struct CrdMetadata {
     pub uid: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub creation_timestamp: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: i64,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,10 +251,17 @@ pub(crate) fn walk_schema_dos_bounds(
 }
 
 /// Validate a CRD's `openAPIV3Schema` (across all versions) against the boon-ReDoS
-/// class of bugs before persisting the CRD.
+/// class of bugs before persisting the CRD. `stored` is the previous CRD on update: its
+/// expressions and unchanged version schemas are ratcheted so an unrelated write cannot
+/// start failing on a rule that was already accepted.
 fn validate_crd_schema(
     spec: &CustomResourceDefinitionSpec,
+    stored: Option<&serde_json::Value>,
 ) -> Result<(), crate::status::StatusError> {
+    let mut preexisting = std::collections::HashSet::new();
+    if let Some(stored) = stored {
+        crate::handlers::cel_rules::collect_expressions(&stored["spec"], &mut preexisting);
+    }
     for version in &spec.versions {
         let Some(schema) = version
             .schema
@@ -257,10 +270,12 @@ fn validate_crd_schema(
         else {
             continue;
         };
-        walk_schema_dos_bounds(
-            schema,
-            &format!("spec.versions[{}].schema.openAPIV3Schema", version.name),
-        )?;
+        let path = format!("spec.versions[{}].schema.openAPIV3Schema", version.name);
+        walk_schema_dos_bounds(schema, &path)?;
+        let ratchet = crate::handlers::cel_rules::Ratchet {
+            preexisting: stored.map(|_| &preexisting),
+        };
+        crate::handlers::cel_rules::check_schema_rules(schema, &path, true, &ratchet)?;
     }
     Ok(())
 }
@@ -341,6 +356,23 @@ fn stamp_server_fields(crd: &mut CustomResourceDefinition) {
     }
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
+}
+
+/// Upstream `crdStrategy.PrepareForUpdate`: the stored generation always wins over the
+/// client/webhook value, and any `spec` change bumps it by one.
+fn prepare_crd_generation_for_update(
+    existing: &serde_json::Value,
+    crd: &mut CustomResourceDefinition,
+) {
+    let stored = existing["metadata"]["generation"].as_i64().unwrap_or(0);
+    let spec_changed = serde_json::to_value(&crd.spec)
+        .map(|spec| spec != existing["spec"])
+        .unwrap_or(false);
+    crd.metadata.generation = if spec_changed {
+        stored.saturating_add(1)
+    } else {
+        stored
+    };
 }
 
 fn new_uid() -> String {
@@ -547,7 +579,7 @@ async fn build_new_crd<S: Store>(
     }
 
     validate_crd_group(&crd.spec.group)?;
-    validate_crd_schema(&crd.spec)?;
+    validate_crd_schema(&crd.spec, None)?;
 
     let expected_name = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
     if name != expected_name {
@@ -581,6 +613,7 @@ async fn build_new_crd<S: Store>(
         crd = serde_json::from_value(mutated)
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
+    crd.metadata.generation = 1;
 
     // Stamp status.conditions so controllers and conformance tests see the CRD
     // as ready immediately after creation (no separate status update loop).
@@ -681,8 +714,6 @@ pub async fn replace_crd<S: Store>(
         )));
     }
 
-    validate_crd_schema(&crd.spec)?;
-
     let key = store_key(&name);
 
     // Ensure the object exists before replacing.
@@ -712,6 +743,7 @@ pub async fn replace_crd<S: Store>(
     };
 
     reject_structural_field_change(&existing, &crd.spec, &name)?;
+    validate_crd_schema(&crd.spec, Some(&existing))?;
 
     // Preserve server-assigned creationTimestamp from stored copy if not present in incoming.
     if crd.metadata.creation_timestamp.is_empty() {
@@ -774,6 +806,7 @@ pub async fn replace_crd<S: Store>(
         crd = serde_json::from_value(mutated)
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
+    prepare_crd_generation_for_update(&existing, &mut crd);
 
     // Dry-run: validation and admission passed; return the would-be replaced CRD without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -1114,7 +1147,7 @@ pub async fn patch_crd<S: Store>(
         .unwrap_or("")
         .to_string();
 
-    validate_crd_schema(&crd.spec)?;
+    validate_crd_schema(&crd.spec, Some(&existing))?;
 
     // Admission webhook pipeline (mutating then validating).
     {
@@ -1140,6 +1173,7 @@ pub async fn patch_crd<S: Store>(
         crd = serde_json::from_value(mutated)
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
+    prepare_crd_generation_for_update(&existing, &mut crd);
 
     // Dry-run: validation and admission passed; return the would-be patched CRD without
     // persisting — mirrors do_patch's dry-run early-return in resource.rs.
@@ -1473,6 +1507,123 @@ mod tests {
 
         assert_eq!(crd.metadata.uid, "my-uid");
         assert_eq!(crd.metadata.creation_timestamp, "2024-01-01T00:00:00Z");
+    }
+
+    fn crd_with_versions(
+        name: &str,
+        versions: serde_json::Value,
+        generation: Option<i64>,
+    ) -> Bytes {
+        let mut meta = serde_json::json!({ "name": name });
+        if let Some(g) = generation {
+            meta["generation"] = serde_json::json!(g);
+        }
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": meta,
+                "spec": {
+                    "group": "argoproj.io",
+                    "names": { "plural": "applications", "singular": "application",
+                               "kind": "Application", "listKind": "ApplicationList" },
+                    "scope": "Namespaced",
+                    "versions": versions
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    async fn stored_crd_generation(state: &AppState, name: &str) -> serde_json::Value {
+        let stored = state
+            .store
+            .get(&store_key(name))
+            .await
+            .unwrap()
+            .expect("stored CRD");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        v["metadata"]["generation"].clone()
+    }
+
+    /// Upstream sets CRD generation to 1 on create and bumps it on spec change; the typed
+    /// CrdMetadata used to drop the field entirely, so nothing observing a CRD's generation
+    /// (e.g. a status.observedGeneration comparison) could ever tell a spec change happened.
+    #[tokio::test]
+    async fn crd_generation_is_1_on_create_and_bumps_on_spec_change_only() {
+        let state = make_state();
+        let name = "applications.argoproj.io";
+        let one = serde_json::json!([{ "name": "v1alpha1", "served": true, "storage": true }]);
+        let two = serde_json::json!([
+            { "name": "v1alpha1", "served": true, "storage": true },
+            { "name": "v1beta1", "served": true, "storage": false }
+        ]);
+
+        assert!(create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            crd_with_versions(name, one.clone(), Some(9)),
+        )
+        .await
+        .is_ok());
+        assert_eq!(
+            stored_crd_generation(&state, name).await,
+            1,
+            "create must stamp generation 1 over the client's 9"
+        );
+
+        let replace = |versions: serde_json::Value, generation: Option<i64>| {
+            replace_crd(
+                State(state.clone()),
+                Path(name.to_string()),
+                test_user(),
+                HeaderMap::new(),
+                crd_with_versions(name, versions, generation),
+            )
+        };
+        assert!(replace(two.clone(), None).await.is_ok());
+        assert_eq!(
+            stored_crd_generation(&state, name).await,
+            2,
+            "spec change must bump, and a PUT omitting generation must not drop it"
+        );
+        assert!(replace(two.clone(), Some(77)).await.is_ok());
+        assert_eq!(
+            stored_crd_generation(&state, name).await,
+            2,
+            "unchanged spec must not bump and a client-chosen generation is ignored"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        assert!(patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers.clone(),
+            Bytes::from(r#"{"metadata":{"labels":{"k":"v"},"generation":1}}"#),
+        )
+        .await
+        .is_ok());
+        assert_eq!(
+            stored_crd_generation(&state, name).await,
+            2,
+            "a metadata-only PATCH must neither bump nor accept the smuggled generation"
+        );
+        assert!(patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            Bytes::from(serde_json::json!({ "spec": { "versions": one } }).to_string()),
+        )
+        .await
+        .is_ok());
+        assert_eq!(stored_crd_generation(&state, name).await, 3);
     }
 
     // create_crd → 201; get_crd → 200 with stored object.
@@ -3781,6 +3932,46 @@ mod tests {
         );
     }
 
+    /// A rule naming a property the schema never declared can never hold; accepting the
+    /// CRD would turn a typo into a 422 on every CR write instead of at install time.
+    #[tokio::test]
+    async fn create_crd_rejects_validation_rule_referencing_undeclared_property() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [{ "rule": "self.z == 100" }],
+                "properties": { "x": { "type": "integer" } }
+            } }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
+        assert_eq!(err.1.code, 422);
+        assert!(
+            err.1.message.contains("undefined field 'z'"),
+            "{}",
+            err.1.message
+        );
+    }
+
+    /// A rule that does not parse must be refused at install time for the same reason.
+    #[tokio::test]
+    async fn create_crd_rejects_validation_rule_with_syntax_error() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [{ "rule": "self = 42" }]
+            } }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
+        assert_eq!(err.1.code, 422);
+        assert!(err.1.message.contains("Syntax error"), "{}", err.1.message);
+    }
+
     /// patternProperties nested inside a `properties` map entry (not just the schema
     /// root) must also be rejected — a CRD author could otherwise bury the forbidden
     /// keyword one level deep to evade a root-only check.
@@ -4466,5 +4657,198 @@ mod admission_tests {
             "replace_crd must be rejected when validating webhook denies — \
              without the fix, admission was bypassed and the CRD was silently updated"
         );
+    }
+}
+
+#[cfg(test)]
+mod ratchet_tests {
+    use axum::extract::{Path, State};
+    use axum::http::HeaderMap;
+    use bytes::Bytes;
+    use serde_json::{json, Value};
+    use u7s_store::Store;
+
+    use super::*;
+    use crate::handlers::test_support::make_state;
+
+    const NAME: &str = "widgets.example.com";
+
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        })
+    }
+
+    fn expensive_rule() -> Value {
+        json!({ "rule": "self.all(s, s == 'string constant')" })
+    }
+
+    fn schema_with_rules(spec_rules: Value, nested_rules: Value) -> Value {
+        json!({ "openAPIV3Schema": {
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": spec_rules,
+                "properties": { "x": {
+                    "maxItems": 10,
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "x-kubernetes-validations": nested_rules
+                    }
+                } }
+            } }
+        } })
+    }
+
+    fn crd_body(rv: &str, labels: Value, versions: Value) -> Bytes {
+        Bytes::from(
+            json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": NAME, "resourceVersion": rv, "labels": labels },
+                "spec": {
+                    "group": "example.com",
+                    "names": { "plural": "widgets", "singular": "widget", "kind": "Widget" },
+                    "scope": "Namespaced",
+                    "versions": versions
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    fn version(name: &str, schema: Value) -> Value {
+        json!({ "name": name, "served": true, "storage": name == "v1", "schema": schema })
+    }
+
+    /// Stores a CRD carrying rules create-time validation would refuse, as an older
+    /// binary (or a looser upstream) could have, and returns its resourceVersion.
+    async fn seed_with_legacy_rules<S: Store>(state: &AppState<S>, schema: Value) -> String {
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            crd_body("", json!({}), json!([version("v1", json!({}))])),
+        )
+        .await
+        .map_err(|_| ())
+        .expect("seed create");
+        let stored = state.store.get(&store_key(NAME)).await.unwrap().unwrap();
+        let mut v: Value = serde_json::from_slice(&stored.value).unwrap();
+        v["spec"]["versions"][0]["schema"] = schema;
+        let rv = state
+            .store
+            .put(&store_key(NAME), Bytes::from(v.to_string()), None)
+            .await
+            .unwrap();
+        rv.to_string()
+    }
+
+    async fn put<S: Store>(state: &AppState<S>, body: Bytes) -> bool {
+        replace_crd(
+            State(state.clone()),
+            Path(NAME.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .is_ok()
+    }
+
+    fn legacy_schema() -> Value {
+        schema_with_rules(
+            json!([{ "rule": "self.nope == 1" }]),
+            json!([expensive_rule()]),
+        )
+    }
+
+    /// An update that leaves the schema alone (a controller stamping a label) must not be
+    /// refused for rules the CRD already carried, or the CRD becomes unmanageable.
+    #[tokio::test]
+    async fn label_only_update_keeps_already_stored_expensive_and_unresolvable_rules() {
+        let state = make_state();
+        let rv = seed_with_legacy_rules(&state, legacy_schema()).await;
+        let body = crd_body(
+            &rv,
+            json!({"a": "b"}),
+            json!([version("v1", legacy_schema())]),
+        );
+        assert!(put(&state, body).await);
+    }
+
+    /// Adding another version leaves v1's schema unchanged, so v1's stored rules still pass.
+    #[tokio::test]
+    async fn unrelated_spec_change_keeps_already_stored_rules() {
+        let state = make_state();
+        let rv = seed_with_legacy_rules(&state, legacy_schema()).await;
+        let versions = json!([version("v1", legacy_schema()), version("v2", json!({}))]);
+        assert!(put(&state, crd_body(&rv, json!({}), versions)).await);
+    }
+
+    /// Ratcheting must not become a bypass: a rule absent from the stored CRD is checked.
+    #[tokio::test]
+    async fn newly_added_unresolvable_rule_is_still_rejected_on_update() {
+        let state = make_state();
+        let rv = seed_with_legacy_rules(&state, legacy_schema()).await;
+        let bad = schema_with_rules(
+            json!([{ "rule": "self.nope == 1" }, { "rule": "self.other == 2" }]),
+            json!([expensive_rule()]),
+        );
+        let body = crd_body(&rv, json!({}), json!([version("v1", bad)]));
+        assert!(!put(&state, body).await);
+    }
+
+    /// Editing one rule must not re-reject a different stored over-limit rule in the same
+    /// version, or an operator cannot fix a small thing in a CRD that already shipped.
+    #[tokio::test]
+    async fn editing_another_rule_keeps_stored_over_limit_rule() {
+        let state = make_state();
+        let rv = seed_with_legacy_rules(&state, legacy_schema()).await;
+        let edited = schema_with_rules(
+            json!([{ "rule": "self.nope == 1" }, { "rule": "true" }]),
+            json!([expensive_rule()]),
+        );
+        let body = crd_body(&rv, json!({}), json!([version("v1", edited)]));
+        assert!(put(&state, body).await);
+    }
+
+    /// A new over-limit rule is refused even when the version also carries a stored one.
+    #[tokio::test]
+    async fn newly_added_expensive_rule_is_still_rejected_on_update() {
+        let state = make_state();
+        let rv = seed_with_legacy_rules(&state, legacy_schema()).await;
+        let costly = schema_with_rules(
+            json!([{ "rule": "self.nope == 1" }]),
+            json!([expensive_rule(), { "rule": "self.all(s, s == 'another constant')" }]),
+        );
+        let body = crd_body(&rv, json!({}), json!([version("v1", costly)]));
+        assert!(!put(&state, body).await);
+    }
+
+    #[tokio::test]
+    async fn label_only_merge_patch_keeps_already_stored_rules() {
+        let state = make_state();
+        seed_with_legacy_rules(&state, legacy_schema()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch = Bytes::from(json!({ "metadata": { "labels": { "a": "b" } } }).to_string());
+        let res = patch_crd(
+            State(state.clone()),
+            Path(NAME.to_string()),
+            test_user(),
+            headers,
+            patch,
+        )
+        .await;
+        assert!(res.is_ok());
     }
 }

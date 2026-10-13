@@ -206,6 +206,7 @@ echo "u7s is reachable."
 # cause the provisioning branch to run and hit "instance already exists".
 VM_DIR="${HOME}/.lima/${VM_NAME}"
 if [ -d "$VM_DIR" ]; then
+  [ -z "$_KUBELET_PORT_OVERRIDE" ] || assert_kubelet_port_matches_vm "$VM_NAME" "$KUBELET_PORT" || exit 1
   STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${VM_NAME} / {print \$2}")
   if [ "$STATUS" != "Running" ]; then
     check_port_free "$KUBELET_PORT" "kubelet"
@@ -518,7 +519,7 @@ if [ -f "$CA_CERT" ]; then
 
   # A golden baked before lima/kubelet.yaml set a kubeadm-style resolvConf still carries
   # `resolvConf: ""`, which gives CoreDNS nameserver 127.0.0.1 (self-forward loop). Idempotent.
-  limactl shell "$VM_NAME" sudo bash -c "if systemctl is-active --quiet systemd-resolved; then rc=/run/systemd/resolve/resolv.conf; else rc=/etc/resolv.conf; fi; sed -i \"s|^resolvConf: .*|resolvConf: \$rc|\" /etc/kubelet-config.yaml"
+  limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml < "$(dirname "$0")/../set-kubelet-resolvconf.sh"
 
   # Write --client-ca-file and --tls-cert-file into the kubelet drop-in (idempotent: overwrite each run).
   limactl shell "$VM_NAME" sudo bash -c "mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF

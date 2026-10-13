@@ -11692,8 +11692,8 @@ mod tests {
         tokio::spawn(serve_tls(listener, app, tls.server_config.clone()));
 
         // --- Client: offer ALPN [h2, http/1.1] in that order, exactly like
-        // client-go's net/http.Transport (confirmed via live pcap in
-        // ai/findings/alpn-check-2026-08-02.md) — then require h2 to have won. ---
+        // client-go's net/http.Transport (confirmed via live pcap)
+        // — then require h2 to have won. ---
         let mut root_store = RootCertStore::empty();
         root_store
             .add(CertificateDer::from(tls.ca_cert_der.clone()))
