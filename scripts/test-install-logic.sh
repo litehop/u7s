@@ -1110,6 +1110,9 @@ assert_true "set-kubelet-resolvconf rewrites an existing resolvConf line so a go
 assert_false "set-kubelet-resolvconf must exit non-zero when the config has no resolvConf line, else the sed no-ops silently and CoreDNS self-forwards" \
   env PATH="$RESOLV_WORK/bin-inactive:$PATH" "$SET_RC" "$RESOLV_WORK/kc-missing.yaml"
 
+assert_false "install.sh unquoted heredoc bodies must not contain backticks: bash command-substitutes them and prints 'command not found' at install time" \
+  awk '/<<-?[A-Za-z_]+$/{h=1; next} /^EOF$/{h=0} h&&/`/{bad=1} END{exit !bad}' "$INSTALL"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then

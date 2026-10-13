@@ -581,40 +581,6 @@ pub fn apply_label_selector(
         .collect()
 }
 
-/// Parse a `fieldSelector` query parameter of the form `key=value` or `key!=value`
-/// into a `FieldSelector`. Returns 400 on malformed input.
-pub(crate) fn parse_field_selector(
-    s: &str,
-) -> Result<u7s_store::FieldSelector, crate::status::StatusError> {
-    if let Some((field, value)) = s.split_once("!=") {
-        if field.is_empty() {
-            return Err(Status::bad_request(format!(
-                "invalid fieldSelector '{s}': empty key"
-            )));
-        }
-        return Ok(u7s_store::FieldSelector {
-            field: field.to_string(),
-            value: value.to_string(),
-            negated: true,
-        });
-    }
-    let (field, value) = s.split_once('=').ok_or_else(|| {
-        Status::bad_request(format!(
-            "invalid fieldSelector '{s}': expected key=value or key!=value"
-        ))
-    })?;
-    if field.is_empty() {
-        return Err(Status::bad_request(format!(
-            "invalid fieldSelector '{s}': empty key"
-        )));
-    }
-    Ok(u7s_store::FieldSelector {
-        field: field.to_string(),
-        value: value.to_string(),
-        negated: false,
-    })
-}
-
 /// TTL for continue tokens. Tokens older than this are rejected with 410 Gone.
 /// Kubernetes etcd compacts old revisions; we simulate this by expiring tokens after 60 seconds.
 /// The conformance test polls every 20s and expects 410 within a reasonable window.
@@ -1693,64 +1659,6 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(wants_generate_name(&obj), None);
-    }
-
-    // -- parse_field_selector --
-
-    #[test]
-    fn parse_field_selector_valid() {
-        // fieldSelector=metadata.name=foo must parse into a FieldSelector with the right field and value.
-        // Handlers use this to push the filter down to the store; a wrong parse means no filtering.
-        let fs = ok(parse_field_selector("metadata.name=foo"));
-        assert_eq!(fs.field, "metadata.name");
-        assert_eq!(fs.value, "foo");
-    }
-
-    #[test]
-    fn parse_field_selector_empty_value_is_valid() {
-        // metadata.namespace= (empty value) must be accepted — it matches objects with empty namespace.
-        let fs = ok(parse_field_selector("metadata.namespace="));
-        assert_eq!(fs.field, "metadata.namespace");
-        assert_eq!(fs.value, "");
-    }
-
-    #[test]
-    fn parse_field_selector_missing_equals_is_400() {
-        // Missing '=' is malformed — must return 400, not 500 or a panic.
-        let err = parse_field_selector("metadata.name").unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn parse_field_selector_neq_operator() {
-        // spec.unschedulable!=true must parse with negated=true and field without '!'.
-        // The bug was that split_once('=') on "spec.unschedulable!=true" produced
-        // field="spec.unschedulable!" — including the '!' — causing json_extract to
-        // look for a field named "spec.unschedulable!" which never exists.
-        let fs = ok(parse_field_selector("spec.unschedulable!=true"));
-        assert_eq!(
-            fs.field, "spec.unschedulable",
-            "field must not include the '!'"
-        );
-        assert_eq!(fs.value, "true");
-        assert!(fs.negated, "!= must set negated=true");
-    }
-
-    #[test]
-    fn parse_field_selector_neq_missing_equals_is_400() {
-        // "spec.unschedulable!true" has no '=' after '!' — must return 400.
-        // Without this guard, the split_once('=') path would accept it with
-        // field="spec.unschedulable!true" (no '=' found → error anyway, so this
-        // test also serves as documentation of the expected error path).
-        let err = parse_field_selector("spec.unschedulable!true").unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn parse_field_selector_empty_key_is_400() {
-        // '=foo' (empty key) is malformed — must return 400.
-        let err = parse_field_selector("=foo").unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
     // -- encode_continue / decode_continue --

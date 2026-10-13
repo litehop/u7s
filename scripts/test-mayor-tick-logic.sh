@@ -125,7 +125,7 @@ run_full_tick() {
 }
 
 WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+trap 'rc=$?; [ "$rc" -ne 0 ] && echo "FATAL: aborted (exit $rc) at line ${LINENO}: $BASH_COMMAND" >&2; rm -rf "$WORKDIR"; exit "$rc"' EXIT
 
 # ---------------------------------------------------------------------------
 # 1. Queue-drain detection.
@@ -675,7 +675,28 @@ STATE_E2E="$(dirname "$SCRATCH_REPO")/state-repo-state-ts.json"
 # "placeholder" fixture text. Safe against this isolated scratch repo (no
 # queue files, gh/bd stubbed to fail) the same way the dispatch-marker
 # lifecycle test above uses dry_run=0 to observe a real on-disk effect.
-PATH="$STUB_EMPTY_BIN:$PATH" \
+# `date` is shadowed so every ISO-stamp call returns a strictly later second
+# than the previous one: with independent `date -u` calls the dashboard and
+# state-file stamps then ALWAYS differ, instead of agreeing by luck whenever
+# both calls land in the same wall-clock second. Non-stamp formats (+%s)
+# pass through to the real date.
+STUB_DATE_BIN="$WORKDIR/stub-date-bin"
+mkdir -p "$STUB_DATE_BIN"
+cp "$STUB_EMPTY_BIN"/* "$STUB_DATE_BIN/"
+cat > "$STUB_DATE_BIN/date" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *%Y-%m-%dT%H:%M:%SZ*)
+    n=\$(cat "$WORKDIR/date-stub-counter" 2>/dev/null || echo 0)
+    n=\$(( n + 1 ))
+    echo "\$n" > "$WORKDIR/date-stub-counter"
+    printf '2026-01-01T00:%02d:%02dZ\n' \$(( n / 60 )) \$(( n % 60 ))
+    ;;
+  *) exec "$(command -v date)" "\$@" ;;
+esac
+EOF
+chmod +x "$STUB_DATE_BIN/date"
+PATH="$STUB_DATE_BIN:$PATH" \
   MAYOR_TICK_QUEUE_DIR="$SCRATCH_REPO/.claude/review-queue" \
   MAYOR_TICK_STATE_FILE="$STATE_E2E" \
   MAYOR_TICK_DASHBOARD_FILE="$DASH_E2E" \
@@ -685,6 +706,8 @@ DASH_TS=$(grep -oE "$ISO_RE" "$DASH_E2E" | head -1 || true)
 STATE_TS=$(jq -r '.timestamp' "$STATE_E2E" 2>/dev/null || true)
 assert "dashboard's spliced repo-state timestamp matches the state file's .timestamp from the SAME tick run (single source of truth, not independently-drifting clocks)" \
   "$([ -n "$DASH_TS" ] && [ "$DASH_TS" = "$STATE_TS" ] && echo 1 || echo 0)"
+assert "...and the stubbed clock was actually the source of both stamps (guards against the stub being bypassed and the equality passing by wall-clock luck)" \
+  "$([ "${DASH_TS:0:10}" = "2026-01-01" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 10. process_review_queue dtype routing, end-to-end through the REAL
@@ -1307,6 +1330,35 @@ assert "a draft PR is never enqueued via gh pr merge, even with a CLEAN mergeSta
 assert "...and the tick exits with a normal in-contract code (not an unhandled error from a rejected draft-merge attempt)" \
   "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
 
+# Dry-run above masks GitHub's real rejection, so repeat with dry-run OFF and
+# a gh whose `pr merge` fails exactly like GitHub does for a draft. If the
+# draft guard regresses, the real merge call runs, exits 1 and (under set -e)
+# aborts the tick outside the 0/10/20/30 contract.
+STUB_PR_DRAFT_REAL_BIN="$WORKDIR/stub-pr-draft-real-bin"
+MERGE_CALLS="$WORKDIR/draft-real-merge-calls"
+mkdir -p "$STUB_PR_DRAFT_REAL_BIN"
+: > "$MERGE_CALLS"
+cp "$STUB_PR_DRAFT_BIN/bd" "$STUB_PR_DRAFT_REAL_BIN/bd"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'if [[ " $* " == *" pr merge "* ]]; then'
+  echo "  echo \"\$*\" >> \"$MERGE_CALLS\""
+  echo '  echo "Pull request is a draft and cannot be merged" >&2'
+  echo '  exit 1'
+  echo 'fi'
+  tail -n +2 "$STUB_PR_DRAFT_BIN/gh"
+} > "$STUB_PR_DRAFT_REAL_BIN/gh"
+chmod +x "$STUB_PR_DRAFT_REAL_BIN/gh" "$STUB_PR_DRAFT_REAL_BIN/bd"
+
+build_scratch_repo
+pushd "$SCRATCH_REPO" >/dev/null
+invoke_tick "$STUB_PR_DRAFT_REAL_BIN" "$SCRATCH_REPO" 0
+popd >/dev/null
+assert "a draft PR never reaches a real gh pr merge call (non-dry-run)" \
+  "$([ ! -s "$MERGE_CALLS" ] && echo 1 || echo 0)"
+assert "...so GitHub's draft rejection cannot abort the tick: exit stays inside the 0/10/20/30 contract (non-dry-run)" \
+  "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 21. Draft-PR skip in reconcile_missing_queue_entries specifically -- the
 #     sibling gap section 20 doesn't cover. gate_and_merge_prs's isDraft
@@ -1354,6 +1406,60 @@ assert "a draft PR with no queue entry and no review is NOT synthesized into pen
   "$([ "$(jq -r '.pending_reviews | index(5555) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
 assert "...and reconcile never even logs the synthesizing message for it" \
   "$(! printf '%s' "$TICK_OUT" | grep -q 'synthesizing pending_reviews entry' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 22. Post-merge checkout refresh in cleanup_merged_worktrees against a REAL
+#     remote: after a worker's PR is MERGED the tick must fetch origin main
+#     and fast-forward the mayor's checkout to it. If either step regresses
+#     the checkout silently stays behind origin and every later worker
+#     worktree branches off stale main.
+# ---------------------------------------------------------------------------
+
+STUB_MERGED_BIN="$WORKDIR/stub-merged-bin"
+mkdir -p "$STUB_MERGED_BIN"
+# Only `gh pr list --head <branch>` answers, reporting that branch's PR as
+# MERGED; every other gh query sees no open PRs.
+cat > "$STUB_MERGED_BIN/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" --head "* ]]; then
+  printf '{"number":7777,"state":"MERGED"}'
+else
+  printf '[]'
+fi
+EOF
+cat > "$STUB_MERGED_BIN/bd" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$STUB_MERGED_BIN/gh" "$STUB_MERGED_BIN/bd"
+
+build_scratch_repo "merged-ff"
+FF_ORIGIN="$(dirname "$SCRATCH_REPO")/origin.git"
+FF_ADVANCER="$(dirname "$SCRATCH_REPO")/advancer"
+git init -q --bare -b main "$FF_ORIGIN"
+git -C "$SCRATCH_REPO" branch -M main
+git -C "$SCRATCH_REPO" remote add origin "$FF_ORIGIN"
+git -C "$SCRATCH_REPO" push -q -u origin main 2>/dev/null
+git clone -q -b main "$FF_ORIGIN" "$FF_ADVANCER" 2>/dev/null
+git -C "$FF_ADVANCER" config user.email test@example.com
+git -C "$FF_ADVANCER" config user.name "Test"
+git -C "$FF_ADVANCER" commit -q --allow-empty -m "merged worker PR lands on origin main"
+git -C "$FF_ADVANCER" push -q origin HEAD:main 2>/dev/null
+FF_BEFORE=$(git -C "$SCRATCH_REPO" rev-parse HEAD)
+FF_ORIGIN_SHA=$(git -C "$FF_ADVANCER" rev-parse HEAD)
+# Local origin/main is still the OLD sha here, so only the tick's own fetch
+# can make the fast-forward possible.
+# The script's `git worktree remove` / `git branch -D` act on the CWD repo, so
+# the tick must run from inside the scratch repo, never this dev checkout.
+pushd "$SCRATCH_REPO" >/dev/null
+invoke_tick "$STUB_MERGED_BIN" "$SCRATCH_REPO" 0
+popd >/dev/null
+assert "fixture sanity: origin is ahead of the checkout before the tick" \
+  "$([ "$FF_BEFORE" != "$FF_ORIGIN_SHA" ] && echo 1 || echo 0)"
+assert "after a MERGED worker PR the checkout fast-forwards to origin's new main (fetch + merge --ff-only both ran)" \
+  "$([ "$(git -C "$SCRATCH_REPO" rev-parse HEAD)" = "$FF_ORIGIN_SHA" ] && echo 1 || echo 0)"
+assert "...and the merged PR is recorded in merged_prs, proving the cleanup path (not some other step) did the pull" \
+  "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

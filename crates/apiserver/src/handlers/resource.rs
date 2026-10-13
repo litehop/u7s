@@ -20,12 +20,13 @@ use crate::{
     util::{content_type, extract_body, extract_body_quiet, parse_resource_version},
 };
 
+use super::field_selector::FieldSelector;
 use super::generic::{
     apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
     check_crb_escalation, check_rb_escalation, check_role_escalation, clear_create_status,
-    decode_continue, generate_suffix, lookup, parse_field_selector, parse_label_selector,
-    resolve_valid_name, stamp_metadata, store_err, validate_path_segment, wants_generate_name,
-    CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
+    decode_continue, generate_suffix, lookup, parse_label_selector, resolve_valid_name,
+    stamp_metadata, store_err, validate_path_segment, wants_generate_name, CollectionQuery,
+    LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
@@ -91,9 +92,9 @@ fn wants_partial_object_metadata(accept: &str) -> bool {
 /// array is spliced into the one place that placeholder appears — so this can never drift
 /// from that function's byte-for-byte-tested envelope output.
 ///
-/// `field_filter` is the handler's post-store field-selector filter (e.g.
-/// `filter_events_by_field_selector` for Events, `filter_pods_by_field_selector` for Pods) —
-/// shared here across every LIST handler rather than forked per-caller. `on_item`, if set, runs
+/// `field_selector` is the handler's already-validated selector, evaluated against each
+/// defaulted item — shared here across every LIST handler rather than forked per-caller.
+/// `on_item`, if set, runs
 /// once per surviving item (e.g. list_pods' per-pod lifecycle debug log) so that diagnostic
 /// hook still fires on the streaming path, not just the materializing one.
 #[allow(clippy::too_many_arguments)]
@@ -105,8 +106,7 @@ pub(crate) fn stream_list_json(
     revision: u64,
     raw_items: &[u7s_store::StoreObject],
     label_pairs: &[LabelSelectorTerm<'_>],
-    field_selector: &str,
-    field_filter: fn(Vec<serde_json::Value>, &str) -> Vec<serde_json::Value>,
+    field_selector: &FieldSelector,
     on_item: Option<fn(&serde_json::Value)>,
     continue_key: Option<String>,
     remaining_count: Option<u64>,
@@ -142,10 +142,9 @@ pub(crate) fn stream_list_json(
             Some(v) => v,
             None => continue,
         };
-        item = match field_filter(vec![item], field_selector).pop() {
-            Some(v) => v,
-            None => continue,
-        };
+        if !field_selector.matches(&item) {
+            continue;
+        }
         if let Some(f) = on_item {
             f(&item);
         }
@@ -181,6 +180,7 @@ pub(crate) async fn list_resource<S: Store>(
         }
     };
     let prefix = group_list_prefix(&group, &plural, None);
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref(), &group, &plural)?;
 
     let accept = headers
         .get(axum::http::header::ACCEPT)
@@ -243,15 +243,6 @@ pub(crate) async fn list_resource<S: Store>(
         .await;
     }
 
-    let store_field_selector = if plural == "events" {
-        None
-    } else {
-        query
-            .field_selector
-            .as_deref()
-            .map(parse_field_selector)
-            .transpose()?
-    };
     // Decode BEFORE listing: on a continuation request this pins the resourceVersion this
     // response (and every later page) must report — see decode_continue's doc for why.
     let continue_decoded = query
@@ -266,7 +257,7 @@ pub(crate) async fn list_resource<S: Store>(
         .list(
             &prefix,
             ListOptions {
-                field_selector: store_field_selector,
+                field_selector: field_selector.store_selector(),
                 limit: query.limit,
                 continue_key,
             },
@@ -290,11 +281,6 @@ pub(crate) async fn list_resource<S: Store>(
         .map(parse_label_selector)
         .transpose()?
         .unwrap_or_default();
-    let events_field_selector = if plural == "events" {
-        query.field_selector.as_deref().unwrap_or("")
-    } else {
-        ""
-    };
 
     // The common case (no PartialObjectMetadata/Table transform, no protobuf re-encode)
     // never needs every item alive at once — stream straight to output bytes instead of
@@ -324,8 +310,7 @@ pub(crate) async fn list_resource<S: Store>(
             list_revision,
             &resp.items,
             &label_pairs,
-            events_field_selector,
-            super::pods::filter_events_by_field_selector,
+            &field_selector,
             None,
             resp.continue_key,
             resp.remaining_count,
@@ -348,11 +333,7 @@ pub(crate) async fn list_resource<S: Store>(
     }
 
     let items = apply_label_selector(items, &label_pairs);
-    let items = if events_field_selector.is_empty() {
-        items
-    } else {
-        super::pods::filter_events_by_field_selector(items, events_field_selector)
-    };
+    let items = field_selector.filter(items);
     tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
     if pom {
@@ -2854,6 +2835,7 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         }
     };
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref(), &group, &plural)?;
 
     let accept = headers
         .get(axum::http::header::ACCEPT)
@@ -2915,15 +2897,6 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         .await;
     }
 
-    let store_field_selector = if plural == "events" {
-        None
-    } else {
-        query
-            .field_selector
-            .as_deref()
-            .map(parse_field_selector)
-            .transpose()?
-    };
     // Decode BEFORE listing: on a continuation request this pins the resourceVersion this
     // response (and every later page) must report — see decode_continue's doc for why.
     let continue_decoded = query
@@ -2938,7 +2911,7 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         .list(
             &prefix,
             ListOptions {
-                field_selector: store_field_selector,
+                field_selector: field_selector.store_selector(),
                 limit: query.limit,
                 continue_key,
             },
@@ -2962,11 +2935,6 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         .map(parse_label_selector)
         .transpose()?
         .unwrap_or_default();
-    let events_field_selector = if plural == "events" {
-        query.field_selector.as_deref().unwrap_or("")
-    } else {
-        ""
-    };
 
     // See list_resource's identically-shaped guard above for why this checks has_encoder
     // rather than wants_protobuf alone.
@@ -2987,8 +2955,7 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
             list_revision,
             &resp.items,
             &label_pairs,
-            events_field_selector,
-            super::pods::filter_events_by_field_selector,
+            &field_selector,
             None,
             resp.continue_key,
             resp.remaining_count,
@@ -3011,11 +2978,7 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
     }
 
     let items = apply_label_selector(items, &label_pairs);
-    let items = if events_field_selector.is_empty() {
-        items
-    } else {
-        super::pods::filter_events_by_field_selector(items, events_field_selector)
-    };
+    let items = field_selector.filter(items);
     tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
     if pom {
@@ -4554,23 +4517,13 @@ pub(crate) async fn delete_collection_resource<S: Store>(
     let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let prefix = group_list_prefix(&group, &plural, None);
-    // "events" needs multi-term, in-memory filtering (see list_resource); every other
-    // built-in resource can use the store's generic single-field selector directly.
-    let store_field_selector = if plural == "events" {
-        None
-    } else {
-        query
-            .field_selector
-            .as_deref()
-            .map(parse_field_selector)
-            .transpose()?
-    };
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref(), &group, &plural)?;
     let resp = state
         .store
         .list(
             &prefix,
             u7s_store::ListOptions {
-                field_selector: store_field_selector,
+                field_selector: field_selector.store_selector(),
                 ..Default::default()
             },
         )
@@ -4599,6 +4552,9 @@ pub(crate) async fn delete_collection_resource<S: Store>(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            if !field_selector.matches_defaulted(&group, &plural, &parsed) {
+                continue;
+            }
             // Honor labelSelector — only delete objects matching the requested labels.
             if let Some(ref pairs) = label_pairs {
                 let kept = apply_label_selector(vec![parsed.clone()], pairs);
@@ -4743,23 +4699,13 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
     let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
-    // "events" needs multi-term, in-memory filtering (see list_namespaced_resource); every
-    // other built-in resource can use the store's generic single-field selector directly.
-    let store_field_selector = if plural == "events" {
-        None
-    } else {
-        query
-            .field_selector
-            .as_deref()
-            .map(parse_field_selector)
-            .transpose()?
-    };
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref(), &group, &plural)?;
     let resp = state
         .store
         .list(
             &prefix,
             u7s_store::ListOptions {
-                field_selector: store_field_selector,
+                field_selector: field_selector.store_selector(),
                 ..Default::default()
             },
         )
@@ -4795,6 +4741,9 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 if !ip.is_empty() {
                     cluster_ip_to_release = Some(ip);
                 }
+            }
+            if !field_selector.matches_defaulted(&group, &plural, &parsed) {
+                continue;
             }
             // Clone (rather than move) `parsed` into the label-selector check — the
             // admission call below still needs the full object.
@@ -5752,13 +5701,14 @@ mod tests {
             .await
             .unwrap();
 
-        let fs = parse_field_selector("metadata.name=foo")
-            .unwrap_or_else(|_| panic!("valid field selector must parse"));
+        let fs = FieldSelector::parse(Some("metadata.name=foo"), "", "configmaps")
+            .unwrap_or_else(|_| panic!("valid field selector must parse"))
+            .store_selector();
         let resp = store
             .list(
                 "/registry/configmaps/default/",
                 ListOptions {
-                    field_selector: Some(fs),
+                    field_selector: fs,
                     ..Default::default()
                 },
             )
@@ -26259,8 +26209,8 @@ mod tests {
     /// a DeleteCollection with a fieldSelector deleted every object regardless of the filter
     /// instead of the requested subset.
     ///
-    /// Fails on revert: without threading field_selector into the store's ListOptions, both
-    /// bindings are deleted regardless of roleRef.name.
+    /// Fails on revert: without applying the field selector in the delete loop, both
+    /// bindings are deleted regardless of the selected name.
     #[tokio::test]
     async fn delete_collection_resource_honors_field_selector() {
         use axum::extract::{Path, Query, State};
@@ -26307,7 +26257,7 @@ mod tests {
                 watch: None,
                 resource_version: None,
                 label_selector: None,
-                field_selector: Some("roleRef.name=admin".to_string()),
+                field_selector: Some("metadata.name=binding-admin".to_string()),
                 limit: None,
                 continue_token: None,
                 send_initial_events: None,
@@ -26340,7 +26290,7 @@ mod tests {
         assert_eq!(
             remaining_names,
             vec!["binding-viewer".to_string()],
-            "DeleteCollection with fieldSelector=roleRef.name=admin must delete only \
+            "DeleteCollection with fieldSelector=metadata.name=binding-admin must delete only \
              binding-admin — if the selector is ignored, both bindings are deleted"
         );
     }
@@ -26414,6 +26364,77 @@ mod tests {
         );
     }
 
+    /// A DeleteCollection selecting Events by a field the store cannot index
+    /// (`involvedObject.name`) must delete only the matching Events: the delete loop used to
+    /// skip field evaluation for in-memory-only selectors, so `kubectl delete events
+    /// --field-selector involvedObject.name=x` wiped every Event in the namespace.
+    ///
+    /// Fails on revert: without the per-object field check in the delete loop, both Events go.
+    #[tokio::test]
+    async fn delete_collection_namespaced_events_honors_in_memory_field_selector() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        for (name, involved) in [("ev-a", "pod-a"), ("ev-b", "pod-b")] {
+            let key = crate::keys::group_object_key("", "events", Some("test-ns"), name);
+            let ev = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Event",
+                "metadata": { "name": name, "namespace": "test-ns" },
+                "involvedObject": { "kind": "Pod", "name": involved, "namespace": "test-ns" },
+                "reason": "Started"
+            });
+            state
+                .store
+                .put(
+                    &key,
+                    bytes::Bytes::from(serde_json::to_vec(&ev).unwrap()),
+                    None,
+                )
+                .await
+                .expect("seed must succeed");
+        }
+
+        delete_collection_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "test-ns".into(), "events".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: Some("involvedObject.name=pod-a".to_string()),
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete_collection must succeed: {e:?}"));
+
+        let prefix = crate::keys::group_list_prefix("", "events", Some("test-ns"));
+        let remaining = state
+            .store
+            .list(&prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list must succeed");
+        let names: Vec<String> = remaining
+            .items
+            .iter()
+            .filter_map(|o| serde_json::from_slice::<serde_json::Value>(&o.value).ok())
+            .map(|v| v["metadata"]["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["ev-b".to_string()],
+            "only the Event involving pod-a may be deleted"
+        );
+    }
+
     /// Namespaced counterpart of delete_collection_resource_honors_field_selector:
     /// delete_collection_namespaced_resource also consulted only label_selector, silently
     /// dropping query.field_selector for built-in resources.
@@ -26459,7 +26480,7 @@ mod tests {
                 watch: None,
                 resource_version: None,
                 label_selector: None,
-                field_selector: Some("spec.holderIdentity=alpha".to_string()),
+                field_selector: Some("metadata.name=alpha".to_string()),
                 limit: None,
                 continue_token: None,
                 send_initial_events: None,
@@ -26483,13 +26504,13 @@ mod tests {
         assert_eq!(
             remaining.items.len(),
             1,
-            "fieldSelector=spec.holderIdentity=alpha must delete only the alpha Lease"
+            "fieldSelector=metadata.name=alpha must delete only the alpha Lease"
         );
         let remaining_obj: serde_json::Value =
             serde_json::from_slice(&remaining.items[0].value).unwrap();
         assert_eq!(
             remaining_obj["metadata"]["name"], "beta",
-            "the surviving Lease must be beta (holderIdentity=beta doesn't match the selector)"
+            "the surviving Lease must be beta (its name does not match the selector)"
         );
     }
 

@@ -13,7 +13,7 @@ use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     handlers::{
-        generic::{apply_delete_policy, parse_field_selector},
+        generic::apply_delete_policy,
         json_patch::{
             apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchQuery,
             PatchType,
@@ -47,6 +47,11 @@ pub(crate) async fn list_namespaces<S: Store>(
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let prefix = cluster_list_prefix("namespaces");
+    let field_selector = super::field_selector::FieldSelector::parse(
+        query.field_selector.as_deref(),
+        "",
+        "namespaces",
+    )?;
 
     if query.watch == Some(true) {
         let initial = super::watch::fetch_initial_events(
@@ -78,33 +83,27 @@ pub(crate) async fn list_namespaces<S: Store>(
         .await;
     }
 
-    // Mirrors the generic resource list path (handlers/resource.rs) — without threading
-    // field_selector into ListOptions here too, a plain (non-watch) `kubectl get namespaces
-    // --field-selector=status.phase=Terminating` silently ignores the filter and returns
-    // every namespace.
-    let store_field_selector = query
-        .field_selector
-        .as_deref()
-        .map(parse_field_selector)
-        .transpose()?;
-
     let resp = state
         .store
         .list(
             &prefix,
             ListOptions {
-                field_selector: store_field_selector,
+                field_selector: field_selector.store_selector(),
                 ..Default::default()
             },
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
+    // A plain (non-watch) `kubectl get namespaces --field-selector=status.phase=Terminating`
+    // must filter like the watch does, so evaluate against the defaulted object.
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
         let v: serde_json::Value =
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        items.push(v);
+        if field_selector.matches_defaulted("", "namespaces", &v) {
+            items.push(v);
+        }
     }
 
     let body = serde_json::json!({

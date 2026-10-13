@@ -14,6 +14,7 @@ use crate::{
     },
     auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
+    handlers::field_selector::FieldSelector,
     handlers::generic::validate_path_segment,
     handlers::json_patch::is_dry_run_header,
     keys::cluster_object_key,
@@ -2398,58 +2399,6 @@ fn apply_cr_field_validation(
 }
 
 // ---------------------------------------------------------------------------
-// CR field selectors (CustomResourceFieldSelectors)
-// ---------------------------------------------------------------------------
-
-/// Test whether a CR object matches a `--field-selector` string, using the fields the CRD
-/// author declared selectable for the requested version (`selectable_fields`) plus the
-/// always-selectable `metadata.name`/`metadata.namespace`.
-///
-/// A field that is not in that allow-list resolves to "" regardless of what the object
-/// actually contains, matching upstream's `fields.Set.Get()` fallback for an unrecognized
-/// key: e.g. `spec.secret=x` on a field the CRD never declared selects nothing rather than
-/// erroring. This allow-list is load-bearing, not cosmetic — CRs are schemaless JSON blobs,
-/// so without it any body field an object happens to carry would become selectable, which
-/// defeats the reason CustomResourceFieldSelectors requires fields to be explicitly declared.
-///
-/// Takes `namespaced`/`selectable_fields` rather than a whole `&CrContext` so the watch path
-/// (`watch::watch_generic_for_cr`) can reuse this exact matching logic for CR watches without
-/// pulling watch.rs's per-event filtering into a dependency on all of CrContext (schema,
-/// conversion config, etc. are irrelevant to field-selector matching).
-pub(crate) fn cr_matches_field_selector(
-    obj: &serde_json::Value,
-    selector: &str,
-    namespaced: bool,
-    selectable_fields: &[String],
-) -> bool {
-    for term in selector.split(',') {
-        let term = term.trim();
-        if term.is_empty() {
-            continue;
-        }
-        let (field, expected, negated) = match term.split_once("!=") {
-            Some((f, v)) => (f.trim(), v.trim(), true),
-            None => match term.split_once('=') {
-                Some((f, v)) => (f.trim(), v.trim(), false),
-                None => continue,
-            },
-        };
-        let selectable = field == "metadata.name"
-            || (namespaced && field == "metadata.namespace")
-            || selectable_fields.iter().any(|f| f == field);
-        let equal = if selectable {
-            u7s_store::json_path_equals(obj, field, expected)
-        } else {
-            expected.is_empty()
-        };
-        if equal == negated {
-            return false;
-        }
-    }
-    true
-}
-
-// ---------------------------------------------------------------------------
 // Cluster-scoped CR handlers
 // ---------------------------------------------------------------------------
 
@@ -2535,7 +2484,8 @@ pub async fn list_cr<S: Store>(
                         from_revision: query.resource_version.unwrap_or(0),
                         initial_items: Some((vec![], 0)),
                         label_selector: query.label_selector,
-                        field_selector: query.field_selector,
+                        // No CRD is left to declare selectable fields, and the stream is empty.
+                        field_selector: None,
                         allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
                         username,
                         as_partial_object_metadata: pom,
@@ -2554,6 +2504,11 @@ pub async fn list_cr<S: Store>(
     // Namespaced CRs are stored as /registry/cr/{group}/{plural}/{ns}/{name},
     // so prefix without namespace matches all of them.
     let prefix = cr_list_prefix(&group, &plural, None);
+    let field_selector = FieldSelector::parse_cr(
+        query.field_selector.as_deref(),
+        ctx.namespaced,
+        &ctx.selectable_fields,
+    )?;
 
     let pom = wants_partial_object_metadata(accept);
 
@@ -2678,11 +2633,7 @@ pub async fn list_cr<S: Store>(
         }
     }
 
-    if let Some(selector) = query.field_selector.as_deref() {
-        items.retain(|item| {
-            cr_matches_field_selector(item, selector, ctx.namespaced, &ctx.selectable_fields)
-        });
-    }
+    items.retain(|item| field_selector.matches(item));
 
     if pom {
         let pom_items: Vec<serde_json::Value> =
@@ -3354,6 +3305,11 @@ pub async fn delete_collection_cr<S: Store>(
     let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let prefix = cr_list_prefix(&group, &plural, None);
+    let field_selector = FieldSelector::parse_cr(
+        query.field_selector.as_deref(),
+        ctx.namespaced,
+        &ctx.selectable_fields,
+    )?;
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -3402,15 +3358,8 @@ pub async fn delete_collection_cr<S: Store>(
                     continue;
                 }
             }
-            if let Some(ref selector) = query.field_selector {
-                if !cr_matches_field_selector(
-                    &filter_item,
-                    selector,
-                    ctx.namespaced,
-                    &ctx.selectable_fields,
-                ) {
-                    continue;
-                }
+            if !field_selector.matches(&filter_item) {
+                continue;
             }
 
             let admission_ctx = AdmissionContext {
@@ -3527,7 +3476,8 @@ pub async fn list_cr_namespaced<S: Store>(
                         from_revision: query.resource_version.unwrap_or(0),
                         initial_items: Some((vec![], 0)),
                         label_selector: query.label_selector,
-                        field_selector: query.field_selector,
+                        // No CRD is left to declare selectable fields, and the stream is empty.
+                        field_selector: None,
                         allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
                         username,
                         as_partial_object_metadata: pom,
@@ -3550,6 +3500,11 @@ pub async fn list_cr_namespaced<S: Store>(
     }
 
     let prefix = cr_list_prefix(&group, &plural, Some(&ns));
+    let field_selector = FieldSelector::parse_cr(
+        query.field_selector.as_deref(),
+        ctx.namespaced,
+        &ctx.selectable_fields,
+    )?;
 
     let pom = wants_partial_object_metadata(accept);
 
@@ -3674,11 +3629,7 @@ pub async fn list_cr_namespaced<S: Store>(
         }
     }
 
-    if let Some(selector) = query.field_selector.as_deref() {
-        items.retain(|item| {
-            cr_matches_field_selector(item, selector, ctx.namespaced, &ctx.selectable_fields)
-        });
-    }
+    items.retain(|item| field_selector.matches(item));
 
     if pom {
         let pom_items: Vec<serde_json::Value> =
@@ -4373,6 +4324,11 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
     let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
     let prefix = cr_list_prefix(&group, &plural, Some(&ns));
+    let field_selector = FieldSelector::parse_cr(
+        query.field_selector.as_deref(),
+        ctx.namespaced,
+        &ctx.selectable_fields,
+    )?;
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -4421,15 +4377,8 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                     continue;
                 }
             }
-            if let Some(ref selector) = query.field_selector {
-                if !cr_matches_field_selector(
-                    &filter_item,
-                    selector,
-                    ctx.namespaced,
-                    &ctx.selectable_fields,
-                ) {
-                    continue;
-                }
+            if !field_selector.matches(&filter_item) {
+                continue;
             }
 
             let admission_ctx = AdmissionContext {
@@ -7312,14 +7261,13 @@ mod tests {
         );
     }
 
-    /// Regression test: a field selector on a path the CRD did NOT declare in
-    /// `selectableFields` must not leak that field's value into filtering — even though the
-    /// CR body actually contains it. Matches upstream's `fields.Set.Get()` fallback for an
-    /// unrecognized key ("", which then fails an equality against a non-empty expectation):
-    /// declaring `selectableFields` is how a CRD author opts specific fields into
-    /// server-side filtering, so an undeclared field must behave as if it were never there.
+    /// A field selector on a path the CRD did NOT declare in `selectableFields` is a 400 on
+    /// LIST and on WATCH, even though the stored CR carries that field: declaring
+    /// `selectableFields` is how a CRD author opts fields into server-side filtering, and
+    /// upstream rejects the rest with "field label not supported" rather than quietly
+    /// returning an unfiltered (or empty) collection.
     #[tokio::test]
-    async fn list_cr_namespaced_ignores_selector_on_undeclared_field() {
+    async fn list_cr_namespaced_rejects_selector_on_undeclared_field_for_list_and_watch() {
         let state = make_state();
         install_namespaced_crd(&state).await;
 
@@ -7343,35 +7291,31 @@ mod tests {
 
         // "destination.namespace" is a real field on the stored object (see app_body) but the
         // installed CRD (namespaced_crd_bytes) declares no selectableFields at all.
-        let query = super::super::generic::CollectionQuery {
-            field_selector: Some("spec.destination.namespace=default".to_string()),
-            ..no_watch_query()
-        };
-        let resp = list_cr_namespaced(
-            State(state.clone()),
-            Path((group, version, ns, plural)),
-            axum::http::HeaderMap::new(),
-            query,
-            "test-user".to_string(),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("list must succeed, got {e:?}"));
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        for watch in [None, Some(true)] {
+            let query = super::super::generic::CollectionQuery {
+                field_selector: Some("spec.destination.namespace=default".to_string()),
+                watch,
+                ..no_watch_query()
+            };
+            let err = list_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                query,
+                "test-user".to_string(),
+            )
             .await
-            .unwrap();
-        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            val["items"]
-                .as_array()
-                .expect("items must be an array")
-                .len(),
-            0,
-            "an undeclared field must resolve as absent regardless of the object's actual \
-             content, so a non-empty equality against it can never match — if this returns \
-             app-one, an arbitrary body field became selectable without the CRD author opting \
-             it in via selectableFields"
-        );
+            .expect_err("an undeclared selectable field must be rejected");
+            assert_eq!(
+                err.0,
+                StatusCode::BAD_REQUEST,
+                "watch={watch:?}: undeclared field must be a 400, not a silent pass-through"
+            );
+            assert_eq!(
+                err.1.message,
+                "field label not supported: spec.destination.namespace"
+            );
+        }
     }
 
     /// Regression test: a CR watch with `?fieldSelector=<CRD-declared field>=<value>` must
