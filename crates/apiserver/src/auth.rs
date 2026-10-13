@@ -440,7 +440,7 @@ fn unix_now() -> u64 {
 /// `metadata.name`/`.namespace`/labels/etc.) is irrelevant here (the caller already knows
 /// the namespace/name via `key`) and is silently skipped by serde's default
 /// unknown-field behavior. `Value` trees are the single largest source of apiserver JSON
-/// allocation (see `ai/findings/json-serde-optimization-scoping-2026-08-06.md`); this
+/// allocation (94.5% of bytes in the conformance profile); this
 /// callsite alone accounted for ~7% of all of it.
 #[derive(Deserialize)]
 struct LivenessCheckFields<'a> {
@@ -3205,8 +3205,7 @@ mod tests {
     // object_is_live minimal-field deserialize
     // -----------------------------------------------------------------------
     // Replaces the full `serde_json::Value` tree parse in `object_is_live` with the
-    // minimal `LivenessCheckFields` struct above — see
-    // `ai/findings/json-serde-optimization-scoping-2026-08-06.md`. This callsite alone
+    // minimal `LivenessCheckFields` struct above. This callsite alone
     // accounted for ~7.2%/8.6% of all apiserver JSON allocation bytes/events over a
     // 60-minute conformance run, entirely spent building and immediately discarding a
     // `Value` tree to read two scalar fields on every SA-JWT-authenticated request.
@@ -3289,8 +3288,8 @@ mod tests {
             !fn_body.contains("serde_json::Value") && !fn_body.contains("serde_json::from_value"),
             "object_is_live must not parse the stored object into a serde_json::Value tree — \
              it only ever reads metadata.uid and metadata.deletionTimestamp, so building a \
-             full recursive Value tree (94.5% of all apiserver JSON allocation bytes per \
-             ai/findings/json-serde-optimization-scoping-2026-08-06.md) for two scalar \
+             full recursive Value tree (94.5% of all apiserver JSON allocation bytes in \
+             the conformance profile) for two scalar \
              fields is pure waste on every SA-JWT-authenticated request:\n{fn_body}"
         );
     }

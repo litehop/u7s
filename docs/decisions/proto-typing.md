@@ -59,14 +59,13 @@ hand-authoring everything. If deep in-code k8s documentation becomes a priority,
 revisit that as an add-on to A — not as a reason to choose B.
 
 ## Key facts (from prior research)
-- `k8s-proto-schema-churn-1.34-1.36-2026-07-03.md`: upstream GA proto is
+- Schema churn (2026-07-03): upstream GA proto is
   addition-dominated — 55 field additions, 0 breaking changes across 1.34→1.36.
   The one "removal" was an alpha field (`WorkloadReference` #42) that lasted one
   release. Our `.proto` FILES are already complete/current at v1.36 (the problem is
   the partial structs, not the schema files). Full-codegen binary bloat ~225KB
   (negligible vs a 10–30MB tokio/hyper binary). Per-release upkeep ~2–4h.
-- `proto-source-of-truth-spike-2026-07-03.md` + `proto-spike-poc/lease-direction-b/`:
-  the A-vs-B toolchain eval + a byte-level-verified Lease PoC.
+- Source-of-truth spike (2026-07-03): A-vs-B toolchain eval, byte-verified Lease PoC.
 
 ## The hard part of the migration (for whoever does it)
 proto.rs's decode functions (~200) COMBINE proto-decode + `serde_json` emission in

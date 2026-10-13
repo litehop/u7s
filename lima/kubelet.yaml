@@ -25,12 +25,12 @@ cpus: 8
 # at 4GiB, and the sonobuoy aggregator itself still OOM'd at
 # 4GiB during a full-suite run, which needed a manual bump to
 # 6GiB to complete — 8GiB below adds documented margin beyond that observed
-# floor (session findings archived 2026-08-18 under ai/findings/).
+# floor.
 memory: 8GiB
 # 20GiB was the original disk default. lima-start.sh's own journald-retention
 # comment already documented the margin as tight ("~14G free observed with
 # only base images pulled"), and a 2026-08-18 --all-e2e DiskPressure audit
-# (session findings archived under ai/findings/) observed a 237-pod/108s
+# observed a 237-pod/108s
 # ReplicaSet-replacement storm during a transient DiskPressure condition
 # under concurrent-namespace image pulls at --procs=16 -- real, correct
 # kube-controller-manager behavior, but the exact trigger (oscillation vs.
