@@ -228,6 +228,62 @@ pub fn force_generation_on_create(group: &str, plural: &str, obj: &mut serde_jso
     }
 }
 
+/// Top-level field whose change bumps `metadata.generation` on update, for built-in kinds whose
+/// release-1.37 `pkg/registry/**/strategy.go` `PrepareForUpdate` bumps it by comparing a single
+/// field. Workloads/PDB, EndpointSlice, DeviceTaintRule, Pods and custom resources track
+/// generation through their own paths. PriorityClass has no update-side bump upstream.
+fn generation_tracked_field(group: &str, plural: &str) -> Option<&'static str> {
+    match (group, plural) {
+        ("", "podtemplates") => Some("template"),
+        (
+            "admissionregistration.k8s.io",
+            "mutatingwebhookconfigurations" | "validatingwebhookconfigurations",
+        ) => Some("webhooks"),
+        ("", "replicationcontrollers")
+        | ("networking.k8s.io", "ingresses" | "ingressclasses" | "networkpolicies")
+        | ("autoscaling", "horizontalpodautoscalers")
+        | ("flowcontrol.apiserver.k8s.io", "flowschemas" | "prioritylevelconfigurations")
+        | (
+            "admissionregistration.k8s.io",
+            "mutatingadmissionpolicies"
+            | "mutatingadmissionpolicybindings"
+            | "validatingadmissionpolicies"
+            | "validatingadmissionpolicybindings",
+        )
+        | ("resource.k8s.io", "deviceclasses" | "resourceslices")
+        | ("storage.k8s.io", "csidrivers") => Some("spec"),
+        _ => None,
+    }
+}
+
+/// Server-owned `metadata.generation` on update for the kinds in `generation_tracked_field`:
+/// restore the stored value over whatever the client or a mutating webhook sent (upstream
+/// `rest.BeforeUpdate`), then bump it when the tracked field changed (the strategy's
+/// `PrepareForUpdate`). Call after mutating webhooks so a webhook cannot overwrite the result.
+pub fn prepare_generation_for_update(
+    group: &str,
+    plural: &str,
+    old: &serde_json::Value,
+    new: &mut serde_json::Value,
+) {
+    let Some(field) = generation_tracked_field(group, plural) else {
+        return;
+    };
+    let stored = old["metadata"]["generation"].as_i64().unwrap_or(0);
+    let generation = if new[field] != old[field] {
+        stored.saturating_add(1)
+    } else {
+        stored
+    };
+    if generation == 0 {
+        if let Some(meta) = new["metadata"].as_object_mut() {
+            meta.remove("generation");
+        }
+    } else {
+        new["metadata"]["generation"] = serde_json::json!(generation);
+    }
+}
+
 /// Set `metadata.generation = 1` on a newly created workload object if absent or null.
 ///
 /// KCM's deployment controller reads metadata.generation to decide whether to
@@ -3956,6 +4012,115 @@ mod tests {
             assert_eq!(
                 obj["metadata"]["generation"], 7,
                 "{group}/{plural}: upstream does not touch generation on create"
+            );
+        }
+    }
+
+    /// Each kind's update must bump generation exactly when upstream's PrepareForUpdate field
+    /// changes (spec; webhooks for webhook configs; template for PodTemplate), and must put the
+    /// stored generation back over whatever the client sent. A kind that never bumps leaves
+    /// controllers (and `kubectl wait --for=jsonpath` users) unable to see spec changes; one
+    /// that trusts the client lets a PUT rewind or inflate it.
+    #[test]
+    fn prepare_generation_for_update_bumps_per_upstream_field_and_restores_stored() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("", "podtemplates", "template"),
+            ("", "replicationcontrollers", "spec"),
+            ("networking.k8s.io", "ingresses", "spec"),
+            ("networking.k8s.io", "ingressclasses", "spec"),
+            ("networking.k8s.io", "networkpolicies", "spec"),
+            ("autoscaling", "horizontalpodautoscalers", "spec"),
+            ("flowcontrol.apiserver.k8s.io", "flowschemas", "spec"),
+            (
+                "flowcontrol.apiserver.k8s.io",
+                "prioritylevelconfigurations",
+                "spec",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "mutatingwebhookconfigurations",
+                "webhooks",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "validatingwebhookconfigurations",
+                "webhooks",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "validatingadmissionpolicies",
+                "spec",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "validatingadmissionpolicybindings",
+                "spec",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "mutatingadmissionpolicies",
+                "spec",
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "mutatingadmissionpolicybindings",
+                "spec",
+            ),
+            ("resource.k8s.io", "deviceclasses", "spec"),
+            ("resource.k8s.io", "resourceslices", "spec"),
+            ("storage.k8s.io", "csidrivers", "spec"),
+        ];
+        for (group, plural, field) in cases {
+            let old = serde_json::json!({
+                "metadata": { "generation": 4 }, *field: { "v": 1 }, "status": { "s": 1 }
+            });
+
+            let mut changed = serde_json::json!({
+                "metadata": { "generation": 1 }, *field: { "v": 2 }
+            });
+            prepare_generation_for_update(group, plural, &old, &mut changed);
+            assert_eq!(
+                changed["metadata"]["generation"], 5,
+                "{group}/{plural}: {field} change must bump the STORED generation, not the client's"
+            );
+
+            let mut same = serde_json::json!({
+                "metadata": { "generation": 99 }, *field: { "v": 1 }, "status": { "s": 2 }
+            });
+            prepare_generation_for_update(group, plural, &old, &mut same);
+            assert_eq!(
+                same["metadata"]["generation"], 4,
+                "{group}/{plural}: unchanged {field} (status-only change) must not bump and a \
+                 client-chosen generation must be discarded"
+            );
+
+            let mut omitted = serde_json::json!({ "metadata": {}, *field: { "v": 1 } });
+            prepare_generation_for_update(group, plural, &old, &mut omitted);
+            assert_eq!(
+                omitted["metadata"]["generation"], 4,
+                "{group}/{plural}: a PUT omitting generation must get the stored value back"
+            );
+        }
+    }
+
+    /// CSIDriver has no generation on create upstream, so its first spec change yields 1;
+    /// PriorityClass/ConfigMap have no update-side tracking and must be left alone.
+    #[test]
+    fn prepare_generation_for_update_matches_upstream_edge_kinds() {
+        let old = serde_json::json!({ "metadata": {}, "spec": { "v": 1 } });
+        let mut new = serde_json::json!({ "metadata": {}, "spec": { "v": 2 } });
+        prepare_generation_for_update("storage.k8s.io", "csidrivers", &old, &mut new);
+        assert_eq!(new["metadata"]["generation"], 1);
+
+        for (group, plural) in [("scheduling.k8s.io", "priorityclasses"), ("", "configmaps")] {
+            let old = serde_json::json!({ "metadata": { "generation": 3 }, "spec": { "v": 1 } });
+            let mut new =
+                serde_json::json!({ "metadata": { "generation": 8 }, "spec": { "v": 2 } });
+            prepare_generation_for_update(group, plural, &old, &mut new);
+            assert_eq!(
+                new["metadata"]["generation"], 8,
+                "{group}/{plural}: upstream has no generation tracking on update, so the body \
+                 must be left untouched"
             );
         }
     }

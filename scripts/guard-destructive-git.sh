@@ -67,11 +67,8 @@ is_target_protected() {
 is_bead_export_discard() {
   # is_bead_export_discard <args> -- true only for `restore [--staged]
   # [--worktree] [--] <paths>` or `checkout -- <paths>` where every path is
-  # exactly one of the two bd-generated JSONL exports. Safe to discard: the
-  # embedded Dolt DB is authoritative and the next bd write regenerates both
-  # files; discarding them unblocks `git pull --ff-only` after a bead
-  # snapshot merges. Anything else (other paths, globs, dirs, --source, -p,
-  # a ref before `--`) is not covered.
+  # exactly one of the two bd-generated JSONL exports, which the Dolt DB
+  # regenerates; discarding them unblocks `git pull --ff-only`.
   local -a toks
   local tok sub npaths=0 seen_dd=0
   read -ra toks <<< "$1"
@@ -167,10 +164,13 @@ Use a scratch worktree instead:
 check_command() {
   # check_command <command-string> <cwd> -- exit 2 (with reason on stderr)
   # if any segment is a destructive git command against a protected repo.
-  local cmd="$1" cwd="$2" current_dir seg raw_seg cdarg rest target_dir
+  local cmd="$1" cwd="$2" current_dir seg raw_seg cdarg rest target_dir has_alias
+  local alias_re='^-c[[:space:]]*["'"'"']?[aA][lL][iI][aA][sS]\.'
 
   MAIN_ROOT=$(mayor_root)
   current_dir="$cwd"
+  local line_cont=$'\\\n'
+  cmd="${cmd//"$line_cont"/}"
 
   while IFS= read -r raw_seg; do
     seg=$(printf '%s' "$raw_seg" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
@@ -186,17 +186,27 @@ check_command() {
 
     rest="${seg#git }"
     target_dir="$current_dir"
-    if [[ "$rest" =~ ^-C[[:space:]]+([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
-      target_dir=$(resolve_dir "$current_dir" "${BASH_REMATCH[1]}")
-      rest="${BASH_REMATCH[2]}"
-    fi
+    has_alias=0
+    while :; do
+      if [[ "$rest" =~ ^-C[[:space:]]+([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
+        target_dir=$(resolve_dir "$target_dir" "${BASH_REMATCH[1]}")
+        rest="${BASH_REMATCH[2]}"
+      elif [[ "$rest" =~ ^-c[[:space:]]*([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
+        [[ "$rest" =~ $alias_re ]] && has_alias=1
+        [[ "$rest" =~ ^-c[[:space:]]*[^[:space:]]+[[:space:]]+(.*)$ ]]
+        rest="${BASH_REMATCH[1]}"
+      else
+        break
+      fi
+    done
 
-    if is_destructive_git_args "$rest" "$target_dir" && is_target_protected "$target_dir"; then
+    # An alias can expand to any destructive command, so refuse them outright.
+    if { [ "$has_alias" = 1 ] || is_destructive_git_args "$rest" "$target_dir"; } && is_target_protected "$target_dir"; then
       # shellcheck disable=SC2059
       printf "$BLOCK_MSG_TEMPLATE" "$seg" "$target_dir" >&2
       return 2
     fi
-  done <<< "$(printf '%s' "$cmd" | sed -E 's/(&&|\|\||;|\|)/\n/g')"
+  done <<< "$(printf '%s' "$cmd" | sed -E 's/(&&|\|\||;|\||\$\(|`|\(|\))/\n/g')"
 
   return 0
 }

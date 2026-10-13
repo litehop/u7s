@@ -897,6 +897,20 @@ call is_live_agent_branch 'main' 'main' || RC=$?
 assert "a non-worker/agent-* branch name never matches, even if it coincidentally equals a --live-agents entry" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
+# --live-agents entries given as agent-<id> or worker/agent-<id> must still
+# match: a mismatch reports live workers as stalled (exit 30).
+for LIVE_FORM in 'abc123' 'agent-abc123' 'worker/agent-abc123' 'xyz999, agent-abc123' 'xyz999, worker/agent-abc123'; do
+  RC=0
+  call is_live_agent_branch 'worker/agent-abc123' "$LIVE_FORM" || RC=$?
+  assert "--live-agents entry form '${LIVE_FORM}' classifies worker/agent-abc123 in-flight -- a prefixed id must not make a live worker look stalled" \
+    "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+done
+
+RC=0
+call is_live_agent_branch 'worker/agent-gone999' 'agent-abc123,worker/agent-def456' || RC=$?
+assert "prefixed --live-agents entries still do not match an unrelated worker branch" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
 # Whitespace-tolerant --live-agents membership match. A comma-space-joined
 # list (e.g. "a, b, c") must protect EVERY id, not just the first --
 # without normalization, the naive ",${live_agents}," substring match
@@ -998,11 +1012,11 @@ assert "a worker/agent-<id> branch with no PR, whose id is NOT in --live-agents,
 assert "...and it's tagged genuinely stale (no-pr-for-branch), not in-flight -- what worktree-hygiene.sh's destructive steps ultimately act on" \
   "$([ "$(jq -r '[.worktree_anomalies[] | select(.branch == "worker/agent-stale-test-agent" and .reason == "no-pr-for-branch")] | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
 
-run_full_tick "$STUB_EMPTY_BIN" "" "agent-two" "agent-one,agent-two,agent-three"
+run_full_tick "$STUB_EMPTY_BIN" "" "two" "one,two,three"
 assert "a --live-agents value with multiple comma-separated ids correctly matches the worker's id even when it isn't first or last in the list" \
   "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
 
-run_full_tick "$STUB_EMPTY_BIN" "" "agent-two" "agent-one, agent-two, agent-three"
+run_full_tick "$STUB_EMPTY_BIN" "" "two" "one, two, three"
 assert "the SAME multi-id match still succeeds through the full main() pipeline when the mayor's --live-agents value is comma-SPACE joined -- a live worker in the middle of the list must not misreport exit 30 (stale) just because of list formatting" \
   "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
 
