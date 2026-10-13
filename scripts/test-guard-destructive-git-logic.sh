@@ -288,6 +288,45 @@ assert "'git restore --staged --worktree $J $I' stays blocked when chained after
   "$(blocked "git reset --hard HEAD && git restore --staged --worktree $J $I" "$MAIN")"
 
 # ---------------------------------------------------------------------------
+# 13. Bypasses: aliases, line continuations, command substitution. Each hides
+#     a destructive op from a naive "segment starts with `git <verb>`" match.
+# ---------------------------------------------------------------------------
+assert "'git -c alias.x=\"reset --hard\" x' on main is blocked -- an alias smuggles a destructive verb past the verb match" \
+  "$(blocked "git -c alias.x='reset --hard' x" "$MAIN")"
+assert "'git -c alias.x=!rm x' on main is blocked -- shell aliases run arbitrary commands" \
+  "$(blocked "git -c alias.x=!true x" "$MAIN")"
+assert "'git -C <main> -c alias.x=... x' from a worker cwd is blocked -- -C and -c combine" \
+  "$(blocked "git -C $MAIN -c alias.x=reset x" "$WORKER")"
+assert "'git -c alias.x=... x' in the worker worktree is allowed -- aliases only matter on protected targets" \
+  "$(allowed "git -c alias.x=reset x" "$WORKER")"
+assert "'git -c core.x=y reset --hard' on main is blocked -- a -c prefix must not hide the verb" \
+  "$(blocked "git -c core.x=y reset --hard" "$MAIN")"
+assert "'git -c color.ui=false status' on main is allowed -- benign -c config is not an alias" \
+  "$(allowed "git -c color.ui=false status" "$MAIN")"
+
+assert "backslash-newline split 'git reset \\\\\\n --hard' on main is blocked -- the shell joins the lines into one destructive command" \
+  "$(blocked $'git reset \\\n--hard' "$MAIN")"
+assert "backslash-newline split 'git \\\\\\n reset --hard' on main is blocked -- the verb itself can be split" \
+  "$(blocked $'git \\\nreset --hard' "$MAIN")"
+assert "multi-line command with a harmless first line and 'git status' second is allowed" \
+  "$(allowed $'echo hi \\\n there\ngit status' "$MAIN")"
+
+assert "'\$(true) git reset --hard' on main is blocked -- a substitution prefix must not hide the git segment" \
+  "$(blocked '$(true) git reset --hard' "$MAIN")"
+assert "'echo \$(git reset --hard)' on main is blocked -- the destructive op runs inside the substitution" \
+  "$(blocked 'echo $(git reset --hard)' "$MAIN")"
+assert "'echo \`git reset --hard\`' on main is blocked -- backtick substitution runs it too" \
+  "$(blocked 'echo `git reset --hard`' "$MAIN")"
+assert "'(git reset --hard)' on main is blocked -- subshell grouping runs it too" \
+  "$(blocked '(git reset --hard)' "$MAIN")"
+assert "'git checkout \$(git rev-parse HEAD)' on main is allowed -- a read-only substitution is not destructive" \
+  "$(allowed 'git checkout $(git rev-parse HEAD)' "$MAIN")"
+assert "'echo \$(git rev-parse HEAD)' on main is allowed -- read-only git inside a substitution" \
+  "$(allowed 'echo $(git rev-parse HEAD)' "$MAIN")"
+assert "'\$(git reset --hard)' in the worker worktree is allowed -- worker branches are unprotected" \
+  "$(allowed 'echo $(git reset --hard)' "$WORKER")"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
