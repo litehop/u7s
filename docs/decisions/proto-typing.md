@@ -65,8 +65,7 @@ revisit that as an add-on to A — not as a reason to choose B.
   release. Our `.proto` FILES are already complete/current at v1.36 (the problem is
   the partial structs, not the schema files). Full-codegen binary bloat ~225KB
   (negligible vs a 10–30MB tokio/hyper binary). Per-release upkeep ~2–4h.
-- Source-of-truth spike (2026-07-03): the A-vs-B toolchain eval + a
-  byte-level-verified Lease PoC.
+- Source-of-truth spike (2026-07-03): A-vs-B toolchain eval, byte-verified Lease PoC.
 
 ## The hard part of the migration (for whoever does it)
 proto.rs's decode functions (~200) COMBINE proto-decode + `serde_json` emission in
