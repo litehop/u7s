@@ -10,6 +10,7 @@
 use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr};
 use serde_json::Value as J;
 
+use crate::handlers::cel_cost;
 use crate::handlers::cr::cel_escape_ident;
 
 /// Static type of a CEL expression, as far as the schema determines it.
@@ -201,7 +202,11 @@ impl<'a> Checker<'a, '_> {
 
 /// Parses `source` and checks it against the schema node it is declared on. `is_root` is
 /// true for the CRD's top-level `openAPIV3Schema`.
-pub(crate) fn compile_rule(source: &str, schema: &J, is_root: bool) -> Result<(), String> {
+pub(crate) fn compile_rule(
+    source: &str,
+    schema: &J,
+    is_root: bool,
+) -> Result<cel::Program, String> {
     let program = cel::Program::compile(source).map_err(|e| e.to_string())?;
     let self_ty = ty_of(schema, is_root);
     let mut checker = Checker {
@@ -211,23 +216,62 @@ pub(crate) fn compile_rule(source: &str, schema: &J, is_root: bool) -> Result<()
     };
     checker.check(program.expression());
     if checker.errors.is_empty() {
-        Ok(())
+        Ok(program)
     } else {
         Err(checker.errors.join("\n"))
     }
 }
 
+/// How many instances of a schema node one object can hold, from the `maxItems` /
+/// `maxProperties` of its ancestors; `None` when some ancestor collection is unbounded.
+type Cardinality = Option<u64>;
+
+fn child_cardinality(card: Cardinality, schema: &J) -> Cardinality {
+    let factor = match schema.get("type").and_then(|t| t.as_str()) {
+        Some("array") => schema.get("maxItems").and_then(J::as_u64),
+        Some("object") if schema.get("additionalProperties").is_some_and(J::is_object) => {
+            schema.get("maxProperties").and_then(J::as_u64)
+        }
+        _ => Some(1),
+    };
+    Some(card?.saturating_mul(factor?))
+}
+
 /// Rejects a CRD `openAPIV3Schema` whose `x-kubernetes-validations` rules or
-/// `messageExpression`s do not compile, formatted like upstream's field errors.
+/// `messageExpression`s do not compile, or whose estimated cost exceeds the budgets,
+/// formatted like upstream's field errors.
 pub(crate) fn check_schema_rules(
     schema: &J,
     path: &str,
     is_root: bool,
 ) -> Result<(), crate::status::StatusError> {
+    let mut total_cost = 0u64;
+    check_node(schema, path, is_root, Some(1), &mut total_cost)?;
+    if total_cost > cel_cost::STATIC_CRD_COST_LIMIT {
+        return Err(crate::status::Status::unprocessable_entity(format!(
+            "{path}: Forbidden: {}",
+            cel_cost::budget_message(
+                "x-kubernetes-validations estimated rule cost total for entire OpenAPIv3 schema",
+                total_cost,
+                cel_cost::STATIC_CRD_COST_LIMIT
+            )
+        )));
+    }
+    Ok(())
+}
+
+fn check_node(
+    schema: &J,
+    path: &str,
+    is_root: bool,
+    card: Cardinality,
+    total_cost: &mut u64,
+) -> Result<(), crate::status::StatusError> {
     if let Some(rules) = schema
         .get("x-kubernetes-validations")
         .and_then(|v| v.as_array())
     {
+        let instances = card.unwrap_or_else(|| cel_cost::unbounded_cardinality(schema));
         for (i, rule) in rules.iter().enumerate() {
             for key in ["rule", "messageExpression"] {
                 let Some(src) = rule
@@ -237,25 +281,48 @@ pub(crate) fn check_schema_rules(
                 else {
                     continue;
                 };
-                compile_rule(src, schema, is_root).map_err(|e| {
+                let program = compile_rule(src, schema, is_root).map_err(|e| {
                     crate::status::Status::unprocessable_entity(format!(
                         "{path}.x-kubernetes-validations[{i}].{key}: Invalid value: \
                          \"{src}\": compilation failed: {e}"
                     ))
                 })?;
+                let node = cel_cost::Node::Schema(schema);
+                let cost = cel_cost::estimate(&program, node, Some(node)).saturating_mul(instances);
+                *total_cost = total_cost.saturating_add(cost);
+                if cost > cel_cost::STATIC_COST_LIMIT {
+                    let name = if key == "rule" {
+                        "estimated rule cost"
+                    } else {
+                        "estimated messageExpression cost"
+                    };
+                    return Err(crate::status::Status::unprocessable_entity(format!(
+                        "{path}.x-kubernetes-validations[{i}].{key}: Forbidden: {}",
+                        cel_cost::budget_message(name, cost, cel_cost::STATIC_COST_LIMIT)
+                    )));
+                }
             }
         }
     }
+    let child_card = child_cardinality(card, schema);
     if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
         for (name, sub) in props {
-            check_schema_rules(sub, &format!("{path}.properties[{name}]"), false)?;
+            let sub_path = format!("{path}.properties[{name}]");
+            check_node(sub, &sub_path, false, child_card, total_cost)?;
         }
     }
     if let Some(items) = schema.get("items").filter(|v| v.is_object()) {
-        check_schema_rules(items, &format!("{path}.items"), false)?;
+        check_node(
+            items,
+            &format!("{path}.items"),
+            false,
+            child_card,
+            total_cost,
+        )?;
     }
     if let Some(ap) = schema.get("additionalProperties").filter(|v| v.is_object()) {
-        check_schema_rules(ap, &format!("{path}.additionalProperties"), false)?;
+        let sub_path = format!("{path}.additionalProperties");
+        check_node(ap, &sub_path, false, child_card, total_cost)?;
     }
     Ok(())
 }
@@ -287,7 +354,7 @@ mod tests {
 
     fn check_at_spec(rule: &str) -> Result<(), String> {
         let root = schema();
-        compile_rule(rule, &root["properties"]["spec"], false)
+        compile_rule(rule, &root["properties"]["spec"], false).map(|_| ())
     }
 
     #[test]
@@ -354,6 +421,79 @@ mod tests {
         let free =
             serde_json::json!({ "type": "object", "x-kubernetes-preserve-unknown-fields": true });
         assert!(compile_rule("self.anything == 1", &free, false).is_ok());
+    }
+
+    #[test]
+    fn rule_over_unbounded_nested_lists_exceeds_the_estimated_cost_budget() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "properties": { "x": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "x-kubernetes-validations": [
+                            { "rule": "self.all(s, s == 'string constant')" }
+                        ]
+                    }
+                } }
+            } }
+        });
+        let err = check_schema_rules(&schema, "openAPIV3Schema", true).unwrap_err();
+        assert!(
+            err.1.message.contains("exceeds budget"),
+            "a rule that can cost billions per CR must be refused at CRD create, not at every \
+             write: {}",
+            err.1.message
+        );
+    }
+
+    #[test]
+    fn same_nested_rule_with_max_items_declared_is_within_budget() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "properties": { "x": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": {
+                        "type": "array",
+                        "maxItems": 10,
+                        "items": { "type": "string", "maxLength": 10 },
+                        "x-kubernetes-validations": [
+                            { "rule": "self.all(s, s == 'string constant')" }
+                        ]
+                    }
+                } }
+            } }
+        });
+        assert!(
+            check_schema_rules(&schema, "openAPIV3Schema", true).is_ok(),
+            "bounding the collections is the documented remedy; it must make the rule acceptable"
+        );
+    }
+
+    #[test]
+    fn quadratic_rule_over_725_items_is_accepted_at_crd_create() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [
+                    { "rule": "self.largeArray.all(x, self.largeArray.all(y, y == x))" }
+                ],
+                "properties": { "largeArray": {
+                    "type": "array", "maxItems": 725, "items": { "type": "integer" }
+                } }
+            } }
+        });
+        assert!(
+            check_schema_rules(&schema, "openAPIV3Schema", true).is_ok(),
+            "the O(n^2) rule is within the static budget; only its runtime cost must trip"
+        );
     }
 
     #[test]

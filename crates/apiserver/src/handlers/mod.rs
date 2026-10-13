@@ -1,6 +1,7 @@
 pub mod aggregation;
 pub mod approval;
 pub mod authorization;
+pub mod cel_cost;
 pub mod cel_rules;
 pub mod certificates;
 pub mod core;
