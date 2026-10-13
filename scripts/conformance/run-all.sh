@@ -291,6 +291,15 @@ if [ -z "$EXTRA_NODE" ] && [ -n "$EXTRA_KUBELET_PORT" ]; then
   exit 1
 fi
 
+# Catch a stale kubelet-port assignment before building/starting anything.
+# --reset deletes the VMs and re-bakes the requested port, so only a kept VM
+# can mismatch.
+if [ "$RESET" -eq 0 ]; then
+  source "$DIR/_lib.sh"
+  [ -z "$KUBELET_PORT" ] || assert_kubelet_port_matches_vm "${U7S_VM_NAME:-lima-node}" "$KUBELET_PORT" || exit 1
+  [ -z "$EXTRA_NODE" ] || assert_kubelet_port_matches_vm "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" || exit 1
+fi
+
 # --dhat-depth is forwarded verbatim to the apiserver's U7S_DHAT_BACKTRACE_DEPTH
 # (crates/apiserver/src/main.rs parses it as a usize) -- reject it here with a
 # clear message instead of letting a typo silently fall back to the apiserver's
