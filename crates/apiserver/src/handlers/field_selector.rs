@@ -645,6 +645,26 @@ mod tests {
         }
     }
 
+    /// Every kind the registry serves resolves to a table that accepts `metadata.name` and
+    /// rejects an undeclared label, so no served kind can fall through to "ignore everything".
+    #[test]
+    fn every_served_kind_resolves_to_a_table_that_rejects_unknown_labels() {
+        let registry = crate::state::build_registry();
+        assert!(registry.len() >= 60, "registry unexpectedly small");
+        for key in registry.keys() {
+            sel("metadata.name=x", &key.group, &key.plural);
+            rejected("bogus.field=x", &key.group, &key.plural);
+        }
+        for (group, plural) in [
+            ("", "pods"),
+            ("", "namespaces"),
+            ("apiextensions.k8s.io", "customresourcedefinitions"),
+        ] {
+            sel("metadata.name=x", group, plural);
+            rejected("bogus.field=x", group, plural);
+        }
+    }
+
     #[test]
     fn unsupported_label_is_400_with_upstream_wording_per_registration_site() {
         assert_eq!(
