@@ -645,6 +645,240 @@ mod tests {
         }
     }
 
+    /// A label accepted with a wrong JSON path parses fine and then matches the wrong objects, so
+    /// a controller's informer silently receives (or misses) objects. Each label gets a distinct
+    /// value at its own path: `=value` must match and `!=value` must not.
+    #[test]
+    fn every_table_field_reads_its_value_from_the_right_path() {
+        let involved = json!({
+            "kind": "Pod", "namespace": "ev-ns", "name": "ev-pod", "uid": "ev-uid",
+            "apiVersion": "ev/v9", "resourceVersion": "4711", "fieldPath": "spec.containers{c}"
+        });
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, &str, Value, Vec<(&str, &str)>)> = vec![
+            (
+                "",
+                "pods",
+                json!({
+                    "metadata": {"name": "p-name", "namespace": "p-ns"},
+                    "spec": {
+                        "nodeName": "p-node", "restartPolicy": "OnFailure",
+                        "schedulerName": "p-sched", "serviceAccountName": "p-sa",
+                        "hostNetwork": true
+                    },
+                    "status": {
+                        "phase": "Running", "podIP": "10.1.2.3",
+                        "nominatedNodeName": "p-nominated"
+                    }
+                }),
+                vec![
+                    ("metadata.name", "p-name"),
+                    ("metadata.namespace", "p-ns"),
+                    ("spec.nodeName", "p-node"),
+                    ("spec.host", "p-node"),
+                    ("spec.restartPolicy", "OnFailure"),
+                    ("spec.schedulerName", "p-sched"),
+                    ("spec.serviceAccountName", "p-sa"),
+                    ("spec.hostNetwork", "true"),
+                    ("status.phase", "Running"),
+                    ("status.podIP", "10.1.2.3"),
+                    ("status.podIPs", ""),
+                    ("status.nominatedNodeName", "p-nominated"),
+                ],
+            ),
+            (
+                "",
+                "nodes",
+                json!({"metadata": {"name": "n-name"}, "spec": {"unschedulable": true}}),
+                vec![("metadata.name", "n-name"), ("spec.unschedulable", "true")],
+            ),
+            (
+                "",
+                "replicationcontrollers",
+                json!({
+                    "metadata": {"name": "rc-name", "namespace": "rc-ns"},
+                    "status": {"replicas": 7}
+                }),
+                vec![
+                    ("metadata.name", "rc-name"),
+                    ("metadata.namespace", "rc-ns"),
+                    ("status.replicas", "7"),
+                ],
+            ),
+            (
+                "",
+                "events",
+                json!({
+                    "metadata": {"name": "e-name", "namespace": "e-ns"},
+                    "involvedObject": involved,
+                    "reason": "Scheduled", "type": "Warning",
+                    "reportingComponent": "e-reporter",
+                    "source": {"component": "e-source"}
+                }),
+                vec![
+                    ("metadata.name", "e-name"),
+                    ("metadata.namespace", "e-ns"),
+                    ("involvedObject.kind", "Pod"),
+                    ("involvedObject.namespace", "ev-ns"),
+                    ("involvedObject.name", "ev-pod"),
+                    ("involvedObject.uid", "ev-uid"),
+                    ("involvedObject.apiVersion", "ev/v9"),
+                    ("involvedObject.resourceVersion", "4711"),
+                    ("involvedObject.fieldPath", "spec.containers{c}"),
+                    ("reason", "Scheduled"),
+                    ("reportingComponent", "e-reporter"),
+                    ("source", "e-source"),
+                    ("type", "Warning"),
+                ],
+            ),
+            (
+                "events.k8s.io",
+                "events",
+                json!({
+                    "metadata": {"name": "e-name", "namespace": "e-ns"},
+                    "involvedObject": involved,
+                    "reason": "Scheduled", "type": "Warning",
+                    "reportingController": "e-controller"
+                }),
+                vec![
+                    ("metadata.name", "e-name"),
+                    ("metadata.namespace", "e-ns"),
+                    ("regarding.kind", "Pod"),
+                    ("regarding.namespace", "ev-ns"),
+                    ("regarding.name", "ev-pod"),
+                    ("regarding.uid", "ev-uid"),
+                    ("regarding.apiVersion", "ev/v9"),
+                    ("regarding.resourceVersion", "4711"),
+                    ("regarding.fieldPath", "spec.containers{c}"),
+                    ("reason", "Scheduled"),
+                    ("reportingController", "e-controller"),
+                    ("type", "Warning"),
+                ],
+            ),
+            (
+                "",
+                "namespaces",
+                json!({"metadata": {"name": "ns-name"}, "status": {"phase": "Terminating"}}),
+                vec![
+                    ("metadata.name", "ns-name"),
+                    ("status.phase", "Terminating"),
+                ],
+            ),
+            (
+                "",
+                "secrets",
+                json!({
+                    "metadata": {"name": "s-name", "namespace": "s-ns"},
+                    "type": "kubernetes.io/tls"
+                }),
+                vec![
+                    ("metadata.name", "s-name"),
+                    ("metadata.namespace", "s-ns"),
+                    ("type", "kubernetes.io/tls"),
+                ],
+            ),
+            (
+                "",
+                "services",
+                json!({
+                    "metadata": {"name": "svc-name", "namespace": "svc-ns"},
+                    "spec": {"clusterIP": "10.96.0.9", "type": "NodePort"}
+                }),
+                vec![
+                    ("metadata.name", "svc-name"),
+                    ("metadata.namespace", "svc-ns"),
+                    ("spec.clusterIP", "10.96.0.9"),
+                    ("spec.type", "NodePort"),
+                ],
+            ),
+            (
+                "batch",
+                "jobs",
+                json!({
+                    "metadata": {"name": "j-name", "namespace": "j-ns"},
+                    "status": {"succeeded": 3}
+                }),
+                vec![
+                    ("metadata.name", "j-name"),
+                    ("metadata.namespace", "j-ns"),
+                    ("status.successful", "3"),
+                ],
+            ),
+            (
+                "certificates.k8s.io",
+                "certificatesigningrequests",
+                json!({"metadata": {"name": "csr-name"}, "spec": {"signerName": "x.io/csr"}}),
+                vec![
+                    ("metadata.name", "csr-name"),
+                    ("spec.signerName", "x.io/csr"),
+                ],
+            ),
+            (
+                "certificates.k8s.io",
+                "clustertrustbundles",
+                json!({"metadata": {"name": "ctb-name"}, "spec": {"signerName": "x.io/ctb"}}),
+                vec![
+                    ("metadata.name", "ctb-name"),
+                    ("spec.signerName", "x.io/ctb"),
+                ],
+            ),
+            (
+                "certificates.k8s.io",
+                "podcertificaterequests",
+                json!({
+                    "metadata": {"name": "pcr-name"},
+                    "spec": {
+                        "signerName": "x.io/pcr", "podName": "pcr-pod", "nodeName": "pcr-node"
+                    }
+                }),
+                vec![
+                    ("metadata.name", "pcr-name"),
+                    ("spec.signerName", "x.io/pcr"),
+                    ("spec.podName", "pcr-pod"),
+                    ("spec.nodeName", "pcr-node"),
+                ],
+            ),
+            (
+                "resource.k8s.io",
+                "resourceslices",
+                json!({
+                    "metadata": {"name": "rs-name"},
+                    "spec": {"nodeName": "rs-node", "driver": "rs.driver", "pool": {"name": "rs-pool"}}
+                }),
+                vec![
+                    ("metadata.name", "rs-name"),
+                    ("spec.nodeName", "rs-node"),
+                    ("spec.driver", "rs.driver"),
+                    ("spec.pool.name", "rs-pool"),
+                ],
+            ),
+        ];
+        for (group, plural, obj, expected) in &cases {
+            let mut covered: Vec<&str> = expected.iter().map(|(l, _)| *l).collect();
+            let mut table: Vec<&str> = kind_fields(group, plural)
+                .fields
+                .iter()
+                .map(|(l, _)| *l)
+                .collect();
+            covered.sort_unstable();
+            table.sort_unstable();
+            assert_eq!(
+                covered, table,
+                "{group}/{plural}: every table field needs a value assertion"
+            );
+            for (label, value) in expected {
+                assert!(
+                    sel(&format!("{label}={value}"), group, plural).matches(obj),
+                    "{group}/{plural} {label}={value} must match — wrong JSON path for this field"
+                );
+                assert!(
+                    !sel(&format!("{label}!={value}"), group, plural).matches(obj),
+                    "{group}/{plural} {label}!={value} must not match"
+                );
+            }
+        }
+    }
+
     /// Every kind the registry serves resolves to a table that accepts `metadata.name` and
     /// rejects an undeclared label, so no served kind can fall through to "ignore everything".
     #[test]
