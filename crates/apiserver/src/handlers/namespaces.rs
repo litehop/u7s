@@ -6871,8 +6871,7 @@ mod admission_tests {
 
         let err = put_namespace_with_rv(&state, "race-rv-ns", Some(&rv))
             .await
-            .err()
-            .expect("stale explicit-RV PUT must fail");
+            .expect_err("stale explicit-RV PUT must fail");
         assert_eq!(err.0, StatusCode::CONFLICT);
     }
 
