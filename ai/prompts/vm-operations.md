@@ -183,7 +183,7 @@ comments for the heap-file relocation and SIGTERM-flush mechanics.
 ## Stack-only mode — live stack without sonobuoy
 
 Use `--stack-only` to bring up steps 1–5 (build, apiserver, kubelet, KCM, scheduler)
-and then stop, leaving the stack running for kubectl or direct-DB investigation. Step 6
+and then exit, leaving the stack up for kubectl or direct-DB investigation during the task (the Final step still reaps it and stops the VM). Step 6
 (sonobuoy) is skipped entirely — no sonobuoy pod is launched.
 
 This is the correct tool when you want to inspect cluster state, run kubectl commands
