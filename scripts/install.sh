@@ -812,12 +812,18 @@ write_kubelet_config_yaml
 # keeping PodLevelResources disabled requires disabling these two as well
 # or kubelet refuses to start ("is enabled, but depends on features that are
 # disabled").
-KUBELET_ROUND2_FLAGS="--feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false"
-# The two gates below only exist from 1.37; an older kubelet rejects them as
-# unrecognized, so they are appended only when the staged kubelet is >= 1.37.
-if [ "${KUBE_MINOR#*.}" -ge 37 ]; then
-  KUBELET_ROUND2_FLAGS="$KUBELET_ROUND2_FLAGS,PodLevelResourcesFixDefaulting=false,PodLevelResourcesFixKubeletQOSClass=false"
-fi
+# Takes the kubelet minor (e.g. "v1.37" or "1.37") and prints the flag string.
+kubelet_round2_flags() {
+  local minor="${1#*.}"
+  local flags="--feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false"
+  # The two gates below only exist from 1.37; an older kubelet rejects them as
+  # unrecognized, so they are appended only when the staged kubelet is >= 1.37.
+  if [ "$minor" -ge 37 ]; then
+    flags="$flags,PodLevelResourcesFixDefaulting=false,PodLevelResourcesFixKubeletQOSClass=false"
+  fi
+  printf '%s' "$flags"
+}
+KUBELET_ROUND2_FLAGS="$(kubelet_round2_flags "$KUBE_MINOR")"
 
 if [ "$WORKER_MODE" -eq 1 ]; then
   # --- Join an existing cluster via the CSR API, or upgrade an
