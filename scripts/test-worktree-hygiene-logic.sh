@@ -134,6 +134,40 @@ assert "the SAME orphan record, with a --live-agents set that does NOT include i
   "$(printf '%s\n' "$FILTERED_STALE" | grep -qF '2222|apiserver|/repo/ai/worktrees/agent-liveid123' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 1c. STEP A -- apiserver-less konnectivity-server in a LIVE worktree (e.g.
+#     the mayor checkout): the leftover that squats a worker slot's
+#     konnectivity ports while find_orphans can't see it.
+# ---------------------------------------------------------------------------
+
+KONN_LINE='alice  3001   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 konnectivity-server --server-cert=/repo/temp/u7s/konnectivity-server.crt --server-port=8235'
+API_LINE='alice  3002   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 target/release/u7s-apiserver --kubeconfig /repo/temp/u7s/kubeconfig --port 6444'
+LIVE_WITH_MAYOR='/repo
+/repo/ai/worktrees/agent-liveid123'
+
+SQUATTER=$(call find_apiserverless_konnectivity "$KONN_LINE" "$LIVE_WITH_MAYOR")
+assert "a konnectivity-server in a live (mayor) checkout with no apiserver of that workdir is flagged -- it is the slot squatter no other reaper sees" \
+  "$([ "$SQUATTER" = '3001|konnectivity-server|/repo' ] && echo 1 || echo 0)"
+
+assert "the same konnectivity-server is NOT flagged while its workdir's apiserver is running -- an operator's healthy stack must never be reaped" \
+  "$([ -z "$(call find_apiserverless_konnectivity "$KONN_LINE
+$API_LINE" "$LIVE_WITH_MAYOR")" ] && echo 1 || echo 0)"
+
+OTHER_API_LINE='alice  3003   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 target/release/u7s-apiserver --kubeconfig /repo/ai/worktrees/agent-liveid123/temp/u7s/kubeconfig --port 6445'
+assert "another workdir's apiserver does not vouch for this workdir's konnectivity-server (staleness is per workdir, not global)" \
+  "$([ "$(call find_apiserverless_konnectivity "$KONN_LINE
+$OTHER_API_LINE" "$LIVE_WITH_MAYOR")" = '3001|konnectivity-server|/repo' ] && echo 1 || echo 0)"
+
+assert "a konnectivity-server whose worktree is gone is left to find_orphans, not double-reported here" \
+  "$([ -z "$(call find_apiserverless_konnectivity "$KONN_LINE" '/elsewhere')" ] && echo 1 || echo 0)"
+
+LIVE_AGENT_KONN='alice  3004   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 konnectivity-server --server-cert=/repo/ai/worktrees/agent-liveid123/temp/u7s/konnectivity-server.crt --server-port=8335'
+LIVE_AGENT_REC=$(call find_apiserverless_konnectivity "$LIVE_AGENT_KONN" "$LIVE_WITH_MAYOR")
+assert "sanity: a live worker's apiserver-less konnectivity-server is a candidate before the live-agents filter" \
+  "$([ "$LIVE_AGENT_REC" = '3004|konnectivity-server|/repo/ai/worktrees/agent-liveid123' ] && echo 1 || echo 0)"
+assert "...and the live-agents filter drops it, so a live worker mid-restart is never reaped" \
+  "$([ -z "$(call filter_orphans_by_live_agents "$LIVE_AGENT_REC" liveid123)" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 2. STEP C -- in-flight guard.
 # ---------------------------------------------------------------------------
 
