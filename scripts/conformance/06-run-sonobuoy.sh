@@ -321,8 +321,16 @@ JSON_REPORT_PATH="/tmp/sonobuoy/results/report.json"
 # --json-report is appended with '|' too in the apply=1 shape (plain space
 # would vanish under that repointed split character) and with a plain space
 # in the apply=0 shape (which never overrides the default space-splitting).
+#
+# GINKGO_SUITE_TIMEOUT (e.g. "3600s"), when set, adds ginkgo's own --timeout so a
+# total hang is cut off at suite level instead of ginkgo's 24h default.
 build_filter_args() {
   local apply="$1"
+  local gt="" gt_pipe=""
+  if [ -n "${GINKGO_SUITE_TIMEOUT:-}" ]; then
+    gt=" --timeout=${GINKGO_SUITE_TIMEOUT}"
+    gt_pipe="|--timeout=${GINKGO_SUITE_TIMEOUT}"
+  fi
   # The disruptive pass selects by ginkgo label (ANDed with the plugin's focus)
   # because RE2 focus/skip regexes cannot express "focus X and also [Disruptive]".
   # The parallel pass skips by text tag only when apply=1; apply=0 uses labels.
@@ -334,7 +342,7 @@ build_filter_args() {
       skip='\[Flaky\]|\[Disruptive\]'
     fi
     FILTER_ARGS=(
-      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${label}|--json-report=${JSON_REPORT_PATH}"
+      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${label}|--json-report=${JSON_REPORT_PATH}${gt_pipe}"
       "--plugin-env=e2e.E2E_EXTRA_ARGS_SEP=|"
       "--e2e-skip=${skip}"
     )
@@ -343,9 +351,22 @@ build_filter_args() {
     # passes split on the ginkgo label instead -- complementary by construction.
     local extra=" --label-filter=!Disruptive"
     [ "$PASS" = "disruptive" ] && extra=" --label-filter=Disruptive"
-    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${extra}")
+    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${gt}${extra}")
   fi
 }
+
+# suite_timeout_seconds <focus> prints the suite-level cap: ~2x the slowest
+# passing suite (conformance max 28.3 min, csi-hostpath max 43 min). An outer
+# bound on a total hang, independent of the per-namespace watchdog above.
+suite_timeout_seconds() {
+  case "$1" in
+    *csi-hostpath*) echo 5400 ;;
+    *) echo 3600 ;;
+  esac
+}
+# Sonobuoy's own --timeout (aggregator wait-for-plugins budget) outlasts the
+# ginkgo cap so ginkgo's report is flushed before sonobuoy gives up.
+SONOBUOY_TIMEOUT_MARGIN_SECONDS=600
 
 # --skip-preflight=existingnamespace skips ONLY sonobuoy's own
 # "existingnamespace" preflight check (cmd/sonobuoy/app/args.go's
@@ -384,9 +405,12 @@ if [ -n "$FOCUS" ]; then
   # to actually run once (e.g. to reproduce a bug on record).
   APPLY_FILTERS=1
   [ "$UNSAFE_FOCUS" -eq 1 ] && APPLY_FILTERS=0
+  SUITE_TIMEOUT=$(suite_timeout_seconds "$FOCUS")
+  GINKGO_SUITE_TIMEOUT="${SUITE_TIMEOUT}s"
   build_filter_args "$APPLY_FILTERS"
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" "--e2e-focus=$FOCUS" || SONOBUOY_EXIT=$?
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" "--e2e-focus=$FOCUS" \
+    --timeout "$(( SUITE_TIMEOUT + SONOBUOY_TIMEOUT_MARGIN_SECONDS ))" || SONOBUOY_EXIT=$?
 elif [ "$ALL_E2E" -eq 1 ]; then
   # Full ginkgo set (~7500 specs) instead of just the [Conformance]-tagged
   # subset — surfaces plain ginkgo.It cases (e.g. SSA field-manager tests)
@@ -420,9 +444,12 @@ elif [ "$ALL_E2E" -eq 1 ]; then
     --e2e-focus=".*" \
     --timeout "$ALL_E2E_TIMEOUT_SECONDS" || SONOBUOY_EXIT=$?
 else
+  SUITE_TIMEOUT=$(suite_timeout_seconds "")
+  GINKGO_SUITE_TIMEOUT="${SUITE_TIMEOUT}s"
   build_filter_args 0
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" --mode=certified-conformance || SONOBUOY_EXIT=$?
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" --mode=certified-conformance \
+    --timeout "$(( SUITE_TIMEOUT + SONOBUOY_TIMEOUT_MARGIN_SECONDS ))" || SONOBUOY_EXIT=$?
 fi
 if [ "$SONOBUOY_EXIT" -ne 0 ]; then
   echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} — attempting partial result retrieval"
@@ -691,9 +718,8 @@ if [ "$UNPACK" -eq 1 ]; then
       fi
     fi
     echo "  Unpacked: $UNPACK_DIR"
-    exit "$(sonobuoy_exit_code "$SONOBUOY_EXIT" "${FAILURES:-0}")"
   else
     echo "error: no junit at $JUNIT — the run produced no results" >&2; exit 1
   fi
 fi
-exit 0
+exit "$(sonobuoy_exit_code "$SONOBUOY_EXIT" "${FAILURES:-0}")"

@@ -89,6 +89,8 @@ scripts/conformance/06-run-sonobuoy.sh [--focus <regex>]
 | `06-run-sonobuoy.sh` | Runs sonobuoy conformance tests inside the lima VM; supports `--focus` |
 | `run-all.sh` | Top-level orchestrator: sources step 02 so KUBECONFIG propagates, runs all steps |
 
+`06-run-sonobuoy.sh` exit codes: `0` clean, `10` spec failures (results retrieved), any other non-zero = infrastructure failure.
+
 **KUBECONFIG propagation:** `run-all.sh` sources `02-start-apiserver.sh` so the
 `KUBECONFIG` export is visible to subsequent steps. When running steps individually,
 export it manually after step 02.

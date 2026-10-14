@@ -12,11 +12,8 @@
 # taking a plain integer of seconds, not a duration string like "12h".
 #
 # This test proves the --timeout flag reaches the --all-e2e branch's actual
-# sonobuoy argv with a value that clears sonobuoy's own 6h default, while
-# staying OUT of the --focus and certified-conformance branches (those
-# ~10min/~25min runs -- certified-conformance sped up once PR #966 made
-# ginkgo's --procs=16 the default -- don't need it, and adding it there would
-# just be an unreviewed behavior change beyond what this fix asks for).
+# sonobuoy argv with a value that clears sonobuoy's own 6h default; the
+# --focus and certified-conformance branches carry the much smaller suite cap.
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
@@ -44,11 +41,11 @@ build_sonobuoy_args() {
   local focus="$1" all_e2e="$2" timeout_secs="$3"
   local base="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
   if [ -n "$focus" ]; then
-    echo "$base --e2e-focus=$focus"
+    echo "$base --e2e-focus=$focus --timeout 4200"
   elif [ "$all_e2e" -eq 1 ]; then
     echo "$base --e2e-focus=.* --e2e-skip=\[Flaky\] --timeout $timeout_secs"
   else
-    echo "$base --mode=certified-conformance"
+    echo "$base --mode=certified-conformance --timeout 4200"
   fi
 }
 
@@ -86,18 +83,16 @@ assert "(regression guard) pre-fix --all-e2e argv genuinely lacks --timeout" \
   "$(printf '%s' "$OLD_ARGS" | grep -q -- "--timeout" && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
-# 2. --focus and certified-conformance (default) argvs are untouched -- their
-#    ~10min/~25min runs (certified-conformance sped up post PR #966's --procs=16
-#    default) never approach sonobuoy's 6h default, so silently adding a flag
-#    there would be an unreviewed behavior change this fix didn't ask for.
+# 2. --focus and certified-conformance (default) argvs carry the 1h suite cap
+#    (+600s sonobuoy margin = 4200), far below the --all-e2e 12h budget.
 # ---------------------------------------------------------------------------
 FOCUS_ARGS=$(build_sonobuoy_args "AdmissionWebhook" 0 "$DEFAULT_ALL_E2E_TIMEOUT_SECONDS")
-assert "--focus argv is unaffected by the --all-e2e timeout fix" \
-  "$(printf '%s' "$FOCUS_ARGS" | grep -q -- "--timeout" && echo 0 || echo 1)"
+assert "--focus argv carries the suite cap, not the --all-e2e 12h budget" \
+  "$(printf '%s' "$FOCUS_ARGS" | grep -q -- "--timeout 4200" && echo 1 || echo 0)"
 
 DEFAULT_ARGS=$(build_sonobuoy_args "" 0 "$DEFAULT_ALL_E2E_TIMEOUT_SECONDS")
-assert "certified-conformance (bare) argv is unaffected by the --all-e2e timeout fix" \
-  "$(printf '%s' "$DEFAULT_ARGS" | grep -q -- "--timeout" && echo 0 || echo 1)"
+assert "certified-conformance (bare) argv carries the suite cap, not the --all-e2e 12h budget" \
+  "$(printf '%s' "$DEFAULT_ARGS" | grep -q -- "--timeout 4200" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 3. SONOBUOY_ALL_E2E_TIMEOUT_SECONDS overrides the default -- mirrors

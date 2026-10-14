@@ -560,6 +560,7 @@ if [ "$STACK_ONLY" -eq 1 ]; then
 else
   banner "Step 6/6: Run sonobuoy"
   export SONOBUOY_FOCUS="$FOCUS"
+  rm -f "$(sonobuoy_results_dir_file "$WORKDIR" parallel)"
   # Captured, not fatal: provenance, sampler teardown and monitoring copy below must still run after a failing pass; the exit is re-raised at the end.
   # shellcheck disable=SC2086
   bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG} ${_PROCS_ARG} ${_K8S_VERSION_ARG} || SONOBUOY_RC=$?
