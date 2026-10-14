@@ -442,6 +442,12 @@ step_a_orphaned_processes() {
       # Same workdir as the operator's slot-0 stack, so a path pattern would
       # kill that too; only the pid is specific to the squatter.
       slot-squatter-*) run_cmd kill "$pid" ;;
+      konnectivity-server)
+        if [ -z "$(agent_id_from_worktree_path "$wpath")" ]; then
+          run_cmd kill "$pid"
+        else
+          run_cmd pkill -f "$(kill_pattern_for "$ptype" "$wpath")"
+        fi ;;
       *)
         pat=$(kill_pattern_for "$ptype" "$wpath")
         run_cmd pkill -f "$pat" ;;

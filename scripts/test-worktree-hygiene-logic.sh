@@ -260,8 +260,11 @@ assert "STEP A (b'): a 6445 squatter next to the slot-0 stack is killed by pid o
   "$([ "$(step_a_dry "$SA_API_6443
 $SA_KONN_SLOT0
 $SA_API_6445")" = "[dry-run] would run: kill 5001" ] && echo 1 || echo 0)"
-assert "STEP A (c): an apiserver-less mayor checkout konnectivity on 8335 is reaped (exactly one kill, of that konnectivity)" \
-  "$([ "$(step_a_dry "$SA_KONN_8335")" = "[dry-run] would run: pkill -f konnectivity-server.*$SA_REAL/temp/u7s" ] && echo 1 || echo 0)"
+assert "STEP A (c): an apiserver-less mayor checkout konnectivity on 8335 is reaped by pid (exactly one kill)" \
+  "$([ "$(step_a_dry "$SA_KONN_8335")" = "[dry-run] would run: kill 5004" ] && echo 1 || echo 0)"
+assert "STEP A (b''): a stale 8335 konnectivity beside the operator's slot-0 konnectivity (same path) is killed by pid only -- a path pkill would take down slot 0" \
+  "$([ "$(step_a_dry "$SA_KONN_SLOT0
+$SA_KONN_8335")" = "[dry-run] would run: kill 5004" ] && echo 1 || echo 0)"
 assert "STEP A (d): a live worker's 6446 apiserver is untouched even beside a real squatter, which alone is killed" \
   "$([ "$(step_a_dry "$SA_WORKER_API
 $SA_API_6445")" = "[dry-run] would run: kill 5001" ] && echo 1 || echo 0)"
