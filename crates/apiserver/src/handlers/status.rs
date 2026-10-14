@@ -131,7 +131,7 @@ pub async fn put_resource_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -196,7 +196,7 @@ pub async fn put_resource_status<S: Store>(
         .store
         .put(&key, current.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+        .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
 
     current.set_resource_version(new_rv);
     inject_type_meta(&mut current.body, &group, &version, &meta.kind);
@@ -221,7 +221,7 @@ pub async fn patch_resource_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -325,7 +325,7 @@ pub async fn patch_resource_status<S: Store>(
         .store
         .put(&key, current.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+        .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
 
     current.set_resource_version(new_rv);
     inject_type_meta(&mut current.body, &group, &version, &meta.kind);
@@ -428,7 +428,7 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &kind_fallback))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -481,7 +481,7 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
         .store
         .put(&key, storage_obj.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, &name, &kind))?;
+        .map_err(|e| store_err(e, &group, &plural, &name, &kind))?;
 
     current.set_resource_version(new_rv);
     inject_type_meta(&mut current.body, &group, &version, &kind);
@@ -533,7 +533,7 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -630,7 +630,7 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
         .store
         .put(&key, storage_obj.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, &name, &kind))?;
+        .map_err(|e| store_err(e, &group, &plural, &name, &kind))?;
 
     current.set_resource_version(new_rv);
     inject_type_meta(&mut current.body, &group, &version, &kind);

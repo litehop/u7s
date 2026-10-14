@@ -718,7 +718,7 @@ mod tests {
     /// help attackers understand the internal key structure and could aid path
     /// traversal or enumeration attacks.
     ///
-    /// Handlers must use Status::not_found(name, kind) which produces the Kubernetes-
+    /// Handlers must use Status::not_found(group, resource, name) which produces the Kubernetes-
     /// standard format `pods "nginx" not found` instead of forwarding e.to_string().
     #[test]
     fn store_not_found_to_string_contains_internal_key() {
@@ -737,20 +737,19 @@ mod tests {
     /// The Kubernetes-compatible 404 message must NOT include the internal store key.
     ///
     /// This test enforces the conversion contract: handlers must call
-    /// `Status::not_found(name, kind)` to produce the standard
+    /// `Status::not_found(group, resource, name)` to produce the standard
     /// `pods "nginx" not found` format, not forward `e.to_string()`.
     #[test]
     fn status_not_found_does_not_leak_internal_key() {
         let internal_key = "/registry/pods/default/nginx";
         let resource_name = "nginx";
-        let kind = "Pod";
 
-        let status_error = Status::not_found(resource_name, kind);
+        let status_error = Status::not_found("", "pods", resource_name);
         let message = &status_error.1.message;
 
         // Must produce the Kubernetes-standard format.
         assert_eq!(
-            message, "Pod \"nginx\" not found",
+            message, "pods \"nginx\" not found",
             "not_found message must match Kubernetes format"
         );
         // Must NOT contain the internal store key path.

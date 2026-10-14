@@ -28,18 +28,6 @@ pub struct Status {
 
 pub struct StatusError(pub StatusCode, pub Status);
 
-impl StatusError {
-    /// Upstream's NewNotFound(qualifiedResource, name) sets `details.kind` to the lowercase
-    /// plural resource and `details.group` to the API group, not the object Kind.
-    pub fn for_resource(mut self, group: &str, resource: &str) -> Self {
-        if let Some(d) = self.1.details.as_mut().and_then(|d| d.as_object_mut()) {
-            d.insert("kind".into(), resource.into());
-            d.insert("group".into(), group.into());
-        }
-        self
-    }
-}
-
 impl std::fmt::Debug for StatusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "StatusError({}: {})", self.0, self.1.message)
@@ -53,18 +41,48 @@ impl IntoResponse for StatusError {
 }
 
 impl Status {
-    pub fn not_found(name: &str, kind: &str) -> StatusError {
+    /// Mirrors upstream `NewNotFound(GroupResource{group, resource}, name)`: message is
+    /// `<resource>[.<group>] "<name>" not found`; `details.kind` is the lowercase plural
+    /// resource (not the object Kind) and `details.group` is omitted for the core group.
+    pub fn not_found(group: &str, resource: &str, name: &str) -> StatusError {
+        let qualified = if group.is_empty() {
+            resource.to_string()
+        } else {
+            format!("{resource}.{group}")
+        };
+        let mut details = serde_json::json!({ "name": name, "kind": resource });
+        if !group.is_empty() {
+            details["group"] = group.into();
+        }
         StatusError(
             StatusCode::NOT_FOUND,
             Status {
                 kind: "Status",
                 api_version: "v1",
                 status: "Failure",
-                message: format!("{kind} \"{name}\" not found"),
+                message: format!("{qualified} \"{name}\" not found"),
                 reason: "NotFound",
                 code: 404,
                 metadata: None,
-                details: Some(Box::new(serde_json::json!({ "name": name, "kind": kind }))),
+                details: Some(Box::new(details)),
+            },
+        )
+    }
+
+    /// Upstream's response for a request path that names no served resource (no qualified
+    /// resource, so no `details`).
+    pub fn route_not_found() -> StatusError {
+        StatusError(
+            StatusCode::NOT_FOUND,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message: "the server could not find the requested resource".into(),
+                reason: "NotFound",
+                code: 404,
+                metadata: None,
+                details: None,
             },
         )
     }
@@ -266,7 +284,7 @@ impl Status {
         err: &u7s_store::CreateNamespacedError,
     ) -> StatusError {
         if matches!(err, u7s_store::CreateNamespacedError::NamespaceNotFound) {
-            return Status::not_found(ns, "namespaces");
+            return Status::not_found("", "namespaces", ns);
         }
         let mut e = Status::forbidden(format!(
             "unable to create new content in namespace {ns} because it is being terminated"
@@ -360,13 +378,23 @@ mod tests {
     // clients (kubectl, client-go retries keyed on the missing object) read them instead of
     // parsing the message, so a Kind there ("Widget") would mis-identify the resource.
     #[test]
-    fn not_found_for_resource_carries_name_group_and_plural_kind_details() {
-        let StatusError(_, status) =
-            Status::not_found("web", "Widget").for_resource("example.com", "widgets");
+    fn not_found_carries_name_group_and_plural_kind_details() {
+        let StatusError(_, status) = Status::not_found("example.com", "widgets", "web");
         let details = status.details.expect("NotFound must carry details");
         assert_eq!(details["name"], "web");
         assert_eq!(details["kind"], "widgets");
         assert_eq!(details["group"], "example.com");
+        assert_eq!(status.message, "widgets.example.com \"web\" not found");
+    }
+
+    // Upstream's StatusDetails.Group is `omitempty` and GroupResource.String() drops the dot
+    // for the core group: `pods "x" not found`, not `pods. "x" not found`.
+    #[test]
+    fn not_found_core_group_omits_group_and_dot() {
+        let StatusError(_, status) = Status::not_found("", "pods", "x");
+        assert_eq!(status.message, "pods \"x\" not found");
+        let details = status.details.expect("NotFound must carry details");
+        assert!(details.get("group").is_none(), "core group must be omitted");
     }
 
     // not_acceptable must produce HTTP 406 with reason "NotAcceptable" so client-go's

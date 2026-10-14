@@ -398,7 +398,7 @@ pub(crate) async fn get_resource<S: Store>(
         .get(key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind).for_resource(&group, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -611,7 +611,7 @@ pub(crate) async fn create_resource<S: Store>(
                     .store
                     .put(&key, obj.to_bytes(), None)
                     .await
-                    .map_err(|e| store_err(e, &name, &meta.kind))?;
+                    .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
             }
             // The client never chose this name (it came from generateName) — a collision
             // is the server's random suffix landing on an existing object, not a real
@@ -651,12 +651,12 @@ pub(crate) async fn create_resource<S: Store>(
                     .get(&key)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+                    .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
                 let existing: serde_json::Value = serde_json::from_slice(&stored.value)
                     .map_err(|e| Status::internal(e.to_string()))?;
                 return Ok((StatusCode::CONFLICT, Json(existing)).into_response());
             }
-            Err(e) => return Err(store_err(e, &name, &meta.kind)),
+            Err(e) => return Err(store_err(e, &group, &plural, &name, &meta.kind)),
         }
     };
     // Recomputed rather than threaded out of the loop above: cheap string formatting, and
@@ -720,6 +720,8 @@ pub(crate) async fn create_resource<S: Store>(
 fn check_replace_resource_version_precondition(
     expected_revision: Option<u64>,
     parsed: &Option<serde_json::Value>,
+    group: &str,
+    resource: &str,
     name: &str,
     kind: &str,
 ) -> Result<(), crate::status::StatusError> {
@@ -736,6 +738,8 @@ fn check_replace_resource_version_precondition(
     }
     Err(store_err(
         StoreError::RevisionMismatch { expected, current },
+        group,
+        resource,
         name,
         kind,
     ))
@@ -835,7 +839,14 @@ pub(crate) async fn replace_resource<S: Store>(
         // Stale-resourceVersion PUTs must 409, not fall through into the immutability
         // checks below using the (by-then-moved-on) freshly-read `parsed` — see
         // check_replace_resource_version_precondition's doc comment.
-        check_replace_resource_version_precondition(expected_revision, &parsed, &name, &meta.kind)?;
+        check_replace_resource_version_precondition(
+            expected_revision,
+            &parsed,
+            &group,
+            &plural,
+            &name,
+            &meta.kind,
+        )?;
 
         // Immutability check: PriorityClass.value drives scheduling/preemption ordering
         // cluster-wide; allowing it to change post-create would silently reorder
@@ -1068,7 +1079,7 @@ pub(crate) async fn replace_resource<S: Store>(
         ok = put_result.is_ok(),
         "replace_resource: store.put call completed"
     );
-    let new_rv = put_result.map_err(|e| store_err(e, &name, &meta.kind))?;
+    let new_rv = put_result.map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
 
     obj.set_resource_version(new_rv);
     if group == RBAC_GROUP {
@@ -1155,7 +1166,7 @@ pub(crate) async fn delete_resource<S: Store>(
             .get(&key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found(&name, &meta.kind).for_resource(&group, &plural))?;
+            .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -1208,7 +1219,7 @@ pub(crate) async fn delete_resource<S: Store>(
                     // write. Re-read the fresh object and redo the delete decision.
                     continue;
                 }
-                Err(e) => return Err(store_err(e, &name, &meta.kind)),
+                Err(e) => return Err(store_err(e, &group, &plural, &name, &meta.kind)),
             };
             // Evict from RBAC index immediately — permissions must not outlast the deletion
             // request even while finalizers are draining. Hard-delete path below also removes,
@@ -1244,7 +1255,7 @@ pub(crate) async fn delete_resource<S: Store>(
             .store
             .delete(&key, None)
             .await
-            .map_err(|e| store_err(e, &name, &meta.kind))?;
+            .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
 
         if group == RBAC_GROUP {
             let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
@@ -1319,7 +1330,7 @@ async fn complete_finalizer_drain<S: Store>(
         .store
         .delete(key, None)
         .await
-        .map_err(|e| store_err(e, name, &meta.kind))?;
+        .map_err(|e| store_err(e, &group, &plural, name, &meta.kind))?;
     if group == RBAC_GROUP {
         let rbac_key = match ns {
             None => rbac_cluster_key(group, version, plural, name),
@@ -1579,7 +1590,7 @@ pub(crate) async fn do_patch<S: Store>(
                     .get(key)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(name, &meta.kind))?;
+                    .ok_or_else(|| Status::not_found(&group, &plural, name))?;
                 let mut current = Object::from_bytes(&stored.value)
                     .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
                 // Full body (not just spec): restrict_node_self_write below also needs
@@ -1713,7 +1724,7 @@ pub(crate) async fn do_patch<S: Store>(
                     .store
                     .put(key, current.to_bytes(), expected_rv)
                     .await
-                    .map_err(|e| store_err(e, name, &meta.kind))?;
+                    .map_err(|e| store_err(e, &group, &plural, name, &meta.kind))?;
                 current.set_resource_version(rv);
                 if group == RBAC_GROUP {
                     let rbac_key = match ns {
@@ -1726,7 +1737,9 @@ pub(crate) async fn do_patch<S: Store>(
                 }
                 return Ok(Json(current.body).into_response());
             }
-            Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, name, &meta.kind)),
+            Err(CreateNamespacedError::Store(e)) => {
+                return Err(store_err(e, &group, &plural, name, &meta.kind))
+            }
         };
         obj.set_resource_version(new_rv);
         // SSA upsert-create: this is the same "object now exists" event create_resource's
@@ -1760,7 +1773,7 @@ pub(crate) async fn do_patch<S: Store>(
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
-    let mut stored = stored_opt.ok_or_else(|| Status::not_found(name, &meta.kind))?;
+    let mut stored = stored_opt.ok_or_else(|| Status::not_found(&group, &plural, name))?;
 
     // A plain PATCH (merge / strategic-merge / JSON Patch) carries no resourceVersion
     // precondition unless the client's own patch body sets metadata.resourceVersion.
@@ -2231,9 +2244,9 @@ pub(crate) async fn do_patch<S: Store>(
                     .get(key)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(name, &meta.kind))?;
+                    .ok_or_else(|| Status::not_found(&group, &plural, name))?;
             }
-            Err(e) => return Err(store_err(e, name, &meta.kind)),
+            Err(e) => return Err(store_err(e, &group, &plural, name, &meta.kind)),
         }
     }
 }
@@ -3047,7 +3060,7 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind).for_resource(&group, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -3300,7 +3313,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
                     .store
                     .put(&key, obj.to_bytes(), None)
                     .await
-                    .map_err(|e| store_err(e, &name, &meta.kind))?;
+                    .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
             }
             // The client never chose this name (it came from generateName) — a collision is
             // the server's random suffix landing on an existing object, not a real conflict
@@ -3340,12 +3353,14 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
                     .get(&key)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+                    .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
                 let existing: serde_json::Value = serde_json::from_slice(&stored.value)
                     .map_err(|e| Status::internal(e.to_string()))?;
                 return Ok((StatusCode::CONFLICT, Json(existing)).into_response());
             }
-            Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, &name, &meta.kind)),
+            Err(CreateNamespacedError::Store(e)) => {
+                return Err(store_err(e, &group, &plural, &name, &meta.kind))
+            }
         }
     };
 
@@ -3658,7 +3673,14 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         // Stale-resourceVersion PUTs must 409, not fall through into the immutability
         // checks below using the (by-then-moved-on) freshly-read `parsed` — see
         // check_replace_resource_version_precondition's doc comment.
-        check_replace_resource_version_precondition(expected_revision, &parsed, &name, &meta.kind)?;
+        check_replace_resource_version_precondition(
+            expected_revision,
+            &parsed,
+            &group,
+            &plural,
+            &name,
+            &meta.kind,
+        )?;
 
         // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
         // reject any update that modifies data/binaryData/stringData or clears the
@@ -3780,7 +3802,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // PodCertificateRequest forbids create-on-update (upstream AllowCreateOnUpdate=false): a
     // PUT must not bypass the POST-only NodeRestriction by creating the object.
     if !object_existed && group == "certificates.k8s.io" && plural == "podcertificaterequests" {
-        return Err(Status::not_found(&name, &meta.kind));
+        return Err(Status::not_found(&group, &plural, &name));
     }
 
     // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
@@ -4045,16 +4067,18 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
                     .store
                     .put(&key, obj.to_bytes(), None)
                     .await
-                    .map_err(|e| store_err(e, &name, &meta.kind))?
+                    .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?
             }
-            Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, &name, &meta.kind)),
+            Err(CreateNamespacedError::Store(e)) => {
+                return Err(store_err(e, &group, &plural, &name, &meta.kind))
+            }
         }
     } else {
         let put_result = state
             .store
             .put(&key, obj.to_bytes(), expected_revision)
             .await;
-        put_result.map_err(|e| store_err(e, &name, &meta.kind))?
+        put_result.map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?
     };
     tracing::debug!(
         key = %key,
@@ -4153,7 +4177,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             .get(&key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found(&name, &meta.kind).for_resource(&group, &plural))?;
+            .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -4211,7 +4235,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
                     // write. Re-read the fresh object and redo the delete decision.
                     continue;
                 }
-                Err(e) => return Err(store_err(e, &name, &meta.kind)),
+                Err(e) => return Err(store_err(e, &group, &plural, &name, &meta.kind)),
             };
             // Evict from RBAC index immediately on soft-delete — same rationale as
             // delete_resource: permissions must not outlast the deletion request.
@@ -4242,7 +4266,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             .store
             .delete(&key, None)
             .await
-            .map_err(|e| store_err(e, &name, &meta.kind))?;
+            .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
 
         // Capture what post-loop cascade side effects need from the freshly-read `obj`
         // before it drops at the end of this iteration — `obj` itself is loop-scoped
@@ -4366,9 +4390,7 @@ pub(crate) async fn patch_collection_namespaced_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_path_segment("namespace", &ns)?;
-    let meta = lookup(&state, &group, &version, &plural)
-        .cloned()
-        .map_err(|_| Status::not_found(&plural, &format!("{group}/{version}/{plural}")))?;
+    let meta = lookup(&state, &group, &version, &plural).cloned()?;
 
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
     let resp = state

@@ -345,7 +345,7 @@ fn parse_crd(body: &Bytes) -> Result<CustomResourceDefinition, crate::status::St
 
 fn store_err_crd(err: StoreError, name: &str) -> crate::status::StatusError {
     match err {
-        StoreError::NotFound { .. } => Status::not_found(name, KIND),
+        StoreError::NotFound { .. } => Status::not_found(GROUP, PLURAL, name),
         StoreError::AlreadyExists { .. } => Status::already_exists(name, KIND),
         other => Status::internal(other.to_string()),
     }
@@ -696,7 +696,7 @@ pub async fn get_crd<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, KIND))?;
+        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
     Ok((
         StatusCode::OK,
@@ -735,7 +735,7 @@ pub async fn replace_crd<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, KIND))?;
+        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
@@ -870,7 +870,7 @@ pub async fn delete_crd<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, KIND))?;
+        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
     // Parse DeleteOptions from the request body (same pattern as single-object delete
     // handlers). client-go's typed Delete() sends DryRun in this body; a raw/proxied caller
@@ -1463,7 +1463,7 @@ pub async fn patch_crd<S: Store>(
         return Ok((StatusCode::CREATED, Json(crd)).into_response());
     }
 
-    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, KIND))?;
+    let stored = stored_opt.ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -1625,7 +1625,7 @@ pub async fn put_crd_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, KIND))?;
+        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -1676,7 +1676,7 @@ pub async fn patch_crd_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, KIND))?;
+        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;

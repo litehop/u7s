@@ -140,7 +140,7 @@ pub async fn create_token<S: Store>(
         .get(&sa_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&sa_name, "ServiceAccount"))?;
+        .ok_or_else(|| Status::not_found("", "serviceaccounts", &sa_name))?;
 
     // 3. Require a signing key.
     let encoding_key = state
