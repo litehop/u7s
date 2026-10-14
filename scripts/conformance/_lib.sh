@@ -249,3 +249,35 @@ reconcile_cni0() {
     esac
   fi
 }
+
+# Pod args are immutable, so re-applying a Pod whose args changed aborts the
+# script. Returns 0 when <desired> and <live> (newline-separated arg lists)
+# differ. An empty <live> (no such pod) is not a difference: nothing to delete.
+agent_args_differ() {
+  [ -n "$2" ] && [ "$1" != "$2" ]
+}
+
+# Applies the Pod manifest on stdin, first deleting the live Pod <pod> when its
+# container args differ from <desired_args> (newline-separated). Fails loud if
+# the delete or apply fails.
+apply_pod_recreating_on_args_change() {
+  local kubeconfig="$1" ns="$2" pod="$3" desired="$4" live manifest
+  manifest=$(cat)
+  live=$(kubectl --kubeconfig="$kubeconfig" get pod "$pod" -n "$ns" --ignore-not-found \
+    -o jsonpath='{range .spec.containers[0].args[*]}{@}{"\n"}{end}') || {
+    echo "ERROR: cannot read live args of pod $ns/$pod" >&2
+    return 1
+  }
+  live="${live%$'\n'}"
+  if agent_args_differ "$desired" "$live"; then
+    echo "pod $ns/$pod args changed; deleting it so the new args can be applied (pod args are immutable)."
+    kubectl --kubeconfig="$kubeconfig" delete pod "$pod" -n "$ns" --wait=true || {
+      echo "ERROR: failed to delete stale pod $ns/$pod" >&2
+      return 1
+    }
+  fi
+  printf '%s\n' "$manifest" | kubectl --kubeconfig="$kubeconfig" apply --validate=false -f - || {
+    echo "ERROR: failed to apply pod $ns/$pod" >&2
+    return 1
+  }
+}
