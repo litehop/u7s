@@ -1482,6 +1482,10 @@ pub async fn run_scheduler(
                             guard.remove(key);
                         }
                     }
+                    info!(
+                        "pod cache synced — releasing {} events held during the replay",
+                        deferred.len()
+                    );
                     let _ = pods_synced_tx_ref.send(true);
                     deferred
                 }
