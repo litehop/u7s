@@ -117,6 +117,8 @@
 set -euo pipefail
 
 REPO_ROOT="${WORKTREE_HYGIENE_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=scripts/_kill-pattern.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_kill-pattern.sh"
 
 run_cmd() {
   if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -396,19 +398,9 @@ filter_orphans_by_live_agents() {
 # the kill step and the "did it actually die" verify step derive the exact
 # same pattern instead of two independently-written regexes drifting apart.
 #
-# The path is ERE-escaped and preceded by a ' ' or '=' (the argv separators of
-# --flag <path> / --flag=<path>) so a dead path that is a suffix of a live
-# one (/a/wt vs /x/a/wt) cannot match the live process; /temp/u7s must end at
-# a separator so /temp/u7s2 does not match either.
+# Anchoring/escaping lives in _kill-pattern.sh.
 kill_pattern_for() {
-  local proc_type="$1" wpath="$2" esc
-  esc=$(printf '%s' "$wpath" | sed -E 's/[][\.*^$+?(){}|\\]/\\&/g')
-  case "$proc_type" in
-    apiserver) printf 'u7s-apiserver.*[ =]%s/temp/u7s/kubeconfig' "$esc" ;;
-    scheduler) printf 'u7s-scheduler.*[ =]%s/temp/u7s/kubeconfig' "$esc" ;;
-    konnectivity-server) printf 'konnectivity-server.*[ =]%s/temp/u7s([/ ]|$)' "$esc" ;;
-    sample-run-metrics) printf 'sample-run-metrics.sh.*[ =]%s/temp/u7s([/ ]|$)' "$esc" ;;
-  esac
+  workdir_kill_pattern "$1" "$2/temp/u7s"
 }
 
 stale_records() {

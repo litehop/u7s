@@ -80,6 +80,8 @@ ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=scripts/conformance/_lib.sh
 source "$REPO/scripts/conformance/_lib.sh"
+# shellcheck source=scripts/_kill-pattern.sh
+source "$REPO/scripts/_kill-pattern.sh"
 
 RESET=0
 BACKGROUND=0
@@ -144,7 +146,7 @@ SERVER_BIN=$(echo "$KONNECTIVITY_OUT" | grep '^server=' | cut -d= -f2)
 
 # Kill this worktree's konnectivity-server (scoped by cert path) so a --reset
 # doesn't leave one running with cert paths that no longer exist in the wiped WORKDIR.
-pkill -f "konnectivity-server.*${WORKDIR}" 2>/dev/null || true
+pkill -f "$(workdir_kill_pattern konnectivity-server "$WORKDIR")" 2>/dev/null || true
 
 if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
@@ -234,7 +236,7 @@ EXTEOF
     rm -f "$WORKDIR/konnectivity-server.csr"
   fi
 
-  pkill -f "konnectivity-server.*${WORKDIR}" || true
+  pkill -f "$(workdir_kill_pattern konnectivity-server "$WORKDIR")" || true
 
   # pkill only matches processes whose command line contains THIS workdir, so
   # it can never kill a foreign konnectivity-server (e.g. another worktree's,
