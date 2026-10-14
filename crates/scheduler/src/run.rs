@@ -492,14 +492,11 @@ const NODE_WATCH_PATH: &str =
 /// fresh `sendInitialEvents=true` relist never corrects (it only re-adds
 /// what still exists).
 ///
-/// `ready`, when given, is set to `true` the first time this watch's initial
+/// `ready` is set to `true` the first time this watch's initial
 /// `sendInitialEvents=true` relist completes (the apiserver's
-/// `k8s.io/initial-events-end` BOOKMARK — see `is_initial_events_end_bookmark`)
-/// — the readiness signal `run_scheduler`'s primary pod watch and periodic
-/// resync loop both await before serving any scheduling decision, so a
-/// restart with a pending-pod backlog never fail-safes every decision for
-/// lack of cached nodes (see those await sites' own comments for the full
-/// story).
+/// `k8s.io/initial-events-end` BOOKMARK — see `is_initial_events_end_bookmark`).
+/// `run_scheduler` joins every cache's `ready` before serving any scheduling
+/// decision. It is never reset: a later reconnect does not re-block scheduling.
 async fn run_cache_watch_loop(
     connector: TlsConnector,
     server: String,
@@ -507,7 +504,7 @@ async fn run_cache_watch_loop(
     path: &'static str,
     apply: fn(&mut NodeTally, &serde_json::Value),
     clear: fn(&mut NodeTally),
-    ready: Option<tokio::sync::watch::Sender<bool>>,
+    ready: tokio::sync::watch::Sender<bool>,
 ) {
     loop {
         info!("starting cache watch on {path}");
@@ -517,9 +514,7 @@ async fn run_cache_watch_loop(
         let result = stream_watch_events(&connector, &server, path, |event| {
             if !synced && is_initial_events_end_bookmark(&event) {
                 synced = true;
-                if let Some(ready) = &ready {
-                    let _ = ready.send(true);
-                }
+                let _ = ready.send(true);
             }
             apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event);
         })
@@ -545,11 +540,17 @@ async fn run_pvc_watch_loop(
     server: String,
     tally: Arc<Mutex<NodeTally>>,
     in_flight: Arc<Mutex<HashSet<String>>>,
+    ready: tokio::sync::watch::Sender<bool>,
 ) {
     loop {
         info!("starting cache watch on {PVC_WATCH_PATH}");
         tally.lock().expect("tally lock poisoned").clear_pvc_cache();
+        let mut synced = false;
         let result = stream_watch_events(&connector, &server, PVC_WATCH_PATH, |event| {
+            if !synced && is_initial_events_end_bookmark(&event) {
+                synced = true;
+                let _ = ready.send(true);
+            }
             let waiting_pods = tally
                 .lock()
                 .expect("tally lock poisoned")
@@ -632,12 +633,12 @@ fn is_initial_events_end_bookmark(event: &serde_json::Value) -> bool {
 /// (see `RESYNC_INTERVAL`'s doc comment for why the watch alone cannot be
 /// relied on to do that).
 ///
-/// `node_cache_synced_rx` gates the very first tick on the same node-cache
+/// `caches_synced_rx` gates the very first tick on the same all-caches
 /// readiness signal `run_scheduler`'s primary pod watch awaits, for the same
-/// reason: a tick that fired before the node cache's initial sync landed
-/// would fail-safe every decision for lack of cached nodes, reproducing the
-/// primary watch's own restart-backlog gap via this independent 30s timer
-/// instead of a fresh connect. A function of its own (not inlined in
+/// reason: a tick that fired before every cache's initial sync landed would
+/// decide against partial state (no nodes, or an unsynced CSIDriver cache
+/// read as "no opt-in"), reproducing the primary watch's own gap via this
+/// independent 30s timer instead of a fresh connect. A function of its own (not inlined in
 /// `run_scheduler`) so this gating can be exercised directly in a test
 /// without also standing up the primary pod watch and every secondary cache
 /// watch.
@@ -650,12 +651,10 @@ async fn run_resync_loop(
     server: String,
     in_flight: Arc<Mutex<HashSet<String>>>,
     tally: Arc<Mutex<NodeTally>>,
-    mut node_cache_synced_rx: tokio::sync::watch::Receiver<bool>,
+    mut caches_synced_rx: tokio::sync::watch::Receiver<bool>,
     interval: std::time::Duration,
 ) {
-    if !*node_cache_synced_rx.borrow() {
-        let _ = node_cache_synced_rx.changed().await;
-    }
+    let _ = caches_synced_rx.wait_for(|synced| *synced).await;
     loop {
         tokio::time::sleep(interval).await;
         let (status, body) = match http_get(&connector, &server, RESYNC_PODS_PATH).await {
@@ -1227,26 +1226,43 @@ pub async fn run_scheduler(
     // replays the full history the store still holds.
     let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
 
-    // `node_cache_synced` is the node watch's readiness barrier — see the
-    // primary pod watch's own await on it further down for the full story on
-    // why a scheduling decision must never be served before this fires. A
-    // `watch` channel, not a `Notify`: both the resync loop below and that
-    // later await are independent consumers of the same one-time transition
-    // to "synced", and a `Notify::notify_one()` wakes at most one of them —
-    // whichever happened to be waiting first would starve the other forever.
-    // `watch` instead retains the current value, so each consumer's own
-    // cloned receiver observes it correctly regardless of arrival order.
-    let (node_cache_synced_tx, mut node_cache_synced_rx) = tokio::sync::watch::channel(false);
+    // One readiness signal per cache the predicates read (nodes, CSINode,
+    // CSIDriver, PVC, PV, StorageClass), joined into `caches_synced`: the
+    // one-time startup gate (upstream WaitForCacheSync) for the primary pod
+    // watch and the resync loop. A `watch` channel, not a `Notify`: both are
+    // independent consumers of the same one-time transition, and `watch`
+    // retains the value so each cloned receiver sees it in any arrival order.
+    let mut cache_ready_rxs = Vec::new();
+    let mut new_cache_ready = || {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        cache_ready_rxs.push(rx);
+        tx
+    };
+    let pvc_ready_tx = new_cache_ready();
+    let pv_ready_tx = new_cache_ready();
+    let storage_class_ready_tx = new_cache_ready();
+    let csi_node_ready_tx = new_cache_ready();
+    let csi_driver_ready_tx = new_cache_ready();
+    let node_ready_tx = new_cache_ready();
+    let (caches_synced_tx, mut caches_synced_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        for mut rx in cache_ready_rxs {
+            if rx.wait_for(|synced| *synced).await.is_err() {
+                return;
+            }
+        }
+        let _ = caches_synced_tx.send(true);
+    });
 
     // Periodic re-sync, independent of the watch stream below — see
     // `run_resync_loop`'s doc comment for what it does and why it is gated
-    // on `node_cache_synced_rx` the same way the primary pod watch is.
+    // on `caches_synced_rx` the same way the primary pod watch is.
     tokio::spawn(run_resync_loop(
         connector.clone(),
         server.clone(),
         in_flight.clone(),
         tally.clone(),
-        node_cache_synced_rx.clone(),
+        caches_synced_rx.clone(),
         RESYNC_INTERVAL,
     ));
 
@@ -1256,22 +1272,6 @@ pub async fn run_scheduler(
     // of a live GET /api/v1/nodes (see `run_cache_watch_loop`'s doc comment)
     // — each watched independently so one's reconnect never blocks the
     // others or the primary pod watch.
-    //
-    // `node_cache_synced_tx` (declared above, alongside the resync loop that
-    // shares it) is notified below once, on the node watch's first
-    // sendInitialEvents relist.
-    //
-    // Only the node watch gets a `ready` sender — the PVC/PV/StorageClass/
-    // CSINode/CSIDriver caches deliberately have none. A pod needing `missing_required_csi_driver`
-    // (see its doc comment) scheduled before the CSINode watch's own initial
-    // relist lands sees an empty `node_registered_drivers` set and fails
-    // closed on every node, same as any other watch-cache-miss; unlike the
-    // node cache's absence (which would fail closed for EVERY pending pod),
-    // this only affects pods with unbound CSI-backed PVCs, and self-heals via
-    // `pods_needing_resync`'s `RESYNC_INTERVAL` retry (30s) once the relist
-    // lands — never a permanent wedge. Gating the pod watch on it too would
-    // trade a bounded, narrow, self-healing delay for an unconditional
-    // startup stall on every pod, CSI or not — not worth it pre-alpha.
     //
     // The PVC watch runs its own dedicated loop (below), not this generic
     // one: unlike the other three caches, a PVC ADDED/MODIFIED event can also
@@ -1284,37 +1284,38 @@ pub async fn run_scheduler(
         server.clone(),
         tally.clone(),
         in_flight.clone(),
+        pvc_ready_tx,
     ));
     for (path, apply, clear, ready) in [
         (
             PV_WATCH_PATH,
             NodeTally::apply_pv_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_pv_cache as fn(&mut NodeTally),
-            None,
+            pv_ready_tx,
         ),
         (
             STORAGE_CLASS_WATCH_PATH,
             NodeTally::apply_storage_class_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_storage_class_cache as fn(&mut NodeTally),
-            None,
+            storage_class_ready_tx,
         ),
         (
             CSI_NODE_WATCH_PATH,
             NodeTally::apply_csi_node_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_csi_node_cache as fn(&mut NodeTally),
-            None,
+            csi_node_ready_tx,
         ),
         (
             CSI_DRIVER_WATCH_PATH,
             NodeTally::apply_csi_driver_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_csi_driver_cache as fn(&mut NodeTally),
-            None,
+            csi_driver_ready_tx,
         ),
         (
             NODE_WATCH_PATH,
             NodeTally::apply_node_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_node_cache as fn(&mut NodeTally),
-            Some(node_cache_synced_tx.clone()),
+            node_ready_tx,
         ),
     ] {
         tokio::spawn(run_cache_watch_loop(
@@ -1328,21 +1329,14 @@ pub async fn run_scheduler(
         ));
     }
 
-    // Readiness barrier: block starting the pod watch (and therefore every
-    // scheduling decision) until the node cache's initial sendInitialEvents
-    // relist has landed. Without this, a scheduler restart with a pending-pod
-    // backlog sees an empty node cache and pick_node fail-safes EVERY
-    // decision — no wrong bind, but no progress either — until the node
-    // watch's own reconnect loop eventually lands the list or the 30s
-    // RESYNC_INTERVAL retries, whichever comes first. This wait is normally a
-    // single network round-trip, not an indefinite stall: on any watch error
-    // before the bookmark arrives, run_cache_watch_loop's own 5s-backoff
-    // reconnect keeps retrying underneath it.
-    info!("waiting for node cache initial sync before serving scheduling decisions");
-    if !*node_cache_synced_rx.borrow() {
-        let _ = node_cache_synced_rx.changed().await;
-    }
-    info!("node cache synced — starting pod watch");
+    // Block the pod watch (and therefore every scheduling decision) until
+    // every cache's initial list has landed, as upstream's WaitForCacheSync
+    // does. An unsynced node cache fail-safes every decision; an unsynced
+    // CSIDriver cache reads as "no opt-in" and fails the CSI-driver check open.
+    // Watch errors before a cache's bookmark are retried by its own loop.
+    info!("waiting for node/CSINode/CSIDriver/PVC/PV/StorageClass caches to sync before serving scheduling decisions");
+    let _ = caches_synced_rx.wait_for(|synced| *synced).await;
+    info!("all scheduler caches synced — starting pod watch");
 
     // Watch loop — reconnect on error with a short backoff.
     loop {
@@ -1495,22 +1489,32 @@ mod tests {
         panic!("timed out waiting for: {what}");
     }
 
-    /// Regression for the node-cache readiness barrier in `run_scheduler`:
-    /// without it, the pod watch loop starts in parallel with the node
-    /// watch's own initial `sendInitialEvents=true` relist, so a restart
-    /// with a pending-pod backlog can see the pod watch's ADDED events
-    /// before a single node is cached — `pick_node` then fail-safes every
-    /// one of them (no wrong bind, but no progress either) until the node
-    /// watch's own reconnect eventually lands the list or the 30s
-    /// RESYNC_INTERVAL retries. This test withholds the node watch's
-    /// initial-events-end BOOKMARK (the sync signal) past when the pod
-    /// watch would otherwise already be connected, and asserts the pod
-    /// watch endpoint is never even DIALED until that BOOKMARK is released.
-    /// Revert the `node_cache_synced.notified().await` barrier in
-    /// `run_scheduler` and this test fails: the pod watch connects
-    /// immediately, well before the release.
+    /// Regression for the all-caches readiness barrier in `run_scheduler`:
+    /// without it, the pod watch loop starts in parallel with the caches'
+    /// own initial `sendInitialEvents=true` relists, so a restart with a
+    /// pending-pod backlog decides against partial state — no cached node
+    /// fail-safes every pod, and an unsynced CSIDriver cache reads as "no
+    /// opt-in" so a pod needing an opted-in driver can land on a driverless
+    /// node. Each of the six caches in turn has its initial-events-end
+    /// BOOKMARK (the sync signal) withheld past when the pod watch would
+    /// otherwise already be connected; the pod watch endpoint must never be
+    /// DIALED until that BOOKMARK is released. Gating on only some of the
+    /// caches fails the case for each one left out.
     #[tokio::test]
-    async fn run_scheduler_defers_pod_watch_until_node_cache_initial_sync() {
+    async fn run_scheduler_defers_pod_watch_until_every_cache_initial_sync() {
+        for withheld_path in [
+            NODE_WATCH_PATH,
+            CSI_NODE_WATCH_PATH,
+            CSI_DRIVER_WATCH_PATH,
+            PVC_WATCH_PATH,
+            PV_WATCH_PATH,
+            STORAGE_CLASS_WATCH_PATH,
+        ] {
+            assert_pod_watch_deferred_until_released(withheld_path).await;
+        }
+    }
+
+    async fn assert_pod_watch_deferred_until_released(withheld_path: &'static str) {
         use rcgen::{CertificateParams, KeyPair, SanType};
         use rustls::pki_types::PrivateKeyDer;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1625,11 +1629,11 @@ mod tests {
         std::fs::write(&kubeconfig_path, &kubeconfig_yaml).expect("write temp kubeconfig");
 
         let pod_watch_connected = Arc::new(AtomicBool::new(false));
-        let release_node_bookmark = Arc::new(Notify::new());
+        let release_withheld_bookmark = Arc::new(Notify::new());
 
         {
             let pod_watch_connected = pod_watch_connected.clone();
-            let release_node_bookmark = release_node_bookmark.clone();
+            let release_withheld_bookmark = release_withheld_bookmark.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((tcp, _)) = listener.accept().await else {
@@ -1637,7 +1641,7 @@ mod tests {
                     };
                     let acceptor = acceptor.clone();
                     let pod_watch_connected = pod_watch_connected.clone();
-                    let release_node_bookmark = release_node_bookmark.clone();
+                    let release_withheld_bookmark = release_withheld_bookmark.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(tcp).await else {
                             return;
@@ -1676,10 +1680,10 @@ mod tests {
                             // round-trip completed.
                             pod_watch_connected.store(true, Ordering::SeqCst);
                             send_chunk(&mut tls, &initial_events_end_bookmark("Pod")).await;
-                        } else if path == NODE_WATCH_PATH {
+                        } else if path == withheld_path {
                             // Held back until the test releases it — this is
                             // what the readiness barrier is waiting on.
-                            release_node_bookmark.notified().await;
+                            release_withheld_bookmark.notified().await;
                             send_chunk(&mut tls, &initial_events_end_bookmark("Node")).await;
                         } else {
                             // PVC/PV/StorageClass/CSINode: irrelevant to this
@@ -1703,17 +1707,16 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
             !pod_watch_connected.load(Ordering::SeqCst),
-            "the pod watch must not connect before the node cache's initial sync completes — \
-             connecting this early means a restart's pending-pod backlog can be fail-safed by \
-             pick_node for lack of any cached node, exactly the regression this barrier exists \
-             to prevent"
+            "the pod watch must not connect before the {withheld_path} cache's initial sync \
+             completes — scheduling against a partially synced cache set fails closed (no \
+             nodes) or open (CSIDriver opt-in unseen) after a scheduler restart"
         );
 
-        release_node_bookmark.notify_one();
+        release_withheld_bookmark.notify_one();
 
         wait_until(
             || pod_watch_connected.load(Ordering::SeqCst),
-            "the pod watch to connect promptly once the node cache's initial sync completes",
+            "the pod watch to connect promptly once the withheld cache's initial sync completes",
         )
         .await;
 
