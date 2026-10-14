@@ -779,13 +779,22 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
 /// Upstream `customResourceStrategy.PrepareForCreate`, run after mutating admission: forces
 /// `generation` to 1 and, when the CRD version has a status subresource, drops `.status` so
 /// create cannot set it. A webhook patch to either must not persist.
-fn prepare_cr_for_create(ctx: &CrContext, obj: &mut serde_json::Value) {
+///
+/// Then schema + CEL validation of the mutated object, as upstream's `rest.BeforeCreate`
+/// runs `Validate` after mutating admission: validating a pre-webhook object would let a
+/// webhook persist a schema-invalid CR.
+fn prepare_cr_for_create(
+    ctx: &CrContext,
+    cache: &crate::state::CrSchemaCache,
+    obj: &mut serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
     if ctx.has_status_subresource {
         if let Some(map) = obj.as_object_mut() {
             map.remove("status");
         }
     }
     obj["metadata"]["generation"] = serde_json::json!(1i64);
+    validate_cr_schema(obj, ctx, cache, None)
 }
 
 /// Anything outside `metadata` (`apiVersion`/`kind` are envelope, not content) differing
@@ -2841,8 +2850,6 @@ pub async fn create_cr<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
-
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
     let admission_ctx = AdmissionContext {
@@ -2861,7 +2868,7 @@ pub async fn create_cr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    prepare_cr_for_create(&ctx, &mut obj);
+    prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -3038,8 +3045,6 @@ pub async fn replace_cr<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
-
     // A PUT whose body has deletionTimestamp set and finalizers now empty is how a
     // controller that removes its own protection finalizer via Update rather than Patch
     // (e.g. external-snapshotter's snapshot-controller on VolumeSnapshotContent) completes
@@ -3050,6 +3055,7 @@ pub async fn replace_cr<S: Store>(
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
         if !is_dry_run_header(&headers) {
             complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
         }
@@ -3075,6 +3081,7 @@ pub async fn replace_cr<S: Store>(
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
     debug_assert_eq!(
         existing["metadata"]["uid"], obj["metadata"]["uid"],
         "old_object passed to run_validating_webhooks must be the same resource's pre-update \
@@ -3839,8 +3846,6 @@ pub async fn create_cr_namespaced<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
-
     obj["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
@@ -3860,7 +3865,7 @@ pub async fn create_cr_namespaced<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    prepare_cr_for_create(&ctx, &mut obj);
+    prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -4073,8 +4078,6 @@ pub async fn replace_cr_namespaced<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
-
     // A PUT whose body has deletionTimestamp set and finalizers now empty is how a
     // controller that removes its own protection finalizer via Update rather than Patch
     // (e.g. external-snapshotter's snapshot-controller on VolumeSnapshot) completes a
@@ -4086,6 +4089,7 @@ pub async fn replace_cr_namespaced<S: Store>(
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
         if !is_dry_run_header(&headers) {
             complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
         }
@@ -4111,6 +4115,7 @@ pub async fn replace_cr_namespaced<S: Store>(
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
     debug_assert_eq!(
         existing["metadata"]["uid"], obj["metadata"]["uid"],
         "old_object passed to run_validating_webhooks must be the same resource's pre-update \
@@ -4494,7 +4499,6 @@ pub async fn patch_cr<S: Store>(
         if let Some(schema) = ctx.schema.as_deref() {
             apply_crd_schema_defaults(schema, &mut obj);
         }
-        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
         let admission_ctx = AdmissionContext {
             group: &group,
             version: &version,
@@ -4511,7 +4515,7 @@ pub async fn patch_cr<S: Store>(
             dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-        prepare_cr_for_create(&ctx, &mut obj);
+        prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -4625,8 +4629,6 @@ pub async fn patch_cr<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
-
     // A patch whose body has deletionTimestamp set and finalizers now empty is how KCM's GC
     // controller completes an Orphan-marked delete_cr: it strips ownerReferences from every
     // dependent CR, then removes the owner's `orphan` finalizer via PATCH. Complete the delete
@@ -4634,6 +4636,7 @@ pub async fn patch_cr<S: Store>(
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
         if !is_dry_run_header(&headers) {
             complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
         }
@@ -4669,6 +4672,7 @@ pub async fn patch_cr<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
     apply_cr_generation_on_update(&old, &mut obj);
@@ -4760,7 +4764,6 @@ pub async fn patch_cr_namespaced<S: Store>(
         if let Some(schema) = ctx.schema.as_deref() {
             apply_crd_schema_defaults(schema, &mut obj);
         }
-        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
         let admission_ctx = AdmissionContext {
             group: &group,
             version: &version,
@@ -4777,7 +4780,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-        prepare_cr_for_create(&ctx, &mut obj);
+        prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -4925,8 +4928,6 @@ pub async fn patch_cr_namespaced<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
-
     // A patch whose body has deletionTimestamp set and finalizers now empty is how KCM's GC
     // controller completes an Orphan-marked delete_cr_namespaced: it strips ownerReferences
     // from every dependent CR, then removes the owner's `orphan` finalizer via PATCH. Complete
@@ -4934,6 +4935,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
         if !is_dry_run_header(&headers) {
             complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
         }
@@ -4969,6 +4971,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
     apply_cr_generation_on_update(&old, &mut obj);
@@ -25924,5 +25927,376 @@ mod tests {
                 "{path:?}: a CRD without a status subresource treats status as plain data"
             );
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum WriteSite {
+        CreateCluster,
+        CreateNamespaced,
+        ApplyCreateCluster,
+        ApplyCreateNamespaced,
+        ReplaceCluster,
+        ReplaceNamespaced,
+        PatchCluster,
+        PatchNamespaced,
+    }
+
+    impl WriteSite {
+        const ALL: [WriteSite; 8] = [
+            WriteSite::CreateCluster,
+            WriteSite::CreateNamespaced,
+            WriteSite::ApplyCreateCluster,
+            WriteSite::ApplyCreateNamespaced,
+            WriteSite::ReplaceCluster,
+            WriteSite::ReplaceNamespaced,
+            WriteSite::PatchCluster,
+            WriteSite::PatchNamespaced,
+        ];
+        fn namespaced(self) -> bool {
+            matches!(
+                self,
+                WriteSite::CreateNamespaced
+                    | WriteSite::ApplyCreateNamespaced
+                    | WriteSite::ReplaceNamespaced
+                    | WriteSite::PatchNamespaced
+            )
+        }
+        fn is_create(self) -> bool {
+            matches!(
+                self,
+                WriteSite::CreateCluster
+                    | WriteSite::CreateNamespaced
+                    | WriteSite::ApplyCreateCluster
+                    | WriteSite::ApplyCreateNamespaced
+            )
+        }
+    }
+
+    async fn install_size_schema_crd(state: &AppState, namespaced: bool) {
+        let (group, plural, kind) = if namespaced {
+            ("nsvalid.example.io", "gadgets", "Gadget")
+        } else {
+            ("clvalid.example.io", "widgets", "Widget")
+        };
+        crate::handlers::crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "CustomResourceDefinition",
+                    "metadata": { "name": format!("{plural}.{group}") },
+                    "spec": {
+                        "group": group,
+                        "names": { "plural": plural, "singular": plural,
+                                   "kind": kind, "listKind": format!("{kind}List") },
+                        "scope": if namespaced { "Namespaced" } else { "Cluster" },
+                        "versions": [{
+                            "name": "v1", "served": true, "storage": true,
+                            "schema": { "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": { "spec": {
+                                    "type": "object",
+                                    "properties": { "size": { "type": "integer" } }
+                                } }
+                            } }
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("install CRD with typed spec.size");
+    }
+
+    async fn install_size_corrupting_webhook(state: &AppState, operation: &str) -> String {
+        use axum::routing::post;
+        use u7s_store::Store;
+
+        let router = axum::Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/spec/size", "value": "not-an-integer"}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "uid-mutate", "allowed": true,
+                        "patch": patch_b64, "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "size-corrupter"},
+            "webhooks": [{
+                "name": "size.corrupt.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"],
+                           "resources": ["*"], "operations": [operation]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/size-corrupter",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        base_url
+    }
+
+    async fn write_cr_at_site(
+        state: &AppState,
+        site: WriteSite,
+        size: i64,
+    ) -> Result<(), crate::status::StatusError> {
+        let (group, plural, kind) = if site.namespaced() {
+            ("nsvalid.example.io", "gadgets", "Gadget")
+        } else {
+            ("clvalid.example.io", "widgets", "Widget")
+        };
+        let mut metadata = serde_json::json!({ "name": "w" });
+        if site.namespaced() {
+            metadata["namespace"] = serde_json::json!("default");
+        }
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": format!("{group}/v1"), "kind": kind,
+                "metadata": metadata, "spec": { "size": size }
+            })
+            .to_string(),
+        );
+        let hdr = |ct: &'static str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(ct),
+            );
+            h
+        };
+        let (g, v, p, n) = (
+            group.to_string(),
+            "v1".to_string(),
+            plural.to_string(),
+            "w".to_string(),
+        );
+        let ns = "default".to_string();
+        let st = State(state.clone());
+        match site {
+            WriteSite::CreateCluster => create_cr(
+                st,
+                Path((g, v, p)),
+                test_user(),
+                hdr("application/json"),
+                body,
+            )
+            .await
+            .map(|_| ()),
+            WriteSite::CreateNamespaced => create_cr_namespaced(
+                st,
+                Path((g, v, ns, p)),
+                test_user(),
+                hdr("application/json"),
+                body,
+            )
+            .await
+            .map(|_| ()),
+            WriteSite::ApplyCreateCluster => patch_cr(
+                st,
+                Path((g, v, p, n)),
+                test_user(),
+                hdr("application/apply-patch+yaml"),
+                body,
+            )
+            .await
+            .map(|_| ()),
+            WriteSite::ApplyCreateNamespaced => patch_cr_namespaced(
+                st,
+                Path((g, v, ns, p, n)),
+                test_user(),
+                hdr("application/apply-patch+yaml"),
+                body,
+            )
+            .await
+            .map(|_| ()),
+            WriteSite::ReplaceCluster => replace_cr(
+                st,
+                Path((g, v, p, n)),
+                test_user(),
+                hdr("application/json"),
+                body,
+            )
+            .await
+            .map(|_| ()),
+            WriteSite::ReplaceNamespaced => replace_cr_namespaced(
+                st,
+                Path((g, v, ns, p, n)),
+                test_user(),
+                hdr("application/json"),
+                body,
+            )
+            .await
+            .map(|_| ()),
+            WriteSite::PatchCluster => patch_cr(
+                st,
+                Path((g, v, p, n)),
+                test_user(),
+                hdr("application/merge-patch+json"),
+                Bytes::from(serde_json::json!({ "spec": { "size": size } }).to_string()),
+            )
+            .await
+            .map(|_| ()),
+            WriteSite::PatchNamespaced => patch_cr_namespaced(
+                st,
+                Path((g, v, ns, p, n)),
+                test_user(),
+                hdr("application/merge-patch+json"),
+                Bytes::from(serde_json::json!({ "spec": { "size": size } }).to_string()),
+            )
+            .await
+            .map(|_| ()),
+        }
+    }
+
+    /// Upstream validates the object AFTER mutating admission. If u7s validates before, a
+    /// mutating webhook can persist a CR that violates its own schema, and every later
+    /// reader (controllers decoding spec.size as an integer) breaks. All 8 CR write sites
+    /// must reject webhook output that violates the schema.
+    #[tokio::test]
+    async fn mutating_webhook_output_that_violates_schema_is_rejected_422_at_every_write_site() {
+        use u7s_store::Store;
+        for site in WriteSite::ALL {
+            let state = make_state();
+            install_size_schema_crd(&state, site.namespaced()).await;
+            let key = if site.namespaced() {
+                cr_store_key("nsvalid.example.io", "gadgets", Some("default"), "w")
+            } else {
+                cr_store_key("clvalid.example.io", "widgets", None, "w")
+            };
+            if !site.is_create() {
+                let seed = if site.namespaced() {
+                    WriteSite::CreateNamespaced
+                } else {
+                    WriteSite::CreateCluster
+                };
+                write_cr_at_site(&state, seed, 1)
+                    .await
+                    .unwrap_or_else(|e| panic!("{site:?}: seed create: {e:?}"));
+            }
+            install_size_corrupting_webhook(
+                &state,
+                if site.is_create() { "CREATE" } else { "UPDATE" },
+            )
+            .await;
+
+            let err = write_cr_at_site(&state, site, 2)
+                .await
+                .expect_err("webhook-corrupted object must be rejected");
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "{site:?}: schema violation introduced by a mutating webhook must be 422, \
+                 got {err:?}"
+            );
+            let stored = state.store.get(&key).await.unwrap();
+            if site.is_create() {
+                assert!(
+                    stored.is_none(),
+                    "{site:?}: rejected create must not persist"
+                );
+            } else {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&stored.expect("seeded CR").value).unwrap();
+                assert_eq!(
+                    v["spec"]["size"], 1,
+                    "{site:?}: stored CR must be unchanged"
+                );
+            }
+        }
+    }
+
+    /// The webhook's mutation can also FIX an object the client sent invalid; upstream only
+    /// validates after mutation, so such a request must be accepted.
+    #[tokio::test]
+    async fn webhook_fixing_a_schema_invalid_request_is_accepted() {
+        use axum::routing::post;
+        use u7s_store::Store;
+        let router = axum::Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "replace", "path": "/spec/size", "value": 5}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview",
+                    "response": { "uid": "u", "allowed": true,
+                                  "patch": patch_b64, "patchType": "JSONPatch" }
+                }))
+            }),
+        );
+        let (base_url, _h) = start_mock_conversion_server(router).await;
+        let state = make_state();
+        install_size_schema_crd(&state, false).await;
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/fixer",
+                Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "apiVersion": "admissionregistration.k8s.io/v1",
+                        "kind": "MutatingWebhookConfiguration",
+                        "metadata": {"name": "fixer"},
+                        "webhooks": [{
+                            "name": "fix.example.com",
+                            "clientConfig": { "url": format!("{base_url}/mutate") },
+                            "rules": [{"apiGroups": ["*"], "apiVersions": ["*"],
+                                       "resources": ["*"], "operations": ["CREATE"]}],
+                            "failurePolicy": "Fail"
+                        }]
+                    }))
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "clvalid.example.io/v1", "kind": "Widget",
+                "metadata": { "name": "w" }, "spec": { "size": "bad" }
+            })
+            .to_string(),
+        );
+        let result = create_cr(
+            State(state.clone()),
+            Path(("clvalid.example.io".into(), "v1".into(), "widgets".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "validating before the webhook rejects objects the webhook would have fixed"
+        );
     }
 }
