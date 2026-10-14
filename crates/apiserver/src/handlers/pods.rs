@@ -526,10 +526,11 @@ pub(crate) async fn create_pod<S: Store>(
             .await
         {
             Ok(rv) => break rv,
-            Err(CreateNamespacedError::NamespaceTerminating) => {
-                return Err(Status::forbidden(format!(
-                    "unable to create new content in namespace {ns} because it is being terminated"
-                )));
+            Err(
+                e @ (CreateNamespacedError::NamespaceTerminating
+                | CreateNamespacedError::NamespaceNotFound),
+            ) => {
+                return Err(Status::namespace_create_rejected(ns.as_str(), &e));
             }
             // The client never chose this name (it came from generateName) — a collision is
             // the server's random suffix landing on an existing object, not a real conflict
@@ -1668,6 +1669,7 @@ pub(crate) async fn evict_pod<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
+    super::generic::ensure_namespace_accepts_creates(&state, ns.as_str()).await?;
     let key = object_key("pods", ns.as_str(), &name);
 
     let eviction: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|_| {
@@ -8116,6 +8118,7 @@ pub(crate) async fn bind_pod<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
+    super::generic::ensure_namespace_accepts_creates(&state, ns.as_str()).await?;
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -12990,6 +12993,77 @@ mod handler_tests {
             "eviction must stamp deletionTimestamp so the kubelet sends SIGTERM and the \
              StatefulSet controller sees the pod as terminating — without this the orphan \
              pod runs forever and the 'Should recreate evicted statefulset' test hangs"
+        );
+    }
+
+    /// Eviction and binding are creates in upstream's admission chain, so NamespaceLifecycle
+    /// refuses them in a Terminating namespace (403) — otherwise a scheduler or evicting
+    /// controller keeps mutating pods the namespace controller is draining.
+    ///
+    /// Fails on revert: without the gate both requests succeed and mutate the pod.
+    #[tokio::test]
+    async fn eviction_and_binding_are_403_in_a_terminating_namespace() {
+        let (state, store) = make_state();
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": {"name": "dying"}, "status": {"phase": "Terminating"}
+        });
+        store
+            .put(
+                "/registry/namespaces/dying",
+                Bytes::from(serde_json::to_vec(&ns_obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let key = "/registry/pods/dying/p";
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "dying"}, "spec": {}, "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        let before = store.get(key).await.unwrap().unwrap().revision;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .layer(auth_layer())
+            .with_state(state);
+
+        for (sub, body) in [
+            (
+                "eviction",
+                serde_json::json!({"apiVersion": "policy/v1", "kind": "Eviction",
+                    "metadata": {"name": "p", "namespace": "dying"}}),
+            ),
+            (
+                "binding",
+                serde_json::json!({"apiVersion": "v1", "kind": "Binding",
+                    "metadata": {"name": "p"}, "target": {"kind": "Node", "name": "n1"}}),
+            ),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/dying/pods/p/{sub}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{sub}");
+        }
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap().revision,
+            before,
+            "a rejected eviction/binding must not touch the pod"
         );
     }
 

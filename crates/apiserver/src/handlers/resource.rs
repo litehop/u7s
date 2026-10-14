@@ -1567,11 +1567,14 @@ pub(crate) async fn do_patch<S: Store>(
             .await
         {
             Ok(rv) => rv,
-            Err(CreateNamespacedError::NamespaceTerminating) => {
-                let namespace = ns.unwrap_or_default();
-                return Err(Status::forbidden(format!(
-                    "unable to create new content in namespace {namespace} because it is being terminated"
-                )));
+            Err(
+                e @ (CreateNamespacedError::NamespaceTerminating
+                | CreateNamespacedError::NamespaceNotFound),
+            ) => {
+                return Err(Status::namespace_create_rejected(
+                    ns.unwrap_or_default(),
+                    &e,
+                ));
             }
             Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
                 // Race: another writer created it; fall through to normal merge below.
@@ -3287,10 +3290,11 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         );
         match result {
             Ok(rv) => break rv,
-            Err(CreateNamespacedError::NamespaceTerminating) => {
-                return Err(Status::forbidden(format!(
-                    "unable to create new content in namespace {ns} because it is being terminated"
-                )));
+            Err(
+                e @ (CreateNamespacedError::NamespaceTerminating
+                | CreateNamespacedError::NamespaceNotFound),
+            ) => {
+                return Err(Status::namespace_create_rejected(&ns, &e));
             }
             Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
                 if meta.create_or_update =>
@@ -4032,10 +4036,11 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             .await
         {
             Ok(rv) => rv,
-            Err(CreateNamespacedError::NamespaceTerminating) => {
-                return Err(Status::forbidden(format!(
-                    "unable to create new content in namespace {ns} because it is being terminated"
-                )));
+            Err(
+                e @ (CreateNamespacedError::NamespaceTerminating
+                | CreateNamespacedError::NamespaceNotFound),
+            ) => {
+                return Err(Status::namespace_create_rejected(&ns, &e));
             }
             // Mirrors create_namespaced_resource's POST loop: a create-on-missing PUT that
             // loses a create race against a concurrent create of the same createOrUpdate
@@ -7158,6 +7163,111 @@ mod tests {
             state.store.get(&key).await.unwrap().is_none(),
             "the ConfigMap must not have been created in the Terminating namespace"
         );
+    }
+
+    /// Every create path (POST, SSA apply-create, PUT create-on-missing) must refuse a
+    /// namespace that does not exist: 404 `namespaces "x" not found`, nothing persisted.
+    /// Otherwise controllers that recreate objects after a namespace is deleted (e.g. the
+    /// root-ca-cert publisher) leave orphans no namespace controller will ever drain.
+    ///
+    /// Fails on revert: without the store-level NamespaceNotFound gate each path returns
+    /// 201/200 and persists the ConfigMap.
+    #[tokio::test]
+    async fn namespaced_creates_into_a_missing_namespace_are_404_on_every_create_path() {
+        let state = make_state();
+        let ns = "ghost-ns";
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "orphan", "namespace": ns },
+            "data": { "k": "v" }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&cm).unwrap());
+        let path = || {
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+                "orphan".to_string(),
+            ))
+        };
+
+        let post = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            body.clone(),
+        )
+        .await;
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        let ssa = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            path(),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            body.clone(),
+        )
+        .await;
+
+        let put = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            path(),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            body,
+        )
+        .await;
+
+        for (label, err) in [
+            ("POST", post.err()),
+            ("SSA apply-create", ssa.err()),
+            ("PUT create-on-missing", put.err()),
+        ] {
+            let err = err.unwrap_or_else(|| panic!("{label} into a missing namespace must fail"));
+            assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND, "{label}");
+            assert_eq!(
+                err.1.message,
+                format!("namespaces \"{ns}\" not found"),
+                "{label}: message must match upstream NamespaceLifecycle"
+            );
+        }
+        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "orphan");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "no create path may leave an orphan in a namespace that does not exist"
+        );
+    }
+
+    /// Terminating-namespace rejections carry the `NamespaceTerminating` cause that
+    /// client-go's `errors.HasStatusCause` keys on (e2e framework retry logic).
+    #[test]
+    fn terminating_namespace_rejection_carries_namespace_terminating_cause() {
+        let err = crate::status::Status::namespace_create_rejected(
+            "dying",
+            &u7s_store::CreateNamespacedError::NamespaceTerminating,
+        );
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["details"]["causes"][0]["reason"],
+            "NamespaceTerminating"
+        );
+        assert_eq!(json["details"]["causes"][0]["field"], "metadata.namespace");
     }
 
     /// `replace_namespaced_resource`'s create-on-missing branch handled
@@ -14551,6 +14661,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::seed_namespace(&state, "test-ns").await;
 
         for name in &["alpha", "beta"] {
             let body = serde_json::json!({
@@ -17411,6 +17522,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::seed_namespace(&state, "webhook-test").await;
 
         // Step 1: Create a Deployment (as kubectl or a test framework would).
         // The Deployment starts with no annotations.
@@ -20393,6 +20505,7 @@ mod tests {
         use axum::response::IntoResponse;
 
         let state = make_state();
+        crate::handlers::test_support::seed_namespace(&state, "test-ns").await;
 
         for name in &["lease-a", "lease-b"] {
             let body = serde_json::json!({
@@ -24320,6 +24433,7 @@ mod tests {
         use u7s_store::SqliteStore;
 
         let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::handlers::test_support::seed_namespace_in(&*inner, "default").await;
         let key = "/registry/apps/statefulsets/default/web";
 
         let winner = serde_json::json!({
@@ -24439,6 +24553,7 @@ mod tests {
         use u7s_store::SqliteStore;
 
         let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::handlers::test_support::seed_namespace_in(&*inner, "default").await;
         let key = "/registry/apps/statefulsets/default/web";
 
         let router = Router::new().route(
@@ -25016,6 +25131,7 @@ mod tests {
         use std::sync::Arc;
 
         let store = Arc::new(FirstPutAlreadyExistsStore::new());
+        crate::handlers::test_support::seed_namespace_in(&*store.inner, "default").await;
         let state = crate::state::AppState::new(
             store,
             None,
@@ -25076,6 +25192,7 @@ mod tests {
         use std::sync::Arc;
 
         let store = Arc::new(FirstPutAlreadyExistsStore::new());
+        crate::handlers::test_support::seed_namespace_in(&*store.inner, "default").await;
         let state = crate::state::AppState::new(
             store,
             None,
@@ -25228,6 +25345,7 @@ mod tests {
         let (base_url, _handle) = start_mock_admission_webhook_server(router).await;
 
         let store = Arc::new(FirstPutAlreadyExistsStore::new());
+        crate::handlers::test_support::seed_namespace_in(&*store.inner, "default").await;
 
         // Seed straight into the wrapped SqliteStore, NOT through `store.put()` — the
         // wrapper's fire-once AlreadyExists injection must be reserved for the PVC create
@@ -25320,6 +25438,7 @@ mod tests {
         use u7s_store::SqliteStore;
 
         let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::handlers::test_support::seed_namespace_in(&*inner, "default").await;
 
         let pvc_key = "/registry/persistentvolumeclaims/default/pvc-repro";
         let pvc = serde_json::json!({
@@ -26443,6 +26562,7 @@ mod tests {
         use axum::extract::{Path, Query, State};
 
         let state = make_state();
+        crate::handlers::test_support::seed_namespace(&state, "test-ns").await;
 
         for name in ["alpha", "beta"] {
             let body = serde_json::json!({
@@ -26528,6 +26648,7 @@ mod tests {
 
         let state = make_state();
         let ns = "quota-ns";
+        crate::handlers::test_support::seed_namespace(&state, ns).await;
 
         let quota = serde_json::json!({
             "apiVersion": "v1",

@@ -968,6 +968,45 @@ impl<S> Clone for AppState<S> {
     }
 }
 
+/// Namespaced creates are rejected when the namespace is missing, so test states carry the
+/// namespaces a booted cluster always has. Runs on its own runtime thread because callers
+/// are sync and usually already inside a current-thread test runtime.
+#[cfg(test)]
+fn seed_immortal_namespaces<S: Store>(store: &Arc<S>) {
+    let store = store.clone();
+    // A test that pre-seeds `default` owns its namespaces (and may wrap the store with a
+    // put-counting double), so leave it alone.
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("seed runtime")
+            .block_on(async move {
+                let default_key = crate::keys::cluster_object_key("namespaces", "default");
+                if matches!(store.get(&default_key).await, Ok(Some(_))) {
+                    return;
+                }
+                for name in ["default", "kube-system", "kube-public", "kube-node-lease"] {
+                    let body = serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": {"name": name},
+                        "status": {"phase": "Active"}
+                    });
+                    let _ = store
+                        .put(
+                            &crate::keys::cluster_object_key("namespaces", name),
+                            bytes::Bytes::from(body.to_string()),
+                            Some(0),
+                        )
+                        .await;
+                }
+            });
+    })
+    .join()
+    .expect("seed thread");
+}
+
 impl<S: Store> AppState<S> {
     /// Convenience constructor for tests: all optional fields default to None.
     #[cfg(test)]
@@ -1105,6 +1144,8 @@ impl<S: Store> AppState<S> {
     /// Test helpers that need only a subset of fields should build an `AppStateConfig`
     /// with the remaining fields set to `None`.
     pub fn new_with_config(cfg: AppStateConfig<S>) -> Self {
+        #[cfg(test)]
+        seed_immortal_namespaces(&cfg.store);
         let registry = build_registry();
         let webhook_client = Self::build_webhook_client(
             cfg.cluster_ca_der.as_deref(),

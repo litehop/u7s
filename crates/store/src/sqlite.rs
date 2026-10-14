@@ -1398,11 +1398,10 @@ fn create_if_namespace_active_sync(
             .prepare_cached("SELECT value FROM objects WHERE key = ?1")?
             .query_row(params![ns_key], |r| r.get(0))
             .optional()?;
-        if let Some(ns_bytes) = ns_value {
-            if let Ok(ns_json) = serde_json::from_slice::<serde_json::Value>(&ns_bytes) {
-                if ns_json["status"]["phase"].as_str() == Some("Terminating") {
-                    return Err(CreateNamespacedError::NamespaceTerminating);
-                }
+        let ns_bytes = ns_value.ok_or(CreateNamespacedError::NamespaceNotFound)?;
+        if let Ok(ns_json) = serde_json::from_slice::<serde_json::Value>(&ns_bytes) {
+            if ns_json["status"]["phase"].as_str() == Some("Terminating") {
+                return Err(CreateNamespacedError::NamespaceTerminating);
             }
         }
     }
@@ -5862,25 +5861,27 @@ mod tests {
         );
     }
 
-    /// A namespace that does not exist at `ns_key` must be treated as active, not rejected —
-    /// this method only closes the create-vs-delete race for namespaces that exist; it is not
-    /// a namespace-existence check (that stays the caller's job, e.g. pods.rs's
-    /// parse_namespace), matching the pre-existing behavior of the inline checks this method
-    /// replaces (which also silently allowed the create when the namespace lookup found
-    /// nothing).
+    /// A create into a namespace that does not exist must be refused and leave nothing behind —
+    /// otherwise controllers recreating objects after a namespace is gone (e.g. the
+    /// root-ca-cert publisher) leave orphans no namespace controller will ever clean up.
     #[tokio::test]
-    async fn create_if_namespace_active_allows_create_when_namespace_absent() {
+    async fn create_if_namespace_active_rejects_create_when_namespace_absent() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/configmaps/never-created/cm";
         let result = store
             .create_if_namespace_active(
                 Some("/registry/namespaces/never-created"),
-                "/registry/core/configmaps/never-created/cm",
+                key,
                 Bytes::from(r#"{"metadata":{"name":"cm","namespace":"never-created"}}"#),
             )
             .await;
         assert!(
-            result.is_ok(),
-            "a missing namespace must not be treated as Terminating — got {result:?}"
+            matches!(result, Err(CreateNamespacedError::NamespaceNotFound)),
+            "a missing namespace must be rejected as NamespaceNotFound — got {result:?}"
+        );
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "a rejected create must not persist the object"
         );
     }
 

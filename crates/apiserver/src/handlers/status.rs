@@ -3757,16 +3757,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Arm the mock so the next put() injects RevisionMismatch.
-        mock.arm();
-
         let state = crate::state::AppState::new(
-            mock,
+            Arc::clone(&mock),
             None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+
+        // Arm after state construction (which seeds namespaces through the store) so the
+        // next put() injects RevisionMismatch.
+        mock.arm();
 
         let body = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
@@ -3822,16 +3823,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Arm the mock so the next put() injects RevisionMismatch.
-        mock.arm();
-
         let state = crate::state::AppState::new(
-            mock,
+            Arc::clone(&mock),
             None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+
+        // Arm after state construction (which seeds namespaces through the store) so the
+        // next put() injects RevisionMismatch.
+        mock.arm();
 
         let body = serde_json::json!({
             "apiVersion": "apps/v1",

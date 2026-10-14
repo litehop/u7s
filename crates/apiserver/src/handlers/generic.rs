@@ -1119,6 +1119,37 @@ pub(crate) fn check_rb_escalation<S: Store>(
     Ok(())
 }
 
+/// NamespaceLifecycle gate for subresource creates (binding, eviction, token) that do not go
+/// through `Store::create_if_namespace_active`: the namespace must exist and must not be
+/// Terminating.
+pub(crate) async fn ensure_namespace_accepts_creates<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+) -> Result<(), crate::status::StatusError> {
+    let key = crate::keys::cluster_object_key("namespaces", ns);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let Some(stored) = stored else {
+        return Err(Status::namespace_create_rejected(
+            ns,
+            &u7s_store::CreateNamespacedError::NamespaceNotFound,
+        ));
+    };
+    let terminating = serde_json::from_slice::<serde_json::Value>(&stored.value)
+        .map(|v| v["status"]["phase"].as_str() == Some("Terminating"))
+        .unwrap_or(false);
+    if terminating {
+        return Err(Status::namespace_create_rejected(
+            ns,
+            &u7s_store::CreateNamespacedError::NamespaceTerminating,
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::json_patch::{

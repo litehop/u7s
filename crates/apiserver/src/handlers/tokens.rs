@@ -129,18 +129,9 @@ pub async fn create_token<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_path_segment("namespace", &raw_ns)?;
     validate_path_segment("name", &sa_name)?;
-    // 1. Validate namespace exists.
+    // 1. Validate namespace exists and is not Terminating.
     let ns = crate::types::Namespace::parse(&raw_ns).map_err(Status::bad_request)?;
-    let ns_key = cluster_object_key("namespaces", ns.as_str());
-    let ns_exists = state
-        .store
-        .get(&ns_key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .is_some();
-    if !ns_exists {
-        return Err(Status::not_found(ns.as_str(), "Namespace"));
-    }
+    super::generic::ensure_namespace_accepts_creates(&state, ns.as_str()).await?;
 
     // 2. Validate ServiceAccount exists.
     let sa_key = object_key("serviceaccounts", ns.as_str(), &sa_name);
@@ -670,7 +661,7 @@ mod handler_tests {
         let (state, _store) = make_state_no_key();
         let result = create_token(
             State(state),
-            Path(("default".to_owned(), "my-sa".to_owned())),
+            Path(("no-such-ns".to_owned(), "my-sa".to_owned())),
             Bytes::new(),
         )
         .await;
@@ -684,7 +675,7 @@ mod handler_tests {
             "missing namespace must yield 404 NotFound"
         );
         assert!(
-            err.1.message.contains("Namespace"),
+            err.1.message.contains("namespaces"),
             "error message must name the missing resource kind"
         );
     }
