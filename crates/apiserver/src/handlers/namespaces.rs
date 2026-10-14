@@ -312,6 +312,13 @@ pub(crate) async fn get_namespace<S: Store>(
         .into_response())
 }
 
+/// A PUT without a resourceVersion must still be conditioned on the revision just read, or a
+/// DELETE landing between that read and the write would be undone by an unconditional put
+/// recreating the namespace without its finalizers.
+fn replace_put_precondition(client_rv: Option<u64>, stored_rv: Option<u64>) -> Option<u64> {
+    client_rv.or(stored_rv)
+}
+
 pub(crate) async fn replace_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
@@ -343,11 +350,13 @@ pub(crate) async fn replace_namespace<S: Store>(
     // status.phase/status.conditions that the real namespace controller last wrote via
     // /status. Mirrors replace_pod's stored_status handling and the generic
     // replace_namespaced_resource in resource.rs.
-    let stored_obj = state
+    let stored_entry = state
         .store
         .get(&key)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let stored_revision = stored_entry.as_ref().map(|s| s.revision);
+    let stored_obj = stored_entry
         .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
     // Upstream disallows create-on-update for Namespace; creating here would skip the create
     // preparation (spec.finalizers), so a later delete would orphan the namespace's content.
@@ -454,7 +463,11 @@ pub(crate) async fn replace_namespace<S: Store>(
 
     let new_rv = state
         .store
-        .put(&key, obj.to_bytes(), expected_revision)
+        .put(
+            &key,
+            obj.to_bytes(),
+            replace_put_precondition(expected_revision, stored_revision),
+        )
         .await
         .map_err(|e| store_err_to_status(e, &name))?;
 
@@ -3577,6 +3590,111 @@ mod tests {
             state.store.get(cm_key).await.unwrap().is_some(),
             "namespace DELETE must not purge content in-process; that is the namespace \
              controller's job, via per-object DELETEs that run admission"
+        );
+    }
+
+    #[test]
+    fn replace_put_is_conditioned_on_the_read_revision_when_client_sends_no_resource_version() {
+        assert_eq!(
+            replace_put_precondition(None, Some(7)),
+            Some(7),
+            "an unconditional put would recreate a namespace deleted after the existence check"
+        );
+        assert_eq!(
+            replace_put_precondition(Some(3), Some(7)),
+            Some(3),
+            "a client-supplied resourceVersion keeps its own optimistic-concurrency check"
+        );
+    }
+
+    // The soft-delete DELETE is the only caller of delete_namespace_scoped_crds. If the call is
+    // dropped, a CRD whose group embeds the namespace name outlives it and KCM's discovery
+    // re-scan never settles, leaving the namespace Terminating forever; a CRD of an unrelated
+    // group must survive.
+    #[tokio::test]
+    async fn delete_terminating_namespace_removes_crds_whose_group_embeds_its_name_only() {
+        use crate::handlers::crd;
+        use u7s_store::Store;
+        let state = make_state();
+
+        for (group, plural, kind) in [
+            ("stable.cascade-ns.example.com", "crontabs", "CronTab"),
+            ("stable.other.example.com", "widgets", "Widget"),
+        ] {
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": { "name": format!("{plural}.{group}") },
+                        "spec": {
+                            "group": group,
+                            "names": { "plural": plural, "singular": plural,
+                                       "kind": kind, "listKind": format!("{kind}List") },
+                            "scope": "Namespaced",
+                            "versions": [{ "name": "v1", "served": true, "storage": true }]
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("install CRD {group}: {e:?}"));
+        }
+
+        let ns_key = crate::keys::cluster_object_key("namespaces", "cascade-ns");
+        state
+            .store
+            .put(
+                &ns_key,
+                bytes::Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Namespace",
+                        "metadata": { "name": "cascade-ns", "uid": "u-1", "resourceVersion": "1" },
+                        "spec": { "finalizers": ["kubernetes"] },
+                        "status": { "phase": "Active" }
+                    })
+                    .to_string(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("seed namespace");
+
+        delete_namespace(
+            State(state.clone()),
+            Path("cascade-ns".to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
+
+        assert!(
+            state.store.get(&ns_key).await.unwrap().is_some(),
+            "the namespace must stay Terminating while spec.finalizers is non-empty"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/apiextensions.k8s.io/customresourcedefinitions/crontabs.stable.cascade-ns.example.com")
+                .await
+                .unwrap()
+                .is_none(),
+            "a CRD whose group embeds the deleted namespace's name must be removed"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.stable.other.example.com")
+                .await
+                .unwrap()
+                .is_some(),
+            "a CRD of an unrelated group must not be touched"
         );
     }
 

@@ -52,7 +52,7 @@ impl Status {
                 reason: "NotFound",
                 code: 404,
                 metadata: None,
-                details: None,
+                details: Some(Box::new(serde_json::json!({ "name": name, "kind": kind }))),
             },
         )
     }
@@ -320,6 +320,16 @@ impl Status {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // Upstream's NotFound carries details{name, kind}; clients (kubectl, client-go retries
+    // keyed on the missing object) read them instead of parsing the message.
+    #[test]
+    fn not_found_carries_name_and_kind_details() {
+        let StatusError(_, status) = Status::not_found("web", "Widget");
+        let details = status.details.expect("NotFound must carry details");
+        assert_eq!(details["name"], "web");
+        assert_eq!(details["kind"], "Widget");
+    }
 
     // not_acceptable must produce HTTP 406 with reason "NotAcceptable" so client-go's
     // errors.IsNotAcceptable() returns true and the conformance test for Table 406 passes.
