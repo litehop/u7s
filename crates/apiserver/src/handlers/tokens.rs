@@ -704,8 +704,9 @@ mod handler_tests {
             "missing ServiceAccount must yield 404 NotFound"
         );
         assert!(
-            err.1.message.contains("ServiceAccount"),
-            "error message must name the missing kind"
+            err.1.message == "serviceaccounts \"ghost-sa\" not found",
+            "error message must name the missing resource as upstream does, got: {}",
+            err.1.message
         );
     }
 

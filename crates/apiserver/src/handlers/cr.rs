@@ -5454,10 +5454,7 @@ async fn cr_scale_get_impl<S: Store>(
     ctx: &CrContext,
     target: CrScaleTarget<'_>,
 ) -> Result<Response, crate::status::StatusError> {
-    let scale_cfg = ctx
-        .scale
-        .as_ref()
-        .ok_or_else(|| Status::route_not_found())?;
+    let scale_cfg = ctx.scale.as_ref().ok_or_else(Status::route_not_found)?;
 
     let key = cr_store_key(target.group, target.plural, target.ns, target.name);
     let stored = state
@@ -5500,10 +5497,7 @@ async fn cr_scale_put_impl<S: Store>(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let scale_cfg = ctx
-        .scale
-        .as_ref()
-        .ok_or_else(|| Status::route_not_found())?;
+    let scale_cfg = ctx.scale.as_ref().ok_or_else(Status::route_not_found)?;
 
     let scale_body = super::scale::decode_scale_body(body, headers)?;
     let new_replicas = scale_body
@@ -5580,10 +5574,7 @@ async fn cr_scale_patch_impl<S: Store>(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let scale_cfg = ctx
-        .scale
-        .as_ref()
-        .ok_or_else(|| Status::route_not_found())?;
+    let scale_cfg = ctx.scale.as_ref().ok_or_else(Status::route_not_found)?;
 
     let scale_body = super::scale::decode_scale_body(body, headers)?;
 

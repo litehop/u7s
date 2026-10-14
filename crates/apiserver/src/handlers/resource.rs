@@ -1330,7 +1330,7 @@ async fn complete_finalizer_drain<S: Store>(
         .store
         .delete(key, None)
         .await
-        .map_err(|e| store_err(e, &group, &plural, name, &meta.kind))?;
+        .map_err(|e| store_err(e, group, plural, name, &meta.kind))?;
     if group == RBAC_GROUP {
         let rbac_key = match ns {
             None => rbac_cluster_key(group, version, plural, name),
@@ -1590,7 +1590,7 @@ pub(crate) async fn do_patch<S: Store>(
                     .get(key)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(&group, &plural, name))?;
+                    .ok_or_else(|| Status::not_found(group, plural, name))?;
                 let mut current = Object::from_bytes(&stored.value)
                     .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
                 // Full body (not just spec): restrict_node_self_write below also needs
@@ -1724,7 +1724,7 @@ pub(crate) async fn do_patch<S: Store>(
                     .store
                     .put(key, current.to_bytes(), expected_rv)
                     .await
-                    .map_err(|e| store_err(e, &group, &plural, name, &meta.kind))?;
+                    .map_err(|e| store_err(e, group, plural, name, &meta.kind))?;
                 current.set_resource_version(rv);
                 if group == RBAC_GROUP {
                     let rbac_key = match ns {
@@ -1738,7 +1738,7 @@ pub(crate) async fn do_patch<S: Store>(
                 return Ok(Json(current.body).into_response());
             }
             Err(CreateNamespacedError::Store(e)) => {
-                return Err(store_err(e, &group, &plural, name, &meta.kind))
+                return Err(store_err(e, group, plural, name, &meta.kind))
             }
         };
         obj.set_resource_version(new_rv);
@@ -1773,7 +1773,7 @@ pub(crate) async fn do_patch<S: Store>(
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
-    let mut stored = stored_opt.ok_or_else(|| Status::not_found(&group, &plural, name))?;
+    let mut stored = stored_opt.ok_or_else(|| Status::not_found(group, plural, name))?;
 
     // A plain PATCH (merge / strategic-merge / JSON Patch) carries no resourceVersion
     // precondition unless the client's own patch body sets metadata.resourceVersion.
@@ -2244,9 +2244,9 @@ pub(crate) async fn do_patch<S: Store>(
                     .get(key)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(&group, &plural, name))?;
+                    .ok_or_else(|| Status::not_found(group, plural, name))?;
             }
-            Err(e) => return Err(store_err(e, &group, &plural, name, &meta.kind)),
+            Err(e) => return Err(store_err(e, group, plural, name, &meta.kind)),
         }
     }
 }
