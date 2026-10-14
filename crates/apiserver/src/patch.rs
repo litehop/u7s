@@ -743,6 +743,8 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
 
         "rules" | "subjects" => MergeKeyKind::Replace,
 
+        "metadata.finalizers" => MergeKeyKind::Set,
+
         _ => MergeKeyKind::Unknown,
     }
 }
@@ -765,6 +767,9 @@ fn crd_merge_key_for_path(schema: &serde_json::Value, path: &str) -> MergeKeyKin
     // collector orphans a CR's dependents with a `$patch:delete` keyed by ownerReference uid.
     if path == "metadata.ownerReferences" {
         return MergeKeyKind::Key(vec!["uid".to_string()]);
+    }
+    if path == "metadata.finalizers" {
+        return MergeKeyKind::Set;
     }
     let Some(node) = find_schema_node(schema, path) else {
         return MergeKeyKind::Unknown;
@@ -2465,6 +2470,45 @@ mod tests {
                 .get("$deleteFromPrimitiveList/finalizers")
                 .is_none(),
             "the directive key must never be stored literally as a sibling metadata field"
+        );
+    }
+
+    /// metadata.finalizers is `patchStrategy:merge` with no key upstream: an SMP adds the
+    /// listed finalizers to the set. Replacing the list would silently drop another
+    /// controller's finalizer and let the object be deleted before that controller cleaned up.
+    #[test]
+    fn cr_smp_adding_a_finalizer_keeps_existing_finalizers_without_duplicates() {
+        let mut target = serde_json::json!({
+            "metadata": { "finalizers": ["a.example.com/one", "a.example.com/two"] }
+        });
+        let patch = serde_json::json!({
+            "metadata": { "finalizers": ["a.example.com/two", "b.example.com/new"] }
+        });
+
+        strategic_merge_patch_for_cr(&mut target, &patch, None).unwrap();
+
+        assert_eq!(
+            target["metadata"]["finalizers"],
+            serde_json::json!([
+                "a.example.com/one",
+                "a.example.com/two",
+                "b.example.com/new"
+            ]),
+            "SMP must union finalizers (existing order kept, new appended, no duplicates)"
+        );
+
+        let mut builtin = serde_json::json!({
+            "metadata": { "finalizers": ["a.example.com/one"] }
+        });
+        strategic_merge_patch(
+            &mut builtin,
+            &serde_json::json!({ "metadata": { "finalizers": ["b.example.com/new"] } }),
+        )
+        .unwrap();
+        assert_eq!(
+            builtin["metadata"]["finalizers"],
+            serde_json::json!(["a.example.com/one", "b.example.com/new"]),
+            "built-in kinds share the same finalizers set-merge"
         );
     }
 

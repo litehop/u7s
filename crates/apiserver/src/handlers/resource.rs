@@ -398,7 +398,7 @@ pub(crate) async fn get_resource<S: Store>(
         .get(key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &meta.kind).for_resource(&group, &plural))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -1155,7 +1155,7 @@ pub(crate) async fn delete_resource<S: Store>(
             .get(&key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+            .ok_or_else(|| Status::not_found(&name, &meta.kind).for_resource(&group, &plural))?;
 
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -3047,7 +3047,7 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &meta.kind).for_resource(&group, &plural))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -4153,7 +4153,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             .get(&key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+            .ok_or_else(|| Status::not_found(&name, &meta.kind).for_resource(&group, &plural))?;
 
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
