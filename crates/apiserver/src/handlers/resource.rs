@@ -395,7 +395,7 @@ pub(crate) async fn get_resource<S: Store>(
     let key = group_object_key(&group, &plural, None, &name);
     let stored = state
         .store
-        .get(&key)
+        .get(key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &meta.kind).for_resource(&group, &plural))?;
@@ -2249,7 +2249,7 @@ async fn storage_class_allows_expansion<S: Store>(state: &AppState<S>, sc_name: 
         return false;
     }
     let key = group_object_key("storage.k8s.io", "storageclasses", None, sc_name);
-    match state.store.get(&key).await {
+    match state.store.get(key).await {
         Ok(Some(stored)) => serde_json::from_slice::<serde_json::Value>(&stored.value)
             .ok()
             .and_then(|v| v["allowVolumeExpansion"].as_bool())
@@ -8215,6 +8215,113 @@ mod tests {
         );
     }
 
+    fn unsupported_table_accept() -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v2"),
+        );
+        headers
+    }
+
+    fn assert_not_acceptable(err: crate::status::StatusError, site: &str) {
+        assert_eq!(
+            err.0,
+            StatusCode::NOT_ACCEPTABLE,
+            "{site}: a client asking for an unsupported Table version must get 406, not a \
+             response claiming a format that was not served"
+        );
+    }
+
+    fn admin_user() -> Extension<crate::auth::UserInfo> {
+        Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        })
+    }
+
+    fn no_watch_query() -> CollectionQuery {
+        CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_resource_with_unsupported_table_version_returns_406() {
+        let err = list_resource(
+            axum::extract::State(make_state()),
+            axum::extract::Path(("storage.k8s.io".into(), "v1".into(), "csinodes".into())),
+            axum::extract::Query(no_watch_query()),
+            unsupported_table_accept(),
+            admin_user(),
+        )
+        .await
+        .expect_err("list_resource must reject Table v2");
+        assert_not_acceptable(err, "list_resource");
+    }
+
+    #[tokio::test]
+    async fn list_namespaced_resource_with_unsupported_table_version_returns_406() {
+        let err = list_namespaced_resource(
+            axum::extract::State(make_state()),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+            )),
+            axum::extract::Query(no_watch_query()),
+            unsupported_table_accept(),
+            admin_user(),
+        )
+        .await
+        .expect_err("list_namespaced_resource must reject Table v2");
+        assert_not_acceptable(err, "list_namespaced_resource");
+    }
+
+    #[tokio::test]
+    async fn get_namespaced_resource_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "default"}
+        });
+        state
+            .store
+            .put(
+                "/registry/apps/deployments/default/web",
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let err = get_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "web".into(),
+            )),
+            unsupported_table_accept(),
+        )
+        .await
+        .expect_err("get_namespaced_resource must reject Table v2");
+        assert_not_acceptable(err, "get_namespaced_resource");
+    }
+
     /// kcm's GC sends `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`
     /// when verifying an owner reference still exists (garbagecollector.go:434-444
     /// isDangling). Before this fix, get_resource always returned the full typed object,
@@ -9875,12 +9982,12 @@ mod tests {
     impl u7s_store::Store for QuotaLockPeekStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key_s = key.to_string();
-            let is_target = key == self.quota_key;
+            let key_s: String = key.into();
+            let is_target = key_s == self.quota_key;
             let locks = self.locks.clone();
             let ns = self.namespace.clone();
             let observed = self.observed_available_permits.clone();
@@ -9897,34 +10004,34 @@ mod tests {
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: bytes::Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.put(&key, value, expected_revision).await }
         }
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -17806,24 +17913,24 @@ mod tests {
     impl u7s_store::Store for PhaseFlipDuringQuotaCheckStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix_owned = prefix.to_string();
+            let prefix_owned: String = prefix.into();
             let quota_prefix = format!("/registry/resourcequotas/{}/", self.target_ns);
-            let should_flip = prefix == quota_prefix
+            let should_flip = prefix_owned == quota_prefix
                 && !self.flipped.swap(true, std::sync::atomic::Ordering::SeqCst);
             let ns_key = format!("/registry/namespaces/{}", self.target_ns);
             async move {
@@ -17848,22 +17955,22 @@ mod tests {
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.put(&key, value, expected_revision).await }
         }
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -17901,14 +18008,14 @@ mod tests {
         fn create_if_namespace_active(
             &self,
             ns_key: Option<&str>,
-            key: &str,
+            key: impl Into<String> + Send,
             value: Bytes,
         ) -> impl std::future::Future<
             Output = std::result::Result<u64, u7s_store::CreateNamespacedError>,
         > + Send {
             let inner = self.inner.clone();
             let ns_key = ns_key.map(|s| s.to_string());
-            let key = key.to_string();
+            let key: String = key.into();
             async move {
                 inner
                     .create_if_namespace_active(ns_key.as_deref(), &key, value)
@@ -23927,45 +24034,45 @@ mod tests {
     impl u7s_store::Store for FailOnDeleteStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: bytes::Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.put(&key, value, expected_revision).await }
         }
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
         {
             let inject = self.arm.swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move {
                 if inject {
                     // Simulate a storage-layer failure (revision mismatch is a concrete
@@ -24060,28 +24167,28 @@ mod tests {
     impl u7s_store::Store for ConcurrentWriterStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: bytes::Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
@@ -24089,7 +24196,7 @@ mod tests {
                 .inject_next
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             let concurrent_write = self.concurrent_write.clone();
             async move {
                 if inject {
@@ -24108,12 +24215,12 @@ mod tests {
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -24190,28 +24297,28 @@ mod tests {
     impl u7s_store::Store for RaceWinnerAlreadyExistsStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: bytes::Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
@@ -24219,7 +24326,7 @@ mod tests {
                 .fire_once
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             let winner_body = self.winner_body.clone();
             async move {
                 if inject {
@@ -24238,12 +24345,12 @@ mod tests {
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -24761,28 +24868,28 @@ mod tests {
     impl u7s_store::Store for FirstPutAlreadyExistsStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: bytes::Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
@@ -24790,7 +24897,7 @@ mod tests {
                 .fire_once
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move {
                 if inject {
                     Err(u7s_store::StoreError::AlreadyExists { key })
@@ -24802,12 +24909,12 @@ mod tests {
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -24881,7 +24988,7 @@ mod tests {
     impl u7s_store::Store for AlwaysAlreadyExistsStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             // A real "already exists" collision means a GET must find something at that
@@ -24898,7 +25005,7 @@ mod tests {
                 .unwrap(),
             );
             std::future::ready(Ok(Some(u7s_store::StoreObject {
-                key: key.to_string(),
+                key: key.into(),
                 value,
                 revision: 1,
             })))
@@ -24906,7 +25013,7 @@ mod tests {
 
         fn list(
             &self,
-            _prefix: &str,
+            _prefix: impl Into<String> + Send,
             _opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
@@ -24920,23 +25027,23 @@ mod tests {
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             _value: bytes::Bytes,
             _expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
             self.put_attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let key = key.to_string();
+            let key: String = key.into();
             async move { Err(u7s_store::StoreError::AlreadyExists { key }) }
         }
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             _expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
         {
-            let key = key.to_string();
+            let key: String = key.into();
             async move { Err(u7s_store::StoreError::NotFound { key }) }
         }
 
@@ -25589,45 +25696,45 @@ mod tests {
     impl u7s_store::Store for NotFoundOnDeleteStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: bytes::Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.put(&key, value, expected_revision).await }
         }
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
         {
             let inject = self.arm.swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move {
                 if inject {
                     Err(u7s_store::StoreError::NotFound { key: key.clone() })

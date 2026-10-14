@@ -1989,12 +1989,12 @@ fn paginate_in_memory(
 }
 
 impl Store for SqliteStore {
-    async fn get(&self, key: &str) -> Result<Option<StoreObject>> {
+    async fn get(&self, key: impl Into<String> + Send) -> Result<Option<StoreObject>> {
         let conn = self.read_conn.clone();
-        let key_str = key.to_string();
-        let obj = tokio::task::spawn_blocking(move || {
+        let key_str: String = key.into();
+        let (obj, key_str) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            get_sync(&conn, &key_str)
+            get_sync(&conn, &key_str).map(|obj| (obj, key_str))
         })
         .await??;
 
@@ -2005,10 +2005,9 @@ impl Store for SqliteStore {
         let min_rev = self.last_written_revision.load(Ordering::Acquire);
         if obj.as_ref().is_some_and(|o| o.revision < min_rev) || (obj.is_none() && min_rev > 0) {
             let write_conn = self.write_conn.clone();
-            let key_str2 = key.to_string();
             return tokio::task::spawn_blocking(move || {
                 let conn = write_conn.blocking_lock();
-                get_sync(&conn, &key_str2)
+                get_sync(&conn, &key_str)
             })
             .await?;
         }
@@ -2016,14 +2015,16 @@ impl Store for SqliteStore {
         Ok(obj)
     }
 
-    async fn list(&self, prefix: &str, opts: ListOptions) -> Result<ListResponse> {
+    async fn list(
+        &self,
+        prefix: impl Into<String> + Send,
+        opts: ListOptions,
+    ) -> Result<ListResponse> {
         let read_conn = self.read_conn.clone();
-        let prefix = prefix.to_string();
-        let prefix2 = prefix.clone();
-        let opts2 = opts.clone();
-        let resp = tokio::task::spawn_blocking(move || {
+        let prefix: String = prefix.into();
+        let (resp, prefix, opts) = tokio::task::spawn_blocking(move || {
             let conn = read_conn.blocking_lock();
-            list_sync(&conn, &prefix, &opts2)
+            list_sync(&conn, &prefix, &opts).map(|resp| (resp, prefix, opts))
         })
         .await??;
 
@@ -2037,7 +2038,7 @@ impl Store for SqliteStore {
             let write_conn = self.write_conn.clone();
             return tokio::task::spawn_blocking(move || {
                 let conn = write_conn.blocking_lock();
-                list_sync(&conn, &prefix2, &opts)
+                list_sync(&conn, &prefix, &opts)
             })
             .await?;
         }
@@ -2045,9 +2046,14 @@ impl Store for SqliteStore {
         Ok(resp)
     }
 
-    async fn put(&self, key: &str, value: Bytes, expected_revision: Option<u64>) -> Result<u64> {
+    async fn put(
+        &self,
+        key: impl Into<String> + Send,
+        value: Bytes,
+        expected_revision: Option<u64>,
+    ) -> Result<u64> {
         let conn = self.write_conn.clone();
-        let key_str = key.to_string();
+        let key_str: String = key.into();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let bookmark_tx = self.bookmark_tx.clone();
@@ -2056,10 +2062,17 @@ impl Store for SqliteStore {
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let epoch = self.epoch;
         let start = std::time::Instant::now();
-        let (revision, is_noop, is_create) = tokio::task::spawn_blocking(move || {
+        let revision = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let (revision, stamped_value, is_create, is_noop, ns) =
                 put_sync(&conn, &key_str, value, expected_revision, &last_written)?;
+            tracing::debug!(
+                key = key_str.as_str(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                is_noop,
+                is_create,
+                "store: write committed"
+            );
             // Skip the broadcast entirely for no-op writes: no revision was bumped and no
             // storage mutation happened, so notifying watchers would be a phantom MODIFIED
             // event for content that never changed — exactly the flood this check exists to
@@ -2086,17 +2099,9 @@ impl Store for SqliteStore {
                     }),
                 );
             }
-            Ok::<(u64, bool, bool), StoreError>((revision, is_noop, is_create))
+            Ok::<u64, StoreError>(revision)
         })
         .await??;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        tracing::debug!(
-            key,
-            elapsed_ms,
-            is_noop,
-            is_create,
-            "store: write committed"
-        );
 
         Ok(revision)
     }
@@ -2104,12 +2109,12 @@ impl Store for SqliteStore {
     async fn create_if_namespace_active(
         &self,
         ns_key: Option<&str>,
-        key: &str,
+        key: impl Into<String> + Send,
         value: Bytes,
     ) -> std::result::Result<u64, CreateNamespacedError> {
         let conn = self.write_conn.clone();
         let ns_key_owned = ns_key.map(|s| s.to_string());
-        let key_str = key.to_string();
+        let key_str: String = key.into();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let bookmark_tx = self.bookmark_tx.clone();
@@ -2127,6 +2132,11 @@ impl Store for SqliteStore {
                 value,
                 &last_written,
             )?;
+            tracing::debug!(
+                key = key_str.as_str(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "store: namespaced create committed"
+            );
             // Broadcast while still holding write_conn's guard — see push_event_locked's doc
             // comment for why this ordering matters under concurrent writers. A namespaced
             // create is always a fresh key (create-only, gated on AlreadyExists above), so
@@ -2153,15 +2163,17 @@ impl Store for SqliteStore {
             Ok::<u64, CreateNamespacedError>(revision)
         })
         .await??;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        tracing::debug!(key, elapsed_ms, "store: namespaced create committed");
 
         Ok(revision)
     }
 
-    async fn delete(&self, key: &str, expected_revision: Option<u64>) -> Result<(u64, Bytes)> {
+    async fn delete(
+        &self,
+        key: impl Into<String> + Send,
+        expected_revision: Option<u64>,
+    ) -> Result<(u64, Bytes)> {
         let conn = self.write_conn.clone();
-        let key_str = key.to_string();
+        let key_str: String = key.into();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let bookmark_tx = self.bookmark_tx.clone();
@@ -2174,6 +2186,11 @@ impl Store for SqliteStore {
             let conn = conn.blocking_lock();
             let (revision, last_value, ns) =
                 delete_sync(&conn, &key_str, expected_revision, &last_written)?;
+            tracing::debug!(
+                key = key_str.as_str(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "store: delete committed"
+            );
             // Broadcast while still holding write_conn's guard — see push_event_locked's
             // doc comment for why this ordering matters under concurrent writers.
             let shard = shard_key(&key_str, ns.as_deref());
@@ -2197,8 +2214,6 @@ impl Store for SqliteStore {
             Ok::<(u64, Bytes), StoreError>((revision, last_value))
         })
         .await??;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        tracing::debug!(key, elapsed_ms, "store: delete committed");
 
         Ok((revision, last_value))
     }
@@ -3939,6 +3954,69 @@ mod tests {
              reverting to unbounded query_all()+in-memory-filter would scan all 20 rows for a \
              single small page, and every NEGATED field selector (the scheduler's pod-list \
              query included) falls through this exact branch"
+        );
+    }
+
+    /// Paging a negated generic field selector via continue tokens must return every matching
+    /// object exactly once, in key order.
+    ///
+    /// Why it matters: this batched branch advances its cursor across chunks that are mostly
+    /// filtered out; if the cursor were taken from the last scanned row instead of the last
+    /// returned row (or the probe row), a page boundary would skip or repeat a pod and a
+    /// scheduler listing `status.phase!=Succeeded` in chunks would miss or double-count pods.
+    #[test]
+    fn negated_generic_field_selector_continue_round_trip_has_no_gaps_or_dupes() {
+        let conn = conn_with_objects_schema();
+        let mut expected_keys = Vec::new();
+        for i in 0..20 {
+            let key = format!("/registry/pods/default/pod-{i:02}");
+            // With limit 3 (chunk of 4): pods 0-3 yield exactly 3 survivors and no probe row, and
+            // pods 4-7 are a whole filtered-out chunk, so boundaries fall on an exact-limit chunk
+            // and inside filtered-out stretches.
+            let succeeded = i == 0 || (4..8).contains(&i) || i == 11 || i == 14;
+            let phase = if succeeded { "Succeeded" } else { "Running" };
+            insert_pod_with_phase(&conn, &key, "default", &format!("pod-{i:02}"), phase);
+            if !succeeded {
+                expected_keys.push(key);
+            }
+        }
+
+        let mut collected = Vec::new();
+        let mut pages = 0;
+        let mut continue_key: Option<String> = None;
+        loop {
+            let resp = list_sync(
+                &conn,
+                "/registry/pods/",
+                &ListOptions {
+                    field_selector: Some(FieldSelector {
+                        field: "status.phase".to_string(),
+                        value: "Succeeded".to_string(),
+                        negated: true,
+                    }),
+                    limit: Some(3),
+                    continue_key: continue_key.clone(),
+                },
+            )
+            .expect("paginated negated list must not error");
+            pages += 1;
+            assert!(pages <= 10, "pagination did not terminate");
+            collected.extend(resp.items.iter().map(|o| o.key.clone()));
+            continue_key = resp.continue_key;
+            if continue_key.is_none() {
+                break;
+            }
+        }
+
+        assert!(
+            pages > 1,
+            "test must span multiple pages to exercise the cursor"
+        );
+        assert_eq!(
+            collected, expected_keys,
+            "paging a negated field selector must return every matching pod exactly once, in key \
+             order; a gap or duplicate means a client paging with --chunk-size misses or \
+             double-processes pods"
         );
     }
 
