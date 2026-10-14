@@ -1479,6 +1479,58 @@ assert "...and the merged PR is recorded in merged_prs, proving the cleanup path
   "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 23. A merged worker PR whose bead-snapshot commit touches a path the mayor
+#     checkout holds a local edit of. bd regenerates .beads/issues.jsonl on
+#     every write, so that path must be discarded and the pull must land;
+#     any other dirty path blocks the pull and must surface as an in-contract
+#     exit 20, never an exit 1 that skips cleanup and the dashboard refresh.
+# ---------------------------------------------------------------------------
+
+# $1=repo-relative path both origin's new commit and the local checkout edit.
+# Sets FF_REPO/FF_ORIGIN_SHA, runs the tick, sets TICK_RC/TICK_STATE.
+run_blocked_pull_tick() {
+  local blocked_path="$1"
+  build_scratch_repo "merged-ff"
+  FF_REPO="$SCRATCH_REPO"
+  local origin="$(dirname "$FF_REPO")/origin.git" advancer="$(dirname "$FF_REPO")/advancer"
+  mkdir -p "$FF_REPO/$(dirname "$blocked_path")"
+  echo base > "$FF_REPO/$blocked_path"
+  git -C "$FF_REPO" add "$blocked_path"
+  git -C "$FF_REPO" commit -q -m "track $blocked_path"
+  git init -q --bare -b main "$origin"
+  git -C "$FF_REPO" branch -M main
+  git -C "$FF_REPO" remote add origin "$origin"
+  git -C "$FF_REPO" push -q -u origin main 2>/dev/null
+  git clone -q -b main "$origin" "$advancer" 2>/dev/null
+  git -C "$advancer" config user.email test@example.com
+  git -C "$advancer" config user.name "Test"
+  echo upstream > "$advancer/$blocked_path"
+  git -C "$advancer" commit -q -am "snapshot lands on origin main"
+  git -C "$advancer" push -q origin HEAD:main 2>/dev/null
+  FF_ORIGIN_SHA=$(git -C "$advancer" rev-parse HEAD)
+  echo local-edit > "$FF_REPO/$blocked_path"
+  invoke_tick "$STUB_MERGED_BIN" "$FF_REPO" 0
+}
+
+run_blocked_pull_tick ".beads/issues.jsonl"
+assert "a locally regenerated .beads/issues.jsonl does not block the post-merge pull (checkout reaches origin main)" \
+  "$([ "$(git -C "$FF_REPO" rev-parse HEAD)" = "$FF_ORIGIN_SHA" ] && echo 1 || echo 0)"
+assert "...and the tick stays inside its 0/10/20/30 contract instead of exiting 1" \
+  "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
+assert "...and post-merge cleanup still ran (merged PR recorded)" \
+  "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
+
+run_blocked_pull_tick "src/other.txt"
+assert "an unrelated dirty path is never discarded: the local edit survives" \
+  "$([ "$(cat "$FF_REPO/src/other.txt")" = "local-edit" ] && echo 1 || echo 0)"
+assert "an unrelated dirty path blocking the pull exits 20, not 1" \
+  "$([ "$TICK_RC" -eq 20 ] && echo 1 || echo 0)"
+assert "...surfaces checkout-pull-blocked in queue_warnings so the mayor sees why" \
+  "$([ "$(jq -r '.queue_warnings[0].reason' "$TICK_STATE")" = "checkout-pull-blocked" ] && echo 1 || echo 0)"
+assert "...and still runs the rest of cleanup (merged PR recorded)" \
+  "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
