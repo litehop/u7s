@@ -3942,6 +3942,67 @@ mod tests {
         );
     }
 
+    /// Paging a negated generic field selector via continue tokens must return every matching
+    /// object exactly once, in key order.
+    ///
+    /// Why it matters: this batched branch advances its cursor across chunks that are mostly
+    /// filtered out; if the cursor were taken from the last scanned row instead of the last
+    /// returned row (or the probe row), a page boundary would skip or repeat a pod and a
+    /// scheduler listing `status.phase!=Succeeded` in chunks would miss or double-count pods.
+    #[test]
+    fn negated_generic_field_selector_continue_round_trip_has_no_gaps_or_dupes() {
+        let conn = conn_with_objects_schema();
+        let mut expected_keys = Vec::new();
+        for i in 0..20 {
+            let key = format!("/registry/pods/default/pod-{i:02}");
+            // Uneven runs of Succeeded so page boundaries fall inside filtered-out stretches.
+            let succeeded = i % 2 == 0 || (8..12).contains(&i);
+            let phase = if succeeded { "Succeeded" } else { "Running" };
+            insert_pod_with_phase(&conn, &key, "default", &format!("pod-{i:02}"), phase);
+            if !succeeded {
+                expected_keys.push(key);
+            }
+        }
+
+        let mut collected = Vec::new();
+        let mut pages = 0;
+        let mut continue_key: Option<String> = None;
+        loop {
+            let resp = list_sync(
+                &conn,
+                "/registry/pods/",
+                &ListOptions {
+                    field_selector: Some(FieldSelector {
+                        field: "status.phase".to_string(),
+                        value: "Succeeded".to_string(),
+                        negated: true,
+                    }),
+                    limit: Some(3),
+                    continue_key: continue_key.clone(),
+                },
+            )
+            .expect("paginated negated list must not error");
+            pages += 1;
+            assert!(pages <= 10, "pagination did not terminate");
+            collected.extend(resp.items.iter().map(|o| o.key.clone()));
+            continue_key = resp.continue_key;
+            if continue_key.is_none() {
+                break;
+            }
+        }
+
+        assert!(
+            pages > 1,
+            "test must span multiple pages to exercise the cursor"
+        );
+        assert_eq!(
+            collected, expected_keys,
+            "paging a negated field selector must return every matching pod exactly once, in key \
+             order; a gap or duplicate means a client paging with --chunk-size misses or \
+             double-processes pods"
+        );
+    }
+
     /// Continue-token pagination under the `metadata.namespace` SQL `LIMIT` fast-path must cover
     /// the exact same set of keys as an unpaginated list, in the same order, with no gaps or
     /// duplicates — identical to the no-field-selector (`None`) branch's keyset semantics.
