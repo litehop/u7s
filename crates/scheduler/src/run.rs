@@ -37,7 +37,8 @@ use crate::{
     patch_pod_status, pick_node, pods_needing_resync, preemption_reservation_still_fits,
     scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
-    stamp_selected_node_for_pvcs, stream_watch_events, BindError, NodeTally, PendingPod, PodList,
+    stamp_selected_node_for_pvcs, stream_watch_events, unscheduled_pod_uids, BindError, NodeTally,
+    PendingPod, PodList,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -553,7 +554,10 @@ impl PodReplay {
             |fresh, event| {
                 let _ = fresh.apply_event(event);
             },
-            |live, fresh| abandoned_deferred_binds = live.replace_pods(fresh),
+            |live, fresh| {
+                let unscheduled = unscheduled_pod_uids(self.deferred.iter().map(|e| &e["object"]));
+                abandoned_deferred_binds = live.replace_pods(fresh, &unscheduled);
+            },
         );
         match step {
             Replay::Consumed => {
@@ -825,6 +829,11 @@ async fn resync_once(
             return None;
         }
     };
+    tally
+        .lock()
+        .expect("tally lock poisoned")
+        .failures
+        .retain_pending(&unscheduled_pod_uids(&list.items));
     let mut in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
     let mut earliest_expiry = None;
     if respect_backoff {
@@ -1379,11 +1388,14 @@ fn handle_pod_event(
                         error!("failed to set PodScheduled=False status for {key}: {patch_err}");
                     }
                 }
+                let uid = event["object"]["metadata"]["uid"]
+                    .as_str()
+                    .unwrap_or_default();
                 emit_event = tally_clone
                     .lock()
                     .expect("tally lock poisoned")
                     .failures
-                    .record_failure(&key, &message, std::time::Instant::now());
+                    .record_failure(&key, uid, &message, std::time::Instant::now());
                 ("FailedScheduling", message, "Warning")
             }
         };
@@ -3577,12 +3589,48 @@ mod tests {
         );
     }
 
+    /// With no event after the one that started the pass, the self re-wake
+    /// timer alone must re-attempt a backed-off pod once its backoff expires.
+    #[tokio::test]
+    async fn backed_off_pod_is_retried_by_the_rearm_timer_without_further_events() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, in_flight, tally, bind_count, _patches, _events) =
+            pod_failed_once_for_cpu().await;
+        assert!(tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&worker_node_event("1000m")));
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
+        tokio::spawn(run_requeue_loop(
+            connector,
+            server,
+            in_flight,
+            tally,
+            synced_rx,
+            requeue.clone(),
+        ));
+        requeue.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            bind_count.load(Ordering::SeqCst),
+            0,
+            "the pass must skip the pod while it is still inside its backoff"
+        );
+        wait_until(
+            || bind_count.load(Ordering::SeqCst) >= 1,
+            "the rearm timer to re-attempt the pod after its backoff expired",
+        )
+        .await;
+    }
+
     #[test]
     fn failure_backoff_doubles_to_cap_and_clears_on_bind() {
         use std::time::{Duration, Instant};
         let mut b = crate::FailureBackoff::default();
         let t0 = Instant::now();
-        b.record_failure("default/p", "m", t0);
+        b.record_failure("default/p", "u1", "m", t0);
         let left = |b: &crate::FailureBackoff, at: Duration| {
             b.backed_off(t0 + at).into_iter().next().map(|(_, l)| l)
         };
@@ -3591,13 +3639,13 @@ mod tests {
             left(&b, Duration::from_secs(1)).is_none(),
             "initial backoff is 1s"
         );
-        b.record_failure("default/p", "m", t0);
+        b.record_failure("default/p", "u1", "m", t0);
         assert!(
             left(&b, Duration::from_millis(1999)).is_some(),
             "second failure doubles to 2s"
         );
         for _ in 0..10 {
-            b.record_failure("default/p", "m", t0);
+            b.record_failure("default/p", "u1", "m", t0);
         }
         assert!(left(&b, Duration::from_millis(9999)).is_some());
         assert!(
@@ -3616,17 +3664,17 @@ mod tests {
         use std::time::{Duration, Instant};
         let mut b = crate::FailureBackoff::default();
         let t0 = Instant::now();
-        assert!(b.record_failure("default/p", "no fit", t0));
+        assert!(b.record_failure("default/p", "u1", "no fit", t0));
         assert!(
-            !b.record_failure("default/p", "no fit", t0 + Duration::from_secs(30)),
+            !b.record_failure("default/p", "u1", "no fit", t0 + Duration::from_secs(30)),
             "identical message inside the window is suppressed"
         );
         assert!(
-            b.record_failure("default/p", "taint", t0 + Duration::from_secs(31)),
+            b.record_failure("default/p", "u1", "taint", t0 + Duration::from_secs(31)),
             "a changed reason must be reported immediately"
         );
         assert!(
-            b.record_failure("default/p", "taint", t0 + Duration::from_secs(91)),
+            b.record_failure("default/p", "u1", "taint", t0 + Duration::from_secs(91)),
             "an unchanged failure is re-announced once the 60s window passes"
         );
     }
@@ -3637,7 +3685,7 @@ mod tests {
         let mut tally = NodeTally::default();
         tally
             .failures
-            .record_failure("default/web-0", "m", Instant::now());
+            .record_failure("default/web-0", "u1", "m", Instant::now());
         tally.apply_event(&json!({
             "type": "DELETED",
             "object": {"metadata": {"name": "web-0", "namespace": "default"}}
@@ -3645,6 +3693,72 @@ mod tests {
         assert!(
             tally.failures.backed_off(Instant::now()).is_empty(),
             "failure state must not outlive the pod"
+        );
+    }
+
+    #[test]
+    fn replay_swap_prunes_failure_state_of_pods_deleted_while_disconnected() {
+        use std::time::Instant;
+        let mut live = NodeTally::default();
+        for (key, uid) in [("default/gone", "u-gone"), ("default/kept", "u-kept")] {
+            live.failures.record_failure(key, uid, "m", Instant::now());
+        }
+        let replay = [json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "kept", "namespace": "default", "uid": "u-kept"},
+                "spec": {"nodeName": ""}
+            }
+        })];
+        let unscheduled = crate::unscheduled_pod_uids(replay.iter().map(|e| &e["object"]));
+        let _ = live.replace_pods(&mut NodeTally::default(), &unscheduled);
+        let left: Vec<String> = live
+            .failures
+            .backed_off(Instant::now())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            left,
+            ["default/kept"],
+            "a pod deleted while the watch was down must not leave backoff state behind forever"
+        );
+    }
+
+    #[test]
+    fn recreated_pod_does_not_inherit_a_stale_failure_entry() {
+        use std::time::Instant;
+        let mut b = crate::FailureBackoff::default();
+        let t0 = Instant::now();
+        assert!(b.record_failure("default/web-0", "old", "no fit", t0));
+        b.clear("default/web-0");
+        // The deleted pod's in-flight attempt finishes after the DELETED echo.
+        b.record_failure("default/web-0", "old", "no fit", t0);
+        assert!(
+            b.record_failure("default/web-0", "new", "no fit", t0),
+            "the recreated pod's first FailedScheduling Event must not be swallowed by its \
+             predecessor's dedupe window"
+        );
+        let left = b.backed_off(t0);
+        assert_eq!(left.len(), 1);
+        assert_eq!(
+            left[0].1,
+            std::time::Duration::from_secs(1),
+            "the recreated pod starts at the initial backoff, not its predecessor's count"
+        );
+    }
+
+    #[test]
+    fn retain_pending_drops_entry_of_recreated_pod_uid() {
+        use std::time::Instant;
+        let mut b = crate::FailureBackoff::default();
+        b.record_failure("default/web-0", "old", "m", Instant::now());
+        let pending =
+            std::collections::HashSet::from([("default/web-0".to_owned(), "new".to_owned())]);
+        b.retain_pending(&pending);
+        assert!(
+            b.backed_off(Instant::now()).is_empty(),
+            "a list showing a different UID under the same key means the tracked pod is gone"
         );
     }
 

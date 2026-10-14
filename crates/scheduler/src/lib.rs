@@ -1593,6 +1593,7 @@ const FAILED_EVENT_REPEAT_WINDOW: std::time::Duration = std::time::Duration::fro
 
 #[derive(Debug)]
 struct FailureState {
+    uid: String,
     failures: u32,
     last_attempt: std::time::Instant,
     last_event_message: String,
@@ -1602,9 +1603,10 @@ struct FailureState {
 /// Per-pod state for unschedulable pods: upstream's `podInitialBackoffDuration`
 /// (1s) doubling to `podMaxBackoffDuration` (10s) gating event-driven
 /// requeues, and a repeat window collapsing identical FailedScheduling Events
-/// the way upstream's event aggregation does. Entries exist only between a
-/// pod's first failure and its bind or deletion, so size is bounded by the
-/// pending pods.
+/// the way upstream's event aggregation does. Entries are tied to the pod's
+/// UID, so a recreated same-name pod never inherits its predecessor's state,
+/// and are pruned (`retain_pending`) against every pod list the scheduler
+/// takes, so a deletion missed by the watch cannot leak one.
 #[derive(Debug, Default)]
 pub struct FailureBackoff {
     entries: std::collections::HashMap<String, FailureState>,
@@ -1612,9 +1614,16 @@ pub struct FailureBackoff {
 
 impl FailureBackoff {
     /// Records a failed attempt; returns whether a FailedScheduling Event
-    /// should be posted (message changed, or the repeat window elapsed).
-    pub fn record_failure(&mut self, key: &str, message: &str, now: std::time::Instant) -> bool {
-        match self.entries.get_mut(key) {
+    /// should be posted (message changed, or the repeat window elapsed). An
+    /// entry left by a different pod UID under the same key is replaced.
+    pub fn record_failure(
+        &mut self,
+        key: &str,
+        uid: &str,
+        message: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        match self.entries.get_mut(key).filter(|s| s.uid == uid) {
             Some(state) => {
                 state.failures = state.failures.saturating_add(1);
                 state.last_attempt = now;
@@ -1630,6 +1639,7 @@ impl FailureBackoff {
                 self.entries.insert(
                     key.to_owned(),
                     FailureState {
+                        uid: uid.to_owned(),
                         failures: 1,
                         last_attempt: now,
                         last_event_message: message.to_owned(),
@@ -1657,6 +1667,31 @@ impl FailureBackoff {
     pub fn clear(&mut self, key: &str) {
         self.entries.remove(key);
     }
+
+    /// Drops every entry whose `(key, uid)` is not in `pending` — the pods a
+    /// fresh list or replay shows as still unscheduled.
+    pub fn retain_pending(&mut self, pending: &std::collections::HashSet<(String, String)>) {
+        self.entries
+            .retain(|k, s| pending.contains(&(k.clone(), s.uid.clone())));
+    }
+}
+
+/// `(namespace/name, uid)` of every pod in `objects` that still needs
+/// scheduling.
+pub fn unscheduled_pod_uids<'a>(
+    objects: impl IntoIterator<Item = &'a Value>,
+) -> std::collections::HashSet<(String, String)> {
+    objects
+        .into_iter()
+        .filter_map(|obj| {
+            let pending = needs_scheduling_pod(obj)?;
+            let uid = obj["metadata"]["uid"].as_str().unwrap_or_default();
+            Some((
+                format!("{}/{}", pending.namespace, pending.pod_name),
+                uid.to_owned(),
+            ))
+        })
+        .collect()
 }
 
 /// An in-memory, watch-maintained running tally of every bound, non-terminal
@@ -2000,8 +2035,13 @@ impl NodeTally {
     /// claims, PVC waiters) is still dropped, and the abandoned plans' keys
     /// are returned for the same reason as `clear`.
     #[must_use]
-    pub fn replace_pods(&mut self, fresh: &mut NodeTally) -> Vec<String> {
+    pub fn replace_pods(
+        &mut self,
+        fresh: &mut NodeTally,
+        unscheduled: &std::collections::HashSet<(String, String)>,
+    ) -> Vec<String> {
         let abandoned = self.clear();
+        self.failures.retain_pending(unscheduled);
         self.pods = std::mem::take(&mut fresh.pods);
         self.by_node = std::mem::take(&mut fresh.by_node);
         abandoned
