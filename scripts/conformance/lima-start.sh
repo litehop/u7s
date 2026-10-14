@@ -285,10 +285,7 @@ fi
 # Flannel's cross-node VXLAN needs a real L2 path between this VM and every node
 # already in the cluster; fail before anything is applied if they are on
 # different Lima networks.
-for PEER in $(kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o jsonpath='{.items[*].metadata.name}'); do
-  [ "$PEER" = "$VM_NAME" ] && continue
-  assert_same_lima_network "$VM_NAME" "$PEER" || exit 1
-done
+assert_same_lima_network "$VM_NAME" "$KUBECONFIG_PATH" || exit 1
 
 # CRI-O ships a default 10-crio-bridge.conf(list) that gives every node its own
 # independent, uncoordinated subnet with no cross-node routing at all. Flannel
@@ -905,7 +902,7 @@ limactl shell "$VM_NAME" sudo systemctl enable kube-proxy 2>/dev/null
 limactl shell "$VM_NAME" sudo systemctl restart kube-proxy
 
 # Verify kube-proxy actually reached the active state (not stuck crashlooping).
-# Without this check, any silent failure (missing ipset, missing kernel module,
+# Without this check, any silent failure (missing kernel module,
 # bad config) leaves kube-proxy dead and the kubernetes Service VIP unreachable —
 # sonobuoy then hangs indefinitely on "dial tcp 10.96.0.1:443: i/o timeout" with
 # no actionable signal to the operator.
