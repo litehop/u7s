@@ -589,7 +589,10 @@ step_g_fix_round_worktrees() {
       rc=1
       continue
     fi
-    run_cmd git -C "$REPO_ROOT" branch -D "$branch"
+    if ! run_cmd git -C "$REPO_ROOT" branch -D "$branch"; then
+      echo "worktree-hygiene: STEP G removed $path but could not delete branch $branch" >&2
+      rc=1
+    fi
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
   return "$rc"
 }
