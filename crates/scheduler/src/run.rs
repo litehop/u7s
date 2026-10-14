@@ -997,7 +997,7 @@ fn handle_pod_event(
             )
             .await
             {
-                Ok(drivers) => pending.unbound_csi_pvc_drivers = drivers,
+                Ok(drivers) => pending.unbound_csi_pvc_drivers.extend(drivers),
                 Err(e) => {
                     error!(
                         "could not resolve unbound CSI PVC drivers while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"

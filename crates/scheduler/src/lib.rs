@@ -200,6 +200,15 @@ struct PodVolume {
     /// inside this value.
     #[serde(default)]
     ephemeral: Option<Value>,
+    /// Inline CSI volume source: no PVC is involved, so the driver name is
+    /// the only thing the scheduler can check against CSINode.
+    #[serde(default)]
+    csi: Option<CsiVolumeSource>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CsiVolumeSource {
+    driver: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -689,7 +698,9 @@ fn needs_scheduling_pod(pod: &Value) -> Option<PendingPod> {
         .unwrap_or_default();
     let node_affinity = affinity.and_then(|a| a.node_affinity);
     let host_ports = container_host_ports(&object.spec.containers);
-    let pvc_names = referenced_pvc_names(pod_name, object.spec.volumes.as_deref().unwrap_or(&[]));
+    let volumes = object.spec.volumes.as_deref().unwrap_or(&[]);
+    let pvc_names = referenced_pvc_names(pod_name, volumes);
+    let unbound_csi_pvc_drivers = inline_csi_drivers(volumes);
     let topology_spread_constraints = object.spec.topology_spread_constraints;
     Some(PendingPod {
         namespace,
@@ -708,8 +719,20 @@ fn needs_scheduling_pod(pod: &Value) -> Option<PendingPod> {
         topology_spread_constraints,
         csi_volume_counts: std::collections::BTreeMap::new(),
         read_write_once_pod_pvcs: Vec::new(),
-        unbound_csi_pvc_drivers: Vec::new(),
+        unbound_csi_pvc_drivers,
     })
+}
+
+/// Driver names of inline (`spec.volumes[].csi`) volumes — resolvable from
+/// the pod spec alone, so `needs_scheduling_pod` seeds them into
+/// `unbound_csi_pvc_drivers` and a node whose CSINode never registered the
+/// driver is rejected by `csi_topology_fit`.
+fn inline_csi_drivers(volumes: &[PodVolume]) -> Vec<String> {
+    volumes
+        .iter()
+        .filter_map(|v| v.csi.as_ref())
+        .map(|c| c.driver.clone())
+        .collect()
 }
 
 /// Every PVC name `pod_name`'s volumes reference — direct
@@ -5483,6 +5506,7 @@ mod tests {
                 claim_name: "data-pvc".to_owned(),
             }),
             ephemeral: None,
+            csi: None,
         }];
         assert_eq!(
             referenced_pvc_names("web-0", &volumes),
@@ -5499,6 +5523,7 @@ mod tests {
             name: "scratch".to_owned(),
             persistent_volume_claim: None,
             ephemeral: Some(json!({"volumeClaimTemplate": {}})),
+            csi: None,
         }];
         assert_eq!(
             referenced_pvc_names("web-0", &volumes),
@@ -5515,6 +5540,7 @@ mod tests {
             name: "config".to_owned(),
             persistent_volume_claim: None,
             ephemeral: None,
+            csi: None,
         }];
         assert!(
             referenced_pvc_names("web-0", &volumes).is_empty(),
@@ -12029,6 +12055,55 @@ mod tests {
              node must be rejected — not scheduled to a wrong one — so the \
              pod stays Pending until the driver's CSINode registration lands: \
              got {result:?}"
+        );
+    }
+
+    #[test]
+    fn needs_scheduling_collects_inline_csi_volume_drivers_without_any_pvc() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "inline-csi", "namespace": "default"},
+                "spec": {"volumes": [
+                    {"name": "scratch", "csi": {"driver": "inline.csi.example.com"}},
+                    {"name": "cfg", "configMap": {"name": "x"}}
+                ]}
+            }
+        });
+        let pod = needs_scheduling(&event).expect("pod needs scheduling");
+        assert_eq!(
+            pod.unbound_csi_pvc_drivers,
+            vec!["inline.csi.example.com".to_owned()],
+            "an inline CSI volume has no PVC to resolve, so its driver must come \
+             straight from the pod spec or the pod is bound to a node that can \
+             never mount it"
+        );
+        assert!(pod.pvc_names.is_empty());
+    }
+
+    #[test]
+    fn select_node_with_capacity_skips_node_missing_inline_csi_driver() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "inline-csi", "namespace": "default"},
+                "spec": {"volumes": [
+                    {"name": "scratch", "csi": {"driver": "inline.csi.example.com"}}
+                ]}
+            }
+        });
+        let pod = needs_scheduling(&event).expect("pod needs scheduling");
+        let mut registered = make_node_with_capacity("has-driver", &[], "110");
+        registered.csi_registered_drivers = ["inline.csi.example.com".to_owned()].into();
+        let list = NodeList {
+            items: vec![make_node_with_capacity("no-driver", &[], "110"), registered],
+        };
+        let chosen = select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &[]);
+        assert_eq!(
+            chosen.unwrap(),
+            "has-driver",
+            "a node whose CSINode never registered the inline volume's driver \
+             must be rejected, or the pod hangs in MountVolume"
         );
     }
 
