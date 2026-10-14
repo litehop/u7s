@@ -114,12 +114,7 @@ NETWORK="${_NETWORK_OVERRIDE:-$_DEFAULT_NETWORK}"
 # (_lib.sh) is shared with add-node.sh so both scripts always compute the same
 # suffix for the same VM_NAME.
 NODE_SUFFIX=$(node_suffix_for "$VM_NAME" "$_NODE_SUFFIX_OVERRIDE")
-if [ -n "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}" ]; then
-  KONNECTIVITY_SERVER_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"
-else
-  # Auto-derive: 6443→8135, 6444→8235, 6445→8335 (each port offset of 1 adds 100).
-  KONNECTIVITY_SERVER_PORT=$(( 8135 + (PORT - 6443) * 100 ))
-fi
+KONNECTIVITY_SERVER_PORT=$(konnectivity_server_port_for "$PORT" "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}")
 # Agent port: server_port-3 (matches the layout 8135/8132 and slot offsets 8235/8232, etc.)
 KONNECTIVITY_AGENT_PORT=$(( KONNECTIVITY_SERVER_PORT - 3 ))
 

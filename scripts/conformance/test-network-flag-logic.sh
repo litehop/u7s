@@ -94,12 +94,12 @@ assert_true "run-all.sh builds _NETWORK_ARG from NETWORK" \
 assert_true "run-all.sh forwards _NETWORK_ARG to the primary node's lima-start.sh call (Step 3)" \
   grep -qF 'bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}' "$RUN_ALL"
 assert_true "run-all.sh forwards _NETWORK_ARG to add-node.sh (2nd node, --extra-node) so both nodes can share a network" \
-  grep -qF 'bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}' "$RUN_ALL"
+  grep -qF 'bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}' "$RUN_ALL"
 
 assert_true "add-node.sh parses --network into a _NETWORK_OVERRIDE variable" \
   grep -qE '^\s*--network\)\s*_NETWORK_OVERRIDE="\$2"; shift 2 ;;\s*$' "$ADD_NODE"
 assert_true "add-node.sh forwards --network to its own lima-start.sh call" \
-  grep -qF 'bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} ${_NETWORK_ARG} --node-suffix "$NODE_SUFFIX" ${_VERBOSE_ARG}' "$ADD_NODE"
+  grep -qF 'bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" --konnectivity-server-port "$KONNECTIVITY_SERVER_PORT" ${_WORKDIR_ARG} ${_NETWORK_ARG} --node-suffix "$NODE_SUFFIX" ${_VERBOSE_ARG}' "$ADD_NODE"
 
 # Regression guard: prove the PRE-FIX invocation lines (no _NETWORK_ARG at
 # all) are gone, not just that a working line also happens to be present

@@ -86,6 +86,41 @@ assert "disruptive pass keeps the FeatureGate allow-set ANDed in" \
 assert "disruptive pass keeps the [Flaky] skip" \
   "$(contains "$(filter_args disruptive 1 1)" '--e2e-skip=\[Flaky\]')"
 
+# Suite-level cap: a total hang must end at ginkgo's --timeout, not its 24h
+# default; unset (--all-e2e keeps its 12h budget) must add no ginkgo --timeout.
+timeout_filter_args() {
+  local apply="$1" gt="$2"
+  (
+    PASS=parallel; PROCS=16
+    FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {A}'
+    JSON_REPORT_PATH=/r.json
+    if [ -n "$gt" ]; then GINKGO_SUITE_TIMEOUT="$gt"; fi
+    # shellcheck disable=SC1090
+    source "$FUNC_FILE"
+    build_filter_args "$apply"
+    printf '%s\n' "${FILTER_ARGS[@]}"
+  )
+}
+for apply in 1 0; do
+  assert "apply=$apply carries ginkgo --timeout=3600s when a suite cap is set" \
+    "$(contains "$(timeout_filter_args "$apply" 3600s)" '--timeout=3600s')"
+  assert "apply=$apply adds no ginkgo --timeout when no cap is set (--all-e2e keeps its own budget)" \
+    "$(contains "$(timeout_filter_args "$apply" "")" '--timeout' | tr 01 10)"
+done
+assert "apply=1 keeps the cap inside the '|'-separated E2E_EXTRA_GINKGO_ARGS value" \
+  "$(contains "$(timeout_filter_args 1 3600s)" '|--timeout=3600s')"
+
+SUITE_FUNC="$TMP/suite_timeout_seconds.sh"
+sed -n '/^suite_timeout_seconds() {/,/^}/p' "$SCRIPT" > "$SUITE_FUNC"
+# shellcheck disable=SC1090
+source "$SUITE_FUNC"
+assert "conformance/default focus is capped at 3600s (~2x the 28 min slowest passing suite)" \
+  "$([ "$(suite_timeout_seconds '')/$(suite_timeout_seconds 'ConfigMap')" = "3600/3600" ] && echo 1 || echo 0)"
+assert "csi-hostpath focus gets 5400s so a 43 min passing run is not cut off" \
+  "$([ "$(suite_timeout_seconds 'External Storage \[Driver: csi-hostpath\]')" = "5400" ] && echo 1 || echo 0)"
+assert "06 wires the cap into both the focus and certified-conformance sonobuoy invocations" \
+  "$([ "$(grep -c 'SONOBUOY_TIMEOUT_MARGIN_SECONDS ))"' "$SCRIPT")" = "2" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 2. The wrapper runs BOTH passes (disruptive first) and fails if either fails.
 # ---------------------------------------------------------------------------
@@ -204,7 +239,9 @@ RUN_ALL="$DIR/run-all.sh"
 assert "run-all.sh no longer guesses the results dir by mtime" \
   "$(grep -q 'ls -td' "$RUN_ALL" && echo 0 || echo 1)"
 assert "run-all.sh reads the parallel pass's recorded results dir (build.json + dhat heap)" \
-  "$([ "$(grep -c 'sonobuoy_results_dir_file "\$WORKDIR" parallel' "$RUN_ALL")" = 2 ] && echo 1 || echo 0)"
+  "$([ "$(grep -c 'cat "$(sonobuoy_results_dir_file "\$WORKDIR" parallel)"' "$RUN_ALL")" = 2 ] && echo 1 || echo 0)"
+assert "run-all.sh removes a stale parallel record before invoking 06 so an early 06 death cannot reuse an old run's dir" \
+  "$(grep -q 'rm -f "$(sonobuoy_results_dir_file "\$WORKDIR" parallel)"' "$RUN_ALL" && echo 1 || echo 0)"
 assert "06-run-sonobuoy.sh clears the stale record before a pass and writes it after retrieval" \
   "$(grep -q 'rm -f "\$RESULTS_DIR_FILE"' "$SCRIPT" && grep -q 'echo "\$RUN_DIR" > "\$RESULTS_DIR_FILE"' "$SCRIPT" && echo 1 || echo 0)"
 
