@@ -114,16 +114,14 @@ SUITE_FUNC="$TMP/suite_timeout_seconds.sh"
 sed -n '/^suite_timeout_seconds() {/,/^}/p' "$SCRIPT" > "$SUITE_FUNC"
 # shellcheck disable=SC1090
 source "$SUITE_FUNC"
-assert "conformance/default focus is capped at 3600s (~2x the 28 min slowest passing suite)" \
-  "$([ "$(suite_timeout_seconds '')/$(suite_timeout_seconds 'ConfigMap')" = "3600/3600" ] && echo 1 || echo 0)"
+assert "no-focus (full certified conformance) gets 5400s because it includes storage specs that can run 43 min; 3600s would cut a passing run off" \
+  "$([ "$(suite_timeout_seconds '')/$(suite_timeout_seconds 'ConfigMap')" = "5400/3600" ] && echo 1 || echo 0)"
 for f in 'External Storage \[Driver: csi-hostpath\]' '\[sig-storage\]' 'CSI Volumes' 'PersistentVolumes' 'Volume expand'; do
   assert "storage/CSI focus '$f' gets 5400s so a 43 min passing run is not cut off" \
     "$([ "$(suite_timeout_seconds "$f")" = "5400" ] && echo 1 || echo 0)"
 done
 assert "U7S_SUITE_TIMEOUT_S overrides the selected cap" \
   "$([ "$(U7S_SUITE_TIMEOUT_S=7200 suite_timeout_seconds 'ConfigMap')/$(U7S_SUITE_TIMEOUT_S=120 suite_timeout_seconds 'CSI')" = "7200/120" ] && echo 1 || echo 0)"
-assert "a non-numeric U7S_SUITE_TIMEOUT_S fails loud instead of building a bad --timeout" \
-  "$(U7S_SUITE_TIMEOUT_S=abc suite_timeout_seconds x >/dev/null 2>&1 && echo 0 || echo 1)"
 
 # Run the REAL 06 (parallel pass) against stub limactl/kubectl and inspect the
 # sonobuoy argv it builds: ginkgo --timeout and sonobuoy --timeout must both
@@ -163,14 +161,23 @@ ARGV="$(run06 --focus 'ConfigMap')"
 assert "06 non-storage focus run: 3600s ginkgo cap and sonobuoy --timeout 4200" \
   "$(has_all "$ARGV" '--timeout=3600s' '--timeout 4200')"
 ARGV="$(run06)"
-assert "06 certified-conformance run: 3600s ginkgo cap, sonobuoy --timeout 4200" \
-  "$(has_all "$ARGV" '--timeout=3600s' '--timeout 4200' '--mode=certified-conformance')"
+assert "06 certified-conformance run: 5400s ginkgo cap (storage specs run in the full suite), sonobuoy --timeout 6000" \
+  "$(has_all "$ARGV" '--timeout=5400s' '--timeout 6000' '--mode=certified-conformance')"
 ARGV="$(CAP=100 run06 --focus 'CSI')"
 assert "06 honours U7S_SUITE_TIMEOUT_S in both the ginkgo and sonobuoy timeouts" \
   "$(has_all "$ARGV" '--timeout=100s' '--timeout 700')"
 ARGV="$(run06 --all-e2e)"
 assert "06 --all-e2e keeps its 12h sonobuoy budget and adds no ginkgo suite cap" \
   "$([ "$(has_all "$ARGV" '--timeout 43200')$(contains "$ARGV" ' --timeout=')" = "10" ] && echo 1 || echo 0)"
+: > "$TMP/lima.log"
+BAD_RC=0
+(
+  cd "$DIR/../.."
+  PATH="$STUB:$PATH" LIMA_LOG="$TMP/lima.log" KUBECONFIG="$TMP/kubeconfig" U7S_SUITE_TIMEOUT_S=abc \
+    "$SCRIPT" --pass parallel --workdir "$TMP/wd" >/dev/null 2>&1
+) || BAD_RC=$?
+assert "an invalid U7S_SUITE_TIMEOUT_S fails 06 before any limactl call, so a typo never boots work on the VM" \
+  "$([ "$BAD_RC" -ne 0 ] && [ ! -s "$TMP/lima.log" ] && echo 1 || echo 0)"
 
 
 # ---------------------------------------------------------------------------

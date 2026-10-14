@@ -78,6 +78,12 @@ case "$PASS" in
   *) echo "error: --pass must be all, parallel or disruptive (got '$PASS')" >&2; exit 1 ;;
 esac
 
+if [ -n "${U7S_SUITE_TIMEOUT_S:-}" ]; then
+  case "$U7S_SUITE_TIMEOUT_S" in
+    *[!0-9]*|0*) echo "error: U7S_SUITE_TIMEOUT_S must be a positive integer (got '$U7S_SUITE_TIMEOUT_S')" >&2; exit 1 ;;
+  esac
+fi
+
 if [ "$PASS" = "all" ]; then
   # Disruptive pass first: run-all.sh resolves "this run's dir" as the newest
   # temp/e2e/ entry, which should be the main parallel pass. A selection with no
@@ -358,19 +364,17 @@ build_filter_args() {
 # suite_timeout_seconds <focus> prints the suite-level cap: ~2x the slowest
 # passing suite (conformance max 28.3 min, csi-hostpath max 43 min). An outer
 # bound on a total hang, independent of the per-namespace watchdog above.
-# Any focus that can match a storage/CSI spec gets the long cap; a focus names
-# specs by free-form regex, so match loosely on storage markers rather than on
-# one driver name. U7S_SUITE_TIMEOUT_S overrides both.
+# An empty focus (full certified-conformance) includes storage specs, and a
+# focus names specs by free-form regex, so storage/CSI markers get the long cap
+# rather than one driver name. U7S_SUITE_TIMEOUT_S overrides both (validated
+# at argument parsing).
 suite_timeout_seconds() {
   if [ -n "${U7S_SUITE_TIMEOUT_S:-}" ]; then
-    case "$U7S_SUITE_TIMEOUT_S" in
-      *[!0-9]*|0*) echo "error: U7S_SUITE_TIMEOUT_S must be a positive integer (got '$U7S_SUITE_TIMEOUT_S')" >&2; return 1 ;;
-    esac
     echo "$U7S_SUITE_TIMEOUT_S"
     return
   fi
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
-    *storage*|*csi*|*volume*|*pvc*|*persistent*) echo 5400 ;;
+    ""|*storage*|*csi*|*volume*|*pvc*|*persistent*) echo 5400 ;;
     *) echo 3600 ;;
   esac
 }
