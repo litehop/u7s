@@ -836,6 +836,9 @@ pub async fn replace_crd<S: Store>(
         .put(&key, to_bytes(&crd)?, expected_rv)
         .await
         .map_err(|e| store_err_crd(e, &name))?;
+    if crd.metadata.deletion_timestamp.is_some() {
+        state.crd_finalizer_wake.notify_one();
+    }
 
     // Clear any stale tombstone for this group. Without this, a CRD deleted then
     // re-created via PUT (replace_crd) would leave a tombstone in the store — mirroring
@@ -885,10 +888,9 @@ pub async fn delete_crd<S: Store>(
     };
     let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
-    // Parse once: used both for the tombstone's group below and as the admission review object.
+    // Parsed once as the admission review object.
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
-    let (group, versions, plural, resource_version) = crd_cache_identity(&existing);
 
     // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
     let admission_ctx = AdmissionContext {
@@ -920,6 +922,21 @@ pub async fn delete_crd<S: Store>(
         })));
     }
 
+    soft_delete_crd(&state, &name, existing, stored.revision)
+        .await
+        .map(Json)
+}
+
+/// Marks a CRD Terminating (deletionTimestamp + cleanup finalizer) and runs one finalizer
+/// pass. Skips admission, so the namespace cascade can share it with the DELETE handler.
+pub(crate) async fn soft_delete_crd<S: Store>(
+    state: &AppState<S>,
+    name: &str,
+    existing: serde_json::Value,
+    expected_rv: u64,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    let key = store_key(name);
+    let (group, versions, plural, resource_version) = crd_cache_identity(&existing);
     // Upstream's registry soft-deletes any object carrying finalizers; the cleanup finalizer
     // is added unconditionally here so CRDs persisted before it existed also get their
     // instances removed.
@@ -941,17 +958,19 @@ pub async fn delete_crd<S: Store>(
     );
     let rv = state
         .store
-        .put(&key, Bytes::from(crd.to_string()), Some(stored.revision))
+        .put(&key, Bytes::from(crd.to_string()), Some(expected_rv))
         .await
-        .map_err(|e| store_err_crd(e, &name))?;
+        .map_err(|e| store_err_crd(e, name))?;
     crd["metadata"]["resourceVersion"] = serde_json::Value::String(rv.to_string());
     // New instance creates must see the Terminating state immediately.
-    evict_cr_schema_cache(&state, &group, &versions, &resource_version);
-    evict_cr_context_cache(&state, &group, &plural, &versions);
+    evict_cr_schema_cache(state, &group, &versions, &resource_version);
+    evict_cr_context_cache(state, &group, &plural, &versions);
 
-    finalize_crd(&state, &name).await;
+    if finalize_crd(state, name).await {
+        state.crd_finalizer_wake.notify_one();
+    }
 
-    Ok(Json(crd))
+    Ok(crd)
 }
 
 pub(crate) const CLEANUP_FINALIZER: &str = "customresourcecleanup.apiextensions.k8s.io";
@@ -1001,14 +1020,30 @@ fn set_terminating_condition(
     }
 }
 
+/// Terminating-condition (reason, message) for a failed instance deletion, matching upstream's
+/// `InstanceDeletionFailed` shapes.
+type InstanceDeletionFailure = (&'static str, String);
+
 /// Deletes every instance of the CRD's resource. Instances carrying their own finalizers are
 /// only marked for deletion, so the count of instances still present is returned.
-async fn delete_instances<S: Store>(state: &AppState<S>, group: &str, plural: &str) -> usize {
+async fn delete_instances<S: Store>(
+    state: &AppState<S>,
+    group: &str,
+    plural: &str,
+) -> Result<usize, InstanceDeletionFailure> {
     let prefix = crate::handlers::cr::cr_list_prefix(group, plural, None);
-    let Ok(resp) = state.store.list(&prefix, ListOptions::default()).await else {
-        return usize::MAX;
-    };
+    let resp = state
+        .store
+        .list(&prefix, ListOptions::default())
+        .await
+        .map_err(|e| {
+            (
+                "InstanceDeletionFailed",
+                format!("could not list instances: {e}"),
+            )
+        })?;
     let mut remaining = 0;
+    let mut errors: Vec<String> = Vec::new();
     for item in resp.items {
         let Ok(mut obj) = Object::from_bytes(&item.value) else {
             remaining += 1;
@@ -1032,28 +1067,56 @@ async fn delete_instances<S: Store>(state: &AppState<S>, group: &str, plural: &s
                 .await
                 .map(|_| ())
         };
-        if let Err(e) = result {
-            tracing::debug!(key = %item.key, err = %e, "CRD instance deletion deferred");
-            remaining += 1;
+        match result {
+            Ok(()) | Err(StoreError::NotFound { .. }) => {}
+            // Written concurrently (another finalizer pass or a client); the next pass retries.
+            Err(StoreError::RevisionMismatch { .. }) => remaining += 1,
+            Err(e) => errors.push(format!("{}: {e}", item.key)),
         }
     }
-    remaining
+    if errors.is_empty() {
+        Ok(remaining)
+    } else {
+        Err((
+            "InstanceDeletionFailed",
+            format!("could not issue all deletes: [{}]", errors.join(", ")),
+        ))
+    }
+}
+
+fn terminating_condition_status(crd: &serde_json::Value) -> Option<&str> {
+    crd["status"]["conditions"]
+        .as_array()?
+        .iter()
+        .find(|c| c["type"].as_str() == Some("Terminating"))
+        .and_then(|c| c["status"].as_str())
+}
+
+fn is_established(crd: &serde_json::Value) -> bool {
+    crd["status"]["conditions"].as_array().is_some_and(|conds| {
+        conds
+            .iter()
+            .any(|c| c["type"].as_str() == Some("Established") && c["status"] == "True")
+    })
 }
 
 /// One pass of upstream's CRD finalizing controller for a terminating CRD: delete its
 /// instances, and once none remain drop the cleanup finalizer; the CRD itself goes away when
 /// no finalizers are left. Safe to call repeatedly and concurrently — every write is
 /// resourceVersion-checked and a lost race is retried by the next pass.
-pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) {
+///
+/// Like upstream, instances are removed straight from storage: no admission webhooks run.
+/// Returns whether the CRD still exists after the pass.
+pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) -> bool {
     let key = store_key(name);
     let Ok(Some(stored)) = state.store.get(&key).await else {
-        return;
+        return false;
     };
     let Ok(mut crd) = serde_json::from_slice::<serde_json::Value>(&stored.value) else {
-        return;
+        return false;
     };
     if crd["metadata"]["deletionTimestamp"].is_null() {
-        return;
+        return false;
     }
     let mut rv = stored.revision;
     let finalizers: Vec<serde_json::Value> = crd["metadata"]["finalizers"]
@@ -1062,35 +1125,73 @@ pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) {
         .unwrap_or_default();
 
     if finalizers.iter().any(|f| f == CLEANUP_FINALIZER) {
-        if set_terminating_condition(
-            &mut crd,
-            "True",
-            "InstanceDeletionInProgress",
-            "CustomResource deletion is in progress",
-        ) {
+        // A condition already True (including a failure reason) is left alone so a failing
+        // CRD is not rewritten on every retry.
+        if terminating_condition_status(&crd) != Some("True")
+            && set_terminating_condition(
+                &mut crd,
+                "True",
+                "InstanceDeletionInProgress",
+                "CustomResource deletion is in progress",
+            )
+        {
             let Ok(new_rv) = state
                 .store
                 .put(&key, Bytes::from(crd.to_string()), Some(rv))
                 .await
             else {
-                return;
+                return true;
             };
             rv = new_rv;
         }
-        let group = crd["spec"]["group"].as_str().unwrap_or("").to_string();
-        let plural = crd["spec"]["names"]["plural"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        if delete_instances(state, &group, &plural).await > 0 {
-            return;
+        if is_established(&crd) {
+            let group = crd["spec"]["group"].as_str().unwrap_or("").to_string();
+            let plural = crd["spec"]["names"]["plural"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            match delete_instances(state, &group, &plural).await {
+                Ok(0) => {
+                    set_terminating_condition(
+                        &mut crd,
+                        "False",
+                        "InstanceDeletionCompleted",
+                        "removed all instances",
+                    );
+                }
+                Ok(_) => {
+                    // Instances are being deleted again; clear any earlier failure reason.
+                    if set_terminating_condition(
+                        &mut crd,
+                        "True",
+                        "InstanceDeletionInProgress",
+                        "CustomResource deletion is in progress",
+                    ) {
+                        let _ = state
+                            .store
+                            .put(&key, Bytes::from(crd.to_string()), Some(rv))
+                            .await;
+                    }
+                    return true;
+                }
+                Err((reason, message)) => {
+                    if set_terminating_condition(&mut crd, "True", reason, &message) {
+                        let _ = state
+                            .store
+                            .put(&key, Bytes::from(crd.to_string()), Some(rv))
+                            .await;
+                    }
+                    return true;
+                }
+            }
+        } else {
+            set_terminating_condition(
+                &mut crd,
+                "False",
+                "NeverEstablished",
+                "resource was never established",
+            );
         }
-        set_terminating_condition(
-            &mut crd,
-            "False",
-            "InstanceDeletionCompleted",
-            "removed all instances",
-        );
         let kept: Vec<serde_json::Value> = finalizers
             .into_iter()
             .filter(|f| f != CLEANUP_FINALIZER)
@@ -1108,7 +1209,7 @@ pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) {
             .put(&key, Bytes::from(crd.to_string()), Some(rv))
             .await
         else {
-            return;
+            return true;
         };
         rv = new_rv;
     }
@@ -1118,21 +1219,23 @@ pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) {
         .is_none_or(|f| f.is_empty());
     if drained {
         crd["metadata"]["resourceVersion"] = serde_json::Value::String(rv.to_string());
-        let _ = purge_crd(state, &key, name, &crd, rv).await;
+        return purge_crd(state, &key, name, &crd, rv).await.is_err();
     }
+    true
 }
 
-/// Sweeps every terminating CRD; this is what resumes finalization after an apiserver restart,
-/// retries instance deletions that were deferred on instance finalizers, and removes a CRD
-/// whose last finalizer a client cleared.
-pub(crate) async fn reconcile_terminating_crds<S: Store>(state: &AppState<S>) {
+/// Finalizes every terminating CRD and returns how many remain, so the caller can keep
+/// retrying only while there is work. Listing every CRD is the price of resuming after an
+/// apiserver restart, so callers must not run this on an idle timer.
+pub(crate) async fn reconcile_terminating_crds<S: Store>(state: &AppState<S>) -> usize {
     let Ok(resp) = state
         .store
         .list(&list_prefix(), ListOptions::default())
         .await
     else {
-        return;
+        return 1;
     };
+    let mut remaining = 0;
     for item in resp.items {
         let Ok(crd) = serde_json::from_slice::<serde_json::Value>(&item.value) else {
             continue;
@@ -1141,7 +1244,39 @@ pub(crate) async fn reconcile_terminating_crds<S: Store>(state: &AppState<S>) {
             continue;
         }
         if let Some(name) = crd["metadata"]["name"].as_str() {
-            finalize_crd(state, name).await;
+            if finalize_crd(state, name).await {
+                remaining += 1;
+            }
+        }
+    }
+    remaining
+}
+
+/// Drives `scan` (which returns how many CRDs are still terminating): once at startup, then
+/// whenever `wake` fires, and on `retry` only while the last scan left work behind. With
+/// nothing terminating the loop parks, so an idle server never lists CRDs.
+pub(crate) async fn run_crd_finalizer<F, Fut>(
+    wake: &tokio::sync::Notify,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    retry: std::time::Duration,
+    mut scan: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = usize>,
+{
+    loop {
+        let terminating = scan().await;
+        let retry_sleep = async {
+            if terminating > 0 {
+                tokio::time::sleep(retry).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            _ = wake.notified() => {}
+            _ = retry_sleep => {}
+            _ = shutdown.changed() => break,
         }
     }
 }
@@ -1440,6 +1575,9 @@ pub async fn patch_crd<S: Store>(
         .put(&key, to_bytes(&crd)?, None)
         .await
         .map_err(|e| store_err_crd(e, &name))?;
+    if crd.metadata.deletion_timestamp.is_some() {
+        state.crd_finalizer_wake.notify_one();
+    }
 
     evict_cr_schema_cache(&state, &old_group, &old_versions, &old_rv);
     evict_cr_context_cache(&state, &old_group, &old_plural, &old_versions);
@@ -5270,6 +5408,487 @@ mod ratchet_tests {
         assert!(
             crd["metadata"]["deletionTimestamp"].is_string(),
             "a client PUT must not un-terminate a CRD mid-finalization"
+        );
+    }
+
+    /// Store double that counts `list` calls and can fail lists or deletes under a key
+    /// prefix, delegating everything else to a real in-memory store.
+    struct FaultStore {
+        inner: std::sync::Arc<u7s_store::SqliteStore>,
+        lists: std::sync::atomic::AtomicUsize,
+        fail_list_prefix: std::sync::Mutex<Option<String>>,
+        fail_delete_prefix: std::sync::Mutex<Option<String>>,
+        /// Instance deletes succeed but report NotFound, as when another pass deleted first.
+        vanish_on_delete: std::sync::atomic::AtomicBool,
+    }
+
+    impl FaultStore {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: std::sync::Arc::new(
+                    u7s_store::SqliteStore::new(":memory:").expect("in-memory store"),
+                ),
+                lists: std::sync::atomic::AtomicUsize::new(0),
+                fail_list_prefix: std::sync::Mutex::new(None),
+                fail_delete_prefix: std::sync::Mutex::new(None),
+                vanish_on_delete: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn list_count(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn injected(_key: &str) -> StoreError {
+        StoreError::Compacted {
+            requested: 0,
+            horizon: 0,
+        }
+    }
+
+    impl Store for FaultStore {
+        fn get(
+            &self,
+            key: impl Into<String> + Send,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key: String = key.into();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: impl Into<String> + Send,
+            opts: ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let prefix: String = prefix.into();
+            let fail = self
+                .fail_list_prefix
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|p| prefix.starts_with(p.as_str()));
+            async move {
+                if fail {
+                    return Err(injected(&prefix));
+                }
+                inner.list(&prefix, opts).await
+            }
+        }
+
+        fn put(
+            &self,
+            key: impl Into<String> + Send,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key: String = key.into();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: impl Into<String> + Send,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key: String = key.into();
+            let fail = self
+                .fail_delete_prefix
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|p| key.starts_with(p.as_str()));
+            let vanished = self
+                .vanish_on_delete
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && key.starts_with(FIN_CR_PREFIX);
+            async move {
+                if fail {
+                    return Err(injected(&key));
+                }
+                let result = inner.delete(&key, expected_revision).await;
+                if vanished {
+                    return Err(StoreError::NotFound { key });
+                }
+                result
+            }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    const FIN_CR_PREFIX: &str = "/registry/cr/fin.io/widgets/";
+
+    fn fault_state() -> (std::sync::Arc<FaultStore>, AppState<FaultStore>) {
+        let store = FaultStore::new();
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        (store, state)
+    }
+
+    async fn terminating_condition(state: &AppState<FaultStore>) -> serde_json::Value {
+        let crd = state
+            .store
+            .get(store_key(FIN_CRD))
+            .await
+            .unwrap()
+            .map(|o| serde_json::from_slice::<serde_json::Value>(&o.value).unwrap())
+            .expect("CRD must still exist");
+        crd["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Terminating")
+            .cloned()
+            .expect("Terminating condition")
+    }
+
+    async fn create_fin_crd_in(state: &AppState<FaultStore>) {
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(FIN_CRD, "fin.io", "widgets"),
+        )
+        .await
+        .expect("create CRD");
+    }
+
+    async fn delete_fin_crd_in(state: &AppState<FaultStore>) {
+        delete_crd(
+            State(state.clone()),
+            Path(FIN_CRD.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete CRD");
+    }
+
+    #[tokio::test]
+    async fn instance_list_failure_is_reported_as_instance_deletion_failed() {
+        let (store, state) = fault_state();
+        create_fin_crd_in(&state).await;
+        *store.fail_list_prefix.lock().unwrap() = Some(FIN_CR_PREFIX.into());
+
+        delete_fin_crd_in(&state).await;
+
+        let cond = terminating_condition(&state).await;
+        assert_eq!(cond["status"], "True");
+        assert_eq!(
+            cond["reason"], "InstanceDeletionFailed",
+            "kubectl describe must show why a CRD is stuck Terminating"
+        );
+        assert!(cond["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("could not list instances:"));
+
+        *store.fail_list_prefix.lock().unwrap() = None;
+        finalize_crd(&state, FIN_CRD).await;
+        assert!(
+            state.store.get(store_key(FIN_CRD)).await.unwrap().is_none(),
+            "finalization must recover once instances can be listed again"
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_delete_failure_is_reported_as_instance_deletion_failed() {
+        let (store, state) = fault_state();
+        create_fin_crd_in(&state).await;
+        let key = format!("{FIN_CR_PREFIX}default/w1");
+        let obj = serde_json::json!({
+            "apiVersion": "fin.io/v1", "kind": "Widget",
+            "metadata": { "name": "w1", "namespace": "default" },
+        });
+        state
+            .store
+            .put(&key, Bytes::from(obj.to_string()), Some(0))
+            .await
+            .unwrap();
+        *store.fail_delete_prefix.lock().unwrap() = Some(FIN_CR_PREFIX.into());
+
+        delete_fin_crd_in(&state).await;
+
+        let cond = terminating_condition(&state).await;
+        assert_eq!(cond["status"], "True");
+        assert_eq!(cond["reason"], "InstanceDeletionFailed");
+        assert!(cond["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("could not issue all deletes:"));
+    }
+
+    #[tokio::test]
+    async fn recovered_deletion_clears_the_failure_reason_while_instances_drain() {
+        let (store, state) = fault_state();
+        create_fin_crd_in(&state).await;
+        let key = format!("{FIN_CR_PREFIX}default/held");
+        let obj = serde_json::json!({
+            "apiVersion": "fin.io/v1", "kind": "Widget",
+            "metadata": { "name": "held", "namespace": "default", "finalizers": ["example.com/hold"] },
+        });
+        state
+            .store
+            .put(&key, Bytes::from(obj.to_string()), Some(0))
+            .await
+            .unwrap();
+        *store.fail_list_prefix.lock().unwrap() = Some(FIN_CR_PREFIX.into());
+        delete_fin_crd_in(&state).await;
+        assert_eq!(
+            terminating_condition(&state).await["reason"],
+            "InstanceDeletionFailed"
+        );
+
+        *store.fail_list_prefix.lock().unwrap() = None;
+        finalize_crd(&state, FIN_CRD).await;
+
+        assert_eq!(
+            terminating_condition(&state).await["reason"],
+            "InstanceDeletionInProgress",
+            "a stale failure reason would tell operators a recovered deletion is still broken"
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_already_deleted_by_a_concurrent_pass_is_not_a_failure() {
+        let (store, state) = fault_state();
+        create_fin_crd_in(&state).await;
+        let key = format!("{FIN_CR_PREFIX}default/w1");
+        let obj = serde_json::json!({
+            "apiVersion": "fin.io/v1", "kind": "Widget",
+            "metadata": { "name": "w1", "namespace": "default" },
+        });
+        state
+            .store
+            .put(&key, Bytes::from(obj.to_string()), Some(0))
+            .await
+            .unwrap();
+        store
+            .vanish_on_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        delete_fin_crd_in(&state).await;
+
+        assert!(
+            state.store.get(store_key(FIN_CRD)).await.unwrap().is_none(),
+            "two finalizer passes racing on one instance must not wedge the CRD Terminating"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_established_crd_is_removed_without_touching_instances() {
+        let (_store, state) = fault_state();
+        create_fin_crd_in(&state).await;
+        let key = store_key(FIN_CRD);
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let mut crd: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        crd["status"]["conditions"] = serde_json::json!([]);
+        state
+            .store
+            .put(&key, Bytes::from(crd.to_string()), Some(stored.revision))
+            .await
+            .unwrap();
+        let widget = format!("{FIN_CR_PREFIX}default/w1");
+        let obj = serde_json::json!({
+            "apiVersion": "fin.io/v1", "kind": "Widget",
+            "metadata": { "name": "w1", "namespace": "default" },
+        });
+        state
+            .store
+            .put(&widget, Bytes::from(obj.to_string()), Some(0))
+            .await
+            .unwrap();
+
+        delete_fin_crd_in(&state).await;
+
+        assert!(state.store.get(&key).await.unwrap().is_none());
+        assert!(
+            state.store.get(&widget).await.unwrap().is_some(),
+            "a CRD that was never established served no instances, so none may be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_finalizer_loop_scans_once_then_only_when_woken() {
+        let scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let handle = {
+            let scans = scans.clone();
+            let wake = wake.clone();
+            tokio::spawn(async move {
+                run_crd_finalizer(&wake, &mut rx, std::time::Duration::from_millis(5), || {
+                    scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(0)
+                })
+                .await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "with no Terminating CRD the loop must not poll: idle CPU/IO is budgeted"
+        );
+        wake.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalizer_loop_retries_while_a_crd_is_terminating() {
+        let scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake = tokio::sync::Notify::new();
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let counter = scans.clone();
+        let task = tokio::spawn(async move {
+            run_crd_finalizer(&wake, &mut rx, std::time::Duration::from_millis(5), || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(1)
+            })
+            .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tx.send(true).unwrap();
+        task.await.unwrap();
+        assert!(
+            scans.load(std::sync::atomic::Ordering::SeqCst) > 3,
+            "a CRD held by instance finalizers must keep being retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_scan_does_no_store_list_when_idle() {
+        let (store, state) = fault_state();
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let loop_state = state.clone();
+        let task = tokio::spawn(async move {
+            run_crd_finalizer(
+                &loop_state.crd_finalizer_wake,
+                &mut rx,
+                std::time::Duration::from_millis(5),
+                || reconcile_terminating_crds(&loop_state),
+            )
+            .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            store.list_count(),
+            1,
+            "only the startup scan may list CRDs while none is Terminating"
+        );
+        tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn crd_finalizes_after_instance_finalizer_is_released() {
+        let state = make_state();
+        create_fin_crd(&state).await;
+        let held = put_widget(&state, "held", &["example.com/hold"]).await;
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let loop_state = state.clone();
+        let task = tokio::spawn(async move {
+            run_crd_finalizer(
+                &loop_state.crd_finalizer_wake,
+                &mut rx,
+                std::time::Duration::from_secs(3600),
+                || reconcile_terminating_crds(&loop_state),
+            )
+            .await;
+        });
+        delete_fin_crd(&state).await;
+        assert!(stored_json(&state, &store_key(FIN_CRD)).await.is_some());
+
+        let mut body = stored_json(&state, &held).await.expect("held instance");
+        body["metadata"]["finalizers"] = serde_json::json!([]);
+        crate::handlers::cr::replace_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "fin.io".into(),
+                "v1".into(),
+                "default".into(),
+                "widgets".into(),
+                "held".into(),
+            )),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("release finalizer: {e:?}"));
+
+        let mut gone = false;
+        for _ in 0..100 {
+            if stored_json(&state, &store_key(FIN_CRD)).await.is_none() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tx.send(true).unwrap();
+        task.await.unwrap();
+        assert!(
+            gone,
+            "releasing the last instance finalizer must wake the finalizer without waiting \
+             for a poll, or `kubectl delete crd` hangs"
         );
     }
 }

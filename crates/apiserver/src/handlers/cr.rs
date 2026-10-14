@@ -3163,6 +3163,8 @@ async fn complete_cr_finalizer_drain<S: Store>(
         .delete(key, None)
         .await
         .map_err(|e| store_err_cr(e, name, kind))?;
+    // The drained CR may be the last instance holding a Terminating CRD.
+    state.crd_finalizer_wake.notify_one();
     if let Some(namespace) = ns {
         // Locked so this full-recompute write of status.used can never interleave with a
         // concurrent record_pod_created/record_pod_removed's incremental read-modify-write of

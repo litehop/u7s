@@ -506,20 +506,22 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     // 10e2. Finalize terminating CRDs: remove their custom resources, then the CRD itself
-    // (upstream's apiextensions CRDFinalizer; not a KCM controller). Also resumes any
-    // finalization interrupted by a restart.
+    // (upstream's apiextensions CRDFinalizer; not a KCM controller). One scan at startup
+    // resumes any finalization interrupted by a restart; after that the loop only runs when
+    // woken by a CRD delete or a custom-resource finalizer drain, and retries on a timer
+    // only while a CRD is still Terminating.
     let (_crd_finalizer_shutdown_tx, mut crd_finalizer_shutdown_rx) =
         tokio::sync::watch::channel(false);
     {
         let finalizer_state = state.clone();
         tokio::spawn(async move {
-            loop {
-                handlers::crd::reconcile_terminating_crds(&finalizer_state).await;
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                    _ = crd_finalizer_shutdown_rx.changed() => break,
-                }
-            }
+            handlers::crd::run_crd_finalizer(
+                &finalizer_state.crd_finalizer_wake,
+                &mut crd_finalizer_shutdown_rx,
+                std::time::Duration::from_secs(1),
+                || handlers::crd::reconcile_terminating_crds(&finalizer_state),
+            )
+            .await;
         });
     }
 
