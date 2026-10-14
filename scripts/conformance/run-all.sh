@@ -498,7 +498,7 @@ if [ -n "$EXTRA_NODE" ]; then
   # so it can't leak into any later step (sonobuoy, etc.) -- same reasoning as
   # U7S_DHAT_BACKTRACE_DEPTH above.
   # shellcheck disable=SC2086
-  U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
+  U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
 fi
 
 # Node podCIDRs only exist once KCM runs, so a cni0 left over from a prior
@@ -560,6 +560,7 @@ if [ "$STACK_ONLY" -eq 1 ]; then
 else
   banner "Step 6/6: Run sonobuoy"
   export SONOBUOY_FOCUS="$FOCUS"
+  rm -f "$(sonobuoy_results_dir_file "$WORKDIR" parallel)"
   # Captured, not fatal: provenance, sampler teardown and monitoring copy below must still run after a failing pass; the exit is re-raised at the end.
   # shellcheck disable=SC2086
   bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG} ${_PROCS_ARG} ${_K8S_VERSION_ARG} || SONOBUOY_RC=$?
@@ -567,14 +568,10 @@ else
   # Build provenance: record what was actually tested (git SHA, dhat feature/
   # depth, node topology, exact invocation) into this run's own meta/build.json
   # -- so two runs are never silently compared across different configurations.
-  # 06-run-sonobuoy.sh has already created temp/e2e/<TIMESTAMP>-<slug>/ by the
-  # time it returns above, so it's the most-recently-created entry under
-  # temp/e2e/ -- same resolution the --profile teardown below uses for the
-  # dhat heap relocation, computed independently here since this must run for
-  # EVERY sonobuoy invocation, not just profiled ones.
-  # shellcheck disable=SC2012 # `ls -t` for mtime-sort has no `find` equivalent; these dirs are our own sanitized TIMESTAMP-slug names, never adversarial filenames.
-  RUN_DIR=$(ls -td "$WORKDIR"/../e2e/*/ 2>/dev/null | head -1) || true
-  RUN_DIR="${RUN_DIR%/}"
+  # The parallel pass's results dir is recorded by 06-run-sonobuoy.sh; absent
+  # when that pass died before retrieving results (taking the newest temp/e2e
+  # entry instead would silently pick the disruptive pass's dir).
+  RUN_DIR=$(cat "$(sonobuoy_results_dir_file "$WORKDIR" parallel)" 2>/dev/null) || true
   if [ -n "$RUN_DIR" ]; then
     ARGV_JSON="[]"
     if [ "${#ORIGINAL_ARGV[@]}" -gt 0 ]; then
@@ -659,14 +656,9 @@ else
     # instead of leaving it under --workdir for the operator to move by
     # hand. That directory's TIMESTAMP is only known to 06-run-sonobuoy.sh
     # (stamped at retrieval time, long after this apiserver was launched
-    # with $DHAT_HEAP_FILE) -- find it as the most-recently-created entry
-    # under temp/e2e/ rather than duplicating that script's own slug logic
-    # here. `|| true` on the assignment: an empty glob match makes `ls`
-    # exit non-zero even with stderr suppressed, which `set -e` would
-    # otherwise treat as fatal for what's meant to be a soft lookup.
-    # shellcheck disable=SC2012 # `ls -t` for mtime-sort has no `find` equivalent; these dirs are our own sanitized TIMESTAMP-slug names, never adversarial filenames.
-    RUN_DIR=$(ls -td "$WORKDIR"/../e2e/*/ 2>/dev/null | head -1) || true
-    RUN_DIR="${RUN_DIR%/}"
+    # with $DHAT_HEAP_FILE), which records it for the parallel pass.
+    # `|| true`: a missing record is a soft lookup, not fatal under `set -e`.
+    RUN_DIR=$(cat "$(sonobuoy_results_dir_file "$WORKDIR" parallel)" 2>/dev/null) || true
     if [ -f "$DHAT_HEAP_FILE" ] && [ -n "$RUN_DIR" ]; then
       TIMESTAMP=$(basename "$RUN_DIR" | cut -d- -f1,2)
       DEST="$RUN_DIR/dhat-heap-apiserver-${TIMESTAMP}.json"
@@ -758,6 +750,10 @@ if [ "$DHAT_HEAP_MISMATCH" -eq 1 ]; then
   exit 1
 fi
 if [ "$SONOBUOY_RC" -ne 0 ]; then
-  echo "ERROR: sonobuoy run failed (exit $SONOBUOY_RC) — see the results summary above" >&2
+  if [ "$SONOBUOY_RC" -eq "$SONOBUOY_EXIT_SPEC_FAILURES" ]; then
+    echo "ERROR: sonobuoy run had spec failures (exit $SONOBUOY_RC) — see the results summary above" >&2
+  else
+    echo "ERROR: sonobuoy run failed to produce results (exit $SONOBUOY_RC) — see the output above" >&2
+  fi
   exit "$SONOBUOY_RC"
 fi

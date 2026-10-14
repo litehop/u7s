@@ -13,7 +13,7 @@
 # still never touches KCM/scheduler; that invariant is unrelated and must hold.
 #
 # Usage:
-#   scripts/conformance/add-node.sh <vm-name> <kubelet-port> [--port <N>] [--workdir <path>]
+#   scripts/conformance/add-node.sh <vm-name> <kubelet-port> [--port <N>] [--konnectivity-server-port <N>] [--workdir <path>]
 #                                    [--network <name>] [--verbose]
 #
 # Delegates to lima-start.sh --node-suffix <derived>, computed from THIS node's
@@ -47,7 +47,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$DIR/_lib.sh"
 
 if [ $# -lt 2 ]; then
-  echo "usage: $0 <vm-name> <kubelet-port> [--port <N>] [--workdir <path>] [--network <name>] [--verbose]" >&2
+  echo "usage: $0 <vm-name> <kubelet-port> [--port <N>] [--konnectivity-server-port <N>] [--workdir <path>] [--network <name>] [--verbose]" >&2
   exit 1
 fi
 VM_NAME="$1"
@@ -55,12 +55,14 @@ KUBELET_PORT="$2"
 shift 2
 
 _PORT_OVERRIDE=""
+_KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 _WORKDIR_OVERRIDE=""
 _NETWORK_OVERRIDE=""
 _VERBOSE_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
+    --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --network) _NETWORK_OVERRIDE="$2"; shift 2 ;;
     --verbose) _VERBOSE_ARG="--verbose"; shift ;;
@@ -104,5 +106,7 @@ _NETWORK_ARG=""
 
 NODE_SUFFIX=$(node_suffix_for "$VM_NAME")
 
+KONNECTIVITY_SERVER_PORT=$(konnectivity_server_port_for "$PORT" "$_KONNECTIVITY_SERVER_PORT_OVERRIDE")
+
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} ${_NETWORK_ARG} --node-suffix "$NODE_SUFFIX" ${_VERBOSE_ARG}
+bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" --konnectivity-server-port "$KONNECTIVITY_SERVER_PORT" ${_WORKDIR_ARG} ${_NETWORK_ARG} --node-suffix "$NODE_SUFFIX" ${_VERBOSE_ARG}

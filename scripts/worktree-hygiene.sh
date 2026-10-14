@@ -52,6 +52,11 @@
 #   workdir path for konnectivity-server and sample-run-metrics.sh). A
 #   worktree whose embedded agent-id is in --live-agents is protected
 #   unconditionally, even if its path otherwise looks orphaned.
+#   Also reaped: a konnectivity-server in a LIVE worktree (e.g. the mayor
+#   checkout) with no u7s-apiserver of the same workdir, still apiserver-less
+#   after a short rescan -- the leftover that squats a worker slot's ports.
+#   A mayor checkout one is reaped only on a worker-slot (1-5) konnectivity
+#   port; slot 0 is the operator's own stack.
 # STEP B: `git worktree prune -v` -- safe by definition, only removes
 #   metadata for worktrees whose directories are already gone.
 # STEP C: delete stale `worker/agent-*` branches, guarded so an in-flight
@@ -197,9 +202,32 @@ proc_type_from_psline() {
   case "$1" in
     *u7s-apiserver*) printf 'apiserver' ;;
     *u7s-scheduler*) printf 'scheduler' ;;
-    *konnectivity-server*) printf 'konnectivity-server' ;;
     *sample-run-metrics.sh*) printf 'sample-run-metrics' ;;
-    *) printf '' ;;
+    *) case "$(exe_basename_from_psline "$1")" in
+         konnectivity-server|proxy-server-*) printf 'konnectivity-server' ;;
+         *) printf '' ;;
+       esac ;;
+  esac
+}
+
+# argv[0] basename of a `ps aux` line (field 11 onward). The released
+# konnectivity binary is cached as proxy-server-<os>-<arch>, so the name
+# "konnectivity-server" only appears in its flags, never as the executable.
+exe_basename_from_psline() {
+  printf '%s' "$1" | awk '{n=split($11, a, "/"); print a[n]}'
+}
+
+# Host konnectivity server port (--server-port=N) of a konnectivity line.
+konnectivity_port_from_psline() {
+  printf '%s' "$1" | grep -oE -e '--server-port=[0-9]+' | head -1 | cut -d= -f2
+}
+
+# Worker slots 1-5 konnectivity server ports (dispatch template slot table).
+# Slot 0 (8135) is the operator's own stack and is never in this set.
+is_worker_slot_konnectivity_port() {
+  case "$1" in
+    8235|8335|8435|8535|8635) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -239,6 +267,35 @@ find_orphans() {
       pid=$(pid_from_psline "$line")
       printf '%s|%s|%s\n' "$pid" "$ptype" "$wpath"
     fi
+  done <<< "$ps_output"
+}
+
+# Emits a `pid|konnectivity-server|worktree_path` record for every
+# konnectivity-server whose worktree is still live but which has no
+# u7s-apiserver of the same workdir in the scan. konnectivity-server only
+# exists to serve that apiserver (scripts/u7s-start.sh starts it after the
+# apiserver), so an apiserver-less one is a leftover squatting the slot's
+# konnectivity ports -- invisible to find_orphans because the mayor checkout
+# (and any other live worktree) is never "gone". The live-agents guard is
+# applied by the caller.
+find_apiserverless_konnectivity() {
+  local ps_output="$1" live_worktrees="$2"
+  local line wpath pid api_paths
+  api_paths=$(while IFS= read -r line; do
+    [ "$(proc_type_from_psline "$line")" = "apiserver" ] || continue
+    extract_worktree_path_from_psline "$line"
+  done <<< "$ps_output")
+  while IFS= read -r line; do
+    [ "$(proc_type_from_psline "$line")" = "konnectivity-server" ] || continue
+    wpath=$(extract_worktree_path_from_psline "$line")
+    [ -n "$wpath" ] || continue
+    printf '%s\n' "$live_worktrees" | grep -qxF "$wpath" || continue
+    if printf '%s\n' "$api_paths" | grep -qxF "$wpath"; then continue; fi
+    if [ -z "$(agent_id_from_worktree_path "$wpath")" ]; then
+      is_worker_slot_konnectivity_port "$(konnectivity_port_from_psline "$line")" || continue
+    fi
+    pid=$(pid_from_psline "$line")
+    printf '%s|konnectivity-server|%s\n' "$pid" "$wpath"
   done <<< "$ps_output"
 }
 
@@ -286,17 +343,33 @@ kill_pattern_for() {
   esac
 }
 
+stale_records() {
+  local ps_out="$1" live="$2"
+  filter_orphans_by_live_agents "$(find_orphans "$ps_out" "$live"; find_apiserverless_konnectivity "$ps_out" "$live")" "$LIVE_AGENTS"
+}
+
+scan_ps() {
+  ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server|sample-run-metrics.sh' | grep -v grep || true
+}
+
 step_a_orphaned_processes() {
   local live ps_out line pid ptype wpath pat
   local orphans=() still_alive=()
 
   live=$(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
-  ps_out=$(ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server|sample-run-metrics.sh' | grep -v grep) || true
+  ps_out=$(scan_ps)
   [ -z "$ps_out" ] && return 0
+
+  # An apiserver-less konnectivity-server is also what a live stack looks like
+  # for a moment while its apiserver restarts; only kill one seen in two scans.
+  if [ -n "$(filter_orphans_by_live_agents "$(find_apiserverless_konnectivity "$ps_out" "$live")" "$LIVE_AGENTS")" ]; then
+    sleep "${HYGIENE_RESCAN_GRACE_S:-15}"
+    ps_out=$(scan_ps)
+  fi
 
   while IFS= read -r line; do
     [ -n "$line" ] && orphans+=("$line")
-  done < <(filter_orphans_by_live_agents "$(find_orphans "$ps_out" "$live")" "$LIVE_AGENTS")
+  done < <(stale_records "$ps_out" "$live")
   [ "${#orphans[@]}" -eq 0 ] && return 0
 
   for line in "${orphans[@]}"; do
@@ -314,10 +387,10 @@ step_a_orphaned_processes() {
   # failure -- surface it instead of silently retrying (a process that
   # survives one kill may be zombied/reparented and needs manual
   # investigation).
-  ps_out=$(ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server|sample-run-metrics.sh' | grep -v grep) || true
+  ps_out=$(scan_ps)
   while IFS= read -r line; do
     [ -n "$line" ] && still_alive+=("$line")
-  done < <(filter_orphans_by_live_agents "$(find_orphans "$ps_out" "$live")" "$LIVE_AGENTS")
+  done < <(stale_records "$ps_out" "$live")
 
   if [ "${#still_alive[@]}" -gt 0 ]; then
     for line in "${still_alive[@]}"; do
@@ -589,7 +662,10 @@ step_g_fix_round_worktrees() {
       rc=1
       continue
     fi
-    run_cmd git -C "$REPO_ROOT" branch -D "$branch"
+    if ! run_cmd git -C "$REPO_ROOT" branch -D "$branch"; then
+      echo "worktree-hygiene: STEP G removed $path but could not delete branch $branch" >&2
+      rc=1
+    fi
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
   return "$rc"
 }

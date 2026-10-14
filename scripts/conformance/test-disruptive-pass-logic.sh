@@ -86,6 +86,41 @@ assert "disruptive pass keeps the FeatureGate allow-set ANDed in" \
 assert "disruptive pass keeps the [Flaky] skip" \
   "$(contains "$(filter_args disruptive 1 1)" '--e2e-skip=\[Flaky\]')"
 
+# Suite-level cap: a total hang must end at ginkgo's --timeout, not its 24h
+# default; unset (--all-e2e keeps its 12h budget) must add no ginkgo --timeout.
+timeout_filter_args() {
+  local apply="$1" gt="$2"
+  (
+    PASS=parallel; PROCS=16
+    FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {A}'
+    JSON_REPORT_PATH=/r.json
+    if [ -n "$gt" ]; then GINKGO_SUITE_TIMEOUT="$gt"; fi
+    # shellcheck disable=SC1090
+    source "$FUNC_FILE"
+    build_filter_args "$apply"
+    printf '%s\n' "${FILTER_ARGS[@]}"
+  )
+}
+for apply in 1 0; do
+  assert "apply=$apply carries ginkgo --timeout=3600s when a suite cap is set" \
+    "$(contains "$(timeout_filter_args "$apply" 3600s)" '--timeout=3600s')"
+  assert "apply=$apply adds no ginkgo --timeout when no cap is set (--all-e2e keeps its own budget)" \
+    "$(contains "$(timeout_filter_args "$apply" "")" '--timeout' | tr 01 10)"
+done
+assert "apply=1 keeps the cap inside the '|'-separated E2E_EXTRA_GINKGO_ARGS value" \
+  "$(contains "$(timeout_filter_args 1 3600s)" '|--timeout=3600s')"
+
+SUITE_FUNC="$TMP/suite_timeout_seconds.sh"
+sed -n '/^suite_timeout_seconds() {/,/^}/p' "$SCRIPT" > "$SUITE_FUNC"
+# shellcheck disable=SC1090
+source "$SUITE_FUNC"
+assert "conformance/default focus is capped at 3600s (~2x the 28 min slowest passing suite)" \
+  "$([ "$(suite_timeout_seconds '')/$(suite_timeout_seconds 'ConfigMap')" = "3600/3600" ] && echo 1 || echo 0)"
+assert "csi-hostpath focus gets 5400s so a 43 min passing run is not cut off" \
+  "$([ "$(suite_timeout_seconds 'External Storage \[Driver: csi-hostpath\]')" = "5400" ] && echo 1 || echo 0)"
+assert "06 wires the cap into both the focus and certified-conformance sonobuoy invocations" \
+  "$([ "$(grep -c 'SONOBUOY_TIMEOUT_MARGIN_SECONDS ))"' "$SCRIPT")" = "2" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 2. The wrapper runs BOTH passes (disruptive first) and fails if either fails.
 # ---------------------------------------------------------------------------
@@ -126,8 +161,16 @@ assert "combined summary totals failures across both passes" \
   "$(contains "$OUT" 'Total failed across passes: 2')"
 # sonobuoy exits 0 even when specs failed (a 1-failed-spec run once exited 0),
 # so a child that exited 0 but reported failures must still fail the script.
-assert "specs failed in a pass whose child exited 0 -> script exits non-zero" \
-  "$([ "$RC" != 0 ] && echo 1 || echo 0)"
+assert "specs failed in a pass whose child exited 0 -> script exits 10 (spec failures), not 0 and not an infra code" \
+  "$([ "$RC" = 10 ] && echo 1 || echo 0)"
+RC=0
+run_wrapper env FAKE_DISRUPTIVE_EXIT=0 FAKE_PARALLEL_EXIT=10 FAKE_PARALLEL_FAILED=2 /bin/bash "$SCRIPT" --focus x || RC=$?
+assert "a child that already reports spec-failure exit 10 stays 10 (not mistaken for an infra error)" \
+  "$([ "$RC" = 10 ] && echo 1 || echo 0)"
+RC=0
+run_wrapper env FAKE_DISRUPTIVE_EXIT=3 FAKE_PARALLEL_EXIT=0 FAKE_PARALLEL_FAILED=2 /bin/bash "$SCRIPT" --focus x || RC=$?
+assert "an infra error in one pass masks spec failures in the other: results may be incomplete" \
+  "$([ "$RC" = 3 ] && echo 1 || echo 0)"
 RC=0
 run_wrapper env FAKE_DISRUPTIVE_EXIT=0 FAKE_PARALLEL_EXIT=0 /bin/bash "$SCRIPT" --focus csi-hostpath || RC=$?
 assert "all passes report 0 failed and exit 0 -> script exits 0" "$([ "$RC" = 0 ] && echo 1 || echo 0)"
@@ -152,8 +195,8 @@ assert "a pass that produced no results is flagged in the summary" \
   "$(contains "$OUT" '[parallel] NO RESULTS')"
 assert "a pass that produced no results counts as a failure in the total" \
   "$(contains "$OUT" 'Total failed across passes: 1')"
-assert "a pass that produced no results fails the script even if its child exited 0" \
-  "$([ "$RC" != 0 ] && echo 1 || echo 0)"
+assert "a pass that produced no results exits 1 (infra), distinct from spec-failure 10, even if its child exited 0" \
+  "$([ "$RC" = 1 ] && echo 1 || echo 0)"
 RC=0
 run_wrapper env FAKE_PARALLEL_RAN=0 /bin/bash "$SCRIPT" --port 6444 || RC=$?
 OUT="$(cat "$TMP/out.log")"
@@ -188,11 +231,28 @@ assert "slug is capped before the suffix is appended" \
   "$(grep -q 'FOCUS_SLUG="${FOCUS_SLUG:0:100}"' "$SCRIPT" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 3b. run-all resolves the parallel results dir from the record 06 writes, never
+#     from "newest temp/e2e entry" (which is the disruptive dir whenever the
+#     parallel pass dies before retrieving results).
+# ---------------------------------------------------------------------------
+RUN_ALL="$DIR/run-all.sh"
+assert "run-all.sh no longer guesses the results dir by mtime" \
+  "$(grep -q 'ls -td' "$RUN_ALL" && echo 0 || echo 1)"
+assert "run-all.sh reads the parallel pass's recorded results dir (build.json + dhat heap)" \
+  "$([ "$(grep -c 'cat "$(sonobuoy_results_dir_file "\$WORKDIR" parallel)"' "$RUN_ALL")" = 2 ] && echo 1 || echo 0)"
+assert "run-all.sh removes a stale parallel record before invoking 06 so an early 06 death cannot reuse an old run's dir" \
+  "$(grep -q 'rm -f "$(sonobuoy_results_dir_file "\$WORKDIR" parallel)"' "$RUN_ALL" && echo 1 || echo 0)"
+assert "06-run-sonobuoy.sh clears the stale record before a pass and writes it after retrieval" \
+  "$(grep -q 'rm -f "\$RESULTS_DIR_FILE"' "$SCRIPT" && grep -q 'echo "\$RUN_DIR" > "\$RESULTS_DIR_FILE"' "$SCRIPT" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 4. One source of truth for the e2e-ssh key path: both scripts derive it from
 #    the kubeconfig directory via the shared helper.
 # ---------------------------------------------------------------------------
 # shellcheck source=scripts/conformance/_lib.sh
 source "$DIR/_lib.sh"
+assert "exit code table: clean=0, spec failures=10, infra error passes through and masks spec failures" \
+  "$([ "$(sonobuoy_exit_code 0 0)/$(sonobuoy_exit_code 0 3)/$(sonobuoy_exit_code 1 0)/$(sonobuoy_exit_code 2 3)" = "0/10/1/2" ] && echo 1 || echo 0)"
 assert "key path derives from the kubeconfig dir" \
   "$([ "$(e2e_ssh_key_path /w/temp/u7s/kubeconfig)" = "/w/temp/u7s/e2e-ssh/id_ed25519" ] && echo 1 || echo 0)"
 assert "lima-start.sh uses the shared key-path helper" \

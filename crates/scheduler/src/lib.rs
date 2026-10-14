@@ -1917,6 +1917,20 @@ impl NodeTally {
         self.waiters.clear()
     }
 
+    /// Swap in the pod state a completed `sendInitialEvents=true` relist built
+    /// into `fresh`, in one step under the caller's lock: a reader sees the
+    /// previous complete state or the new complete one, never an empty or
+    /// partial replay. Everything else `clear` drops (deferred plans, victim
+    /// claims, PVC waiters) is still dropped, and the abandoned plans' keys
+    /// are returned for the same reason as `clear`.
+    #[must_use]
+    pub fn replace_pods(&mut self, fresh: &mut NodeTally) -> Vec<String> {
+        let abandoned = self.clear();
+        self.pods = std::mem::take(&mut fresh.pods);
+        self.by_node = std::mem::take(&mut fresh.by_node);
+        abandoned
+    }
+
     /// Defer `pod`'s bind to `node_name` until every one of `victims` has a
     /// real (not just this scheduler's own soft-delete bookkeeping) removal
     /// observed via `apply_event` — see `PreemptionWaiters`. Called by
@@ -2123,6 +2137,11 @@ impl NodeTally {
         self.csi_prevent_scheduling.clear();
     }
 
+    /// Replace the CSIDriver cache with `fresh`'s — see `replace_pods`.
+    pub fn replace_csi_driver_cache(&mut self, fresh: &mut NodeTally) {
+        self.csi_prevent_scheduling = std::mem::take(&mut fresh.csi_prevent_scheduling);
+    }
+
     /// Update the PVC cache from one raw PVC watch event — see `pvcs`'s doc
     /// comment. A malformed event, or one with no name, is silently ignored
     /// exactly like `apply_event`'s pod handling (a bookmark event has no
@@ -2278,9 +2297,20 @@ impl NodeTally {
         self.pvc_waiters.clear();
     }
 
+    /// Replace the PVC cache with `fresh`'s — see `replace_pods`.
+    pub fn replace_pvc_cache(&mut self, fresh: &mut NodeTally) {
+        self.clear_pvc_cache();
+        self.pvcs = std::mem::take(&mut fresh.pvcs);
+    }
+
     /// Drop the PV cache — see `clear_pvc_cache`'s doc comment.
     pub fn clear_pv_cache(&mut self) {
         self.pv_csi_drivers.clear();
+    }
+
+    /// Replace the PV cache with `fresh`'s — see `replace_pods`.
+    pub fn replace_pv_cache(&mut self, fresh: &mut NodeTally) {
+        self.pv_csi_drivers = std::mem::take(&mut fresh.pv_csi_drivers);
     }
 
     /// Drop the StorageClass cache — see `clear_pvc_cache`'s doc comment.
@@ -2288,10 +2318,21 @@ impl NodeTally {
         self.sc_provisioners.clear();
     }
 
+    /// Replace the StorageClass cache with `fresh`'s — see `replace_pods`.
+    pub fn replace_storage_class_cache(&mut self, fresh: &mut NodeTally) {
+        self.sc_provisioners = std::mem::take(&mut fresh.sc_provisioners);
+    }
+
     /// Drop the CSINode cache — see `clear_pvc_cache`'s doc comment.
     pub fn clear_csi_node_cache(&mut self) {
         self.csi_node_limits.clear();
         self.csi_node_drivers.clear();
+    }
+
+    /// Replace the CSINode cache with `fresh`'s — see `replace_pods`.
+    pub fn replace_csi_node_cache(&mut self, fresh: &mut NodeTally) {
+        self.csi_node_limits = std::mem::take(&mut fresh.csi_node_limits);
+        self.csi_node_drivers = std::mem::take(&mut fresh.csi_node_drivers);
     }
 
     /// Update the node cache from one raw Node watch event — see `nodes`'s
@@ -2314,6 +2355,12 @@ impl NodeTally {
     /// Drop the node cache — see `clear_pvc_cache`'s doc comment.
     pub fn clear_node_cache(&mut self) {
         self.nodes.clear();
+    }
+
+    /// Replace the node cache with `fresh`'s — see `replace_pods`.
+    pub fn replace_node_cache(&mut self, fresh: &mut NodeTally) {
+        self.clear_node_cache();
+        self.nodes = std::mem::take(&mut fresh.nodes);
     }
 
     /// One cached node by name — `fetch_node`'s direct O(1) lookup in place

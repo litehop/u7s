@@ -84,19 +84,23 @@ if [ "$PASS" = "all" ]; then
   # [Disruptive] specs just runs 0 specs in its pass (cheaper than a dry-run).
   PASS_LOG_DIR=$(mktemp -d)
   trap 'rm -rf "$PASS_LOG_DIR"' EXIT
-  OVERALL_EXIT=0
+  INFRA_EXIT=0
   for P in disruptive parallel; do
     echo "=== [06] pass: $P ==="
     P_EXIT=0
     bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} --pass "$P" 2>&1 | tee "$PASS_LOG_DIR/$P.log" || P_EXIT=$?
-    [ "$P_EXIT" -ne 0 ] && [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=$P_EXIT
+    if [ "$P_EXIT" -ne 0 ] && [ "$P_EXIT" -ne "$SONOBUOY_EXIT_SPEC_FAILURES" ] && [ "$INFRA_EXIT" -eq 0 ]; then
+      INFRA_EXIT=$P_EXIT
+    fi
   done
   echo ""
   echo "=== Combined results (both passes) ==="
   TOTAL_FAILED=0
+  SPEC_FAILED=0
   for P in disruptive parallel; do
     echo "  [$P] $(grep -E '^  (Ran|Passed|Failed):' "$PASS_LOG_DIR/$P.log" | sed 's/^ *//' | tr -s ' ' | tr '\n' ' ')"
     F=$(sed -n 's/^  Failed: *//p' "$PASS_LOG_DIR/$P.log" | head -1)
+    SPEC_FAILED=$(( SPEC_FAILED + ${F:-0} ))
     TOTAL_FAILED=$(( TOTAL_FAILED + ${F:-0} ))
     R=$(sed -n 's/^  Ran: *//p' "$PASS_LOG_DIR/$P.log" | head -1)
     # A pass that printed no summary never produced results; with no
@@ -104,21 +108,23 @@ if [ "$PASS" = "all" ]; then
     # [Disruptive] specs), so 0 there means the filter or sonobuoy invocation broke.
     if [ -z "$R" ]; then
       echo "  [$P] NO RESULTS: pass did not complete (counted as failure)"
-      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=1
+      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$INFRA_EXIT" -eq 0 ] && INFRA_EXIT=1
     elif [ "$R" -eq 0 ] && [ -z "$FOCUS" ] && [ "$ALL_E2E" -eq 0 ]; then
       echo "  [$P] RAN 0 SPECS: certified-conformance pass selected nothing (counted as failure)"
-      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=1
+      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$INFRA_EXIT" -eq 0 ] && INFRA_EXIT=1
     fi
   done
   echo "  Total failed across passes: $TOTAL_FAILED"
   # sonobuoy exits 0 even when specs failed, so the failure count is the signal.
-  [ "$TOTAL_FAILED" -gt 0 ] && [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=1
+  OVERALL_EXIT=$(sonobuoy_exit_code "$INFRA_EXIT" "$SPEC_FAILED")
   exit "$OVERALL_EXIT"
 fi
 
 if [ "$PASS" = "disruptive" ]; then PROCS=1; fi
 
 echo "=== [06] Run sonobuoy ($PASS pass) ==="
+RESULTS_DIR_FILE=$(sonobuoy_results_dir_file "$WORKDIR" "$PASS")
+rm -f "$RESULTS_DIR_FILE"
 
 if ! command -v limactl &>/dev/null; then
   echo "error: limactl not found — install with: brew install lima" >&2; exit 1
@@ -315,8 +321,16 @@ JSON_REPORT_PATH="/tmp/sonobuoy/results/report.json"
 # --json-report is appended with '|' too in the apply=1 shape (plain space
 # would vanish under that repointed split character) and with a plain space
 # in the apply=0 shape (which never overrides the default space-splitting).
+#
+# GINKGO_SUITE_TIMEOUT (e.g. "3600s"), when set, adds ginkgo's own --timeout so a
+# total hang is cut off at suite level instead of ginkgo's 24h default.
 build_filter_args() {
   local apply="$1"
+  local gt="" gt_pipe=""
+  if [ -n "${GINKGO_SUITE_TIMEOUT:-}" ]; then
+    gt=" --timeout=${GINKGO_SUITE_TIMEOUT}"
+    gt_pipe="|--timeout=${GINKGO_SUITE_TIMEOUT}"
+  fi
   # The disruptive pass selects by ginkgo label (ANDed with the plugin's focus)
   # because RE2 focus/skip regexes cannot express "focus X and also [Disruptive]".
   # The parallel pass skips by text tag only when apply=1; apply=0 uses labels.
@@ -328,7 +342,7 @@ build_filter_args() {
       skip='\[Flaky\]|\[Disruptive\]'
     fi
     FILTER_ARGS=(
-      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${label}|--json-report=${JSON_REPORT_PATH}"
+      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${label}|--json-report=${JSON_REPORT_PATH}${gt_pipe}"
       "--plugin-env=e2e.E2E_EXTRA_ARGS_SEP=|"
       "--e2e-skip=${skip}"
     )
@@ -337,9 +351,22 @@ build_filter_args() {
     # passes split on the ginkgo label instead -- complementary by construction.
     local extra=" --label-filter=!Disruptive"
     [ "$PASS" = "disruptive" ] && extra=" --label-filter=Disruptive"
-    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${extra}")
+    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${gt}${extra}")
   fi
 }
+
+# suite_timeout_seconds <focus> prints the suite-level cap: ~2x the slowest
+# passing suite (conformance max 28.3 min, csi-hostpath max 43 min). An outer
+# bound on a total hang, independent of the per-namespace watchdog above.
+suite_timeout_seconds() {
+  case "$1" in
+    *csi-hostpath*) echo 5400 ;;
+    *) echo 3600 ;;
+  esac
+}
+# Sonobuoy's own --timeout (aggregator wait-for-plugins budget) outlasts the
+# ginkgo cap so ginkgo's report is flushed before sonobuoy gives up.
+SONOBUOY_TIMEOUT_MARGIN_SECONDS=600
 
 # --skip-preflight=existingnamespace skips ONLY sonobuoy's own
 # "existingnamespace" preflight check (cmd/sonobuoy/app/args.go's
@@ -378,9 +405,12 @@ if [ -n "$FOCUS" ]; then
   # to actually run once (e.g. to reproduce a bug on record).
   APPLY_FILTERS=1
   [ "$UNSAFE_FOCUS" -eq 1 ] && APPLY_FILTERS=0
+  SUITE_TIMEOUT=$(suite_timeout_seconds "$FOCUS")
+  GINKGO_SUITE_TIMEOUT="${SUITE_TIMEOUT}s"
   build_filter_args "$APPLY_FILTERS"
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" "--e2e-focus=$FOCUS" || SONOBUOY_EXIT=$?
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" "--e2e-focus=$FOCUS" \
+    --timeout "$(( SUITE_TIMEOUT + SONOBUOY_TIMEOUT_MARGIN_SECONDS ))" || SONOBUOY_EXIT=$?
 elif [ "$ALL_E2E" -eq 1 ]; then
   # Full ginkgo set (~7500 specs) instead of just the [Conformance]-tagged
   # subset — surfaces plain ginkgo.It cases (e.g. SSA field-manager tests)
@@ -414,9 +444,12 @@ elif [ "$ALL_E2E" -eq 1 ]; then
     --e2e-focus=".*" \
     --timeout "$ALL_E2E_TIMEOUT_SECONDS" || SONOBUOY_EXIT=$?
 else
+  SUITE_TIMEOUT=$(suite_timeout_seconds "")
+  GINKGO_SUITE_TIMEOUT="${SUITE_TIMEOUT}s"
   build_filter_args 0
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" --mode=certified-conformance || SONOBUOY_EXIT=$?
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" --mode=certified-conformance \
+    --timeout "$(( SUITE_TIMEOUT + SONOBUOY_TIMEOUT_MARGIN_SECONDS ))" || SONOBUOY_EXIT=$?
 fi
 if [ "$SONOBUOY_EXIT" -ne 0 ]; then
   echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} — attempting partial result retrieval"
@@ -588,6 +621,8 @@ echo "Results: $OUTFILE"
 # Collected for every node in the run (not just the primary) — KCM/scheduler run once
 # for the whole cluster so they stay unlisted here.
 RUN_DIR="${OUTFILE%.tar.gz}"
+mkdir -p "$WORKDIR"
+echo "$RUN_DIR" > "$RESULTS_DIR_FILE"
 HOST_LOGS_DIR="$RUN_DIR/host-logs"
 mkdir -p "$HOST_LOGS_DIR"
 [ -f "$WORKDIR/apiserver.log" ]              && cp "$WORKDIR/apiserver.log"   "$HOST_LOGS_DIR/apiserver.log"
@@ -648,11 +683,7 @@ if [ "$UNPACK" -eq 1 ]; then
 
   JUNIT="$UNPACK_DIR/plugins/e2e/results/global/junit_01.xml"
   if [ -f "$JUNIT" ]; then
-    # Extract totals from the testsuites element.
-    TESTS=$(grep -o 'tests="[0-9]*"' "$JUNIT" | head -1 | grep -o '[0-9]*')
-    FAILURES=$(grep -o 'failures="[0-9]*"' "$JUNIT" | head -1 | grep -o '[0-9]*')
-    SKIPPED=$(grep -o 'skipped="[0-9]*"' "$JUNIT" | head -1 | grep -o '[0-9]*')
-    RAN=$(( TESTS - ${SKIPPED:-0} ))
+    read -r RAN FAILURES < <(junit_spec_totals "$JUNIT")
     echo ""
     echo "=== Results summary ==="
     echo "  Ran:    $RAN"
@@ -687,5 +718,8 @@ if [ "$UNPACK" -eq 1 ]; then
       fi
     fi
     echo "  Unpacked: $UNPACK_DIR"
+  else
+    echo "error: no junit at $JUNIT — the run produced no results" >&2; exit 1
   fi
 fi
+exit "$(sonobuoy_exit_code "$SONOBUOY_EXIT" "${FAILURES:-0}")"

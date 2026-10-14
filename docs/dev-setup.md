@@ -57,6 +57,7 @@ To run the Kubernetes conformance suite against u7s locally:
    scripts/conformance/06-run-sonobuoy.sh
    ```
    This runs `--mode=non-disruptive-conformance` — the single-node conformance subset, approximately 5–15 minutes.
+   Exit code: `0` clean, `10` specs failed (results were retrieved), anything else is an infrastructure failure.
 
 4. To iterate on a specific failure area, use `--focus` to run only matching tests:
    ```sh
