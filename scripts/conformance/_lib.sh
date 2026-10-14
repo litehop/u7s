@@ -147,11 +147,23 @@ _ipv4_to_int() {
 # lies outside the IPv4 pod CIDR. The CNI bridge plugin keeps cni0's address
 # across sessions, so a node re-assigned a different podCIDR (state wiped with
 # reset.sh --host-only, VM kept) leaves cni0 on the old subnet and flannel
-# fails with "failed to set bridge addr".
+# fails with "failed to set bridge addr". Returns 2 (neither stale nor fresh)
+# on a malformed address or CIDR, so a garbage read never triggers a delete.
 cni0_addr_is_stale() {
-  local addr="${1%%/*}" cidr="$2" net len mask
+  local addr="${1%%/*}" cidr="$2" net len mask octet
   net="${cidr%%/*}"
   len="${cidr##*/}"
+  local ip_re='^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+  if ! [[ "$addr" =~ $ip_re && "$net" =~ $ip_re && "$cidr" == */* && "$len" =~ ^[0-9]{1,2}$ ]] || [ "$len" -gt 32 ]; then
+    echo "cni0_addr_is_stale: malformed input addr='$1' cidr='$cidr'" >&2
+    return 2
+  fi
+  for octet in ${addr//./ } ${net//./ }; do
+    if [ "$octet" -gt 255 ]; then
+      echo "cni0_addr_is_stale: octet out of range in addr='$1' cidr='$cidr'" >&2
+      return 2
+    fi
+  done
   mask=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
   [ $(( $(_ipv4_to_int "$addr") & mask )) -ne $(( $(_ipv4_to_int "$net") & mask )) ]
 }
@@ -173,10 +185,21 @@ reconcile_cni0() {
   addr=$(limactl shell "$vm" ip -4 -o addr show dev cni0 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' | head -1 | cut -d' ' -f2) || true
   if [ -z "$addr" ]; then
     echo "cni0 on $vm: absent (node podCIDR $cidr); nothing to reconcile."
-  elif cni0_addr_is_stale "$addr" "$cidr"; then
-    echo "WARNING: cni0 on $vm has stale address $addr outside node $node podCIDR $cidr; deleting cni0 so it is recreated." >&2
-    limactl shell "$vm" sudo ip link delete cni0
   else
-    echo "cni0 on $vm: $addr matches podCIDR $cidr; leaving it."
+    local rc=0
+    cni0_addr_is_stale "$addr" "$cidr" || rc=$?
+    case $rc in
+      0)
+        echo "WARNING: cni0 on $vm has stale address $addr outside node $node podCIDR $cidr; deleting cni0 so it is recreated; pods already on $node lose networking (their veths detach) and must be recreated." >&2
+        limactl shell "$vm" sudo ip link delete cni0
+        ;;
+      1)
+        echo "cni0 on $vm: $addr matches podCIDR $cidr; leaving it."
+        ;;
+      *)
+        echo "ERROR: cannot judge cni0 address '$addr' on $vm against node $node podCIDR '$cidr'" >&2
+        return 1
+        ;;
+    esac
   fi
 }
