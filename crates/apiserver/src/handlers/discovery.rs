@@ -5717,11 +5717,11 @@ mod tests {
     impl u7s_store::Store for SlowGetStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             let delay = self.delay;
             async move {
                 tokio::time::sleep(delay).await;
@@ -5731,33 +5731,33 @@ mod tests {
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.put(&key, value, expected_revision).await }
         }
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 

@@ -1334,12 +1334,12 @@ mod tests {
     impl Store for PanicsOnReadWhenArmedStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let armed = self.armed.load(std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move {
                 assert!(
                     !armed,
@@ -1353,13 +1353,13 @@ mod tests {
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let armed = self.armed.load(std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move {
                 assert!(
                     !armed,
@@ -1373,22 +1373,22 @@ mod tests {
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.put(&key, value, expected_revision).await }
         }
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
