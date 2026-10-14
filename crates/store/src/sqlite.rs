@@ -1989,12 +1989,12 @@ fn paginate_in_memory(
 }
 
 impl Store for SqliteStore {
-    async fn get(&self, key: &str) -> Result<Option<StoreObject>> {
+    async fn get(&self, key: impl Into<String> + Send) -> Result<Option<StoreObject>> {
         let conn = self.read_conn.clone();
-        let key_str = key.to_string();
-        let obj = tokio::task::spawn_blocking(move || {
+        let key_str: String = key.into();
+        let (obj, key_str) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            get_sync(&conn, &key_str)
+            get_sync(&conn, &key_str).map(|obj| (obj, key_str))
         })
         .await??;
 
@@ -2005,10 +2005,9 @@ impl Store for SqliteStore {
         let min_rev = self.last_written_revision.load(Ordering::Acquire);
         if obj.as_ref().is_some_and(|o| o.revision < min_rev) || (obj.is_none() && min_rev > 0) {
             let write_conn = self.write_conn.clone();
-            let key_str2 = key.to_string();
             return tokio::task::spawn_blocking(move || {
                 let conn = write_conn.blocking_lock();
-                get_sync(&conn, &key_str2)
+                get_sync(&conn, &key_str)
             })
             .await?;
         }
@@ -2016,14 +2015,16 @@ impl Store for SqliteStore {
         Ok(obj)
     }
 
-    async fn list(&self, prefix: &str, opts: ListOptions) -> Result<ListResponse> {
+    async fn list(
+        &self,
+        prefix: impl Into<String> + Send,
+        opts: ListOptions,
+    ) -> Result<ListResponse> {
         let read_conn = self.read_conn.clone();
-        let prefix = prefix.to_string();
-        let prefix2 = prefix.clone();
-        let opts2 = opts.clone();
-        let resp = tokio::task::spawn_blocking(move || {
+        let prefix: String = prefix.into();
+        let (resp, prefix, opts) = tokio::task::spawn_blocking(move || {
             let conn = read_conn.blocking_lock();
-            list_sync(&conn, &prefix, &opts2)
+            list_sync(&conn, &prefix, &opts).map(|resp| (resp, prefix, opts))
         })
         .await??;
 
@@ -2037,7 +2038,7 @@ impl Store for SqliteStore {
             let write_conn = self.write_conn.clone();
             return tokio::task::spawn_blocking(move || {
                 let conn = write_conn.blocking_lock();
-                list_sync(&conn, &prefix2, &opts)
+                list_sync(&conn, &prefix, &opts)
             })
             .await?;
         }
@@ -2045,9 +2046,14 @@ impl Store for SqliteStore {
         Ok(resp)
     }
 
-    async fn put(&self, key: &str, value: Bytes, expected_revision: Option<u64>) -> Result<u64> {
+    async fn put(
+        &self,
+        key: impl Into<String> + Send,
+        value: Bytes,
+        expected_revision: Option<u64>,
+    ) -> Result<u64> {
         let conn = self.write_conn.clone();
-        let key_str = key.to_string();
+        let key_str: String = key.into();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let bookmark_tx = self.bookmark_tx.clone();
@@ -2056,10 +2062,17 @@ impl Store for SqliteStore {
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let epoch = self.epoch;
         let start = std::time::Instant::now();
-        let (revision, is_noop, is_create) = tokio::task::spawn_blocking(move || {
+        let revision = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let (revision, stamped_value, is_create, is_noop, ns) =
                 put_sync(&conn, &key_str, value, expected_revision, &last_written)?;
+            tracing::debug!(
+                key = key_str.as_str(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                is_noop,
+                is_create,
+                "store: write committed"
+            );
             // Skip the broadcast entirely for no-op writes: no revision was bumped and no
             // storage mutation happened, so notifying watchers would be a phantom MODIFIED
             // event for content that never changed — exactly the flood this check exists to
@@ -2086,17 +2099,9 @@ impl Store for SqliteStore {
                     }),
                 );
             }
-            Ok::<(u64, bool, bool), StoreError>((revision, is_noop, is_create))
+            Ok::<u64, StoreError>(revision)
         })
         .await??;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        tracing::debug!(
-            key,
-            elapsed_ms,
-            is_noop,
-            is_create,
-            "store: write committed"
-        );
 
         Ok(revision)
     }
@@ -2104,12 +2109,12 @@ impl Store for SqliteStore {
     async fn create_if_namespace_active(
         &self,
         ns_key: Option<&str>,
-        key: &str,
+        key: impl Into<String> + Send,
         value: Bytes,
     ) -> std::result::Result<u64, CreateNamespacedError> {
         let conn = self.write_conn.clone();
         let ns_key_owned = ns_key.map(|s| s.to_string());
-        let key_str = key.to_string();
+        let key_str: String = key.into();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let bookmark_tx = self.bookmark_tx.clone();
@@ -2127,6 +2132,11 @@ impl Store for SqliteStore {
                 value,
                 &last_written,
             )?;
+            tracing::debug!(
+                key = key_str.as_str(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "store: namespaced create committed"
+            );
             // Broadcast while still holding write_conn's guard — see push_event_locked's doc
             // comment for why this ordering matters under concurrent writers. A namespaced
             // create is always a fresh key (create-only, gated on AlreadyExists above), so
@@ -2153,15 +2163,17 @@ impl Store for SqliteStore {
             Ok::<u64, CreateNamespacedError>(revision)
         })
         .await??;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        tracing::debug!(key, elapsed_ms, "store: namespaced create committed");
 
         Ok(revision)
     }
 
-    async fn delete(&self, key: &str, expected_revision: Option<u64>) -> Result<(u64, Bytes)> {
+    async fn delete(
+        &self,
+        key: impl Into<String> + Send,
+        expected_revision: Option<u64>,
+    ) -> Result<(u64, Bytes)> {
         let conn = self.write_conn.clone();
-        let key_str = key.to_string();
+        let key_str: String = key.into();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let bookmark_tx = self.bookmark_tx.clone();
@@ -2174,6 +2186,11 @@ impl Store for SqliteStore {
             let conn = conn.blocking_lock();
             let (revision, last_value, ns) =
                 delete_sync(&conn, &key_str, expected_revision, &last_written)?;
+            tracing::debug!(
+                key = key_str.as_str(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "store: delete committed"
+            );
             // Broadcast while still holding write_conn's guard — see push_event_locked's
             // doc comment for why this ordering matters under concurrent writers.
             let shard = shard_key(&key_str, ns.as_deref());
@@ -2197,8 +2214,6 @@ impl Store for SqliteStore {
             Ok::<(u64, Bytes), StoreError>((revision, last_value))
         })
         .await??;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        tracing::debug!(key, elapsed_ms, "store: delete committed");
 
         Ok((revision, last_value))
     }
