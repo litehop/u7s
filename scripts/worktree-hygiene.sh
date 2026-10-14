@@ -572,7 +572,7 @@ step_f_orphaned_origin_branches() {
 # reachable from a remote ref (nothing unpushed to lose).
 # ---------------------------------------------------------------------------
 step_g_fix_round_worktrees() {
-  local path branch agent_id
+  local path branch agent_id rc=0
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     agent_id=$(agent_id_from_worktree_path "$path" || true)
@@ -584,9 +584,14 @@ step_g_fix_round_worktrees() {
     esac
     [ -z "$(git -C "$path" status --porcelain 2>/dev/null)" ] || continue
     [ -z "$(git -C "$path" rev-list HEAD --not --remotes 2>/dev/null)" ] || continue
-    run_cmd git -C "$REPO_ROOT" worktree remove "$path"
+    if ! run_cmd git -C "$REPO_ROOT" worktree remove "$path"; then
+      echo "worktree-hygiene: STEP G could not remove $path (locked?); keeping branch $branch" >&2
+      rc=1
+      continue
+    fi
     run_cmd git -C "$REPO_ROOT" branch -D "$branch"
   done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
+  return "$rc"
 }
 
 main() {
@@ -652,7 +657,7 @@ main() {
   step_d_gone_upstream_branches
   step_e_stale_findings
   step_f_orphaned_origin_branches
-  step_g_fix_round_worktrees
+  step_g_fix_round_worktrees || rc=1
   exit "$rc"
 }
 
