@@ -590,26 +590,44 @@ impl PodReplay {
 /// `run_scheduler` joins every cache's `ready` before serving any scheduling
 /// decision. It is never reset: a later reconnect keeps serving the previous
 /// complete cache until its own bookmark swaps in the new one.
+///
+/// `apply` returns whether the event changed something a pending pod's last
+/// failure could depend on; a live change, and every cache swap, wake
+/// `requeue` (see `run_requeue_loop`).
+#[allow(clippy::too_many_arguments)]
 async fn run_cache_watch_loop(
     connector: TlsConnector,
     server: String,
     tally: Arc<Mutex<NodeTally>>,
     path: &'static str,
-    apply: fn(&mut NodeTally, &serde_json::Value),
+    apply: fn(&mut NodeTally, &serde_json::Value) -> bool,
     replace: fn(&mut NodeTally, &mut NodeTally),
     ready: tokio::sync::watch::Sender<bool>,
+    requeue: Arc<tokio::sync::Notify>,
 ) {
     loop {
         info!("starting cache watch on {path}");
         let tally_ref = &tally;
         let mut replay = ReplayBuffer::default();
         let result = stream_watch_events(&connector, &server, path, |event| {
-            match replay.absorb(&event, tally_ref, apply, replace) {
+            match replay.absorb(
+                &event,
+                tally_ref,
+                |fresh, event| {
+                    apply(fresh, event);
+                },
+                replace,
+            ) {
                 Replay::Consumed => {}
                 Replay::Synced => {
                     let _ = ready.send(true);
+                    requeue.notify_one();
                 }
-                Replay::Live => apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event),
+                Replay::Live => {
+                    if apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event) {
+                        requeue.notify_one();
+                    }
+                }
             }
         })
         .await;
@@ -635,30 +653,36 @@ async fn run_pvc_watch_loop(
     tally: Arc<Mutex<NodeTally>>,
     in_flight: Arc<Mutex<HashSet<String>>>,
     ready: tokio::sync::watch::Sender<bool>,
+    requeue: Arc<tokio::sync::Notify>,
 ) {
     loop {
         info!("starting cache watch on {PVC_WATCH_PATH}");
         let mut replay = ReplayBuffer::default();
         let result = stream_watch_events(&connector, &server, PVC_WATCH_PATH, |event| {
+            let mut waiting_pods = Vec::new();
             match replay.absorb(
                 &event,
                 &tally,
                 |fresh, event| {
                     fresh.apply_pvc_event(event);
                 },
-                NodeTally::replace_pvc_cache,
+                |live, fresh| waiting_pods = live.replace_pvc_cache(fresh),
             ) {
                 Replay::Consumed => return,
                 Replay::Synced => {
                     let _ = ready.send(true);
-                    return;
+                    requeue.notify_one();
                 }
-                Replay::Live => {}
+                Replay::Live => {
+                    if event["type"] != "BOOKMARK" {
+                        requeue.notify_one();
+                    }
+                    waiting_pods = tally
+                        .lock()
+                        .expect("tally lock poisoned")
+                        .apply_pvc_event(&event);
+                }
             }
-            let waiting_pods = tally
-                .lock()
-                .expect("tally lock poisoned")
-                .apply_pvc_event(&event);
             for pod_key in waiting_pods {
                 let connector = connector.clone();
                 let server = server.clone();
@@ -719,6 +743,14 @@ async fn redrive_pod(
     );
 }
 
+/// A real object event (not a bookmark heartbeat).
+fn is_object_event(event: &serde_json::Value) -> bool {
+    matches!(
+        event["type"].as_str(),
+        Some("ADDED" | "MODIFIED" | "DELETED")
+    )
+}
+
 /// True for the single synthetic BOOKMARK the apiserver sends to mark the end
 /// of a `sendInitialEvents=true` relist (Kubernetes 1.27+ informer protocol —
 /// see `crates/apiserver/src/handlers/watch.rs`). Distinct from an ordinary
@@ -760,28 +792,65 @@ async fn run_resync_loop(
     let _ = synced_rx.wait_for(|synced| *synced).await;
     loop {
         tokio::time::sleep(interval).await;
-        let (status, body) = match http_get(&connector, &server, RESYNC_PODS_PATH).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!("resync: GET {RESYNC_PODS_PATH} failed: {e}");
-                continue;
-            }
-        };
-        if !status.is_success() {
-            error!("resync: GET {RESYNC_PODS_PATH} returned {status}");
-            continue;
+        resync_once(&connector, &server, &in_flight, &tally).await;
+    }
+}
+
+/// One resync pass: re-list every unscheduled pod and re-attempt scheduling.
+async fn resync_once(
+    connector: &TlsConnector,
+    server: &str,
+    in_flight: &Arc<Mutex<HashSet<String>>>,
+    tally: &Arc<Mutex<NodeTally>>,
+) {
+    let (status, body) = match http_get(connector, server, RESYNC_PODS_PATH).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("resync: GET {RESYNC_PODS_PATH} failed: {e}");
+            return;
         }
-        let list: PodList = match serde_json::from_str(&body) {
-            Ok(list) => list,
-            Err(e) => {
-                error!("resync: failed to parse pod list: {e}");
-                continue;
-            }
-        };
-        let in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
-        for event in pods_needing_resync(&list.items, &in_flight_snapshot) {
-            handle_pod_event(event, &connector, &server, &in_flight, &tally);
+    };
+    if !status.is_success() {
+        error!("resync: GET {RESYNC_PODS_PATH} returned {status}");
+        return;
+    }
+    let list: PodList = match serde_json::from_str(&body) {
+        Ok(list) => list,
+        Err(e) => {
+            error!("resync: failed to parse pod list: {e}");
+            return;
         }
+    };
+    let in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
+    for event in pods_needing_resync(&list.items, &in_flight_snapshot) {
+        handle_pod_event(event, connector, server, in_flight, tally);
+    }
+}
+
+/// Debounce between a cluster event and the requeue pass it triggers, so a
+/// burst (node registration, a PVC replay) costs one pass.
+const REQUEUE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Upstream's `MoveAllToActiveOrBackoffQueue` on a cluster event: when a
+/// node, PVC, PV, StorageClass, CSINode or CSIDriver change (or a cache
+/// swap) wakes `requeue`, re-attempt every unscheduled pod now instead of at
+/// the next `RESYNC_INTERVAL` tick. Re-attempting all of them rather than
+/// tracking which predicate each failed on costs one indexed list of
+/// unscheduled pods per debounced burst, and `handle_pod_event`'s `in_flight`
+/// dedup bounds the rest. Gated on the pod cache like `run_resync_loop`.
+async fn run_requeue_loop(
+    connector: TlsConnector,
+    server: String,
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    tally: Arc<Mutex<NodeTally>>,
+    mut synced_rx: tokio::sync::watch::Receiver<bool>,
+    requeue: Arc<tokio::sync::Notify>,
+) {
+    let _ = synced_rx.wait_for(|synced| *synced).await;
+    loop {
+        requeue.notified().await;
+        tokio::time::sleep(REQUEUE_DEBOUNCE).await;
+        resync_once(&connector, &server, &in_flight, &tally).await;
     }
 }
 
@@ -1361,6 +1430,16 @@ pub async fn run_scheduler(
         let _ = caches_synced_tx.send(true);
     });
 
+    let requeue = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(run_requeue_loop(
+        connector.clone(),
+        server.clone(),
+        in_flight.clone(),
+        tally.clone(),
+        pods_synced_rx.clone(),
+        requeue.clone(),
+    ));
+
     // Periodic re-sync, independent of the watch stream below — see
     // `run_resync_loop`'s doc comment for what it does and why it is gated
     // on the pod watch's own initial sync (itself after `caches_synced`).
@@ -1392,35 +1471,48 @@ pub async fn run_scheduler(
         tally.clone(),
         in_flight.clone(),
         pvc_ready_tx,
+        requeue.clone(),
     ));
     for (path, apply, replace, ready) in [
         (
             PV_WATCH_PATH,
-            NodeTally::apply_pv_event as fn(&mut NodeTally, &serde_json::Value),
+            (|tally, event| {
+                NodeTally::apply_pv_event(tally, event);
+                is_object_event(event)
+            }) as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_pv_cache as fn(&mut NodeTally, &mut NodeTally),
             pv_ready_tx,
         ),
         (
             STORAGE_CLASS_WATCH_PATH,
-            NodeTally::apply_storage_class_event as fn(&mut NodeTally, &serde_json::Value),
+            (|tally, event| {
+                NodeTally::apply_storage_class_event(tally, event);
+                is_object_event(event)
+            }) as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_storage_class_cache as fn(&mut NodeTally, &mut NodeTally),
             storage_class_ready_tx,
         ),
         (
             CSI_NODE_WATCH_PATH,
-            NodeTally::apply_csi_node_event as fn(&mut NodeTally, &serde_json::Value),
+            (|tally, event| {
+                NodeTally::apply_csi_node_event(tally, event);
+                is_object_event(event)
+            }) as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_csi_node_cache as fn(&mut NodeTally, &mut NodeTally),
             csi_node_ready_tx,
         ),
         (
             CSI_DRIVER_WATCH_PATH,
-            NodeTally::apply_csi_driver_event as fn(&mut NodeTally, &serde_json::Value),
+            (|tally, event| {
+                NodeTally::apply_csi_driver_event(tally, event);
+                is_object_event(event)
+            }) as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_csi_driver_cache as fn(&mut NodeTally, &mut NodeTally),
             csi_driver_ready_tx,
         ),
         (
             NODE_WATCH_PATH,
-            NodeTally::apply_node_event as fn(&mut NodeTally, &serde_json::Value),
+            NodeTally::apply_node_event as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_node_cache as fn(&mut NodeTally, &mut NodeTally),
             node_ready_tx,
         ),
@@ -1433,6 +1525,7 @@ pub async fn run_scheduler(
             apply,
             replace,
             ready,
+            requeue.clone(),
         ));
     }
 
@@ -3182,6 +3275,88 @@ mod tests {
             ["worker-0"],
             "the redriven attempt must bind to worker-0 — the only node, which does register \
              the driver its now-visible PVC needs"
+        );
+    }
+
+    /// A pod that failed for lack of node capacity must bind as soon as a node
+    /// event makes room — via `run_requeue_loop` with no resync tick running —
+    /// not up to RESYNC_INTERVAL later (the 30s stall seen when a conformance
+    /// spec labels a node and expects prompt scheduling).
+    #[tokio::test]
+    async fn node_change_requeues_pending_pod_without_waiting_for_the_resync_tick() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, bind_count, bound_nodes) =
+            spawn_missing_referenced_pvc_mock_server(0).await;
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        let node_event = |cpu: &str| {
+            json!({
+                "type": "MODIFIED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": cpu}}}
+            })
+        };
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.apply_node_event(&node_event("50m"));
+            guard.apply_csi_node_event(&json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": "worker-0"},
+                    "spec": {"drivers": [{"name": "csi-hostpath.csi.k8s.io"}]}
+                }
+            }));
+        }
+
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            bind_count.load(Ordering::SeqCst),
+            0,
+            "the only node lacks the capacity, so the pod must stay pending"
+        );
+
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
+        tokio::spawn(run_requeue_loop(
+            connector.clone(),
+            server.clone(),
+            in_flight.clone(),
+            tally.clone(),
+            synced_rx,
+            requeue.clone(),
+        ));
+        let changed = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&node_event("1000m"));
+        assert!(changed);
+        requeue.notify_one();
+
+        wait_until(
+            || bind_count.load(Ordering::SeqCst) >= 1,
+            "the pending pod to bind right after the node event, with no resync loop running",
+        )
+        .await;
+        assert_eq!(
+            bound_nodes
+                .lock()
+                .expect("bound_nodes lock poisoned")
+                .as_slice(),
+            ["worker-0"]
         );
     }
 
