@@ -90,6 +90,39 @@ assert_kubelet_port_matches_vm() {
   fi
 }
 
+# Network name a Lima VM recorded at creation (its live lima.yaml), empty if none.
+lima_network_of() {
+  awk '/^networks:/{f=1;next} f&&/lima:/{print $NF;exit}' "${LIMA_HOME:-$HOME/.lima}/$1/lima.yaml"
+}
+
+# Fail loud when two VMs of one cluster sit on different Lima networks.
+# Separate networks are separate L2 segments, so flannel's VXLAN overlay
+# (flannel.1) between them can never deliver a packet; without this check the
+# misconfiguration only surfaces later as cross-node pod traffic failing.
+# Registered Node names are assumed to equal Lima VM names (kubelet runs with
+# --hostname-override=<VM name>), so a peer with no local lima.yaml is an
+# error: either a stale Node object or a name mismatch that hides a mispairing.
+assert_same_lima_network() {
+  local vm="$1" kubeconfig="$2" peers peer vm_net peer_net
+  peers=$(kubectl --kubeconfig="$kubeconfig" get nodes -o jsonpath='{.items[*].metadata.name}') || {
+    echo "error: cannot list cluster nodes to verify '$vm' shares a Lima network with its peers" >&2
+    return 1
+  }
+  vm_net=$(lima_network_of "$vm")
+  for peer in $peers; do
+    [ "$peer" = "$vm" ] && continue
+    if [ ! -f "${LIMA_HOME:-$HOME/.lima}/$peer/lima.yaml" ]; then
+      echo "error: registered node '$peer' has no local Lima VM config, so its network cannot be compared with '$vm'; if the node is stale run 'kubectl delete node $peer', otherwise rerun with --reset" >&2
+      return 1
+    fi
+    peer_net=$(lima_network_of "$peer")
+    if [ "$vm_net" != "$peer_net" ]; then
+      echo "error: $vm is on network '${vm_net:-none}' but peer node '$peer' is on '${peer_net:-none}'; separate Lima networks have no L2 path, so flannel's cross-node overlay would be unreachable. Pair VMs that share a network." >&2
+      return 1
+    fi
+  done
+}
+
 # Rig-only SSH credential for the e2e framework's SSH-to-node helpers
 # ([Disruptive] kubelet-down specs). Both lima-start.sh (generates + authorizes)
 # and 06-run-sonobuoy.sh (ships to the e2e pod) derive the path from the
