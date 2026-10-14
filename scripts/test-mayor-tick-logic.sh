@@ -1530,6 +1530,24 @@ assert "...surfaces checkout-pull-blocked in queue_warnings so the mayor sees wh
 assert "...and still runs the rest of cleanup (merged PR recorded)" \
   "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
 
+# A failing .beads restore (here: a held index lock) is a blocked pull, not a
+# tick abort: set -e must not turn it into exit 1.
+build_scratch_repo "merged-ff"
+FF_REPO="$SCRATCH_REPO"
+mkdir -p "$FF_REPO/.beads"
+echo base > "$FF_REPO/.beads/issues.jsonl"
+git -C "$FF_REPO" add .beads/issues.jsonl
+git -C "$FF_REPO" commit -q -m "track beads jsonl"
+echo regenerated > "$FF_REPO/.beads/issues.jsonl"
+touch "$FF_REPO/.git/index.lock"
+invoke_tick "$STUB_MERGED_BIN" "$FF_REPO" 0
+assert "a failed .beads JSONL restore exits 20 (checkout-pull-blocked), not 1 -- exit 1 skips cleanup and the dashboard refresh" \
+  "$([ "$TICK_RC" -eq 20 ] && echo 1 || echo 0)"
+assert "...and surfaces checkout-pull-blocked in queue_warnings" \
+  "$([ "$(jq -r '.queue_warnings[0].reason' "$TICK_STATE")" = "checkout-pull-blocked" ] && echo 1 || echo 0)"
+assert "...and still runs the rest of cleanup (merged PR recorded)" \
+  "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
