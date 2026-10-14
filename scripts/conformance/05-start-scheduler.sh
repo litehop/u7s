@@ -12,6 +12,8 @@ set -euo pipefail
 ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=scripts/_kill-pattern.sh
+source "$REPO/scripts/_kill-pattern.sh"
 BINARY="${U7S_TARGET_DIR:-$REPO/target}/release/u7s-scheduler"
 
 TARGET_DIR_ARGS=()
@@ -57,9 +59,9 @@ fi
 # Scope the kill to a scheduler already bound to THIS kubeconfig so parallel
 # workers on other VMs/ports keep their schedulers. A global `pkill -f
 # u7s-scheduler` would tear down a peer worker's scheduler.
-if pgrep -f "u7s-scheduler.*${WORKDIR}/kubeconfig" >/dev/null 2>&1; then
+if pgrep -f "$(workdir_kill_pattern scheduler "$WORKDIR")" >/dev/null 2>&1; then
   echo "WARNING: u7s-scheduler for $WORKDIR already running — killing and restarting" >&2
-  pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
+  pkill -f "$(workdir_kill_pattern scheduler "$WORKDIR")" 2>/dev/null || true
   sleep 1
 fi
 
