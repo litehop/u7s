@@ -61,6 +61,7 @@ for bad in "" "10.244.2.0" "10.244.2.0/33" "10.244.2.0/" "10.244.2.0/x" "10.244.
 done
 
 LIMACTL_CALLS=$(mktemp)
+trap 'rm -f "$LIMACTL_CALLS"' EXIT
 limactl() {
   if [ "$3" = ip ]; then echo "5: cni0    inet $STUB_ADDR scope global cni0"; return 0; fi
   echo "$*" >> "$LIMACTL_CALLS"
@@ -74,8 +75,11 @@ assert_true "reconcile_cni0 does not delete cni0 when it cannot judge the addres
   [ ! -s "$LIMACTL_CALLS" ]
 assert_true "reconcile_cni0 succeeds when the address matches" \
   [ "$(reconcile_rc 10.244.2.1/24 10.244.2.0/24)" = 0 ]
-assert_true "reconcile_cni0 deletes a stale cni0" \
+stale_cni0_deleted() {
   [ "$(reconcile_rc 10.244.1.1/24 10.244.2.0/24)" = 0 ] && grep -q "ip link delete cni0" "$LIMACTL_CALLS"
+}
+assert_true "reconcile_cni0 deletes a stale cni0" \
+  stale_cni0_deleted
 
 assert_true "run-all.sh reconciles cni0 for the primary node -- otherwise a warm reconnect of the primary still hits the stale bridge" \
   grep -q 'reconcile_cni0 "\${U7S_VM_NAME:-lima-node}"' "$DIR/run-all.sh"

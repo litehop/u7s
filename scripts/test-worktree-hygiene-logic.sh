@@ -96,13 +96,13 @@ assert "an empty ps scan (no matching processes at all) yields no orphans" \
   "$([ -z "$(call find_orphans '' "$LIVE_WORKTREES")" ] && echo 1 || echo 0)"
 
 assert "kill_pattern_for builds the apiserver pattern anchored on the dead worktree's kubeconfig path" \
-  "$([ "$(call kill_pattern_for apiserver /dead)" = 'u7s-apiserver.*/dead/temp/u7s/kubeconfig' ] && echo 1 || echo 0)"
+  "$([ "$(call kill_pattern_for apiserver /dead)" = 'u7s-apiserver.*[ =]/dead/temp/u7s/kubeconfig' ] && echo 1 || echo 0)"
 assert "kill_pattern_for builds the scheduler pattern anchored on the dead worktree's kubeconfig path" \
-  "$([ "$(call kill_pattern_for scheduler /dead)" = 'u7s-scheduler.*/dead/temp/u7s/kubeconfig' ] && echo 1 || echo 0)"
+  "$([ "$(call kill_pattern_for scheduler /dead)" = 'u7s-scheduler.*[ =]/dead/temp/u7s/kubeconfig' ] && echo 1 || echo 0)"
 assert "kill_pattern_for builds the konnectivity-server pattern anchored on the dead worktree's workdir (no /kubeconfig suffix)" \
-  "$([ "$(call kill_pattern_for konnectivity-server /dead)" = 'konnectivity-server.*/dead/temp/u7s' ] && echo 1 || echo 0)"
+  "$([ "$(call kill_pattern_for konnectivity-server /dead)" = 'konnectivity-server.*[ =]/dead/temp/u7s([/ ]|$)' ] && echo 1 || echo 0)"
 assert "kill_pattern_for builds the sample-run-metrics.sh pattern anchored on the dead worktree's workdir (no /kubeconfig suffix -- it has no cert to serve, just polls the VM)" \
-  "$([ "$(call kill_pattern_for sample-run-metrics /dead)" = 'sample-run-metrics.sh.*/dead/temp/u7s' ] && echo 1 || echo 0)"
+  "$([ "$(call kill_pattern_for sample-run-metrics /dead)" = 'sample-run-metrics.sh.*[ =]/dead/temp/u7s([/ ]|$)' ] && echo 1 || echo 0)"
 
 assert "proc_type_from_psline classifies a sample-run-metrics.sh line as its own type (must not be silently ignored as an unmatched process)" \
   "$([ "$(call proc_type_from_psline 'bash scripts/conformance/sample-run-metrics.sh start --workdir /x/temp/u7s')" = 'sample-run-metrics' ] && echo 1 || echo 0)"
@@ -270,6 +270,26 @@ assert "STEP A (d): a live worker's 6446 apiserver is untouched even beside a re
 $SA_API_6445")" = "[dry-run] would run: kill 5001" ] && echo 1 || echo 0)"
 assert "STEP A (d'): a live worker's 6446 apiserver alone produces no kill" \
   "$([ -z "$(step_a_dry "$SA_WORKER_API")" ] && echo 1 || echo 0)"
+
+# A dead worktree whose path is a suffix of the live one (/stepa vs
+# <tmp>/stepa) must yield a pkill -f pattern that cannot match the live
+# process's argv -- otherwise reaping the dead one kills a live stack.
+SA_DEAD_SUFFIX="/$(basename "$SA_REAL")"
+SA_API_DEAD=$(mk_api 5006 6447 "$SA_DEAD_SUFFIX")
+SA_API_LIVE=$(mk_api 5007 6443 "$SA_REAL")
+SA_KILLS=$(step_a_dry "$SA_API_LIVE
+$SA_API_DEAD")
+SA_PAT="${SA_KILLS#*pkill -f }"
+assert "STEP A suffix collision: exactly one pkill is issued, for the dead worktree" \
+  "$([ "$(printf '%s\n' "$SA_KILLS" | grep -c 'would run: pkill -f ')" = 1 ] && echo 1 || echo 0)"
+assert "STEP A suffix collision: the pattern matches the dead worktree's process" \
+  "$(printf '%s\n' "$SA_API_DEAD" | grep -qE -- "$SA_PAT" && echo 1 || echo 0)"
+assert "STEP A suffix collision: the pattern does NOT match the live worktree's process whose path ends with the dead path" \
+  "$(! printf '%s\n' "$SA_API_LIVE" | grep -qE -- "$SA_PAT" && echo 1 || echo 0)"
+assert "kill_pattern_for escapes regex metacharacters: /a.b must not match /aXb" \
+  "$(! echo 'u7s-apiserver --kubeconfig /aXb/temp/u7s/kubeconfig' | grep -qE -- "$(call kill_pattern_for apiserver /a.b)" && echo 1 || echo 0)"
+assert "kill_pattern_for ends /temp/u7s at a separator: /temp/u7s2 is another workdir" \
+  "$(! echo 'konnectivity-server --server-cert=/dead/temp/u7s2/x.crt' | grep -qE -- "$(call kill_pattern_for konnectivity-server /dead)" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 2. STEP C -- in-flight guard.
