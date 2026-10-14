@@ -252,14 +252,14 @@ pub trait Store: Send + Sync + 'static {
     /// Get a single object by exact key. Returns None if not found.
     fn get(
         &self,
-        key: &str,
+        key: impl Into<String> + Send,
     ) -> impl std::future::Future<Output = Result<Option<StoreObject>>> + Send;
 
     /// List all objects whose keys share the given prefix.
     /// Returns a consistent snapshot and the revision of that snapshot.
     fn list(
         &self,
-        prefix: &str,
+        prefix: impl Into<String> + Send,
         opts: ListOptions,
     ) -> impl std::future::Future<Output = Result<ListResponse>> + Send;
 
@@ -284,7 +284,7 @@ pub trait Store: Send + Sync + 'static {
     /// content would have been unchanged — the CAS check runs first.
     fn put(
         &self,
-        key: &str,
+        key: impl Into<String> + Send,
         value: Bytes,
         expected_revision: Option<u64>,
     ) -> impl std::future::Future<Output = Result<u64>> + Send;
@@ -311,7 +311,7 @@ pub trait Store: Send + Sync + 'static {
     fn create_if_namespace_active(
         &self,
         ns_key: Option<&str>,
-        key: &str,
+        key: impl Into<String> + Send,
         value: Bytes,
     ) -> impl std::future::Future<Output = std::result::Result<u64, CreateNamespacedError>> + Send
     {
@@ -339,7 +339,7 @@ pub trait Store: Send + Sync + 'static {
     /// Returns the new global revision and the last-known object bytes on success.
     fn delete(
         &self,
-        key: &str,
+        key: impl Into<String> + Send,
         expected_revision: Option<u64>,
     ) -> impl std::future::Future<Output = Result<(u64, Bytes)>> + Send;
 
