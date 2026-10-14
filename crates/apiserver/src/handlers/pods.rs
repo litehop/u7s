@@ -10098,9 +10098,10 @@ mod handler_tests {
         app.oneshot(req).await.unwrap()
     }
 
-    /// A kubelet registers one of its own static pods by creating a mirror pod bound to its
-    /// own node — reverting the node_authz wiring (either the coarse allow arm or the
-    /// body-level check) makes this 403, breaking static pod support entirely.
+    /// Positive-path sanity check: a kubelet creating a mirror pod bound to its own node is
+    /// accepted by the handler. Not a fail-on-revert guard for the node_authz wiring — the
+    /// test router bypasses AuthService and the coarse allow arm; the deny tests and the
+    /// node_authz tests cover those reverts.
     #[tokio::test]
     async fn create_pod_allows_node_to_create_mirror_pod_bound_to_itself() {
         let (state, store) = make_state();
