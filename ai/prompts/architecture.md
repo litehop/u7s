@@ -167,7 +167,7 @@ u7s does not ship a node agent binary. The node runtime is the real upstream `ku
 provisioning script and run as an ordinary systemd service inside a Lima VM (Linux is
 required for CRI-O/kubelet; the u7s API server itself runs natively on the Mac host — see
 `scripts/conformance/lima-start.sh`'s header comment for the split). `kube-proxy` is the
-same story: the real upstream binary, run as a systemd service in IPVS mode, not a u7s
+same story: the real upstream binary, run as a systemd service in iptables mode, not a u7s
 reimplementation.
 
 u7s's job is limited to what an operator would otherwise do by hand to join a node:
@@ -445,7 +445,7 @@ does it end to end:
   CRI-O's default /16) and programs static inter-node routes, since nothing else in this
   arrangement runs a CNI/BGP control plane of its own.
 - Installs and starts the real upstream `kube-proxy` binary (extracted from the kube-proxy
-  container image) as a systemd service in IPVS mode — not a u7s reimplementation.
+  container image) as a systemd service in iptables mode — not a u7s reimplementation.
 
 None of this lives in a u7s crate: there is no node-registration protocol, no bootstrap
 token exchange, and no lifecycle state machine for u7s to maintain. Node registration

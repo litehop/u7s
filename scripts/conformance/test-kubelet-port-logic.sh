@@ -87,8 +87,36 @@ assert "run-all.sh aborts on --kubelet-port mismatch" "$([ "$rc" != 0 ] && echo 
 out=$("$RUN_ALL" --vm vm-ok --kubelet-port 10263 --extra-node vm-reversed --extra-kubelet-port 10271 --stack-only 2>&1) && rc=0 || rc=$?
 assert "run-all.sh aborts on --extra-kubelet-port mismatch" "$([ "$rc" != 0 ] && echo "$out" | grep -q 'vm-reversed forwards guest 10250 to host 10270' && echo 1 || echo 0)"
 
-if grep -q 'assert_kubelet_port_matches_vm' "$LIMA_START"; then ok=1; else ok=0; fi
-assert "lima-start.sh (also reached via add-node.sh) enforces the check" "$ok"
+mkvm vm-quoted <<'Y'
+portForwards:
+- guestPort: "10250"   # kubelet
+  hostPort: '10281'
+Y
+mkvm vm-flow <<'Y'
+portForwards:
+- {guestPort: 80, hostPort: 8080}
+- {guestPort: 10250, hostPort: 10282}  # kubelet
+Y
+out=$("$HELPER" vm-quoted 2>&1) && rc=0 || rc=$?
+assert "quoted values and trailing comments do not cause a false 'no portForwards entry' abort" "$([ "$rc" = 0 ] && [ "$out" = 10281 ] && echo 1 || echo 0)"
+out=$("$HELPER" vm-flow 2>&1) && rc=0 || rc=$?
+assert "flow-style {..} entries are parsed per-entry, not merged with a neighbour" "$([ "$rc" = 0 ] && [ "$out" = 10282 ] && echo 1 || echo 0)"
+out=$("$HELPER" vm-nomap 2>&1) && rc=0 || rc=$?
+assert "unmapped-10250 error tells the operator to pass --reset" "$([ "$rc" != 0 ] && echo "$out" | grep -q -- '--reset' && echo 1 || echo 0)"
+
+# Run lima-start.sh's real gate line (extracted, not re-typed) so removing or
+# mis-gating the call fails here.
+GATE=$(grep -F 'assert_kubelet_port_matches_vm "$VM_NAME"' "$LIMA_START")
+assert "lima-start.sh has exactly one kubelet-port gate line" "$([ "$(printf '%s\n' "$GATE" | wc -l)" -eq 1 ] && [ -n "$GATE" ] && echo 1 || echo 0)"
+run_gate() { # <override> <vm> <port>
+  ( _KUBELET_PORT_OVERRIDE="$1" VM_NAME="$2" KUBELET_PORT="$3"; eval "$GATE"; echo reached ) 2>/dev/null
+}
+out=$(run_gate "" vm-ok 10253) || true
+assert "gate is skipped when --kubelet-port was not passed (default 10250 must not trip on a custom-port VM)" "$([ "$out" = reached ] && echo 1 || echo 0)"
+out=$(run_gate 10253 vm-ok 10253) || true
+assert "gate aborts lima-start when an explicit --kubelet-port mismatches the VM" "$([ -z "$out" ] && echo 1 || echo 0)"
+out=$(run_gate 10263 vm-ok 10263) || true
+assert "gate lets a matching explicit --kubelet-port continue" "$([ "$out" = reached ] && echo 1 || echo 0)"
 
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

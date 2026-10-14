@@ -3,8 +3,8 @@
 # `i/o timeout` in the act and correlate the failure timestamp against
 # per-layer evidence: Mac somaxconn accept-queue overflow (visible only from
 # the host side), shared `limactl usernet` capacity (indirect — no direct
-# counters, inferred from guest-side symptoms), or guest conntrack/IPVS
-# desync (direct — conntrack -S / ipvsadm --stats below).
+# counters, inferred from guest-side symptoms), or guest conntrack
+# desync (direct — conntrack -S / iptables -t nat counters below).
 #
 # Appends a timestamped snapshot to $LOG every 2s. Intended to run for the
 # duration of a `[Conformance]` sonobuoy run, started before sonobuoy and
@@ -13,10 +13,10 @@
 # Usage (from inside the guest, or via `limactl shell <vm> -- bash /path/to/this.sh`):
 #   instrument-vip-capture.sh [logfile] [vip] [port]
 #
-# Prerequisite: `conntrack` and `ipvsadm` are not preinstalled on the Lima
-# conformance image, and a `--reset` reprovision wipes them again — install
+# Prerequisite: `conntrack` is not preinstalled on the Lima
+# conformance image, and a `--reset` reprovision wipes it again — install
 # fresh on every reset before starting this script:
-#   limactl shell <vm> sudo apt-get install -y conntrack ipvsadm
+#   limactl shell <vm> sudo apt-get install -y conntrack
 #
 # Companion capture (run separately, also inside the guest):
 #   sudo tcpdump -i any -w /tmp/vip-capture.pcap -s 128 host <vip> or port 6443
@@ -41,8 +41,8 @@ while true; do
     nstat -az | grep -iE "overflow|drop|listen"
     echo "--conntrack-S--"
     sudo conntrack -S
-    echo "--ipvsadm-L-n-stats--"
-    sudo ipvsadm -L -n --stats -t "${VIP}:${PORT}"
+    echo "--iptables-nat-vip--"
+    sudo iptables -t nat -L -n -v | grep -F -e "${VIP}" -e "dpt:${PORT}"
     # /proc/net/nf_conntrack (the per-entry listing the bead asked for via
     # `wc -l`) is not exposed on this kernel/netns (CONFIG_NF_CONNTRACK_PROCFS
     # off or hidden) - nf_conntrack_count is the equivalent live entry count.

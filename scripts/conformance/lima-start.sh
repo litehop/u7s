@@ -67,7 +67,7 @@ done
 KUBELET_V=2
 [ "$VERBOSE" -eq 1 ] && KUBELET_V=5
 # kube-proxy --v=5 additionally logs every EndpointSlice update it processes and every
-# IPVS sync completion (this deployment runs kube-proxy in IPVS mode — see config.conf
+# iptables sync completion (this deployment runs kube-proxy in iptables mode — see config.conf
 # below) — the measurement needed to tell whether kube-proxy saw an EndpointSlice event
 # late or reprogrammed slowly. --v=2 is the unchanged default.
 KUBE_PROXY_V=2
@@ -276,6 +276,11 @@ else
     limactl start --tty=false --timeout 30m --name="$VM_NAME" "$LIMA_YAML"
   fi
 fi
+
+# Flannel's cross-node VXLAN needs a real L2 path between this VM and every node
+# already in the cluster; fail before anything is applied if they are on
+# different Lima networks.
+assert_same_lima_network "$VM_NAME" "$KUBECONFIG_PATH" || exit 1
 
 # CRI-O ships a default 10-crio-bridge.conf(list) that gives every node its own
 # independent, uncoordinated subnet with no cross-node routing at all. Flannel
@@ -740,7 +745,7 @@ RBACEOF
 # suppression / fallback here: an empty token does not crash kube-proxy — it starts,
 # systemd reports it "active", and it just spins forever as system:anonymous,
 # failing every List/Watch call ("... is not allowed to list nodes") without ever
-# programming an IPVS rule. That is indistinguishable from success to the
+# programming an iptables rule. That is indistinguishable from success to the
 # KUBE_PROXY_ACTIVE check below, so a `create token` failure must stop the script
 # right here instead of surfacing as an unexplained Service-routing failure later.
 KUBE_PROXY_TOKEN=$(kubectl --kubeconfig="$KUBECONFIG_PATH" create token kube-proxy \
@@ -825,30 +830,28 @@ PULLEOF
   limactl shell "$VM_NAME" sudo rm -f /tmp/kubelet-pods/kube-proxy-pull.yaml
 fi
 
-# Install ipset (required by kube-proxy IPVS mode), conntrack (network diagnostics), and
-# nfs-common (provides the /sbin/mount.nfs helper). All three are load-bearing — without
-# ipset/conntrack kube-proxy crashloops silently, making the kubernetes Service VIP
-# unreachable for the entire run; without nfs-common, kubelet's `mount -t nfs` fails with
+# Install conntrack (kube-proxy flushes stale UDP conntrack entries with it, plus network
+# diagnostics) and nfs-common (provides the /sbin/mount.nfs helper). Both are load-bearing
+# — without conntrack stale Service conntrack entries linger; without nfs-common, kubelet's `mount -t nfs` fails with
 # "bad option; ... need /sbin/mount.<type> helper program" for every nfs/nfs3 driver
 # storage conformance test, even once the PV/PVC bind itself succeeds. No output
 # suppression / `|| true` here: let `set -euo pipefail` fail the script loudly
 # if either command fails, rather than continuing with a half-provisioned VM.
 limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 update
-limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 install -y ipset conntrack nfs-common
+limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 install -y conntrack nfs-common
 
-# Load IPVS and bridge netfilter kernel modules.
+# Load the bridge netfilter kernel module.
 # br_netfilter is required so that bridge traffic (pod-to-pod) passes through
-# netfilter hooks; without it, IPVS DNAT for ClusterIP services never fires for
+# netfilter hooks; without it, iptables DNAT for ClusterIP services never fires for
 # traffic originating from pods, breaking in-pod DNS and service connectivity.
 # modprobe of an already-loaded module is a documented no-op (exit 0), so this
 # does NOT need `|| true` to be safe on repeat runs — but a genuinely missing
 # module (wrong kernel, module not built) also exits nonzero with a FATAL
-# message, and that case is load-bearing for kube-proxy's ipvs mode. No
+# message, and that case is load-bearing for kube-proxy's iptables mode. No
 # suppression here (nor on the whole block, previously via a trailing
 # `2>/dev/null`): let `set -euo pipefail` fail loud with the real modprobe/sysctl
-# error text instead of silently leaving IPVS unable to program any rules.
+# error text instead of silently leaving iptables DNAT unable to fire.
 limactl shell "$VM_NAME" sudo bash -c '
-  modprobe ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh
   modprobe br_netfilter
   sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1 >/dev/null
 '
@@ -894,7 +897,7 @@ limactl shell "$VM_NAME" sudo systemctl enable kube-proxy 2>/dev/null
 limactl shell "$VM_NAME" sudo systemctl restart kube-proxy
 
 # Verify kube-proxy actually reached the active state (not stuck crashlooping).
-# Without this check, any silent failure (missing ipset, missing kernel module,
+# Without this check, any silent failure (missing kernel module,
 # bad config) leaves kube-proxy dead and the kubernetes Service VIP unreachable —
 # sonobuoy then hangs indefinitely on "dial tcp 10.96.0.1:443: i/o timeout" with
 # no actionable signal to the operator.
@@ -919,7 +922,7 @@ echo "kube-proxy systemd service started (logs: limactl shell ${VM_NAME} sudo jo
 
 # Resolve the host gateway IP used to route the kubernetes ClusterIP. This (and the
 # patch below) used to only WARN and continue on failure — but skipping either one
-# leaves kube-proxy's IPVS rule for 10.96.0.1:443 pointed at 127.0.0.1 (this node's
+# leaves kube-proxy's iptables rule for 10.96.0.1:443 pointed at 127.0.0.1 (this node's
 # own loopback) instead of the host, which silently breaks every in-cluster Service
 # call (including sonobuoy's own liveness dial) while the rest of this script still
 # reports success. Fail loud instead.
@@ -930,7 +933,7 @@ if [ -z "$HOST_IP" ]; then
 fi
 limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-# Patch the kubernetes EndpointSlice with the host IP so kube-proxy's IPVS rule
+# Patch the kubernetes EndpointSlice with the host IP so kube-proxy's iptables rule
 # routes 10.96.0.1:443 → host (not 127.0.0.1 which is the VM's own loopback).
 # The apiserver seeds 127.0.0.1 as a safe default; we correct it here once we
 # know the host gateway IP.
@@ -938,7 +941,7 @@ echo "Patching kubernetes EndpointSlice with host IP ${HOST_IP}..."
 if ! kubectl --kubeconfig="$KUBECONFIG_PATH" patch endpointslice kubernetes -n default \
     --type=json \
     -p="[{\"op\":\"replace\",\"path\":\"/endpoints/0/addresses/0\",\"value\":\"${HOST_IP}\"}]"; then
-  echo "error: EndpointSlice patch failed — kube-proxy IPVS will keep routing 10.96.0.1:443 to 127.0.0.1 instead of the host, breaking cluster Service routing for every pod" >&2
+  echo "error: EndpointSlice patch failed — kube-proxy's iptables DNAT will keep routing 10.96.0.1:443 to 127.0.0.1 instead of the host, breaking cluster Service routing for every pod" >&2
   exit 1
 fi
 echo "EndpointSlice patched: 10.96.0.1:443 → ${HOST_IP}:${PORT}"
