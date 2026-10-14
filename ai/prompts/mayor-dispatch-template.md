@@ -479,7 +479,7 @@ and your PR is open — must be:
 
 ```bash
 scripts/conformance/reset.sh --host-only --workdir "$PWD/temp/u7s" --port <YOUR_ASSIGNED_PORT>
-limactl stop <ASSIGNED_VM>
+limactl stop <VM_NAME>
 ```
 
 Stop the VM (idle u7s VMs share the host with other repos' VMs; operator rule 2026-10-14)
