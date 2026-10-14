@@ -855,6 +855,24 @@ assert "...keeps the locked worktree and its branch" \
 assert "...and returns nonzero so the failed removal counts as an anomaly" \
   "$([ "$G_RC" -ne 0 ] && echo 1 || echo 0)"
 
+# A failing `git branch -D` after a successful remove (a stale ref lock stands
+# in for any failure) must not abort the step either.
+for pair in aaabranchfail:fix-9 zzafter2:fix-10; do
+  id="${pair%%:*}"; br="${pair##*:}"
+  git -C "$G" branch "$br" main
+  git -C "$G" push -q origin "$br"
+  git -C "$G" worktree add -q "$G/ai/worktrees/agent-$id" "$br"
+done
+git -C "$G" worktree unlock "$G/ai/worktrees/agent-aaalocked"
+git -C "$G" worktree remove --force "$G/ai/worktrees/agent-aaalocked"
+touch "$G/.git/refs/heads/fix-9.lock"
+G_RC=0
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$G" call step_g_fix_round_worktrees >/dev/null 2>&1 || G_RC=$?
+assert "STEP G keeps going after a failed branch delete -- one undeletable branch must not strand every later fix-<PR> worktree" \
+  "$([ ! -d "$G/ai/worktrees/agent-zzafter2" ] && echo 1 || echo 0)"
+assert "...and returns nonzero so the failed branch delete counts as an anomaly" \
+  "$([ "$G_RC" -ne 0 ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
