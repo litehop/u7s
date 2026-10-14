@@ -1,10 +1,4 @@
 
-# Mayor Method working files. New ai/findings/*.md files are git-tracked
-# under the bead lifecycle (see "Findings lifecycle" in the workflow docs);
-# only the pre-convention legacy pile stays gitignored pending migration.
-ai/findings/legacy/*
-!ai/findings/legacy/.gitkeep
-
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
