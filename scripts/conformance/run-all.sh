@@ -501,6 +501,14 @@ if [ -n "$EXTRA_NODE" ]; then
   U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
 fi
 
+# Node podCIDRs only exist once KCM runs, so a cni0 left over from a prior
+# session (VM kept, state wiped) can only be checked against the current
+# podCIDR here, before any pod sandbox is created on it.
+source "$DIR/_lib.sh"
+banner "Reconcile cni0 with node podCIDRs"
+reconcile_cni0 "${U7S_VM_NAME:-lima-node}" "$KUBECONFIG" "${U7S_VM_NAME:-lima-node}"
+[ -z "$EXTRA_NODE" ] || reconcile_cni0 "$EXTRA_NODE" "$KUBECONFIG" "$EXTRA_NODE"
+
 # kube-network-policies DaemonSet-Ready wait: lima-start.sh (Step 3, above) applies
 # the manifest but deliberately does not wait — DaemonSet pod materialization is
 # KCM's job (Step 4) and placement is the scheduler's (Step 5), so waiting inside
