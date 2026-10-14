@@ -283,6 +283,20 @@ pub(crate) fn generate_suffix() -> String {
         .collect()
 }
 
+/// Upstream `names.MaxGeneratedNameLength` (`maxNameLength 63 - randomLength 5`): the
+/// base is cut to this many bytes for every kind, including 253-char subdomain kinds.
+const MAX_GENERATED_NAME_BASE_LENGTH: usize = 63 - 5;
+
+/// Upstream `SimpleNameGenerator.GenerateName`: truncate the base, then append a random
+/// suffix, so an over-long `generateName` still yields a name instead of a rejection.
+pub(crate) fn generate_name(base: &str) -> String {
+    let mut end = base.len().min(MAX_GENERATED_NAME_BASE_LENGTH);
+    while !base.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &base[..end], generate_suffix())
+}
+
 pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::StatusError> {
     match obj.name().filter(|n| !n.is_empty()) {
         Some(n) => Ok(n.to_string()),
@@ -295,7 +309,7 @@ pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::St
                     "metadata.name or metadata.generateName is required".into(),
                 ));
             }
-            let name = format!("{}{}", gen, generate_suffix());
+            let name = generate_name(gen);
             obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
             Ok(name)
         }
@@ -313,13 +327,7 @@ pub(crate) fn resolve_valid_name(
     plural: &str,
     kind: &str,
 ) -> Result<String, crate::status::StatusError> {
-    let generate_prefix = wants_generate_name(obj);
-    let name = resolve_name(obj)?;
-    validate_name_for_group("metadata.name", &name, group, plural).map_err(|e| {
-        let (field, value) = match &generate_prefix {
-            Some(prefix) => ("metadata.generateName", prefix.as_str()),
-            None => ("metadata.name", name.as_str()),
-        };
+    let invalid = |e: crate::status::StatusError, name: &str, field: &str, value: &str| {
         let reason =
             e.1.message
                 .rsplit_once("': ")
@@ -334,6 +342,26 @@ pub(crate) fn resolve_valid_name(
             "causes": [{"reason": "FieldValueInvalid", "message": cause, "field": field}]
         })));
         err
+    };
+    let generate_prefix = wants_generate_name(obj);
+    // Upstream validates the whole generateName prefix, not the truncated generated name,
+    // so a prefix longer than the kind's limit (e.g. 64+ chars for a Namespace) is still
+    // rejected even though truncation would make the generated name valid.
+    if let Some(prefix) = generate_prefix
+        .as_deref()
+        .filter(|p| p.len() > MAX_GENERATED_NAME_BASE_LENGTH)
+    {
+        let trimmed = prefix.trim_end_matches(['-', '.']);
+        validate_name_for_group("metadata.generateName", trimmed, group, plural)
+            .map_err(|e| invalid(e, prefix, "metadata.generateName", prefix))?;
+    }
+    let name = resolve_name(obj)?;
+    validate_name_for_group("metadata.name", &name, group, plural).map_err(|e| {
+        let (field, value) = match &generate_prefix {
+            Some(prefix) => ("metadata.generateName", prefix.as_str()),
+            None => ("metadata.name", name.as_str()),
+        };
+        invalid(e, &name, field, value)
     })?;
     Ok(name)
 }
@@ -1610,6 +1638,71 @@ mod tests {
         );
         // The name must be written back into the object body.
         assert_eq!(obj.body["metadata"]["name"].as_str(), Some(name.as_str()));
+    }
+
+    fn generate_name_obj(prefix: &str) -> Object {
+        Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({ "metadata": { "generateName": prefix } }).to_string(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn generate_name_truncates_base_to_58_for_every_kind_like_upstream() {
+        // Upstream SimpleNameGenerator cuts the base to 63-5 even for 253-char subdomain
+        // kinds; without it a client (e.g. e2e generateName stress) gets 422 instead of a
+        // created object.
+        let base = "a".repeat(252);
+        let name = generate_name(&base);
+        assert_eq!(name.len(), 63);
+        assert!(name.starts_with(&"a".repeat(58)));
+    }
+
+    #[test]
+    fn generate_name_never_splits_a_multibyte_char() {
+        let base = format!("{}é{}", "a".repeat(57), "b".repeat(10));
+        let name = generate_name(&base);
+        assert!(name.starts_with(&"a".repeat(57)));
+        assert_eq!(name.len(), 57 + 5);
+    }
+
+    #[test]
+    fn resolve_valid_name_creates_namespace_with_62_char_generate_name_prefix() {
+        let prefix = "a".repeat(62);
+        let mut obj = generate_name_obj(&prefix);
+        let name = ok(resolve_valid_name(&mut obj, "", "namespaces", "Namespace"));
+        assert_eq!(name.len(), 63, "truncated base 58 + 5 suffix");
+        assert!(name.starts_with(&prefix[..58]));
+    }
+
+    #[test]
+    fn resolve_valid_name_creates_subdomain_kind_with_252_char_generate_name_prefix() {
+        let prefix = format!("{}.{}", "a".repeat(60), "b".repeat(100));
+        let mut obj = generate_name_obj(&prefix);
+        let name = ok(resolve_valid_name(
+            &mut obj,
+            "apps",
+            "deployments",
+            "Deployment",
+        ));
+        assert_eq!(name.len(), 63);
+        assert!(name.starts_with(&"a".repeat(58)));
+    }
+
+    #[test]
+    fn resolve_valid_name_still_rejects_namespace_generate_name_prefix_over_63() {
+        // Upstream validates the full generateName prefix, so truncation must not turn an
+        // over-long Namespace prefix into a success.
+        let mut obj = generate_name_obj(&"a".repeat(64));
+        let err = resolve_valid_name(&mut obj, "", "namespaces", "Namespace").unwrap_err();
+        crate::handlers::test_support::assert_invalid_name_field(&err, "metadata.generateName");
+    }
+
+    #[test]
+    fn resolve_valid_name_rejects_invalid_chars_in_over_long_generate_name_prefix() {
+        let mut obj = generate_name_obj(&format!("{}_", "a".repeat(100)));
+        let err = resolve_valid_name(&mut obj, "apps", "deployments", "Deployment").unwrap_err();
+        crate::handlers::test_support::assert_invalid_name_field(&err, "metadata.generateName");
     }
 
     #[test]

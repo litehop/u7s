@@ -541,10 +541,8 @@ pub(crate) async fn create_pod<S: Store>(
                         < crate::handlers::generic::MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
             {
                 attempts_made += 1;
-                name = format!(
-                    "{}{}",
+                name = crate::handlers::generic::generate_name(
                     generate_name_prefix.as_deref().unwrap_or_default(),
-                    crate::handlers::generic::generate_suffix()
                 );
                 obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
                 // Re-validate the regenerated name — mirrors create_resource's retry, which
