@@ -12389,26 +12389,40 @@ mod tests {
         // `NodeUsage`/`NodePod`'s PVC keys, this pod would have been wrongly
         // rejected here forever — a same-named PVC in an unrelated namespace
         // is not the same volume and must never block scheduling.
-        let list = NodeList {
+        let make_list = || NodeList {
             items: vec![make_node("worker-0", &[])],
         };
         let mut pod = empty_pending_pod();
         pod.namespace = "team-b".to_owned();
         pod.read_write_once_pod_pvcs = vec!["data-pvc".to_owned()];
-        let usage: std::collections::HashMap<String, NodeUsage> = [(
-            "worker-0".to_owned(),
-            NodeUsage {
-                pvc_names: vec!["team-a/data-pvc".to_owned()],
-                ..Default::default()
-            },
-        )]
-        .into();
-        let result = select_node_with_capacity(list, &pod, &usage, &[]);
+        // Usage is produced by the real tally (not hand-written keys) so a
+        // regression in how the tally qualifies keys is visible here.
+        let assume_holder = |namespace: &str| {
+            let mut tally = NodeTally::default();
+            tally.assume(
+                namespace,
+                "holder",
+                "worker-0",
+                0,
+                ResourceRequests::default(),
+                Vec::new(),
+                std::collections::HashMap::new(),
+                vec!["data-pvc".to_owned()],
+            );
+            tally.usage_by_node()
+        };
+        let result = select_node_with_capacity(make_list(), &pod, &assume_holder("team-a"), &[]);
         assert_eq!(
             result.unwrap(),
             "worker-0",
             "a PVC named \"data-pvc\" in namespace team-a must never conflict \
              with a DIFFERENT PVC of the same bare name in namespace team-b"
+        );
+        let result = select_node_with_capacity(make_list(), &pod, &assume_holder("team-b"), &[]);
+        assert!(
+            result.is_err(),
+            "control: the same-namespace holder of data-pvc must still conflict, \
+             otherwise the allow above proves nothing"
         );
     }
 
