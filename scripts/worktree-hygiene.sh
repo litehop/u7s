@@ -56,7 +56,10 @@
 #   checkout) with no u7s-apiserver of the same workdir, still apiserver-less
 #   after a short rescan -- the leftover that squats a worker slot's ports.
 #   A mayor checkout one is reaped only on a worker-slot (1-5) konnectivity
-#   port; slot 0 is the operator's own stack.
+#   port; slot 0 is the operator's own stack. Likewise a mayor checkout
+#   u7s-apiserver/u7s-scheduler on a worker-slot apiserver port (6444-6448,
+#   from its --listen / kubeconfig server URL) with no live worker's
+#   apiserver/scheduler on that port. Processes are typed by argv[0] basename.
 # STEP B: `git worktree prune -v` -- safe by definition, only removes
 #   metadata for worktrees whose directories are already gone.
 # STEP C: delete stale `worker/agent-*` branches, guarded so an in-flight
@@ -199,14 +202,38 @@ is_live_agent_branch() {
 # Which of the four tracked process types (if any) a `ps aux` line
 # belongs to.
 proc_type_from_psline() {
-  case "$1" in
-    *u7s-apiserver*) printf 'apiserver' ;;
-    *u7s-scheduler*) printf 'scheduler' ;;
-    *sample-run-metrics.sh*) printf 'sample-run-metrics' ;;
-    *) case "$(exe_basename_from_psline "$1")" in
-         konnectivity-server|proxy-server-*) printf 'konnectivity-server' ;;
+  case "$(exe_basename_from_psline "$1")" in
+    u7s-apiserver) printf 'apiserver' ;;
+    u7s-scheduler) printf 'scheduler' ;;
+    konnectivity-server|proxy-server-*) printf 'konnectivity-server' ;;
+    *) case "$1" in
+         *sample-run-metrics.sh*) printf 'sample-run-metrics' ;;
          *) printf '' ;;
        esac ;;
+  esac
+}
+
+# Worker-slot apiserver ports 6444-6448 (dispatch template slot table); slot 0
+# (6443) is the operator's own stack and is never in this set.
+is_worker_slot_apiserver_port() {
+  case "$1" in
+    6444|6445|6446|6447|6448) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The apiserver port a u7s-apiserver / u7s-scheduler line talks to: the
+# apiserver's `--listen host:port`; the scheduler has no port flag, so the
+# `server:` URL of the kubeconfig it was handed. Empty if undeterminable.
+apiserver_port_from_psline() {
+  local line="$1" kc
+  case "$(proc_type_from_psline "$line")" in
+    apiserver)
+      printf '%s' "$line" | grep -oE -e '--listen[ =][^ ]*:[0-9]+' | head -1 | grep -oE '[0-9]+$' || true ;;
+    scheduler)
+      kc=$(printf '%s' "$line" | grep -oE -e '--kubeconfig[ =][^ ]+' | head -1 | sed -E 's/^--kubeconfig[ =]//')
+      [ -f "$kc" ] || return 0
+      grep -m1 -E 'server: *https?://' "$kc" | grep -oE ':[0-9]+/?$' | grep -oE '[0-9]+' || true ;;
   esac
 }
 
@@ -299,13 +326,48 @@ find_apiserverless_konnectivity() {
   done <<< "$ps_output"
 }
 
+# Emits a `pid|apiserver|path` / `pid|scheduler|path` record for every
+# u7s-apiserver / u7s-scheduler of a worker-less checkout (the mayor's: no
+# agent-<id> path) on a worker-slot port (6444-6448). The mayor checkout
+# never legitimately owns a worker slot (its stack is slot 0, 6443), so such a
+# process is a leftover squatting the slot -- unless a live agent worktree's
+# apiserver/scheduler in the scan is on that same port, in which case the slot
+# is in use and ownership is unclear, so nothing is flagged. The port must be
+# provable from the process's own args/kubeconfig; otherwise it is left alone.
+# The caller applies the rescan grace.
+find_mayor_worker_slot_squatters() {
+  local ps_output="$1" live_worktrees="$2"
+  local line ptype wpath port agent_ports
+  agent_ports=$(while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    ptype=$(proc_type_from_psline "$line")
+    [ "$ptype" = "apiserver" ] || [ "$ptype" = "scheduler" ] || continue
+    wpath=$(extract_worktree_path_from_psline "$line")
+    [ -n "$(agent_id_from_worktree_path "$wpath")" ] || continue
+    apiserver_port_from_psline "$line"
+  done <<< "$ps_output")
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    ptype=$(proc_type_from_psline "$line")
+    [ "$ptype" = "apiserver" ] || [ "$ptype" = "scheduler" ] || continue
+    wpath=$(extract_worktree_path_from_psline "$line")
+    [ -n "$wpath" ] || continue
+    printf '%s\n' "$live_worktrees" | grep -qxF "$wpath" || continue
+    [ -z "$(agent_id_from_worktree_path "$wpath")" ] || continue
+    port=$(apiserver_port_from_psline "$line")
+    is_worker_slot_apiserver_port "$port" || continue
+    if printf '%s\n' "$agent_ports" | grep -qxF "$port"; then continue; fi
+    printf '%s|slot-squatter-%s|%s\n' "$(pid_from_psline "$line")" "$ptype" "$wpath"
+  done <<< "$ps_output"
+}
+
 # The agent-id embedded in a worktree path shaped .../ai/worktrees/agent-<id>
 # (the convention every worker worktree in this repo is created under), or
 # empty if the path doesn't match that shape -- the mayor's own checkout has
 # no such suffix and is therefore never a candidate for the live-agents
 # guard below.
 agent_id_from_worktree_path() {
-  printf '%s' "$1" | grep -oE 'ai/worktrees/agent-[^/]+$' | sed -E 's#^ai/worktrees/agent-##'
+  printf '%s' "$1" | { grep -oE 'ai/worktrees/agent-[^/]+$' || true; } | sed -E 's#^ai/worktrees/agent-##'
 }
 
 # Drops any find_orphans record whose embedded worktree belongs to a
@@ -345,7 +407,7 @@ kill_pattern_for() {
 
 stale_records() {
   local ps_out="$1" live="$2"
-  filter_orphans_by_live_agents "$(find_orphans "$ps_out" "$live"; find_apiserverless_konnectivity "$ps_out" "$live")" "$LIVE_AGENTS"
+  filter_orphans_by_live_agents "$(find_orphans "$ps_out" "$live"; find_apiserverless_konnectivity "$ps_out" "$live"; find_mayor_worker_slot_squatters "$ps_out" "$live")" "$LIVE_AGENTS"
 }
 
 scan_ps() {
@@ -361,8 +423,9 @@ step_a_orphaned_processes() {
   [ -z "$ps_out" ] && return 0
 
   # An apiserver-less konnectivity-server is also what a live stack looks like
-  # for a moment while its apiserver restarts; only kill one seen in two scans.
-  if [ -n "$(filter_orphans_by_live_agents "$(find_apiserverless_konnectivity "$ps_out" "$live")" "$LIVE_AGENTS")" ]; then
+  # for a moment while its apiserver restarts, and a worker-slot-port mayor
+  # process may be mid-handoff; only kill one seen in two scans.
+  if [ -n "$(filter_orphans_by_live_agents "$(find_apiserverless_konnectivity "$ps_out" "$live"; find_mayor_worker_slot_squatters "$ps_out" "$live")" "$LIVE_AGENTS")" ]; then
     sleep "${HYGIENE_RESCAN_GRACE_S:-15}"
     ps_out=$(scan_ps)
   fi
@@ -375,8 +438,20 @@ step_a_orphaned_processes() {
   for line in "${orphans[@]}"; do
     IFS='|' read -r pid ptype wpath <<< "$line"
     echo "[hygiene] orphan-kill: ${ptype} pid=${pid} workdir=${wpath}"
-    pat=$(kill_pattern_for "$ptype" "$wpath")
-    run_cmd pkill -f "$pat"
+    case "$ptype" in
+      # Same workdir as the operator's slot-0 stack, so a path pattern would
+      # kill that too; only the pid is specific to the squatter.
+      slot-squatter-*) run_cmd kill "$pid" ;;
+      konnectivity-server)
+        if [ -z "$(agent_id_from_worktree_path "$wpath")" ]; then
+          run_cmd kill "$pid"
+        else
+          run_cmd pkill -f "$(kill_pattern_for "$ptype" "$wpath")"
+        fi ;;
+      *)
+        pat=$(kill_pattern_for "$ptype" "$wpath")
+        run_cmd pkill -f "$pat" ;;
+    esac
   done
 
   # Dry-run never actually killed anything, so a re-scan finding the same
