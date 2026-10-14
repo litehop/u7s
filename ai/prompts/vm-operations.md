@@ -269,7 +269,7 @@ This provisions the VM (if needed) or reconnects the kubelet. Handles:
 - Rewriting `<IP>` → `host.lima.internal` in the kubelet kubeconfig
 - Kubelet serving cert signed by the cluster CA
 - konnectivity-agent pod (mTLS)
-- kube-proxy systemd service (IPVS)
+- kube-proxy systemd service (iptables)
 - iptables DNAT for ClusterIP `10.96.0.1:443` → host apiserver
 
 Wait for node Ready (up to 60s):
