@@ -69,7 +69,7 @@ while IFS= read -r f; do
 done < <(find "$DIR" -type f -name '*.sh' | sort)
 if [ -n "${OFFENDERS//$'\n'/}" ]; then
   echo "unanchored pkill/pgrep -f sites (use workdir_kill_pattern from scripts/_kill-pattern.sh):" >&2
-  printf '%s\n' "$OFFENDERS" >&2
+  printf '%s\n' "$OFFENDERS" | grep -v '^$' >&2
 fi
 assert_true "no pkill/pgrep -f under scripts/ builds a path pattern without workdir_kill_pattern" [ -z "${OFFENDERS//$'\n'/}" ]
 
