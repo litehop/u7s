@@ -49,8 +49,10 @@ Methodology: `ai/perf/mayor-5x0kh-k3s-matched-comparison-2026-08-20.md`.
 Not a linear sequence; some run in parallel.
 
 ### Gate 1 — Conformance floor ✓ CLEARED, with known blind spots
-Full 446-spec sonobuoy Conformance passes: single-node first green
-2026-07-24; two-node 446/0/0/7133 2026-08-10.
+Full sonobuoy Conformance passes: single-node first green 2026-07-24;
+two-node 446/0/0/7133 2026-08-10. Current (1.37.1, two-node, iptables
+kube-proxy): 460/460 + 2/2 disruptive on 2026-10-14. Counts come from
+e2e.txt; script totals before #1771 also counted ginkgo suite nodes.
 
 Green is necessary, not sufficient. (1) Single-node bias: the scheduler once
 shipped zero taint/toleration handling (Gate 5 keeps catching this class).
