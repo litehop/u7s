@@ -505,6 +505,24 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         });
     }
 
+    // 10e2. Finalize terminating CRDs: remove their custom resources, then the CRD itself
+    // (upstream's apiextensions CRDFinalizer; not a KCM controller). Also resumes any
+    // finalization interrupted by a restart.
+    let (_crd_finalizer_shutdown_tx, mut crd_finalizer_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+    {
+        let finalizer_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                handlers::crd::reconcile_terminating_crds(&finalizer_state).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    _ = crd_finalizer_shutdown_rx.changed() => break,
+                }
+            }
+        });
+    }
+
     // 10f. Publish/reconcile kube-system/extension-apiserver-authentication for aggregated
     // backends (see reconcile_extension_apiserver_authentication's doc for why this is a
     // polling loop rather than a one-shot seed).

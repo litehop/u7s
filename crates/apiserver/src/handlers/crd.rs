@@ -118,6 +118,10 @@ pub struct CrdMetadata {
     pub creation_timestamp: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub generation: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finalizers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_timestamp: Option<String>,
 }
 
 fn is_zero(n: &i64) -> bool {
@@ -615,6 +619,14 @@ async fn build_new_crd<S: Store>(
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
     crd.metadata.generation = 1;
+    if !crd
+        .metadata
+        .finalizers
+        .iter()
+        .any(|f| f == CLEANUP_FINALIZER)
+    {
+        crd.metadata.finalizers.push(CLEANUP_FINALIZER.into());
+    }
 
     // Stamp status.conditions so controllers and conformance tests see the CRD
     // as ready immediately after creation (no separate status update loop).
@@ -774,6 +786,10 @@ pub async fn replace_crd<S: Store>(
         )));
     }
 
+    crd.metadata.deletion_timestamp = existing["metadata"]["deletionTimestamp"]
+        .as_str()
+        .map(str::to_string);
+
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
 
@@ -904,15 +920,249 @@ pub async fn delete_crd<S: Store>(
         })));
     }
 
-    state
+    // Upstream's registry soft-deletes any object carrying finalizers; the cleanup finalizer
+    // is added unconditionally here so CRDs persisted before it existed also get their
+    // instances removed.
+    let mut crd = existing;
+    let finalizers = crd["metadata"]["finalizers"].take();
+    let mut finalizers = finalizers.as_array().cloned().unwrap_or_default();
+    if !finalizers.iter().any(|f| f == CLEANUP_FINALIZER) {
+        finalizers.push(serde_json::Value::String(CLEANUP_FINALIZER.into()));
+    }
+    crd["metadata"]["finalizers"] = serde_json::Value::Array(finalizers);
+    if crd["metadata"]["deletionTimestamp"].is_null() {
+        crd["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+    }
+    set_terminating_condition(
+        &mut crd,
+        "True",
+        "InstanceDeletionInProgress",
+        "CustomResource deletion is in progress",
+    );
+    let rv = state
         .store
-        .delete(&key, None)
+        .put(&key, Bytes::from(crd.to_string()), Some(stored.revision))
         .await
         .map_err(|e| store_err_crd(e, &name))?;
-
+    crd["metadata"]["resourceVersion"] = serde_json::Value::String(rv.to_string());
+    // New instance creates must see the Terminating state immediately.
     evict_cr_schema_cache(&state, &group, &versions, &resource_version);
     evict_cr_context_cache(&state, &group, &plural, &versions);
-    crate::handlers::discovery::refresh_discovery_cache(&state).await;
+
+    finalize_crd(&state, &name).await;
+
+    Ok(Json(crd))
+}
+
+pub(crate) const CLEANUP_FINALIZER: &str = "customresourcecleanup.apiextensions.k8s.io";
+
+/// Upserts the `Terminating` condition; returns whether `crd` changed. `lastTransitionTime`
+/// only moves when the status flips, so re-asserting the same state is a byte-identical
+/// no-op write instead of a resourceVersion bump per sweep.
+fn set_terminating_condition(
+    crd: &mut serde_json::Value,
+    status: &str,
+    reason: &str,
+    message: &str,
+) -> bool {
+    if !crd["status"].is_object() {
+        crd["status"] = serde_json::json!({});
+    }
+    if !crd["status"]["conditions"].is_array() {
+        crd["status"]["conditions"] = serde_json::json!([]);
+    }
+    let conds = crd["status"]["conditions"]
+        .as_array_mut()
+        .expect("conditions was just coerced to an array");
+    let existing = conds
+        .iter_mut()
+        .find(|c| c["type"].as_str() == Some("Terminating"));
+    let transition = match &existing {
+        Some(c) if c["status"].as_str() == Some(status) => c["lastTransitionTime"].clone(),
+        _ => serde_json::Value::String(utc_now_rfc3339()),
+    };
+    let new = serde_json::json!({
+        "type": "Terminating",
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "lastTransitionTime": transition,
+    });
+    match existing {
+        Some(c) if *c == new => false,
+        Some(c) => {
+            *c = new;
+            true
+        }
+        None => {
+            conds.push(new);
+            true
+        }
+    }
+}
+
+/// Deletes every instance of the CRD's resource. Instances carrying their own finalizers are
+/// only marked for deletion, so the count of instances still present is returned.
+async fn delete_instances<S: Store>(state: &AppState<S>, group: &str, plural: &str) -> usize {
+    let prefix = crate::handlers::cr::cr_list_prefix(group, plural, None);
+    let Ok(resp) = state.store.list(&prefix, ListOptions::default()).await else {
+        return usize::MAX;
+    };
+    let mut remaining = 0;
+    for item in resp.items {
+        let Ok(mut obj) = Object::from_bytes(&item.value) else {
+            remaining += 1;
+            continue;
+        };
+        if !obj.body["metadata"]["deletionTimestamp"].is_null() {
+            remaining += 1;
+            continue;
+        }
+        let result = if crate::handlers::generic::apply_delete_policy(&mut obj).is_some() {
+            remaining += 1;
+            state
+                .store
+                .put(&item.key, obj.to_bytes(), Some(item.revision))
+                .await
+                .map(|_| ())
+        } else {
+            state
+                .store
+                .delete(&item.key, Some(item.revision))
+                .await
+                .map(|_| ())
+        };
+        if let Err(e) = result {
+            tracing::debug!(key = %item.key, err = %e, "CRD instance deletion deferred");
+            remaining += 1;
+        }
+    }
+    remaining
+}
+
+/// One pass of upstream's CRD finalizing controller for a terminating CRD: delete its
+/// instances, and once none remain drop the cleanup finalizer; the CRD itself goes away when
+/// no finalizers are left. Safe to call repeatedly and concurrently — every write is
+/// resourceVersion-checked and a lost race is retried by the next pass.
+pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) {
+    let key = store_key(name);
+    let Ok(Some(stored)) = state.store.get(&key).await else {
+        return;
+    };
+    let Ok(mut crd) = serde_json::from_slice::<serde_json::Value>(&stored.value) else {
+        return;
+    };
+    if crd["metadata"]["deletionTimestamp"].is_null() {
+        return;
+    }
+    let mut rv = stored.revision;
+    let finalizers: Vec<serde_json::Value> = crd["metadata"]["finalizers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    if finalizers.iter().any(|f| f == CLEANUP_FINALIZER) {
+        if set_terminating_condition(
+            &mut crd,
+            "True",
+            "InstanceDeletionInProgress",
+            "CustomResource deletion is in progress",
+        ) {
+            let Ok(new_rv) = state
+                .store
+                .put(&key, Bytes::from(crd.to_string()), Some(rv))
+                .await
+            else {
+                return;
+            };
+            rv = new_rv;
+        }
+        let group = crd["spec"]["group"].as_str().unwrap_or("").to_string();
+        let plural = crd["spec"]["names"]["plural"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if delete_instances(state, &group, &plural).await > 0 {
+            return;
+        }
+        set_terminating_condition(
+            &mut crd,
+            "False",
+            "InstanceDeletionCompleted",
+            "removed all instances",
+        );
+        let kept: Vec<serde_json::Value> = finalizers
+            .into_iter()
+            .filter(|f| f != CLEANUP_FINALIZER)
+            .collect();
+        if kept.is_empty() {
+            crd["metadata"]
+                .as_object_mut()
+                .expect("metadata is an object")
+                .remove("finalizers");
+        } else {
+            crd["metadata"]["finalizers"] = serde_json::Value::Array(kept);
+        }
+        let Ok(new_rv) = state
+            .store
+            .put(&key, Bytes::from(crd.to_string()), Some(rv))
+            .await
+        else {
+            return;
+        };
+        rv = new_rv;
+    }
+
+    let drained = crd["metadata"]["finalizers"]
+        .as_array()
+        .is_none_or(|f| f.is_empty());
+    if drained {
+        crd["metadata"]["resourceVersion"] = serde_json::Value::String(rv.to_string());
+        let _ = purge_crd(state, &key, name, &crd, rv).await;
+    }
+}
+
+/// Sweeps every terminating CRD; this is what resumes finalization after an apiserver restart,
+/// retries instance deletions that were deferred on instance finalizers, and removes a CRD
+/// whose last finalizer a client cleared.
+pub(crate) async fn reconcile_terminating_crds<S: Store>(state: &AppState<S>) {
+    let Ok(resp) = state
+        .store
+        .list(&list_prefix(), ListOptions::default())
+        .await
+    else {
+        return;
+    };
+    for item in resp.items {
+        let Ok(crd) = serde_json::from_slice::<serde_json::Value>(&item.value) else {
+            continue;
+        };
+        if crd["metadata"]["deletionTimestamp"].is_null() {
+            continue;
+        }
+        if let Some(name) = crd["metadata"]["name"].as_str() {
+            finalize_crd(state, name).await;
+        }
+    }
+}
+
+async fn purge_crd<S: Store>(
+    state: &AppState<S>,
+    key: &str,
+    name: &str,
+    existing: &serde_json::Value,
+    expected_rv: u64,
+) -> Result<(), crate::status::StatusError> {
+    let (group, versions, plural, resource_version) = crd_cache_identity(existing);
+    state
+        .store
+        .delete(key, Some(expected_rv))
+        .await
+        .map_err(|e| store_err_crd(e, name))?;
+
+    evict_cr_schema_cache(state, &group, &versions, &resource_version);
+    evict_cr_context_cache(state, &group, &plural, &versions);
+    crate::handlers::discovery::refresh_discovery_cache(state).await;
 
     // A deleted CRD's versions can never be requested (or converted to) again, so every
     // cr_conversion_cache entry targeting one of them is now permanently unreachable —
@@ -956,12 +1206,7 @@ pub async fn delete_crd<S: Store>(
             .await;
     }
 
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Success",
-        "code": 200
-    })))
+    Ok(())
 }
 
 /// DELETE /apis/apiextensions.k8s.io/v1/customresourcedefinitions (delete collection)
@@ -1152,6 +1397,9 @@ pub async fn patch_crd<S: Store>(
         .as_str()
         .unwrap_or("")
         .to_string();
+    crd.metadata.deletion_timestamp = existing["metadata"]["deletionTimestamp"]
+        .as_str()
+        .map(str::to_string);
 
     validate_crd_schema(&crd.spec, Some(&existing))?;
 
@@ -1399,7 +1647,7 @@ mod tests {
         )
     }
 
-    fn minimal_crd_bytes_with_group(name: &str, group: &str, plural: &str) -> Bytes {
+    pub(super) fn minimal_crd_bytes_with_group(name: &str, group: &str, plural: &str) -> Bytes {
         Bytes::from(
             serde_json::json!({
                 "apiVersion": "apiextensions.k8s.io/v1",
@@ -4369,9 +4617,8 @@ mod tests {
         .await
         .expect("delete must succeed");
 
-        assert_eq!(
-            store.compaction_horizon_for(&prefix),
-            rv,
+        assert!(
+            store.compaction_horizon_for(&prefix) >= rv,
             "CRD delete must eagerly free the resource-type shard rather than waiting 120s for \
              idle-GC — CRD conformance churn (dozens of transient CRDs per run) would otherwise \
              pin many-KiB of ring capacity per dead CRD until the grace period expires, and any \
@@ -4463,14 +4710,12 @@ mod tests {
         .await
         .expect("delete must succeed");
 
-        assert_eq!(
-            store.compaction_horizon_for(&cluster_prefix),
-            rv,
+        assert!(
+            store.compaction_horizon_for(&cluster_prefix) >= rv,
             "cluster-scoped shard must be torn down by CRD delete"
         );
-        assert_eq!(
-            store.compaction_horizon_for(&ns_prefix),
-            rv,
+        assert!(
+            store.compaction_horizon_for(&ns_prefix) >= rv,
             "a naive exact-key `remove(cluster_scoped_key)` would leave namespace-scoped shards \
              for the same resource type alive after CRD delete — the namespace-scoped ones \
              would then serve empty/synthetic replays to reconnecting watchers, and their \
@@ -4674,6 +4919,7 @@ mod ratchet_tests {
     use serde_json::{json, Value};
     use u7s_store::Store;
 
+    use super::tests::minimal_crd_bytes_with_group;
     use super::*;
     use crate::handlers::test_support::make_state;
 
@@ -4856,5 +5102,174 @@ mod ratchet_tests {
         )
         .await;
         assert!(res.is_ok());
+    }
+
+    const FIN_CRD: &str = "widgets.fin.io";
+
+    async fn create_fin_crd(state: &AppState) {
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(FIN_CRD, "fin.io", "widgets"),
+        )
+        .await
+        .expect("create CRD");
+    }
+
+    async fn put_widget(state: &AppState, name: &str, finalizers: &[&str]) -> String {
+        let key = format!("/registry/cr/fin.io/widgets/default/{name}");
+        let obj = serde_json::json!({
+            "apiVersion": "fin.io/v1", "kind": "Widget",
+            "metadata": { "name": name, "namespace": "default", "finalizers": finalizers },
+        });
+        state
+            .store
+            .put(&key, Bytes::from(obj.to_string()), Some(0))
+            .await
+            .expect("seed widget");
+        key
+    }
+
+    async fn stored_json(state: &AppState, key: &str) -> Option<serde_json::Value> {
+        state
+            .store
+            .get(key)
+            .await
+            .unwrap()
+            .map(|o| serde_json::from_slice(&o.value).unwrap())
+    }
+
+    async fn delete_fin_crd(state: &AppState) {
+        delete_crd(
+            State(state.clone()),
+            Path(FIN_CRD.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete CRD");
+    }
+
+    #[tokio::test]
+    async fn created_crd_carries_cleanup_finalizer() {
+        let state = make_state();
+        create_fin_crd(&state).await;
+        let crd = stored_json(&state, &store_key(FIN_CRD)).await.unwrap();
+        assert_eq!(
+            crd["metadata"]["finalizers"],
+            serde_json::json!([CLEANUP_FINALIZER]),
+            "without the finalizer a CRD delete has no hook to remove its instances"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_crd_removes_its_custom_resources() {
+        let state = make_state();
+        create_fin_crd(&state).await;
+        let k1 = put_widget(&state, "w1", &[]).await;
+        let k2 = put_widget(&state, "w2", &[]).await;
+
+        delete_fin_crd(&state).await;
+
+        assert!(
+            stored_json(&state, &store_key(FIN_CRD)).await.is_none(),
+            "CRD must be gone once its instances are removed"
+        );
+        for k in [k1, k2] {
+            assert!(
+                stored_json(&state, &k).await.is_none(),
+                "instance {k} left behind would resurrect when a same-named CRD is re-created"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn crd_stays_terminating_while_an_instance_holds_a_finalizer() {
+        let state = make_state();
+        create_fin_crd(&state).await;
+        let plain = put_widget(&state, "plain", &[]).await;
+        let held = put_widget(&state, "held", &["example.com/hold"]).await;
+
+        delete_fin_crd(&state).await;
+
+        let crd = stored_json(&state, &store_key(FIN_CRD))
+            .await
+            .expect("CRD must survive until the instance finalizer is released");
+        assert!(crd["metadata"]["deletionTimestamp"].is_string());
+        let term = crd["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Terminating")
+            .expect("Terminating condition");
+        assert_eq!(term["status"], "True");
+        assert!(stored_json(&state, &plain).await.is_none());
+        let held_obj = stored_json(&state, &held)
+            .await
+            .expect("held instance kept");
+        assert!(
+            held_obj["metadata"]["deletionTimestamp"].is_string(),
+            "instance finalizers must be honored, not bypassed"
+        );
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "fin.io/v1", "kind": "Widget",
+                "metadata": { "name": "held", "namespace": "default" },
+            })
+            .to_string(),
+        );
+        let err = crate::handlers::cr::create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "fin.io".into(),
+                "v1".into(),
+                "default".into(),
+                "widgets".into(),
+            )),
+            test_user(),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .err()
+        .expect("create must be rejected while the CRD is terminating");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        state.store.delete(&held, None).await.unwrap();
+        finalize_crd(&state, FIN_CRD).await;
+        assert!(
+            stored_json(&state, &store_key(FIN_CRD)).await.is_none(),
+            "CRD must complete deletion once no instances remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_does_not_clear_deletion_timestamp() {
+        let state = make_state();
+        create_fin_crd(&state).await;
+        put_widget(&state, "held", &["example.com/hold"]).await;
+        delete_fin_crd(&state).await;
+
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&minimal_crd_bytes_with_group(FIN_CRD, "fin.io", "widgets"))
+                .unwrap();
+        body["metadata"]["finalizers"] = serde_json::json!([CLEANUP_FINALIZER]);
+        replace_crd(
+            State(state.clone()),
+            Path(FIN_CRD.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .expect("replace");
+        let crd = stored_json(&state, &store_key(FIN_CRD)).await.unwrap();
+        assert!(
+            crd["metadata"]["deletionTimestamp"].is_string(),
+            "a client PUT must not un-terminate a CRD mid-finalization"
+        );
     }
 }
