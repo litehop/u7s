@@ -93,3 +93,18 @@ authorized_keys_replace_cmd() {
   local pubkey="$1"
   echo "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && { grep -v ' ${E2E_SSH_KEY_COMMENT}\$' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.new || true; } && echo '${pubkey}' >> ~/.ssh/authorized_keys.new && cat ~/.ssh/authorized_keys.new > ~/.ssh/authorized_keys && rm -f ~/.ssh/authorized_keys.new"
 }
+
+# Prints "<ran> <failed>" for a ginkgo junit file, matching the "Ran X of Y
+# Specs" line in e2e.txt. The junit also carries one testcase per suite-level
+# node execution (one [SynchronizedBeforeSuite]/[SynchronizedAfterSuite] per
+# ginkgo process plus the Report*Suite nodes); those are not specs, so passed
+# ones are not counted as ran. Failed ones stay in failures so a broken suite
+# node still fails the run.
+junit_spec_totals() {
+  local junit="$1" tests skipped failures suite_nodes
+  tests=$(grep -o 'tests="[0-9]*"' "$junit" | head -1 | grep -o '[0-9]*')
+  skipped=$(grep -o 'skipped="[0-9]*"' "$junit" | head -1 | grep -o '[0-9]*')
+  failures=$(grep -o 'failures="[0-9]*"' "$junit" | head -1 | grep -o '[0-9]*')
+  suite_nodes=$(grep -cE '<testcase name="\[(Report(Before|After)Suite|Synchronized(Before|After)Suite|BeforeSuite|AfterSuite)\][^"]*"[^>]*status="passed"' "$junit" || true)
+  echo "$(( tests - ${skipped:-0} - suite_nodes )) ${failures:-0}"
+}

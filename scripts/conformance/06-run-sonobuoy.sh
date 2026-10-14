@@ -648,11 +648,7 @@ if [ "$UNPACK" -eq 1 ]; then
 
   JUNIT="$UNPACK_DIR/plugins/e2e/results/global/junit_01.xml"
   if [ -f "$JUNIT" ]; then
-    # Extract totals from the testsuites element.
-    TESTS=$(grep -o 'tests="[0-9]*"' "$JUNIT" | head -1 | grep -o '[0-9]*')
-    FAILURES=$(grep -o 'failures="[0-9]*"' "$JUNIT" | head -1 | grep -o '[0-9]*')
-    SKIPPED=$(grep -o 'skipped="[0-9]*"' "$JUNIT" | head -1 | grep -o '[0-9]*')
-    RAN=$(( TESTS - ${SKIPPED:-0} ))
+    read -r RAN FAILURES < <(junit_spec_totals "$JUNIT")
     echo ""
     echo "=== Results summary ==="
     echo "  Ran:    $RAN"
