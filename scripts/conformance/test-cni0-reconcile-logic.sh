@@ -37,7 +37,32 @@ assert_true "non-/24 podCIDR: 10.244.4.1 is outside 10.244.2.0/23" \
 assert_true "high-octet addresses do not overflow the mask math (192.168.1.1 vs 10.0.0.0/8)" \
   cni0_addr_is_stale 192.168.1.1/24 10.0.0.0/8
 
-assert_true "run-all.sh reconciles cni0 for the primary and extra node -- otherwise a warm reconnect still hits the stale bridge" \
+assert_false "/0 podCIDR contains every address -- a stale verdict would delete a bridge that cannot conflict" \
+  cni0_addr_is_stale 10.244.1.1/24 0.0.0.0/0
+assert_false "/32 podCIDR keeps its single exact address" \
+  cni0_addr_is_stale 10.244.2.5/32 10.244.2.5/32
+assert_true "/32 podCIDR: the neighbouring address is stale" \
+  cni0_addr_is_stale 10.244.2.6/32 10.244.2.5/32
+assert_false "the podCIDR network address (10.244.2.0) is inside the CIDR" \
+  cni0_addr_is_stale 10.244.2.0/24 10.244.2.0/24
+assert_false "the podCIDR broadcast address (10.244.2.255) is inside the CIDR" \
+  cni0_addr_is_stale 10.244.2.255/24 10.244.2.0/24
+assert_true "one past the broadcast address (10.244.3.0) is outside" \
+  cni0_addr_is_stale 10.244.3.0/24 10.244.2.0/24
+
+cni0_rc() { local rc=0; cni0_addr_is_stale "$@" 2>/dev/null || rc=$?; echo "$rc"; }
+for bad in "" "garbage" "10.244.2" "10.244.2.1.1" "10.244.2.300/24" "/24"; do
+  assert_true "malformed address '$bad' is rejected with rc 2, not reported stale -- an empty read would otherwise delete a healthy cni0" \
+    [ "$(cni0_rc "$bad" 10.244.2.0/24)" = 2 ]
+done
+for bad in "" "10.244.2.0" "10.244.2.0/33" "10.244.2.0/" "10.244.2.0/x" "10.244.2/24"; do
+  assert_true "malformed podCIDR '$bad' is rejected with rc 2, not reported stale" \
+    [ "$(cni0_rc 10.244.2.1/24 "$bad")" = 2 ]
+done
+
+assert_true "run-all.sh reconciles cni0 for the primary node -- otherwise a warm reconnect of the primary still hits the stale bridge" \
+  grep -q 'reconcile_cni0 "\${U7S_VM_NAME:-lima-node}"' "$DIR/run-all.sh"
+assert_true "run-all.sh reconciles cni0 for the extra node -- otherwise a warm reconnect still hits the stale bridge" \
   grep -q 'reconcile_cni0 "\$EXTRA_NODE"' "$DIR/run-all.sh"
 
 echo ""
