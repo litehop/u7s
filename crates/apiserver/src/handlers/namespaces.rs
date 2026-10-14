@@ -1220,7 +1220,7 @@ mod tests {
     #[tokio::test]
     async fn create_namespace_accepts_valid_label_names() {
         let state = make_state();
-        for name in ["default", "kube-system", "a", "ns-1-x", &"a".repeat(63)] {
+        for name in ["kube-test", "a", "ns-1-x", &"a".repeat(63)] {
             assert!(
                 create_ns(&state, namespace_body(name)).await.is_ok(),
                 "{name:?} is a valid DNS-1123 label"
@@ -4511,7 +4511,7 @@ mod tests {
             "spec": { "finalizers": ["other-controller"] },
             "status": { "phase": "Terminating" }
         });
-        state
+        let seeded_rv = state
             .store
             .put(&key, bytes::Bytes::from(ns.to_string()), Some(0))
             .await
@@ -4525,7 +4525,7 @@ mod tests {
                 "metadata": {
                     "name": "put-drain-ns",
                     "uid": "00000000-0000-0000-0000-000000000004",
-                    "resourceVersion": "1",
+                    "resourceVersion": seeded_rv.to_string(),
                     "deletionTimestamp": "2024-01-01T00:00:00Z"
                 },
                 "spec": { "finalizers": [] },

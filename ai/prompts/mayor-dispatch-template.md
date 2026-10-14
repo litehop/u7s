@@ -479,7 +479,11 @@ and your PR is open — must be:
 
 ```bash
 scripts/conformance/reset.sh --host-only --workdir "$PWD/temp/u7s" --port <YOUR_ASSIGNED_PORT>
+limactl stop <VM_NAME>
 ```
+
+Stop the VM (idle u7s VMs share the host with other repos' VMs; operator rule 2026-10-14)
+unless the mayor's brief explicitly says to leave it up for an immediate continuation round.
 
 Always pass YOUR OWN assigned `--port` — never omit it and never let it
 default to `6443`; an unscoped `--port` can kill whatever slot's stack is
@@ -944,6 +948,9 @@ sonobuoy PASS line from `e2e.txt`. A return without both will be rejected.
 For script-only beads (no server restart needed): run the commands via
 `limactl shell <VM_NAME>` first, encode them in the script, run it, verify exit 0,
 and include at least one `limactl shell` / mcp tool output in your return.
+
+**Final step:** after `reset.sh --host-only --port <PORT>`, run `limactl stop <VM_NAME>`
+(skip only if the brief says to leave the VM up for an immediate continuation round).
 ```
 
 ### Mayor enforcement at return-review time

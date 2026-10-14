@@ -682,6 +682,37 @@ gate_and_merge_prs() {
 # worktrees (bounded, small) rather than a "since last tick" timestamp
 # window -- self-healing across a missed tick and needs no continuity with
 # the previous state file.
+#
+# sync_checkout_to_main fast-forwards the mayor's checkout. bd regenerates
+# the tracked bead JSONL on every write, so those two paths are discarded
+# first (bd re-exports on the next write); any other failure to pull is
+# surfaced as a gate exception (exit 20) instead of aborting the tick.
+sync_checkout_to_main() {
+  local dirty_beads pull_blocked=0
+  dirty_beads=$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no -- \
+    .beads/issues.jsonl .beads/interactions.jsonl | cut -c4-)
+  if [ -n "$dirty_beads" ]; then
+    echo "mayor-tick: discarding regenerated bead JSONL before pull: $(printf '%s' "$dirty_beads" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    if ! run_cmd git -C "$REPO_ROOT" restore --staged --worktree -- $dirty_beads; then
+      pull_blocked=1
+    fi
+  fi
+  # Explicit fetch+merge of ONLY main, not a bare `pull --ff-only`:
+  # the wildcard fetch refspec populates FETCH_HEAD with every
+  # updated branch during a multi-PR merge cascade, and a bare pull
+  # then tries to fast-forward to all of FETCH_HEAD at once ("Cannot
+  # fast-forward to multiple branches", exit 128).
+  if [ "$pull_blocked" -eq 1 ] \
+    || ! run_cmd git -C "$REPO_ROOT" fetch origin main \
+    || ! run_cmd git -C "$REPO_ROOT" merge --ff-only origin/main; then
+    GATE_EXCEPTIONS+=("$(jq -nc '{reason:"checkout-pull-blocked"}')")
+    QUEUE_WARNINGS+=("$(jq -nc --arg dirty "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no | cut -c4- | tr '\n' ' ')" '{reason:"checkout-pull-blocked", dirty_paths:$dirty}')")
+    return 0
+  fi
+  run_cmd git -C "$REPO_ROOT" remote prune origin
+}
+
 cleanup_merged_worktrees() {
   local path branch pr_state st num did_pull=0
   while IFS= read -r path; do
@@ -698,14 +729,7 @@ cleanup_merged_worktrees() {
     num=$(printf '%s' "$pr_state" | jq -r '.number')
     if [ "$st" = "MERGED" ]; then
       if [ "$did_pull" -eq 0 ]; then
-        # Explicit fetch+merge of ONLY main, not a bare `pull --ff-only`:
-        # the wildcard fetch refspec populates FETCH_HEAD with every
-        # updated branch during a multi-PR merge cascade, and a bare pull
-        # then tries to fast-forward to all of FETCH_HEAD at once ("Cannot
-        # fast-forward to multiple branches", exit 128).
-        run_cmd git -C "$REPO_ROOT" fetch origin main
-        run_cmd git -C "$REPO_ROOT" merge --ff-only origin/main
-        run_cmd git -C "$REPO_ROOT" remote prune origin
+        sync_checkout_to_main
         did_pull=1
       fi
       run_cmd git -C "$REPO_ROOT" worktree remove "$path"

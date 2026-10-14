@@ -526,10 +526,11 @@ pub(crate) async fn create_pod<S: Store>(
             .await
         {
             Ok(rv) => break rv,
-            Err(CreateNamespacedError::NamespaceTerminating) => {
-                return Err(Status::forbidden(format!(
-                    "unable to create new content in namespace {ns} because it is being terminated"
-                )));
+            Err(
+                e @ (CreateNamespacedError::NamespaceTerminating
+                | CreateNamespacedError::NamespaceNotFound),
+            ) => {
+                return Err(Status::namespace_create_rejected(ns.as_str(), &e));
             }
             // The client never chose this name (it came from generateName) — a collision is
             // the server's random suffix landing on an existing object, not a real conflict
@@ -608,7 +609,7 @@ pub(crate) async fn get_pod<S: Store>(
     let key = object_key("pods", ns.as_str(), &name);
     let stored = state
         .store
-        .get(&key)
+        .get(key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, "Pod"))?;
@@ -1668,6 +1669,7 @@ pub(crate) async fn evict_pod<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
+    super::generic::ensure_namespace_accepts_creates(&state, ns.as_str()).await?;
     let key = object_key("pods", ns.as_str(), &name);
 
     let eviction: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|_| {
@@ -8116,6 +8118,7 @@ pub(crate) async fn bind_pod<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
+    super::generic::ensure_namespace_accepts_creates(&state, ns.as_str()).await?;
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -10098,9 +10101,10 @@ mod handler_tests {
         app.oneshot(req).await.unwrap()
     }
 
-    /// A kubelet registers one of its own static pods by creating a mirror pod bound to its
-    /// own node — reverting the node_authz wiring (either the coarse allow arm or the
-    /// body-level check) makes this 403, breaking static pod support entirely.
+    /// Positive-path sanity check: a kubelet creating a mirror pod bound to its own node is
+    /// accepted by the handler. Not a fail-on-revert guard for the node_authz wiring — the
+    /// test router bypasses AuthService and the coarse allow arm; the deny tests and the
+    /// node_authz tests cover those reverts.
     #[tokio::test]
     async fn create_pod_allows_node_to_create_mirror_pod_bound_to_itself() {
         let (state, store) = make_state();
@@ -10219,28 +10223,28 @@ mod handler_tests {
     impl u7s_store::Store for FirstPutAlreadyExistsStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
@@ -10248,7 +10252,7 @@ mod handler_tests {
                 .fire_once
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move {
                 if inject {
                     Err(u7s_store::StoreError::AlreadyExists { key })
@@ -10260,11 +10264,11 @@ mod handler_tests {
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -12990,6 +12994,77 @@ mod handler_tests {
             "eviction must stamp deletionTimestamp so the kubelet sends SIGTERM and the \
              StatefulSet controller sees the pod as terminating — without this the orphan \
              pod runs forever and the 'Should recreate evicted statefulset' test hangs"
+        );
+    }
+
+    /// Eviction and binding are creates in upstream's admission chain, so NamespaceLifecycle
+    /// refuses them in a Terminating namespace (403) — otherwise a scheduler or evicting
+    /// controller keeps mutating pods the namespace controller is draining.
+    ///
+    /// Fails on revert: without the gate both requests succeed and mutate the pod.
+    #[tokio::test]
+    async fn eviction_and_binding_are_403_in_a_terminating_namespace() {
+        let (state, store) = make_state();
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": {"name": "dying"}, "status": {"phase": "Terminating"}
+        });
+        store
+            .put(
+                "/registry/namespaces/dying",
+                Bytes::from(serde_json::to_vec(&ns_obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let key = "/registry/pods/dying/p";
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "dying"}, "spec": {}, "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        let before = store.get(key).await.unwrap().unwrap().revision;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .layer(auth_layer())
+            .with_state(state);
+
+        for (sub, body) in [
+            (
+                "eviction",
+                serde_json::json!({"apiVersion": "policy/v1", "kind": "Eviction",
+                    "metadata": {"name": "p", "namespace": "dying"}}),
+            ),
+            (
+                "binding",
+                serde_json::json!({"apiVersion": "v1", "kind": "Binding",
+                    "metadata": {"name": "p"}, "target": {"kind": "Node", "name": "n1"}}),
+            ),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/dying/pods/p/{sub}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{sub}");
+        }
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap().revision,
+            before,
+            "a rejected eviction/binding must not touch the pod"
         );
     }
 
@@ -18790,28 +18865,28 @@ mod handler_tests {
     impl u7s_store::Store for ConflictInjectStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
@@ -18819,7 +18894,7 @@ mod handler_tests {
                 .inject_next
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move {
                 if inject {
                     // Simulate concurrent kubelet status patch advancing the rv.
@@ -18837,11 +18912,11 @@ mod handler_tests {
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -19016,28 +19091,28 @@ mod handler_tests {
     impl u7s_store::Store for ConcurrentWriterStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
@@ -19045,7 +19120,7 @@ mod handler_tests {
                 .inject_next
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             let concurrent_write = self.concurrent_write.clone();
             async move {
                 if inject {
@@ -19064,11 +19139,11 @@ mod handler_tests {
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -21830,7 +21905,11 @@ mod admission_tests {
         let existing = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "collection-denied-pod", "namespace": "default"},
+            "metadata": {
+                "name": "collection-denied-pod",
+                "namespace": "default",
+                "deletionTimestamp": "2020-01-01T00:00:00Z"
+            },
             "spec": {"containers": [{"name": "app", "image": "nginx"}]}
         });
         store
@@ -21864,28 +21943,31 @@ mod admission_tests {
             .await
             .unwrap();
 
-        let result = delete_collection_pods(
-            axum::extract::State(state),
-            axum::extract::Path(("default".to_string(),)),
-            test_user(),
-            axum::extract::Query(crate::handlers::generic::CollectionQuery {
-                watch: None,
-                resource_version: None,
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-                send_initial_events: None,
-                allow_watch_bookmarks: None,
-                timeout_seconds: None,
-            }),
-            axum::extract::Query(GracePeriodQuery {
-                grace_period_seconds: None,
-            }),
-            axum::http::HeaderMap::new(),
-            Bytes::new(),
-        )
-        .await;
+        let run = || {
+            delete_collection_pods(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(),)),
+                test_user(),
+                axum::extract::Query(crate::handlers::generic::CollectionQuery {
+                    watch: None,
+                    resource_version: None,
+                    label_selector: None,
+                    field_selector: None,
+                    limit: None,
+                    continue_token: None,
+                    send_initial_events: None,
+                    allow_watch_bookmarks: None,
+                    timeout_seconds: None,
+                }),
+                axum::extract::Query(GracePeriodQuery {
+                    grace_period_seconds: None,
+                }),
+                axum::http::HeaderMap::new(),
+                Bytes::new(),
+            )
+        };
+
+        let result = run().await;
 
         assert!(
             result.is_err(),
@@ -21897,6 +21979,25 @@ mod admission_tests {
         assert!(
             stored.is_some(),
             "denied pod must remain in the store — DeleteCollection must not have deleted it"
+        );
+
+        // Control: the seeded pod is already Terminating with no finalizers, so it
+        // hard-deletes whenever admission lets it through. Without this, survival above
+        // could be explained by the soft-delete path rather than the webhook denial.
+        store
+            .delete(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-delete-collection",
+                None,
+            )
+            .await
+            .unwrap();
+        run()
+            .await
+            .expect("DeleteCollection without webhook must succeed");
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "control pod must hard-delete once the webhook is gone — proves the earlier \
+             survival was caused by the webhook denial, not by soft-delete semantics"
         );
     }
 

@@ -37,6 +37,33 @@ pub(crate) fn assert_invalid_name_field(err: &crate::status::StatusError, field:
     assert!(body["details"]["group"].is_string(), "{body}");
 }
 
+/// Create an Active Namespace so namespaced creates into it pass NamespaceLifecycle.
+/// Idempotent: an existing namespace is left untouched.
+pub(crate) async fn seed_namespace(state: &AppState, name: &str) {
+    seed_namespace_in(&*state.store, name).await;
+}
+
+/// [`seed_namespace`] against a bare store, for tests that wrap the store before building state.
+pub(crate) async fn seed_namespace_in<S: u7s_store::Store>(store: &S, name: &str) {
+    let body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": name},
+        "status": {"phase": "Active"}
+    });
+    match store
+        .put(
+            &crate::keys::cluster_object_key("namespaces", name),
+            bytes::Bytes::from(body.to_string()),
+            Some(0),
+        )
+        .await
+    {
+        Ok(_) | Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => panic!("seed namespace {name}: {e}"),
+    }
+}
+
 /// Build a minimal in-memory `AppState` backed by a fresh `SqliteStore`.
 pub(crate) fn make_state() -> AppState {
     make_state_with_store(Arc::new(

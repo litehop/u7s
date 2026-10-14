@@ -246,6 +246,29 @@ impl Status {
         )
     }
 
+    /// NamespaceLifecycle rejection of a create: 404 for a missing namespace, 403 with the
+    /// `NamespaceTerminating` cause for one being deleted — the same responses upstream's
+    /// admission plugin returns.
+    pub fn namespace_create_rejected(
+        ns: &str,
+        err: &u7s_store::CreateNamespacedError,
+    ) -> StatusError {
+        if matches!(err, u7s_store::CreateNamespacedError::NamespaceNotFound) {
+            return Status::not_found(ns, "namespaces");
+        }
+        let mut e = Status::forbidden(format!(
+            "unable to create new content in namespace {ns} because it is being terminated"
+        ));
+        e.1.details = Some(Box::new(serde_json::json!({
+            "causes": [{
+                "reason": "NamespaceTerminating",
+                "message": format!("namespace {ns} is being terminated"),
+                "field": "metadata.namespace"
+            }]
+        })));
+        e
+    }
+
     pub fn forbidden(message: String) -> StatusError {
         StatusError(
             StatusCode::FORBIDDEN,

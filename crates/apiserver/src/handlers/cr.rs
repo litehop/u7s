@@ -3904,10 +3904,11 @@ pub async fn create_cr_namespaced<S: Store>(
             .await
         {
             Ok(rv) => break rv,
-            Err(u7s_store::CreateNamespacedError::NamespaceTerminating) => {
-                return Err(Status::forbidden(format!(
-                    "unable to create new content in namespace {ns} because it is being terminated"
-                )));
+            Err(
+                e @ (u7s_store::CreateNamespacedError::NamespaceTerminating
+                | u7s_store::CreateNamespacedError::NamespaceNotFound),
+            ) => {
+                return Err(Status::namespace_create_rejected(&ns, &e));
             }
             // The client never chose this name (it came from generateName) — a collision is
             // the server's random suffix landing on an existing object, not a real conflict
@@ -4811,10 +4812,11 @@ pub async fn patch_cr_namespaced<S: Store>(
             .await
         {
             Ok(rv) => rv,
-            Err(u7s_store::CreateNamespacedError::NamespaceTerminating) => {
-                return Err(Status::forbidden(format!(
-                    "unable to create new content in namespace {ns} because it is being terminated"
-                )));
+            Err(
+                e @ (u7s_store::CreateNamespacedError::NamespaceTerminating
+                | u7s_store::CreateNamespacedError::NamespaceNotFound),
+            ) => {
+                return Err(Status::namespace_create_rejected(&ns, &e));
             }
             Err(u7s_store::CreateNamespacedError::Store(e)) => {
                 return Err(store_err_cr(e, &name, &ctx.kind))
@@ -5859,6 +5861,7 @@ mod tests {
 
     async fn install_namespaced_crd(state: &AppState) {
         use crate::handlers::crd;
+        crate::handlers::test_support::seed_namespace(state, "argocd").await;
         assert!(
             crd::create_crd(
                 State(state.clone()),
@@ -5885,6 +5888,108 @@ mod tests {
             .is_ok(),
             "install cluster CRD"
         );
+    }
+
+    fn unsupported_table_accept() -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v2"),
+        );
+        headers
+    }
+
+    fn assert_not_acceptable(err: crate::status::StatusError, site: &str) {
+        assert_eq!(
+            err.0,
+            StatusCode::NOT_ACCEPTABLE,
+            "{site}: a client asking for an unsupported Table version must get 406, not a \
+             response claiming a format that was not served"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_cr_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+        let err = expect_err_status(
+            list_cr(
+                State(state),
+                Path(("example.io".into(), "v1".into(), "widgets".into())),
+                unsupported_table_accept(),
+                no_watch_query(),
+                "test-user".to_string(),
+            )
+            .await,
+            "list_cr must reject Table v2",
+        );
+        assert_not_acceptable(err, "list_cr");
+    }
+
+    #[tokio::test]
+    async fn get_cr_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+        let err = expect_err_status(
+            get_cr(
+                State(state),
+                Path((
+                    "example.io".into(),
+                    "v1".into(),
+                    "widgets".into(),
+                    "w1".into(),
+                )),
+                unsupported_table_accept(),
+            )
+            .await,
+            "get_cr must reject Table v2",
+        );
+        assert_not_acceptable(err, "get_cr");
+    }
+
+    #[tokio::test]
+    async fn list_cr_namespaced_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+        let err = expect_err_status(
+            list_cr_namespaced(
+                State(state),
+                Path((
+                    "argoproj.io".into(),
+                    "v1alpha1".into(),
+                    "default".into(),
+                    "applications".into(),
+                )),
+                unsupported_table_accept(),
+                no_watch_query(),
+                "test-user".to_string(),
+            )
+            .await,
+            "list_cr_namespaced must reject Table v2",
+        );
+        assert_not_acceptable(err, "list_cr_namespaced");
+    }
+
+    #[tokio::test]
+    async fn get_cr_namespaced_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+        let err = expect_err_status(
+            get_cr_namespaced(
+                State(state),
+                Path((
+                    "argoproj.io".into(),
+                    "v1alpha1".into(),
+                    "default".into(),
+                    "applications".into(),
+                    "a1".into(),
+                )),
+                unsupported_table_accept(),
+            )
+            .await,
+            "get_cr_namespaced must reject Table v2",
+        );
+        assert_not_acceptable(err, "get_cr_namespaced");
     }
 
     fn app_body(name: &str, ns: &str) -> Bytes {
@@ -6250,6 +6355,8 @@ mod tests {
     async fn cluster_wide_list_for_namespaced_crd_returns_all_namespaces() {
         let state = make_state();
         install_namespaced_crd(&state).await;
+        crate::handlers::test_support::seed_namespace(&state, "ns-a").await;
+        crate::handlers::test_support::seed_namespace(&state, "ns-b").await;
 
         // Create CRs in two different namespaces.
         assert!(
@@ -6429,28 +6536,28 @@ mod tests {
     impl u7s_store::Store for FirstPutAlreadyExistsStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
@@ -6458,7 +6565,7 @@ mod tests {
                 .fire_once
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move {
                 if inject {
                     Err(u7s_store::StoreError::AlreadyExists { key })
@@ -6470,11 +6577,11 @@ mod tests {
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -6622,6 +6729,9 @@ mod tests {
             )
             .await
             .expect("seed CRD");
+        for ns in ["default", "argocd"] {
+            crate::handlers::test_support::seed_namespace_in(&*inner, ns).await;
+        }
         let collision_store = Arc::new(FirstPutAlreadyExistsStore::new(Arc::clone(&inner)));
         let state = AppState::new(
             Arc::clone(&collision_store),
@@ -9918,6 +10028,7 @@ mod tests {
 
     async fn install_crd_with_status_subresource(state: &AppState) {
         use crate::handlers::crd;
+        crate::handlers::test_support::seed_namespace(state, "argocd").await;
         assert!(
             crd::create_crd(
                 State(state.clone()),
@@ -18274,6 +18385,65 @@ mod tests {
         );
     }
 
+    /// A CR create (POST and SSA apply-create) into a namespace that does not exist must be
+    /// 404 and persist nothing, like every built-in kind — otherwise CR controllers leave
+    /// orphan instances in deleted namespaces that no namespace controller will drain.
+    ///
+    /// Fails on revert: without the store-level NamespaceNotFound gate both return 201.
+    #[tokio::test]
+    async fn namespaced_cr_creates_into_a_missing_namespace_are_404_on_post_and_ssa() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let post = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "ghost-ns".to_string(),
+                "applications".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body("ghost-app", "ghost-ns"),
+        )
+        .await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        let ssa = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "ghost-ns".to_string(),
+                "applications".to_string(),
+                "ghost-app".to_string(),
+            )),
+            test_user(),
+            headers,
+            app_body("ghost-app", "ghost-ns"),
+        )
+        .await;
+
+        for (label, err) in [("POST", post.err()), ("SSA apply-create", ssa.err())] {
+            let err = err.unwrap_or_else(|| panic!("{label} into a missing namespace must fail"));
+            assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND, "{label}");
+            assert_eq!(
+                err.1.message, "namespaces \"ghost-ns\" not found",
+                "{label}"
+            );
+        }
+        let key = cr_store_key("argoproj.io", "applications", Some("ghost-ns"), "ghost-app");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "no CR create path may leave an orphan in a missing namespace"
+        );
+    }
+
     // patch_cr_namespaced's SSA-upsert branch (is_ssa && stored_opt.is_none()) never called
     // quota::check_resource_quota, unlike create_cr_namespaced — so `kubectl apply
     // --server-side` on a not-yet-existing CR name could create a CR past a
@@ -24655,6 +24825,7 @@ mod tests {
 
     async fn install_namespaced_crd_with_scale_subresource(state: &AppState) {
         use crate::handlers::crd;
+        crate::handlers::test_support::seed_namespace(state, "argocd").await;
         assert!(
             crd::create_crd(
                 State(state.clone()),

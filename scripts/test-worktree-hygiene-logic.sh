@@ -777,6 +777,85 @@ assert "...and PRESERVES a branch whose id IS in --live-agents even with no PR a
   "$(origin_f_heads | grep -qxF 'refs/heads/worker/agent-liveagent' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 9. STEP G -- fix-round worktrees on fix-<PR> branches. STEP C only knows
+#    worker/agent-* names, so without STEP G these worktrees accumulate
+#    forever after the worker finishes.
+# ---------------------------------------------------------------------------
+
+BARE_G="$SANDBOX_ROOT/origin-g.git"
+git init -q --bare "$BARE_G"
+G="$SANDBOX_ROOT/step-g-repo"
+new_sandbox "$G"
+printf 'x\n' > "$G/file.txt"
+git -C "$G" add -A
+git -C "$G" commit -q -m initial
+git -C "$G" remote add origin "$BARE_G"
+git -C "$G" push -q origin main
+mkdir -p "$G/ai/worktrees"
+for pair in done:fix-1 live:fix-2 dirty:fix-3 unpushed:fix-4; do
+  id="${pair%%:*}"; br="${pair##*:}"
+  git -C "$G" branch "$br" main
+  git -C "$G" push -q origin "$br"
+  git -C "$G" worktree add -q "$G/ai/worktrees/agent-$id" "$br"
+done
+printf 'wip\n' > "$G/ai/worktrees/agent-dirty/wip.txt"
+git -C "$G/ai/worktrees/agent-dirty" add wip.txt
+git -C "$G/ai/worktrees/agent-unpushed" config user.email test@example.com
+git -C "$G/ai/worktrees/agent-unpushed" config user.name Test
+git -C "$G/ai/worktrees/agent-unpushed" commit -q --allow-empty -m "local only"
+
+LIVE_AGENTS="live" WORKTREE_HYGIENE_REPO_ROOT="$G" call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G reaps a finished fix-<PR> worktree (clean, pushed, agent not live) -- otherwise it survives every hygiene run until the mayor deletes it by hand" \
+  "$([ ! -d "$G/ai/worktrees/agent-done" ] && echo 1 || echo 0)"
+assert "...and deletes its local fix-<PR> branch" \
+  "$(! git -C "$G" rev-parse --verify -q refs/heads/fix-1 >/dev/null && echo 1 || echo 0)"
+assert "STEP G keeps a fix-<PR> worktree whose agent id is live -- reaping would pull the checkout from under a running worker" \
+  "$([ -d "$G/ai/worktrees/agent-live" ] && echo 1 || echo 0)"
+assert "STEP G keeps a worktree with uncommitted changes -- they exist nowhere else" \
+  "$([ -d "$G/ai/worktrees/agent-dirty" ] && echo 1 || echo 0)"
+assert "STEP G keeps a worktree with commits on no remote -- reaping would destroy unpushed work" \
+  "$([ -d "$G/ai/worktrees/agent-unpushed" ] && echo 1 || echo 0)"
+assert "STEP G returns 0 when every removal succeeded -- a nonzero rc on a clean run would make every hygiene tick report an anomaly" \
+  "$(LIVE_AGENTS="live" WORKTREE_HYGIENE_REPO_ROOT="$G" call step_g_fix_round_worktrees >/dev/null 2>&1 && echo 1 || echo 0)"
+
+# --no-live-workers sets LIVE_AGENTS="" (see main()): a worktree whose agent
+# id would be live under --live-agents is reaped, while the clean/pushed
+# guards still protect dirty and unpushed ones.
+for pair in idle:fix-5 idledirty:fix-6; do
+  id="${pair%%:*}"; br="${pair##*:}"
+  git -C "$G" branch "$br" main
+  git -C "$G" push -q origin "$br"
+  git -C "$G" worktree add -q "$G/ai/worktrees/agent-$id" "$br"
+done
+printf 'wip\n' > "$G/ai/worktrees/agent-idledirty/wip.txt"
+git -C "$G/ai/worktrees/agent-idledirty" add wip.txt
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$G" call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G with an empty live set (--no-live-workers) reaps a finished fix-<PR> worktree, including one whose id was live in the earlier run -- otherwise idle-state ticks leave fix worktrees forever" \
+  "$([ ! -d "$G/ai/worktrees/agent-idle" ] && [ ! -d "$G/ai/worktrees/agent-live" ] && echo 1 || echo 0)"
+assert "...but an empty live set still keeps a dirty worktree -- waiving liveness must not waive the uncommitted-work guard" \
+  "$([ -d "$G/ai/worktrees/agent-idledirty" ] && echo 1 || echo 0)"
+assert "...and still keeps a worktree with unpushed commits" \
+  "$([ -d "$G/ai/worktrees/agent-unpushed" ] && echo 1 || echo 0)"
+
+# A worktree whose removal fails (locked) must not abort the step: later
+# worktrees are still reaped and the failure surfaces as a nonzero rc.
+for pair in aaalocked:fix-7 zzafter:fix-8; do
+  id="${pair%%:*}"; br="${pair##*:}"
+  git -C "$G" branch "$br" main
+  git -C "$G" push -q origin "$br"
+  git -C "$G" worktree add -q "$G/ai/worktrees/agent-$id" "$br"
+done
+git -C "$G" worktree lock "$G/ai/worktrees/agent-aaalocked"
+G_RC=0
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$G" call step_g_fix_round_worktrees >/dev/null 2>&1 || G_RC=$?
+assert "STEP G keeps going after a failed worktree remove -- one locked worktree must not strand every later fix-<PR> worktree" \
+  "$([ ! -d "$G/ai/worktrees/agent-zzafter" ] && echo 1 || echo 0)"
+assert "...keeps the locked worktree and its branch" \
+  "$([ -d "$G/ai/worktrees/agent-aaalocked" ] && git -C "$G" rev-parse --verify -q refs/heads/fix-7 >/dev/null && echo 1 || echo 0)"
+assert "...and returns nonzero so the failed removal counts as an anomaly" \
+  "$([ "$G_RC" -ne 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

@@ -5234,15 +5234,15 @@ mod tests {
             )
             .await
             .expect("configmap write must succeed");
-        let expected_rv = store.current_revision();
 
         let state = AppState::new(
-            store,
+            store.clone(),
             None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        let expected_rv = store.current_revision();
 
         let resp = watch_generic(
             state,

@@ -3629,28 +3629,28 @@ mod tests {
     impl u7s_store::Store for MockStore {
         fn get(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
         ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.get(&key).await }
         }
 
         fn list(
             &self,
-            prefix: &str,
+            prefix: impl Into<String> + Send,
             opts: u7s_store::ListOptions,
         ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
         {
             let inner = self.inner.clone();
-            let prefix = prefix.to_string();
+            let prefix: String = prefix.into();
             async move { inner.list(&prefix, opts).await }
         }
 
         fn put(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             value: bytes::Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
@@ -3658,7 +3658,7 @@ mod tests {
                 .inject_next
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move {
                 if inject {
                     Err(u7s_store::StoreError::RevisionMismatch {
@@ -3673,12 +3673,12 @@ mod tests {
 
         fn delete(
             &self,
-            key: &str,
+            key: impl Into<String> + Send,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
         {
             let inner = self.inner.clone();
-            let key = key.to_string();
+            let key: String = key.into();
             async move { inner.delete(&key, expected_revision).await }
         }
 
@@ -3757,16 +3757,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Arm the mock so the next put() injects RevisionMismatch.
-        mock.arm();
-
         let state = crate::state::AppState::new(
-            mock,
+            Arc::clone(&mock),
             None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+
+        // Arm after state construction (which seeds namespaces through the store) so the
+        // next put() injects RevisionMismatch.
+        mock.arm();
 
         let body = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
@@ -3822,16 +3823,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Arm the mock so the next put() injects RevisionMismatch.
-        mock.arm();
-
         let state = crate::state::AppState::new(
-            mock,
+            Arc::clone(&mock),
             None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+
+        // Arm after state construction (which seeds namespaces through the store) so the
+        // next put() injects RevisionMismatch.
+        mock.arm();
 
         let body = serde_json::json!({
             "apiVersion": "apps/v1",

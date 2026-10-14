@@ -199,6 +199,9 @@ pub enum CreateNamespacedError {
     /// it land in a namespace that is mid-deletion.
     #[error("namespace is being terminated")]
     NamespaceTerminating,
+    /// No namespace object exists at the checked key.
+    #[error("namespace not found")]
+    NamespaceNotFound,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -252,14 +255,14 @@ pub trait Store: Send + Sync + 'static {
     /// Get a single object by exact key. Returns None if not found.
     fn get(
         &self,
-        key: &str,
+        key: impl Into<String> + Send,
     ) -> impl std::future::Future<Output = Result<Option<StoreObject>>> + Send;
 
     /// List all objects whose keys share the given prefix.
     /// Returns a consistent snapshot and the revision of that snapshot.
     fn list(
         &self,
-        prefix: &str,
+        prefix: impl Into<String> + Send,
         opts: ListOptions,
     ) -> impl std::future::Future<Output = Result<ListResponse>> + Send;
 
@@ -284,7 +287,7 @@ pub trait Store: Send + Sync + 'static {
     /// content would have been unchanged — the CAS check runs first.
     fn put(
         &self,
-        key: &str,
+        key: impl Into<String> + Send,
         value: Bytes,
         expected_revision: Option<u64>,
     ) -> impl std::future::Future<Output = Result<u64>> + Send;
@@ -298,10 +301,8 @@ pub trait Store: Send + Sync + 'static {
     /// `None` for cluster-scoped creates, which skip the namespace check entirely and behave
     /// exactly like `put(key, value, Some(0))`.
     ///
-    /// A namespace that does not exist at `ns_key` is treated as active (not Terminating):
-    /// namespace-existence enforcement, where a caller wants it, is the caller's own job (see
-    /// e.g. pods.rs's `parse_namespace`), not this method's — it exists solely to close the
-    /// create-vs-delete phase-flip race, not to add a new validation rule.
+    /// A namespace that does not exist at `ns_key` yields `NamespaceNotFound`, checked in the
+    /// same transaction so a create can never land after the namespace's final removal.
     ///
     /// The default implementation (`get` the namespace, then `put`) is NOT atomic — it exists
     /// so callers that don't need real atomicity (test doubles wrapping another `Store`) don't
@@ -311,21 +312,20 @@ pub trait Store: Send + Sync + 'static {
     fn create_if_namespace_active(
         &self,
         ns_key: Option<&str>,
-        key: &str,
+        key: impl Into<String> + Send,
         value: Bytes,
     ) -> impl std::future::Future<Output = std::result::Result<u64, CreateNamespacedError>> + Send
     {
         async move {
             if let Some(ns_key) = ns_key {
-                if let Some(stored) = self
+                let stored = self
                     .get(ns_key)
                     .await
                     .map_err(CreateNamespacedError::Store)?
-                {
-                    if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
-                        if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
-                            return Err(CreateNamespacedError::NamespaceTerminating);
-                        }
+                    .ok_or(CreateNamespacedError::NamespaceNotFound)?;
+                if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                    if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
+                        return Err(CreateNamespacedError::NamespaceTerminating);
                     }
                 }
             }
@@ -339,7 +339,7 @@ pub trait Store: Send + Sync + 'static {
     /// Returns the new global revision and the last-known object bytes on success.
     fn delete(
         &self,
-        key: &str,
+        key: impl Into<String> + Send,
         expected_revision: Option<u64>,
     ) -> impl std::future::Future<Output = Result<(u64, Bytes)>> + Send;
 

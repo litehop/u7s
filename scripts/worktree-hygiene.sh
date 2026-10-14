@@ -562,6 +562,38 @@ step_f_orphaned_origin_branches() {
   done < <(origin_worker_branches "$REPO_ROOT")
 }
 
+# ---------------------------------------------------------------------------
+# STEP G -- fix-round worktrees on non-worker branch names.
+#
+# A fix-round worker checks out an existing PR branch as a local branch such
+# as fix-<PR>, so STEP C (worker/agent-* names only) never considers its
+# worktree and STEP D skips a checked-out branch. Reaped here once the
+# worker is gone: agent-id not live, worktree clean, and HEAD already
+# reachable from a remote ref (nothing unpushed to lose).
+# ---------------------------------------------------------------------------
+step_g_fix_round_worktrees() {
+  local path branch agent_id rc=0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    agent_id=$(agent_id_from_worktree_path "$path" || true)
+    [ -n "$agent_id" ] || continue
+    agent_id_is_live "$agent_id" "$LIVE_AGENTS" && continue
+    branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    case "$branch" in
+      ""|HEAD|worker/agent-*) continue ;;
+    esac
+    [ -z "$(git -C "$path" status --porcelain 2>/dev/null)" ] || continue
+    [ -z "$(git -C "$path" rev-list HEAD --not --remotes 2>/dev/null)" ] || continue
+    if ! run_cmd git -C "$REPO_ROOT" worktree remove "$path"; then
+      echo "worktree-hygiene: STEP G could not remove $path (locked?); keeping branch $branch" >&2
+      rc=1
+      continue
+    fi
+    run_cmd git -C "$REPO_ROOT" branch -D "$branch"
+  done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
+  return "$rc"
+}
+
 main() {
   local live_agents_provided=0 no_live_workers=0
   while [ "$#" -gt 0 ]; do
@@ -625,6 +657,7 @@ main() {
   step_d_gone_upstream_branches
   step_e_stale_findings
   step_f_orphaned_origin_branches
+  step_g_fix_round_worktrees || rc=1
   exit "$rc"
 }
 
