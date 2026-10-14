@@ -184,6 +184,44 @@ assert "a 'tail -f .../konnectivity-server.log' line is not typed as a konnectiv
 assert "the real cached binary (proxy-server-<os>-<arch>) IS typed as a konnectivity-server, whose name appears only in its flags" \
   "$([ "$(call proc_type_from_psline "$REAL_KONN")" = 'konnectivity-server' ] && echo 1 || echo 0)"
 
+# 1d. STEP A -- mayor checkout apiserver/scheduler squatting a worker-slot port.
+SQ_DIR="$SANDBOX_ROOT/sq"
+mkdir -p "$SQ_DIR/temp/u7s"
+printf 'clusters:\n- cluster:\n    server: https://127.0.0.1:6445\n' > "$SQ_DIR/temp/u7s/kubeconfig-scheduler"
+printf 'clusters:\n- cluster:\n    server: https://127.0.0.1:6443\n' > "$SQ_DIR/temp/u7s/kubeconfig-slot0"
+SQ_LIVE="$SQ_DIR"
+mk_api() {  # pid listen-port wpath
+  echo "alice  $1   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 /repo/target/release/u7s-apiserver --db $3/temp/u7s/state.db --listen 127.0.0.1:$2 --kubeconfig $3/temp/u7s/kubeconfig"
+}
+mk_sched() {  # pid kubeconfig-file wpath
+  echo "alice  $1   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 /repo/target/release/u7s-scheduler --kubeconfig $3/temp/u7s/$2"
+}
+squat() { call find_mayor_worker_slot_squatters "$1" "$SQ_LIVE"; }
+
+assert "a mayor checkout apiserver on slot 0 (6443) is NOT flagged -- that is the operator's own stack" \
+  "$([ -z "$(squat "$(mk_api 4001 6443 "$SQ_DIR")")" ] && echo 1 || echo 0)"
+assert "a mayor checkout apiserver on worker slot 2 (6445) with no live worker on it IS flagged -- the mayor never owns a worker slot" \
+  "$([ "$(squat "$(mk_api 4002 6445 "$SQ_DIR")")" = "4002|slot-squatter-apiserver|$SQ_DIR" ] && echo 1 || echo 0)"
+AGENT_API="$(mk_api 4003 6445 "/repo/ai/worktrees/agent-liveid9")"
+assert "a mayor checkout apiserver on 6445 is NOT flagged while a live worker's apiserver is on 6445 -- slot ownership unclear, never kill" \
+  "$([ -z "$(squat "$(mk_api 4002 6445 "$SQ_DIR")
+$AGENT_API")" ] && echo 1 || echo 0)"
+assert "a live worker's apiserver on a worker slot is never flagged by the mayor squatter rule" \
+  "$([ -z "$(call find_mayor_worker_slot_squatters "$AGENT_API" "/repo/ai/worktrees/agent-liveid9")" ] && echo 1 || echo 0)"
+assert "a mayor checkout scheduler whose kubeconfig points at worker slot 6445 IS flagged" \
+  "$([ "$(squat "$(mk_sched 4004 kubeconfig-scheduler "$SQ_DIR")")" = "4004|slot-squatter-scheduler|$SQ_DIR" ] && echo 1 || echo 0)"
+assert "a mayor checkout scheduler whose kubeconfig points at slot 0 (6443) is NOT flagged" \
+  "$([ -z "$(squat "$(mk_sched 4005 kubeconfig-slot0 "$SQ_DIR")")" ] && echo 1 || echo 0)"
+assert "a mayor checkout scheduler with an unreadable kubeconfig is NOT flagged -- port unprovable" \
+  "$([ -z "$(squat "$(mk_sched 4006 kubeconfig-missing "$SQ_DIR")")" ] && echo 1 || echo 0)"
+CARGO_LINE="alice  4007   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 cargo build --release -p u7s-apiserver -p u7s-scheduler --listen 127.0.0.1:6445 --manifest-path $SQ_DIR/temp/u7s/kubeconfig"
+assert "a non-u7s process merely mentioning u7s-apiserver (cargo build) is not typed, so never a kill candidate" \
+  "$([ -z "$(call proc_type_from_psline "$CARGO_LINE")" ] && [ -z "$(squat "$CARGO_LINE")" ] && echo 1 || echo 0)"
+assert "the live-agents filter passes a mayor checkout record through (no agent-id in its path must not abort the set -e script, or the squatter is silently never reaped)" \
+  "$([ "$(call filter_orphans_by_live_agents "4002|slot-squatter-apiserver|$SQ_DIR" liveid9)" = "4002|slot-squatter-apiserver|$SQ_DIR" ] && echo 1 || echo 0)"
+assert "u7s-apiserver is typed by argv[0] basename, even from a full path" \
+  "$([ "$(call proc_type_from_psline "$(mk_api 4008 6445 "$SQ_DIR")")" = apiserver ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 2. STEP C -- in-flight guard.
 # ---------------------------------------------------------------------------
