@@ -62,6 +62,19 @@ node_suffix_for() {
   esac
 }
 
+# Effective konnectivity-server port for an apiserver port: the explicit
+# override, else the auto-derived default (6443→8135, 6444→8235, +100 per port).
+# lima-start.sh and add-node.sh both resolve through this so the primary's and
+# the extra node's konnectivity-agent always target the same server port.
+konnectivity_server_port_for() {
+  local port="$1" override="${2:-}"
+  if [ -n "$override" ]; then
+    echo "$override"
+  else
+    echo $(( 8135 + (port - 6443) * 100 ))
+  fi
+}
+
 # Fail loud when an EXISTING VM's baked kubelet hostPort forward differs from
 # the requested kubelet port. The forward is fixed at VM creation; a mismatch
 # leaves watch/list/get working while kubectl exec/logs/attach silently reach
