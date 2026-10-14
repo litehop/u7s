@@ -282,6 +282,14 @@ else
   fi
 fi
 
+# Flannel's cross-node VXLAN needs a real L2 path between this VM and every node
+# already in the cluster; fail before anything is applied if they are on
+# different Lima networks.
+for PEER in $(kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o jsonpath='{.items[*].metadata.name}'); do
+  [ "$PEER" = "$VM_NAME" ] && continue
+  assert_same_lima_network "$VM_NAME" "$PEER" || exit 1
+done
+
 # CRI-O ships a default 10-crio-bridge.conf(list) that gives every node its own
 # independent, uncoordinated subnet with no cross-node routing at all. Flannel
 # supplies the real CNI config instead (10-flannel.conflist, installed by its
