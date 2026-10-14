@@ -691,9 +691,8 @@ if [ "$UNPACK" -eq 1 ]; then
       fi
     fi
     echo "  Unpacked: $UNPACK_DIR"
-    exit "$(sonobuoy_exit_code "$SONOBUOY_EXIT" "${FAILURES:-0}")"
   else
     echo "error: no junit at $JUNIT — the run produced no results" >&2; exit 1
   fi
 fi
-exit 0
+exit "$(sonobuoy_exit_code "$SONOBUOY_EXIT" "${FAILURES:-0}")"

@@ -60,6 +60,20 @@ EOF
 assert "a failed suite node still counts in failures so a broken BeforeSuite cannot read green" \
   "$([ "$(junit_spec_totals "$TMP/suitefail.xml")" = "2 1" ] && echo 1 || echo 0)"
 
+# The script's final line is its exit computation; running it verbatim proves
+# --no-unpack (which skips the junit branch) cannot exit 0 after a failed run.
+SCRIPT_06="$(cd "$(dirname "$0")" && pwd)/06-run-sonobuoy.sh"
+FINAL_LINE="$(tail -n 1 "$SCRIPT_06")"
+exit_of() { ( SONOBUOY_EXIT="$1"; [ -n "${2:-}" ] && FAILURES="$2"; eval "$FINAL_LINE" ); }
+rc=0; exit_of 2 || rc=$?
+assert "sonobuoy infra failure exits non-zero even when the junit branch is skipped (--no-unpack)" \
+  "$([ "$rc" = "2" ] && echo 1 || echo 0)"
+rc=0; exit_of 0 || rc=$?
+assert "clean run exits 0" "$([ "$rc" = "0" ] && echo 1 || echo 0)"
+rc=0; exit_of 0 3 || rc=$?
+assert "spec failures exit 10 so run-all.sh can tell them from infra failure" \
+  "$([ "$rc" = "10" ] && echo 1 || echo 0)"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then

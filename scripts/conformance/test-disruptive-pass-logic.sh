@@ -204,7 +204,9 @@ RUN_ALL="$DIR/run-all.sh"
 assert "run-all.sh no longer guesses the results dir by mtime" \
   "$(grep -q 'ls -td' "$RUN_ALL" && echo 0 || echo 1)"
 assert "run-all.sh reads the parallel pass's recorded results dir (build.json + dhat heap)" \
-  "$([ "$(grep -c 'sonobuoy_results_dir_file "\$WORKDIR" parallel' "$RUN_ALL")" = 2 ] && echo 1 || echo 0)"
+  "$([ "$(grep -c 'cat "$(sonobuoy_results_dir_file "\$WORKDIR" parallel)"' "$RUN_ALL")" = 2 ] && echo 1 || echo 0)"
+assert "run-all.sh removes a stale parallel record before invoking 06 so an early 06 death cannot reuse an old run's dir" \
+  "$(grep -q 'rm -f "$(sonobuoy_results_dir_file "\$WORKDIR" parallel)"' "$RUN_ALL" && echo 1 || echo 0)"
 assert "06-run-sonobuoy.sh clears the stale record before a pass and writes it after retrieval" \
   "$(grep -q 'rm -f "\$RESULTS_DIR_FILE"' "$SCRIPT" && grep -q 'echo "\$RUN_DIR" > "\$RESULTS_DIR_FILE"' "$SCRIPT" && echo 1 || echo 0)"
 
