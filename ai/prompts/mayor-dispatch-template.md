@@ -77,7 +77,7 @@ The mayor checkout: <MAYOR_CHECKOUT>
 ```bash
 # For VM-requiring beads only: assign an unused VM + port + kubelet port from the table above.
 #   Check which VMs are in use: limactl list
-#   Pick an unused or stopped VM; assign the matching port pair (6444+10251 … 6448+10255).
+#   Pick an unused or stopped VM; assign that slot's port and live kubelet port from the slot table below.
 #   Include --port <PORT> and --kubelet-port <KUBELET_PORT> in dispatch.
 #   Workers always bind to 127.0.0.1; port is the only isolation boundary.
 ```
