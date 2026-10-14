@@ -8215,6 +8215,113 @@ mod tests {
         );
     }
 
+    fn unsupported_table_accept() -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v2"),
+        );
+        headers
+    }
+
+    fn assert_not_acceptable(err: crate::status::StatusError, site: &str) {
+        assert_eq!(
+            err.0,
+            StatusCode::NOT_ACCEPTABLE,
+            "{site}: a client asking for an unsupported Table version must get 406, not a \
+             response claiming a format that was not served"
+        );
+    }
+
+    fn admin_user() -> Extension<crate::auth::UserInfo> {
+        Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        })
+    }
+
+    fn no_watch_query() -> CollectionQuery {
+        CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_resource_with_unsupported_table_version_returns_406() {
+        let err = list_resource(
+            axum::extract::State(make_state()),
+            axum::extract::Path(("storage.k8s.io".into(), "v1".into(), "csinodes".into())),
+            axum::extract::Query(no_watch_query()),
+            unsupported_table_accept(),
+            admin_user(),
+        )
+        .await
+        .expect_err("list_resource must reject Table v2");
+        assert_not_acceptable(err, "list_resource");
+    }
+
+    #[tokio::test]
+    async fn list_namespaced_resource_with_unsupported_table_version_returns_406() {
+        let err = list_namespaced_resource(
+            axum::extract::State(make_state()),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+            )),
+            axum::extract::Query(no_watch_query()),
+            unsupported_table_accept(),
+            admin_user(),
+        )
+        .await
+        .expect_err("list_namespaced_resource must reject Table v2");
+        assert_not_acceptable(err, "list_namespaced_resource");
+    }
+
+    #[tokio::test]
+    async fn get_namespaced_resource_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "default"}
+        });
+        state
+            .store
+            .put(
+                "/registry/apps/deployments/default/web",
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let err = get_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "web".into(),
+            )),
+            unsupported_table_accept(),
+        )
+        .await
+        .expect_err("get_namespaced_resource must reject Table v2");
+        assert_not_acceptable(err, "get_namespaced_resource");
+    }
+
     /// kcm's GC sends `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`
     /// when verifying an owner reference still exists (garbagecollector.go:434-444
     /// isDangling). Before this fix, get_resource always returned the full typed object,

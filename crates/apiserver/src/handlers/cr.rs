@@ -5887,6 +5887,108 @@ mod tests {
         );
     }
 
+    fn unsupported_table_accept() -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v2"),
+        );
+        headers
+    }
+
+    fn assert_not_acceptable(err: crate::status::StatusError, site: &str) {
+        assert_eq!(
+            err.0,
+            StatusCode::NOT_ACCEPTABLE,
+            "{site}: a client asking for an unsupported Table version must get 406, not a \
+             response claiming a format that was not served"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_cr_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+        let err = expect_err_status(
+            list_cr(
+                State(state),
+                Path(("example.io".into(), "v1".into(), "widgets".into())),
+                unsupported_table_accept(),
+                no_watch_query(),
+                "test-user".to_string(),
+            )
+            .await,
+            "list_cr must reject Table v2",
+        );
+        assert_not_acceptable(err, "list_cr");
+    }
+
+    #[tokio::test]
+    async fn get_cr_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+        let err = expect_err_status(
+            get_cr(
+                State(state),
+                Path((
+                    "example.io".into(),
+                    "v1".into(),
+                    "widgets".into(),
+                    "w1".into(),
+                )),
+                unsupported_table_accept(),
+            )
+            .await,
+            "get_cr must reject Table v2",
+        );
+        assert_not_acceptable(err, "get_cr");
+    }
+
+    #[tokio::test]
+    async fn list_cr_namespaced_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+        let err = expect_err_status(
+            list_cr_namespaced(
+                State(state),
+                Path((
+                    "argoproj.io".into(),
+                    "v1alpha1".into(),
+                    "default".into(),
+                    "applications".into(),
+                )),
+                unsupported_table_accept(),
+                no_watch_query(),
+                "test-user".to_string(),
+            )
+            .await,
+            "list_cr_namespaced must reject Table v2",
+        );
+        assert_not_acceptable(err, "list_cr_namespaced");
+    }
+
+    #[tokio::test]
+    async fn get_cr_namespaced_with_unsupported_table_version_returns_406() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+        let err = expect_err_status(
+            get_cr_namespaced(
+                State(state),
+                Path((
+                    "argoproj.io".into(),
+                    "v1alpha1".into(),
+                    "default".into(),
+                    "applications".into(),
+                    "a1".into(),
+                )),
+                unsupported_table_accept(),
+            )
+            .await,
+            "get_cr_namespaced must reject Table v2",
+        );
+        assert_not_acceptable(err, "get_cr_namespaced");
+    }
+
     fn app_body(name: &str, ns: &str) -> Bytes {
         Bytes::from(
             serde_json::json!({
