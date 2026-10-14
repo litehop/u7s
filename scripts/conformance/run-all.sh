@@ -498,7 +498,7 @@ if [ -n "$EXTRA_NODE" ]; then
   # so it can't leak into any later step (sonobuoy, etc.) -- same reasoning as
   # U7S_DHAT_BACKTRACE_DEPTH above.
   # shellcheck disable=SC2086
-  U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
+  U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
 fi
 
 # Node podCIDRs only exist once KCM runs, so a cni0 left over from a prior
