@@ -24,7 +24,7 @@ use super::field_selector::FieldSelector;
 use super::generic::{
     apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
     check_crb_escalation, check_rb_escalation, check_role_escalation, clear_create_status,
-    decode_continue, generate_suffix, lookup, parse_label_selector, resolve_valid_name,
+    decode_continue, generate_name, lookup, parse_label_selector, resolve_valid_name,
     stamp_metadata, store_err, validate_path_segment, wants_generate_name, CollectionQuery,
     LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
@@ -623,11 +623,7 @@ pub(crate) async fn create_resource<S: Store>(
                     && attempts_made < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
             {
                 attempts_made += 1;
-                name = format!(
-                    "{}{}",
-                    generate_name_prefix.as_deref().unwrap_or_default(),
-                    generate_suffix()
-                );
+                name = generate_name(generate_name_prefix.as_deref().unwrap_or_default());
                 obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
                 // Re-validate the regenerated name — mirrors upstream's
                 // createWithGenerateNameRetry, which invokes createValidation (validating
@@ -3316,11 +3312,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
                     && attempts_made < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
             {
                 attempts_made += 1;
-                name = format!(
-                    "{}{}",
-                    generate_name_prefix.as_deref().unwrap_or_default(),
-                    generate_suffix()
-                );
+                name = generate_name(generate_name_prefix.as_deref().unwrap_or_default());
                 obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
                 // Re-validate the regenerated name — mirrors upstream's
                 // createWithGenerateNameRetry, which invokes createValidation (validating

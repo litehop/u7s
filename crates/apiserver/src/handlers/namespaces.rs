@@ -1205,14 +1205,20 @@ mod tests {
         }
     }
 
-    // A generateName prefix that fills the 63-char budget leaves no room for the suffix, so
-    // the generated name overflows the label limit and must be refused, not stored.
+    // Upstream truncates the generateName base to 58 chars so a valid-length (<=63) prefix
+    // always yields a valid name; only a prefix that is itself over the label limit is refused.
     #[tokio::test]
-    async fn create_namespace_refuses_generate_name_that_overflows_label_limit() {
+    async fn create_namespace_truncates_generate_name_prefix_instead_of_overflowing() {
         let state = make_state();
-        let err = create_ns(&state, generate_name_body(&"a".repeat(62)))
+        assert!(
+            create_ns(&state, generate_name_body(&"a".repeat(62)))
+                .await
+                .is_ok(),
+            "62-char prefix must be truncated to 58 + 5-char suffix, not rejected"
+        );
+        let err = create_ns(&state, generate_name_body(&"a".repeat(64)))
             .await
-            .expect_err("62-char prefix + 5-char suffix exceeds 63");
+            .expect_err("64-char prefix is itself an invalid label");
         assert_invalid_name_field(&err, "metadata.generateName");
     }
 

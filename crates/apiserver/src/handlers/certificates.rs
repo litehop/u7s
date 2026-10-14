@@ -1780,6 +1780,43 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
+    /// A name that carries the signer prefix but has a segment the by-name read path rejects
+    /// would persist and then 400 on every GET/PUT/DELETE, wedging the bundle forever.
+    #[tokio::test]
+    async fn clustertrustbundle_create_rejects_names_the_read_path_would_reject_because_they_would_wedge_the_object(
+    ) {
+        let state = make_state();
+        for (meta, field) in [
+            (
+                serde_json::json!({"name": "example.com:s:BAD"}),
+                "metadata.name",
+            ),
+            (
+                serde_json::json!({"generateName": "example.com:s:BAD_"}),
+                "metadata.generateName",
+            ),
+        ] {
+            let body = serde_json::json!({
+                "apiVersion": "certificates.k8s.io/v1",
+                "kind": "ClusterTrustBundle",
+                "metadata": meta,
+                "spec": {"signerName": "example.com/s", "trustBundle": valid_cert_pem()}
+            });
+            let err = create_cluster_trust_bundle(
+                State(state.clone()),
+                Path("v1".to_string()),
+                Query(CreateQuery::default()),
+                Extension(test_user()),
+                json_headers(),
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .expect_err("unreadable bundle name must be refused at create");
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+            crate::handlers::test_support::assert_invalid_name_field(&err, field);
+        }
+    }
+
     #[test]
     fn validate_cluster_trust_bundle_generate_name_must_carry_signer_prefix_so_random_suffix_cannot_squat_another_signers_namespace(
     ) {
