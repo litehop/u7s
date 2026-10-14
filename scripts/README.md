@@ -91,6 +91,8 @@ scripts/conformance/06-run-sonobuoy.sh [--focus <regex>]
 
 `06-run-sonobuoy.sh` exit codes: `0` clean, `10` spec failures (results retrieved), any other non-zero = infrastructure failure.
 
+`U7S_SUITE_TIMEOUT_S` overrides the ginkgo suite cap (default 5400s for a full or storage-focused run, 3600s otherwise); sonobuoy's `--timeout` is the cap + 600s. Must be a positive integer; anything else exits 1 before any VM work starts.
+
 **KUBECONFIG propagation:** `run-all.sh` sources `02-start-apiserver.sh` so the
 `KUBECONFIG` export is visible to subsequent steps. When running steps individually,
 export it manually after step 02.

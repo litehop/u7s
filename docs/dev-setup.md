@@ -58,6 +58,7 @@ To run the Kubernetes conformance suite against u7s locally:
    ```
    This runs `--mode=non-disruptive-conformance` — the single-node conformance subset, approximately 5–15 minutes.
    Exit code: `0` clean, `10` specs failed (results were retrieved), anything else is an infrastructure failure.
+   `U7S_SUITE_TIMEOUT_S` overrides the ginkgo suite cap (default 5400s for a full or storage-focused run, 3600s otherwise); sonobuoy's `--timeout` is the cap + 600s. Must be a positive integer; anything else exits 1 before any VM work starts.
 
 4. To iterate on a specific failure area, use `--focus` to run only matching tests:
    ```sh

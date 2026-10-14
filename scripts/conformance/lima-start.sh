@@ -640,7 +640,20 @@ fi
 # Run the agent as a Pod in kube-system so it uses CoreDNS: service DNS names like
 # e2e-test-webhook.webhook-N.svc resolve correctly inside the pod network.
 # hostAliases injects host.lima.internal so the pod can dial the Mac-side server.
-kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f - <<PODEOF
+AGENT_ARGS=(
+  --logtostderr=true
+  --proxy-server-host=host.lima.internal
+  --proxy-server-port="${KONNECTIVITY_AGENT_PORT}"
+  --ca-cert=/certs/ca.crt
+  --agent-cert=/certs/tls.crt
+  --agent-key=/certs/tls.key
+  --agent-identifiers=default-route=true
+  --sync-interval=5s
+  --sync-interval-cap=30s
+)
+AGENT_ARGS_TEXT=$(printf '%s\n' "${AGENT_ARGS[@]}")
+AGENT_ARGS_YAML=$(printf '    - %s\n' "${AGENT_ARGS[@]}")
+apply_pod_recreating_on_args_change "$KUBECONFIG_PATH" kube-system "konnectivity-agent${NODE_SUFFIX}" "$AGENT_ARGS_TEXT" <<PODEOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -662,15 +675,7 @@ spec:
   - name: konnectivity-agent
     image: registry.k8s.io/kas-network-proxy/proxy-agent:v0.35.0
     args:
-    - --logtostderr=true
-    - --proxy-server-host=host.lima.internal
-    - --proxy-server-port=${KONNECTIVITY_AGENT_PORT}
-    - --ca-cert=/certs/ca.crt
-    - --agent-cert=/certs/tls.crt
-    - --agent-key=/certs/tls.key
-    - --agent-identifiers=default-route=true
-    - --sync-interval=5s
-    - --sync-interval-cap=30s
+${AGENT_ARGS_YAML}
     volumeMounts:
     - name: certs
       mountPath: /certs
