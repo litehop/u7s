@@ -2469,6 +2469,7 @@ mod tests {
         // its dry-run early-return, and from the background terminating-CRD sweep.
         "finalize_crd",
         "delete_instances",
+        "soft_delete_crd",
         "purge_crd",
         "delete_finalized_namespace",
         "delete_namespace_scoped_crds",
