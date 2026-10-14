@@ -5,11 +5,11 @@
 
 ## Context
 
-u7s runs upstream kube-proxy in IPVS mode and uses CRI-O's stock `bridge` CNI plugin. Neither implements NetworkPolicy enforcement. An August 2026 audit (grep-verified, live-tested) confirmed the apiserver stored, listed, and watched NetworkPolicy objects correctly but nothing acted on them — a `default-deny-all-ingress` policy in place, a probe from `eve` to `bob` succeeded. Every deny rule was silently unenforced.
+u7s runs upstream kube-proxy in iptables mode and uses CRI-O's stock `bridge` CNI plugin. Neither implements NetworkPolicy enforcement. An August 2026 audit (grep-verified, live-tested) confirmed the apiserver stored, listed, and watched NetworkPolicy objects correctly but nothing acted on them — a `default-deny-all-ingress` policy in place, a probe from `eve` to `bob` succeeded. Every deny rule was silently unenforced.
 
 ## Decision
 
-Use `kubernetes-sigs/kube-network-policies` as u7s's tested and recommended NetworkPolicy engine, wired into the conformance/dev-loop test harness — but **do not bundle it as a production default**. Document it as the recommended engine for operators who want NetworkPolicy enforcement, so they don't have to re-run the CNI comparison from scratch. Keep IPVS kube-proxy and the CRI-O bridge CNI unchanged either way.
+Use `kubernetes-sigs/kube-network-policies` as u7s's tested and recommended NetworkPolicy engine, wired into the conformance/dev-loop test harness — but **do not bundle it as a production default**. Document it as the recommended engine for operators who want NetworkPolicy enforcement, so they don't have to re-run the CNI comparison from scratch. Keep iptables kube-proxy and the CRI-O bridge CNI unchanged either way.
 
 **Amendment (2026-08-25):** confirmed via upstream `test/e2e/network/netpol/network_policy.go` (release-1.36) that NetworkPolicy tests carry zero `framework.ConformanceIt` markers — enforcement was never a certification requirement. Combined with a separate memory-first CNI/LB investigation demoting NetworkPolicy to near-zero priority for resource-constrained deployments, this supersedes the original "install as a production DaemonSet" decision below in favor of test-only-plus-documented-recommendation.
 

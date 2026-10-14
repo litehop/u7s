@@ -215,6 +215,27 @@ pub struct CrContext {
     /// specific to the requested version's schema, so this is `None` unless the matched
     /// version itself declares `subresources.scale`.
     pub scale: Option<CrScaleConfig>,
+    /// The CRD has a deletionTimestamp: its instances are being removed, so creates are refused.
+    pub terminating: bool,
+}
+
+impl CrContext {
+    /// Upstream's `forbidCreateAdmission`: a CR created while its CRD is finalizing would
+    /// outlive the CRD's instance sweep.
+    pub(crate) fn forbid_create_if_terminating(
+        &self,
+        group: &str,
+        plural: &str,
+        name: &str,
+    ) -> Result<(), crate::status::StatusError> {
+        if self.terminating {
+            return Err(Status::forbidden(format!(
+                "{plural}.{group} \"{name}\" is forbidden: create not allowed while custom \
+                 resource definition is terminating"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The three JSONPath-ish field paths (leading `.` stripped) a CRD author declares under
@@ -382,6 +403,7 @@ pub async fn find_crd<S: Store>(
             schema_cache_key,
             storage_version,
             scale,
+            terminating: crd.metadata.deletion_timestamp.is_some(),
         };
         state.cr_context_cache.insert_if_current(
             cache_key,
@@ -2837,6 +2859,7 @@ pub async fn create_cr<S: Store>(
     let generate_name_prefix = crate::handlers::generic::wants_generate_name(&wrapped);
     let mut name =
         crate::handlers::generic::resolve_valid_name(&mut wrapped, &group, &plural, &ctx.kind)?;
+    ctx.forbid_create_if_terminating(&group, &plural, &name)?;
     let mut obj = wrapped.body;
 
     let warn_header = apply_cr_field_validation(
@@ -3140,6 +3163,8 @@ async fn complete_cr_finalizer_drain<S: Store>(
         .delete(key, None)
         .await
         .map_err(|e| store_err_cr(e, name, kind))?;
+    // The drained CR may be the last instance holding a Terminating CRD.
+    state.crd_finalizer_wake.notify_one();
     if let Some(namespace) = ns {
         // Locked so this full-recompute write of status.used can never interleave with a
         // concurrent record_pod_created/record_pod_removed's incremental read-modify-write of
@@ -3831,6 +3856,7 @@ pub async fn create_cr_namespaced<S: Store>(
     let generate_name_prefix = crate::handlers::generic::wants_generate_name(&wrapped);
     let mut name =
         crate::handlers::generic::resolve_valid_name(&mut wrapped, &group, &plural, &ctx.kind)?;
+    ctx.forbid_create_if_terminating(&group, &plural, &name)?;
     let mut obj = wrapped.body;
 
     let warn_header = apply_cr_field_validation(
@@ -4485,6 +4511,7 @@ pub async fn patch_cr<S: Store>(
     // handles kubelet SSA bodies that happen to be JSON, CR SSA bodies from the conformance
     // test binary are real YAML. ssa_body_to_json (yaml-rust2) handles both JSON and YAML.
     if is_ssa && stored_opt.is_none() {
+        ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
@@ -4745,6 +4772,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // SSA upsert for namespaced CRs: mirrors patch_cr cluster-scoped path.
     // ssa_body_to_json (yaml-rust2) handles both JSON and genuine YAML bodies.
     if is_ssa && stored_opt.is_none() {
+        ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
@@ -10700,6 +10728,7 @@ mod tests {
             schema_cache_key: ("test".into(), "v1".into(), "0".into()),
             storage_version: "v1".into(),
             scale: None,
+            terminating: false,
         };
         // Fresh cache per call: these tests exercise schema-correctness, not caching, and
         // every call here uses the same fixed schema_cache_key — sharing one cache across
@@ -10836,6 +10865,7 @@ mod tests {
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
             storage_version: "v1".into(),
             scale: None,
+            terminating: false,
         };
         // Local to this test (not a shared/global counter) so parallel test execution in
         // the same process cannot pollute the count.
@@ -10886,6 +10916,7 @@ mod tests {
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
             storage_version: "v1".into(),
             scale: None,
+            terminating: false,
         };
         let cache = crate::state::CrSchemaCache::new();
         let value = serde_json::json!({ "spec": {} });
@@ -10953,6 +10984,7 @@ mod tests {
             schema_cache_key: ("group.example.com".into(), "v1".into(), rv.into()),
             storage_version: "v1".into(),
             scale: None,
+            terminating: false,
         };
         let cache = crate::state::CrSchemaCache::new();
         let value = serde_json::json!({ "spec": {} });

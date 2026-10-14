@@ -10,12 +10,9 @@
 # doesn't silently revert an isolated worker back onto the shared,
 # defect-prone user-v2.
 #
-# (lima-start.sh's inter-node static-route loop, which used to carry a
-# same-network peer-validation guard of its own, was removed when flannel's
-# VXLAN overlay took over cross-node pod routing -- flannel.1 needs the same
-# real L2 path but has no equivalent pre-flight check; a misconfigured
-# --network now surfaces as a cross-node connectivity failure instead of a
-# fail-loud precondition here.)
+# It also covers the same-network pre-flight (assert_same_lima_network) that
+# runs before flannel is applied: flannel.1's VXLAN needs a real L2 path
+# between paired VMs.
 #
 # Exits 0 on success, 1 on any assertion failure.
 # shellcheck disable=SC2016 # file-wide: every single-quoted grep pattern below
@@ -95,6 +92,44 @@ assert_true "the staleness check fails loud when RECORDED_NETWORK differs from t
 # otherwise a VM reprovisioned onto the wrong partition would silently pass.
 assert_false "(regression guard) the old presence-only staleness check (blind to a wrong network NAME) is gone" \
   grep -qF "grep -q '^networks:' \"\$LIMA_YAML\" && ! grep -q '^networks:' \"\$VM_DIR/lima.yaml\"" "$LIMA_START"
+
+# ---------------------------------------------------------------------------
+# Same-network pre-flight for flannel.1.
+# ---------------------------------------------------------------------------
+source "$DIR/_lib.sh"
+LIMA_HOME="$FIXTURES/lima"
+export LIMA_HOME
+for vm in vm-a vm-a2 vm-b; do
+  mkdir -p "$LIMA_HOME/$vm"
+  cp "$FIXTURES/$vm.yaml" "$LIMA_HOME/$vm/lima.yaml"
+done
+
+NODES=""
+kubectl() { echo "$NODES"; }
+NODES="vm-a2"
+assert_true "VMs on the same network pass the pre-flight (same-partition pairing stays allowed)" \
+  assert_same_lima_network vm-a kc
+NODES="vm-a vm-a2"
+assert_true "the joining VM's own Node entry is not compared against itself" \
+  assert_same_lima_network vm-a kc
+NODES="vm-a2 vm-b"
+out=$(assert_same_lima_network vm-a kc 2>&1) && rc=0 || rc=$?
+assert "VMs on different networks fail loud, naming both networks, so no unreachable overlay is programmed" \
+  "$([ "$rc" != 0 ] && echo "$out" | grep -q "user-v2-workers-a.*user-v2-workers-b" && echo 1 || echo 0)"
+NODES="vm-a2 vm-gone"
+out=$(assert_same_lima_network vm-a kc 2>&1) && rc=0 || rc=$?
+assert "a registered peer with no local lima.yaml fails loud, naming it and the remedies, instead of silently skipping the check" \
+  "$([ "$rc" != 0 ] && echo "$out" | grep -q "vm-gone" && echo "$out" | grep -q 'kubectl delete node vm-gone' && echo "$out" | grep -q -- '--reset' && echo 1 || echo 0)"
+kubectl() { return 1; }
+out=$(assert_same_lima_network vm-a kc 2>&1) && rc=0 || rc=$?
+assert "a kubectl failure fails loud rather than iterating zero peers and passing a mispaired VM" \
+  "$([ "$rc" != 0 ] && echo "$out" | grep -q 'cannot list cluster nodes' && echo 1 || echo 0)"
+unset -f kubectl
+
+APPLY_LINE=$(grep -n 'Applying flannel CNI DaemonSet' "$LIMA_START" | head -1 | cut -d: -f1 || true)
+CHECK_LINE=$(grep -n 'assert_same_lima_network "\$VM_NAME" "\$KUBECONFIG_PATH"' "$LIMA_START" | head -1 | cut -d: -f1 || true)
+assert "lima-start.sh runs the same-network pre-flight before applying flannel" \
+  "$([ -n "$CHECK_LINE" ] && [ -n "$APPLY_LINE" ] && [ "$CHECK_LINE" -lt "$APPLY_LINE" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

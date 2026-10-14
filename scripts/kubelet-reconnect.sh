@@ -7,7 +7,7 @@
 # What this does (idempotent, safe to re-run):
 #   - Copies the new kubeconfig and CA cert into the VM
 #   - Rewrites the kubelet drop-in and restarts kubelet
-#   - Ensures IPVS masquerade forwarding is enabled for in-cluster API access
+#   - Ensures IPv4 forwarding is enabled for in-cluster API access
 #   - Waits for the node to re-register
 #
 # Usage:
@@ -108,9 +108,9 @@ fi
 echo "Restarting kubelet..."
 limactl shell "$VM_NAME" sudo systemctl restart kubelet
 
-# kube-proxy's IPVS virtual server covers 10.96.0.1:443 → host apiserver routing
+# kube-proxy's iptables DNAT covers 10.96.0.1:443 → host apiserver routing
 # (no manual DNAT needed here; see removed block in lima-start.sh, commit 42400e1c).
-# IPVS Masq forwarding still requires this sysctl.
+# Forwarding the DNATed traffic still requires this sysctl.
 limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 # Refresh cert Secret and restart the konnectivity-agent pod so it reconnects with

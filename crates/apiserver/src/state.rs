@@ -860,6 +860,9 @@ pub struct AppState<S = SqliteStore> {
     /// Per-namespace lock serializing ResourceQuota check-then-write critical sections.
     /// See `QuotaAdmissionLocks` for why this is required.
     pub quota_admission_locks: QuotaAdmissionLocks,
+    /// Wakes the CRD finalizer loop: signalled when a CRD enters Terminating or a custom
+    /// resource finishes its own finalizer drain, so an idle server does no periodic CRD scans.
+    pub crd_finalizer_wake: Arc<tokio::sync::Notify>,
     /// Cache of compiled CRD `openAPIV3Schema`s, keyed by CRD generation.
     /// See `CrSchemaCache` for the invalidation strategy.
     pub cr_schema_cache: Arc<CrSchemaCache>,
@@ -958,6 +961,7 @@ impl<S> Clone for AppState<S> {
             apiservice_cache: self.apiservice_cache.clone(),
             discovery_cache: self.discovery_cache.clone(),
             quota_admission_locks: self.quota_admission_locks.clone(),
+            crd_finalizer_wake: self.crd_finalizer_wake.clone(),
             cr_schema_cache: self.cr_schema_cache.clone(),
             cr_conversion_cache: self.cr_conversion_cache.clone(),
             cr_context_cache: self.cr_context_cache.clone(),
@@ -1201,6 +1205,7 @@ impl<S: Store> AppState<S> {
             apiservice_cache: Arc::new(ApiServiceCache::new()),
             discovery_cache: Arc::new(DiscoveryCache::new()),
             quota_admission_locks: QuotaAdmissionLocks::new(),
+            crd_finalizer_wake: Arc::new(tokio::sync::Notify::new()),
             cr_schema_cache: Arc::new(CrSchemaCache::new()),
             cr_conversion_cache: Arc::new(CrConversionCache::new()),
             cr_context_cache: Arc::new(CrContextCache::new()),
@@ -2072,6 +2077,7 @@ mod tests {
             schema_cache_key: ("example.io".to_string(), "v1".to_string(), "1".to_string()),
             storage_version: "v1".to_string(),
             scale: None,
+            terminating: false,
         });
         let inserted = cache.insert_if_current(key.clone(), stale_ctx, epoch_before_scan);
 

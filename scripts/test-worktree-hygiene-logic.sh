@@ -184,6 +184,93 @@ assert "a 'tail -f .../konnectivity-server.log' line is not typed as a konnectiv
 assert "the real cached binary (proxy-server-<os>-<arch>) IS typed as a konnectivity-server, whose name appears only in its flags" \
   "$([ "$(call proc_type_from_psline "$REAL_KONN")" = 'konnectivity-server' ] && echo 1 || echo 0)"
 
+# 1d. STEP A -- mayor checkout apiserver/scheduler squatting a worker-slot port.
+SQ_DIR="$SANDBOX_ROOT/sq"
+mkdir -p "$SQ_DIR/temp/u7s"
+printf 'clusters:\n- cluster:\n    server: https://127.0.0.1:6445\n' > "$SQ_DIR/temp/u7s/kubeconfig-scheduler"
+printf 'clusters:\n- cluster:\n    server: https://127.0.0.1:6443\n' > "$SQ_DIR/temp/u7s/kubeconfig-slot0"
+SQ_LIVE="$SQ_DIR"
+mk_api() {  # pid listen-port wpath
+  echo "alice  $1   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 /repo/target/release/u7s-apiserver --db $3/temp/u7s/state.db --listen 127.0.0.1:$2 --kubeconfig $3/temp/u7s/kubeconfig"
+}
+mk_sched() {  # pid kubeconfig-file wpath
+  echo "alice  $1   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 /repo/target/release/u7s-scheduler --kubeconfig $3/temp/u7s/$2"
+}
+squat() { call find_mayor_worker_slot_squatters "$1" "$SQ_LIVE"; }
+
+assert "a mayor checkout apiserver on slot 0 (6443) is NOT flagged -- that is the operator's own stack" \
+  "$([ -z "$(squat "$(mk_api 4001 6443 "$SQ_DIR")")" ] && echo 1 || echo 0)"
+assert "a mayor checkout apiserver on worker slot 2 (6445) with no live worker on it IS flagged -- the mayor never owns a worker slot" \
+  "$([ "$(squat "$(mk_api 4002 6445 "$SQ_DIR")")" = "4002|slot-squatter-apiserver|$SQ_DIR" ] && echo 1 || echo 0)"
+AGENT_API="$(mk_api 4003 6445 "/repo/ai/worktrees/agent-liveid9")"
+assert "a mayor checkout apiserver on 6445 is NOT flagged while a live worker's apiserver is on 6445 -- slot ownership unclear, never kill" \
+  "$([ -z "$(squat "$(mk_api 4002 6445 "$SQ_DIR")
+$AGENT_API")" ] && echo 1 || echo 0)"
+assert "a live worker's apiserver on a worker slot is never flagged by the mayor squatter rule" \
+  "$([ -z "$(call find_mayor_worker_slot_squatters "$AGENT_API" "/repo/ai/worktrees/agent-liveid9")" ] && echo 1 || echo 0)"
+assert "a mayor checkout scheduler whose kubeconfig points at worker slot 6445 IS flagged" \
+  "$([ "$(squat "$(mk_sched 4004 kubeconfig-scheduler "$SQ_DIR")")" = "4004|slot-squatter-scheduler|$SQ_DIR" ] && echo 1 || echo 0)"
+assert "a mayor checkout scheduler whose kubeconfig points at slot 0 (6443) is NOT flagged" \
+  "$([ -z "$(squat "$(mk_sched 4005 kubeconfig-slot0 "$SQ_DIR")")" ] && echo 1 || echo 0)"
+assert "a mayor checkout scheduler with an unreadable kubeconfig is NOT flagged -- port unprovable" \
+  "$([ -z "$(squat "$(mk_sched 4006 kubeconfig-missing "$SQ_DIR")")" ] && echo 1 || echo 0)"
+CARGO_LINE="alice  4007   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 cargo build --release -p u7s-apiserver -p u7s-scheduler --listen 127.0.0.1:6445 --manifest-path $SQ_DIR/temp/u7s/kubeconfig"
+assert "a non-u7s process merely mentioning u7s-apiserver (cargo build) is not typed, so never a kill candidate" \
+  "$([ -z "$(call proc_type_from_psline "$CARGO_LINE")" ] && [ -z "$(squat "$CARGO_LINE")" ] && echo 1 || echo 0)"
+assert "the live-agents filter passes a mayor checkout record through (no agent-id in its path must not abort the set -e script, or the squatter is silently never reaped)" \
+  "$([ "$(call filter_orphans_by_live_agents "4002|slot-squatter-apiserver|$SQ_DIR" liveid9)" = "4002|slot-squatter-apiserver|$SQ_DIR" ] && echo 1 || echo 0)"
+assert "u7s-apiserver is typed by argv[0] basename, even from a full path" \
+  "$([ "$(call proc_type_from_psline "$(mk_api 4008 6445 "$SQ_DIR")")" = apiserver ] && echo 1 || echo 0)"
+
+# 1e. STEP A end to end (DRY_RUN=1, stubbed scan_ps): the real entry point must
+# signal exactly the squatter's pid -- a `pkill -f` path pattern would also
+# kill the operator's slot-0 stack, which shares the mayor checkout path.
+SA_DIR="$SANDBOX_ROOT/stepa"
+mkdir -p "$SA_DIR/temp/u7s"
+new_sandbox "$SA_DIR"
+SA_REAL=$(cd -P "$SA_DIR" && pwd)
+mk_konn() {  # pid server-port wpath
+  echo "alice  $1   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 konnectivity-server --server-cert=$3/temp/u7s/konnectivity-server.crt --server-port=$2"
+}
+step_a_dry() {  # ps lines -> every "would run:" line of a dry-run STEP A
+  local out
+  out=$(
+    export DRY_RUN=1 HYGIENE_RESCAN_GRACE_S=0 WORKTREE_HYGIENE_REPO_ROOT="$SA_REAL"
+    # shellcheck disable=SC1090
+    source "$SCRIPT"
+    LIVE_AGENTS="liveid9"
+    PS_FIXTURE="$1"
+    scan_ps() { printf '%s\n' "$PS_FIXTURE"; }
+    step_a_orphaned_processes 2>&1
+  )
+  printf '%s\n' "$out" | grep 'would run:' || true
+}
+SA_API_6445=$(mk_api 5001 6445 "$SA_REAL")
+SA_API_6443=$(mk_api 5002 6443 "$SA_REAL")
+SA_KONN_SLOT0=$(mk_konn 5003 8135 "$SA_REAL")
+SA_KONN_8335=$(mk_konn 5004 8335 "$SA_REAL")
+SA_WORKER_API=$(mk_api 5005 6446 "/repo/ai/worktrees/agent-liveid9")
+
+assert "STEP A (a): a mayor checkout apiserver on 6445 is killed by pid alone -- the only signal that spares the slot-0 stack at the same path" \
+  "$([ "$(step_a_dry "$SA_API_6445")" = "[dry-run] would run: kill 5001" ] && echo 1 || echo 0)"
+assert "STEP A (b): the operator's slot-0 stack (apiserver 6443 + konnectivity 8135) is never signalled, and no pkill -f pattern is issued" \
+  "$([ -z "$(step_a_dry "$SA_API_6443
+$SA_KONN_SLOT0")" ] && echo 1 || echo 0)"
+assert "STEP A (b'): a 6445 squatter next to the slot-0 stack is killed by pid only -- no pkill -f that would match slot 0" \
+  "$([ "$(step_a_dry "$SA_API_6443
+$SA_KONN_SLOT0
+$SA_API_6445")" = "[dry-run] would run: kill 5001" ] && echo 1 || echo 0)"
+assert "STEP A (c): an apiserver-less mayor checkout konnectivity on 8335 is reaped by pid (exactly one kill)" \
+  "$([ "$(step_a_dry "$SA_KONN_8335")" = "[dry-run] would run: kill 5004" ] && echo 1 || echo 0)"
+assert "STEP A (b''): a stale 8335 konnectivity beside the operator's slot-0 konnectivity (same path) is killed by pid only -- a path pkill would take down slot 0" \
+  "$([ "$(step_a_dry "$SA_KONN_SLOT0
+$SA_KONN_8335")" = "[dry-run] would run: kill 5004" ] && echo 1 || echo 0)"
+assert "STEP A (d): a live worker's 6446 apiserver is untouched even beside a real squatter, which alone is killed" \
+  "$([ "$(step_a_dry "$SA_WORKER_API
+$SA_API_6445")" = "[dry-run] would run: kill 5001" ] && echo 1 || echo 0)"
+assert "STEP A (d'): a live worker's 6446 apiserver alone produces no kill" \
+  "$([ -z "$(step_a_dry "$SA_WORKER_API")" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 2. STEP C -- in-flight guard.
 # ---------------------------------------------------------------------------
