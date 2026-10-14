@@ -94,6 +94,49 @@ authorized_keys_replace_cmd() {
   echo "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && { grep -v ' ${E2E_SSH_KEY_COMMENT}\$' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.new || true; } && echo '${pubkey}' >> ~/.ssh/authorized_keys.new && cat ~/.ssh/authorized_keys.new > ~/.ssh/authorized_keys && rm -f ~/.ssh/authorized_keys.new"
 }
 
+# 06-run-sonobuoy.sh exit codes. Spec failures (results retrieved, Failed>0)
+# get their own code so callers can tell "the cluster failed specs" from "the
+# rig failed to produce results" (1, or the sonobuoy/retrieval code passed
+# through).
+SONOBUOY_EXIT_SPEC_FAILURES=10
+
+# Overall exit code from the worst child-pass infra exit (0 if none) and the
+# total spec failures: an infra error masks spec failures because the results
+# those counts came from may be incomplete.
+sonobuoy_exit_code() {
+  local infra_exit="$1" spec_failures="$2"
+  if [ "$infra_exit" -ne 0 ]; then
+    echo "$infra_exit"
+  elif [ "$spec_failures" -gt 0 ]; then
+    echo "$SONOBUOY_EXIT_SPEC_FAILURES"
+  else
+    echo 0
+  fi
+}
+
+# File where 06-run-sonobuoy.sh records the results directory of one pass, so
+# run-all.sh resolves the parallel pass's directory explicitly instead of
+# taking the newest temp/e2e entry (the disruptive pass's dir when the
+# parallel pass dies before creating its own).
+sonobuoy_results_dir_file() {
+  echo "$1/results-dir.$2"
+}
+
+# Prints "<ran> <failed>" for a ginkgo junit file, matching the "Ran X of Y
+# Specs" line in e2e.txt. The junit also carries one testcase per suite-level
+# node execution (one [SynchronizedBeforeSuite]/[SynchronizedAfterSuite] per
+# ginkgo process plus the Report*Suite nodes); those are not specs, so passed
+# ones are not counted as ran. Failed ones stay in failures so a broken suite
+# node still fails the run.
+junit_spec_totals() {
+  local junit="$1" tests skipped failures suite_nodes
+  tests=$(grep -o 'tests="[0-9]*"' "$junit" | head -1 | grep -o '[0-9]*')
+  skipped=$(grep -o 'skipped="[0-9]*"' "$junit" | head -1 | grep -o '[0-9]*')
+  failures=$(grep -o 'failures="[0-9]*"' "$junit" | head -1 | grep -o '[0-9]*')
+  suite_nodes=$(grep -cE '<testcase name="\[(Report(Before|After)Suite|Synchronized(Before|After)Suite|BeforeSuite|AfterSuite)\][^"]*"[^>]*status="passed"' "$junit" || true)
+  echo "$(( tests - ${skipped:-0} - suite_nodes )) ${failures:-0}"
+}
+
 _ipv4_to_int() {
   local IFS=. a b c d
   read -r a b c d <<<"$1"
