@@ -167,6 +167,23 @@ assert "sanity: a live worker's apiserver-less konnectivity-server is a candidat
 assert "...and the live-agents filter drops it, so a live worker mid-restart is never reaped" \
   "$([ -z "$(call filter_orphans_by_live_agents "$LIVE_AGENT_REC" liveid123)" ] && echo 1 || echo 0)"
 
+KONN_SLOT0='alice  3005   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 konnectivity-server --server-cert=/repo/temp/u7s/konnectivity-server.crt --server-port=8135'
+KONN_NOPORT='alice  3006   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 konnectivity-server --server-cert=/repo/temp/u7s/konnectivity-server.crt'
+KONN_SLOT2='alice  3007   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 konnectivity-server --server-cert=/repo/temp/u7s/konnectivity-server.crt --server-port=8335'
+assert "an apiserver-less mayor checkout konnectivity-server on slot 0 (8135) is NOT flagged -- that is the operator's own stack" \
+  "$([ -z "$(call find_apiserverless_konnectivity "$KONN_SLOT0" "$LIVE_WITH_MAYOR")" ] && echo 1 || echo 0)"
+assert "a mayor checkout konnectivity-server with no --server-port is NOT flagged -- no proof it squats a worker slot" \
+  "$([ -z "$(call find_apiserverless_konnectivity "$KONN_NOPORT" "$LIVE_WITH_MAYOR")" ] && echo 1 || echo 0)"
+assert "a mayor checkout konnectivity-server on worker slot 2 (8335) IS flagged" \
+  "$([ "$(call find_apiserverless_konnectivity "$KONN_SLOT2" "$LIVE_WITH_MAYOR")" = '3007|konnectivity-server|/repo' ] && echo 1 || echo 0)"
+
+TAIL_LINE='alice  3008   0.0  0.0  123456  1234 s001  S    10:00AM   0:00.01 tail -f /repo/temp/u7s/konnectivity-server.log'
+REAL_KONN='alice  3009   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 /Users/alice/.cache/u7s/konnectivity/v0.35.0/proxy-server-darwin-arm64 --server-cert=/repo/ai/worktrees/agent-x/temp/u7s/konnectivity-server.crt --server-port=8335'
+assert "a 'tail -f .../konnectivity-server.log' line is not typed as a konnectivity-server -- it must never be a kill candidate" \
+  "$([ -z "$(call proc_type_from_psline "$TAIL_LINE")" ] && echo 1 || echo 0)"
+assert "the real cached binary (proxy-server-<os>-<arch>) IS typed as a konnectivity-server, whose name appears only in its flags" \
+  "$([ "$(call proc_type_from_psline "$REAL_KONN")" = 'konnectivity-server' ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 2. STEP C -- in-flight guard.
 # ---------------------------------------------------------------------------

@@ -55,6 +55,8 @@
 #   Also reaped: a konnectivity-server in a LIVE worktree (e.g. the mayor
 #   checkout) with no u7s-apiserver of the same workdir, still apiserver-less
 #   after a short rescan -- the leftover that squats a worker slot's ports.
+#   A mayor checkout one is reaped only on a worker-slot (1-5) konnectivity
+#   port; slot 0 is the operator's own stack.
 # STEP B: `git worktree prune -v` -- safe by definition, only removes
 #   metadata for worktrees whose directories are already gone.
 # STEP C: delete stale `worker/agent-*` branches, guarded so an in-flight
@@ -200,9 +202,32 @@ proc_type_from_psline() {
   case "$1" in
     *u7s-apiserver*) printf 'apiserver' ;;
     *u7s-scheduler*) printf 'scheduler' ;;
-    *konnectivity-server*) printf 'konnectivity-server' ;;
     *sample-run-metrics.sh*) printf 'sample-run-metrics' ;;
-    *) printf '' ;;
+    *) case "$(exe_basename_from_psline "$1")" in
+         konnectivity-server|proxy-server-*) printf 'konnectivity-server' ;;
+         *) printf '' ;;
+       esac ;;
+  esac
+}
+
+# argv[0] basename of a `ps aux` line (field 11 onward). The released
+# konnectivity binary is cached as proxy-server-<os>-<arch>, so the name
+# "konnectivity-server" only appears in its flags, never as the executable.
+exe_basename_from_psline() {
+  printf '%s' "$1" | awk '{n=split($11, a, "/"); print a[n]}'
+}
+
+# Host konnectivity server port (--server-port=N) of a konnectivity line.
+konnectivity_port_from_psline() {
+  printf '%s' "$1" | grep -oE -e '--server-port=[0-9]+' | head -1 | cut -d= -f2
+}
+
+# Worker slots 1-5 konnectivity server ports (dispatch template slot table).
+# Slot 0 (8135) is the operator's own stack and is never in this set.
+is_worker_slot_konnectivity_port() {
+  case "$1" in
+    8235|8335|8435|8535|8635) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -266,6 +291,9 @@ find_apiserverless_konnectivity() {
     [ -n "$wpath" ] || continue
     printf '%s\n' "$live_worktrees" | grep -qxF "$wpath" || continue
     if printf '%s\n' "$api_paths" | grep -qxF "$wpath"; then continue; fi
+    if [ -z "$(agent_id_from_worktree_path "$wpath")" ]; then
+      is_worker_slot_konnectivity_port "$(konnectivity_port_from_psline "$line")" || continue
+    fi
     pid=$(pid_from_psline "$line")
     printf '%s|konnectivity-server|%s\n' "$pid" "$wpath"
   done <<< "$ps_output"
@@ -335,7 +363,7 @@ step_a_orphaned_processes() {
   # An apiserver-less konnectivity-server is also what a live stack looks like
   # for a moment while its apiserver restarts; only kill one seen in two scans.
   if [ -n "$(filter_orphans_by_live_agents "$(find_apiserverless_konnectivity "$ps_out" "$live")" "$LIVE_AGENTS")" ]; then
-    sleep "${HYGIENE_RESCAN_GRACE_S:-5}"
+    sleep "${HYGIENE_RESCAN_GRACE_S:-15}"
     ps_out=$(scan_ps)
   fi
 
