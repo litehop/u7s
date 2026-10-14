@@ -1055,7 +1055,7 @@ pub struct NodeList {
     pub items: Vec<NodeItem>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct NodeItem {
     pub metadata: NodeMetadata,
     #[serde(default)]
@@ -1087,7 +1087,7 @@ pub struct NodeItem {
     pub csi_prevent_scheduling_drivers: std::collections::HashSet<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct NodeSpec {
     #[serde(default)]
     pub taints: Vec<Taint>,
@@ -1105,7 +1105,7 @@ pub struct NodeSpec {
 /// scheduling in this MVP — `PreferNoSchedule` is a soft signal upstream only
 /// weighs during scoring, and this scheduler does no scoring, so it is treated
 /// as always tolerated.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Taint {
     pub key: String,
     #[serde(default)]
@@ -1113,7 +1113,7 @@ pub struct Taint {
     pub effect: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct NodeStatus {
     #[serde(default)]
     pub allocatable: NodeAllocatable,
@@ -1121,7 +1121,7 @@ pub struct NodeStatus {
     pub capacity: NodeAllocatable,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct NodeAllocatable {
     /// Maximum pods the node will accept (quantity string, e.g. "110").
     /// Zero means the field was absent — treat as unlimited for safety (no cap check).
@@ -1152,7 +1152,7 @@ pub struct NodeAllocatable {
     pub extended: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct NodeMetadata {
     pub name: String,
     #[serde(default)]
@@ -1587,6 +1587,113 @@ impl PvcWaiters {
     }
 }
 
+const POD_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+const POD_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+const FAILED_EVENT_REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug)]
+struct FailureState {
+    uid: String,
+    failures: u32,
+    last_attempt: std::time::Instant,
+    last_event_message: String,
+    last_event_at: std::time::Instant,
+}
+
+/// Per-pod state for unschedulable pods: upstream's `podInitialBackoffDuration`
+/// (1s) doubling to `podMaxBackoffDuration` (10s) gating event-driven
+/// requeues, and a repeat window collapsing identical FailedScheduling Events
+/// the way upstream's event aggregation does. Entries are tied to the pod's
+/// UID, so a recreated same-name pod never inherits its predecessor's state,
+/// and are pruned (`retain_pending`) against every pod list the scheduler
+/// takes, so a deletion missed by the watch cannot leak one.
+#[derive(Debug, Default)]
+pub struct FailureBackoff {
+    entries: std::collections::HashMap<String, FailureState>,
+}
+
+impl FailureBackoff {
+    /// Records a failed attempt; returns whether a FailedScheduling Event
+    /// should be posted (message changed, or the repeat window elapsed). An
+    /// entry left by a different pod UID under the same key is replaced.
+    pub fn record_failure(
+        &mut self,
+        key: &str,
+        uid: &str,
+        message: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        match self.entries.get_mut(key).filter(|s| s.uid == uid) {
+            Some(state) => {
+                state.failures = state.failures.saturating_add(1);
+                state.last_attempt = now;
+                let emit = state.last_event_message != message
+                    || now.duration_since(state.last_event_at) >= FAILED_EVENT_REPEAT_WINDOW;
+                if emit {
+                    state.last_event_message = message.to_owned();
+                    state.last_event_at = now;
+                }
+                emit
+            }
+            None => {
+                self.entries.insert(
+                    key.to_owned(),
+                    FailureState {
+                        uid: uid.to_owned(),
+                        failures: 1,
+                        last_attempt: now,
+                        last_event_message: message.to_owned(),
+                        last_event_at: now,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Keys whose backoff has not yet expired at `now`, with the time left.
+    pub fn backed_off(&self, now: std::time::Instant) -> Vec<(String, std::time::Duration)> {
+        self.entries
+            .iter()
+            .filter_map(|(k, s)| {
+                let shift = s.failures.saturating_sub(1).min(8);
+                let delay = (POD_INITIAL_BACKOFF * (1u32 << shift)).min(POD_MAX_BACKOFF);
+                let expiry = s.last_attempt + delay;
+                (now < expiry).then(|| (k.clone(), expiry - now))
+            })
+            .collect()
+    }
+
+    pub fn clear(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+
+    /// Drops every entry whose `(key, uid)` is not in `pending` — the pods a
+    /// fresh list or replay shows as still unscheduled.
+    pub fn retain_pending(&mut self, pending: &std::collections::HashSet<(String, String)>) {
+        self.entries
+            .retain(|k, s| pending.contains(&(k.clone(), s.uid.clone())));
+    }
+}
+
+/// `(namespace/name, uid)` of every pod in `objects` that still needs
+/// scheduling.
+pub fn unscheduled_pod_uids<'a>(
+    objects: impl IntoIterator<Item = &'a Value>,
+) -> std::collections::HashSet<(String, String)> {
+    objects
+        .into_iter()
+        .filter_map(|obj| {
+            let pending = needs_scheduling_pod(obj)?;
+            let uid = obj["metadata"]["uid"].as_str().unwrap_or_default();
+            Some((
+                format!("{}/{}", pending.namespace, pending.pod_name),
+                uid.to_owned(),
+            ))
+        })
+        .collect()
+}
+
 /// An in-memory, watch-maintained running tally of every bound, non-terminal
 /// pod's resource requests, keyed by "namespace/name".
 ///
@@ -1668,6 +1775,8 @@ pub struct NodeTally {
     /// live GET would have returned — preserving `select_node_with_capacity`'s
     /// list-order tie-break for nodes that score identically.
     nodes: std::collections::BTreeMap<String, NodeItem>,
+    /// Unschedulable-pod backoff and Event dedupe — see `FailureBackoff`.
+    pub failures: FailureBackoff,
 }
 
 /// A PVC's fields needed to resolve its backing CSI driver — see
@@ -1756,6 +1865,7 @@ impl NodeTally {
 
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.remove_pod(&key);
+            self.failures.clear(&key);
             // A deleted pod can never be re-driven — see `PvcWaiters::remove_pod`.
             self.pvc_waiters.remove_pod(&key);
             return self.waiters.resolve(&key);
@@ -1782,6 +1892,7 @@ impl NodeTally {
                 // re-driven off `resolve` any more (see
                 // `PvcWaiters::remove_pod`).
                 self.pvc_waiters.remove_pod(&key);
+                self.failures.clear(&key);
                 self.insert_pod(
                     key,
                     TalliedPod {
@@ -1924,8 +2035,13 @@ impl NodeTally {
     /// claims, PVC waiters) is still dropped, and the abandoned plans' keys
     /// are returned for the same reason as `clear`.
     #[must_use]
-    pub fn replace_pods(&mut self, fresh: &mut NodeTally) -> Vec<String> {
+    pub fn replace_pods(
+        &mut self,
+        fresh: &mut NodeTally,
+        unscheduled: &std::collections::HashSet<(String, String)>,
+    ) -> Vec<String> {
         let abandoned = self.clear();
+        self.failures.retain_pending(unscheduled);
         self.pods = std::mem::take(&mut fresh.pods);
         self.by_node = std::mem::take(&mut fresh.by_node);
         abandoned
@@ -2297,10 +2413,23 @@ impl NodeTally {
         self.pvc_waiters.clear();
     }
 
-    /// Replace the PVC cache with `fresh`'s — see `replace_pods`.
-    pub fn replace_pvc_cache(&mut self, fresh: &mut NodeTally) {
-        self.clear_pvc_cache();
+    /// Replace the PVC cache with `fresh`'s — see `replace_pods`. Waiters
+    /// survive the swap (a PVC event consumed into `fresh` during the replay
+    /// never reaches `apply_pvc_event`); those whose PVC the snapshot
+    /// contains are resolved and returned for the caller to re-drive.
+    pub fn replace_pvc_cache(&mut self, fresh: &mut NodeTally) -> Vec<String> {
         self.pvcs = std::mem::take(&mut fresh.pvcs);
+        let present: Vec<String> = self
+            .pvc_waiters
+            .by_pvc
+            .keys()
+            .filter(|key| self.pvcs.contains_key(*key))
+            .cloned()
+            .collect();
+        present
+            .iter()
+            .flat_map(|key| self.pvc_waiters.resolve(key))
+            .collect()
     }
 
     /// Drop the PV cache — see `clear_pvc_cache`'s doc comment.
@@ -2336,20 +2465,23 @@ impl NodeTally {
     }
 
     /// Update the node cache from one raw Node watch event — see `nodes`'s
-    /// doc comment.
-    pub fn apply_node_event(&mut self, event: &Value) {
+    /// doc comment. Returns true when the cached node was added or changed
+    /// (`NodeItem` holds only scheduling-relevant fields), so a kubelet status
+    /// heartbeat that alters nothing the predicates read does not requeue
+    /// pending pods.
+    pub fn apply_node_event(&mut self, event: &Value) -> bool {
         let Ok(watch_event) = WatchEvent::<NodeItem>::deserialize(event) else {
-            return;
+            return false;
         };
         let name = watch_event.object.metadata.name.clone();
         if name.is_empty() {
-            return;
+            return false;
         }
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.nodes.remove(&name);
-            return;
+            return false;
         }
-        self.nodes.insert(name, watch_event.object);
+        self.nodes.insert(name, watch_event.object.clone()) != Some(watch_event.object)
     }
 
     /// Drop the node cache — see `clear_pvc_cache`'s doc comment.
@@ -10498,6 +10630,79 @@ mod tests {
             ready.is_empty(),
             "an unrelated PVC's ADDED event must never resolve a different PVC's waiter — got \
              {ready:?}"
+        );
+    }
+
+    /// A PVC ADDED consumed into the replay buffer during a reconnect never
+    /// reaches `apply_pvc_event`, so the swap itself must hand back the pods
+    /// waiting on it; otherwise they wait out the 30s resync.
+    #[test]
+    fn replace_pvc_cache_resolves_waiters_whose_pvc_arrived_in_the_replay() {
+        let mut live = NodeTally::default();
+        live.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+        live.register_pvc_waiter("default", "still-missing", "default/populate-b".to_owned());
+        let mut fresh = NodeTally::default();
+        let _ = fresh.apply_pvc_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "prime-pvc", "namespace": "default" },
+                "spec": {}
+            }
+        }));
+
+        let ready = live.replace_pvc_cache(&mut fresh);
+
+        assert_eq!(ready, vec!["default/populate-a".to_owned()]);
+        let later = live.apply_pvc_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "still-missing", "namespace": "default" },
+                "spec": {}
+            }
+        }));
+        assert_eq!(
+            later,
+            vec!["default/populate-b".to_owned()],
+            "a waiter whose PVC is absent from the snapshot must survive the swap for its \
+             later ADDED event"
+        );
+    }
+
+    /// Kubelet heartbeats re-send the node object; requeueing every pending
+    /// pod on each would defeat the 30s backoff for genuinely unschedulable
+    /// pods, while a label/taint/allocatable change must always requeue.
+    #[test]
+    fn apply_node_event_reports_only_scheduling_relevant_changes() {
+        let node = |labels: Value| {
+            json!({
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": { "name": "n1", "labels": labels },
+                    "status": { "allocatable": { "cpu": "1" } }
+                }
+            })
+        };
+        let mut tally = NodeTally::default();
+
+        assert!(tally.apply_node_event(&node(json!({}))), "new node");
+        assert!(
+            !tally.apply_node_event(&node(json!({}))),
+            "an identical re-send must not requeue pending pods"
+        );
+        assert!(
+            tally.apply_node_event(&node(json!({"disk": "ssd"}))),
+            "a label change can make a pod with a nodeSelector schedulable"
+        );
+        assert!(
+            tally.apply_node_event(&json!({
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": { "name": "n1", "labels": {"disk": "ssd"} },
+                    "spec": { "taints": [{"key": "k", "effect": "NoSchedule"}] },
+                    "status": { "allocatable": { "cpu": "1" } }
+                }
+            })),
+            "a taint change must requeue"
         );
     }
 

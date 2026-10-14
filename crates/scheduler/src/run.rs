@@ -37,7 +37,8 @@ use crate::{
     patch_pod_status, pick_node, pods_needing_resync, preemption_reservation_still_fits,
     scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
-    stamp_selected_node_for_pvcs, stream_watch_events, BindError, NodeTally, PendingPod, PodList,
+    stamp_selected_node_for_pvcs, stream_watch_events, unscheduled_pod_uids, BindError, NodeTally,
+    PendingPod, PodList,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -553,7 +554,10 @@ impl PodReplay {
             |fresh, event| {
                 let _ = fresh.apply_event(event);
             },
-            |live, fresh| abandoned_deferred_binds = live.replace_pods(fresh),
+            |live, fresh| {
+                let unscheduled = unscheduled_pod_uids(self.deferred.iter().map(|e| &e["object"]));
+                abandoned_deferred_binds = live.replace_pods(fresh, &unscheduled);
+            },
         );
         match step {
             Replay::Consumed => {
@@ -590,26 +594,44 @@ impl PodReplay {
 /// `run_scheduler` joins every cache's `ready` before serving any scheduling
 /// decision. It is never reset: a later reconnect keeps serving the previous
 /// complete cache until its own bookmark swaps in the new one.
+///
+/// `apply` returns whether the event changed something a pending pod's last
+/// failure could depend on; a live change, and every cache swap, wake
+/// `requeue` (see `run_requeue_loop`).
+#[allow(clippy::too_many_arguments)]
 async fn run_cache_watch_loop(
     connector: TlsConnector,
     server: String,
     tally: Arc<Mutex<NodeTally>>,
     path: &'static str,
-    apply: fn(&mut NodeTally, &serde_json::Value),
+    apply: fn(&mut NodeTally, &serde_json::Value) -> bool,
     replace: fn(&mut NodeTally, &mut NodeTally),
     ready: tokio::sync::watch::Sender<bool>,
+    requeue: Arc<tokio::sync::Notify>,
 ) {
     loop {
         info!("starting cache watch on {path}");
         let tally_ref = &tally;
         let mut replay = ReplayBuffer::default();
         let result = stream_watch_events(&connector, &server, path, |event| {
-            match replay.absorb(&event, tally_ref, apply, replace) {
+            match replay.absorb(
+                &event,
+                tally_ref,
+                |fresh, event| {
+                    apply(fresh, event);
+                },
+                replace,
+            ) {
                 Replay::Consumed => {}
                 Replay::Synced => {
                     let _ = ready.send(true);
+                    requeue.notify_one();
                 }
-                Replay::Live => apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event),
+                Replay::Live => {
+                    if apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event) {
+                        requeue.notify_one();
+                    }
+                }
             }
         })
         .await;
@@ -635,30 +657,36 @@ async fn run_pvc_watch_loop(
     tally: Arc<Mutex<NodeTally>>,
     in_flight: Arc<Mutex<HashSet<String>>>,
     ready: tokio::sync::watch::Sender<bool>,
+    requeue: Arc<tokio::sync::Notify>,
 ) {
     loop {
         info!("starting cache watch on {PVC_WATCH_PATH}");
         let mut replay = ReplayBuffer::default();
         let result = stream_watch_events(&connector, &server, PVC_WATCH_PATH, |event| {
+            let mut waiting_pods = Vec::new();
             match replay.absorb(
                 &event,
                 &tally,
                 |fresh, event| {
                     fresh.apply_pvc_event(event);
                 },
-                NodeTally::replace_pvc_cache,
+                |live, fresh| waiting_pods = live.replace_pvc_cache(fresh),
             ) {
                 Replay::Consumed => return,
                 Replay::Synced => {
                     let _ = ready.send(true);
-                    return;
+                    requeue.notify_one();
                 }
-                Replay::Live => {}
+                Replay::Live => {
+                    if event["type"] != "BOOKMARK" {
+                        requeue.notify_one();
+                    }
+                    waiting_pods = tally
+                        .lock()
+                        .expect("tally lock poisoned")
+                        .apply_pvc_event(&event);
+                }
             }
-            let waiting_pods = tally
-                .lock()
-                .expect("tally lock poisoned")
-                .apply_pvc_event(&event);
             for pod_key in waiting_pods {
                 let connector = connector.clone();
                 let server = server.clone();
@@ -719,6 +747,14 @@ async fn redrive_pod(
     );
 }
 
+/// A real object event (not a bookmark heartbeat).
+fn is_object_event(event: &serde_json::Value) -> bool {
+    matches!(
+        event["type"].as_str(),
+        Some("ADDED" | "MODIFIED" | "DELETED")
+    )
+}
+
 /// True for the single synthetic BOOKMARK the apiserver sends to mark the end
 /// of a `sendInitialEvents=true` relist (Kubernetes 1.27+ informer protocol —
 /// see `crates/apiserver/src/handlers/watch.rs`). Distinct from an ordinary
@@ -760,27 +796,97 @@ async fn run_resync_loop(
     let _ = synced_rx.wait_for(|synced| *synced).await;
     loop {
         tokio::time::sleep(interval).await;
-        let (status, body) = match http_get(&connector, &server, RESYNC_PODS_PATH).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!("resync: GET {RESYNC_PODS_PATH} failed: {e}");
-                continue;
-            }
-        };
-        if !status.is_success() {
-            error!("resync: GET {RESYNC_PODS_PATH} returned {status}");
-            continue;
+        let _ = resync_once(&connector, &server, &in_flight, &tally, false).await;
+    }
+}
+
+/// One resync pass: re-list every unscheduled pod and re-attempt scheduling.
+/// With `respect_backoff`, pods still inside their `FailureBackoff` window
+/// are skipped; the periodic resync passes `false` and re-attempts them all.
+/// Returns the time until the earliest skipped backoff expires.
+async fn resync_once(
+    connector: &TlsConnector,
+    server: &str,
+    in_flight: &Arc<Mutex<HashSet<String>>>,
+    tally: &Arc<Mutex<NodeTally>>,
+    respect_backoff: bool,
+) -> Option<std::time::Duration> {
+    let (status, body) = match http_get(connector, server, RESYNC_PODS_PATH).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("resync: GET {RESYNC_PODS_PATH} failed: {e}");
+            return None;
         }
-        let list: PodList = match serde_json::from_str(&body) {
-            Ok(list) => list,
-            Err(e) => {
-                error!("resync: failed to parse pod list: {e}");
-                continue;
-            }
-        };
-        let in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
-        for event in pods_needing_resync(&list.items, &in_flight_snapshot) {
-            handle_pod_event(event, &connector, &server, &in_flight, &tally);
+    };
+    if !status.is_success() {
+        error!("resync: GET {RESYNC_PODS_PATH} returned {status}");
+        return None;
+    }
+    let list: PodList = match serde_json::from_str(&body) {
+        Ok(list) => list,
+        Err(e) => {
+            error!("resync: failed to parse pod list: {e}");
+            return None;
+        }
+    };
+    tally
+        .lock()
+        .expect("tally lock poisoned")
+        .failures
+        .retain_pending(&unscheduled_pod_uids(&list.items));
+    let mut in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
+    let mut earliest_expiry = None;
+    if respect_backoff {
+        let backed_off = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .failures
+            .backed_off(std::time::Instant::now());
+        earliest_expiry = backed_off.iter().map(|(_, left)| *left).min();
+        in_flight_snapshot.extend(backed_off.into_iter().map(|(key, _)| key));
+    }
+    for event in pods_needing_resync(&list.items, &in_flight_snapshot) {
+        handle_pod_event(event, connector, server, in_flight, tally);
+    }
+    earliest_expiry
+}
+
+/// Debounce between a cluster event and the requeue pass it triggers, so a
+/// burst (node registration, a PVC replay) costs one pass.
+const REQUEUE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Upstream's `MoveAllToActiveOrBackoffQueue` on a cluster event: when a
+/// node, PVC, PV, StorageClass, CSINode or CSIDriver change (or a cache
+/// swap) wakes `requeue`, re-attempt every unscheduled pod now instead of at
+/// the next `RESYNC_INTERVAL` tick. Re-attempting all of them rather than
+/// tracking which predicate each failed on costs one indexed list of
+/// unscheduled pods per debounced burst, and `handle_pod_event`'s `in_flight`
+/// dedup bounds the rest. Gated on the pod cache like `run_resync_loop`.
+async fn run_requeue_loop(
+    connector: TlsConnector,
+    server: String,
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    tally: Arc<Mutex<NodeTally>>,
+    mut synced_rx: tokio::sync::watch::Receiver<bool>,
+    requeue: Arc<tokio::sync::Notify>,
+) {
+    let _ = synced_rx.wait_for(|synced| *synced).await;
+    let mut rearm: Option<tokio::task::JoinHandle<()>> = None;
+    loop {
+        requeue.notified().await;
+        tokio::time::sleep(REQUEUE_DEBOUNCE).await;
+        // An event that lands while a pod is backing off is swallowed above;
+        // re-wake once the backoff expires so it is not left to the resync.
+        let wait = resync_once(&connector, &server, &in_flight, &tally, true).await;
+        if let Some(old) = rearm.take() {
+            old.abort();
+        }
+        if let Some(wait) = wait {
+            let requeue = requeue.clone();
+            rearm = Some(tokio::spawn(async move {
+                tokio::time::sleep(wait).await;
+                requeue.notify_one();
+            }));
         }
     }
 }
@@ -1243,12 +1349,20 @@ fn handle_pod_event(
             }
         };
 
+        let mut emit_event = true;
         let (reason, message, event_type) = match &outcome {
-            Ok(node) => (
-                "Scheduled",
-                format!("Successfully assigned {namespace}/{pod_name} to {node}"),
-                "Normal",
-            ),
+            Ok(node) => {
+                tally_clone
+                    .lock()
+                    .expect("tally lock poisoned")
+                    .failures
+                    .clear(&key);
+                (
+                    "Scheduled",
+                    format!("Successfully assigned {namespace}/{pod_name} to {node}"),
+                    "Normal",
+                )
+            }
             Err(e) => {
                 error!("scheduling error for {key}: {e}");
                 let message = format!("{e}");
@@ -1274,9 +1388,20 @@ fn handle_pod_event(
                         error!("failed to set PodScheduled=False status for {key}: {patch_err}");
                     }
                 }
+                let uid = event["object"]["metadata"]["uid"]
+                    .as_str()
+                    .unwrap_or_default();
+                emit_event = tally_clone
+                    .lock()
+                    .expect("tally lock poisoned")
+                    .failures
+                    .record_failure(&key, uid, &message, std::time::Instant::now());
                 ("FailedScheduling", message, "Warning")
             }
         };
+        if !emit_event {
+            return;
+        }
         if let Err(e) = emit_scheduling_event(
             &connector_clone,
             &server_clone,
@@ -1361,6 +1486,16 @@ pub async fn run_scheduler(
         let _ = caches_synced_tx.send(true);
     });
 
+    let requeue = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(run_requeue_loop(
+        connector.clone(),
+        server.clone(),
+        in_flight.clone(),
+        tally.clone(),
+        pods_synced_rx.clone(),
+        requeue.clone(),
+    ));
+
     // Periodic re-sync, independent of the watch stream below — see
     // `run_resync_loop`'s doc comment for what it does and why it is gated
     // on the pod watch's own initial sync (itself after `caches_synced`).
@@ -1392,35 +1527,48 @@ pub async fn run_scheduler(
         tally.clone(),
         in_flight.clone(),
         pvc_ready_tx,
+        requeue.clone(),
     ));
     for (path, apply, replace, ready) in [
         (
             PV_WATCH_PATH,
-            NodeTally::apply_pv_event as fn(&mut NodeTally, &serde_json::Value),
+            (|tally, event| {
+                NodeTally::apply_pv_event(tally, event);
+                is_object_event(event)
+            }) as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_pv_cache as fn(&mut NodeTally, &mut NodeTally),
             pv_ready_tx,
         ),
         (
             STORAGE_CLASS_WATCH_PATH,
-            NodeTally::apply_storage_class_event as fn(&mut NodeTally, &serde_json::Value),
+            (|tally, event| {
+                NodeTally::apply_storage_class_event(tally, event);
+                is_object_event(event)
+            }) as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_storage_class_cache as fn(&mut NodeTally, &mut NodeTally),
             storage_class_ready_tx,
         ),
         (
             CSI_NODE_WATCH_PATH,
-            NodeTally::apply_csi_node_event as fn(&mut NodeTally, &serde_json::Value),
+            (|tally, event| {
+                NodeTally::apply_csi_node_event(tally, event);
+                is_object_event(event)
+            }) as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_csi_node_cache as fn(&mut NodeTally, &mut NodeTally),
             csi_node_ready_tx,
         ),
         (
             CSI_DRIVER_WATCH_PATH,
-            NodeTally::apply_csi_driver_event as fn(&mut NodeTally, &serde_json::Value),
+            (|tally, event| {
+                NodeTally::apply_csi_driver_event(tally, event);
+                is_object_event(event)
+            }) as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_csi_driver_cache as fn(&mut NodeTally, &mut NodeTally),
             csi_driver_ready_tx,
         ),
         (
             NODE_WATCH_PATH,
-            NodeTally::apply_node_event as fn(&mut NodeTally, &serde_json::Value),
+            NodeTally::apply_node_event as fn(&mut NodeTally, &serde_json::Value) -> bool,
             NodeTally::replace_node_cache as fn(&mut NodeTally, &mut NodeTally),
             node_ready_tx,
         ),
@@ -1433,6 +1581,7 @@ pub async fn run_scheduler(
             apply,
             replace,
             ready,
+            requeue.clone(),
         ));
     }
 
@@ -2765,6 +2914,24 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<Mutex<Vec<String>>>,
     ) {
+        let (connector, server, bind_count, bound_nodes, _, _) =
+            spawn_counting_pvc_mock_server(flip_after).await;
+        (connector, server, bind_count, bound_nodes)
+    }
+
+    /// `spawn_missing_referenced_pvc_mock_server`, additionally returning the
+    /// number of `PATCH .../status` requests (one per failed scheduling
+    /// attempt) and `POST .../events` requests received.
+    async fn spawn_counting_pvc_mock_server(
+        flip_after: usize,
+    ) -> (
+        TlsConnector,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use rcgen::{CertificateParams, KeyPair, SanType};
         use rustls::pki_types::PrivateKeyDer;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2796,6 +2963,10 @@ mod tests {
         let pvc_get_count_srv = pvc_get_count.clone();
         let bound_nodes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let bound_nodes_srv = bound_nodes.clone();
+        let status_patches = Arc::new(AtomicUsize::new(0));
+        let status_patches_srv = status_patches.clone();
+        let event_posts = Arc::new(AtomicUsize::new(0));
+        let event_posts_srv = event_posts.clone();
 
         tokio::spawn(async move {
             loop {
@@ -2806,6 +2977,8 @@ mod tests {
                 let bind_count = bind_count_srv.clone();
                 let pvc_get_count = pvc_get_count_srv.clone();
                 let bound_nodes = bound_nodes_srv.clone();
+                let status_patches = status_patches_srv.clone();
+                let event_posts = event_posts_srv.clone();
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(tcp).await else {
                         return;
@@ -2921,6 +3094,11 @@ mod tests {
                             .push(node);
                         ("201 Created".to_owned(), r#"{"kind":"Binding"}"#.to_owned())
                     } else {
+                        if method == "PATCH" && path.ends_with("/status") {
+                            status_patches.fetch_add(1, Ordering::SeqCst);
+                        } else if method == "POST" && path.ends_with("/events") {
+                            event_posts.fetch_add(1, Ordering::SeqCst);
+                        }
                         (
                             "200 OK".to_owned(),
                             r#"{"kind":"Status","status":"Success"}"#.to_owned(),
@@ -2946,7 +3124,14 @@ mod tests {
         let connector = TlsConnector::from(Arc::new(client_config));
         let server = format!("https://127.0.0.1:{port}");
 
-        (connector, server, bind_count, bound_nodes)
+        (
+            connector,
+            server,
+            bind_count,
+            bound_nodes,
+            status_patches,
+            event_posts,
+        )
     }
 
     #[tokio::test]
@@ -3183,6 +3368,499 @@ mod tests {
             "the redriven attempt must bind to worker-0 — the only node, which does register \
              the driver its now-visible PVC needs"
         );
+    }
+
+    /// A pod that failed for lack of node capacity must bind as soon as a node
+    /// event makes room — via `run_requeue_loop` with no resync tick running —
+    /// not up to RESYNC_INTERVAL later (the 30s stall seen when a conformance
+    /// spec labels a node and expects prompt scheduling).
+    #[tokio::test]
+    async fn node_change_requeues_pending_pod_without_waiting_for_the_resync_tick() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, bind_count, bound_nodes) =
+            spawn_missing_referenced_pvc_mock_server(0).await;
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        let node_event = |cpu: &str| {
+            json!({
+                "type": "MODIFIED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": cpu}}}
+            })
+        };
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.apply_node_event(&node_event("50m"));
+            guard.apply_csi_node_event(&json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": "worker-0"},
+                    "spec": {"drivers": [{"name": "csi-hostpath.csi.k8s.io"}]}
+                }
+            }));
+        }
+
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            bind_count.load(Ordering::SeqCst),
+            0,
+            "the only node lacks the capacity, so the pod must stay pending"
+        );
+
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
+        tokio::spawn(run_requeue_loop(
+            connector.clone(),
+            server.clone(),
+            in_flight.clone(),
+            tally.clone(),
+            synced_rx,
+            requeue.clone(),
+        ));
+        let changed = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&node_event("1000m"));
+        assert!(changed);
+        requeue.notify_one();
+
+        wait_until(
+            || bind_count.load(Ordering::SeqCst) >= 1,
+            "the pending pod to bind right after the node event, with no resync loop running",
+        )
+        .await;
+        assert_eq!(
+            bound_nodes
+                .lock()
+                .expect("bound_nodes lock poisoned")
+                .as_slice(),
+            ["worker-0"]
+        );
+    }
+
+    type PendingFixture = (
+        TlsConnector,
+        String,
+        Arc<Mutex<HashSet<String>>>,
+        Arc<Mutex<NodeTally>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
+
+    fn worker_node_event(cpu: &str) -> serde_json::Value {
+        json!({
+            "type": "MODIFIED",
+            "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": cpu}}}
+        })
+    }
+
+    /// A pod that has already failed once for lack of CPU on its only node:
+    /// returns after the first FailedScheduling Event landed, plus the
+    /// (bind, status-patch, event) request counters.
+    async fn pod_failed_once_for_cpu() -> PendingFixture {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, bind_count, _bound, patches, events) =
+            spawn_counting_pvc_mock_server(0).await;
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.apply_node_event(&worker_node_event("50m"));
+            guard.apply_csi_node_event(&json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": "worker-0"},
+                    "spec": {"drivers": [{"name": "csi-hostpath.csi.k8s.io"}]}
+                }
+            }));
+        }
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        wait_until(
+            || events.load(Ordering::SeqCst) >= 1,
+            "the first FailedScheduling event",
+        )
+        .await;
+        (
+            connector, server, in_flight, tally, bind_count, patches, events,
+        )
+    }
+
+    /// Under PV/PVC churn every event wakes the requeue loop; without a
+    /// per-pod backoff each wake re-attempts the pod (a status PATCH and a
+    /// FailedScheduling Event POST each time), hammering a 1 vCPU apiserver.
+    #[tokio::test]
+    async fn event_burst_attempts_unschedulable_pod_at_most_twice_and_posts_one_event() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, in_flight, tally, _bind, patches, events) =
+            pod_failed_once_for_cpu().await;
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
+        tokio::spawn(run_requeue_loop(
+            connector,
+            server,
+            in_flight,
+            tally,
+            synced_rx,
+            requeue.clone(),
+        ));
+        for _ in 0..50 {
+            requeue.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let attempts = patches.load(Ordering::SeqCst);
+        assert!(
+            attempts <= 2,
+            "50 events inside ~1s must cost at most the first attempt plus one post-backoff \
+             retry, got {attempts} attempts"
+        );
+        assert_eq!(
+            events.load(Ordering::SeqCst),
+            1,
+            "an unchanged failure message must not be re-posted as a new Event inside the \
+             repeat window"
+        );
+    }
+
+    /// A pod backing off must not be stranded until the 30s resync: a node
+    /// change after its backoff expired binds it on the very next pass.
+    #[tokio::test]
+    async fn node_change_after_backoff_expiry_binds_promptly() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, in_flight, tally, bind_count, _patches, _events) =
+            pod_failed_once_for_cpu().await;
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
+        tokio::spawn(run_requeue_loop(
+            connector,
+            server,
+            in_flight,
+            tally.clone(),
+            synced_rx,
+            requeue.clone(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&worker_node_event("1000m")));
+        let changed_at = std::time::Instant::now();
+        requeue.notify_one();
+        wait_until(
+            || bind_count.load(Ordering::SeqCst) >= 1,
+            "the pod to bind after the node change once its backoff expired",
+        )
+        .await;
+        assert!(
+            changed_at.elapsed() < std::time::Duration::from_millis(600),
+            "a post-backoff node change must bind within the debounce, not wait on a timer"
+        );
+    }
+
+    /// With no event after the one that started the pass, the self re-wake
+    /// timer alone must re-attempt a backed-off pod once its backoff expires.
+    #[tokio::test]
+    async fn backed_off_pod_is_retried_by_the_rearm_timer_without_further_events() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, in_flight, tally, bind_count, _patches, _events) =
+            pod_failed_once_for_cpu().await;
+        assert!(tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&worker_node_event("1000m")));
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
+        tokio::spawn(run_requeue_loop(
+            connector,
+            server,
+            in_flight,
+            tally,
+            synced_rx,
+            requeue.clone(),
+        ));
+        requeue.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            bind_count.load(Ordering::SeqCst),
+            0,
+            "the pass must skip the pod while it is still inside its backoff"
+        );
+        wait_until(
+            || bind_count.load(Ordering::SeqCst) >= 1,
+            "the rearm timer to re-attempt the pod after its backoff expired",
+        )
+        .await;
+    }
+
+    #[test]
+    fn failure_backoff_doubles_to_cap_and_clears_on_bind() {
+        use std::time::{Duration, Instant};
+        let mut b = crate::FailureBackoff::default();
+        let t0 = Instant::now();
+        b.record_failure("default/p", "u1", "m", t0);
+        let left = |b: &crate::FailureBackoff, at: Duration| {
+            b.backed_off(t0 + at).into_iter().next().map(|(_, l)| l)
+        };
+        assert!(left(&b, Duration::from_millis(999)).is_some());
+        assert!(
+            left(&b, Duration::from_secs(1)).is_none(),
+            "initial backoff is 1s"
+        );
+        b.record_failure("default/p", "u1", "m", t0);
+        assert!(
+            left(&b, Duration::from_millis(1999)).is_some(),
+            "second failure doubles to 2s"
+        );
+        for _ in 0..10 {
+            b.record_failure("default/p", "u1", "m", t0);
+        }
+        assert!(left(&b, Duration::from_millis(9999)).is_some());
+        assert!(
+            left(&b, Duration::from_secs(10)).is_none(),
+            "backoff is capped at 10s"
+        );
+        b.clear("default/p");
+        assert!(
+            b.backed_off(t0).is_empty(),
+            "a bound or deleted pod must not stay backed off"
+        );
+    }
+
+    #[test]
+    fn failure_event_repeats_only_on_new_message_or_after_window() {
+        use std::time::{Duration, Instant};
+        let mut b = crate::FailureBackoff::default();
+        let t0 = Instant::now();
+        assert!(b.record_failure("default/p", "u1", "no fit", t0));
+        assert!(
+            !b.record_failure("default/p", "u1", "no fit", t0 + Duration::from_secs(30)),
+            "identical message inside the window is suppressed"
+        );
+        assert!(
+            b.record_failure("default/p", "u1", "taint", t0 + Duration::from_secs(31)),
+            "a changed reason must be reported immediately"
+        );
+        assert!(
+            b.record_failure("default/p", "u1", "taint", t0 + Duration::from_secs(91)),
+            "an unchanged failure is re-announced once the 60s window passes"
+        );
+    }
+
+    #[test]
+    fn pod_deletion_clears_failure_state() {
+        use std::time::Instant;
+        let mut tally = NodeTally::default();
+        tally
+            .failures
+            .record_failure("default/web-0", "u1", "m", Instant::now());
+        tally.apply_event(&json!({
+            "type": "DELETED",
+            "object": {"metadata": {"name": "web-0", "namespace": "default"}}
+        }));
+        assert!(
+            tally.failures.backed_off(Instant::now()).is_empty(),
+            "failure state must not outlive the pod"
+        );
+    }
+
+    #[test]
+    fn replay_swap_prunes_failure_state_of_pods_deleted_while_disconnected() {
+        use std::time::Instant;
+        let mut live = NodeTally::default();
+        for (key, uid) in [("default/gone", "u-gone"), ("default/kept", "u-kept")] {
+            live.failures.record_failure(key, uid, "m", Instant::now());
+        }
+        let replay = [json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "kept", "namespace": "default", "uid": "u-kept"},
+                "spec": {"nodeName": ""}
+            }
+        })];
+        let unscheduled = crate::unscheduled_pod_uids(replay.iter().map(|e| &e["object"]));
+        let _ = live.replace_pods(&mut NodeTally::default(), &unscheduled);
+        let left: Vec<String> = live
+            .failures
+            .backed_off(Instant::now())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            left,
+            ["default/kept"],
+            "a pod deleted while the watch was down must not leave backoff state behind forever"
+        );
+    }
+
+    #[test]
+    fn recreated_pod_does_not_inherit_a_stale_failure_entry() {
+        use std::time::Instant;
+        let mut b = crate::FailureBackoff::default();
+        let t0 = Instant::now();
+        assert!(b.record_failure("default/web-0", "old", "no fit", t0));
+        b.clear("default/web-0");
+        // The deleted pod's in-flight attempt finishes after the DELETED echo.
+        b.record_failure("default/web-0", "old", "no fit", t0);
+        assert!(
+            b.record_failure("default/web-0", "new", "no fit", t0),
+            "the recreated pod's first FailedScheduling Event must not be swallowed by its \
+             predecessor's dedupe window"
+        );
+        let left = b.backed_off(t0);
+        assert_eq!(left.len(), 1);
+        assert_eq!(
+            left[0].1,
+            std::time::Duration::from_secs(1),
+            "the recreated pod starts at the initial backoff, not its predecessor's count"
+        );
+    }
+
+    #[test]
+    fn retain_pending_drops_entry_of_recreated_pod_uid() {
+        use std::time::Instant;
+        let mut b = crate::FailureBackoff::default();
+        b.record_failure("default/web-0", "old", "m", Instant::now());
+        let pending =
+            std::collections::HashSet::from([("default/web-0".to_owned(), "new".to_owned())]);
+        b.retain_pending(&pending);
+        assert!(
+            b.backed_off(Instant::now()).is_empty(),
+            "a list showing a different UID under the same key means the tracked pod is gone"
+        );
+    }
+
+    /// A PVC ADDED through the real watch loop must wake the requeue pass —
+    /// a dropped notify would leave a pod waiting on its volume until the
+    /// 30s resync.
+    #[tokio::test]
+    async fn pvc_added_through_watch_loop_wakes_requeue() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            loop {
+                let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tls
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let events = [
+                json!({"type": "BOOKMARK", "object": {"kind": "PersistentVolumeClaim",
+                    "metadata": {"resourceVersion": "1",
+                        "annotations": {"k8s.io/initial-events-end": "true"}}}}),
+                json!({"type": "ADDED", "object": {
+                    "metadata": {"name": "data", "namespace": "default"},
+                    "spec": {"storageClassName": "csi-hostpath-class"}}}),
+            ];
+            for (i, event) in events.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                let mut line = event.to_string();
+                line.push('\n');
+                let chunk = format!("{:x}\r\n{line}\r\n", line.len());
+                let _ = tls.write_all(chunk.as_bytes()).await;
+                let _ = tls.flush().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(run_pvc_watch_loop(
+            connector,
+            format!("https://127.0.0.1:{port}"),
+            Arc::new(Mutex::new(NodeTally::default())),
+            Arc::new(Mutex::new(HashSet::new())),
+            ready_tx,
+            requeue.clone(),
+        ));
+        ready_rx
+            .wait_for(|ready| *ready)
+            .await
+            .expect("pvc cache to sync");
+        // Drain the permit the initial sync stored, so only the live ADDED
+        // can satisfy the wait below.
+        requeue.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), requeue.notified())
+            .await
+            .expect("a live PVC ADDED must wake the requeue loop");
     }
 
     /// Spin up an in-process TLS mock server for a PVC that NEVER appears
