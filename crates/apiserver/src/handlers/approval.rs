@@ -293,6 +293,11 @@ mod tests {
         h
     }
 
+    async fn current_rv(store: &Arc<SqliteStore>, name: &str) -> String {
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        store.get(&key).await.unwrap().unwrap().revision.to_string()
+    }
+
     async fn seed_csr(store: &Arc<SqliteStore>, name: &str, certificate: Option<&str>) -> String {
         let mut status = json!({
             "conditions": []
@@ -333,7 +338,7 @@ mod tests {
         let put_body = json!({
             "apiVersion": "certificates.k8s.io/v1",
             "kind": "CertificateSigningRequest",
-            "metadata": {"name": name, "resourceVersion": "1"},
+            "metadata": {"name": name, "resourceVersion": current_rv(&state.store, name).await},
             "spec": {
                 "request": "dGVzdA==",
                 "signerName": "kubernetes.io/kube-apiserver-client"
@@ -389,7 +394,7 @@ mod tests {
         let put_body = json!({
             "apiVersion": "certificates.k8s.io/v1",
             "kind": "CertificateSigningRequest",
-            "metadata": {"name": name, "resourceVersion": "1"},
+            "metadata": {"name": name, "resourceVersion": current_rv(&state.store, name).await},
             "spec": {
                 "request": "dGVzdA==",
                 "signerName": "kubernetes.io/kube-apiserver-client"
@@ -445,7 +450,7 @@ mod tests {
         let put_body = json!({
             "apiVersion": "certificates.k8s.io/v1",
             "kind": "CertificateSigningRequest",
-            "metadata": {"name": name, "resourceVersion": "1"},
+            "metadata": {"name": name, "resourceVersion": current_rv(&state.store, name).await},
             "spec": {
                 "request": "dGVzdA==",
                 "signerName": "kubernetes.io/kube-apiserver-client"
@@ -586,7 +591,7 @@ mod tests {
         let put_body = json!({
             "apiVersion": "certificates.k8s.io/v1",
             "kind": "CertificateSigningRequest",
-            "metadata": {"name": name, "resourceVersion": "1"},
+            "metadata": {"name": name, "resourceVersion": current_rv(&state.store, name).await},
             "spec": {
                 "request": "dGVzdA==",
                 "signerName": "kubernetes.io/kube-apiserver-client"

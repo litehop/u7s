@@ -1994,7 +1994,7 @@ mod tests {
                 }]
             }
         });
-        state
+        let seeded_rv = state
             .store
             .put(&key, bytes::Bytes::from(body.to_string()), Some(0))
             .await
@@ -2004,7 +2004,7 @@ mod tests {
 
         let stored = state.store.get(&key).await.unwrap().unwrap();
         assert_eq!(
-            stored.revision, 1,
+            stored.revision, seeded_rv,
             "an already-checked apiservice must not be re-written — resourceVersion must \
              stay put, or every status read would churn it"
         );

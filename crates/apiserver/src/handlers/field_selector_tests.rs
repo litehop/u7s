@@ -355,6 +355,14 @@ mod tests {
     async fn list_and_watch_select_the_same_objects_for_every_kind() {
         for case in cases() {
             let state = seeded_state(&case).await;
+            // Test states carry the always-present namespaces; they are not under test here.
+            let without_bootstrap = |mut v: Vec<String>| {
+                v.retain(|n| {
+                    !["default", "kube-system", "kube-public", "kube-node-lease"]
+                        .contains(&n.as_str())
+                });
+                v
+            };
             let listed = names(
                 call(&state, &case, case.selector, false)
                     .await
@@ -362,6 +370,7 @@ mod tests {
                 false,
             )
             .await;
+            let listed = without_bootstrap(listed);
             let watched = names(
                 call(&state, &case, case.selector, true)
                     .await
@@ -369,6 +378,7 @@ mod tests {
                 true,
             )
             .await;
+            let watched = without_bootstrap(watched);
             assert_eq!(
                 listed,
                 vec!["match".to_string()],

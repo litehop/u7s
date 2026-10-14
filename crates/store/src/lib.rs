@@ -199,6 +199,9 @@ pub enum CreateNamespacedError {
     /// it land in a namespace that is mid-deletion.
     #[error("namespace is being terminated")]
     NamespaceTerminating,
+    /// No namespace object exists at the checked key.
+    #[error("namespace not found")]
+    NamespaceNotFound,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -298,10 +301,8 @@ pub trait Store: Send + Sync + 'static {
     /// `None` for cluster-scoped creates, which skip the namespace check entirely and behave
     /// exactly like `put(key, value, Some(0))`.
     ///
-    /// A namespace that does not exist at `ns_key` is treated as active (not Terminating):
-    /// namespace-existence enforcement, where a caller wants it, is the caller's own job (see
-    /// e.g. pods.rs's `parse_namespace`), not this method's — it exists solely to close the
-    /// create-vs-delete phase-flip race, not to add a new validation rule.
+    /// A namespace that does not exist at `ns_key` yields `NamespaceNotFound`, checked in the
+    /// same transaction so a create can never land after the namespace's final removal.
     ///
     /// The default implementation (`get` the namespace, then `put`) is NOT atomic — it exists
     /// so callers that don't need real atomicity (test doubles wrapping another `Store`) don't
@@ -317,15 +318,14 @@ pub trait Store: Send + Sync + 'static {
     {
         async move {
             if let Some(ns_key) = ns_key {
-                if let Some(stored) = self
+                let stored = self
                     .get(ns_key)
                     .await
                     .map_err(CreateNamespacedError::Store)?
-                {
-                    if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
-                        if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
-                            return Err(CreateNamespacedError::NamespaceTerminating);
-                        }
+                    .ok_or(CreateNamespacedError::NamespaceNotFound)?;
+                if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                    if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
+                        return Err(CreateNamespacedError::NamespaceTerminating);
                     }
                 }
             }
