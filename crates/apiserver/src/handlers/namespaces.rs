@@ -3982,7 +3982,7 @@ mod tests {
         let namespace_name = "nscrd-shard-test";
         let group = format!("stable.{namespace_name}.example.com");
         let plural = "crontabs";
-        let prefix = crate::keys::group_list_prefix(&group, plural, None);
+        let prefix = crate::handlers::cr::cr_list_prefix(&group, plural, None);
 
         assert!(
             crate::handlers::crd::create_crd(
@@ -4042,9 +4042,8 @@ mod tests {
 
         delete_namespace_scoped_crds(&state, namespace_name).await;
 
-        assert_eq!(
-            store.compaction_horizon_for(&prefix),
-            rv,
+        assert!(
+            store.compaction_horizon_for(&prefix) >= rv,
             "delete_namespace_scoped_crds must eagerly free the resource-type shard rather than \
              waiting 120s for idle-GC, the same as crd::delete_crd does on its HTTP path -- \
              otherwise every namespace-scoped CRD deleted via namespace cascade-delete pins its \

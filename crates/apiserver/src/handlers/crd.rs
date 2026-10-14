@@ -1025,12 +1025,14 @@ fn set_terminating_condition(
 type InstanceDeletionFailure = (&'static str, String);
 
 /// Deletes every instance of the CRD's resource. Instances carrying their own finalizers are
-/// only marked for deletion, so the count of instances still present is returned.
+/// only marked for deletion, so the count of instances still present is returned, plus whether
+/// this pass issued any new delete (false means every remaining instance was already held by
+/// its own finalizers from an earlier pass).
 async fn delete_instances<S: Store>(
     state: &AppState<S>,
     group: &str,
     plural: &str,
-) -> Result<usize, InstanceDeletionFailure> {
+) -> Result<(usize, bool), InstanceDeletionFailure> {
     let prefix = crate::handlers::cr::cr_list_prefix(group, plural, None);
     let resp = state
         .store
@@ -1043,6 +1045,7 @@ async fn delete_instances<S: Store>(
             )
         })?;
     let mut remaining = 0;
+    let mut issued = false;
     let mut errors: Vec<String> = Vec::new();
     for item in resp.items {
         let Ok(mut obj) = Object::from_bytes(&item.value) else {
@@ -1053,6 +1056,7 @@ async fn delete_instances<S: Store>(
             remaining += 1;
             continue;
         }
+        issued = true;
         let result = if crate::handlers::generic::apply_delete_policy(&mut obj).is_some() {
             remaining += 1;
             state
@@ -1075,7 +1079,7 @@ async fn delete_instances<S: Store>(
         }
     }
     if errors.is_empty() {
-        Ok(remaining)
+        Ok((remaining, issued))
     } else {
         Err((
             "InstanceDeletionFailed",
@@ -1151,7 +1155,7 @@ pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) -> b
                 .unwrap_or("")
                 .to_string();
             match delete_instances(state, &group, &plural).await {
-                Ok(0) => {
+                Ok((0, _)) => {
                     set_terminating_condition(
                         &mut crd,
                         "False",
@@ -1159,14 +1163,26 @@ pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) -> b
                         "removed all instances",
                     );
                 }
-                Ok(_) => {
-                    // Instances are being deleted again; clear any earlier failure reason.
-                    if set_terminating_condition(
-                        &mut crd,
-                        "True",
-                        "InstanceDeletionInProgress",
-                        "CustomResource deletion is in progress",
-                    ) {
+                Ok((remaining, issued)) => {
+                    // Upstream polls for zero instances after the delete pass and reports
+                    // InstanceDeletionCheck when some never go away; here that is every
+                    // remaining instance already held by its own finalizers from a prior pass.
+                    // Otherwise deletes were just issued; this also clears any earlier failure.
+                    let (reason, message) = if issued {
+                        (
+                            "InstanceDeletionInProgress",
+                            "CustomResource deletion is in progress".to_string(),
+                        )
+                    } else {
+                        (
+                            "InstanceDeletionCheck",
+                            format!(
+                                "could not confirm zero CustomResources remaining: \
+                                 {remaining} instance(s) still present"
+                            ),
+                        )
+                    };
+                    if set_terminating_condition(&mut crd, "True", reason, &message) {
                         let _ = state
                             .store
                             .put(&key, Bytes::from(crd.to_string()), Some(rv))
@@ -1315,12 +1331,12 @@ async fn purge_crd<S: Store>(
     // Eagerly free this CRD's watch-ring shard(s) instead of waiting up to
     // RING_SHARD_IDLE_GRACE after the last watcher disconnects: a deleted CRD's resource type
     // can never be watched again, so there is no reason to hold its history alive. The prefix
-    // is version-independent (CRs are stored under `/registry/{group}/{plural}/...` regardless
+    // is version-independent (CRs are stored under `/registry/cr/{group}/{plural}/...` regardless
     // of served version), so this needs to run once per CRD, not once per version.
     if let Some(plural) = existing["spec"]["names"]["plural"].as_str() {
         state
             .store
-            .evict_resource_type(&crate::keys::group_list_prefix(&group, plural, None));
+            .evict_resource_type(&crate::handlers::cr::cr_list_prefix(&group, plural, None));
     }
 
     // Write a tombstone so CR handlers can return 410 Gone (not 404) for this
@@ -4705,7 +4721,7 @@ mod tests {
         let name = "widgets.teardown.example.com";
         let group = "teardown.example.com";
         let plural = "widgets";
-        let prefix = crate::keys::group_list_prefix(group, plural, None);
+        let prefix = crate::handlers::cr::cr_list_prefix(group, plural, None);
 
         create_crd(
             State(state.clone()),
@@ -4792,8 +4808,8 @@ mod tests {
         let name = "gadgets.teardown2.example.com";
         let group = "teardown2.example.com";
         let plural = "gadgets";
-        let cluster_prefix = crate::keys::group_list_prefix(group, plural, None);
-        let ns_prefix = crate::keys::group_list_prefix(group, plural, Some("default"));
+        let cluster_prefix = crate::handlers::cr::cr_list_prefix(group, plural, None);
+        let ns_prefix = crate::handlers::cr::cr_list_prefix(group, plural, Some("default"));
 
         create_crd(
             State(state.clone()),
@@ -4859,6 +4875,87 @@ mod tests {
              would then serve empty/synthetic replays to reconnecting watchers, and their \
              KiB-per-shard cost would leak until idle-GC (or forever if a watcher stays \
              connected)"
+        );
+    }
+
+    /// A connected CR watcher must see its objects DELETED when the CRD goes away, and the
+    /// CRD's CR watch-ring shard must be reclaimed while that watcher is still attached —
+    /// otherwise every deleted CRD leaks ring memory for as long as any client stays connected.
+    ///
+    /// Fails on revert to the wrong shard prefix (`group_list_prefix`, which is not where CRs
+    /// live): the CR shard stays live, so its horizon never advances off 0.
+    #[tokio::test]
+    async fn deleted_crd_cr_watcher_gets_terminal_event_and_shard_is_reclaimed() {
+        use futures_util::StreamExt;
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store, WatchEvent};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "sprockets.teardown3.example.com";
+        let group = "teardown3.example.com";
+        let plural = "sprockets";
+        let prefix = crate::handlers::cr::cr_list_prefix(group, plural, None);
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, group, plural),
+        )
+        .await
+        .expect("create must succeed");
+        let cr_key = format!("{prefix}default/sprocket-a");
+        let rv = store
+            .put(
+                &cr_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": format!("{group}/v1"), "kind": "Sprocket",
+                        "metadata": { "name": "sprocket-a", "namespace": "default" },
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("CR write must succeed");
+
+        let watch = store.watch(&prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(watch);
+        assert!(
+            matches!(watch.next().await, Some(WatchEvent::Added(o)) if o.key == cr_key),
+            "watcher must first see the existing CR"
+        );
+        assert_eq!(store.compaction_horizon_for(&prefix), 0);
+
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next())
+            .await
+            .expect("watcher must not hang after its CRD is deleted");
+        assert!(
+            matches!(&terminal, Some(WatchEvent::Deleted { key, .. }) if *key == cr_key),
+            "watcher of a deleted CRD must be told its objects are gone, got {terminal:?}"
+        );
+        assert!(
+            store.compaction_horizon_for(&prefix) >= rv,
+            "the CR watch-ring shard must be torn down with the CRD even while a watcher is \
+             still attached; otherwise each deleted CRD leaks its ring until every client leaves"
         );
     }
 }
@@ -5701,6 +5798,50 @@ mod ratchet_tests {
             terminating_condition(&state).await["reason"],
             "InstanceDeletionInProgress",
             "a stale failure reason would tell operators a recovered deletion is still broken"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalizer_held_instances_report_instance_deletion_check() {
+        let (_store, state) = fault_state();
+        create_fin_crd_in(&state).await;
+        let obj = serde_json::json!({
+            "apiVersion": "fin.io/v1", "kind": "Widget",
+            "metadata": {
+                "name": "held", "namespace": "default",
+                "finalizers": ["example.com/hold"],
+            },
+        });
+        state
+            .store
+            .put(
+                &format!("{FIN_CR_PREFIX}default/held"),
+                Bytes::from(obj.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed widget");
+        delete_fin_crd_in(&state).await;
+        assert_eq!(
+            terminating_condition(&state).await["reason"],
+            "InstanceDeletionInProgress",
+            "the pass that issues deletes is still in progress"
+        );
+
+        finalize_crd(&state, FIN_CRD).await;
+
+        let cond = terminating_condition(&state).await;
+        assert_eq!(cond["status"], "True");
+        assert_eq!(
+            cond["reason"], "InstanceDeletionCheck",
+            "operators must be told why the CRD is stuck: instances held by their own finalizers"
+        );
+        assert!(
+            cond["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not confirm zero CustomResources remaining: "),
+            "message must match upstream's wording, got {cond}"
         );
     }
 
