@@ -776,10 +776,15 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
 }
 
-/// Re-force `generation` to 1 after mutating webhooks on create: upstream runs
-/// `PrepareForCreate` after admission, so a webhook patch to `/metadata/generation` must not
-/// persist.
-fn force_cr_generation_on_create(obj: &mut serde_json::Value) {
+/// Upstream `customResourceStrategy.PrepareForCreate`, run after mutating admission: forces
+/// `generation` to 1 and, when the CRD version has a status subresource, drops `.status` so
+/// create cannot set it. A webhook patch to either must not persist.
+fn prepare_cr_for_create(ctx: &CrContext, obj: &mut serde_json::Value) {
+    if ctx.has_status_subresource {
+        if let Some(map) = obj.as_object_mut() {
+            map.remove("status");
+        }
+    }
     obj["metadata"]["generation"] = serde_json::json!(1i64);
 }
 
@@ -2856,7 +2861,7 @@ pub async fn create_cr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    force_cr_generation_on_create(&mut obj);
+    prepare_cr_for_create(&ctx, &mut obj);
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -3855,7 +3860,7 @@ pub async fn create_cr_namespaced<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    force_cr_generation_on_create(&mut obj);
+    prepare_cr_for_create(&ctx, &mut obj);
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -4506,7 +4511,7 @@ pub async fn patch_cr<S: Store>(
             dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-        force_cr_generation_on_create(&mut obj);
+        prepare_cr_for_create(&ctx, &mut obj);
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -4772,7 +4777,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-        force_cr_generation_on_create(&mut obj);
+        prepare_cr_for_create(&ctx, &mut obj);
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
 
@@ -25791,5 +25796,133 @@ mod tests {
              delete_cr_namespaced stops calling update_quota_status, the quota sticks at 1 \
              forever, permanently blocking any future create once the hard limit was ever hit"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CreatePath {
+        ClusterPost,
+        NamespacedPost,
+        ClusterSsa,
+        NamespacedSsa,
+    }
+
+    async fn create_cr_with_client_status(state: &AppState, path: CreatePath) -> serde_json::Value {
+        use axum::response::IntoResponse;
+        let ssa_headers = || {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+            );
+            h
+        };
+        let (group, version, plural, kind, ns) = match path {
+            CreatePath::ClusterPost | CreatePath::ClusterSsa => {
+                ("example.io", "v1", "widgets", "Widget", None)
+            }
+            CreatePath::NamespacedPost | CreatePath::NamespacedSsa => (
+                "argoproj.io",
+                "v1alpha1",
+                "applications",
+                "Application",
+                Some("argocd"),
+            ),
+        };
+        let mut metadata = serde_json::json!({ "name": "w" });
+        if let Some(ns) = ns {
+            metadata["namespace"] = serde_json::json!(ns);
+        }
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": format!("{group}/{version}"), "kind": kind,
+                "metadata": metadata,
+                "spec": { "a": 1 },
+                "status": { "phase": "client-chosen" }
+            })
+            .to_string(),
+        );
+        let (g, v, p) = (group.to_string(), version.to_string(), plural.to_string());
+        let resp = match path {
+            CreatePath::ClusterPost => create_cr(
+                State(state.clone()),
+                Path((g, v, p)),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response),
+            CreatePath::NamespacedPost => create_cr_namespaced(
+                State(state.clone()),
+                Path((g, v, "argocd".to_string(), p)),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response),
+            CreatePath::ClusterSsa => patch_cr(
+                State(state.clone()),
+                Path((g, v, p, "w".to_string())),
+                test_user(),
+                ssa_headers(),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response),
+            CreatePath::NamespacedSsa => patch_cr_namespaced(
+                State(state.clone()),
+                Path((g, v, "argocd".to_string(), p, "w".to_string())),
+                test_user(),
+                ssa_headers(),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response),
+        }
+        .unwrap_or_else(|e| panic!("{path:?} create must succeed, got: {e:?}"));
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Upstream PrepareForCreate drops `.status` when the status subresource is enabled, so
+    /// a client cannot fake controller-owned state (conditions, observedGeneration) at
+    /// creation. Every create entry point must apply it.
+    #[tokio::test]
+    async fn create_with_status_subresource_drops_client_status_on_every_create_path() {
+        for path in [
+            CreatePath::ClusterPost,
+            CreatePath::NamespacedPost,
+            CreatePath::ClusterSsa,
+            CreatePath::NamespacedSsa,
+        ] {
+            let state = make_state();
+            install_cluster_crd_with_status_subresource(&state).await;
+            install_crd_with_status_subresource(&state).await;
+            let obj = create_cr_with_client_status(&state, path).await;
+            assert!(
+                obj.get("status").is_none(),
+                "{path:?}: client-sent status must not survive create when the CRD has a \
+                 status subresource (got {obj})"
+            );
+            assert_eq!(obj["spec"]["a"], 1, "{path:?}: spec must be kept");
+        }
+    }
+
+    /// Without a status subresource `.status` is ordinary content and must be kept.
+    #[tokio::test]
+    async fn create_without_status_subresource_keeps_client_status() {
+        for path in [CreatePath::ClusterPost, CreatePath::NamespacedPost] {
+            let state = make_state();
+            install_cluster_crd(&state).await;
+            install_namespaced_crd(&state).await;
+            let obj = create_cr_with_client_status(&state, path).await;
+            assert_eq!(
+                obj["status"]["phase"], "client-chosen",
+                "{path:?}: a CRD without a status subresource treats status as plain data"
+            );
+        }
     }
 }
