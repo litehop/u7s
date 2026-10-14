@@ -6,7 +6,6 @@ use axum::{
 };
 use bytes::Bytes;
 use serde::Deserialize;
-use std::collections::HashSet;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
@@ -975,48 +974,13 @@ async fn delete_namespace_scoped_crds<S: Store>(state: &AppState<S>, namespace_n
             Some(n) if !n.is_empty() => n.to_string(),
             _ => continue,
         };
-        let key = format!("/registry/apiextensions.k8s.io/customresourcedefinitions/{crd_name}");
-        if let Err(e) = state.store.delete(&key, None).await {
-            tracing::warn!("cascade-delete CRD {crd_name} for namespace {namespace_name}: {e}");
-            continue;
+        // Same soft-delete as DELETE on the CRD: the finalizer removes its CRs, then purges
+        // the caches, discovery entry and watch shard and writes the group tombstone.
+        if let Err(e) =
+            crate::handlers::crd::soft_delete_crd(state, &crd_name, crd, item.revision).await
+        {
+            tracing::warn!("cascade-delete CRD {crd_name} for namespace {namespace_name}: {e:?}");
         }
-
-        // This is a direct store write on the CRD key, not a call into crd::delete_crd — so it
-        // must run the exact same cache eviction and discovery refresh crd::delete_crd runs
-        // after its own delete, or (a) find_crd (cr.rs) keeps serving the pre-delete
-        // CrContext/schema forever (its cache check has no tombstone/404 fallback to fall
-        // through to), and (b) /apis keeps advertising the deleted group forever, so KCM's
-        // namespace-controller re-discovers it on every resync, hits the tombstone's 410, and
-        // requeues the namespace drain forever.
-        let (group, versions, plural, resource_version) =
-            crate::handlers::crd::crd_cache_identity(&crd);
-        crate::handlers::crd::evict_cr_schema_cache(state, &group, &versions, &resource_version);
-        crate::handlers::crd::evict_cr_context_cache(state, &group, &plural, &versions);
-        crate::handlers::discovery::refresh_discovery_cache(state).await;
-        if !versions.is_empty() {
-            let target_api_versions: HashSet<String> =
-                versions.iter().map(|v| format!("{group}/{v}")).collect();
-            state
-                .cr_conversion_cache
-                .invalidate_by_target_api_versions(&target_api_versions);
-        }
-
-        // Mirrors crd::delete_crd's eager watch-ring-shard eviction: without it, this
-        // cascade-delete path leaves the deleted namespace-scoped CRD's shard alive until
-        // idle-GC reclaims it after RING_SHARD_IDLE_GRACE (120s) instead of freeing it now.
-        if !plural.is_empty() {
-            state
-                .store
-                .evict_resource_type(&crate::keys::group_list_prefix(&group, &plural, None));
-        }
-
-        let tombstone_key = crate::handlers::crd::deleted_group_tombstone_key(&group);
-        let tombstone_val =
-            serde_json::to_vec(&serde_json::json!({ "group": &group })).unwrap_or_default();
-        let _ = state
-            .store
-            .put(&tombstone_key, bytes::Bytes::from(tombstone_val), None)
-            .await;
     }
 }
 
@@ -3779,6 +3743,68 @@ mod tests {
             axum::http::StatusCode::GONE,
             "must be 410 Gone (delete_namespace_scoped_crds writes a group tombstone) rather \
              than a stale Ok(ctx) or an uncached 404"
+        );
+    }
+
+    // The cascade must go through the CRD finalizer: removing only the CRD key would leave its
+    // custom resources in the store, where they reappear if a same-named CRD is re-created.
+    #[tokio::test]
+    async fn delete_namespace_scoped_crds_removes_the_crds_custom_resources() {
+        let state = make_state();
+        let group = "stable.nscrd-cr-test.example.com";
+        crate::handlers::crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "CustomResourceDefinition",
+                    "metadata": { "name": format!("crontabs.{group}") },
+                    "spec": {
+                        "group": group,
+                        "names": {
+                            "plural": "crontabs",
+                            "singular": "crontab",
+                            "kind": "CronTab",
+                            "listKind": "CronTabList"
+                        },
+                        "scope": "Namespaced",
+                        "versions": [{ "name": "v1", "served": true, "storage": true }]
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("install CRD");
+        let cr_key = format!("/registry/cr/{group}/crontabs/default/ct1");
+        let cr = serde_json::json!({
+            "apiVersion": format!("{group}/v1"), "kind": "CronTab",
+            "metadata": { "name": "ct1", "namespace": "default" },
+        });
+        state
+            .store
+            .put(&cr_key, Bytes::from(cr.to_string()), Some(0))
+            .await
+            .expect("seed CR");
+
+        delete_namespace_scoped_crds(&state, "nscrd-cr-test").await;
+
+        assert!(
+            state
+                .store
+                .get(&format!(
+                    "/registry/apiextensions.k8s.io/customresourcedefinitions/crontabs.{group}"
+                ))
+                .await
+                .unwrap()
+                .is_none(),
+            "the cascade must remove the CRD"
+        );
+        assert!(
+            state.store.get(&cr_key).await.unwrap().is_none(),
+            "custom resources of a cascade-deleted CRD must not be orphaned in the store"
         );
     }
 

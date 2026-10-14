@@ -2465,6 +2465,12 @@ mod tests {
     const SAFE_NO_DRY_RUN_SIGNAL: &[&str] = &[
         "complete_finalizer_drain",
         "complete_cr_finalizer_drain",
+        // CRD finalization (finalize_crd and its helpers): reached from delete_crd only after
+        // its dry-run early-return, and from the background terminating-CRD sweep.
+        "finalize_crd",
+        "delete_instances",
+        "soft_delete_crd",
+        "purge_crd",
         "delete_finalized_namespace",
         "delete_namespace_scoped_crds",
         "update_quota_status",
