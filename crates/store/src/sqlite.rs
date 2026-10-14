@@ -3970,8 +3970,10 @@ mod tests {
         let mut expected_keys = Vec::new();
         for i in 0..20 {
             let key = format!("/registry/pods/default/pod-{i:02}");
-            // Uneven runs of Succeeded so page boundaries fall inside filtered-out stretches.
-            let succeeded = i % 2 == 0 || (8..12).contains(&i);
+            // With limit 3 (chunk of 4): pods 0-3 yield exactly 3 survivors and no probe row, and
+            // pods 4-7 are a whole filtered-out chunk, so boundaries fall on an exact-limit chunk
+            // and inside filtered-out stretches.
+            let succeeded = i == 0 || (4..8).contains(&i) || i == 11 || i == 14;
             let phase = if succeeded { "Succeeded" } else { "Running" };
             insert_pod_with_phase(&conn, &key, "default", &format!("pod-{i:02}"), phase);
             if !succeeded {
