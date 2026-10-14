@@ -777,6 +777,46 @@ assert "...and PRESERVES a branch whose id IS in --live-agents even with no PR a
   "$(origin_f_heads | grep -qxF 'refs/heads/worker/agent-liveagent' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 9. STEP G -- fix-round worktrees on fix-<PR> branches. STEP C only knows
+#    worker/agent-* names, so without STEP G these worktrees accumulate
+#    forever after the worker finishes.
+# ---------------------------------------------------------------------------
+
+BARE_G="$SANDBOX_ROOT/origin-g.git"
+git init -q --bare "$BARE_G"
+G="$SANDBOX_ROOT/step-g-repo"
+new_sandbox "$G"
+printf 'x\n' > "$G/file.txt"
+git -C "$G" add -A
+git -C "$G" commit -q -m initial
+git -C "$G" remote add origin "$BARE_G"
+git -C "$G" push -q origin main
+mkdir -p "$G/ai/worktrees"
+for pair in done:fix-1 live:fix-2 dirty:fix-3 unpushed:fix-4; do
+  id="${pair%%:*}"; br="${pair##*:}"
+  git -C "$G" branch "$br" main
+  git -C "$G" push -q origin "$br"
+  git -C "$G" worktree add -q "$G/ai/worktrees/agent-$id" "$br"
+done
+printf 'wip\n' > "$G/ai/worktrees/agent-dirty/wip.txt"
+git -C "$G/ai/worktrees/agent-dirty" add wip.txt
+git -C "$G/ai/worktrees/agent-unpushed" config user.email test@example.com
+git -C "$G/ai/worktrees/agent-unpushed" config user.name Test
+git -C "$G/ai/worktrees/agent-unpushed" commit -q --allow-empty -m "local only"
+
+LIVE_AGENTS="live" WORKTREE_HYGIENE_REPO_ROOT="$G" call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G reaps a finished fix-<PR> worktree (clean, pushed, agent not live) -- otherwise it survives every hygiene run until the mayor deletes it by hand" \
+  "$([ ! -d "$G/ai/worktrees/agent-done" ] && echo 1 || echo 0)"
+assert "...and deletes its local fix-<PR> branch" \
+  "$(! git -C "$G" rev-parse --verify -q refs/heads/fix-1 >/dev/null && echo 1 || echo 0)"
+assert "STEP G keeps a fix-<PR> worktree whose agent id is live -- reaping would pull the checkout from under a running worker" \
+  "$([ -d "$G/ai/worktrees/agent-live" ] && echo 1 || echo 0)"
+assert "STEP G keeps a worktree with uncommitted changes -- they exist nowhere else" \
+  "$([ -d "$G/ai/worktrees/agent-dirty" ] && echo 1 || echo 0)"
+assert "STEP G keeps a worktree with commits on no remote -- reaping would destroy unpushed work" \
+  "$([ -d "$G/ai/worktrees/agent-unpushed" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
