@@ -29,15 +29,13 @@ don't collide. Always pass `--kubelet-port <KUBELET_PORT>` to `run-all.sh` and
 `u7s-start.sh` — `run-all.sh` (via `lima-start.sh`) provisions the VM with this port
 automatically on first run; no separate provisioning step is needed.
 
-**Never `limactl stop <VM>` when you finish.** The mayor owns VM lifecycle across the
-whole session and reassigns your VM to the next worker once you're done — stopping it
-forces an unnecessary ~45s reprovision cost on whoever gets it next. Clean up only what
-you created: delete your own sonobuoy run if you started one (see the delete command
-later in this doc), leave the apiserver/kubelet/KCM stack running, and leave the VM
-itself running.
+**When you finish**, reap your host processes with
+`scripts/conformance/reset.sh --host-only --workdir "$PWD/temp/u7s" --port <PORT>`,
+then `limactl stop <VM_NAME>`, unless the mayor's brief says to leave the VM up for an
+immediate continuation round. See "Final step — reap your host processes" in
+`ai/prompts/mayor-dispatch-template.md`.
 
-**Bumping a VM's memory** (the one case where stopping it is legitimate) has two
-traps: `run-all.sh --reset` silently reverts `limactl edit --memory` because
+**Bumping a VM's memory** has two traps: `run-all.sh --reset` silently reverts `limactl edit --memory` because
 `--reset` reprovisions from `lima/kubelet.yaml` (4GiB default, no `--memory`
 override in `lima-start.sh`); and `limactl stop`/`start` kills
 kubelet (its systemd unit is disabled in the base image) — restarting KCM alone
@@ -49,7 +47,8 @@ scripts/conformance/run-all.sh --vm <VM> --stack-only --workdir <same-workdir>
 `--stack-only` (no `--reset`) reconnects kubelet without reprovisioning or
 touching the new memory setting. Only `limactl delete` + `run-all.sh --reset`
 gives a clean reprovision from `lima/kubelet.yaml`; use `limactl edit` instead
-when you want to keep disk state (certs, cached images).
+when you want to keep disk state (certs, cached images). After any stop, the next
+`run-all.sh` restarts the VM and reconnects kubelet.
 
 ---
 
@@ -184,7 +183,7 @@ comments for the heap-file relocation and SIGTERM-flush mechanics.
 ## Stack-only mode — live stack without sonobuoy
 
 Use `--stack-only` to bring up steps 1–5 (build, apiserver, kubelet, KCM, scheduler)
-and then stop, leaving the stack running for kubectl or direct-DB investigation. Step 6
+and then exit, leaving the stack up for kubectl or direct-DB investigation during the task (the Final step still reaps it and stops the VM). Step 6
 (sonobuoy) is skipped entirely — no sonobuoy pod is launched.
 
 This is the correct tool when you want to inspect cluster state, run kubectl commands

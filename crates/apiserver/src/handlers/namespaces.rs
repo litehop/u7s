@@ -302,7 +302,7 @@ pub(crate) async fn get_namespace<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
 
     Ok((
         StatusCode::OK,
@@ -310,6 +310,15 @@ pub(crate) async fn get_namespace<S: Store>(
         stored.value,
     )
         .into_response())
+}
+
+/// A PUT without a resourceVersion must still be conditioned on the revision just read, or a
+/// DELETE landing between that read and the write would be undone by an unconditional put
+/// recreating the namespace without its finalizers.
+const MAX_REPLACE_CONFLICT_RETRIES: u32 = 5;
+
+fn replace_put_precondition(client_rv: Option<u64>, stored_rv: Option<u64>) -> Option<u64> {
+    client_rv.or(stored_rv)
 }
 
 pub(crate) async fn replace_namespace<S: Store>(
@@ -343,96 +352,130 @@ pub(crate) async fn replace_namespace<S: Store>(
     // status.phase/status.conditions that the real namespace controller last wrote via
     // /status. Mirrors replace_pod's stored_status handling and the generic
     // replace_namespaced_resource in resource.rs.
-    let stored_obj = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
-    // Upstream disallows create-on-update for Namespace; creating here would skip the create
-    // preparation (spec.finalizers), so a later delete would orphan the namespace's content.
-    if stored_obj.is_none() {
-        return Err(Status::not_found(&name, "Namespace"));
-    }
-    let stored_status = stored_obj.as_ref().map(|v| v["status"].clone());
-    match stored_status {
-        Some(ref s) if !s.is_null() => {
-            obj.body["status"] = s.clone();
+    let original_body = obj.body.clone();
+    let mut attempt = 0u32;
+    let new_rv = loop {
+        attempt += 1;
+        obj.body = original_body.clone();
+        let stored_entry = state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let stored_revision = stored_entry.as_ref().map(|s| s.revision);
+        let stored_obj = stored_entry
+            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+        // Upstream disallows create-on-update for Namespace; creating here would skip the create
+        // preparation (spec.finalizers), so a later delete would orphan the namespace's content.
+        if stored_obj.is_none() {
+            return Err(Status::not_found(&name, "Namespace").for_resource("", "namespaces"));
         }
-        _ => {
-            obj.body.as_object_mut().map(|m| m.remove("status"));
-        }
-    }
-
-    // metadata.uid is immutable identity, exactly like the generic replace_namespaced_resource
-    // path (resource.rs): a blank incoming uid is restored from the stored object, but a
-    // non-blank incoming uid that mismatches the stored one is identity forgery, not a
-    // legitimate update — allowing it would let a client forge a match against a stale/foreign
-    // ownerReference (corrupting the garbage collector's cascade-GC decision) or defeat
-    // controllers' "same name, different uid ⇒ different object" recreate-detection. Namespace
-    // routes around the generic path entirely (bespoke handler), so it never got 2pzru's fix.
-    let stored_uid = stored_obj.as_ref().map(|v| v["metadata"]["uid"].clone());
-    let incoming_uid_blank = obj.body["metadata"]["uid"]
-        .as_str()
-        .map(str::is_empty)
-        .unwrap_or(true);
-    if incoming_uid_blank {
-        if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
-            if !uid.is_empty() {
-                obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+        let stored_status = stored_obj.as_ref().map(|v| v["status"].clone());
+        match stored_status {
+            Some(ref s) if !s.is_null() => {
+                obj.body["status"] = s.clone();
+            }
+            _ => {
+                obj.body.as_object_mut().map(|m| m.remove("status"));
             }
         }
-    } else if let Some(stored_uid_str) = stored_uid
-        .as_ref()
-        .and_then(|u| u.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
-        if incoming_uid_str != stored_uid_str {
-            return Err(Status::conflict(format!(
-                "Namespace \"{name}\": the object was updated with a mismatched uid \
+
+        // metadata.uid is immutable identity, exactly like the generic replace_namespaced_resource
+        // path (resource.rs): a blank incoming uid is restored from the stored object, but a
+        // non-blank incoming uid that mismatches the stored one is identity forgery, not a
+        // legitimate update — allowing it would let a client forge a match against a stale/foreign
+        // ownerReference (corrupting the garbage collector's cascade-GC decision) or defeat
+        // controllers' "same name, different uid ⇒ different object" recreate-detection. Namespace
+        // routes around the generic path entirely (bespoke handler), so it never got 2pzru's fix.
+        let stored_uid = stored_obj.as_ref().map(|v| v["metadata"]["uid"].clone());
+        let incoming_uid_blank = obj.body["metadata"]["uid"]
+            .as_str()
+            .map(str::is_empty)
+            .unwrap_or(true);
+        if incoming_uid_blank {
+            if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
+                if !uid.is_empty() {
+                    obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+                }
+            }
+        } else if let Some(stored_uid_str) = stored_uid
+            .as_ref()
+            .and_then(|u| u.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+            if incoming_uid_str != stored_uid_str {
+                return Err(Status::conflict(format!(
+                    "Namespace \"{name}\": the object was updated with a mismatched uid \
                  (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable"
-            )));
+                )));
+            }
         }
-    }
 
-    // Admission webhook pipeline (mutating then validating), threading the pre-existing
-    // namespace as oldObject — mirrors create_namespace's CREATE call above. Previously
-    // replace_namespace called neither hook at all, so a webhook registered for
-    // namespaces/UPDATE was silently skipped on every PUT.
-    let admission_ctx = AdmissionContext {
-        group: "",
-        version: "v1",
-        resource: "namespaces",
-        name: &name,
-        namespace: None,
-        operation: "UPDATE",
-        user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-            "extra": user.extra,
-        })),
-        dry_run: is_dry_run_header(&headers),
+        // Admission webhook pipeline (mutating then validating), threading the pre-existing
+        // namespace as oldObject — mirrors create_namespace's CREATE call above. Previously
+        // replace_namespace called neither hook at all, so a webhook registered for
+        // namespaces/UPDATE was silently skipped on every PUT.
+        let admission_ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "namespaces",
+            name: &name,
+            namespace: None,
+            operation: "UPDATE",
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+                "extra": user.extra,
+            })),
+            dry_run: is_dry_run_header(&headers),
+        };
+        obj.body =
+            run_mutating_webhooks(&state, obj.body, stored_obj.as_ref(), &admission_ctx).await?;
+
+        // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
+        // forged/scalar status the earlier restore already discarded, and this is the last point
+        // before persistence that can discard it again. Mirrors do_patch's (resource.rs) identical
+        // post-webhook re-restore on its generic PATCH/PUT-onto-live-object path.
+        match stored_status {
+            Some(ref s) if !s.is_null() => {
+                obj.body["status"] = s.clone();
+            }
+            _ => {
+                obj.body.as_object_mut().map(|m| m.remove("status"));
+            }
+        }
+
+        run_validating_webhooks(&state, &obj.body, stored_obj.as_ref(), &admission_ctx).await?;
+
+        // Dry-run: return the would-be replaced object without persisting — mirrors
+        // create_namespace's dry-run early-return (is_dry_run_header is the router-wide
+        // ?dryRun=All signal for handlers, like this one, with no Query<...> extractor of
+        // their own).
+        if is_dry_run_header(&headers) {
+            return Ok(Json(obj.body).into_response());
+        }
+
+        match state
+            .store
+            .put(
+                &key,
+                obj.to_bytes(),
+                replace_put_precondition(expected_revision, stored_revision),
+            )
+            .await
+        {
+            Ok(rv) => break rv,
+            // Upstream GuaranteedUpdate re-reads and retries an unconditional update on conflict.
+            Err(StoreError::RevisionMismatch { .. })
+                if expected_revision.is_none() && attempt < MAX_REPLACE_CONFLICT_RETRIES => {}
+            Err(e) => return Err(store_err_to_status(e, &name)),
+        }
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, stored_obj.as_ref(), &admission_ctx).await?;
 
-    // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
-    // forged/scalar status the earlier restore already discarded, and this is the last point
-    // before persistence that can discard it again. Mirrors do_patch's (resource.rs) identical
-    // post-webhook re-restore on its generic PATCH/PUT-onto-live-object path.
-    match stored_status {
-        Some(ref s) if !s.is_null() => {
-            obj.body["status"] = s.clone();
-        }
-        _ => {
-            obj.body.as_object_mut().map(|m| m.remove("status"));
-        }
-    }
+    obj.set_resource_version(new_rv);
 
-    run_validating_webhooks(&state, &obj.body, stored_obj.as_ref(), &admission_ctx).await?;
-
-    // Post-replace: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let replace_meta: ObjectMeta =
         ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
     let deletion_ts_set = replace_meta.deletion_timestamp.is_some();
@@ -443,23 +486,6 @@ pub(crate) async fn replace_namespace<S: Store>(
         .as_deref()
         .map(|f| f.is_empty())
         .unwrap_or(true);
-
-    // Dry-run: return the would-be replaced object without persisting — mirrors
-    // create_namespace's dry-run early-return (is_dry_run_header is the router-wide
-    // ?dryRun=All signal for handlers, like this one, with no Query<...> extractor of
-    // their own).
-    if is_dry_run_header(&headers) {
-        return Ok(Json(obj.body).into_response());
-    }
-
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), expected_revision)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
-
-    obj.set_resource_version(new_rv);
-
     if deletion_ts_set && finalizers_empty {
         delete_finalized_namespace(&state, &name).await;
     }
@@ -527,7 +553,7 @@ pub(crate) async fn patch_namespace<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -676,7 +702,7 @@ pub(crate) async fn finalize_namespace<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -761,7 +787,7 @@ pub(crate) async fn put_namespace_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -819,7 +845,7 @@ pub(crate) async fn patch_namespace_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -1009,7 +1035,7 @@ pub(crate) async fn delete_namespace<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -3583,6 +3609,111 @@ mod tests {
             state.store.get(cm_key).await.unwrap().is_some(),
             "namespace DELETE must not purge content in-process; that is the namespace \
              controller's job, via per-object DELETEs that run admission"
+        );
+    }
+
+    #[test]
+    fn replace_put_is_conditioned_on_the_read_revision_when_client_sends_no_resource_version() {
+        assert_eq!(
+            replace_put_precondition(None, Some(7)),
+            Some(7),
+            "an unconditional put would recreate a namespace deleted after the existence check"
+        );
+        assert_eq!(
+            replace_put_precondition(Some(3), Some(7)),
+            Some(3),
+            "a client-supplied resourceVersion keeps its own optimistic-concurrency check"
+        );
+    }
+
+    // The soft-delete DELETE is the only caller of delete_namespace_scoped_crds. If the call is
+    // dropped, a CRD whose group embeds the namespace name outlives it and KCM's discovery
+    // re-scan never settles, leaving the namespace Terminating forever; a CRD of an unrelated
+    // group must survive.
+    #[tokio::test]
+    async fn delete_terminating_namespace_removes_crds_whose_group_embeds_its_name_only() {
+        use crate::handlers::crd;
+        use u7s_store::Store;
+        let state = make_state();
+
+        for (group, plural, kind) in [
+            ("stable.cascade-ns.example.com", "crontabs", "CronTab"),
+            ("stable.other.example.com", "widgets", "Widget"),
+        ] {
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": { "name": format!("{plural}.{group}") },
+                        "spec": {
+                            "group": group,
+                            "names": { "plural": plural, "singular": plural,
+                                       "kind": kind, "listKind": format!("{kind}List") },
+                            "scope": "Namespaced",
+                            "versions": [{ "name": "v1", "served": true, "storage": true }]
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("install CRD {group}: {e:?}"));
+        }
+
+        let ns_key = crate::keys::cluster_object_key("namespaces", "cascade-ns");
+        state
+            .store
+            .put(
+                &ns_key,
+                bytes::Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Namespace",
+                        "metadata": { "name": "cascade-ns", "uid": "u-1", "resourceVersion": "1" },
+                        "spec": { "finalizers": ["kubernetes"] },
+                        "status": { "phase": "Active" }
+                    })
+                    .to_string(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("seed namespace");
+
+        delete_namespace(
+            State(state.clone()),
+            Path("cascade-ns".to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
+
+        assert!(
+            state.store.get(&ns_key).await.unwrap().is_some(),
+            "the namespace must stay Terminating while spec.finalizers is non-empty"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/apiextensions.k8s.io/customresourcedefinitions/crontabs.stable.cascade-ns.example.com")
+                .await
+                .unwrap()
+                .is_none(),
+            "a CRD whose group embeds the deleted namespace's name must be removed"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.stable.other.example.com")
+                .await
+                .unwrap()
+                .is_some(),
+            "a CRD of an unrelated group must not be touched"
         );
     }
 
@@ -6600,6 +6731,154 @@ mod admission_tests {
                 }))
             }),
         )
+    }
+
+    /// Registers a webhook that, on its first UPDATE admission call, bumps the namespace's
+    /// revision in the store — a deterministic concurrent write landing between
+    /// replace_namespace's read and its write.
+    async fn install_revision_bumping_webhook(store: Arc<SqliteStore>, ns: &str) {
+        let bumped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let key = crate::keys::cluster_object_key("namespaces", ns);
+        let bump_store = store.clone();
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let (store, key, bumped) = (bump_store.clone(), key.clone(), bumped.clone());
+                async move {
+                    if !bumped.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let cur = store.get(&key).await.unwrap().unwrap();
+                        let mut v: serde_json::Value = serde_json::from_slice(&cur.value).unwrap();
+                        v["metadata"]["labels"] = serde_json::json!({"concurrent": "writer"});
+                        store
+                            .put(
+                                &key,
+                                Bytes::from(serde_json::to_vec(&v).unwrap()),
+                                Some(cur.revision),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "test-uid", "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook(router).await;
+        std::mem::forget(_handle);
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "bump-on-update"},
+            "webhooks": [{
+                "name": "bump.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["namespaces"], "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/bump-on-update",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn ns_json(name: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}})
+                .to_string(),
+        )
+    }
+
+    async fn put_namespace_with_rv(
+        state: &crate::state::AppState<SqliteStore>,
+        name: &str,
+        rv: Option<&str>,
+    ) -> Result<(), crate::status::StatusError> {
+        let mut meta = serde_json::json!({"name": name, "labels": {"env": "prod"}});
+        if let Some(rv) = rv {
+            meta["resourceVersion"] = rv.into();
+        }
+        replace_namespace(
+            axum::extract::State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": meta})
+                    .to_string(),
+            ),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Upstream GuaranteedUpdate re-reads and retries an update that carries no
+    /// resourceVersion, so a concurrent label writer must never surface as a 409 to
+    /// `kubectl replace`-style unconditional PUTs.
+    #[tokio::test]
+    async fn unconditional_namespace_put_retries_when_a_concurrent_write_lands() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        create_namespace(
+            axum::extract::State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            ns_json("race-ns"),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect("create must succeed");
+        install_revision_bumping_webhook(store.clone(), "race-ns").await;
+
+        put_namespace_with_rv(&state, "race-ns", None)
+            .await
+            .map_err(|e| e.0)
+            .expect("unconditional PUT must retry past a concurrent write, not 409");
+
+        let stored = store
+            .get(&crate::keys::cluster_object_key("namespaces", "race-ns"))
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["metadata"]["labels"]["env"], "prod");
+    }
+
+    /// A client-supplied resourceVersion is the client's optimistic-concurrency contract:
+    /// a mismatch must stay a 409, never be silently retried over the other writer.
+    #[tokio::test]
+    async fn explicit_rv_namespace_put_still_409s_when_a_concurrent_write_lands() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        create_namespace(
+            axum::extract::State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            ns_json("race-rv-ns"),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect("create must succeed");
+        let rv = store
+            .get(&crate::keys::cluster_object_key("namespaces", "race-rv-ns"))
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+            .to_string();
+        install_revision_bumping_webhook(store.clone(), "race-rv-ns").await;
+
+        let err = put_namespace_with_rv(&state, "race-rv-ns", Some(&rv))
+            .await
+            .expect_err("stale explicit-RV PUT must fail");
+        assert_eq!(err.0, StatusCode::CONFLICT);
     }
 
     /// replace_namespace must invoke the validating admission pipeline.

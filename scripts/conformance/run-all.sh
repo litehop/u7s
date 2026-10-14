@@ -501,6 +501,14 @@ if [ -n "$EXTRA_NODE" ]; then
   U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
 fi
 
+# Node podCIDRs only exist once KCM runs, so a cni0 left over from a prior
+# session (VM kept, state wiped) can only be checked against the current
+# podCIDR here, before any pod sandbox is created on it.
+source "$DIR/_lib.sh"
+banner "Reconcile cni0 with node podCIDRs"
+reconcile_cni0 "${U7S_VM_NAME:-lima-node}" "$KUBECONFIG" "${U7S_VM_NAME:-lima-node}"
+[ -z "$EXTRA_NODE" ] || reconcile_cni0 "$EXTRA_NODE" "$KUBECONFIG" "$EXTRA_NODE"
+
 # kube-network-policies DaemonSet-Ready wait: lima-start.sh (Step 3, above) applies
 # the manifest but deliberately does not wait — DaemonSet pod materialization is
 # KCM's job (Step 4) and placement is the scheduler's (Step 5), so waiting inside
@@ -562,7 +570,6 @@ else
   # The parallel pass's results dir is recorded by 06-run-sonobuoy.sh; absent
   # when that pass died before retrieving results (taking the newest temp/e2e
   # entry instead would silently pick the disruptive pass's dir).
-  source "$DIR/_lib.sh"
   RUN_DIR=$(cat "$(sonobuoy_results_dir_file "$WORKDIR" parallel)" 2>/dev/null) || true
   if [ -n "$RUN_DIR" ]; then
     ARGV_JSON="[]"
@@ -650,7 +657,6 @@ else
     # (stamped at retrieval time, long after this apiserver was launched
     # with $DHAT_HEAP_FILE), which records it for the parallel pass.
     # `|| true`: a missing record is a soft lookup, not fatal under `set -e`.
-    source "$DIR/_lib.sh"
     RUN_DIR=$(cat "$(sonobuoy_results_dir_file "$WORKDIR" parallel)" 2>/dev/null) || true
     if [ -f "$DHAT_HEAP_FILE" ] && [ -n "$RUN_DIR" ]; then
       TIMESTAMP=$(basename "$RUN_DIR" | cut -d- -f1,2)

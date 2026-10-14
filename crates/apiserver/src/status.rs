@@ -28,6 +28,18 @@ pub struct Status {
 
 pub struct StatusError(pub StatusCode, pub Status);
 
+impl StatusError {
+    /// Upstream's NewNotFound(qualifiedResource, name) sets `details.kind` to the lowercase
+    /// plural resource and `details.group` to the API group, not the object Kind.
+    pub fn for_resource(mut self, group: &str, resource: &str) -> Self {
+        if let Some(d) = self.1.details.as_mut().and_then(|d| d.as_object_mut()) {
+            d.insert("kind".into(), resource.into());
+            d.insert("group".into(), group.into());
+        }
+        self
+    }
+}
+
 impl std::fmt::Debug for StatusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "StatusError({}: {})", self.0, self.1.message)
@@ -52,7 +64,7 @@ impl Status {
                 reason: "NotFound",
                 code: 404,
                 metadata: None,
-                details: None,
+                details: Some(Box::new(serde_json::json!({ "name": name, "kind": kind }))),
             },
         )
     }
@@ -343,6 +355,19 @@ impl Status {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // Upstream's NotFound carries details{name, group, kind=lowercase plural resource};
+    // clients (kubectl, client-go retries keyed on the missing object) read them instead of
+    // parsing the message, so a Kind there ("Widget") would mis-identify the resource.
+    #[test]
+    fn not_found_for_resource_carries_name_group_and_plural_kind_details() {
+        let StatusError(_, status) =
+            Status::not_found("web", "Widget").for_resource("example.com", "widgets");
+        let details = status.details.expect("NotFound must carry details");
+        assert_eq!(details["name"], "web");
+        assert_eq!(details["kind"], "widgets");
+        assert_eq!(details["group"], "example.com");
+    }
 
     // not_acceptable must produce HTTP 406 with reason "NotAcceptable" so client-go's
     // errors.IsNotAcceptable() returns true and the conformance test for Table 406 passes.

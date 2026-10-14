@@ -136,3 +136,47 @@ junit_spec_totals() {
   suite_nodes=$(grep -cE '<testcase name="\[(Report(Before|After)Suite|Synchronized(Before|After)Suite|BeforeSuite|AfterSuite)\][^"]*"[^>]*status="passed"' "$junit" || true)
   echo "$(( tests - ${skipped:-0} - suite_nodes )) ${failures:-0}"
 }
+
+_ipv4_to_int() {
+  local IFS=. a b c d
+  read -r a b c d <<<"$1"
+  echo $(( (a << 24) | (b << 16) | (c << 8) | d ))
+}
+
+# Pure decision: returns 0 (stale) when an IPv4 address (with or without /len)
+# lies outside the IPv4 pod CIDR. The CNI bridge plugin keeps cni0's address
+# across sessions, so a node re-assigned a different podCIDR (state wiped with
+# reset.sh --host-only, VM kept) leaves cni0 on the old subnet and flannel
+# fails with "failed to set bridge addr".
+cni0_addr_is_stale() {
+  local addr="${1%%/*}" cidr="$2" net len mask
+  net="${cidr%%/*}"
+  len="${cidr##*/}"
+  mask=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+  [ $(( $(_ipv4_to_int "$addr") & mask )) -ne $(( $(_ipv4_to_int "$net") & mask )) ]
+}
+
+# Deletes <vm>'s cni0 when its IPv4 address is outside <node>'s current IPv4
+# podCIDR (the next pod create recreates it correctly). A matching or absent
+# cni0 is left alone. Fails loud if no podCIDR is allocated.
+reconcile_cni0() {
+  local vm="$1" kubeconfig="$2" node="$3" cidr="" addr="" i
+  for i in $(seq 1 60); do
+    cidr=$(kubectl --kubeconfig="$kubeconfig" get node "$node" -o jsonpath='{.spec.podCIDRs}' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | head -1) || true
+    [ -n "$cidr" ] && break
+    sleep 1
+  done
+  if [ -z "$cidr" ]; then
+    echo "ERROR: node $node has no IPv4 podCIDR after 60s; cannot reconcile cni0 on $vm" >&2
+    return 1
+  fi
+  addr=$(limactl shell "$vm" ip -4 -o addr show dev cni0 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' | head -1 | cut -d' ' -f2) || true
+  if [ -z "$addr" ]; then
+    echo "cni0 on $vm: absent (node podCIDR $cidr); nothing to reconcile."
+  elif cni0_addr_is_stale "$addr" "$cidr"; then
+    echo "WARNING: cni0 on $vm has stale address $addr outside node $node podCIDR $cidr; deleting cni0 so it is recreated." >&2
+    limactl shell "$vm" sudo ip link delete cni0
+  else
+    echo "cni0 on $vm: $addr matches podCIDR $cidr; leaving it."
+  fi
+}

@@ -3,8 +3,9 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use u7s_scheduler::{
-    csi_topology_fit, resource_fits, select_node_with_capacity, NodeAllocatable, NodeItem,
-    NodeList, NodeMetadata, NodeSpec, NodeStatus, NodeUsage, PendingPod, ResourceRequests,
+    missing_required_csi_driver, resource_fits, select_node_with_capacity, NodeAllocatable,
+    NodeItem, NodeList, NodeMetadata, NodeSpec, NodeStatus, NodeUsage, PendingPod,
+    ResourceRequests,
 };
 
 /// 100m cpu / 128Mi memory: a realistic single-container request, small next
@@ -56,6 +57,7 @@ fn roomy_node(name: String, selector_value: &str) -> NodeItem {
         },
         csi_driver_headroom: Default::default(),
         csi_registered_drivers: Default::default(),
+        csi_prevent_scheduling_drivers: Default::default(),
     }
 }
 
@@ -134,13 +136,13 @@ fn bench_resource_fits(c: &mut Criterion) {
     group.finish();
 }
 
-/// `csi_topology_fit`'s only collection-shaped inputs are the node's
+/// `missing_required_csi_driver`'s only collection-shaped inputs are the node's
 /// registered-driver set and the pod's unbound-driver want-list — sized like
 /// `bench_resource_fits`, with every wanted driver registered so `.all(...)`
 /// must scan the whole want-list instead of short-circuiting on the first
 /// unregistered one (the worst case a real fit check hits).
-fn bench_csi_topology_fit(c: &mut Criterion) {
-    let mut group = c.benchmark_group("csi_topology_fit");
+fn bench_missing_required_csi_driver(c: &mut Criterion) {
+    let mut group = c.benchmark_group("missing_required_csi_driver");
     for size in [10usize, 100, 1000] {
         let registered: HashSet<String> = (0..size)
             .map(|i| format!("driver-{i}.csi.k8s.io"))
@@ -149,7 +151,13 @@ fn bench_csi_topology_fit(c: &mut Criterion) {
             .map(|i| format!("driver-{i}.csi.k8s.io"))
             .collect();
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
-            b.iter(|| csi_topology_fit(black_box(&registered), black_box(&wanted)));
+            b.iter(|| {
+                missing_required_csi_driver(
+                    black_box(&registered),
+                    black_box(&registered),
+                    black_box(&wanted),
+                )
+            });
         });
     }
     group.finish();
@@ -159,6 +167,6 @@ criterion_group!(
     benches,
     bench_select_node_with_capacity,
     bench_resource_fits,
-    bench_csi_topology_fit
+    bench_missing_required_csi_driver
 );
 criterion_main!(benches);

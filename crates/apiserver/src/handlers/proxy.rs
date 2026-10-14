@@ -6176,6 +6176,36 @@ mod tests {
             400,
             "node proxy must reject '%' in the node name"
         );
+
+        // `scheme:name:port` is the proxy subresource's own name syntax, and ':' is a valid
+        // path-segment character; a missing object must answer 404, never 400.
+        for (what, err) in [
+            (
+                "pod proxy",
+                resolve_pod_proxy_target(&state, "default", "https:pod:443")
+                    .await
+                    .err(),
+            ),
+            (
+                "service proxy",
+                resolve_service_proxy_target(&state, "default", "https:svc:443")
+                    .await
+                    .err(),
+            ),
+            (
+                "node proxy",
+                resolve_node_proxy_target(&state, "node:10250", "")
+                    .await
+                    .err(),
+            ),
+        ] {
+            let err = err.unwrap_or_else(|| panic!("{what} resolved a nonexistent object"));
+            assert_eq!(
+                err.0.as_u16(),
+                404,
+                "{what} must accept ':' in the name and fall through to the store miss"
+            );
+        }
     }
 
     /// pod proxy must return 404 when the pod does not exist.
