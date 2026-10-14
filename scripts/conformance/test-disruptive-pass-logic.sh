@@ -116,10 +116,62 @@ sed -n '/^suite_timeout_seconds() {/,/^}/p' "$SCRIPT" > "$SUITE_FUNC"
 source "$SUITE_FUNC"
 assert "conformance/default focus is capped at 3600s (~2x the 28 min slowest passing suite)" \
   "$([ "$(suite_timeout_seconds '')/$(suite_timeout_seconds 'ConfigMap')" = "3600/3600" ] && echo 1 || echo 0)"
-assert "csi-hostpath focus gets 5400s so a 43 min passing run is not cut off" \
-  "$([ "$(suite_timeout_seconds 'External Storage \[Driver: csi-hostpath\]')" = "5400" ] && echo 1 || echo 0)"
-assert "06 wires the cap into both the focus and certified-conformance sonobuoy invocations" \
-  "$([ "$(grep -c 'SONOBUOY_TIMEOUT_MARGIN_SECONDS ))"' "$SCRIPT")" = "2" ] && echo 1 || echo 0)"
+for f in 'External Storage \[Driver: csi-hostpath\]' '\[sig-storage\]' 'CSI Volumes' 'PersistentVolumes' 'Volume expand'; do
+  assert "storage/CSI focus '$f' gets 5400s so a 43 min passing run is not cut off" \
+    "$([ "$(suite_timeout_seconds "$f")" = "5400" ] && echo 1 || echo 0)"
+done
+assert "U7S_SUITE_TIMEOUT_S overrides the selected cap" \
+  "$([ "$(U7S_SUITE_TIMEOUT_S=7200 suite_timeout_seconds 'ConfigMap')/$(U7S_SUITE_TIMEOUT_S=120 suite_timeout_seconds 'CSI')" = "7200/120" ] && echo 1 || echo 0)"
+assert "a non-numeric U7S_SUITE_TIMEOUT_S fails loud instead of building a bad --timeout" \
+  "$(U7S_SUITE_TIMEOUT_S=abc suite_timeout_seconds x >/dev/null 2>&1 && echo 0 || echo 1)"
+
+# Run the REAL 06 (parallel pass) against stub limactl/kubectl and inspect the
+# sonobuoy argv it builds: ginkgo --timeout and sonobuoy --timeout must both
+# derive from the same cap, in every mode except --all-e2e.
+STUB="$TMP/stub"
+mkdir -p "$STUB"
+cat > "$STUB/limactl" <<'STUBEOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$LIMA_LOG"
+case "$*" in *"sonobuoy status"*) exit 1 ;; esac
+exit 0
+STUBEOF
+cat > "$STUB/kubectl" <<'STUBEOF'
+#!/bin/sh
+case "$*" in
+  *"-f -") cat > /dev/null ;;
+  *" get nodes"*) echo node/lima-node ;;
+esac
+STUBEOF
+chmod +x "$STUB/limactl" "$STUB/kubectl"
+: > "$TMP/kubeconfig"
+# CAP, when set, is passed as U7S_SUITE_TIMEOUT_S.
+run06() {
+  : > "$TMP/lima.log"
+  (
+    cd "$DIR/../.."
+    PATH="$STUB:$PATH" LIMA_LOG="$TMP/lima.log" KUBECONFIG="$TMP/kubeconfig" \
+      U7S_SUITE_TIMEOUT_S="${CAP:-}" "$SCRIPT" --pass parallel --workdir "$TMP/wd" "$@" >/dev/null 2>&1 || true
+  )
+  grep 'sudo sonobuoy run ' "$TMP/lima.log" | head -1
+}
+has_all() { local argv="$1"; shift; local p; for p in "$@"; do case "$argv" in *"$p"*) ;; *) echo 0; return ;; esac; done; echo 1; }
+ARGV="$(run06 --focus 'CSI Volumes')"
+assert "06 storage focus run: ginkgo --timeout=5400s and sonobuoy --timeout 6000 (cap + margin)" \
+  "$(has_all "$ARGV" '--timeout=5400s' '--timeout 6000' '--e2e-focus=CSI Volumes')"
+ARGV="$(run06 --focus 'ConfigMap')"
+assert "06 non-storage focus run: 3600s ginkgo cap and sonobuoy --timeout 4200" \
+  "$(has_all "$ARGV" '--timeout=3600s' '--timeout 4200')"
+ARGV="$(run06)"
+assert "06 certified-conformance run: 3600s ginkgo cap, sonobuoy --timeout 4200" \
+  "$(has_all "$ARGV" '--timeout=3600s' '--timeout 4200' '--mode=certified-conformance')"
+ARGV="$(CAP=100 run06 --focus 'CSI')"
+assert "06 honours U7S_SUITE_TIMEOUT_S in both the ginkgo and sonobuoy timeouts" \
+  "$(has_all "$ARGV" '--timeout=100s' '--timeout 700')"
+ARGV="$(run06 --all-e2e)"
+assert "06 --all-e2e keeps its 12h sonobuoy budget and adds no ginkgo suite cap" \
+  "$([ "$(has_all "$ARGV" '--timeout 43200')$(contains "$ARGV" ' --timeout=')" = "10" ] && echo 1 || echo 0)"
+
 
 # ---------------------------------------------------------------------------
 # 2. The wrapper runs BOTH passes (disruptive first) and fails if either fails.
@@ -240,10 +292,22 @@ assert "run-all.sh no longer guesses the results dir by mtime" \
   "$(grep -q 'ls -td' "$RUN_ALL" && echo 0 || echo 1)"
 assert "run-all.sh reads the parallel pass's recorded results dir (build.json + dhat heap)" \
   "$([ "$(grep -c 'cat "$(sonobuoy_results_dir_file "\$WORKDIR" parallel)"' "$RUN_ALL")" = 2 ] && echo 1 || echo 0)"
+# Execute the real `rm -f` line from run-all.sh (the line itself is the unit; the
+# rest of run-all.sh needs a whole rig) against a stale record.
+# shellcheck source=scripts/conformance/_lib.sh
+source "$DIR/_lib.sh"
+RM_LINE="$(grep -m1 '^  rm -f "$(sonobuoy_results_dir_file "$WORKDIR" parallel)"' "$RUN_ALL" || true)"
+WORKDIR="$TMP/wd-stale"; mkdir -p "$WORKDIR"
+echo /old/run > "$(sonobuoy_results_dir_file "$WORKDIR" parallel)"
+[ -n "$RM_LINE" ] && eval "$RM_LINE"
 assert "run-all.sh removes a stale parallel record before invoking 06 so an early 06 death cannot reuse an old run's dir" \
-  "$(grep -q 'rm -f "$(sonobuoy_results_dir_file "\$WORKDIR" parallel)"' "$RUN_ALL" && echo 1 || echo 0)"
-assert "06-run-sonobuoy.sh clears the stale record before a pass and writes it after retrieval" \
-  "$(grep -q 'rm -f "\$RESULTS_DIR_FILE"' "$SCRIPT" && grep -q 'echo "\$RUN_DIR" > "\$RESULTS_DIR_FILE"' "$SCRIPT" && echo 1 || echo 0)"
+  "$([ -n "$RM_LINE" ] && [ ! -e "$(sonobuoy_results_dir_file "$WORKDIR" parallel)" ] && echo 1 || echo 0)"
+# 06 against stubs that die at sonobuoy: a stale record must not survive the run.
+mkdir -p "$TMP/wd"
+echo /old/run > "$(sonobuoy_results_dir_file "$TMP/wd" parallel)"
+run06 --focus x >/dev/null
+assert "06-run-sonobuoy.sh clears the stale record at pass start (a pass that dies early leaves none)" \
+  "$([ ! -e "$(sonobuoy_results_dir_file "$TMP/wd" parallel)" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 4. One source of truth for the e2e-ssh key path: both scripts derive it from
