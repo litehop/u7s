@@ -478,6 +478,97 @@ const CSI_DRIVER_WATCH_PATH: &str =
 const NODE_WATCH_PATH: &str =
     "/api/v1/nodes?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
 
+/// What `ReplayBuffer::absorb` did with an event.
+enum Replay {
+    /// Part of the in-progress replay; the live tally is untouched.
+    Consumed,
+    /// The initial-events-end bookmark: the replayed state was just swapped in.
+    Synced,
+    /// The replay already completed on this connection; apply to the live tally.
+    Live,
+}
+
+/// Builds one watch connection's `sendInitialEvents=true` replay into a fresh
+/// `NodeTally`, so the live tally keeps its previous complete state until the
+/// initial-events-end bookmark swaps the finished replay in.
+#[derive(Default)]
+struct ReplayBuffer {
+    fresh: NodeTally,
+    synced: bool,
+}
+
+impl ReplayBuffer {
+    fn absorb(
+        &mut self,
+        event: &serde_json::Value,
+        live: &Mutex<NodeTally>,
+        apply: impl FnOnce(&mut NodeTally, &serde_json::Value),
+        replace: impl FnOnce(&mut NodeTally, &mut NodeTally),
+    ) -> Replay {
+        if self.synced {
+            return Replay::Live;
+        }
+        if is_initial_events_end_bookmark(event) {
+            replace(
+                &mut live.lock().expect("tally lock poisoned"),
+                &mut self.fresh,
+            );
+            self.synced = true;
+            return Replay::Synced;
+        }
+        apply(&mut self.fresh, event);
+        Replay::Consumed
+    }
+}
+
+/// What `PodReplay::absorb` decided for one pod watch event.
+enum PodReplayStep {
+    /// Mid-replay: held back, no scheduling decision may run yet.
+    Deferred,
+    /// The initial-events-end bookmark: the replayed pod state is now live.
+    /// `deferred` is every event held back during the replay, to be handled
+    /// in order now that the pod cache is complete.
+    Synced {
+        abandoned_deferred_binds: Vec<String>,
+        deferred: Vec<serde_json::Value>,
+    },
+    /// Replay already complete: handle immediately.
+    Live(serde_json::Value),
+}
+
+/// The pod watch's `ReplayBuffer`, plus the events whose handling (scheduling,
+/// gate-status patches) must wait until the replay has completed.
+#[derive(Default)]
+struct PodReplay {
+    buffer: ReplayBuffer,
+    deferred: Vec<serde_json::Value>,
+}
+
+impl PodReplay {
+    fn absorb(&mut self, event: serde_json::Value, live: &Mutex<NodeTally>) -> PodReplayStep {
+        let mut abandoned_deferred_binds = Vec::new();
+        let step = self.buffer.absorb(
+            &event,
+            live,
+            |fresh, event| {
+                let _ = fresh.apply_event(event);
+            },
+            |live, fresh| abandoned_deferred_binds = live.replace_pods(fresh),
+        );
+        match step {
+            Replay::Consumed => {
+                self.deferred.push(event);
+                PodReplayStep::Deferred
+            }
+            Replay::Synced => PodReplayStep::Synced {
+                abandoned_deferred_binds,
+                deferred: std::mem::take(&mut self.deferred),
+            },
+            Replay::Live => PodReplayStep::Live(event),
+        }
+    }
+}
+
 /// Run one of the scheduler's secondary cache-maintenance watches (PVC/PV/
 /// StorageClass/CSINode). Unlike the primary pod watch, these never trigger
 /// scheduling directly — they only keep `NodeTally`'s CSI-driver-resolution
@@ -486,37 +577,40 @@ const NODE_WATCH_PATH: &str =
 /// live GET chain per decision (see that function's doc comment for why the
 /// live-GET version raced under concurrent scheduling).
 ///
-/// `clear` runs before every (re)connect, including the first, for the same
-/// reason `NodeTally::clear` runs on the pod watch's own reconnect: a delete
-/// missed while disconnected would otherwise leave a phantom cache entry the
-/// fresh `sendInitialEvents=true` relist never corrects (it only re-adds
-/// what still exists).
+/// Every (re)connect replays into a fresh `NodeTally` (`ReplayBuffer`) and
+/// `replace` swaps the finished cache into the live tally at the
+/// initial-events-end bookmark (upstream informer `Replace`): a delete missed
+/// while disconnected is dropped by the swap, and a concurrent scheduling
+/// decision reads the previous complete cache, never an empty or partial
+/// replay.
 ///
 /// `ready` is set to `true` the first time this watch's initial
 /// `sendInitialEvents=true` relist completes (the apiserver's
 /// `k8s.io/initial-events-end` BOOKMARK — see `is_initial_events_end_bookmark`).
 /// `run_scheduler` joins every cache's `ready` before serving any scheduling
-/// decision. It is never reset: a later reconnect does not re-block scheduling.
+/// decision. It is never reset: a later reconnect keeps serving the previous
+/// complete cache until its own bookmark swaps in the new one.
 async fn run_cache_watch_loop(
     connector: TlsConnector,
     server: String,
     tally: Arc<Mutex<NodeTally>>,
     path: &'static str,
     apply: fn(&mut NodeTally, &serde_json::Value),
-    clear: fn(&mut NodeTally),
+    replace: fn(&mut NodeTally, &mut NodeTally),
     ready: tokio::sync::watch::Sender<bool>,
 ) {
     loop {
         info!("starting cache watch on {path}");
-        clear(&mut tally.lock().expect("tally lock poisoned"));
         let tally_ref = &tally;
-        let mut synced = false;
+        let mut replay = ReplayBuffer::default();
         let result = stream_watch_events(&connector, &server, path, |event| {
-            if !synced && is_initial_events_end_bookmark(&event) {
-                synced = true;
-                let _ = ready.send(true);
+            match replay.absorb(&event, tally_ref, apply, replace) {
+                Replay::Consumed => {}
+                Replay::Synced => {
+                    let _ = ready.send(true);
+                }
+                Replay::Live => apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event),
             }
-            apply(&mut tally_ref.lock().expect("tally lock poisoned"), &event);
         })
         .await;
         if let Err(e) = result {
@@ -544,12 +638,22 @@ async fn run_pvc_watch_loop(
 ) {
     loop {
         info!("starting cache watch on {PVC_WATCH_PATH}");
-        tally.lock().expect("tally lock poisoned").clear_pvc_cache();
-        let mut synced = false;
+        let mut replay = ReplayBuffer::default();
         let result = stream_watch_events(&connector, &server, PVC_WATCH_PATH, |event| {
-            if !synced && is_initial_events_end_bookmark(&event) {
-                synced = true;
-                let _ = ready.send(true);
+            match replay.absorb(
+                &event,
+                &tally,
+                |fresh, event| {
+                    fresh.apply_pvc_event(event);
+                },
+                NodeTally::replace_pvc_cache,
+            ) {
+                Replay::Consumed => return,
+                Replay::Synced => {
+                    let _ = ready.send(true);
+                    return;
+                }
+                Replay::Live => {}
             }
             let waiting_pods = tally
                 .lock()
@@ -633,10 +737,9 @@ fn is_initial_events_end_bookmark(event: &serde_json::Value) -> bool {
 /// (see `RESYNC_INTERVAL`'s doc comment for why the watch alone cannot be
 /// relied on to do that).
 ///
-/// `caches_synced_rx` gates the very first tick on the same all-caches
-/// readiness signal `run_scheduler`'s primary pod watch awaits, for the same
-/// reason: a tick that fired before every cache's initial sync landed would
-/// decide against partial state (no nodes, or an unsynced CSIDriver cache
+/// `synced_rx` gates the very first tick on every cache's initial sync,
+/// the pod cache included: a tick that fired earlier would decide against
+/// partial state (no nodes, a partial pod set, or an unsynced CSIDriver cache
 /// read as "no opt-in"), reproducing the primary watch's own gap via this
 /// independent 30s timer instead of a fresh connect. A function of its own (not inlined in
 /// `run_scheduler`) so this gating can be exercised directly in a test
@@ -651,10 +754,10 @@ async fn run_resync_loop(
     server: String,
     in_flight: Arc<Mutex<HashSet<String>>>,
     tally: Arc<Mutex<NodeTally>>,
-    mut caches_synced_rx: tokio::sync::watch::Receiver<bool>,
+    mut synced_rx: tokio::sync::watch::Receiver<bool>,
     interval: std::time::Duration,
 ) {
-    let _ = caches_synced_rx.wait_for(|synced| *synced).await;
+    let _ = synced_rx.wait_for(|synced| *synced).await;
     loop {
         tokio::time::sleep(interval).await;
         let (status, body) = match http_get(&connector, &server, RESYNC_PODS_PATH).await {
@@ -1245,6 +1348,10 @@ pub async fn run_scheduler(
     let csi_driver_ready_tx = new_cache_ready();
     let node_ready_tx = new_cache_ready();
     let (caches_synced_tx, mut caches_synced_rx) = tokio::sync::watch::channel(false);
+    let (pods_synced_tx, pods_synced_rx) = tokio::sync::watch::channel(false);
+    // Deferred until the pod watch's own bookmark: the pod cache feeds
+    // capacity, affinity and preemption, so no decision may run on a partial
+    // replay of it (upstream's pod informer is part of WaitForCacheSync too).
     tokio::spawn(async move {
         for mut rx in cache_ready_rxs {
             if rx.wait_for(|synced| *synced).await.is_err() {
@@ -1256,13 +1363,13 @@ pub async fn run_scheduler(
 
     // Periodic re-sync, independent of the watch stream below — see
     // `run_resync_loop`'s doc comment for what it does and why it is gated
-    // on `caches_synced_rx` the same way the primary pod watch is.
+    // on the pod watch's own initial sync (itself after `caches_synced`).
     tokio::spawn(run_resync_loop(
         connector.clone(),
         server.clone(),
         in_flight.clone(),
         tally.clone(),
-        caches_synced_rx.clone(),
+        pods_synced_rx,
         RESYNC_INTERVAL,
     ));
 
@@ -1286,35 +1393,35 @@ pub async fn run_scheduler(
         in_flight.clone(),
         pvc_ready_tx,
     ));
-    for (path, apply, clear, ready) in [
+    for (path, apply, replace, ready) in [
         (
             PV_WATCH_PATH,
             NodeTally::apply_pv_event as fn(&mut NodeTally, &serde_json::Value),
-            NodeTally::clear_pv_cache as fn(&mut NodeTally),
+            NodeTally::replace_pv_cache as fn(&mut NodeTally, &mut NodeTally),
             pv_ready_tx,
         ),
         (
             STORAGE_CLASS_WATCH_PATH,
             NodeTally::apply_storage_class_event as fn(&mut NodeTally, &serde_json::Value),
-            NodeTally::clear_storage_class_cache as fn(&mut NodeTally),
+            NodeTally::replace_storage_class_cache as fn(&mut NodeTally, &mut NodeTally),
             storage_class_ready_tx,
         ),
         (
             CSI_NODE_WATCH_PATH,
             NodeTally::apply_csi_node_event as fn(&mut NodeTally, &serde_json::Value),
-            NodeTally::clear_csi_node_cache as fn(&mut NodeTally),
+            NodeTally::replace_csi_node_cache as fn(&mut NodeTally, &mut NodeTally),
             csi_node_ready_tx,
         ),
         (
             CSI_DRIVER_WATCH_PATH,
             NodeTally::apply_csi_driver_event as fn(&mut NodeTally, &serde_json::Value),
-            NodeTally::clear_csi_driver_cache as fn(&mut NodeTally),
+            NodeTally::replace_csi_driver_cache as fn(&mut NodeTally, &mut NodeTally),
             csi_driver_ready_tx,
         ),
         (
             NODE_WATCH_PATH,
             NodeTally::apply_node_event as fn(&mut NodeTally, &serde_json::Value),
-            NodeTally::clear_node_cache as fn(&mut NodeTally),
+            NodeTally::replace_node_cache as fn(&mut NodeTally, &mut NodeTally),
             node_ready_tx,
         ),
     ] {
@@ -1324,7 +1431,7 @@ pub async fn run_scheduler(
             tally.clone(),
             path,
             apply,
-            clear,
+            replace,
             ready,
         ));
     }
@@ -1342,33 +1449,46 @@ pub async fn run_scheduler(
     loop {
         info!("starting pod watch on {POD_WATCH_PATH}");
         let path = POD_WATCH_PATH;
-        // Any preemption plan still waiting on a victim's real removal is
-        // abandoned by this clear — release `in_flight` for each one too, or
-        // a pod whose deferred bind can now never resolve (see
-        // `attempt_deferred_bind`) would stay wrongly deduped forever instead
-        // of being re-planned by the next watch tick or resync.
-        let abandoned_deferred_binds = tally.lock().expect("tally lock poisoned").clear();
-        if !abandoned_deferred_binds.is_empty() {
-            let mut guard = in_flight.lock().expect("in_flight lock poisoned");
-            for key in &abandoned_deferred_binds {
-                info!(
-                    "watch reconnect: releasing in_flight for {key} — its deferred \
-                     preemption bind was abandoned; the fresh watch replay or periodic \
-                     resync will re-plan it from scratch"
-                );
-                guard.remove(key);
-            }
-        }
-
         // Collect events; for each ADDED/MODIFIED pod with empty nodeName, schedule it.
         // We clone connector per loop iteration (cheap Arc clone inside).
         let connector_ref = &connector;
         let server_ref = &server;
         let in_flight_ref = &in_flight;
         let tally_ref = &tally;
+        let pods_synced_tx_ref = &pods_synced_tx;
+        let mut replay = PodReplay::default();
 
         let result = stream_watch_events(connector_ref, server_ref, path, |event| {
-            handle_pod_event(event, connector_ref, server_ref, in_flight_ref, tally_ref);
+            let events = match replay.absorb(event, tally_ref) {
+                PodReplayStep::Deferred => return,
+                PodReplayStep::Live(event) => vec![event],
+                PodReplayStep::Synced {
+                    abandoned_deferred_binds,
+                    deferred,
+                } => {
+                    // Any preemption plan still waiting on a victim's real removal
+                    // was abandoned by the swap — release `in_flight` for each one
+                    // too, or a pod whose deferred bind can now never resolve (see
+                    // `attempt_deferred_bind`) would stay wrongly deduped forever
+                    // instead of being re-planned by the next watch tick or resync.
+                    if !abandoned_deferred_binds.is_empty() {
+                        let mut guard = in_flight_ref.lock().expect("in_flight lock poisoned");
+                        for key in &abandoned_deferred_binds {
+                            info!(
+                                "watch reconnect: releasing in_flight for {key} — its deferred \
+                                 preemption bind was abandoned; the fresh watch replay or \
+                                 periodic resync will re-plan it from scratch"
+                            );
+                            guard.remove(key);
+                        }
+                    }
+                    let _ = pods_synced_tx_ref.send(true);
+                    deferred
+                }
+            };
+            for event in events {
+                handle_pod_event(event, connector_ref, server_ref, in_flight_ref, tally_ref);
+            }
         })
         .await;
 
@@ -3384,6 +3504,142 @@ mod tests {
             ready_after_delete.is_empty(),
             "a deleted pod's waiter must not linger — resolving its PVC afterward must not \
              hand back a pod key that no longer exists; got {ready_after_delete:?}"
+        );
+    }
+
+    fn replay_pod_event(name: &str, node: &str) -> serde_json::Value {
+        json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": name, "namespace": "default"},
+                "spec": {
+                    "nodeName": node,
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}]
+                },
+                "status": {}
+            }
+        })
+    }
+
+    fn end_bookmark() -> serde_json::Value {
+        json!({
+            "type": "BOOKMARK",
+            "object": {"metadata": {"annotations": {"k8s.io/initial-events-end": "true"}}}
+        })
+    }
+
+    /// A pod seen mid-replay must not reach scheduling before the pod
+    /// watch's own bookmark: capacity, affinity and preemption read the pod
+    /// cache, which is only complete then. Deciding earlier packs a node that
+    /// the not-yet-replayed pods already fill.
+    #[test]
+    fn pending_pod_seen_mid_replay_is_held_until_the_pod_bookmark() {
+        let live = Mutex::new(NodeTally::default());
+        let mut replay = PodReplay::default();
+
+        let pending = replay_pod_event("pending", "");
+        let step = replay.absorb(pending.clone(), &live);
+        assert!(
+            matches!(step, PodReplayStep::Deferred),
+            "a pending pod mid-replay must be held back, not handed to scheduling"
+        );
+        replay.absorb(replay_pod_event("bound", "node-a"), &live);
+
+        let step = replay.absorb(end_bookmark(), &live);
+        let PodReplayStep::Synced { deferred, .. } = step else {
+            panic!("the bookmark must complete the replay");
+        };
+        assert_eq!(
+            deferred[0], pending,
+            "held pods are released in arrival order"
+        );
+        assert_eq!(
+            live.lock().unwrap().pods_on("node-a").len(),
+            1,
+            "the replayed bound pod must be in the pod cache before any held pod is decided"
+        );
+        assert!(
+            matches!(
+                replay.absorb(replay_pod_event("later", ""), &live),
+                PodReplayStep::Live(_)
+            ),
+            "after the bookmark events flow straight through"
+        );
+    }
+
+    /// On reconnect the live pod cache must keep its previous complete state
+    /// until the new replay finishes: a decision racing the relist must never
+    /// see an empty or partial pod set, and a pod deleted while disconnected
+    /// must still vanish at the swap.
+    #[test]
+    fn pod_cache_reader_sees_old_state_during_reconnect_replay_then_the_new_one() {
+        let live = Mutex::new(NodeTally::default());
+        let mut first = PodReplay::default();
+        first.absorb(replay_pod_event("old-a", "node-a"), &live);
+        first.absorb(replay_pod_event("gone", "node-a"), &live);
+        first.absorb(end_bookmark(), &live);
+        assert_eq!(live.lock().unwrap().pods_on("node-a").len(), 2);
+
+        let mut second = PodReplay::default();
+        second.absorb(replay_pod_event("old-a", "node-a"), &live);
+        assert_eq!(
+            live.lock().unwrap().pods_on("node-a").len(),
+            2,
+            "mid-replay the reader must still see the old complete pod set"
+        );
+        second.absorb(end_bookmark(), &live);
+        assert_eq!(
+            live.lock().unwrap().pods_on("node-a").len(),
+            1,
+            "the swap must drop the pod deleted while disconnected"
+        );
+    }
+
+    /// Same guarantee for the secondary caches: an empty CSIDriver set reads
+    /// as "no opt-in" and would fail the CSI-driver check open mid-relist.
+    #[test]
+    fn csi_driver_cache_reader_never_sees_an_empty_set_during_reconnect_replay() {
+        let live = Mutex::new(NodeTally::default());
+        let driver = |name: &str| {
+            json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": name},
+                    "spec": {"preventPodSchedulingIfMissing": true}
+                }
+            })
+        };
+        let absorb = |replay: &mut ReplayBuffer, event: &serde_json::Value| {
+            replay.absorb(
+                event,
+                &live,
+                NodeTally::apply_csi_driver_event,
+                NodeTally::replace_csi_driver_cache,
+            )
+        };
+
+        let mut first = ReplayBuffer::default();
+        absorb(&mut first, &driver("old.csi"));
+        assert!(matches!(
+            absorb(&mut first, &end_bookmark()),
+            Replay::Synced
+        ));
+
+        let mut second = ReplayBuffer::default();
+        assert!(matches!(
+            absorb(&mut second, &driver("new.csi")),
+            Replay::Consumed
+        ));
+        let mid = live.lock().unwrap().csi_prevent_scheduling_drivers();
+        assert!(
+            mid.contains("old.csi") && !mid.contains("new.csi"),
+            "mid-replay readers must see the old complete set, got {mid:?}"
+        );
+        absorb(&mut second, &end_bookmark());
+        let after = live.lock().unwrap().csi_prevent_scheduling_drivers();
+        assert!(
+            after.contains("new.csi") && !after.contains("old.csi"),
+            "the bookmark must swap in the replayed set, got {after:?}"
         );
     }
 }
