@@ -688,20 +688,23 @@ gate_and_merge_prs() {
 # first (bd re-exports on the next write); any other failure to pull is
 # surfaced as a gate exception (exit 20) instead of aborting the tick.
 sync_checkout_to_main() {
-  local dirty_beads
+  local dirty_beads pull_blocked=0
   dirty_beads=$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no -- \
     .beads/issues.jsonl .beads/interactions.jsonl | cut -c4-)
   if [ -n "$dirty_beads" ]; then
     echo "mayor-tick: discarding regenerated bead JSONL before pull: $(printf '%s' "$dirty_beads" | tr '\n' ' ')"
     # shellcheck disable=SC2086
-    run_cmd git -C "$REPO_ROOT" restore --staged --worktree -- $dirty_beads
+    if ! run_cmd git -C "$REPO_ROOT" restore --staged --worktree -- $dirty_beads; then
+      pull_blocked=1
+    fi
   fi
   # Explicit fetch+merge of ONLY main, not a bare `pull --ff-only`:
   # the wildcard fetch refspec populates FETCH_HEAD with every
   # updated branch during a multi-PR merge cascade, and a bare pull
   # then tries to fast-forward to all of FETCH_HEAD at once ("Cannot
   # fast-forward to multiple branches", exit 128).
-  if ! run_cmd git -C "$REPO_ROOT" fetch origin main \
+  if [ "$pull_blocked" -eq 1 ] \
+    || ! run_cmd git -C "$REPO_ROOT" fetch origin main \
     || ! run_cmd git -C "$REPO_ROOT" merge --ff-only origin/main; then
     GATE_EXCEPTIONS+=("$(jq -nc '{reason:"checkout-pull-blocked"}')")
     QUEUE_WARNINGS+=("$(jq -nc --arg dirty "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no | cut -c4- | tr '\n' ' ')" '{reason:"checkout-pull-blocked", dirty_paths:$dirty}')")

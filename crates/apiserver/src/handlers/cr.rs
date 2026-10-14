@@ -2897,10 +2897,8 @@ pub async fn create_cr<S: Store>(
                         < crate::handlers::generic::MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
             {
                 attempts_made += 1;
-                name = format!(
-                    "{}{}",
+                name = crate::handlers::generic::generate_name(
                     generate_name_prefix.as_deref().unwrap_or_default(),
-                    crate::handlers::generic::generate_suffix()
                 );
                 obj["metadata"]["name"] = serde_json::Value::String(name.clone());
                 // Re-validate the regenerated name — mirrors create_resource's retry, which
@@ -3904,10 +3902,11 @@ pub async fn create_cr_namespaced<S: Store>(
             .await
         {
             Ok(rv) => break rv,
-            Err(u7s_store::CreateNamespacedError::NamespaceTerminating) => {
-                return Err(Status::forbidden(format!(
-                    "unable to create new content in namespace {ns} because it is being terminated"
-                )));
+            Err(
+                e @ (u7s_store::CreateNamespacedError::NamespaceTerminating
+                | u7s_store::CreateNamespacedError::NamespaceNotFound),
+            ) => {
+                return Err(Status::namespace_create_rejected(&ns, &e));
             }
             // The client never chose this name (it came from generateName) — a collision is
             // the server's random suffix landing on an existing object, not a real conflict
@@ -3919,10 +3918,8 @@ pub async fn create_cr_namespaced<S: Store>(
                 && attempts_made < crate::handlers::generic::MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
             {
                 attempts_made += 1;
-                name = format!(
-                    "{}{}",
+                name = crate::handlers::generic::generate_name(
                     generate_name_prefix.as_deref().unwrap_or_default(),
-                    crate::handlers::generic::generate_suffix()
                 );
                 obj["metadata"]["name"] = serde_json::Value::String(name.clone());
                 // Re-validate the regenerated name — mirrors create_resource's retry, which
@@ -4811,10 +4808,11 @@ pub async fn patch_cr_namespaced<S: Store>(
             .await
         {
             Ok(rv) => rv,
-            Err(u7s_store::CreateNamespacedError::NamespaceTerminating) => {
-                return Err(Status::forbidden(format!(
-                    "unable to create new content in namespace {ns} because it is being terminated"
-                )));
+            Err(
+                e @ (u7s_store::CreateNamespacedError::NamespaceTerminating
+                | u7s_store::CreateNamespacedError::NamespaceNotFound),
+            ) => {
+                return Err(Status::namespace_create_rejected(&ns, &e));
             }
             Err(u7s_store::CreateNamespacedError::Store(e)) => {
                 return Err(store_err_cr(e, &name, &ctx.kind))
@@ -5859,6 +5857,7 @@ mod tests {
 
     async fn install_namespaced_crd(state: &AppState) {
         use crate::handlers::crd;
+        crate::handlers::test_support::seed_namespace(state, "argocd").await;
         assert!(
             crd::create_crd(
                 State(state.clone()),
@@ -6352,6 +6351,8 @@ mod tests {
     async fn cluster_wide_list_for_namespaced_crd_returns_all_namespaces() {
         let state = make_state();
         install_namespaced_crd(&state).await;
+        crate::handlers::test_support::seed_namespace(&state, "ns-a").await;
+        crate::handlers::test_support::seed_namespace(&state, "ns-b").await;
 
         // Create CRs in two different namespaces.
         assert!(
@@ -6724,6 +6725,9 @@ mod tests {
             )
             .await
             .expect("seed CRD");
+        for ns in ["default", "argocd"] {
+            crate::handlers::test_support::seed_namespace_in(&*inner, ns).await;
+        }
         let collision_store = Arc::new(FirstPutAlreadyExistsStore::new(Arc::clone(&inner)));
         let state = AppState::new(
             Arc::clone(&collision_store),
@@ -10020,6 +10024,7 @@ mod tests {
 
     async fn install_crd_with_status_subresource(state: &AppState) {
         use crate::handlers::crd;
+        crate::handlers::test_support::seed_namespace(state, "argocd").await;
         assert!(
             crd::create_crd(
                 State(state.clone()),
@@ -18376,6 +18381,65 @@ mod tests {
         );
     }
 
+    /// A CR create (POST and SSA apply-create) into a namespace that does not exist must be
+    /// 404 and persist nothing, like every built-in kind — otherwise CR controllers leave
+    /// orphan instances in deleted namespaces that no namespace controller will drain.
+    ///
+    /// Fails on revert: without the store-level NamespaceNotFound gate both return 201.
+    #[tokio::test]
+    async fn namespaced_cr_creates_into_a_missing_namespace_are_404_on_post_and_ssa() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let post = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "ghost-ns".to_string(),
+                "applications".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body("ghost-app", "ghost-ns"),
+        )
+        .await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        let ssa = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "ghost-ns".to_string(),
+                "applications".to_string(),
+                "ghost-app".to_string(),
+            )),
+            test_user(),
+            headers,
+            app_body("ghost-app", "ghost-ns"),
+        )
+        .await;
+
+        for (label, err) in [("POST", post.err()), ("SSA apply-create", ssa.err())] {
+            let err = err.unwrap_or_else(|| panic!("{label} into a missing namespace must fail"));
+            assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND, "{label}");
+            assert_eq!(
+                err.1.message, "namespaces \"ghost-ns\" not found",
+                "{label}"
+            );
+        }
+        let key = cr_store_key("argoproj.io", "applications", Some("ghost-ns"), "ghost-app");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "no CR create path may leave an orphan in a missing namespace"
+        );
+    }
+
     // patch_cr_namespaced's SSA-upsert branch (is_ssa && stored_opt.is_none()) never called
     // quota::check_resource_quota, unlike create_cr_namespaced — so `kubectl apply
     // --server-side` on a not-yet-existing CR name could create a CR past a
@@ -24757,6 +24821,7 @@ mod tests {
 
     async fn install_namespaced_crd_with_scale_subresource(state: &AppState) {
         use crate::handlers::crd;
+        crate::handlers::test_support::seed_namespace(state, "argocd").await;
         assert!(
             crd::create_crd(
                 State(state.clone()),

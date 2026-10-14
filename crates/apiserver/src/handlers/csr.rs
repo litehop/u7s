@@ -34,7 +34,7 @@ use crate::{
     handlers::{
         field_selector::FieldSelector,
         generic::{
-            apply_label_selector, build_list_response, decode_continue, generate_suffix, lookup,
+            apply_label_selector, build_list_response, decode_continue, generate_name, lookup,
             parse_label_selector, resolve_valid_name, stamp_metadata, validate_path_segment,
             wants_generate_name, CollectionQuery, MAX_GENERATE_NAME_CREATE_ATTEMPTS,
         },
@@ -336,11 +336,7 @@ pub async fn create_csr<S: Store>(
                     && attempts_made < MAX_GENERATE_NAME_CREATE_ATTEMPTS =>
             {
                 attempts_made += 1;
-                name = format!(
-                    "{}{}",
-                    generate_name_prefix.as_deref().unwrap_or_default(),
-                    generate_suffix()
-                );
+                name = generate_name(generate_name_prefix.as_deref().unwrap_or_default());
                 obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
                 // Re-validate the regenerated name — mirrors create_resource's retry, which
                 // re-runs validating admission once per attempt, not just for the first

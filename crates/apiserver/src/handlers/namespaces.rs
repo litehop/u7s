@@ -1205,14 +1205,20 @@ mod tests {
         }
     }
 
-    // A generateName prefix that fills the 63-char budget leaves no room for the suffix, so
-    // the generated name overflows the label limit and must be refused, not stored.
+    // Upstream truncates the generateName base to 58 chars so a valid-length (<=63) prefix
+    // always yields a valid name; only a prefix that is itself over the label limit is refused.
     #[tokio::test]
-    async fn create_namespace_refuses_generate_name_that_overflows_label_limit() {
+    async fn create_namespace_truncates_generate_name_prefix_instead_of_overflowing() {
         let state = make_state();
-        let err = create_ns(&state, generate_name_body(&"a".repeat(62)))
+        assert!(
+            create_ns(&state, generate_name_body(&"a".repeat(62)))
+                .await
+                .is_ok(),
+            "62-char prefix must be truncated to 58 + 5-char suffix, not rejected"
+        );
+        let err = create_ns(&state, generate_name_body(&"a".repeat(64)))
             .await
-            .expect_err("62-char prefix + 5-char suffix exceeds 63");
+            .expect_err("64-char prefix is itself an invalid label");
         assert_invalid_name_field(&err, "metadata.generateName");
     }
 
@@ -1220,7 +1226,7 @@ mod tests {
     #[tokio::test]
     async fn create_namespace_accepts_valid_label_names() {
         let state = make_state();
-        for name in ["default", "kube-system", "a", "ns-1-x", &"a".repeat(63)] {
+        for name in ["kube-test", "a", "ns-1-x", &"a".repeat(63)] {
             assert!(
                 create_ns(&state, namespace_body(name)).await.is_ok(),
                 "{name:?} is a valid DNS-1123 label"
@@ -4511,7 +4517,7 @@ mod tests {
             "spec": { "finalizers": ["other-controller"] },
             "status": { "phase": "Terminating" }
         });
-        state
+        let seeded_rv = state
             .store
             .put(&key, bytes::Bytes::from(ns.to_string()), Some(0))
             .await
@@ -4525,7 +4531,7 @@ mod tests {
                 "metadata": {
                     "name": "put-drain-ns",
                     "uid": "00000000-0000-0000-0000-000000000004",
-                    "resourceVersion": "1",
+                    "resourceVersion": seeded_rv.to_string(),
                     "deletionTimestamp": "2024-01-01T00:00:00Z"
                 },
                 "spec": { "finalizers": [] },

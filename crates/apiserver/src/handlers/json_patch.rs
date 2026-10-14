@@ -2477,6 +2477,8 @@ mod tests {
         // ensure_availability_checked) — runs off a timer / a GET's side effect, never as part
         // of any client write request, so no dryRun=All ever reaches it to check.
         "check_and_persist_availability",
+        // Test fixture seeding Namespaces; not reachable from any request.
+        "seed_namespace_in",
     ];
 
     #[test]
