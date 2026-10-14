@@ -792,39 +792,54 @@ async fn run_resync_loop(
     let _ = synced_rx.wait_for(|synced| *synced).await;
     loop {
         tokio::time::sleep(interval).await;
-        resync_once(&connector, &server, &in_flight, &tally).await;
+        let _ = resync_once(&connector, &server, &in_flight, &tally, false).await;
     }
 }
 
 /// One resync pass: re-list every unscheduled pod and re-attempt scheduling.
+/// With `respect_backoff`, pods still inside their `FailureBackoff` window
+/// are skipped; the periodic resync passes `false` and re-attempts them all.
+/// Returns the time until the earliest skipped backoff expires.
 async fn resync_once(
     connector: &TlsConnector,
     server: &str,
     in_flight: &Arc<Mutex<HashSet<String>>>,
     tally: &Arc<Mutex<NodeTally>>,
-) {
+    respect_backoff: bool,
+) -> Option<std::time::Duration> {
     let (status, body) = match http_get(connector, server, RESYNC_PODS_PATH).await {
         Ok(resp) => resp,
         Err(e) => {
             error!("resync: GET {RESYNC_PODS_PATH} failed: {e}");
-            return;
+            return None;
         }
     };
     if !status.is_success() {
         error!("resync: GET {RESYNC_PODS_PATH} returned {status}");
-        return;
+        return None;
     }
     let list: PodList = match serde_json::from_str(&body) {
         Ok(list) => list,
         Err(e) => {
             error!("resync: failed to parse pod list: {e}");
-            return;
+            return None;
         }
     };
-    let in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
+    let mut in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
+    let mut earliest_expiry = None;
+    if respect_backoff {
+        let backed_off = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .failures
+            .backed_off(std::time::Instant::now());
+        earliest_expiry = backed_off.iter().map(|(_, left)| *left).min();
+        in_flight_snapshot.extend(backed_off.into_iter().map(|(key, _)| key));
+    }
     for event in pods_needing_resync(&list.items, &in_flight_snapshot) {
         handle_pod_event(event, connector, server, in_flight, tally);
     }
+    earliest_expiry
 }
 
 /// Debounce between a cluster event and the requeue pass it triggers, so a
@@ -847,10 +862,23 @@ async fn run_requeue_loop(
     requeue: Arc<tokio::sync::Notify>,
 ) {
     let _ = synced_rx.wait_for(|synced| *synced).await;
+    let mut rearm: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         requeue.notified().await;
         tokio::time::sleep(REQUEUE_DEBOUNCE).await;
-        resync_once(&connector, &server, &in_flight, &tally).await;
+        // An event that lands while a pod is backing off is swallowed above;
+        // re-wake once the backoff expires so it is not left to the resync.
+        let wait = resync_once(&connector, &server, &in_flight, &tally, true).await;
+        if let Some(old) = rearm.take() {
+            old.abort();
+        }
+        if let Some(wait) = wait {
+            let requeue = requeue.clone();
+            rearm = Some(tokio::spawn(async move {
+                tokio::time::sleep(wait).await;
+                requeue.notify_one();
+            }));
+        }
     }
 }
 
@@ -1312,12 +1340,20 @@ fn handle_pod_event(
             }
         };
 
+        let mut emit_event = true;
         let (reason, message, event_type) = match &outcome {
-            Ok(node) => (
-                "Scheduled",
-                format!("Successfully assigned {namespace}/{pod_name} to {node}"),
-                "Normal",
-            ),
+            Ok(node) => {
+                tally_clone
+                    .lock()
+                    .expect("tally lock poisoned")
+                    .failures
+                    .clear(&key);
+                (
+                    "Scheduled",
+                    format!("Successfully assigned {namespace}/{pod_name} to {node}"),
+                    "Normal",
+                )
+            }
             Err(e) => {
                 error!("scheduling error for {key}: {e}");
                 let message = format!("{e}");
@@ -1343,9 +1379,17 @@ fn handle_pod_event(
                         error!("failed to set PodScheduled=False status for {key}: {patch_err}");
                     }
                 }
+                emit_event = tally_clone
+                    .lock()
+                    .expect("tally lock poisoned")
+                    .failures
+                    .record_failure(&key, &message, std::time::Instant::now());
                 ("FailedScheduling", message, "Warning")
             }
         };
+        if !emit_event {
+            return;
+        }
         if let Err(e) = emit_scheduling_event(
             &connector_clone,
             &server_clone,
@@ -2858,6 +2902,24 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<Mutex<Vec<String>>>,
     ) {
+        let (connector, server, bind_count, bound_nodes, _, _) =
+            spawn_counting_pvc_mock_server(flip_after).await;
+        (connector, server, bind_count, bound_nodes)
+    }
+
+    /// `spawn_missing_referenced_pvc_mock_server`, additionally returning the
+    /// number of `PATCH .../status` requests (one per failed scheduling
+    /// attempt) and `POST .../events` requests received.
+    async fn spawn_counting_pvc_mock_server(
+        flip_after: usize,
+    ) -> (
+        TlsConnector,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use rcgen::{CertificateParams, KeyPair, SanType};
         use rustls::pki_types::PrivateKeyDer;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2889,6 +2951,10 @@ mod tests {
         let pvc_get_count_srv = pvc_get_count.clone();
         let bound_nodes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let bound_nodes_srv = bound_nodes.clone();
+        let status_patches = Arc::new(AtomicUsize::new(0));
+        let status_patches_srv = status_patches.clone();
+        let event_posts = Arc::new(AtomicUsize::new(0));
+        let event_posts_srv = event_posts.clone();
 
         tokio::spawn(async move {
             loop {
@@ -2899,6 +2965,8 @@ mod tests {
                 let bind_count = bind_count_srv.clone();
                 let pvc_get_count = pvc_get_count_srv.clone();
                 let bound_nodes = bound_nodes_srv.clone();
+                let status_patches = status_patches_srv.clone();
+                let event_posts = event_posts_srv.clone();
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(tcp).await else {
                         return;
@@ -3014,6 +3082,11 @@ mod tests {
                             .push(node);
                         ("201 Created".to_owned(), r#"{"kind":"Binding"}"#.to_owned())
                     } else {
+                        if method == "PATCH" && path.ends_with("/status") {
+                            status_patches.fetch_add(1, Ordering::SeqCst);
+                        } else if method == "POST" && path.ends_with("/events") {
+                            event_posts.fetch_add(1, Ordering::SeqCst);
+                        }
                         (
                             "200 OK".to_owned(),
                             r#"{"kind":"Status","status":"Success"}"#.to_owned(),
@@ -3039,7 +3112,14 @@ mod tests {
         let connector = TlsConnector::from(Arc::new(client_config));
         let server = format!("https://127.0.0.1:{port}");
 
-        (connector, server, bind_count, bound_nodes)
+        (
+            connector,
+            server,
+            bind_count,
+            bound_nodes,
+            status_patches,
+            event_posts,
+        )
     }
 
     #[tokio::test]
@@ -3358,6 +3438,315 @@ mod tests {
                 .as_slice(),
             ["worker-0"]
         );
+    }
+
+    type PendingFixture = (
+        TlsConnector,
+        String,
+        Arc<Mutex<HashSet<String>>>,
+        Arc<Mutex<NodeTally>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
+
+    fn worker_node_event(cpu: &str) -> serde_json::Value {
+        json!({
+            "type": "MODIFIED",
+            "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": cpu}}}
+        })
+    }
+
+    /// A pod that has already failed once for lack of CPU on its only node:
+    /// returns after the first FailedScheduling Event landed, plus the
+    /// (bind, status-patch, event) request counters.
+    async fn pod_failed_once_for_cpu() -> PendingFixture {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, bind_count, _bound, patches, events) =
+            spawn_counting_pvc_mock_server(0).await;
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.apply_node_event(&worker_node_event("50m"));
+            guard.apply_csi_node_event(&json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": "worker-0"},
+                    "spec": {"drivers": [{"name": "csi-hostpath.csi.k8s.io"}]}
+                }
+            }));
+        }
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "target", "persistentVolumeClaim": {"claimName": "prime-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        wait_until(
+            || events.load(Ordering::SeqCst) >= 1,
+            "the first FailedScheduling event",
+        )
+        .await;
+        (
+            connector, server, in_flight, tally, bind_count, patches, events,
+        )
+    }
+
+    /// Under PV/PVC churn every event wakes the requeue loop; without a
+    /// per-pod backoff each wake re-attempts the pod (a status PATCH and a
+    /// FailedScheduling Event POST each time), hammering a 1 vCPU apiserver.
+    #[tokio::test]
+    async fn event_burst_attempts_unschedulable_pod_at_most_twice_and_posts_one_event() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, in_flight, tally, _bind, patches, events) =
+            pod_failed_once_for_cpu().await;
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
+        tokio::spawn(run_requeue_loop(
+            connector,
+            server,
+            in_flight,
+            tally,
+            synced_rx,
+            requeue.clone(),
+        ));
+        for _ in 0..50 {
+            requeue.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let attempts = patches.load(Ordering::SeqCst);
+        assert!(
+            attempts <= 2,
+            "50 events inside ~1s must cost at most the first attempt plus one post-backoff \
+             retry, got {attempts} attempts"
+        );
+        assert_eq!(
+            events.load(Ordering::SeqCst),
+            1,
+            "an unchanged failure message must not be re-posted as a new Event inside the \
+             repeat window"
+        );
+    }
+
+    /// A pod backing off must not be stranded until the 30s resync: a node
+    /// change after its backoff expired binds it on the very next pass.
+    #[tokio::test]
+    async fn node_change_after_backoff_expiry_binds_promptly() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, in_flight, tally, bind_count, _patches, _events) =
+            pod_failed_once_for_cpu().await;
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
+        tokio::spawn(run_requeue_loop(
+            connector,
+            server,
+            in_flight,
+            tally.clone(),
+            synced_rx,
+            requeue.clone(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&worker_node_event("1000m")));
+        let changed_at = std::time::Instant::now();
+        requeue.notify_one();
+        wait_until(
+            || bind_count.load(Ordering::SeqCst) >= 1,
+            "the pod to bind after the node change once its backoff expired",
+        )
+        .await;
+        assert!(
+            changed_at.elapsed() < std::time::Duration::from_millis(600),
+            "a post-backoff node change must bind within the debounce, not wait on a timer"
+        );
+    }
+
+    #[test]
+    fn failure_backoff_doubles_to_cap_and_clears_on_bind() {
+        use std::time::{Duration, Instant};
+        let mut b = crate::FailureBackoff::default();
+        let t0 = Instant::now();
+        b.record_failure("default/p", "m", t0);
+        let left = |b: &crate::FailureBackoff, at: Duration| {
+            b.backed_off(t0 + at).into_iter().next().map(|(_, l)| l)
+        };
+        assert!(left(&b, Duration::from_millis(999)).is_some());
+        assert!(
+            left(&b, Duration::from_secs(1)).is_none(),
+            "initial backoff is 1s"
+        );
+        b.record_failure("default/p", "m", t0);
+        assert!(
+            left(&b, Duration::from_millis(1999)).is_some(),
+            "second failure doubles to 2s"
+        );
+        for _ in 0..10 {
+            b.record_failure("default/p", "m", t0);
+        }
+        assert!(left(&b, Duration::from_millis(9999)).is_some());
+        assert!(
+            left(&b, Duration::from_secs(10)).is_none(),
+            "backoff is capped at 10s"
+        );
+        b.clear("default/p");
+        assert!(
+            b.backed_off(t0).is_empty(),
+            "a bound or deleted pod must not stay backed off"
+        );
+    }
+
+    #[test]
+    fn failure_event_repeats_only_on_new_message_or_after_window() {
+        use std::time::{Duration, Instant};
+        let mut b = crate::FailureBackoff::default();
+        let t0 = Instant::now();
+        assert!(b.record_failure("default/p", "no fit", t0));
+        assert!(
+            !b.record_failure("default/p", "no fit", t0 + Duration::from_secs(30)),
+            "identical message inside the window is suppressed"
+        );
+        assert!(
+            b.record_failure("default/p", "taint", t0 + Duration::from_secs(31)),
+            "a changed reason must be reported immediately"
+        );
+        assert!(
+            b.record_failure("default/p", "taint", t0 + Duration::from_secs(91)),
+            "an unchanged failure is re-announced once the 60s window passes"
+        );
+    }
+
+    #[test]
+    fn pod_deletion_clears_failure_state() {
+        use std::time::Instant;
+        let mut tally = NodeTally::default();
+        tally
+            .failures
+            .record_failure("default/web-0", "m", Instant::now());
+        tally.apply_event(&json!({
+            "type": "DELETED",
+            "object": {"metadata": {"name": "web-0", "namespace": "default"}}
+        }));
+        assert!(
+            tally.failures.backed_off(Instant::now()).is_empty(),
+            "failure state must not outlive the pod"
+        );
+    }
+
+    /// A PVC ADDED through the real watch loop must wake the requeue pass —
+    /// a dropped notify would leave a pod waiting on its volume until the
+    /// 30s resync.
+    #[tokio::test]
+    async fn pvc_added_through_watch_loop_wakes_requeue() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            loop {
+                let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tls
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let events = [
+                json!({"type": "BOOKMARK", "object": {"kind": "PersistentVolumeClaim",
+                    "metadata": {"resourceVersion": "1",
+                        "annotations": {"k8s.io/initial-events-end": "true"}}}}),
+                json!({"type": "ADDED", "object": {
+                    "metadata": {"name": "data", "namespace": "default"},
+                    "spec": {"storageClassName": "csi-hostpath-class"}}}),
+            ];
+            for (i, event) in events.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                let mut line = event.to_string();
+                line.push('\n');
+                let chunk = format!("{:x}\r\n{line}\r\n", line.len());
+                let _ = tls.write_all(chunk.as_bytes()).await;
+                let _ = tls.flush().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let requeue = Arc::new(tokio::sync::Notify::new());
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(run_pvc_watch_loop(
+            connector,
+            format!("https://127.0.0.1:{port}"),
+            Arc::new(Mutex::new(NodeTally::default())),
+            Arc::new(Mutex::new(HashSet::new())),
+            ready_tx,
+            requeue.clone(),
+        ));
+        ready_rx
+            .wait_for(|ready| *ready)
+            .await
+            .expect("pvc cache to sync");
+        // Drain the permit the initial sync stored, so only the live ADDED
+        // can satisfy the wait below.
+        requeue.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), requeue.notified())
+            .await
+            .expect("a live PVC ADDED must wake the requeue loop");
     }
 
     /// Spin up an in-process TLS mock server for a PVC that NEVER appears

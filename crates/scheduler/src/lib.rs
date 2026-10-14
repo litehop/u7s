@@ -1587,6 +1587,78 @@ impl PvcWaiters {
     }
 }
 
+const POD_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+const POD_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+const FAILED_EVENT_REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug)]
+struct FailureState {
+    failures: u32,
+    last_attempt: std::time::Instant,
+    last_event_message: String,
+    last_event_at: std::time::Instant,
+}
+
+/// Per-pod state for unschedulable pods: upstream's `podInitialBackoffDuration`
+/// (1s) doubling to `podMaxBackoffDuration` (10s) gating event-driven
+/// requeues, and a repeat window collapsing identical FailedScheduling Events
+/// the way upstream's event aggregation does. Entries exist only between a
+/// pod's first failure and its bind or deletion, so size is bounded by the
+/// pending pods.
+#[derive(Debug, Default)]
+pub struct FailureBackoff {
+    entries: std::collections::HashMap<String, FailureState>,
+}
+
+impl FailureBackoff {
+    /// Records a failed attempt; returns whether a FailedScheduling Event
+    /// should be posted (message changed, or the repeat window elapsed).
+    pub fn record_failure(&mut self, key: &str, message: &str, now: std::time::Instant) -> bool {
+        match self.entries.get_mut(key) {
+            Some(state) => {
+                state.failures = state.failures.saturating_add(1);
+                state.last_attempt = now;
+                let emit = state.last_event_message != message
+                    || now.duration_since(state.last_event_at) >= FAILED_EVENT_REPEAT_WINDOW;
+                if emit {
+                    state.last_event_message = message.to_owned();
+                    state.last_event_at = now;
+                }
+                emit
+            }
+            None => {
+                self.entries.insert(
+                    key.to_owned(),
+                    FailureState {
+                        failures: 1,
+                        last_attempt: now,
+                        last_event_message: message.to_owned(),
+                        last_event_at: now,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Keys whose backoff has not yet expired at `now`, with the time left.
+    pub fn backed_off(&self, now: std::time::Instant) -> Vec<(String, std::time::Duration)> {
+        self.entries
+            .iter()
+            .filter_map(|(k, s)| {
+                let shift = s.failures.saturating_sub(1).min(8);
+                let delay = (POD_INITIAL_BACKOFF * (1u32 << shift)).min(POD_MAX_BACKOFF);
+                let expiry = s.last_attempt + delay;
+                (now < expiry).then(|| (k.clone(), expiry - now))
+            })
+            .collect()
+    }
+
+    pub fn clear(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+}
+
 /// An in-memory, watch-maintained running tally of every bound, non-terminal
 /// pod's resource requests, keyed by "namespace/name".
 ///
@@ -1668,6 +1740,8 @@ pub struct NodeTally {
     /// live GET would have returned — preserving `select_node_with_capacity`'s
     /// list-order tie-break for nodes that score identically.
     nodes: std::collections::BTreeMap<String, NodeItem>,
+    /// Unschedulable-pod backoff and Event dedupe — see `FailureBackoff`.
+    pub failures: FailureBackoff,
 }
 
 /// A PVC's fields needed to resolve its backing CSI driver — see
@@ -1756,6 +1830,7 @@ impl NodeTally {
 
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.remove_pod(&key);
+            self.failures.clear(&key);
             // A deleted pod can never be re-driven — see `PvcWaiters::remove_pod`.
             self.pvc_waiters.remove_pod(&key);
             return self.waiters.resolve(&key);
@@ -1782,6 +1857,7 @@ impl NodeTally {
                 // re-driven off `resolve` any more (see
                 // `PvcWaiters::remove_pod`).
                 self.pvc_waiters.remove_pod(&key);
+                self.failures.clear(&key);
                 self.insert_pod(
                     key,
                     TalliedPod {
