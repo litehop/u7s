@@ -1025,12 +1025,14 @@ fn set_terminating_condition(
 type InstanceDeletionFailure = (&'static str, String);
 
 /// Deletes every instance of the CRD's resource. Instances carrying their own finalizers are
-/// only marked for deletion, so the count of instances still present is returned.
+/// only marked for deletion, so the count of instances still present is returned, plus whether
+/// this pass issued any new delete (false means every remaining instance was already held by
+/// its own finalizers from an earlier pass).
 async fn delete_instances<S: Store>(
     state: &AppState<S>,
     group: &str,
     plural: &str,
-) -> Result<usize, InstanceDeletionFailure> {
+) -> Result<(usize, bool), InstanceDeletionFailure> {
     let prefix = crate::handlers::cr::cr_list_prefix(group, plural, None);
     let resp = state
         .store
@@ -1043,6 +1045,7 @@ async fn delete_instances<S: Store>(
             )
         })?;
     let mut remaining = 0;
+    let mut issued = false;
     let mut errors: Vec<String> = Vec::new();
     for item in resp.items {
         let Ok(mut obj) = Object::from_bytes(&item.value) else {
@@ -1053,6 +1056,7 @@ async fn delete_instances<S: Store>(
             remaining += 1;
             continue;
         }
+        issued = true;
         let result = if crate::handlers::generic::apply_delete_policy(&mut obj).is_some() {
             remaining += 1;
             state
@@ -1075,7 +1079,7 @@ async fn delete_instances<S: Store>(
         }
     }
     if errors.is_empty() {
-        Ok(remaining)
+        Ok((remaining, issued))
     } else {
         Err((
             "InstanceDeletionFailed",
@@ -1151,7 +1155,7 @@ pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) -> b
                 .unwrap_or("")
                 .to_string();
             match delete_instances(state, &group, &plural).await {
-                Ok(0) => {
+                Ok((0, _)) => {
                     set_terminating_condition(
                         &mut crd,
                         "False",
@@ -1159,14 +1163,26 @@ pub(crate) async fn finalize_crd<S: Store>(state: &AppState<S>, name: &str) -> b
                         "removed all instances",
                     );
                 }
-                Ok(_) => {
-                    // Instances are being deleted again; clear any earlier failure reason.
-                    if set_terminating_condition(
-                        &mut crd,
-                        "True",
-                        "InstanceDeletionInProgress",
-                        "CustomResource deletion is in progress",
-                    ) {
+                Ok((remaining, issued)) => {
+                    // Upstream polls for zero instances after the delete pass and reports
+                    // InstanceDeletionCheck when some never go away; here that is every
+                    // remaining instance already held by its own finalizers from a prior pass.
+                    // Otherwise deletes were just issued; this also clears any earlier failure.
+                    let (reason, message) = if issued {
+                        (
+                            "InstanceDeletionInProgress",
+                            "CustomResource deletion is in progress".to_string(),
+                        )
+                    } else {
+                        (
+                            "InstanceDeletionCheck",
+                            format!(
+                                "could not confirm zero CustomResources remaining: \
+                                 {remaining} instance(s) still present"
+                            ),
+                        )
+                    };
+                    if set_terminating_condition(&mut crd, "True", reason, &message) {
                         let _ = state
                             .store
                             .put(&key, Bytes::from(crd.to_string()), Some(rv))
@@ -5701,6 +5717,50 @@ mod ratchet_tests {
             terminating_condition(&state).await["reason"],
             "InstanceDeletionInProgress",
             "a stale failure reason would tell operators a recovered deletion is still broken"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalizer_held_instances_report_instance_deletion_check() {
+        let (_store, state) = fault_state();
+        create_fin_crd_in(&state).await;
+        let obj = serde_json::json!({
+            "apiVersion": "fin.io/v1", "kind": "Widget",
+            "metadata": {
+                "name": "held", "namespace": "default",
+                "finalizers": ["example.com/hold"],
+            },
+        });
+        state
+            .store
+            .put(
+                &format!("{FIN_CR_PREFIX}default/held"),
+                Bytes::from(obj.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed widget");
+        delete_fin_crd_in(&state).await;
+        assert_eq!(
+            terminating_condition(&state).await["reason"],
+            "InstanceDeletionInProgress",
+            "the pass that issues deletes is still in progress"
+        );
+
+        finalize_crd(&state, FIN_CRD).await;
+
+        let cond = terminating_condition(&state).await;
+        assert_eq!(cond["status"], "True");
+        assert_eq!(
+            cond["reason"], "InstanceDeletionCheck",
+            "operators must be told why the CRD is stuck: instances held by their own finalizers"
+        );
+        assert!(
+            cond["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not confirm zero CustomResources remaining: "),
+            "message must match upstream's wording, got {cond}"
         );
     }
 

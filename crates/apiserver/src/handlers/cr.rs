@@ -3289,6 +3289,7 @@ pub async fn delete_cr<S: Store>(
         .delete(&key, None)
         .await
         .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
+    state.crd_finalizer_wake.notify_one();
 
     evict_cr_conversion_cache(&state, obj.resource_version());
 
@@ -3430,7 +3431,8 @@ pub async fn delete_collection_cr<S: Store>(
             }
         }
         match state.store.delete(&obj.key, None).await {
-            Ok(_) | Err(u7s_store::StoreError::NotFound { .. }) => {}
+            Ok(_) => state.crd_finalizer_wake.notify_one(),
+            Err(u7s_store::StoreError::NotFound { .. }) => {}
             Err(e) => return Err(Status::internal(e.to_string())),
         }
     }
@@ -4284,6 +4286,7 @@ pub async fn delete_cr_namespaced<S: Store>(
         .delete(&key, None)
         .await
         .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
+    state.crd_finalizer_wake.notify_one();
 
     evict_cr_conversion_cache(&state, obj.resource_version());
 
@@ -4441,7 +4444,8 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
             }
         }
         match state.store.delete(&obj.key, None).await {
-            Ok(_) | Err(u7s_store::StoreError::NotFound { .. }) => {}
+            Ok(_) => state.crd_finalizer_wake.notify_one(),
+            Err(u7s_store::StoreError::NotFound { .. }) => {}
             Err(e) => return Err(Status::internal(e.to_string())),
         }
     }
@@ -6014,6 +6018,78 @@ mod tests {
             })
             .to_string(),
         )
+    }
+
+    async fn finalizer_woken(state: &AppState) -> bool {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            state.crd_finalizer_wake.notified(),
+        )
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn direct_cr_hard_deletes_wake_the_crd_finalizer() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+        let path = |name: Option<&str>| {
+            (
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+                name.map(str::to_string),
+            )
+        };
+        for name in ["a", "b"] {
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".into(),
+                    "v1alpha1".into(),
+                    "argocd".into(),
+                    "applications".into(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(name, "argocd"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("seed create: {e:?}"));
+        }
+        assert!(!finalizer_woken(&state).await, "create must not wake");
+
+        let (g, v, ns, p, _) = path(Some("a"));
+        delete_cr_namespaced(
+            State(state.clone()),
+            Path((g, v, ns, p, "a".to_string())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete: {e:?}"));
+        assert!(
+            finalizer_woken(&state).await,
+            "the deleted CR may be the last instance holding a Terminating CRD"
+        );
+
+        let (g, v, ns, p, _) = path(None);
+        delete_collection_cr_namespaced(
+            State(state.clone()),
+            Path((g, v, ns, p)),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            no_watch_query(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete collection: {e:?}"));
+        assert!(
+            finalizer_woken(&state).await,
+            "collection hard-deletes must wake the CRD finalizer too"
+        );
     }
 
     fn widget_body(name: &str) -> Bytes {
