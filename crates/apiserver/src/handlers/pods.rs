@@ -103,7 +103,7 @@ async fn parse_namespace<S: Store>(
 
 fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusError {
     match err {
-        StoreError::NotFound { .. } => Status::not_found(name, "Pod"),
+        StoreError::NotFound { .. } => Status::not_found(name, "Pod").for_resource("", "pods"),
         StoreError::AlreadyExists { .. } => Status::already_exists(name, "Pod"),
         StoreError::RevisionMismatch { expected, current } => Status::conflict(format!(
             "Pod \"{name}\" cannot be updated: resource version mismatch (expected {expected}, current {current})"
@@ -611,7 +611,7 @@ pub(crate) async fn get_pod<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     // kcm's GC verifies owner references via metadata-only Get() calls
     // (garbagecollector.go's isDangling); without this, it receives a typed Pod object it
@@ -712,7 +712,7 @@ pub(crate) async fn replace_pod<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     // Stale-resourceVersion PUTs must 409, not fall through into
     // validate_pod_spec_immutable using the freshly-read `stored` below — see
@@ -1290,7 +1290,7 @@ pub(crate) async fn delete_pod<S: Store>(
             .get(&key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+            .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -1482,7 +1482,7 @@ pub(crate) async fn patch_pod<S: Store>(
             .get(&key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+            .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -1690,7 +1690,7 @@ pub(crate) async fn evict_pod<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -2515,7 +2515,7 @@ pub(crate) async fn get_pod_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     Ok((
         StatusCode::OK,
@@ -2552,7 +2552,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -2845,7 +2845,7 @@ pub(crate) async fn patch_pod_status<S: Store>(
             .get(&key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+            .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -3323,7 +3323,7 @@ pub(crate) async fn patch_pod_resize<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -3385,7 +3385,7 @@ pub(crate) async fn get_pod_resize<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     Ok((
         StatusCode::OK,
@@ -3452,7 +3452,7 @@ pub(crate) async fn get_ephemeral_containers<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     Ok((
         StatusCode::OK,
@@ -3484,7 +3484,7 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -3533,7 +3533,7 @@ pub(crate) async fn put_ephemeral_containers<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -8132,7 +8132,7 @@ pub(crate) async fn bind_pod<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(&name, "Pod").for_resource("", "pods"))?;
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;

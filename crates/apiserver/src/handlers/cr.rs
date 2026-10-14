@@ -2698,7 +2698,7 @@ pub async fn get_cr<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
 
     // kubectl's default Accept header requests Table format; without this, kubectl can't
@@ -2725,7 +2725,7 @@ pub async fn get_cr<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
@@ -2961,7 +2961,7 @@ pub async fn replace_cr<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
 
     let ct = headers
@@ -2995,7 +2995,7 @@ pub async fn replace_cr<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
 
     // Stale-resourceVersion PUTs must 409, not fall through into the CEL
     // x-kubernetes-validations oldSelf comparison (validate_cr_schema below) against the
@@ -3165,7 +3165,7 @@ pub async fn delete_cr<S: Store>(
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
 
     let key = cr_store_key(&group, &plural, None, &name);
@@ -3175,7 +3175,7 @@ pub async fn delete_cr<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
 
     // Parse DeleteOptions from the request body (same pattern as built-in delete handlers).
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
@@ -3693,7 +3693,7 @@ pub async fn get_cr_namespaced<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
 
     // kubectl's default Accept header requests Table format; without this, kubectl can't
@@ -3720,7 +3720,7 @@ pub async fn get_cr_namespaced<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
@@ -3996,7 +3996,7 @@ pub async fn replace_cr_namespaced<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
 
     let ct = headers
@@ -4029,7 +4029,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
 
     // Stale-resourceVersion PUTs must 409, not fall through into the CEL
     // x-kubernetes-validations oldSelf comparison (validate_cr_schema below) against the
@@ -4168,7 +4168,7 @@ pub async fn delete_cr_namespaced<S: Store>(
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
 
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
@@ -4178,7 +4178,7 @@ pub async fn delete_cr_namespaced<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
 
     // Parse DeleteOptions from the request body (same pattern as built-in delete handlers).
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
@@ -4468,7 +4468,7 @@ pub async fn patch_cr<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
 
     let key = cr_store_key(&group, &plural, None, &name);
@@ -4551,7 +4551,8 @@ pub async fn patch_cr<S: Store>(
         return Ok(resp);
     }
 
-    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+    let stored = stored_opt
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -4734,7 +4735,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
 
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
@@ -4850,7 +4851,8 @@ pub async fn patch_cr_namespaced<S: Store>(
         return Ok(resp);
     }
 
-    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+    let stored = stored_opt
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -5057,7 +5059,7 @@ pub async fn put_cr_status<S: Store>(
         // CR fallback: find the CRD to get the kind name, use CR storage key.
         let ctx = find_crd(&state, &group, &version, &plural).await?;
         if ctx.namespaced {
-            return Err(Status::not_found(&name, &ctx.kind));
+            return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
         }
         (
             cr_store_key(&group, &plural, None, &name),
@@ -5186,7 +5188,7 @@ pub async fn get_cr_status<S: Store>(
     // CR path.
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
     let key = cr_store_key(&group, &plural, None, &name);
     let stored = state
@@ -5194,7 +5196,7 @@ pub async fn get_cr_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -5243,7 +5245,7 @@ pub async fn patch_cr_status<S: Store>(
     } else {
         let ctx = find_crd(&state, &group, &version, &plural).await?;
         if ctx.namespaced {
-            return Err(Status::not_found(&name, &ctx.kind));
+            return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
         }
         (
             cr_store_key(&group, &plural, None, &name),
@@ -5649,7 +5651,7 @@ pub async fn get_cr_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5671,7 +5673,7 @@ pub async fn put_cr_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5693,7 +5695,7 @@ pub async fn patch_cr_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5714,7 +5716,7 @@ pub async fn get_cr_namespaced_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5737,7 +5739,7 @@ pub async fn put_cr_namespaced_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5760,7 +5762,7 @@ pub async fn patch_cr_namespaced_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind));
+        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
     }
     let target = CrScaleTarget {
         group: &group,
