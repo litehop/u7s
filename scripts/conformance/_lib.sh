@@ -142,10 +142,21 @@ reconcile_cni0() {
   addr=$(limactl shell "$vm" ip -4 -o addr show dev cni0 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' | head -1 | cut -d' ' -f2) || true
   if [ -z "$addr" ]; then
     echo "cni0 on $vm: absent (node podCIDR $cidr); nothing to reconcile."
-  elif cni0_addr_is_stale "$addr" "$cidr"; then
-    echo "WARNING: cni0 on $vm has stale address $addr outside node $node podCIDR $cidr; deleting cni0 so it is recreated; pods already on $node lose networking (their veths detach) and must be recreated." >&2
-    limactl shell "$vm" sudo ip link delete cni0
   else
-    echo "cni0 on $vm: $addr matches podCIDR $cidr; leaving it."
+    local rc=0
+    cni0_addr_is_stale "$addr" "$cidr" || rc=$?
+    case $rc in
+      0)
+        echo "WARNING: cni0 on $vm has stale address $addr outside node $node podCIDR $cidr; deleting cni0 so it is recreated; pods already on $node lose networking (their veths detach) and must be recreated." >&2
+        limactl shell "$vm" sudo ip link delete cni0
+        ;;
+      1)
+        echo "cni0 on $vm: $addr matches podCIDR $cidr; leaving it."
+        ;;
+      *)
+        echo "ERROR: cannot judge cni0 address '$addr' on $vm against node $node podCIDR '$cidr'" >&2
+        return 1
+        ;;
+    esac
   fi
 }

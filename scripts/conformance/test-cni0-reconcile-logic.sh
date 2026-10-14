@@ -60,6 +60,23 @@ for bad in "" "10.244.2.0" "10.244.2.0/33" "10.244.2.0/" "10.244.2.0/x" "10.244.
     [ "$(cni0_rc 10.244.2.1/24 "$bad")" = 2 ]
 done
 
+LIMACTL_CALLS=$(mktemp)
+limactl() {
+  if [ "$3" = ip ]; then echo "5: cni0    inet $STUB_ADDR scope global cni0"; return 0; fi
+  echo "$*" >> "$LIMACTL_CALLS"
+}
+kubectl() { echo "[\"$STUB_CIDR\"]"; }
+reconcile_rc() { local rc=0; STUB_ADDR="$1" STUB_CIDR="$2" reconcile_cni0 vm kc node >/dev/null 2>&1 || rc=$?; echo "$rc"; }
+
+assert_false "reconcile_cni0 fails loud on an unjudgeable cni0 address -- otherwise run-all.sh proceeds into the broken-network failure it was meant to prevent" \
+  [ "$(reconcile_rc 10.244.2.300/24 10.244.2.0/24)" = 0 ]
+assert_true "reconcile_cni0 does not delete cni0 when it cannot judge the address" \
+  [ ! -s "$LIMACTL_CALLS" ]
+assert_true "reconcile_cni0 succeeds when the address matches" \
+  [ "$(reconcile_rc 10.244.2.1/24 10.244.2.0/24)" = 0 ]
+assert_true "reconcile_cni0 deletes a stale cni0" \
+  [ "$(reconcile_rc 10.244.1.1/24 10.244.2.0/24)" = 0 ] && grep -q "ip link delete cni0" "$LIMACTL_CALLS"
+
 assert_true "run-all.sh reconciles cni0 for the primary node -- otherwise a warm reconnect of the primary still hits the stale bridge" \
   grep -q 'reconcile_cni0 "\${U7S_VM_NAME:-lima-node}"' "$DIR/run-all.sh"
 assert_true "run-all.sh reconciles cni0 for the extra node -- otherwise a warm reconnect still hits the stale bridge" \
