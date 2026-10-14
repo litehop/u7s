@@ -1811,8 +1811,7 @@ mod tests {
                 Bytes::from(serde_json::to_vec(&body).unwrap()),
             )
             .await
-            .err()
-            .expect("unreadable bundle name must be refused at create");
+            .expect_err("unreadable bundle name must be refused at create");
             assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
             crate::handlers::test_support::assert_invalid_name_field(&err, field);
         }
