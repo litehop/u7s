@@ -307,10 +307,7 @@ pub async fn find_crd<S: Store>(
             .iter()
             .find(|v| v.name == version && v.served)
         else {
-            return Err(Status::not_found(
-                &format!("{group}/{version}/{plural}"),
-                "Resource",
-            ));
+            return Err(Status::route_not_found());
         };
         // Extract openAPIV3Schema from the matched version's schema field. Arc-wrapped (see
         // CrContext::schema's doc) so a cache hit below shares this schema instead of
@@ -429,10 +426,7 @@ pub async fn find_crd<S: Store>(
         )));
     }
 
-    Err(Status::not_found(
-        &format!("{group}/{version}/{plural}"),
-        "Resource",
-    ))
+    Err(Status::route_not_found())
 }
 
 /// Like `find_crd`, but downgrades a tombstoned group's 410 Gone to 404 Not Found.
@@ -453,10 +447,7 @@ async fn find_crd_for_delete<S: Store>(
     plural: &str,
 ) -> Result<CrContext, crate::status::StatusError> {
     match find_crd(state, group, version, plural).await {
-        Err(err) if err.0 == StatusCode::GONE => Err(Status::not_found(
-            &format!("{group}/{version}/{plural}"),
-            "Resource",
-        )),
+        Err(err) if err.0 == StatusCode::GONE => Err(Status::route_not_found()),
         result => result,
     }
 }
@@ -946,9 +937,15 @@ fn new_cr_uid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-fn store_err_cr(err: u7s_store::StoreError, name: &str, kind: &str) -> crate::status::StatusError {
+fn store_err_cr(
+    err: u7s_store::StoreError,
+    group: &str,
+    plural: &str,
+    name: &str,
+    kind: &str,
+) -> crate::status::StatusError {
     match err {
-        u7s_store::StoreError::NotFound { .. } => Status::not_found(name, kind),
+        u7s_store::StoreError::NotFound { .. } => Status::not_found(group, plural, name),
         u7s_store::StoreError::AlreadyExists { .. } => Status::already_exists(name, kind),
         u7s_store::StoreError::RevisionMismatch { expected, current } => Status::conflict(format!(
             "{kind} \"{name}\" cannot be updated: resource version mismatch (expected {expected}, current {current})"
@@ -2720,7 +2717,7 @@ pub async fn get_cr<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
 
     // kubectl's default Accept header requests Table format; without this, kubectl can't
@@ -2747,7 +2744,7 @@ pub async fn get_cr<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
@@ -2836,10 +2833,7 @@ pub async fn create_cr<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
-        return Err(Status::not_found(
-            &format!("{group}/{version}/{plural}"),
-            "Resource",
-        ));
+        return Err(Status::route_not_found());
     }
 
     let ct = headers
@@ -2956,7 +2950,7 @@ pub async fn create_cr<S: Store>(
                 };
                 run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
             }
-            Err(e) => return Err(store_err_cr(e, &name, &ctx.kind)),
+            Err(e) => return Err(store_err_cr(e, &group, &plural, &name, &ctx.kind)),
         }
     };
 
@@ -2982,7 +2976,7 @@ pub async fn replace_cr<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
 
     let ct = headers
@@ -3016,7 +3010,7 @@ pub async fn replace_cr<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     // Stale-resourceVersion PUTs must 409, not fall through into the CEL
     // x-kubernetes-validations oldSelf comparison (validate_cr_schema below) against the
@@ -3034,6 +3028,8 @@ pub async fn replace_cr<S: Store>(
                     expected,
                     current: stored.revision,
                 },
+                &group,
+                &plural,
                 &name,
                 &ctx.kind,
             ));
@@ -3078,7 +3074,8 @@ pub async fn replace_cr<S: Store>(
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
         if !is_dry_run_header(&headers) {
-            complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
+            complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, None)
+                .await?;
         }
         return Ok(Json(obj));
     }
@@ -3133,7 +3130,7 @@ pub async fn replace_cr<S: Store>(
         .store
         .put(&key, Bytes::from(bytes), expected_revision)
         .await
-        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
     evict_cr_conversion_cache(&state, existing["metadata"]["resourceVersion"].as_str());
 
     let mut meta: crate::types::ObjectMeta =
@@ -3154,6 +3151,8 @@ pub async fn replace_cr<S: Store>(
 async fn complete_cr_finalizer_drain<S: Store>(
     state: &AppState<S>,
     key: &str,
+    group: &str,
+    plural: &str,
     name: &str,
     kind: &str,
     ns: Option<&str>,
@@ -3162,7 +3161,7 @@ async fn complete_cr_finalizer_drain<S: Store>(
         .store
         .delete(key, None)
         .await
-        .map_err(|e| store_err_cr(e, name, kind))?;
+        .map_err(|e| store_err_cr(e, group, plural, name, kind))?;
     // The drained CR may be the last instance holding a Terminating CRD.
     state.crd_finalizer_wake.notify_one();
     if let Some(namespace) = ns {
@@ -3188,7 +3187,7 @@ pub async fn delete_cr<S: Store>(
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
 
     let key = cr_store_key(&group, &plural, None, &name);
@@ -3198,7 +3197,7 @@ pub async fn delete_cr<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     // Parse DeleteOptions from the request body (same pattern as built-in delete handlers).
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
@@ -3267,7 +3266,7 @@ pub async fn delete_cr<S: Store>(
             .store
             .put(&key, obj.to_bytes(), expected_rv)
             .await
-            .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+            .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
         let mut resp_body = Object { body: soft };
         resp_body.set_resource_version(new_rv);
         return Ok(Json(resp_body.body).into_response());
@@ -3289,7 +3288,7 @@ pub async fn delete_cr<S: Store>(
         .store
         .delete(&key, None)
         .await
-        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
 
     evict_cr_conversion_cache(&state, obj.resource_version());
 
@@ -3528,10 +3527,7 @@ pub async fn list_cr_namespaced<S: Store>(
     };
 
     if !ctx.namespaced {
-        return Err(Status::not_found(
-            &format!("{group}/{version}/{plural}"),
-            "Resource",
-        ));
+        return Err(Status::route_not_found());
     }
 
     let prefix = cr_list_prefix(&group, &plural, Some(&ns));
@@ -3716,7 +3712,7 @@ pub async fn get_cr_namespaced<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
 
     // kubectl's default Accept header requests Table format; without this, kubectl can't
@@ -3743,7 +3739,7 @@ pub async fn get_cr_namespaced<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
@@ -3833,10 +3829,7 @@ pub async fn create_cr_namespaced<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(
-            &format!("{group}/{version}/{plural}"),
-            "Resource",
-        ));
+        return Err(Status::route_not_found());
     }
 
     let ct = headers
@@ -3979,7 +3972,7 @@ pub async fn create_cr_namespaced<S: Store>(
                 run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
             }
             Err(u7s_store::CreateNamespacedError::Store(e)) => {
-                return Err(store_err_cr(e, &name, &ctx.kind))
+                return Err(store_err_cr(e, &group, &plural, &name, &ctx.kind))
             }
         }
     };
@@ -4019,7 +4012,7 @@ pub async fn replace_cr_namespaced<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
 
     let ct = headers
@@ -4052,7 +4045,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     // Stale-resourceVersion PUTs must 409, not fall through into the CEL
     // x-kubernetes-validations oldSelf comparison (validate_cr_schema below) against the
@@ -4070,6 +4063,8 @@ pub async fn replace_cr_namespaced<S: Store>(
                     expected,
                     current: stored.revision,
                 },
+                &group,
+                &plural,
                 &name,
                 &ctx.kind,
             ));
@@ -4114,7 +4109,8 @@ pub async fn replace_cr_namespaced<S: Store>(
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
         if !is_dry_run_header(&headers) {
-            complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
+            complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, Some(&ns))
+                .await?;
         }
         return Ok(Json(obj));
     }
@@ -4169,7 +4165,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         .store
         .put(&key, Bytes::from(bytes), expected_revision)
         .await
-        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
     evict_cr_conversion_cache(&state, existing["metadata"]["resourceVersion"].as_str());
 
     let mut meta: crate::types::ObjectMeta =
@@ -4191,7 +4187,7 @@ pub async fn delete_cr_namespaced<S: Store>(
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
 
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
@@ -4201,7 +4197,7 @@ pub async fn delete_cr_namespaced<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     // Parse DeleteOptions from the request body (same pattern as built-in delete handlers).
     // DeleteOptions parsing is intentionally lenient: a malformed/undecodable body must never
@@ -4265,7 +4261,7 @@ pub async fn delete_cr_namespaced<S: Store>(
             .store
             .put(&key, obj.to_bytes(), expected_rv)
             .await
-            .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+            .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
         let mut resp_body = Object { body: soft };
         resp_body.set_resource_version(new_rv);
         return Ok(Json(resp_body.body).into_response());
@@ -4287,7 +4283,7 @@ pub async fn delete_cr_namespaced<S: Store>(
         .store
         .delete(&key, None)
         .await
-        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
 
     evict_cr_conversion_cache(&state, obj.resource_version());
 
@@ -4334,10 +4330,7 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
     let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(
-            &format!("{group}/{version}/{plural}"),
-            "Resource",
-        ));
+        return Err(Status::route_not_found());
     }
 
     // Parse DeleteOptions from the request body (same pattern as single-object delete
@@ -4491,7 +4484,7 @@ pub async fn patch_cr<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
 
     let key = cr_store_key(&group, &plural, None, &name);
@@ -4563,7 +4556,7 @@ pub async fn patch_cr<S: Store>(
             .store
             .put(&key, Bytes::from(bytes), Some(0))
             .await
-            .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+            .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
         let mut meta: crate::types::ObjectMeta =
             serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
         meta.resource_version = Some(rv.to_string());
@@ -4575,8 +4568,7 @@ pub async fn patch_cr<S: Store>(
         return Ok(resp);
     }
 
-    let stored = stored_opt
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
+    let stored = stored_opt.ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -4663,7 +4655,8 @@ pub async fn patch_cr<S: Store>(
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
         if !is_dry_run_header(&headers) {
-            complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
+            complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, None)
+                .await?;
         }
         return Ok(Json(obj).into_response());
     }
@@ -4721,7 +4714,7 @@ pub async fn patch_cr<S: Store>(
         .store
         .put(&key, Bytes::from(bytes), Some(stored.revision))
         .await
-        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
     evict_cr_conversion_cache(&state, old["metadata"]["resourceVersion"].as_str());
 
     let mut meta: crate::types::ObjectMeta =
@@ -4759,7 +4752,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
 
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
@@ -4852,7 +4845,7 @@ pub async fn patch_cr_namespaced<S: Store>(
                 return Err(Status::namespace_create_rejected(&ns, &e));
             }
             Err(u7s_store::CreateNamespacedError::Store(e)) => {
-                return Err(store_err_cr(e, &name, &ctx.kind))
+                return Err(store_err_cr(e, &group, &plural, &name, &ctx.kind))
             }
         };
 
@@ -4877,8 +4870,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         return Ok(resp);
     }
 
-    let stored = stored_opt
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
+    let stored = stored_opt.ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -4965,7 +4957,8 @@ pub async fn patch_cr_namespaced<S: Store>(
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
         if !is_dry_run_header(&headers) {
-            complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
+            complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, Some(&ns))
+                .await?;
         }
         return Ok(Json(obj).into_response());
     }
@@ -5023,7 +5016,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         .store
         .put(&key, Bytes::from(bytes), Some(stored.revision))
         .await
-        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
     evict_cr_conversion_cache(&state, old["metadata"]["resourceVersion"].as_str());
 
     let mut meta: crate::types::ObjectMeta =
@@ -5085,7 +5078,7 @@ pub async fn put_cr_status<S: Store>(
         // CR fallback: find the CRD to get the kind name, use CR storage key.
         let ctx = find_crd(&state, &group, &version, &plural).await?;
         if ctx.namespaced {
-            return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+            return Err(Status::not_found(&group, &plural, &name));
         }
         (
             cr_store_key(&group, &plural, None, &name),
@@ -5099,7 +5092,7 @@ pub async fn put_cr_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &kind))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -5158,7 +5151,7 @@ pub async fn put_cr_status<S: Store>(
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
-        .map_err(|e| store_err_cr(e, &name, &kind))?;
+        .map_err(|e| store_err_cr(e, &group, &plural, &name, &kind))?;
     // `resourceVersion` is in merge_incoming_metadata's PROTECTED list, so `current`
     // still carries the pre-put (old) rv here, before it's overwritten below. A no-op
     // for the registry-resource branch above (its rv never appears in the CR conversion
@@ -5214,7 +5207,7 @@ pub async fn get_cr_status<S: Store>(
     // CR path.
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
     let key = cr_store_key(&group, &plural, None, &name);
     let stored = state
@@ -5222,7 +5215,7 @@ pub async fn get_cr_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind).for_resource(&group, &plural))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -5271,7 +5264,7 @@ pub async fn patch_cr_status<S: Store>(
     } else {
         let ctx = find_crd(&state, &group, &version, &plural).await?;
         if ctx.namespaced {
-            return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+            return Err(Status::not_found(&group, &plural, &name));
         }
         (
             cr_store_key(&group, &plural, None, &name),
@@ -5285,7 +5278,7 @@ pub async fn patch_cr_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &kind))?;
+        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
 
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -5370,7 +5363,7 @@ pub async fn patch_cr_status<S: Store>(
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
-        .map_err(|e| store_err_cr(e, &name, &kind))?;
+        .map_err(|e| store_err_cr(e, &group, &plural, &name, &kind))?;
     // Same ordering as put_cr_status: `current["metadata"]["resourceVersion"]` here is
     // still the pre-put (old) rv for the merge/strategic-merge branches (protected by
     // merge_incoming_metadata), which is what the conversion cache is keyed on.
@@ -5461,12 +5454,7 @@ async fn cr_scale_get_impl<S: Store>(
     ctx: &CrContext,
     target: CrScaleTarget<'_>,
 ) -> Result<Response, crate::status::StatusError> {
-    let scale_cfg = ctx.scale.as_ref().ok_or_else(|| {
-        Status::not_found(
-            target.name,
-            &format!("scale subresource for {}", target.plural),
-        )
-    })?;
+    let scale_cfg = ctx.scale.as_ref().ok_or_else(Status::route_not_found)?;
 
     let key = cr_store_key(target.group, target.plural, target.ns, target.name);
     let stored = state
@@ -5474,7 +5462,7 @@ async fn cr_scale_get_impl<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(target.group, target.plural, target.name))?;
     let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
     let obj = convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
@@ -5509,12 +5497,7 @@ async fn cr_scale_put_impl<S: Store>(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let scale_cfg = ctx.scale.as_ref().ok_or_else(|| {
-        Status::not_found(
-            target.name,
-            &format!("scale subresource for {}", target.plural),
-        )
-    })?;
+    let scale_cfg = ctx.scale.as_ref().ok_or_else(Status::route_not_found)?;
 
     let scale_body = super::scale::decode_scale_body(body, headers)?;
     let new_replicas = scale_body
@@ -5528,7 +5511,7 @@ async fn cr_scale_put_impl<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(target.group, target.plural, target.name))?;
     let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
     let mut obj =
@@ -5571,7 +5554,7 @@ async fn cr_scale_put_impl<S: Store>(
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
-        .map_err(|e| store_err_cr(e, target.name, &ctx.kind))?;
+        .map_err(|e| store_err_cr(e, target.group, target.plural, target.name, &ctx.kind))?;
     evict_cr_conversion_cache(state, old_rv.as_deref());
 
     Ok(Json(super::scale::build_scale(
@@ -5591,12 +5574,7 @@ async fn cr_scale_patch_impl<S: Store>(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let scale_cfg = ctx.scale.as_ref().ok_or_else(|| {
-        Status::not_found(
-            target.name,
-            &format!("scale subresource for {}", target.plural),
-        )
-    })?;
+    let scale_cfg = ctx.scale.as_ref().ok_or_else(Status::route_not_found)?;
 
     let scale_body = super::scale::decode_scale_body(body, headers)?;
 
@@ -5606,7 +5584,7 @@ async fn cr_scale_patch_impl<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
+        .ok_or_else(|| Status::not_found(target.group, target.plural, target.name))?;
     let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
     let mut obj =
@@ -5656,7 +5634,7 @@ async fn cr_scale_patch_impl<S: Store>(
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
-        .map_err(|e| store_err_cr(e, target.name, &ctx.kind))?;
+        .map_err(|e| store_err_cr(e, target.group, target.plural, target.name, &ctx.kind))?;
     evict_cr_conversion_cache(state, old_rv.as_deref());
 
     Ok(Json(super::scale::build_scale(
@@ -5677,7 +5655,7 @@ pub async fn get_cr_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5699,7 +5677,7 @@ pub async fn put_cr_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5721,7 +5699,7 @@ pub async fn patch_cr_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5742,7 +5720,7 @@ pub async fn get_cr_namespaced_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5765,7 +5743,7 @@ pub async fn put_cr_namespaced_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -5788,7 +5766,7 @@ pub async fn patch_cr_namespaced_scale<S: Store>(
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
     if !ctx.namespaced {
-        return Err(Status::not_found(&name, &ctx.kind).for_resource(&group, &plural));
+        return Err(Status::not_found(&group, &plural, &name));
     }
     let target = CrScaleTarget {
         group: &group,
@@ -18064,6 +18042,8 @@ mod tests {
             u7s_store::StoreError::NotFound {
                 key: "/registry/cr/example.io/v1/widgets/my-widget".into(),
             },
+            "example.io",
+            "widgets",
             "my-widget",
             "Widget",
         );
@@ -18081,6 +18061,8 @@ mod tests {
             u7s_store::StoreError::AlreadyExists {
                 key: "/registry/cr/example.io/v1/widgets/my-widget".into(),
             },
+            "example.io",
+            "widgets",
             "my-widget",
             "Widget",
         );
@@ -18100,6 +18082,8 @@ mod tests {
                 expected: 42,
                 current: 99,
             },
+            "example.io",
+            "widgets",
             "my-widget",
             "Widget",
         );
@@ -18124,6 +18108,8 @@ mod tests {
                 expected: 1,
                 current: 5,
             },
+            "example.io",
+            "widgets",
             "my-widget",
             "Widget",
         );

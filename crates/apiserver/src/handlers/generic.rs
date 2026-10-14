@@ -406,12 +406,18 @@ pub(crate) fn lookup<'a, S: Store>(
     state
         .resource_registry
         .get(&key)
-        .ok_or_else(|| Status::not_found(&format!("{}/{}/{}", group, version, plural), "Resource"))
+        .ok_or_else(Status::route_not_found)
 }
 
-pub(crate) fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusError {
+pub(crate) fn store_err(
+    err: StoreError,
+    group: &str,
+    resource: &str,
+    name: &str,
+    kind: &str,
+) -> crate::status::StatusError {
     match err {
-        StoreError::NotFound { .. } => Status::not_found(name, kind),
+        StoreError::NotFound { .. } => Status::not_found(group, resource, name),
         StoreError::AlreadyExists { .. } => Status::already_exists(name, kind),
         StoreError::RevisionMismatch { expected, current } => Status::conflict(format!(
             "{kind} \"{name}\" cannot be updated: resource version mismatch (expected {expected}, current {current})"
@@ -2405,6 +2411,8 @@ mod tests {
             StoreError::AlreadyExists {
                 key: "/registry/pods/default/my-pod".into(),
             },
+            "",
+            "pods",
             "my-pod",
             "Pod",
         );
@@ -2419,6 +2427,8 @@ mod tests {
             StoreError::NotFound {
                 key: "/registry/pods/default/gone".into(),
             },
+            "",
+            "pods",
             "gone",
             "Pod",
         );
@@ -2434,6 +2444,8 @@ mod tests {
                 expected: 5,
                 current: 10,
             },
+            "",
+            "pods",
             "my-pod",
             "Pod",
         );
