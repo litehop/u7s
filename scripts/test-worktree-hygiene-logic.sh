@@ -222,6 +222,52 @@ assert "the live-agents filter passes a mayor checkout record through (no agent-
 assert "u7s-apiserver is typed by argv[0] basename, even from a full path" \
   "$([ "$(call proc_type_from_psline "$(mk_api 4008 6445 "$SQ_DIR")")" = apiserver ] && echo 1 || echo 0)"
 
+# 1e. STEP A end to end (DRY_RUN=1, stubbed scan_ps): the real entry point must
+# signal exactly the squatter's pid -- a `pkill -f` path pattern would also
+# kill the operator's slot-0 stack, which shares the mayor checkout path.
+SA_DIR="$SANDBOX_ROOT/stepa"
+mkdir -p "$SA_DIR/temp/u7s"
+new_sandbox "$SA_DIR"
+SA_REAL=$(cd -P "$SA_DIR" && pwd)
+mk_konn() {  # pid server-port wpath
+  echo "alice  $1   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 konnectivity-server --server-cert=$3/temp/u7s/konnectivity-server.crt --server-port=$2"
+}
+step_a_dry() {  # ps lines -> every "would run:" line of a dry-run STEP A
+  local out
+  out=$(
+    export DRY_RUN=1 HYGIENE_RESCAN_GRACE_S=0 WORKTREE_HYGIENE_REPO_ROOT="$SA_REAL"
+    # shellcheck disable=SC1090
+    source "$SCRIPT"
+    LIVE_AGENTS="liveid9"
+    PS_FIXTURE="$1"
+    scan_ps() { printf '%s\n' "$PS_FIXTURE"; }
+    step_a_orphaned_processes 2>&1
+  )
+  printf '%s\n' "$out" | grep 'would run:' || true
+}
+SA_API_6445=$(mk_api 5001 6445 "$SA_REAL")
+SA_API_6443=$(mk_api 5002 6443 "$SA_REAL")
+SA_KONN_SLOT0=$(mk_konn 5003 8135 "$SA_REAL")
+SA_KONN_8335=$(mk_konn 5004 8335 "$SA_REAL")
+SA_WORKER_API=$(mk_api 5005 6446 "/repo/ai/worktrees/agent-liveid9")
+
+assert "STEP A (a): a mayor checkout apiserver on 6445 is killed by pid alone -- the only signal that spares the slot-0 stack at the same path" \
+  "$([ "$(step_a_dry "$SA_API_6445")" = "[dry-run] would run: kill 5001" ] && echo 1 || echo 0)"
+assert "STEP A (b): the operator's slot-0 stack (apiserver 6443 + konnectivity 8135) is never signalled, and no pkill -f pattern is issued" \
+  "$([ -z "$(step_a_dry "$SA_API_6443
+$SA_KONN_SLOT0")" ] && echo 1 || echo 0)"
+assert "STEP A (b'): a 6445 squatter next to the slot-0 stack is killed by pid only -- no pkill -f that would match slot 0" \
+  "$([ "$(step_a_dry "$SA_API_6443
+$SA_KONN_SLOT0
+$SA_API_6445")" = "[dry-run] would run: kill 5001" ] && echo 1 || echo 0)"
+assert "STEP A (c): an apiserver-less mayor checkout konnectivity on 8335 is reaped (exactly one kill, of that konnectivity)" \
+  "$([ "$(step_a_dry "$SA_KONN_8335")" = "[dry-run] would run: pkill -f konnectivity-server.*$SA_REAL/temp/u7s" ] && echo 1 || echo 0)"
+assert "STEP A (d): a live worker's 6446 apiserver is untouched even beside a real squatter, which alone is killed" \
+  "$([ "$(step_a_dry "$SA_WORKER_API
+$SA_API_6445")" = "[dry-run] would run: kill 5001" ] && echo 1 || echo 0)"
+assert "STEP A (d'): a live worker's 6446 apiserver alone produces no kill" \
+  "$([ -z "$(step_a_dry "$SA_WORKER_API")" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 2. STEP C -- in-flight guard.
 # ---------------------------------------------------------------------------
