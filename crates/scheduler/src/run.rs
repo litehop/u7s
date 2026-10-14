@@ -465,6 +465,8 @@ const PV_WATCH_PATH: &str =
 const STORAGE_CLASS_WATCH_PATH: &str = "/apis/storage.k8s.io/v1/storageclasses?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
 const CSI_NODE_WATCH_PATH: &str =
     "/apis/storage.k8s.io/v1/csinodes?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
+const CSI_DRIVER_WATCH_PATH: &str =
+    "/apis/storage.k8s.io/v1/csidrivers?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
 
 /// Watch path feeding `NodeTally`'s node cache (`NodeTally::apply_node_event`)
 /// — the same query params as `POD_WATCH_PATH`, for the same reason: this
@@ -984,7 +986,7 @@ fn handle_pod_event(
                 fetch_read_write_once_pod_pvc_names(&pvc_info, &pending.pvc_names);
             // Same reasoning again, for the CSI topology Filter: without
             // this, a pod's own unbound CSI-backed PVCs never get their
-            // driver resolved, so `csi_topology_fit` always sees an empty
+            // driver resolved, so `missing_required_csi_driver` always sees an empty
             // want-set and the scheduler can bind the pod to a node the
             // driver never registered — the AnyVolumeDataSource populate-pod
             // hang this predicate exists to close (see
@@ -1260,7 +1262,7 @@ pub async fn run_scheduler(
     // sendInitialEvents relist.
     //
     // Only the node watch gets a `ready` sender — the PVC/PV/StorageClass/
-    // CSINode caches deliberately have none. A pod needing `csi_topology_fit`
+    // CSINode/CSIDriver caches deliberately have none. A pod needing `missing_required_csi_driver`
     // (see its doc comment) scheduled before the CSINode watch's own initial
     // relist lands sees an empty `node_registered_drivers` set and fails
     // closed on every node, same as any other watch-cache-miss; unlike the
@@ -1300,6 +1302,12 @@ pub async fn run_scheduler(
             CSI_NODE_WATCH_PATH,
             NodeTally::apply_csi_node_event as fn(&mut NodeTally, &serde_json::Value),
             NodeTally::clear_csi_node_cache as fn(&mut NodeTally),
+            None,
+        ),
+        (
+            CSI_DRIVER_WATCH_PATH,
+            NodeTally::apply_csi_driver_event as fn(&mut NodeTally, &serde_json::Value),
+            NodeTally::clear_csi_driver_cache as fn(&mut NodeTally),
             None,
         ),
         (
@@ -1454,6 +1462,7 @@ mod tests {
             PV_WATCH_PATH,
             STORAGE_CLASS_WATCH_PATH,
             CSI_NODE_WATCH_PATH,
+            CSI_DRIVER_WATCH_PATH,
             NODE_WATCH_PATH,
         ] {
             assert!(
@@ -2863,6 +2872,13 @@ mod tests {
                 "object": {
                     "metadata": {"name": "worker-1"},
                     "spec": {"drivers": [{"name": "csi-hostpath.csi.k8s.io"}]}
+                }
+            }));
+            guard.apply_csi_driver_event(&json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": "csi-hostpath.csi.k8s.io"},
+                    "spec": {"preventPodSchedulingIfMissing": true}
                 }
             }));
         }

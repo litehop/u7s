@@ -611,9 +611,19 @@ pub struct PendingPod {
     /// itself (needs a PVC/StorageClass GET) — the caller fetches it once
     /// via `fetch_unbound_csi_pvc_drivers` and fills it in right before the
     /// first `pick_node` attempt. Empty for a pod with no unbound
-    /// CSI-backed PVCs, which `csi_topology_fit` then treats as "nothing to
-    /// check".
+    /// CSI-backed PVCs, which `missing_required_csi_driver` then treats as
+    /// "nothing to check".
     pub unbound_csi_pvc_drivers: Vec<String>,
+}
+
+impl PendingPod {
+    /// Every CSI driver this pod's volumes need: inline and unbound-PVC
+    /// drivers plus bound PVCs' (`csi_volume_counts`' keys).
+    fn needed_csi_drivers(&self) -> impl Iterator<Item = &String> {
+        self.unbound_csi_pvc_drivers
+            .iter()
+            .chain(self.csi_volume_counts.keys())
+    }
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -726,7 +736,7 @@ fn needs_scheduling_pod(pod: &Value) -> Option<PendingPod> {
 /// Driver names of inline (`spec.volumes[].csi`) volumes — resolvable from
 /// the pod spec alone, so `needs_scheduling_pod` seeds them into
 /// `unbound_csi_pvc_drivers` and a node whose CSINode never registered the
-/// driver is rejected by `csi_topology_fit`.
+/// driver is rejected by `missing_required_csi_driver`.
 fn inline_csi_drivers(volumes: &[PodVolume]) -> Vec<String> {
     volumes
         .iter()
@@ -1064,11 +1074,17 @@ pub struct NodeItem {
     /// CSI driver names this node's CSINode currently registers. Never
     /// present in the raw `/api/v1/nodes` JSON (hence `skip_deserializing`)
     /// — `select_and_reserve_node` fills this in from `NodeTally`'s
-    /// watch-maintained CSINode cache, only when the pending pod itself has
-    /// an unbound CSI-backed PVC (`PendingPod::unbound_csi_pvc_drivers`),
-    /// exactly like `csi_driver_headroom`. See `csi_topology_fit`.
+    /// watch-maintained CSINode cache, only when the pending pod itself
+    /// needs a CSI driver, exactly like `csi_driver_headroom`. See
+    /// `missing_required_csi_driver`.
     #[serde(default, skip_deserializing)]
     pub csi_registered_drivers: std::collections::HashSet<String>,
+    /// Names of CSIDrivers with `spec.preventPodSchedulingIfMissing=true`,
+    /// filled in alongside `csi_registered_drivers` from `NodeTally`'s
+    /// CSIDriver cache (cluster-wide, repeated per node for the
+    /// `select_node_with_capacity` signature's sake).
+    #[serde(default, skip_deserializing)]
+    pub csi_prevent_scheduling_drivers: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1634,9 +1650,13 @@ pub struct NodeTally {
     /// (not derived from `csi_node_limits`'s keys) because many real CSI
     /// drivers, csi-hostpath included, never set `allocatable.count`, so
     /// `csi_node_limits` alone cannot answer "is this driver registered
-    /// here" — only "does it have this limit". This is `csi_topology_fit`'s
-    /// per-node input.
+    /// here" — only "does it have this limit". This is
+    /// `missing_required_csi_driver`'s per-node input.
     csi_node_drivers: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Names of CSIDrivers with `spec.preventPodSchedulingIfMissing=true` —
+    /// watch-maintained by `apply_csi_driver_event`, mirroring upstream's
+    /// CSIDriver lister.
+    csi_prevent_scheduling: std::collections::HashSet<String>,
     /// Node name -> node object, watch-maintained by `apply_node_event` —
     /// `pick_node`/`fetch_node`/`find_preemption_plan` read this instead of a
     /// live GET /api/v1/nodes per scheduling decision, mirroring the pod
@@ -2064,7 +2084,7 @@ impl NodeTally {
     }
 
     /// Every node's CSINode-registered CSI driver names — see
-    /// `csi_node_drivers`'s doc comment. `csi_topology_fit`'s per-node
+    /// `csi_node_drivers`'s doc comment. `missing_required_csi_driver`'s per-node
     /// input; read under the same lock discipline as
     /// `csi_driver_limits_by_node` for consistency, even though a driver's
     /// CSINode registration changes far less often than attach counts do.
@@ -2072,6 +2092,35 @@ impl NodeTally {
         &self,
     ) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
         self.csi_node_drivers.clone()
+    }
+
+    /// Names of CSIDrivers that opt in to `preventPodSchedulingIfMissing` —
+    /// see `csi_prevent_scheduling`'s doc comment.
+    pub fn csi_prevent_scheduling_drivers(&self) -> std::collections::HashSet<String> {
+        self.csi_prevent_scheduling.clone()
+    }
+
+    /// Update the CSIDriver cache from one raw CSIDriver watch event — see
+    /// `csi_prevent_scheduling`'s doc comment.
+    pub fn apply_csi_driver_event(&mut self, event: &Value) {
+        let Ok(watch_event) = WatchEvent::<CsiDriverItem>::deserialize(event) else {
+            return;
+        };
+        let name = watch_event.object.metadata.name;
+        if name.is_empty() {
+            return;
+        }
+        let opted_in = watch_event.object.spec.prevent_pod_scheduling_if_missing == Some(true);
+        if (watch_event.event_type == "ADDED" || watch_event.event_type == "MODIFIED") && opted_in {
+            self.csi_prevent_scheduling.insert(name);
+        } else {
+            self.csi_prevent_scheduling.remove(&name);
+        }
+    }
+
+    /// Drop the CSIDriver cache — see `clear_pvc_cache`'s doc comment.
+    pub fn clear_csi_driver_cache(&mut self) {
+        self.csi_prevent_scheduling.clear();
     }
 
     /// Update the PVC cache from one raw PVC watch event — see `pvcs`'s doc
@@ -2580,6 +2629,10 @@ pub fn select_node_with_capacity(
     // this per-node needs the filter to record more than a single failure
     // reason per candidate, which no caller currently needs.
     let mut csi_limit_was_the_only_blocker = false;
+    // First opted-in CSI driver (preventPodSchedulingIfMissing) some node
+    // lacked; names it in the final error like upstream's
+    // "<driver> CSI driver is not installed on the node" event message.
+    let mut csi_driver_missing: Option<String> = None;
     let candidates: Vec<NodeItem> = list
         .items
         .into_iter()
@@ -2616,7 +2669,12 @@ pub fn select_node_with_capacity(
                 csi_limit_was_the_only_blocker = true;
                 return false;
             }
-            if !csi_topology_fit(&n.csi_registered_drivers, &pod.unbound_csi_pvc_drivers) {
+            if let Some(driver) = missing_required_csi_driver(
+                &n.csi_registered_drivers,
+                &n.csi_prevent_scheduling_drivers,
+                pod.needed_csi_drivers(),
+            ) {
+                csi_driver_missing.get_or_insert_with(|| driver.clone());
                 return false;
             }
             true
@@ -2638,6 +2696,8 @@ pub fn select_node_with_capacity(
     found.map(|n| n.metadata.name).ok_or_else(|| {
         if csi_limit_was_the_only_blocker {
             anyhow::anyhow!("node(s) exceed max volume count")
+        } else if let Some(driver) = csi_driver_missing {
+            anyhow::anyhow!("{driver} CSI driver is not installed on the node")
         } else {
             anyhow::anyhow!(
                 "no node satisfies the pod's nodeSelector/tolerations with free pod/resource capacity (NodeResourcesFit)"
@@ -3617,12 +3677,14 @@ fn select_and_reserve_node(
             node.csi_driver_headroom = net_csi_headroom(limits, &attached);
         }
     }
-    if !pod.unbound_csi_pvc_drivers.is_empty() {
+    if pod.needed_csi_drivers().next().is_some() {
         let drivers_by_node = tally_guard.csi_driver_names_by_node();
+        let prevent = tally_guard.csi_prevent_scheduling_drivers();
         for node in &mut list.items {
             if let Some(drivers) = drivers_by_node.get(&node.metadata.name) {
                 node.csi_registered_drivers = drivers.clone();
             }
+            node.csi_prevent_scheduling_drivers = prevent.clone();
         }
     }
     let node = select_node_with_capacity(list, pod, &usage, &tally_guard.tallied_pod_labels())
@@ -3849,12 +3911,14 @@ fn find_preemption_candidate(
         // whose CSINode does not register `pod`'s unbound PVC's driver
         // cannot serve it no matter which lower-priority pods get evicted,
         // so it must never be chosen as a preemption target — see
-        // `csi_topology_fit`'s own doc comment.
-        let topology_fits = pod.unbound_csi_pvc_drivers.is_empty()
-            || csi_topology_fit(
+        // `missing_required_csi_driver`'s own doc comment.
+        let topology_fits = pod.needed_csi_drivers().next().is_none()
+            || missing_required_csi_driver(
                 &fresh_csi_registered_drivers_for_node(&tally_guard, node_name),
-                &pod.unbound_csi_pvc_drivers,
-            );
+                &tally_guard.csi_prevent_scheduling_drivers(),
+                pod.needed_csi_drivers(),
+            )
+            .is_none();
         drop(tally_guard);
         if !csi_fits || !topology_fits {
             continue;
@@ -4701,10 +4765,10 @@ const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
 /// currently UNBOUND (`spec.volumeName` empty) and backed by a
 /// StorageClass with a real provisioner — the provisioning-time
 /// counterpart to `fetch_bound_pv_node_affinities`'s already-bound case.
-/// Feeds `PendingPod::unbound_csi_pvc_drivers`, which `csi_topology_fit`
+/// Feeds `PendingPod::unbound_csi_pvc_drivers`, which `missing_required_csi_driver`
 /// then treats as one more mandatory (ANDed) filter: a node whose CSINode
 /// does not register this driver cannot serve whatever volume
-/// csi-provisioner is about to create for it — see `csi_topology_fit`'s own
+/// csi-provisioner is about to create for it — see `missing_required_csi_driver`'s own
 /// doc comment for the AnyVolumeDataSource hang this closes.
 ///
 /// `kubernetes.io/no-provisioner` is excluded even though it IS a
@@ -4851,6 +4915,21 @@ pub(crate) async fn fetch_csi_volume_counts(
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct CsiDriverItem {
+    #[serde(default)]
+    metadata: CsiNodeMetadata,
+    #[serde(default)]
+    spec: CsiDriverSpecView,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CsiDriverSpecView {
+    #[serde(default)]
+    prevent_pod_scheduling_if_missing: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct CsiNodeItem {
     #[serde(default)]
     metadata: CsiNodeMetadata,
@@ -4962,34 +5041,30 @@ fn fresh_csi_registered_drivers_for_node(
         .unwrap_or_default()
 }
 
-/// The VolumeBinding-provisioning-topology Filter: true when every CSI
-/// driver `pod`'s own UNBOUND PVCs still need provisioned
-/// (`unbound_csi_pvc_drivers`) is registered in this node's CSINode
-/// (`node_registered_drivers`) — mirrors upstream's VolumeBinding Filter
-/// plugin rejecting a node that cannot possibly serve a provisioning
-/// claim's topology.
+/// The CSI driver-presence Filter: the first driver `pod` needs
+/// (`pod_drivers`) that this node's CSINode does not register
+/// (`node_registered_drivers`) AND whose CSIDriver object opts in with
+/// `spec.preventPodSchedulingIfMissing=true` (`prevent_if_missing`), or `None`
+/// when the node is acceptable. Mirrors upstream's `checkCSIDriverOnNode`
+/// (KEP-5030): no CSIDriver object, or the flag unset/false, never rejects —
+/// the driver may simply not be a CSI driver, or may register later. A node
+/// with no CSINode at all registers nothing, so it is rejected for an opted-in
+/// driver, as upstream does.
 ///
-/// Unlike `csi_volume_limits_fit`'s "unknown means unlimited" convention, a
-/// driver absent from `node_registered_drivers` on EVERY node (an empty
-/// candidate set) is NOT permissive here: it correctly rejects every node,
-/// leaving the pod Pending until the driver's own CSINode registration
-/// lands. Treating "driver location unknown" as "any node will do" is
-/// exactly the bug this predicate exists to close — the csi-hostpath CSI
-/// driver runs as a single-replica StatefulSet, so a node picked without
-/// checking CSINode is very likely the wrong one: its PV then carries a
-/// `nodeAffinity` pinning it to the driver's real node, and a pod bound to
-/// any other node fails `MountVolume.NodeAffinity check failed` forever
-/// (the AnyVolumeDataSource conformance hang this predicate fixes).
+/// Applied to every volume source that names a driver — PVC-backed (bound or
+/// unbound) and inline `spec.volumes[].csi`; upstream only covers the PVC
+/// ones, inline sharing the opt-in is a deliberate extension.
 ///
 /// `pub` (not module-private) for the same reason `csi_volume_limits_fit`
 /// is: a criterion bench may exercise it directly.
-pub fn csi_topology_fit(
+pub fn missing_required_csi_driver<'a>(
     node_registered_drivers: &std::collections::HashSet<String>,
-    unbound_csi_pvc_drivers: &[String],
-) -> bool {
-    unbound_csi_pvc_drivers
-        .iter()
-        .all(|driver| node_registered_drivers.contains(driver))
+    prevent_if_missing: &std::collections::HashSet<String>,
+    pod_drivers: impl IntoIterator<Item = &'a String>,
+) -> Option<&'a String> {
+    pod_drivers.into_iter().find(|driver| {
+        prevent_if_missing.contains(*driver) && !node_registered_drivers.contains(*driver)
+    })
 }
 
 /// Bind a pod to a node via POST .../pods/:name/binding.
@@ -7022,6 +7097,7 @@ mod tests {
                     status: NodeStatus::default(),
                     csi_driver_headroom: Default::default(),
                     csi_registered_drivers: Default::default(),
+                    csi_prevent_scheduling_drivers: Default::default(),
                 },
                 NodeItem {
                     metadata: NodeMetadata {
@@ -7032,6 +7108,7 @@ mod tests {
                     status: NodeStatus::default(),
                     csi_driver_headroom: Default::default(),
                     csi_registered_drivers: Default::default(),
+                    csi_prevent_scheduling_drivers: Default::default(),
                 },
             ],
         };
@@ -7134,6 +7211,7 @@ mod tests {
                 status: NodeStatus::default(),
                 csi_driver_headroom: Default::default(),
                 csi_registered_drivers: Default::default(),
+                csi_prevent_scheduling_drivers: Default::default(),
             }],
         };
         let name = select_first_node(list).expect("single-item list must return Ok");
@@ -7160,6 +7238,7 @@ mod tests {
             status: NodeStatus::default(),
             csi_driver_headroom: Default::default(),
             csi_registered_drivers: Default::default(),
+            csi_prevent_scheduling_drivers: Default::default(),
         }
     }
 
@@ -8374,6 +8453,7 @@ mod tests {
             },
             csi_driver_headroom: Default::default(),
             csi_registered_drivers: Default::default(),
+            csi_prevent_scheduling_drivers: Default::default(),
         }
     }
 
@@ -11953,7 +12033,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // csi_topology_fit / the VolumeBinding provisioning-topology predicate — a
+    // missing_required_csi_driver / the VolumeBinding provisioning-topology predicate — a
     // pod whose own unbound PVC still needs a CSI driver provisioned must not
     // be bound to a node that driver has never registered on (CSINode). The
     // csi-hostpath e2e driver runs as a single-replica StatefulSet: without
@@ -11964,38 +12044,128 @@ mod tests {
     // conformance hang this predicate exists to close.
     // ---------------------------------------------------------------------------
 
+    const DRIVER_X: &str = "csi-hostpath-provisioning-6547";
+
+    fn set_of(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     #[test]
-    fn csi_topology_fit_false_when_node_does_not_register_required_driver() {
-        let registered: std::collections::HashSet<String> = Default::default();
-        let wants = vec!["csi-hostpath-provisioning-6547".to_owned()];
+    fn missing_required_csi_driver_rejects_only_opted_in_unregistered_driver() {
+        let wants = vec![DRIVER_X.to_owned()];
+        let cases = [
+            (&[][..], &[][..], false, "no CSIDriver object"),
+            (&[][..], &[][..], false, "CSIDriver flag unset or false"),
+            (
+                &[DRIVER_X][..],
+                &[DRIVER_X][..],
+                false,
+                "flag true, driver present",
+            ),
+            (&[][..], &[DRIVER_X][..], true, "flag true, driver missing"),
+        ];
+        for (registered, prevent, rejected, row) in cases {
+            let got = missing_required_csi_driver(&set_of(registered), &set_of(prevent), &wants);
+            assert_eq!(
+                got.is_some(),
+                rejected,
+                "{row}: a node lacking a driver may be rejected only when its CSIDriver opts in \
+                 via preventPodSchedulingIfMissing — rejecting otherwise strands pods whose \
+                 driver registers late or is not a CSI driver"
+            );
+        }
         assert!(
-            !csi_topology_fit(&registered, &wants),
-            "a node whose CSINode does not register the driver a pod's unbound \
-             PVC needs must not be treated as feasible — its eventual PV can \
-             only be mounted where the driver actually runs"
+            missing_required_csi_driver(&set_of(&[]), &set_of(&[DRIVER_X]), &[]).is_none(),
+            "a pod needing no CSI driver must never be blocked"
         );
     }
 
     #[test]
-    fn csi_topology_fit_true_when_node_registers_required_driver() {
-        let registered: std::collections::HashSet<String> =
-            ["csi-hostpath-provisioning-6547".to_owned()].into();
-        let wants = vec!["csi-hostpath-provisioning-6547".to_owned()];
+    fn csi_driver_event_tracks_only_opted_in_drivers() {
+        let event = |kind: &str, flag: serde_json::Value| {
+            json!({"type": kind, "object": {
+                "metadata": {"name": DRIVER_X}, "spec": {"preventPodSchedulingIfMissing": flag}
+            }})
+        };
+        let mut tally = NodeTally::default();
+        tally.apply_csi_driver_event(&event("ADDED", json!(true)));
+        assert_eq!(tally.csi_prevent_scheduling_drivers(), set_of(&[DRIVER_X]));
+        tally.apply_csi_driver_event(&event("MODIFIED", json!(false)));
         assert!(
-            csi_topology_fit(&registered, &wants),
-            "a node whose CSINode registers the exact driver a pod's unbound \
-             PVC needs must qualify"
+            tally.csi_prevent_scheduling_drivers().is_empty(),
+            "flipping the flag off must stop rejecting nodes"
+        );
+        tally.apply_csi_driver_event(&event("ADDED", json!(true)));
+        tally.apply_csi_driver_event(&event("DELETED", json!(true)));
+        assert!(
+            tally.csi_prevent_scheduling_drivers().is_empty(),
+            "deleting the CSIDriver object must stop rejecting nodes"
         );
     }
 
+    /// Drives the decision table through the tally-backed selection path for
+    /// both PVC-backed (bound -> `csi_volume_counts`) and inline
+    /// (`spec.volumes[].csi`) volumes.
     #[test]
-    fn csi_topology_fit_is_true_when_pod_has_no_unbound_csi_pvcs() {
-        let registered: std::collections::HashSet<String> = Default::default();
-        assert!(
-            csi_topology_fit(&registered, &[]),
-            "a pod with no unbound CSI-backed PVCs must never be blocked by \
-             this predicate, regardless of what any node's CSINode registers"
-        );
+    fn select_and_reserve_node_applies_csi_driver_presence_table_to_pvc_and_inline_volumes() {
+        let inline_pod = || {
+            let event = json!({"type": "ADDED", "object": {
+                "metadata": {"name": "p", "namespace": "default"},
+                "spec": {"volumes": [{"name": "v", "csi": {"driver": DRIVER_X}}]}
+            }});
+            needs_scheduling(&event).expect("pod needs scheduling")
+        };
+        let pvc_pod = || {
+            let mut pod = empty_pending_pod();
+            pod.csi_volume_counts = [(DRIVER_X.to_owned(), 1i64)].into();
+            pod
+        };
+        let driver_event = |flag: serde_json::Value| {
+            json!({"type": "ADDED", "object": {
+                "metadata": {"name": DRIVER_X}, "spec": {"preventPodSchedulingIfMissing": flag}
+            }})
+        };
+        let rows: [(&str, Option<serde_json::Value>, bool, bool); 4] = [
+            ("no CSIDriver", None, false, true),
+            ("flag false", Some(json!(false)), false, true),
+            ("flag true, driver present", Some(json!(true)), true, true),
+            ("flag true, driver missing", Some(json!(true)), false, false),
+        ];
+        for (kind, make_pod) in [
+            ("PVC", &pvc_pod as &dyn Fn() -> PendingPod),
+            ("inline", &inline_pod),
+        ] {
+            for (row, flag, registered, schedulable) in &rows {
+                let mut tally = NodeTally::default();
+                if let Some(flag) = flag {
+                    tally.apply_csi_driver_event(&driver_event(flag.clone()));
+                }
+                if *registered {
+                    tally.apply_csi_node_event(&json!({"type": "ADDED", "object": {
+                        "metadata": {"name": "worker-0"},
+                        "spec": {"drivers": [{"name": DRIVER_X}]}
+                    }}));
+                }
+                let list = NodeList {
+                    items: vec![make_node_with_capacity("worker-0", &[], "110")],
+                };
+                let result =
+                    select_and_reserve_node(list, &make_pod(), &std::sync::Mutex::new(tally));
+                assert_eq!(
+                    result.is_ok(),
+                    *schedulable,
+                    "{kind} volume, {row}: got {result:?}"
+                );
+                if !schedulable {
+                    assert!(
+                        result.unwrap_err().to_string().contains(&format!(
+                            "{DRIVER_X} CSI driver is not installed on the node"
+                        )),
+                        "{kind}: the FailedScheduling reason must name the missing driver"
+                    );
+                }
+            }
+        }
     }
 
     /// Mirrors the AnyVolumeDataSource populate-pod scenario end to end: the
@@ -12003,7 +12173,7 @@ mod tests {
     /// CSINode, a second node does not — and, the trap that makes this
     /// fail-on-revert meaningful, the WRONG node is the LESS loaded one, so
     /// the ordinary least-loaded tie-break would prefer it if the
-    /// `csi_topology_fit` conjunct did not filter it out first.
+    /// `missing_required_csi_driver` conjunct did not filter it out first.
     #[test]
     fn select_node_with_capacity_binds_to_node_registering_unbound_csi_pvcs_driver_over_less_loaded_node(
     ) {
@@ -12014,6 +12184,9 @@ mod tests {
             items: vec![driver_node, other_node],
         };
         list.items[0].csi_registered_drivers = [DRIVER.to_owned()].into();
+        for node in &mut list.items {
+            node.csi_prevent_scheduling_drivers = [DRIVER.to_owned()].into();
+        }
         let mut pod = empty_pending_pod();
         pod.unbound_csi_pvc_drivers = vec![DRIVER.to_owned()];
         let counts: std::collections::HashMap<String, NodeUsage> = [
@@ -12027,7 +12200,7 @@ mod tests {
             Some("lima-node-4".to_owned()),
             "must bind to the node registering the unbound PVC's CSI driver \
              even though the other node is less loaded — reverting the \
-             csi_topology_fit conjunct picks lima-node-3 by the ordinary \
+             missing_required_csi_driver conjunct picks lima-node-3 by the ordinary \
              least-loaded tie-break, exactly the bug that stranded the \
              lib-volume-populator populate pod on a node without the \
              csi-hostpath driver and hung the AnyVolumeDataSource e2e test"
@@ -12040,14 +12213,17 @@ mod tests {
     /// claim's driver location being unknown is never "any node will do".
     #[test]
     fn select_node_with_capacity_leaves_pod_pending_when_no_node_registers_the_required_driver() {
-        let list = NodeList {
+        let mut list = NodeList {
             items: vec![
                 make_node_with_capacity("lima-node-4", &[], "110"),
                 make_node_with_capacity("lima-node-3", &[], "110"),
             ],
         };
+        for node in &mut list.items {
+            node.csi_prevent_scheduling_drivers = [DRIVER_X.to_owned()].into();
+        }
         let mut pod = empty_pending_pod();
-        pod.unbound_csi_pvc_drivers = vec!["csi-hostpath-provisioning-6547".to_owned()];
+        pod.unbound_csi_pvc_drivers = vec![DRIVER_X.to_owned()];
         let result = select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &[]);
         assert!(
             result.is_err(),
@@ -12095,9 +12271,12 @@ mod tests {
         let pod = needs_scheduling(&event).expect("pod needs scheduling");
         let mut registered = make_node_with_capacity("has-driver", &[], "110");
         registered.csi_registered_drivers = ["inline.csi.example.com".to_owned()].into();
-        let list = NodeList {
+        let mut list = NodeList {
             items: vec![make_node_with_capacity("no-driver", &[], "110"), registered],
         };
+        for node in &mut list.items {
+            node.csi_prevent_scheduling_drivers = ["inline.csi.example.com".to_owned()].into();
+        }
         let chosen = select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &[]);
         assert_eq!(
             chosen.unwrap(),
@@ -12741,6 +12920,13 @@ mod tests {
             "object": {
                 "metadata": { "name": "lima-node-3" },
                 "spec": { "drivers": [] }
+            }
+        }));
+        tally.apply_csi_driver_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "csi-hostpath-provisioning-6547" },
+                "spec": { "preventPodSchedulingIfMissing": true }
             }
         }));
         let tally = std::sync::Mutex::new(tally);
