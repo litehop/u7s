@@ -21831,7 +21831,11 @@ mod admission_tests {
         let existing = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "collection-denied-pod", "namespace": "default"},
+            "metadata": {
+                "name": "collection-denied-pod",
+                "namespace": "default",
+                "deletionTimestamp": "2020-01-01T00:00:00Z"
+            },
             "spec": {"containers": [{"name": "app", "image": "nginx"}]}
         });
         store
@@ -21865,28 +21869,31 @@ mod admission_tests {
             .await
             .unwrap();
 
-        let result = delete_collection_pods(
-            axum::extract::State(state),
-            axum::extract::Path(("default".to_string(),)),
-            test_user(),
-            axum::extract::Query(crate::handlers::generic::CollectionQuery {
-                watch: None,
-                resource_version: None,
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-                send_initial_events: None,
-                allow_watch_bookmarks: None,
-                timeout_seconds: None,
-            }),
-            axum::extract::Query(GracePeriodQuery {
-                grace_period_seconds: None,
-            }),
-            axum::http::HeaderMap::new(),
-            Bytes::new(),
-        )
-        .await;
+        let run = || {
+            delete_collection_pods(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(),)),
+                test_user(),
+                axum::extract::Query(crate::handlers::generic::CollectionQuery {
+                    watch: None,
+                    resource_version: None,
+                    label_selector: None,
+                    field_selector: None,
+                    limit: None,
+                    continue_token: None,
+                    send_initial_events: None,
+                    allow_watch_bookmarks: None,
+                    timeout_seconds: None,
+                }),
+                axum::extract::Query(GracePeriodQuery {
+                    grace_period_seconds: None,
+                }),
+                axum::http::HeaderMap::new(),
+                Bytes::new(),
+            )
+        };
+
+        let result = run().await;
 
         assert!(
             result.is_err(),
@@ -21898,6 +21905,25 @@ mod admission_tests {
         assert!(
             stored.is_some(),
             "denied pod must remain in the store — DeleteCollection must not have deleted it"
+        );
+
+        // Control: the seeded pod is already Terminating with no finalizers, so it
+        // hard-deletes whenever admission lets it through. Without this, survival above
+        // could be explained by the soft-delete path rather than the webhook denial.
+        store
+            .delete(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-delete-collection",
+                None,
+            )
+            .await
+            .unwrap();
+        run()
+            .await
+            .expect("DeleteCollection without webhook must succeed");
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "control pod must hard-delete once the webhook is gone — proves the earlier \
+             survival was caused by the webhook denial, not by soft-delete semantics"
         );
     }
 
