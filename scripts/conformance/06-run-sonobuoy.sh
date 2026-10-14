@@ -84,19 +84,23 @@ if [ "$PASS" = "all" ]; then
   # [Disruptive] specs just runs 0 specs in its pass (cheaper than a dry-run).
   PASS_LOG_DIR=$(mktemp -d)
   trap 'rm -rf "$PASS_LOG_DIR"' EXIT
-  OVERALL_EXIT=0
+  INFRA_EXIT=0
   for P in disruptive parallel; do
     echo "=== [06] pass: $P ==="
     P_EXIT=0
     bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} --pass "$P" 2>&1 | tee "$PASS_LOG_DIR/$P.log" || P_EXIT=$?
-    [ "$P_EXIT" -ne 0 ] && [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=$P_EXIT
+    if [ "$P_EXIT" -ne 0 ] && [ "$P_EXIT" -ne "$SONOBUOY_EXIT_SPEC_FAILURES" ] && [ "$INFRA_EXIT" -eq 0 ]; then
+      INFRA_EXIT=$P_EXIT
+    fi
   done
   echo ""
   echo "=== Combined results (both passes) ==="
   TOTAL_FAILED=0
+  SPEC_FAILED=0
   for P in disruptive parallel; do
     echo "  [$P] $(grep -E '^  (Ran|Passed|Failed):' "$PASS_LOG_DIR/$P.log" | sed 's/^ *//' | tr -s ' ' | tr '\n' ' ')"
     F=$(sed -n 's/^  Failed: *//p' "$PASS_LOG_DIR/$P.log" | head -1)
+    SPEC_FAILED=$(( SPEC_FAILED + ${F:-0} ))
     TOTAL_FAILED=$(( TOTAL_FAILED + ${F:-0} ))
     R=$(sed -n 's/^  Ran: *//p' "$PASS_LOG_DIR/$P.log" | head -1)
     # A pass that printed no summary never produced results; with no
@@ -104,21 +108,23 @@ if [ "$PASS" = "all" ]; then
     # [Disruptive] specs), so 0 there means the filter or sonobuoy invocation broke.
     if [ -z "$R" ]; then
       echo "  [$P] NO RESULTS: pass did not complete (counted as failure)"
-      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=1
+      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$INFRA_EXIT" -eq 0 ] && INFRA_EXIT=1
     elif [ "$R" -eq 0 ] && [ -z "$FOCUS" ] && [ "$ALL_E2E" -eq 0 ]; then
       echo "  [$P] RAN 0 SPECS: certified-conformance pass selected nothing (counted as failure)"
-      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=1
+      TOTAL_FAILED=$(( TOTAL_FAILED + 1 )); [ "$INFRA_EXIT" -eq 0 ] && INFRA_EXIT=1
     fi
   done
   echo "  Total failed across passes: $TOTAL_FAILED"
   # sonobuoy exits 0 even when specs failed, so the failure count is the signal.
-  [ "$TOTAL_FAILED" -gt 0 ] && [ "$OVERALL_EXIT" -eq 0 ] && OVERALL_EXIT=1
+  OVERALL_EXIT=$(sonobuoy_exit_code "$INFRA_EXIT" "$SPEC_FAILED")
   exit "$OVERALL_EXIT"
 fi
 
 if [ "$PASS" = "disruptive" ]; then PROCS=1; fi
 
 echo "=== [06] Run sonobuoy ($PASS pass) ==="
+RESULTS_DIR_FILE=$(sonobuoy_results_dir_file "$WORKDIR" "$PASS")
+rm -f "$RESULTS_DIR_FILE"
 
 if ! command -v limactl &>/dev/null; then
   echo "error: limactl not found — install with: brew install lima" >&2; exit 1
@@ -588,6 +594,8 @@ echo "Results: $OUTFILE"
 # Collected for every node in the run (not just the primary) — KCM/scheduler run once
 # for the whole cluster so they stay unlisted here.
 RUN_DIR="${OUTFILE%.tar.gz}"
+mkdir -p "$WORKDIR"
+echo "$RUN_DIR" > "$RESULTS_DIR_FILE"
 HOST_LOGS_DIR="$RUN_DIR/host-logs"
 mkdir -p "$HOST_LOGS_DIR"
 [ -f "$WORKDIR/apiserver.log" ]              && cp "$WORKDIR/apiserver.log"   "$HOST_LOGS_DIR/apiserver.log"
@@ -683,5 +691,9 @@ if [ "$UNPACK" -eq 1 ]; then
       fi
     fi
     echo "  Unpacked: $UNPACK_DIR"
+    exit "$(sonobuoy_exit_code "$SONOBUOY_EXIT" "${FAILURES:-0}")"
+  else
+    echo "error: no junit at $JUNIT — the run produced no results" >&2; exit 1
   fi
 fi
+exit 0
