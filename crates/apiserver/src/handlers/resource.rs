@@ -1794,10 +1794,6 @@ pub(crate) async fn do_patch<S: Store>(
         attempt += 1;
         let mut current = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-        // Snapshotted before the patch mutates `current.body` in place below — this is the
-        // only pre-patch copy available to pass as old_object to the admission webhooks.
-        let old_object = current.body.clone();
-
         // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
         // snapshot data/binaryData/stringData before the patch is applied so the rejection
         // below (after the patch) can be scoped to changes that actually touch them or
@@ -1985,9 +1981,9 @@ pub(crate) async fn do_patch<S: Store>(
             }
         }
 
-        if let Some(ref old_spec) = pvc_spec_before_patch {
+        if let Some(old_spec) = pvc_spec_before_patch {
             let old_status = stored_status.as_ref().unwrap_or(&serde_json::Value::Null);
-            validate_pvc_spec_immutable(old_spec, &current.body["spec"], old_status)
+            validate_pvc_spec_immutable(&old_spec, &current.body["spec"], old_status)
                 .map_err(Status::unprocessable_entity)?;
         }
 
@@ -1996,13 +1992,13 @@ pub(crate) async fn do_patch<S: Store>(
                 .map_err(Status::unprocessable_entity)?;
         }
 
-        if let Some(ref old_spec) = pv_spec_before_patch {
-            validate_pv_spec_immutable(old_spec, &current.body["spec"])
+        if let Some(old_spec) = pv_spec_before_patch {
+            validate_pv_spec_immutable(&old_spec, &current.body["spec"])
                 .map_err(Status::unprocessable_entity)?;
         }
 
-        if let Some(ref old_body) = storageclass_before_patch {
-            validate_storageclass_immutable(old_body, &current.body)
+        if let Some(old_body) = storageclass_before_patch {
+            validate_storageclass_immutable(&old_body, &current.body)
                 .map_err(Status::unprocessable_entity)?;
         }
 
@@ -2025,8 +2021,8 @@ pub(crate) async fn do_patch<S: Store>(
             .map_err(Status::forbidden)?;
         }
 
-        if let Some(ref old_spec) = svc_spec_before_patch {
-            validate_service_cluster_ip_immutable(old_spec, &current.body["spec"])
+        if let Some(old_spec) = svc_spec_before_patch {
+            validate_service_cluster_ip_immutable(&old_spec, &current.body["spec"])
                 .map_err(Status::unprocessable_entity)?;
         }
 
@@ -2042,15 +2038,13 @@ pub(crate) async fn do_patch<S: Store>(
             .await?;
         }
 
-        if let Some((ref data_before, ref binary_data_before, ref string_data_before)) =
-            immutable_snapshot
-        {
+        if let Some((data_before, binary_data_before, string_data_before)) = immutable_snapshot {
             let new_immutable = &current.body["immutable"];
             let immutable_cleared =
                 new_immutable == &serde_json::Value::Bool(false) || new_immutable.is_null();
-            let data_changed = &current.body["data"] != data_before;
-            let binary_data_changed = &current.body["binaryData"] != binary_data_before;
-            let string_data_changed = &current.body["stringData"] != string_data_before;
+            let data_changed = current.body["data"] != data_before;
+            let binary_data_changed = current.body["binaryData"] != binary_data_before;
+            let string_data_changed = current.body["stringData"] != string_data_before;
             if immutable_cleared || data_changed || binary_data_changed || string_data_changed {
                 return Err(Status::unprocessable_entity(format!(
                     "{plural}/{name} is immutable and cannot be updated"
@@ -2058,30 +2052,64 @@ pub(crate) async fn do_patch<S: Store>(
             }
         }
 
+        let admission_ctx = AdmissionContext {
+            group,
+            version,
+            resource: plural,
+            name,
+            namespace: ns,
+            operation: "UPDATE",
+            user_info: user_info.clone(),
+            dry_run,
+        };
+        // The pre-patch object is re-parsed from the stored bytes (current.body was patched in
+        // place) and only when something reads it, so a PATCH of a kind with no old-object
+        // validator and no webhook configured never holds a second full tree.
+        let kind_reads_old_object = matches!(
+            (group, plural),
+            (
+                "certificates.k8s.io",
+                "clustertrustbundles" | "podcertificaterequests"
+            ) | ("storagemigration.k8s.io", "storageversionmigrations")
+                | ("resource.k8s.io", "devicetaintrules")
+        ) || super::defaults::generation_tracked_field(group, plural)
+            .is_some();
+        let old_object = if kind_reads_old_object {
+            Some(
+                Object::from_bytes(&stored.value)
+                    .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?
+                    .body,
+            )
+        } else {
+            crate::admission::load_old_object_for_admission(state, &admission_ctx, &stored.value)
+                .await?
+        };
+        let old_or_null = old_object.as_ref().unwrap_or(&serde_json::Value::Null);
+
         super::defaults::apply_defaults(group, plural, &mut current.body);
         super::defaults::validate_resource(group, plural, &current.body)
             .map_err(Status::unprocessable_entity)?;
         if group == "certificates.k8s.io" && plural == "clustertrustbundles" {
             super::certificates::validate_cluster_trust_bundle_signer_immutable(
-                &old_object,
+                old_or_null,
                 &current.body,
             )
             .map_err(Status::unprocessable_entity)?;
         }
         if group == "certificates.k8s.io" && plural == "podcertificaterequests" {
             super::certificates::validate_pod_certificate_request_spec_immutable(
-                &old_object,
+                old_or_null,
                 &current.body,
             )
             .map_err(Status::unprocessable_entity)?;
         }
         if group == "storagemigration.k8s.io" && plural == "storageversionmigrations" {
-            super::storagemigration::validate_spec_immutable(&old_object, &current.body)
+            super::storagemigration::validate_spec_immutable(old_or_null, &current.body)
                 .map_err(Status::unprocessable_entity)?;
         }
         if group == "resource.k8s.io" && plural == "devicetaintrules" {
             super::device_taint_rule::prepare_device_taint_rule_update(
-                &old_object,
+                old_or_null,
                 &mut current.body,
             );
         }
@@ -2147,18 +2175,8 @@ pub(crate) async fn do_patch<S: Store>(
         }
 
         // Admission webhook pipeline (mutating then validating).
-        let admission_ctx = AdmissionContext {
-            group,
-            version,
-            resource: plural,
-            name,
-            namespace: ns,
-            operation: "UPDATE",
-            user_info: user_info.clone(),
-            dry_run,
-        };
         current.body =
-            run_mutating_webhooks(state, current.body, Some(&old_object), &admission_ctx).await?;
+            run_mutating_webhooks(state, current.body, old_object.as_ref(), &admission_ctx).await?;
         // Re-restore status after mutating webhooks — same rationale as the SSA-create-race
         // fallback's post-webhook re-call above: a webhook's JSON patch can reinject a
         // forged/scalar status the earlier restore (before this match block) already
@@ -2171,10 +2189,11 @@ pub(crate) async fn do_patch<S: Store>(
         super::defaults::prepare_generation_for_update(
             group,
             plural,
-            &old_object,
+            old_or_null,
             &mut current.body,
         );
-        run_validating_webhooks(state, &current.body, Some(&old_object), &admission_ctx).await?;
+        run_validating_webhooks(state, &current.body, old_object.as_ref(), &admission_ctx).await?;
+        drop(old_object);
 
         // A user PATCH on an Endpoints object signals that the endpoints are now user-managed.
         // Clear the annotation the KCM endpoints-controller stamps; the mirroring controller
