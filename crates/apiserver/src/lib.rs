@@ -32,6 +32,7 @@ mod rbac;
 mod rbac_gen_adapter;
 mod resource_gen_adapter;
 mod sa_sig_cache;
+mod service_alloc;
 mod service_resolver;
 mod state;
 mod status;
@@ -3346,7 +3347,7 @@ async fn seed_services(
     match store
         .put(
             &dns_ip_sentinel_key,
-            Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+            service_alloc::owned_ip_sentinel("kube-system", "kube-dns"),
             Some(0),
         )
         .await
