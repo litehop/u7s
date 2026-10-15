@@ -55,5 +55,5 @@ default-bloat failure mode the packaging philosophy exists to avoid.
 
 - CRI-O beyond Ubuntu is unaddressed until there is demand.
 - HPA requires a user-applied manifest.
-- A future native kube-proxy folds into u7s's own binary; this ADR governs
-  only the upstream-binary path.
+- kube-proxy replacement is out of u7s scope (beep-side, post-v1.0); this
+  ADR governs only the upstream-binary path.
