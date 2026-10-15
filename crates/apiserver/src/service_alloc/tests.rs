@@ -778,3 +778,110 @@ async fn repair_is_idempotent_and_agrees_with_owned_sentinels() {
     assert_eq!((second.seeded, second.released), (0, 0), "{second:?}");
     assert!(held(&st, &ip_key("10.96.0.1")).await);
 }
+
+async fn held_ips(st: &AppState<SqliteStore>) -> Vec<String> {
+    let mut keys: Vec<String> = st
+        .store
+        .list(SERVICE_IP_PREFIX, u7s_store::ListOptions::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The clusterIP is auto-allocated before quota admission runs; a Service the quota turns
+/// away must not keep its VIP, or every rejected create permanently shrinks the pool.
+#[tokio::test]
+async fn quota_rejected_create_does_not_leak_its_auto_allocated_cluster_ip() {
+    let st = state();
+    let before = held_ips(&st).await;
+    st.store
+        .put(
+            "/registry/resourcequotas/default/no-services",
+            bytes::Bytes::from(
+                json!({
+                    "apiVersion": "v1", "kind": "ResourceQuota",
+                    "metadata": {"name": "no-services", "namespace": "default"},
+                    "spec": {"hard": {"services": "0"}},
+                })
+                .to_string(),
+            ),
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+    let r = create(&st, "denied", json!({"ports": [{"port": 80}]}), false).await;
+    assert!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "{r:?}");
+    for _ in 0..400 {
+        if held_ips(&st).await == before {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "a create rejected by quota leaked its auto-allocated clusterIP: {:?}",
+        held_ips(&st).await
+    );
+}
+
+/// A client that disconnects while its Service is being written cancels the handler future,
+/// but the store write still lands. The persisted Service must keep its VIP and node port:
+/// freeing them would let the next Service be handed the same address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_disconnect_during_create_keeps_reservations_of_the_persisted_service() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    let mut cancelled_after_persist = 0;
+    for _ in 0..50 {
+        let st = state();
+        let body = svc("svc", np_spec(80, 0));
+        let mut fut = Box::pin(create_namespaced_resource(
+            State(st.clone()),
+            coll_path(),
+            Query(CreateQuery::default()),
+            user(),
+            headers("application/json"),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+            if st
+                .store
+                .get("/registry/services/default/svc")
+                .await
+                .unwrap()
+                .is_some()
+            {
+                drop(fut);
+                cancelled_after_persist += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let stored = get(&st, "svc").await;
+                let ip = stored["spec"]["clusterIP"].as_str().unwrap();
+                let np = stored["spec"]["ports"][0]["nodePort"].as_i64().unwrap();
+                assert!(
+                    held(&st, &ip_key(ip)).await,
+                    "persisted Service lost its clusterIP reservation on client disconnect"
+                );
+                assert!(
+                    held(&st, &port_key(np)).await,
+                    "persisted Service lost its nodePort reservation on client disconnect"
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+    assert!(
+        cancelled_after_persist > 0,
+        "never cancelled a create after its write landed; the test did not exercise the window"
+    );
+}

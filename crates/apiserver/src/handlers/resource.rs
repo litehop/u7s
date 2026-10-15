@@ -3394,7 +3394,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
 
     // Reserve the Service's clusterIP/nodePorts after admission, like upstream's BeginCreate;
     // dropped (and thus rolled back) on any failure below.
-    let svc_alloc = if group.is_empty() && plural == "services" {
+    let mut svc_alloc = if group.is_empty() && plural == "services" {
         Some(
             crate::service_alloc::begin(
                 &state,
@@ -3436,10 +3436,31 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         // a separate earlier check + this write used to leave open (a create could observe
         // Active, then a concurrent delete_namespace flips the phase, and this write would
         // blindly succeed regardless).
-        let result = state
-            .store
-            .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
-            .await;
+        let result = match svc_alloc.take() {
+            // A Service's reservations are committed on the write's own task: if the client
+            // disconnects mid-write the object still lands, and must keep its VIP/ports.
+            Some(txn) => match crate::service_alloc::create_committing(
+                state.store.clone(),
+                ns_key.clone(),
+                key.clone(),
+                obj.to_bytes(),
+                txn,
+            )
+            .await
+            {
+                Ok(rv) => Ok(rv),
+                Err((e, txn)) => {
+                    svc_alloc = Some(txn);
+                    Err(e)
+                }
+            },
+            None => {
+                state
+                    .store
+                    .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
+                    .await
+            }
+        };
         tracing::debug!(
             key = %key,
             elapsed_ms = put_start.elapsed().as_millis() as u64,
@@ -5039,7 +5060,7 @@ async fn maybe_allocate_cluster_ip<S: Store>(
     name: &str,
     body: &mut serde_json::Value,
     dry_run: bool,
-) -> Result<Option<std::net::Ipv4Addr>, crate::status::StatusError> {
+) -> Result<Option<crate::service_alloc::AutoClusterIp<S>>, crate::status::StatusError> {
     // ExternalName services must not have a ClusterIP; skip allocation entirely.
     let svc_type = body["spec"]["type"].as_str().unwrap_or("");
     if svc_type == "ExternalName" {
@@ -5063,7 +5084,7 @@ async fn maybe_allocate_cluster_ip<S: Store>(
     if let Some(ip) = ip {
         body["spec"]["clusterIP"] = serde_json::Value::String(ip.to_string());
     }
-    Ok(ip)
+    Ok(ip.map(|ip| crate::service_alloc::AutoClusterIp::new(state.store.clone(), ip)))
 }
 
 pub(crate) fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
