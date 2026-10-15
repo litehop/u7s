@@ -2227,7 +2227,7 @@ dependencies = [
 [[package]]
 name = "politeia"
 version = "0.1.0"
-source = "git+https://github.com/litehop/politeia?tag=v0.1.0#d80cbc16afff4eb94174ce96d9e1150cbe1a6712"
+source = "git+https://github.com/litehop/politeia?tag=v0.1.1#9b9f07df55c2cf5ec0fce0be1ce6434f2ce51da1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
