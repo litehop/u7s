@@ -433,5 +433,115 @@ async fn reserve_all<S: Store>(
     Ok(stale)
 }
 
+/// Outcome of one `repair` pass.
+#[derive(Debug, Default)]
+pub(crate) struct RepairReport {
+    pub seeded: usize,
+    pub released: usize,
+    pub conflicts: Vec<String>,
+}
+
+/// Sentinel key -> owner, for a sentinel reserved ahead of its Service (None: plain).
+async fn list_sentinels<S: Store>(
+    store: &S,
+    prefix: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, Option<String>>> {
+    let resp = store.list(prefix, ListOptions::default()).await?;
+    Ok(resp
+        .items
+        .into_iter()
+        .map(|o| {
+            let owner = serde_json::from_slice::<Value>(&o.value)
+                .ok()
+                .and_then(|v| v["owner"].as_str().map(str::to_string));
+            (o.key, owner)
+        })
+        .collect())
+}
+
+/// Reconcile reservations with stored Services, as upstream's repair controllers do
+/// (`ipallocator/controller/repair.go`, `portallocator/controller/repair.go`): reserve what
+/// a Service holds but no sentinel records, release plain sentinels no Service holds, and
+/// report a value held by several Services or reserved for another owner without changing
+/// either. Sentinels reserved ahead of their Service (an `owner`) are never released.
+///
+/// Must run before the server accepts writes: a concurrent Service write holds a reservation
+/// before its object is stored, which this pass would see as an orphan.
+pub(crate) async fn repair<S: Store>(store: &S) -> anyhow::Result<RepairReport> {
+    let services = store
+        .list("/registry/services/", ListOptions::default())
+        .await?;
+    let mut ip_holders: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut port_holders: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
+    for obj in &services.items {
+        let Some(id) = obj.key.strip_prefix("/registry/services/") else {
+            continue;
+        };
+        let Ok(svc) = serde_json::from_slice::<Value>(&obj.value) else {
+            continue;
+        };
+        for ip in spec_ips(&svc["spec"]) {
+            ip_holders.entry(ip).or_default().push(id.to_string());
+        }
+        for port in spec_ports(&svc["spec"]) {
+            port_holders.entry(port).or_default().push(id.to_string());
+        }
+    }
+
+    let ip_sentinels = list_sentinels(store, SERVICE_IP_PREFIX).await?;
+    let port_sentinels = list_sentinels(store, NODE_PORT_PREFIX).await?;
+    let wanted = ip_holders
+        .iter()
+        .map(|(ip, h)| (ip_key(ip), format!("clusterIP {ip}"), h))
+        .chain(
+            port_holders
+                .iter()
+                .map(|(p, h)| (port_key(*p), format!("nodePort {p}"), h)),
+        );
+
+    let mut report = RepairReport::default();
+    let mut wanted_keys = BTreeSet::new();
+    for (key, what, holders) in wanted {
+        wanted_keys.insert(key.clone());
+        if holders.len() > 1 {
+            report
+                .conflicts
+                .push(format!("{what} is held by several Services: {holders:?}"));
+        }
+        match ip_sentinels.get(&key).or_else(|| port_sentinels.get(&key)) {
+            None => match store
+                .put(&key, bytes::Bytes::from_static(SENTINEL), Some(0))
+                .await
+            {
+                Ok(_) => report.seeded += 1,
+                Err(StoreError::AlreadyExists { .. }) => {}
+                Err(e) => return Err(anyhow::anyhow!("seed reservation {key}: {e}")),
+            },
+            Some(Some(owner)) if !holders.contains(owner) => report.conflicts.push(format!(
+                "{what} is held by {holders:?} but reserved for {owner}"
+            )),
+            Some(_) => {}
+        }
+    }
+
+    for (key, owner) in ip_sentinels.iter().chain(port_sentinels.iter()) {
+        if owner.is_none() && !wanted_keys.contains(key) {
+            delete_sentinel(store, key).await;
+            report.released += 1;
+        }
+    }
+
+    for c in &report.conflicts {
+        tracing::warn!("service allocation repair: {c}");
+    }
+    tracing::info!(
+        "service allocation repair: seeded {} reservations, released {} orphans, {} conflicts",
+        report.seeded,
+        report.released,
+        report.conflicts.len()
+    );
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests;
