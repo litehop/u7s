@@ -1326,11 +1326,26 @@ async fn complete_finalizer_drain<S: Store>(
         ns,
         name,
     } = ctx;
+    let released_service_spec = if group.is_empty() && plural == "services" {
+        state
+            .store
+            .get(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.value).ok())
+            .map(|v| v["spec"].clone())
+    } else {
+        None
+    };
     state
         .store
         .delete(key, None)
         .await
         .map_err(|e| store_err(e, group, plural, name, &meta.kind))?;
+    if let Some(spec) = released_service_spec {
+        crate::service_alloc::release_service_allocations(state, &spec).await;
+    }
     if group == RBAC_GROUP {
         let rbac_key = match ns {
             None => rbac_cluster_key(group, version, plural, name),
@@ -1458,6 +1473,19 @@ pub(crate) async fn do_patch<S: Store>(
             &meta.kind,
             &mut obj.body,
         )?;
+        let mut auto_cluster_ip = None;
+        if group.is_empty() && plural == "services" {
+            super::defaults::validate_service_ip_family_fields(&obj.body)
+                .map_err(Status::unprocessable_entity)?;
+            auto_cluster_ip = maybe_allocate_cluster_ip(
+                state,
+                ns.unwrap_or_default(),
+                name,
+                &mut obj.body,
+                dry_run,
+            )
+            .await?;
+        }
         super::defaults::apply_defaults(group, plural, &mut obj.body);
         if group.is_empty() && plural == "namespaces" {
             super::defaults::prepare_namespace_for_create(&mut obj.body)
@@ -1554,6 +1582,23 @@ pub(crate) async fn do_patch<S: Store>(
         super::defaults::force_generation_on_create(group, plural, &mut obj.body);
         run_validating_webhooks(state, &obj.body, None, &admission_ctx).await?;
 
+        let svc_alloc = if group.is_empty() && plural == "services" {
+            Some(
+                crate::service_alloc::begin(
+                    state,
+                    ns.unwrap_or_default(),
+                    name,
+                    None,
+                    &mut obj.body,
+                    auto_cluster_ip,
+                    dry_run,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
         if dry_run {
             // Dry-run: validation passed; return the would-be created object without persisting.
             if let Some(fm) = field_manager {
@@ -1585,6 +1630,9 @@ pub(crate) async fn do_patch<S: Store>(
             }
             Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
                 // Race: another writer created it; fall through to normal merge below.
+                if let Some(txn) = svc_alloc {
+                    txn.rollback().await;
+                }
                 let stored = state
                     .store
                     .get(key)
@@ -1593,6 +1641,8 @@ pub(crate) async fn do_patch<S: Store>(
                     .ok_or_else(|| Status::not_found(group, plural, name))?;
                 let mut current = Object::from_bytes(&stored.value)
                     .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+                let race_svc_spec = (group.is_empty() && plural == "services")
+                    .then(|| current.body["spec"].clone());
                 // Full body (not just spec): restrict_node_self_write below also needs
                 // metadata.labels/ownerReferences, not only spec.
                 let node_before = if group.is_empty() && plural == "nodes" {
@@ -1719,6 +1769,22 @@ pub(crate) async fn do_patch<S: Store>(
                     let now = crate::util::utc_now_rfc3339();
                     inject_managed_fields(&mut current.body, fm, &api_ver, &now);
                 }
+                let race_svc_alloc = if group.is_empty() && plural == "services" {
+                    Some(
+                        crate::service_alloc::begin(
+                            state,
+                            ns.unwrap_or_default(),
+                            name,
+                            race_svc_spec.as_ref(),
+                            &mut current.body,
+                            None,
+                            false,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
                 let expected_rv = parse_resource_version(current.resource_version())?;
                 let rv = state
                     .store
@@ -1726,6 +1792,9 @@ pub(crate) async fn do_patch<S: Store>(
                     .await
                     .map_err(|e| store_err(e, group, plural, name, &meta.kind))?;
                 current.set_resource_version(rv);
+                if let Some(txn) = race_svc_alloc {
+                    txn.commit().await;
+                }
                 if group == RBAC_GROUP {
                     let rbac_key = match ns {
                         None => rbac_cluster_key(group, version, plural, name),
@@ -1742,6 +1811,9 @@ pub(crate) async fn do_patch<S: Store>(
             }
         };
         obj.set_resource_version(new_rv);
+        if let Some(txn) = svc_alloc {
+            txn.commit().await;
+        }
         // SSA upsert-create: this is the same "object now exists" event create_resource's
         // RBAC_GROUP hook handles for a plain POST — without it, a ClusterRole/ClusterRoleBinding
         // created via `kubectl apply --server-side` (or this apiserver's own bootstrap-installer,
@@ -2021,8 +2093,8 @@ pub(crate) async fn do_patch<S: Store>(
             .map_err(Status::forbidden)?;
         }
 
-        if let Some(old_spec) = svc_spec_before_patch {
-            validate_service_cluster_ip_immutable(&old_spec, &current.body["spec"])
+        if let Some(ref old_spec) = svc_spec_before_patch {
+            validate_service_cluster_ip_immutable(old_spec, &current.body["spec"])
                 .map_err(Status::unprocessable_entity)?;
         }
 
@@ -2052,6 +2124,19 @@ pub(crate) async fn do_patch<S: Store>(
             }
         }
 
+        let mut auto_cluster_ip = None;
+        if group.is_empty() && plural == "services" {
+            super::defaults::validate_service_ip_family_fields(&current.body)
+                .map_err(Status::unprocessable_entity)?;
+            auto_cluster_ip = maybe_allocate_cluster_ip(
+                state,
+                ns.unwrap_or_default(),
+                name,
+                &mut current.body,
+                dry_run,
+            )
+            .await?;
+        }
         let admission_ctx = AdmissionContext {
             group,
             version,
@@ -2208,6 +2293,23 @@ pub(crate) async fn do_patch<S: Store>(
                 serde_json::to_value(patch_meta).map_err(|e| Status::internal(e.to_string()))?;
         }
 
+        let svc_alloc = if group.is_empty() && plural == "services" {
+            Some(
+                crate::service_alloc::begin(
+                    state,
+                    ns.unwrap_or_default(),
+                    name,
+                    svc_spec_before_patch.as_ref(),
+                    &mut current.body,
+                    auto_cluster_ip,
+                    dry_run,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
         // Dry-run: validation and admission passed; return the would-be result without persisting.
         if dry_run {
             if is_ssa {
@@ -2228,6 +2330,9 @@ pub(crate) async fn do_patch<S: Store>(
         match state.store.put(key, current.to_bytes(), expected_rv).await {
             Ok(new_rv) => {
                 current.set_resource_version(new_rv);
+                if let Some(txn) = svc_alloc {
+                    txn.commit().await;
+                }
                 if group == RBAC_GROUP {
                     let rbac_key = match ns {
                         None => rbac_cluster_key(group, version, plural, name),
@@ -2258,6 +2363,10 @@ pub(crate) async fn do_patch<S: Store>(
                 return Ok(Json(current.body).into_response());
             }
             Err(StoreError::RevisionMismatch { .. }) if attempt < MAX_PATCH_CONFLICT_RETRIES => {
+                // Await the rollback so the retry can re-reserve the same values.
+                if let Some(txn) = svc_alloc {
+                    txn.rollback().await;
+                }
                 stored = state
                     .store
                     .get(key)
@@ -3218,11 +3327,13 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     // The ip-family check runs first, on the raw client body, so a Service the cluster
     // cannot satisfy (e.g. ipFamilyPolicy: RequireDualStack) is rejected before an IP is
     // ever taken from the pool — rejecting after allocation would leak it.
+    let mut auto_cluster_ip = None;
     if group.is_empty() && plural == "services" {
         super::defaults::validate_service_ip_family_fields(&obj.body)
             .map_err(Status::unprocessable_entity)?;
-        maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body, create_query.is_dry_run())
-            .await?;
+        auto_cluster_ip =
+            maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body, create_query.is_dry_run())
+                .await?;
     }
 
     let api_version = if group.is_empty() {
@@ -3280,6 +3391,25 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     // the check, and collectively exceed the quota.
     let _quota_lock = state.quota_admission_locks.lock(&ns).await;
     quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj.body)).await?;
+
+    // Reserve the Service's clusterIP/nodePorts after admission, like upstream's BeginCreate;
+    // dropped (and thus rolled back) on any failure below.
+    let svc_alloc = if group.is_empty() && plural == "services" {
+        Some(
+            crate::service_alloc::begin(
+                &state,
+                &ns,
+                &name,
+                None,
+                &mut obj.body,
+                auto_cluster_ip,
+                create_query.is_dry_run(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     // Dry-run: validation and admission passed; return the would-be created object without persisting.
     if create_query.is_dry_run() {
@@ -3384,6 +3514,9 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     };
 
     obj.set_resource_version(new_rv);
+    if let Some(txn) = svc_alloc {
+        txn.commit().await;
+    }
     if group == RBAC_GROUP {
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
@@ -3901,10 +4034,11 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // the type is (still) ExternalName, so calling it unconditionally is safe.
     // The ip-family check runs first, on the raw client body, for the same
     // leak-avoidance reason as the create path above.
+    let mut auto_cluster_ip = None;
     if group.is_empty() && plural == "services" {
         super::defaults::validate_service_ip_family_fields(&obj.body)
             .map_err(Status::unprocessable_entity)?;
-        maybe_allocate_cluster_ip(
+        auto_cluster_ip = maybe_allocate_cluster_ip(
             &state,
             &ns,
             &name,
@@ -4022,6 +4156,23 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         None
     };
 
+    let svc_alloc = if group.is_empty() && plural == "services" {
+        Some(
+            crate::service_alloc::begin(
+                &state,
+                &ns,
+                &name,
+                svc_spec_before_replace.as_ref(),
+                &mut obj.body,
+                auto_cluster_ip,
+                replace_query.is_dry_run(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     // Dry-run: validation and admission passed; return the would-be result without persisting.
     if replace_query.is_dry_run() {
         inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
@@ -4106,6 +4257,9 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     );
 
     obj.set_resource_version(new_rv);
+    if let Some(txn) = svc_alloc {
+        txn.commit().await;
+    }
     if group == RBAC_GROUP {
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
@@ -4189,7 +4343,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
     // re-read the fresh object and redo the delete decision rather than returning a 409 the
     // client never asked to guard against. Mirrors delete_pod's retry-on-RevisionMismatch loop,
     // added for the same race class.
-    let cluster_ip;
+    let released_spec;
     loop {
         let stored = state
             .store
@@ -4290,10 +4444,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
         // Capture what post-loop cascade side effects need from the freshly-read `obj`
         // before it drops at the end of this iteration — `obj` itself is loop-scoped
         // since every retry re-reads it fresh.
-        cluster_ip = obj.body["spec"]["clusterIP"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        released_spec = obj.body["spec"].clone();
         break;
     }
 
@@ -4302,9 +4453,9 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
         state.rbac_index.remove_object(&rbac_key);
     }
 
-    // Release the clusterIP sentinel so the IP can be re-allocated.
+    // Release the clusterIP and node-port reservations so they can be re-allocated.
     if group.is_empty() && plural == "services" {
-        state.release_service_ip(&cluster_ip).await;
+        crate::service_alloc::release_service_allocations(&state, &released_spec).await;
     }
 
     // Locked so this full-recompute write of status.used can never interleave with a
@@ -4584,7 +4735,7 @@ pub(crate) async fn delete_collection_resource<S: Store>(
 
     for obj in resp.items {
         // Extract name from the stored JSON for RBAC index eviction and protection.
-        let mut cluster_ip_to_release: Option<String> = None;
+        let mut spec_to_release: Option<serde_json::Value> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
             let name = parsed["metadata"]["name"]
                 .as_str()
@@ -4636,13 +4787,7 @@ pub(crate) async fn delete_collection_resource<S: Store>(
                 state.rbac_index.remove_object(&rbac_key);
             }
             if group.is_empty() && plural == "services" {
-                let ip = parsed["spec"]["clusterIP"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                if !ip.is_empty() {
-                    cluster_ip_to_release = Some(ip);
-                }
+                spec_to_release = Some(parsed["spec"].clone());
             }
 
             // Respect metadata.finalizers exactly like a single-object DELETE would: a
@@ -4669,8 +4814,8 @@ pub(crate) async fn delete_collection_resource<S: Store>(
                 Ok(_) | Err(StoreError::NotFound { .. }) => {}
                 Err(e) => return Err(Status::internal(e.to_string())),
             }
-            if let Some(ref ip) = cluster_ip_to_release {
-                state.release_service_ip(ip).await;
+            if let Some(ref spec) = spec_to_release {
+                crate::service_alloc::release_service_allocations(&state, spec).await;
             }
         }
     }
@@ -4765,20 +4910,14 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
     }));
 
     for obj in resp.items {
-        let mut cluster_ip_to_release: Option<String> = None;
+        let mut spec_to_release: Option<serde_json::Value> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
             let name = parsed["metadata"]["name"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
             if group.is_empty() && plural == "services" {
-                let ip = parsed["spec"]["clusterIP"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                if !ip.is_empty() {
-                    cluster_ip_to_release = Some(ip);
-                }
+                spec_to_release = Some(parsed["spec"].clone());
             }
             if !field_selector.matches_defaulted(&group, &plural, &parsed) {
                 continue;
@@ -4847,8 +4986,8 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 Ok(_) | Err(StoreError::NotFound { .. }) => {}
                 Err(e) => return Err(Status::internal(e.to_string())),
             }
-            if let Some(ref ip) = cluster_ip_to_release {
-                state.release_service_ip(ip).await;
+            if let Some(ref spec) = spec_to_release {
+                crate::service_alloc::release_service_allocations(&state, spec).await;
             }
         }
     }
@@ -4900,30 +5039,31 @@ async fn maybe_allocate_cluster_ip<S: Store>(
     name: &str,
     body: &mut serde_json::Value,
     dry_run: bool,
-) -> Result<(), crate::status::StatusError> {
+) -> Result<Option<std::net::Ipv4Addr>, crate::status::StatusError> {
     // ExternalName services must not have a ClusterIP; skip allocation entirely.
     let svc_type = body["spec"]["type"].as_str().unwrap_or("");
     if svc_type == "ExternalName" {
-        return Ok(());
+        return Ok(None);
     }
 
     // Only auto-allocate when clusterIP is absent or empty.
     let existing = body["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
     if !existing.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     if dry_run {
-        return Ok(());
+        return Ok(None);
     }
 
     // Detect the special `default/kubernetes` Service which reserves .1.
     let is_kubernetes_service = ns == "default" && name == "kubernetes";
 
-    if let Some(ip) = state.allocate_service_ip(is_kubernetes_service).await? {
+    let ip = state.allocate_service_ip(is_kubernetes_service).await?;
+    if let Some(ip) = ip {
         body["spec"]["clusterIP"] = serde_json::Value::String(ip.to_string());
     }
-    Ok(())
+    Ok(ip)
 }
 
 pub(crate) fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {

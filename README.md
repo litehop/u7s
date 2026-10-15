@@ -16,11 +16,18 @@ The install script bootstraps a single-node cluster on a fresh Ubuntu LTS
 host: it installs CRI-O, stages the u7s binaries and the vendored kubelet
 and kube-controller-manager, and writes a systemd unit for each.
 
-1. Run the install script as root on the target host:
+1. Run the install script as root on the target host. Every release is
+   still a prerelease (snapshot), so the unpinned `/install.sh` URL
+   returns 404 by design; pin a snapshot tag instead:
 
    ```bash
-   curl -sfL https://u7s.dekiru.tech/install.sh | sudo bash
+   TAG=$(curl -sf "https://api.github.com/repos/litehop/u7s/releases?per_page=1" | grep -m1 '"tag_name"' | cut -d'"' -f4)
+   curl -fsSL "https://u7s.dekiru.tech/${TAG:?could not resolve the latest release tag - set TAG manually}/install.sh" | sudo bash
    ```
+
+   The lookup uses `curl`, `grep` and `cut` (unauthenticated GitHub API
+   calls are rate-limited; if it fails, set `TAG` by hand from
+   <https://github.com/litehop/u7s/releases>).
 
 2. With no flags, the node name defaults to the host's hostname and the
    cluster network binds to the first non-loopback interface. Override
