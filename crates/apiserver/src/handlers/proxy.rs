@@ -33,6 +33,22 @@ use crate::{
     status::Status,
 };
 
+/// Max inbound/outbound websocket frame and message size on proxy streams. Legitimate
+/// exec/attach/portforward payloads are io.Copy chunks (32 KiB) plus a 1-byte channel
+/// prefix; 1 MiB leaves 32x headroom while denying tungstenite's 16/64 MiB defaults.
+const WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+fn capped_upgrade(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+    ws.max_frame_size(WS_MAX_FRAME_BYTES)
+        .max_message_size(WS_MAX_FRAME_BYTES)
+}
+
+fn outbound_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_frame_size(Some(WS_MAX_FRAME_BYTES))
+        .max_message_size(Some(WS_MAX_FRAME_BYTES))
+}
+
 // ---------------------------------------------------------------------------
 // /log — query parameters forwarded to the kubelet
 // ---------------------------------------------------------------------------
@@ -301,13 +317,13 @@ pub async fn pod_log<S: Store>(
             .await
             .map_err(|e| Status::bad_request(format!("invalid websocket upgrade request: {e}")))?;
 
-        return Ok(ws.protocols([LOG_WS_SUBPROTOCOL]).on_upgrade(
-            move |socket: WebSocket| async move {
+        return Ok(capped_upgrade(ws)
+            .protocols([LOG_WS_SUBPROTOCOL])
+            .on_upgrade(move |socket: WebSocket| async move {
                 if let Err(e) = stream_log_over_websocket(socket, client, kubelet_url).await {
                     tracing::warn!("log websocket stream error: {e}");
                 }
-            },
-        ));
+            }));
     }
 
     let kubelet_resp = client.get(&kubelet_url).send().await.map_err(|e| {
@@ -532,13 +548,13 @@ pub async fn pod_attach<S: Store>(
 ) -> Result<Response, crate::status::StatusError> {
     let target = resolve_attach_target(&state, &raw_ns, &pod_name, &query).await?;
 
-    let resp =
-        ws.protocols([ATTACH_SUBPROTOCOL])
-            .on_upgrade(move |inbound: WebSocket| async move {
-                if let Err(e) = run_attach_proxy(inbound, target).await {
-                    tracing::warn!("attach proxy error: {e}");
-                }
-            });
+    let resp = capped_upgrade(ws)
+        .protocols([ATTACH_SUBPROTOCOL])
+        .on_upgrade(move |inbound: WebSocket| async move {
+            if let Err(e) = run_attach_proxy(inbound, target).await {
+                tracing::warn!("attach proxy error: {e}");
+            }
+        });
 
     Ok(resp)
 }
@@ -739,10 +755,14 @@ async fn dial_kubelet_attach(
         subprotocol.parse().expect("valid header value"),
     );
 
-    let (ws, _resp) =
-        tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
-            .await
-            .map_err(|e| anyhow::anyhow!("kubelet attach connect failed: {e}"))?;
+    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+        req,
+        Some(outbound_ws_config()),
+        false,
+        Some(connector),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("kubelet attach connect failed: {e}"))?;
     Ok(ws)
 }
 
@@ -1045,7 +1065,7 @@ pub async fn pod_exec<S: Store>(
     )
     .await?;
 
-    let resp = ws
+    let resp = capped_upgrade(ws)
         .protocols(EXEC_KUBECTL_PROTOCOLS.iter().copied())
         .on_upgrade(move |inbound: WebSocket| async move {
             if let Err(e) = run_exec_proxy(inbound, target).await {
@@ -1181,10 +1201,14 @@ async fn dial_kubelet_exec(
         subprotocol.parse().expect("valid header value"),
     );
 
-    let (ws, _resp) =
-        tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
-            .await
-            .map_err(|e| anyhow::anyhow!("kubelet exec connect failed: {e}"))?;
+    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+        req,
+        Some(outbound_ws_config()),
+        false,
+        Some(connector),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("kubelet exec connect failed: {e}"))?;
     Ok(ws)
 }
 
@@ -1603,9 +1627,13 @@ pub async fn pod_portforward<S: Store>(
 
     if is_websocket_upgrade_request(&req) {
         let (mut parts, _body) = req.into_parts();
-        let ws = WebSocketUpgrade::from_request_parts(&mut parts, &state)
-            .await
-            .map_err(|e| Status::bad_request(format!("invalid websocket upgrade request: {e}")))?;
+        let ws = capped_upgrade(
+            WebSocketUpgrade::from_request_parts(&mut parts, &state)
+                .await
+                .map_err(|e| {
+                    Status::bad_request(format!("invalid websocket upgrade request: {e}"))
+                })?,
+        );
 
         let requested: Vec<String> = ws
             .requested_protocols()
@@ -1775,21 +1803,25 @@ async fn dial_kubelet_portforward_v4(
             .expect("valid header value"),
     );
 
-    let (outbound_ws, _resp) =
-        tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
-            .await
-            .map_err(|e| {
-                if let tokio_tungstenite::tungstenite::Error::Http(resp) = &e {
-                    anyhow::anyhow!(
-                        "kubelet v4 portforward connect failed: HTTP {} headers={:?} body={:?}",
-                        resp.status(),
-                        resp.headers(),
-                        resp.body().as_deref()
-                    )
-                } else {
-                    anyhow::anyhow!("kubelet v4 portforward connect failed: {e}")
-                }
-            })?;
+    let (outbound_ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+        req,
+        Some(outbound_ws_config()),
+        false,
+        Some(connector),
+    )
+    .await
+    .map_err(|e| {
+        if let tokio_tungstenite::tungstenite::Error::Http(resp) = &e {
+            anyhow::anyhow!(
+                "kubelet v4 portforward connect failed: HTTP {} headers={:?} body={:?}",
+                resp.status(),
+                resp.headers(),
+                resp.body().as_deref()
+            )
+        } else {
+            anyhow::anyhow!("kubelet v4 portforward connect failed: {e}")
+        }
+    })?;
 
     Ok(TungsteniteWs(outbound_ws))
 }
@@ -11280,6 +11312,128 @@ mod tests {
             503,
             "an unknown named port must return 503, not silently forward to the wrong port — \
              falling back to port[0] when the named port is absent hides misconfiguration"
+        );
+    }
+
+    async fn send_and_expect_echo_or_close(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        len: usize,
+    ) -> bool {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+        if ws
+            .send(Message::Binary(vec![7u8; len].into()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .expect("server must reply or close within 5s"),
+            Some(Ok(Message::Binary(b))) if b.len() == len
+        )
+    }
+
+    #[tokio::test]
+    async fn inbound_upgrade_rejects_frame_over_cap_so_one_client_cannot_make_apiserver_buffer_huge_frame(
+    ) {
+        use tokio_tungstenite::connect_async;
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async {
+                capped_upgrade(ws).on_upgrade(|mut socket: WebSocket| async move {
+                    while let Some(Ok(msg)) = socket.recv().await {
+                        if socket.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (mut ok, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        assert!(
+            send_and_expect_echo_or_close(&mut ok, WS_MAX_FRAME_BYTES).await,
+            "a frame exactly at the cap must still be proxied or legitimate streams break"
+        );
+        let (mut big, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        assert!(
+            !send_and_expect_echo_or_close(&mut big, WS_MAX_FRAME_BYTES + 1).await,
+            "one client can make the apiserver buffer a huge frame: a frame over the cap \
+             was accepted and echoed"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_config_rejects_frame_over_cap_so_kubelet_cannot_make_apiserver_buffer_huge_frame(
+    ) {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest as _, Message};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    let n = match ws.next().await {
+                        Some(Ok(Message::Binary(b))) => b[0] as usize,
+                        _ => return,
+                    };
+                    let len = WS_MAX_FRAME_BYTES + n;
+                    let _ = ws.send(Message::Binary(vec![1u8; len].into())).await;
+                    let _ = ws.next().await;
+                });
+            }
+        });
+
+        let dial = |extra: u8| async move {
+            let req = format!("ws://{addr}/").into_client_request().unwrap();
+            let (mut ws, _) = tokio_tungstenite::connect_async_with_config(
+                req,
+                Some(outbound_ws_config()),
+                false,
+            )
+            .await
+            .unwrap();
+            ws.send(Message::Binary(vec![extra].into())).await.unwrap();
+            ws.next().await
+        };
+        assert!(
+            matches!(dial(0).await, Some(Ok(Message::Binary(b))) if b.len() == WS_MAX_FRAME_BYTES),
+            "a frame exactly at the cap from kubelet must be accepted"
+        );
+        assert!(
+            !matches!(dial(1).await, Some(Ok(Message::Binary(_)))),
+            "a kubelet can make the apiserver buffer a huge frame: a frame over the cap \
+             was accepted"
+        );
+    }
+
+    #[test]
+    fn every_websocket_site_applies_the_shared_cap_so_per_site_values_cannot_drift() {
+        let src = include_str!("proxy.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            prod.matches("Some(outbound_ws_config())").count(),
+            prod.matches("connect_async_tls_with_config(").count(),
+            "an outbound kubelet dial passes a literal config; None restores tungstenite's \
+             16/64 MiB defaults"
+        );
+        let upgrade_sites = prod.matches("WebSocketUpgrade::from_request_parts").count()
+            + prod.matches("ws: WebSocketUpgrade").count();
+        assert_eq!(
+            prod.matches("capped_upgrade(").count(),
+            upgrade_sites,
+            "an inbound WebSocketUpgrade bypasses capped_upgrade()"
         );
     }
 }

@@ -232,7 +232,7 @@ pub fn force_generation_on_create(group: &str, plural: &str, obj: &mut serde_jso
 /// release-1.37 `pkg/registry/**/strategy.go` `PrepareForUpdate` bumps it by comparing a single
 /// field. Workloads/PDB, EndpointSlice, DeviceTaintRule, Pods and custom resources track
 /// generation through their own paths. PriorityClass has no update-side bump upstream.
-fn generation_tracked_field(group: &str, plural: &str) -> Option<&'static str> {
+pub(super) fn generation_tracked_field(group: &str, plural: &str) -> Option<&'static str> {
     match (group, plural) {
         ("", "podtemplates") => Some("template"),
         (

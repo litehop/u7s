@@ -3519,6 +3519,29 @@ fn is_webhook_configuration_resource(ctx: &AdmissionContext<'_>) -> bool {
         )
 }
 
+/// Parse the pre-update object from its stored bytes, but only when UPDATE admission for
+/// `ctx` can read it (any webhook configuration or validating policy exists and `ctx` is not
+/// itself exempt). Lets PATCH handlers avoid holding a second full object tree for the whole
+/// request when nothing will ever look at `oldObject`.
+pub async fn load_old_object_for_admission<S: Store>(
+    state: &AppState<S>,
+    ctx: &AdmissionContext<'_>,
+    stored: &bytes::Bytes,
+) -> Result<Option<serde_json::Value>, StatusError> {
+    if is_webhook_configuration_resource(ctx) {
+        return Ok(None);
+    }
+    let needed = !fetch_mutating_configs(state).await.is_empty()
+        || !fetch_validating_configs(state).await.is_empty()
+        || !fetch_validating_policies(state).await.is_empty();
+    if !needed {
+        return Ok(None);
+    }
+    crate::types::Object::from_bytes(stored)
+        .map(|o| Some(o.body))
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))
+}
+
 /// Run the mutating admission webhook chain.
 ///
 /// Fetches all MutatingWebhookConfiguration objects from the store, filters by
@@ -4288,6 +4311,86 @@ mod tests {
             "resources": [resource],
             "operations": [operation]
         })
+    }
+
+    fn old_object_ctx(group: &'static str, resource: &'static str) -> AdmissionContext<'static> {
+        AdmissionContext {
+            group,
+            version: "v1",
+            resource,
+            name: "x",
+            namespace: Some("default"),
+            operation: "UPDATE",
+            user_info: None,
+            dry_run: false,
+        }
+    }
+
+    /// With no webhook or policy configured nothing can read oldObject, so PATCH handlers must
+    /// not parse (and hold) a second full object tree for the whole request.
+    #[tokio::test]
+    async fn load_old_object_skips_parse_when_no_admission_configured() {
+        let state = make_state();
+        let stored = bytes::Bytes::from_static(br#"{"metadata":{"name":"x"}}"#);
+        let old = load_old_object_for_admission(&state, &old_object_ctx("", "pods"), &stored)
+            .await
+            .unwrap();
+        assert!(
+            old.is_none(),
+            "no webhooks configured: parsing the stored object would hold a needless full copy"
+        );
+    }
+
+    /// Once a webhook is configured the pre-patch object must be delivered intact, or
+    /// immutability-enforcing webhooks silently approve every PATCH.
+    #[tokio::test]
+    async fn load_old_object_returns_stored_body_when_webhook_configured() {
+        let state = make_state();
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "load-old-vwc"},
+            "webhooks": [{
+                "name": "load-old.test.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1/x" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/load-old-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let stored = bytes::Bytes::from_static(br#"{"metadata":{"name":"x"},"data":{"k":"v"}}"#);
+
+        let old = load_old_object_for_admission(&state, &old_object_ctx("", "configmaps"), &stored)
+            .await
+            .unwrap();
+        assert_eq!(
+            old.expect("webhook configured: oldObject must be loaded")["data"]["k"],
+            "v",
+            "oldObject must be the stored pre-patch body"
+        );
+
+        let exempt = load_old_object_for_admission(
+            &state,
+            &old_object_ctx(
+                "admissionregistration.k8s.io",
+                "validatingwebhookconfigurations",
+            ),
+            &stored,
+        )
+        .await
+        .unwrap();
+        assert!(
+            exempt.is_none(),
+            "webhook configuration resources bypass admission, so nothing reads their oldObject"
+        );
     }
 
     // -- bootstrap deadlock prevention tests --
