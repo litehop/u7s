@@ -3343,18 +3343,21 @@ async fn seed_services(
     // Without this, allocate_service_ip (hint starts at offset 2, +1 per call) has no
     // idea offset 10 is taken and will hand it to the 9th ordinary dynamic Service,
     // colliding with kube-dns's VIP.
-    let dns_ip_sentinel_key = format!("{}{}", state::SERVICE_IP_PREFIX, kube_dns_cluster_ip);
-    match store
-        .put(
-            &dns_ip_sentinel_key,
-            service_alloc::owned_ip_sentinel("kube-system", "kube-dns"),
-            Some(0),
-        )
-        .await
-    {
-        Ok(_) => {}
-        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
-        Err(e) => return Err(anyhow::anyhow!("seed kube-dns clusterIP sentinel: {e}")),
+    // default/kubernetes' VIP is reserved the same way (upstream's kubernetesservice
+    // controller does this every boot), so no tenant Service can claim the apiserver's
+    // in-cluster address.
+    for (ip, ns, name) in [
+        (kubernetes_cluster_ip, "default", "kubernetes"),
+        (kube_dns_cluster_ip, "kube-system", "kube-dns"),
+    ] {
+        let key = format!("{}{}", state::SERVICE_IP_PREFIX, ip);
+        match store
+            .put(&key, service_alloc::owned_ip_sentinel(ns, name), Some(0))
+            .await
+        {
+            Ok(_) | Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(anyhow::anyhow!("seed {ns}/{name} clusterIP sentinel: {e}")),
+        }
     }
 
     // default/kubernetes Endpoints — controllers (e.g. endpoint controller, admission webhooks)

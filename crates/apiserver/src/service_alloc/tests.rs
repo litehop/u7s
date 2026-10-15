@@ -609,3 +609,50 @@ async fn service_may_claim_its_own_pre_reserved_cluster_ip_but_nobody_else_can()
     );
     assert!(held(&st, &ip_key("10.96.0.50")).await);
 }
+
+/// default/kubernetes is seeded straight into the store. If its VIP is not reserved, a
+/// tenant Service can claim the apiserver's in-cluster address and kube-proxy programs a
+/// second backend set on it, intercepting in-cluster API traffic.
+#[tokio::test]
+async fn user_service_cannot_claim_the_kubernetes_service_vip() {
+    let st = state();
+    let first = ServiceIpAllocator::from_cidr(RANGE)
+        .unwrap()
+        .nth_host(1)
+        .unwrap()
+        .to_string();
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+        .await
+        .unwrap();
+    assert_422(
+        create(&st, "thief", json!({"clusterIP": first}), false).await,
+        "provided IP is already allocated",
+    );
+    let sentinel = st.store.get(&ip_key(&first)).await.unwrap().unwrap();
+    assert!(
+        String::from_utf8_lossy(&sentinel.value).contains("default/kubernetes"),
+        "the VIP sentinel must be owned by default/kubernetes"
+    );
+}
+
+/// A store seeded by an older build holds default/kubernetes without a VIP reservation; the
+/// next boot must add it so existing clusters are protected too.
+#[tokio::test]
+async fn seed_services_reserves_the_kubernetes_vip_on_an_existing_store() {
+    let st = state();
+    let first = ServiceIpAllocator::from_cidr(RANGE)
+        .unwrap()
+        .nth_host(1)
+        .unwrap()
+        .to_string();
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+        .await
+        .unwrap();
+    st.store.delete(&ip_key(&first), None).await.unwrap();
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+        .await
+        .unwrap();
+    assert!(held(&st, &ip_key(&first)).await);
+    let svc = get(&st, "kubernetes").await;
+    assert_eq!(svc["spec"]["clusterIP"], first);
+}
