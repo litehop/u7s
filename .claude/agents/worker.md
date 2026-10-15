@@ -140,11 +140,13 @@ Work is NOT done until:
 - [ ] Branch pushed to remote
 - [ ] PR opened
 - [ ] Bead closed with PR reference
-- [ ] Referenceable test results evacuated (below)
+- [ ] Evidence inline, worthwhile archives evacuated (below)
 
-Evacuate referenceable results: if you cite test output beyond "my fix
-passes" (baseline or full-suite runs, timing data, a flake's only
-reproduction), `cp -R` the run dir and its `.tar.gz` (or other `temp/` output)
-into `<MAYOR_CHECKOUT>/temp/e2e/` before ending and cite that path. This is
-the only sanctioned write to the mayor checkout (gitignored path, Bash `cp`
-only). Why: worktree `temp/` is destroyed when the worktree is reaped.
+Evidence: nothing may depend on a gitignored file being present. Put the PASS
+lines, counts, measured numbers and trimmed kubectl output inline in the PR
+body or bead notes; conclusions in `ai/findings/` or `docs/`; commit reusable
+artefacts. Additionally `cp -R` run archives worth keeping (baseline or
+full-suite runs, timing data, a flake's only reproduction) and their `.tar.gz`
+into `<MAYOR_CHECKOUT>/temp/e2e/` before ending; mention the path only as "raw
+archive, if still present". This is the only sanctioned write to the mayor
+checkout (gitignored path, Bash `cp` only).
