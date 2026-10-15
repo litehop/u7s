@@ -573,8 +573,7 @@ Before removing any worker worktree, evacuate first:
 3. `ls -la` the destination to confirm the evacuation succeeded.
 4. Only THEN run `git worktree remove --force <worktree>`.
 
-Losing a findings doc means either re-dispatching the investigation (5-30 min) or
-relying on the worker's return message plus banked bd memory — rarely as detailed
-as the original document. See bd memory
+Evacuation is for reference only: the facts a PR, bead or doc relies on must also
+be inline or committed, never solely a `temp/` path. See bd memory
 `evacuate-worker-run-artifacts-before-worktree-removal` for the full procedure
 and casualty history.

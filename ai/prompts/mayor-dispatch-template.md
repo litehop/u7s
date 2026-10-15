@@ -510,15 +510,17 @@ and running it with a default/omitted `--port` risks matching whatever's
 running on `6443` instead of safely doing nothing.
 ```
 
-## Final step — evacuate referenceable test results
+## Final step — evidence inline, archives evacuated
 
-If your return, bead notes, or PR body will cite test results as evidence
-beyond "my fix passes" (baseline or full-suite runs, timing data, a flake's
-only reproduction), `cp -R` the run archive (`temp/e2e/<run-dir>` and its
-`.tar.gz`, or other `temp/` test output) into `<MAYOR_CHECKOUT>/temp/e2e/`
-before ending, and cite that path. This gitignored copy is the one permitted
-write to the mayor checkout; never write anything tracked. Why: worktree
-`temp/` is destroyed when the mayor reaps the worktree.
+Nothing may depend on a gitignored file being present. Put the actual PASS
+lines, counts, measured numbers and trimmed kubectl output inline in the PR body
+or bead notes; conclusions in `ai/findings/` or `docs/`; commit reusable
+artefacts (VM templates, harness scripts). Additionally `cp -R` run archives
+worth keeping (baseline or full-suite runs, timing data, a flake's only
+reproduction; `temp/e2e/<run-dir>` and its `.tar.gz`) into
+`<MAYOR_CHECKOUT>/temp/e2e/` before ending, because worktree `temp/` dies when
+the worktree is reaped. Cite that path only as "raw archive, if still present".
+This gitignored copy is the one permitted write to the mayor checkout.
 
 ## Worktree path convention
 
@@ -942,8 +944,10 @@ read the result from `podlogs/sonobuoy/.../logs/e2e.txt`, not `plugins/.../e2e.l
 "verify live" means kubectl-first per vm-operations.md, not a sonobuoy run per
 iteration.
 
-Your return MUST include: (a) the kubectl before/after reproduction, and (b) the
+Your return MUST include, inline in the PR body or bead notes (a `temp/` path
+alone is not evidence): (a) the trimmed kubectl before/after output, and (b) the
 sonobuoy PASS line from `e2e.txt`. A return without both will be rejected.
+Still evacuate the run archive per "Final step".
 
 For script-only beads (no server restart needed): run the commands via
 `limactl shell <VM_NAME>` first, encode them in the script, run it, verify exit 0,
