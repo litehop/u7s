@@ -833,8 +833,8 @@ fn default_endpoints(obj: &mut serde_json::Value) {
 /// 2. Default spec.sessionAffinity to "None" — `kubectl describe svc` prints the raw
 ///    field value, so an absent sessionAffinity renders as an empty "Session Affinity:"
 ///    line and fails the sig-cli describe conformance test.
-/// 3. Allocate NodePorts for NodePort/LoadBalancer services — ports without a nodePort
-///    get one assigned from the standard 30000-32767 range.
+/// 3. NodePorts are NOT defaulted here: they come from the cluster-wide allocator in
+///    `service_alloc`, since a per-object default cannot avoid other Services' ports.
 /// 4. Skip ClusterIP-family defaults for ExternalName — ExternalName services must not
 ///    have ipFamilies/ipFamilyPolicy/clusterIPs set (they have no cluster IP at all).
 fn default_service(obj: &mut serde_json::Value) {
@@ -871,11 +871,6 @@ fn default_service_spec(spec: &mut ServiceSpec) {
         .clone()
         .unwrap_or_else(|| "ClusterIP".to_string());
 
-    // 3. Allocate NodePorts for NodePort and LoadBalancer services.
-    if svc_type == "NodePort" || svc_type == "LoadBalancer" {
-        default_node_ports(spec);
-    }
-
     if let Some(ports) = spec.ports.as_mut() {
         for port_entry in ports.iter_mut() {
             let needs_target_port = port_entry.target_port.is_none()
@@ -907,50 +902,6 @@ fn default_service_spec(spec: &mut ServiceSpec) {
     }
 
     default_service_ip_fields_spec(spec);
-}
-
-/// Assign NodePorts to ports that don't have one yet.
-///
-/// Scans spec.ports for any port with protocol TCP/UDP/SCTP that lacks a nodePort.
-/// Assigns ports sequentially from 30000, skipping values already in use within this
-/// object. The range 30000-32767 matches the Kubernetes default nodePort range.
-///
-/// Idempotent: ports that already have a nodePort are not modified.
-fn default_node_ports(spec: &mut ServiceSpec) {
-    let ports = match spec.ports.as_mut() {
-        Some(p) => p,
-        None => return,
-    };
-
-    // Collect already-assigned NodePorts so we don't re-use them.
-    let mut used: std::collections::HashSet<u16> = ports
-        .iter()
-        .filter_map(|p| p.node_port.as_ref().and_then(|v| v.as_u64()))
-        .filter(|&n| (30000..=32767).contains(&n))
-        .map(|n| n as u16)
-        .collect();
-
-    let mut next_candidate: u16 = 30000;
-
-    for port in ports.iter_mut() {
-        // Skip ports that already have a nodePort.
-        if port.node_port.is_some() {
-            continue;
-        }
-
-        // Find the next unused port in the range.
-        while used.contains(&next_candidate) || next_candidate > 32767 {
-            next_candidate = next_candidate.saturating_add(1);
-            if next_candidate > 32767 {
-                // Range exhausted — leave remaining ports without a nodePort.
-                return;
-            }
-        }
-
-        port.node_port = Some(serde_json::Value::Number(next_candidate.into()));
-        used.insert(next_candidate);
-        next_candidate += 1;
-    }
 }
 
 /// Normalize Event timestamp fields to include microsecond precision.
@@ -3219,89 +3170,6 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Regression tests: NodePort allocation
     // ---------------------------------------------------------------------------
-
-    /// A NodePort Service with no nodePort on its ports must have one assigned.
-    ///
-    /// Sonobuoy tests create NodePort services and assert Spec.Ports[0].NodePort != 0.
-    /// Without allocation, NodePort comes back as 0 and the tests fail.
-    #[test]
-    fn nodeport_service_gets_node_port_assigned() {
-        let mut obj = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": { "name": "np-svc", "namespace": "default" },
-            "spec": {
-                "type": "NodePort",
-                "ports": [{ "port": 80, "protocol": "TCP" }]
-            }
-        });
-
-        apply_defaults("", "services", &mut obj);
-
-        let node_port = obj["spec"]["ports"][0]["nodePort"]
-            .as_u64()
-            .expect("nodePort must be a number after defaulting");
-        assert!(
-            (30000..=32767).contains(&node_port),
-            "nodePort must be in [30000, 32767], got {node_port} — sonobuoy checks for non-zero nodePort"
-        );
-    }
-
-    /// Two ports on a NodePort service must each get a distinct nodePort.
-    ///
-    /// If both ports share the same nodePort, the OS will reject one bind and
-    /// kube-proxy cannot set up the iptables rule for the second port.
-    #[test]
-    fn nodeport_service_multiple_ports_get_distinct_node_ports() {
-        let mut obj = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": { "name": "np-multi", "namespace": "default" },
-            "spec": {
-                "type": "NodePort",
-                "ports": [
-                    { "port": 80, "protocol": "TCP" },
-                    { "port": 443, "protocol": "TCP" }
-                ]
-            }
-        });
-
-        apply_defaults("", "services", &mut obj);
-
-        let np0 = obj["spec"]["ports"][0]["nodePort"]
-            .as_u64()
-            .expect("port 0 must have nodePort");
-        let np1 = obj["spec"]["ports"][1]["nodePort"]
-            .as_u64()
-            .expect("port 1 must have nodePort");
-        assert_ne!(np0, np1, "each port must receive a distinct nodePort — duplicates break kube-proxy iptables rules");
-        assert!((30000..=32767).contains(&np0));
-        assert!((30000..=32767).contains(&np1));
-    }
-
-    /// LoadBalancer services also need NodePorts (cloud LBs route via nodePort internally).
-    #[test]
-    fn loadbalancer_service_gets_node_port_assigned() {
-        let mut obj = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": { "name": "lb-svc", "namespace": "default" },
-            "spec": {
-                "type": "LoadBalancer",
-                "ports": [{ "port": 80 }]
-            }
-        });
-
-        apply_defaults("", "services", &mut obj);
-
-        let node_port = obj["spec"]["ports"][0]["nodePort"]
-            .as_u64()
-            .expect("LoadBalancer port must have nodePort after defaulting");
-        assert!(
-            (30000..=32767).contains(&node_port),
-            "LoadBalancer nodePort must be in [30000, 32767], got {node_port}"
-        );
-    }
 
     /// ClusterIP service must NOT get a nodePort injected.
     ///
