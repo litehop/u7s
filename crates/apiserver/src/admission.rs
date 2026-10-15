@@ -574,12 +574,46 @@ struct ServiceReference {
 ///
 /// `DirectUrl` is used when `clientConfig.url` is set directly.
 /// `ServiceResolved` is used when `clientConfig.service` is set: the URL uses the
-/// service DNS name (e.g. `https://<svc>.<ns>.svc:<port><path>`) for correct SNI.
-/// With kube-proxy running inside the VM, the konnectivity-agent resolves service DNS
-/// names via CoreDNS and routes to the ClusterIP correctly — no pod-IP substitution needed.
+/// service DNS name (e.g. `https://<svc>.<ns>.svc:<port><path>`) for correct SNI and
+/// certificate verification, while `dial` is the address the Service resolved to
+/// (ClusterIP:port, from the apiserver's own store).
 enum WebhookTarget {
     DirectUrl(String),
-    ServiceResolved { url: String },
+    ServiceResolved {
+        url: String,
+        host: String,
+        dial: std::net::SocketAddr,
+    },
+}
+
+type TargetRouting<'a> = (
+    Option<&'a str>,
+    Option<&'a [u8]>,
+    Option<(&'a str, std::net::SocketAddr)>,
+);
+
+impl WebhookTarget {
+    /// (konnectivity proxy, mTLS identity, DNS override) for this target.
+    ///
+    /// DirectUrl webhooks go to an external endpoint: no konnectivity proxy (which only
+    /// reaches the cluster network) and no apiserver mTLS identity (which would leak it to an
+    /// external host). Service webhooks dial the resolved ClusterIP directly, relying on
+    /// kube-proxy's NAT of host-originated traffic; when konnectivity is configured the
+    /// proxy dials the Service DNS name instead, since an HTTP CONNECT target and the TLS
+    /// server name cannot differ in the client.
+    fn routing<'a, S: Store>(&'a self, state: &'a AppState<S>) -> TargetRouting<'a> {
+        match self {
+            WebhookTarget::DirectUrl(_) => (None, None, None),
+            WebhookTarget::ServiceResolved { host, dial, .. } => {
+                let proxy = state.konnectivity_proxy_addr.as_deref();
+                (
+                    proxy,
+                    state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
+                    proxy.is_none().then_some((host.as_str(), *dial)),
+                )
+            }
+        }
+    }
 }
 
 /// Returns why `octets` falls in a range this function blocks, or `None` if it doesn't.
@@ -746,12 +780,11 @@ fn validate_service_reference(svc_ref: &ServiceReference) -> Result<(), String> 
 /// If `clientConfig.service` is set, returns `ServiceResolved` with a URL using the
 /// service DNS name and the SERVICE port (e.g. `https://<svc>.<ns>.svc:<svc_port><path>`).
 ///
-/// With kube-proxy running inside the VM (PR #406), the konnectivity-agent resolves
-/// service DNS names via CoreDNS → ClusterIP, and kube-proxy NATs ClusterIP:svc_port →
-/// PodIP:targetPort. Using the service port (not target port) ensures kube-proxy
-/// intercepts the connection correctly.
+/// The Service is resolved to its ClusterIP from the apiserver's own store (upstream's
+/// `ResolveCluster`); kube-proxy NATs ClusterIP:svc_port → PodIP:targetPort, so the SERVICE
+/// port (not the target port) is what must be dialed.
 async fn webhook_url<S: Store>(
-    _state: &AppState<S>,
+    state: &AppState<S>,
     config: &WebhookClientConfig,
     webhook_name: &str,
 ) -> Result<WebhookTarget, String> {
@@ -765,14 +798,18 @@ async fn webhook_url<S: Store>(
 
         validate_service_reference(svc_ref)?;
 
-        // With kube-proxy running inside the VM (PR #406), the konnectivity-agent
-        // resolves the service DNS name via CoreDNS → ClusterIP, and kube-proxy NATs
-        // ClusterIP:svc_port → PodIP:targetPort. Use the service port (not target port)
-        // in the URL so kube-proxy intercepts the connection correctly.
+        let dial = crate::service_resolver::resolve_service_addr(
+            state,
+            &svc_ref.namespace,
+            &svc_ref.name,
+            i32::from(svc_port),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let path = svc_ref.path.as_deref().unwrap_or("/");
-        let svc_host = format!("{}.{}.svc", svc_ref.name, svc_ref.namespace);
-        let url = format!("https://{svc_host}:{svc_port}{path}");
-        return Ok(WebhookTarget::ServiceResolved { url });
+        let host = format!("{}.{}.svc", svc_ref.name, svc_ref.namespace);
+        let url = format!("https://{host}:{svc_port}{path}");
+        return Ok(WebhookTarget::ServiceResolved { url, host, dial });
     }
 
     Err(format!(
@@ -1100,6 +1137,7 @@ fn build_webhook_call_client(
     proxy_addr: Option<&str>,
     cluster_ca_der: Option<&[u8]>,
     webhook_identity_pem: Option<&[u8]>,
+    dial: Option<(&str, std::net::SocketAddr)>,
     fallback: &reqwest::Client,
     timeout_seconds: Option<i64>,
 ) -> reqwest::Client {
@@ -1167,6 +1205,9 @@ fn build_webhook_call_client(
             builder = builder.proxy(proxy);
         }
     }
+    if let Some((host, addr)) = dial {
+        builder = builder.resolve(host, addr);
+    }
     builder.build().unwrap_or_else(|_| fallback.clone())
 }
 
@@ -1189,25 +1230,20 @@ pub(crate) async fn prepare_webhook_call<S: Store>(
     let config: WebhookClientConfig = WebhookClientConfig::deserialize(client_config)
         .map_err(|e| format!("invalid clientConfig: {e}"))?;
     let target = webhook_url(state, &config, webhook_name).await?;
-    let (effective_proxy, effective_identity) = match &target {
-        WebhookTarget::DirectUrl(_) => (None, None),
-        WebhookTarget::ServiceResolved { .. } => (
-            state.konnectivity_proxy_addr.as_deref(),
-            state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
-        ),
-    };
-    let url = match target {
-        WebhookTarget::DirectUrl(u) => u,
-        WebhookTarget::ServiceResolved { url } => url,
-    };
+    let (effective_proxy, effective_identity, dial) = target.routing(state);
     let client = build_webhook_call_client(
         config.ca_bundle.as_deref(),
         effective_proxy,
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         effective_identity,
+        dial,
         &state.webhook_client,
         None,
     );
+    let url = match target {
+        WebhookTarget::DirectUrl(u) => u,
+        WebhookTarget::ServiceResolved { url, .. } => url,
+    };
     Ok((url, client))
 }
 
@@ -1425,7 +1461,7 @@ async fn invoke_mutating_webhook<S: Store>(
     };
     let base_url = match &target {
         WebhookTarget::DirectUrl(u) => u.as_str(),
-        WebhookTarget::ServiceResolved { url } => url.as_str(),
+        WebhookTarget::ServiceResolved { url, .. } => url.as_str(),
     };
     let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
     // Append timeout=Ns so the URL in error messages matches what the conformance
@@ -1435,22 +1471,14 @@ async fn invoke_mutating_webhook<S: Store>(
     let uid = uuid::Uuid::new_v4().to_string();
     let review = build_review(&uid, ctx, object, old_object);
 
-    // DirectUrl webhooks go to an external endpoint: do not route through the
-    // konnectivity proxy (which only reaches pod IPs inside the VM) and do not
-    // present the apiserver mTLS identity (which would leak it to an external host).
-    let (effective_proxy, effective_identity) = match &target {
-        WebhookTarget::DirectUrl(_) => (None, None),
-        WebhookTarget::ServiceResolved { .. } => (
-            state.konnectivity_proxy_addr.as_deref(),
-            state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
-        ),
-    };
+    let (effective_proxy, effective_identity, dial) = target.routing(state);
 
     let wh_client = build_webhook_call_client(
         webhook.client_config.ca_bundle.as_deref(),
         effective_proxy,
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         effective_identity,
+        dial,
         &state.webhook_client,
         webhook.timeout_seconds,
     );
@@ -4166,7 +4194,7 @@ pub async fn run_validating_webhooks<S: Store>(
             };
             let base_url = match &target {
                 WebhookTarget::DirectUrl(u) => u.as_str(),
-                WebhookTarget::ServiceResolved { url } => url.as_str(),
+                WebhookTarget::ServiceResolved { url, .. } => url.as_str(),
             };
             let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
             // Append timeout=Ns so the URL in error messages matches what the conformance
@@ -4176,22 +4204,14 @@ pub async fn run_validating_webhooks<S: Store>(
             let uid = uuid::Uuid::new_v4().to_string();
             let review = build_review(&uid, ctx, &object_arc, old_object_arc.as_ref());
 
-            // DirectUrl webhooks go to an external endpoint: do not route through the
-            // konnectivity proxy (which only reaches pod IPs inside the VM) and do not
-            // present the apiserver mTLS identity (which would leak it to an external host).
-            let (effective_proxy, effective_identity) = match &target {
-                WebhookTarget::DirectUrl(_) => (None, None),
-                WebhookTarget::ServiceResolved { .. } => (
-                    state.konnectivity_proxy_addr.as_deref(),
-                    state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
-                ),
-            };
+            let (effective_proxy, effective_identity, dial) = target.routing(state);
 
             let wh_client = build_webhook_call_client(
                 webhook.client_config.ca_bundle.as_deref(),
                 effective_proxy,
                 state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
                 effective_identity,
+                dial,
                 &state.webhook_client,
                 webhook.timeout_seconds,
             );
@@ -5892,7 +5912,7 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         let client =
-            build_webhook_call_client(Some(&wrong_ca_b64), None, None, None, &fallback, None);
+            build_webhook_call_client(Some(&wrong_ca_b64), None, None, None, None, &fallback, None);
 
         let err = client
             .get(format!("https://{addr}/"))
@@ -7621,7 +7641,8 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         // Must not panic and must not return the fallback clone (cert was valid).
-        let client = build_webhook_call_client(Some(&ca_b64), None, None, None, &fallback, None);
+        let client =
+            build_webhook_call_client(Some(&ca_b64), None, None, None, None, &fallback, None);
         drop(client);
     }
 
@@ -7651,6 +7672,7 @@ mod tests {
             Some("127.0.0.1:8135"),
             None,
             None,
+            None,
             &fallback,
             None,
         );
@@ -7662,7 +7684,7 @@ mod tests {
     #[test]
     fn build_webhook_call_client_no_bundle_does_not_panic() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(None, None, None, None, &fallback, None);
+        let client = build_webhook_call_client(None, None, None, None, None, &fallback, None);
         drop(client);
     }
 
@@ -7676,6 +7698,7 @@ mod tests {
         // Invalid base64 must return a usable client (not panic) so the apiserver keeps running.
         let client = build_webhook_call_client(
             Some("!!!not-valid-base64!!!"),
+            None,
             None,
             None,
             None,
@@ -7705,37 +7728,6 @@ mod tests {
             "message must be None when absent in response"
         );
     }
-
-    /// WebhookTarget::ServiceResolved must carry the service DNS URL (not a raw pod IP).
-    ///
-    /// With kube-proxy running (PR #406), the konnectivity-agent resolves service DNS names
-    /// via CoreDNS and routes through kube-proxy to the pod. Using the service DNS name
-    /// ensures correct TLS SNI matching against the webhook cert's SAN, and no
-    /// danger_accept_invalid_hostnames workaround is needed.
-    #[test]
-    fn webhook_target_service_resolved_uses_service_dns_name() {
-        // Verify the variant carries only the service DNS URL — compile-time structural check.
-        let target = WebhookTarget::ServiceResolved {
-            url: "https://my-webhook.webhook-ns.svc:443/validate".to_string(),
-        };
-        match target {
-            WebhookTarget::ServiceResolved { url } => {
-                assert!(
-                    url.contains(".svc:"),
-                    "ServiceResolved URL must use service DNS name (not a raw pod IP) \
-                     so TLS SNI matches the webhook cert SAN"
-                );
-                assert!(
-                    !url.contains("10."),
-                    "ServiceResolved URL must not contain a raw pod IP — \
-                     kube-proxy (PR #406) routes via ClusterIP through the konnectivity proxy"
-                );
-            }
-            _ => panic!("must match ServiceResolved"),
-        }
-    }
-
-    // -- Regression tests for build_review's request.kind population --
 
     /// build_review must populate request.kind.kind from the object's "kind" field.
     ///
@@ -7953,6 +7945,7 @@ mod tests {
             None, // effective_proxy = None (the fix)
             None, // cluster_ca_der
             None, // effective_identity = None (the fix)
+            None, // dial
             &fallback, None, // timeout_seconds — use default 10s
         );
         // Client is usable — no panic during build.
@@ -8421,6 +8414,8 @@ mod tests {
             "kind": "Service",
             "metadata": {"name": "my-webhook-svc", "namespace": "webhook-ns"},
             "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.96.0.50",
                 "ports": [{"port": 8443, "targetPort": 8444}]
             }
         });
@@ -8482,8 +8477,8 @@ mod tests {
         };
 
         let target = webhook_url(&state, &config, "test").await.unwrap();
-        let url = match target {
-            WebhookTarget::ServiceResolved { url } => url,
+        let url = match &target {
+            WebhookTarget::ServiceResolved { url, .. } => url.clone(),
             WebhookTarget::DirectUrl(_) => panic!("expected ServiceResolved"),
         };
 
@@ -8501,6 +8496,165 @@ mod tests {
             url.contains("my-webhook-svc.webhook-ns.svc"),
             "service webhook URL must use service DNS name for correct TLS SNI and kube-proxy routing: url={url}"
         );
+        match target {
+            WebhookTarget::ServiceResolved { dial, .. } => assert_eq!(
+                dial,
+                "10.96.0.50:8443".parse().unwrap(),
+                "the webhook must be dialed at the Service ClusterIP:servicePort"
+            ),
+            WebhookTarget::DirectUrl(_) => unreachable!(),
+        }
+    }
+
+    /// Both admission paths (mutating and validating) must dial the Service's ClusterIP while
+    /// verifying the `<svc>.<ns>.svc` certificate name. On an install without konnectivity
+    /// nothing resolves `*.svc` on the host, so a path that dials by DNS fails every
+    /// failurePolicy=Fail webhook (cert-manager, ingress-nginx, Kyverno, ...) and blocks
+    /// writes cluster-wide.
+    #[tokio::test]
+    async fn service_webhooks_reach_backend_via_clusterip_in_mutating_and_validating_paths() {
+        use crate::service_resolver::test_support::{put_loopback_service, tls_json_backend};
+
+        let backend = tls_json_backend(
+            "hook.hook-ns.svc",
+            json!({
+                "apiVersion": "admission.k8s.io/v1",
+                "kind": "AdmissionReview",
+                "response": {"uid": "u", "allowed": true}
+            }),
+        )
+        .await;
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        put_loopback_service(&*store, "hook-ns", "hook", backend.port).await;
+
+        for (kind, plural) in [
+            (
+                "MutatingWebhookConfiguration",
+                "mutatingwebhookconfigurations",
+            ),
+            (
+                "ValidatingWebhookConfiguration",
+                "validatingwebhookconfigurations",
+            ),
+        ] {
+            let cfg = json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": kind,
+                "metadata": {"name": "svc-hook"},
+                "webhooks": [{
+                    "name": "svc.hook.example.com",
+                    "clientConfig": {
+                        "service": {"namespace": "hook-ns", "name": "hook", "port": backend.port, "path": "/x"},
+                        "caBundle": backend.ca_bundle_b64
+                    },
+                    "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                    "failurePolicy": "Fail",
+                    "sideEffects": "None",
+                    "admissionReviewVersions": ["v1"]
+                }]
+            });
+            store
+                .put(
+                    &format!("/registry/admissionregistration.k8s.io/{plural}/svc-hook"),
+                    bytes::Bytes::from(serde_json::to_vec(&cfg).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let obj = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c"}});
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "c",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        run_mutating_webhooks(&state, obj.clone(), None, &ctx)
+            .await
+            .expect("mutating webhook must be reached through the Service ClusterIP");
+        run_validating_webhooks(&state, &obj, None, &ctx)
+            .await
+            .expect("validating webhook must be reached through the Service ClusterIP");
+
+        assert_eq!(
+            backend.hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both the mutating and the validating call must have hit the backend"
+        );
+    }
+
+    /// A webhook whose Service does not exist must fail with the resolver's error (upstream
+    /// lister shape), not an opaque connect failure, so operators can see the dangling
+    /// reference.
+    #[tokio::test]
+    async fn service_webhook_with_missing_service_reports_service_not_found() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let config = WebhookClientConfig {
+            url: None,
+            service: Some(ServiceReference {
+                namespace: "ns".to_string(),
+                name: "gone".to_string(),
+                port: None,
+                path: None,
+            }),
+            ca_bundle: None,
+        };
+
+        let err = webhook_url(&state, &config, "w").await.err().unwrap();
+
+        assert_eq!(err, "service \"gone\" not found");
+    }
+
+    /// With konnectivity configured the proxy dials the Service DNS name (a CONNECT target
+    /// cannot differ from the TLS server name in the client), so no DNS override may be
+    /// installed; without it the override is what makes the host reach the Service at all.
+    #[tokio::test]
+    async fn webhook_target_routing_overrides_dns_only_without_konnectivity() {
+        let target = WebhookTarget::ServiceResolved {
+            url: "https://hook.ns.svc:443/x".to_owned(),
+            host: "hook.ns.svc".to_owned(),
+            dial: "10.96.0.7:443".parse().unwrap(),
+        };
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let mut state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let (proxy, _, dial) = target.routing(&state);
+        assert_eq!(
+            (proxy, dial),
+            (
+                None,
+                Some(("hook.ns.svc", "10.96.0.7:443".parse().unwrap()))
+            )
+        );
+
+        state.konnectivity_proxy_addr = Some("127.0.0.1:8132".to_owned());
+        let (proxy, _, dial) = target.routing(&state);
+        assert_eq!((proxy, dial), (Some("127.0.0.1:8132"), None));
     }
 
     // ---------------------------------------------------------------------------
@@ -10549,10 +10703,11 @@ mod tests {
         let fallback = reqwest::Client::new();
         // With timeout_seconds=30, the request timeout must be 30s (verified by building
         // without panic — reqwest validates Duration).
-        let client = build_webhook_call_client(None, None, None, None, &fallback, Some(30));
+        let client = build_webhook_call_client(None, None, None, None, None, &fallback, Some(30));
         drop(client);
 
-        let client_default = build_webhook_call_client(None, None, None, None, &fallback, None);
+        let client_default =
+            build_webhook_call_client(None, None, None, None, None, &fallback, None);
         drop(client_default);
     }
 
@@ -12474,6 +12629,7 @@ mod tests {
         let client = build_webhook_call_client(
             None,                // no caBundle — the pre-fix bug dropped the proxy here
             Some("127.0.0.1:1"), // unreachable proxy
+            None,
             None,
             None,
             &fallback,

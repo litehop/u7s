@@ -32,6 +32,7 @@ mod rbac;
 mod rbac_gen_adapter;
 mod resource_gen_adapter;
 mod sa_sig_cache;
+mod service_resolver;
 mod state;
 mod status;
 mod status_dispatch;
