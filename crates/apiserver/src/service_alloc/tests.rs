@@ -609,3 +609,172 @@ async fn service_may_claim_its_own_pre_reserved_cluster_ip_but_nobody_else_can()
     );
     assert!(held(&st, &ip_key("10.96.0.50")).await);
 }
+
+/// default/kubernetes is seeded straight into the store. If its VIP is not reserved, a
+/// tenant Service can claim the apiserver's in-cluster address and kube-proxy programs a
+/// second backend set on it, intercepting in-cluster API traffic.
+#[tokio::test]
+async fn user_service_cannot_claim_the_kubernetes_service_vip() {
+    let st = state();
+    let first = ServiceIpAllocator::from_cidr(RANGE)
+        .unwrap()
+        .nth_host(1)
+        .unwrap()
+        .to_string();
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+        .await
+        .unwrap();
+    assert_422(
+        create(&st, "thief", json!({"clusterIP": first}), false).await,
+        "provided IP is already allocated",
+    );
+    let sentinel = st.store.get(&ip_key(&first)).await.unwrap().unwrap();
+    assert!(
+        String::from_utf8_lossy(&sentinel.value).contains("default/kubernetes"),
+        "the VIP sentinel must be owned by default/kubernetes"
+    );
+}
+
+/// A store seeded by an older build holds default/kubernetes without a VIP reservation; the
+/// next boot must add it so existing clusters are protected too.
+#[tokio::test]
+async fn seed_services_reserves_the_kubernetes_vip_on_an_existing_store() {
+    let st = state();
+    let first = ServiceIpAllocator::from_cidr(RANGE)
+        .unwrap()
+        .nth_host(1)
+        .unwrap()
+        .to_string();
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+        .await
+        .unwrap();
+    st.store.delete(&ip_key(&first), None).await.unwrap();
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+        .await
+        .unwrap();
+    assert!(held(&st, &ip_key(&first)).await);
+    let svc = get(&st, "kubernetes").await;
+    assert_eq!(svc["spec"]["clusterIP"], first);
+}
+
+async fn store_without_sentinels(st: &AppState<SqliteStore>, ns: &str, name: &str, spec: Value) {
+    let mut body = svc(name, spec);
+    body["metadata"]["namespace"] = json!(ns);
+    st.store
+        .put(
+            &format!("/registry/services/{ns}/{name}"),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            Some(0),
+        )
+        .await
+        .unwrap();
+}
+
+/// Services stored before reservations existed hold values no sentinel records, so the
+/// lowest-free auto-allocator would hand their nodePort or VIP to a new Service.
+#[tokio::test]
+async fn repair_backfills_reservations_so_auto_allocation_never_collides() {
+    let st = state();
+    store_without_sentinels(
+        &st,
+        "default",
+        "old",
+        json!({
+            "type": "LoadBalancer", "externalTrafficPolicy": "Local",
+            "clusterIP": "10.96.0.2", "clusterIPs": ["10.96.0.2"],
+            "healthCheckNodePort": 30001,
+            "ports": [{"port": 80, "nodePort": 30000}]
+        }),
+    )
+    .await;
+    let report = super::repair(&*st.store).await.unwrap();
+    assert_eq!(report.seeded, 3, "{report:?}");
+    for k in [ip_key("10.96.0.2"), port_key(30000), port_key(30001)] {
+        assert!(held(&st, &k).await, "{k} must be reserved after repair");
+    }
+
+    let (_, v) = create(&st, "new", np_spec(80, 0), false).await.unwrap();
+    assert_eq!(
+        v["spec"]["ports"][0]["nodePort"], 30002,
+        "auto-assigned nodePort must skip the ports the old Service holds"
+    );
+    assert_ne!(v["spec"]["clusterIP"], "10.96.0.2");
+
+    delete(&st, "old").await;
+    assert!(
+        !held(&st, &port_key(30000)).await && held(&st, &port_key(30002)).await,
+        "deleting the old Service releases only its own reservations"
+    );
+}
+
+/// A crash between reserving and storing leaves sentinels no Service holds; they would
+/// shrink the pool forever. Sentinels reserved ahead for a not-yet-created Service
+/// (kube-dns, kubernetes) are not orphans.
+#[tokio::test]
+async fn repair_releases_orphans_but_keeps_pre_reserved_owned_sentinels() {
+    let st = state();
+    for key in [ip_key("10.96.0.77"), port_key(30077)] {
+        st.store
+            .put(&key, bytes::Bytes::from_static(b"{}"), Some(0))
+            .await
+            .unwrap();
+    }
+    st.store
+        .put(
+            &ip_key("10.96.0.10"),
+            super::owned_ip_sentinel("kube-system", "kube-dns"),
+            Some(0),
+        )
+        .await
+        .unwrap();
+    let report = super::repair(&*st.store).await.unwrap();
+    assert_eq!(report.released, 2, "{report:?}");
+    assert!(!held(&st, &ip_key("10.96.0.77")).await);
+    assert!(!held(&st, &port_key(30077)).await);
+    assert!(held(&st, &ip_key("10.96.0.10")).await);
+}
+
+/// Like upstream, two Services holding one value are reported and left untouched; a
+/// corrupt store must not stop the apiserver from booting.
+#[tokio::test]
+async fn repair_reports_duplicates_without_failing_or_changing_services() {
+    let st = state();
+    let spec = json!({"type": "NodePort", "clusterIP": "10.96.0.5", "clusterIPs": ["10.96.0.5"],
+        "ports": [{"port": 80, "nodePort": 30005}]});
+    store_without_sentinels(&st, "default", "a", spec.clone()).await;
+    store_without_sentinels(&st, "default", "b", spec).await;
+    let report = super::repair(&*st.store).await.unwrap();
+    assert_eq!(report.conflicts.len(), 2, "{report:?}");
+    assert!(report
+        .conflicts
+        .iter()
+        .all(|c| c.contains("default/a") && c.contains("default/b")));
+    assert!(held(&st, &ip_key("10.96.0.5")).await && held(&st, &port_key(30005)).await);
+    assert_eq!(get(&st, "b").await["spec"]["ports"][0]["nodePort"], 30005);
+}
+
+/// Repair must converge with owned sentinels: a Service holding the IP reserved for it is
+/// consistent (no conflict, nothing released), and a second pass is a no-op.
+#[tokio::test]
+async fn repair_is_idempotent_and_agrees_with_owned_sentinels() {
+    let st = state();
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+        .await
+        .unwrap();
+    store_without_sentinels(
+        &st,
+        "kube-system",
+        "kube-dns",
+        json!({"clusterIP": "10.96.0.10", "clusterIPs": ["10.96.0.10"]}),
+    )
+    .await;
+    let first = super::repair(&*st.store).await.unwrap();
+    assert_eq!(
+        (first.seeded, first.released, first.conflicts.len()),
+        (0, 0, 0),
+        "{first:?}"
+    );
+    let second = super::repair(&*st.store).await.unwrap();
+    assert_eq!((second.seeded, second.released), (0, 0), "{second:?}");
+    assert!(held(&st, &ip_key("10.96.0.1")).await);
+}
