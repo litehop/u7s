@@ -738,10 +738,10 @@ fn main() {
     )
     .expect("failed to write generated DeviceCounterConsumption codec");
     std::fs::write(
-        out_dir.join("node_allocatable_resource_mapping_gen.rs"),
-        codegen::generate_node_allocatable_resource_mapping(descriptor_bytes),
+        out_dir.join("node_allocatable_resource_gen.rs"),
+        codegen::generate_node_allocatable_resource(descriptor_bytes),
     )
-    .expect("failed to write generated NodeAllocatableResourceMapping codec");
+    .expect("failed to write generated NodeAllocatableResource codec");
     std::fs::write(
         out_dir.join("device_gen.rs"),
         codegen::generate_device(descriptor_bytes),

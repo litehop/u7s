@@ -969,6 +969,14 @@ mod tests {
             "manualSelector",
             "podFailurePolicy.rules.action",
             "successPolicy.rules.succeededIndexes",
+            "scheduling.schedulingPolicy.basic",
+            "scheduling.schedulingPolicy.gang.minCount",
+            "scheduling.schedulingConstraints.topology.key",
+            "scheduling.disruptionMode.single",
+            "scheduling.disruptionMode.all",
+            "scheduling.resourceClaims.name",
+            "scheduling.resourceClaims.resourceClaimName",
+            "scheduling.resourceClaims.resourceClaimTemplateName",
             "template",
             "startTime",
             "completionTime",
@@ -1431,7 +1439,11 @@ mod tests {
                 namespace: Some("default".to_string()),
                 ..Default::default()
             }),
-            spec: Some(batch_v1::JobSpec::sentinel()),
+            // `scheduling` post-dates the frozen pre-migration decoder.
+            spec: Some(batch_v1::JobSpec {
+                scheduling: None,
+                ..batch_v1::JobSpec::sentinel()
+            }),
             status: Some(batch_v1::JobStatus::sentinel()),
         };
         let mut job_bytes = Vec::new();
@@ -1461,13 +1473,21 @@ mod tests {
              exactly, including its `template: {{}}` default and its omit-if-empty `status` guard"
         );
 
+        let mut cj_spec = batch_v1::CronJobSpec::sentinel();
+        if let Some(job_spec) = cj_spec
+            .job_template
+            .as_mut()
+            .and_then(|jt| jt.spec.as_mut())
+        {
+            job_spec.scheduling = None;
+        }
         let cj = batch_v1::CronJob {
             metadata: Some(meta_v1::ObjectMeta {
                 name: Some("audit-cj".to_string()),
                 namespace: Some("default".to_string()),
                 ..Default::default()
             }),
-            spec: Some(batch_v1::CronJobSpec::sentinel()),
+            spec: Some(cj_spec),
             status: Some(batch_v1::CronJobStatus::sentinel()),
         };
         let mut cj_bytes = Vec::new();

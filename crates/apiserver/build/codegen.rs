@@ -240,6 +240,7 @@ pub fn generate_object_reference(descriptor_bytes: &[u8]) -> String {
 const VOLUME_SOURCE: &str = ".k8s.io.api.core.v1.VolumeSource";
 const VOLUME: &str = ".k8s.io.api.core.v1.Volume";
 const QUANTITY: &str = ".k8s.io.apimachinery.pkg.api.resource.Quantity";
+const TIME: &str = ".k8s.io.apimachinery.pkg.apis.meta.v1.Time";
 
 /// VolumeSource fields with zero implementation today, matched against the hand-rolled
 /// `json_to_volume_proto`/`gen_pod_spec_to_json` this codegen replaces before it was deleted.
@@ -305,7 +306,7 @@ fn delegated_field_templates(field_name: &str) -> Option<(&'static str, &'static
         "downwardAPI" => Some((
             "if let Some(x0) = src.downward_api { \
                 vm.insert(\"downwardAPI\".to_string(), \
-                    gen_downward_api_volume_source_to_json(x0.items, x0.default_mode)); \
+                    gen_downward_api_volume_source_to_json(x0.items, x0.default_mode, x0.default_user)); \
              }",
             "v.get(\"downwardAPI\").map(json_to_downward_api_volume_source_proto)",
         )),
@@ -497,6 +498,19 @@ fn emit_field_encode(
             .unwrap();
             out.push_str("    }\n");
         }
+        Type::Message if !repeated && field.type_name() == TIME => {
+            writeln!(
+                out,
+                "    if let Some(secs) = {value_var}.{rust_field}.and_then(|t| t.seconds).filter(|&s| s > 0) {{"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "        {map_var}.insert(\"{key}\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));"
+            )
+            .unwrap();
+            out.push_str("    }\n");
+        }
         Type::Message if repeated => {
             let nested = find_message(set, field.type_name());
             let item_var = format!("x{}", depth + 1);
@@ -527,6 +541,15 @@ fn emit_field_encode(
             writeln!(
                 out,
                 "        {map_var}.insert(\"{key}\".to_string(), serde_json::Value::Array(arr));"
+            )
+            .unwrap();
+            out.push_str("    }\n");
+        }
+        Type::Message if find_message(set, field.type_name()).field.is_empty() => {
+            writeln!(out, "    if {value_var}.{rust_field}.is_some() {{").unwrap();
+            writeln!(
+                out,
+                "        {map_var}.insert(\"{key}\".to_string(), serde_json::Value::Object(serde_json::Map::new()));"
             )
             .unwrap();
             out.push_str("    }\n");
@@ -629,6 +652,9 @@ fn field_decode_rhs(
         Type::Message if field.type_name() == QUANTITY => format!(
             "jstr({value_var}, \"{key}\").map(|s| super::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {{ string: Some(s) }})"
         ),
+        Type::Message if !repeated && field.type_name() == TIME => {
+            format!("jtime({value_var}, \"{key}\")")
+        }
         Type::Message if repeated => {
             let nested = find_message(set, field.type_name());
             let nested_rust_type = rust_message_path(field.type_name());
@@ -646,6 +672,10 @@ fn field_decode_rhs(
             format!(
                 "{value_var}.get(\"{key}\").and_then(|a| a.as_array()).map(|a| a.iter().map(|{item_var}| {item_expr}).collect()).unwrap_or_default()"
             )
+        }
+        Type::Message if find_message(set, field.type_name()).field.is_empty() => {
+            let nested_rust_type = rust_message_path(field.type_name());
+            format!("{value_var}.get(\"{key}\").map(|_| {nested_rust_type} {{}})")
         }
         Type::Message => {
             let nested = find_message(set, field.type_name());
@@ -9363,7 +9393,7 @@ fn hpa_v2_status_delegated_field(field_name: &str) -> Option<&'static str> {
             "    m.insert(\"desiredReplicas\".to_string(), serde_json::Value::Number(status.desired_replicas.unwrap_or(0).into()));\n",
         ),
         "conditions" => Some(
-            "    if !status.conditions.is_empty() {\n        let conditions: Vec<serde_json::Value> = status.conditions.into_iter().map(|c| gen_condition_common(c.r#type, c.status, c.last_transition_time, c.reason, c.message)).collect();\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(conditions));\n    }\n",
+            "    if !status.conditions.is_empty() {\n        let conditions: Vec<serde_json::Value> = status.conditions.into_iter().map(|c| gen_condition_common(c.r#type, c.status, c.last_transition_time, c.reason, c.message, c.observed_generation)).collect();\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(conditions));\n    }\n",
         ),
         _ => None,
     }
@@ -9476,8 +9506,7 @@ const DEVICE_ATTRIBUTE: &str = ".k8s.io.api.resource.v1.DeviceAttribute";
 const DEVICE_COUNTER: &str = ".k8s.io.api.resource.v1.Counter";
 const DEVICE_COUNTER_SET: &str = ".k8s.io.api.resource.v1.CounterSet";
 const DEVICE_COUNTER_CONSUMPTION: &str = ".k8s.io.api.resource.v1.DeviceCounterConsumption";
-const NODE_ALLOCATABLE_RESOURCE_MAPPING: &str =
-    ".k8s.io.api.resource.v1.NodeAllocatableResourceMapping";
+const NODE_ALLOCATABLE_RESOURCE: &str = ".k8s.io.api.resource.v1.NodeAllocatableResource";
 const DEVICE: &str = ".k8s.io.api.resource.v1.Device";
 const DEVICE_CONFIGURATION: &str = ".k8s.io.api.resource.v1.DeviceConfiguration";
 const DEVICE_CAPACITY_REQUIREMENTS: &str = ".k8s.io.api.resource.v1.CapacityRequirements";
@@ -9819,27 +9848,21 @@ pub fn generate_device_counter_consumption(descriptor_bytes: &[u8]) -> String {
     out
 }
 
-/// Generates `gen_node_allocatable_resource_mapping_to_json`. `capacityKey` (a plain optional
-/// string) and `allocationMultiplier` (a bare `Quantity`) are already reproduced exactly by the
-/// mechanical walker's generic defaults — no delegate table needed.
-pub fn generate_node_allocatable_resource_mapping(descriptor_bytes: &[u8]) -> String {
+/// Generates `gen_node_allocatable_resource_to_json`. `mapping`/`overhead` are nested messages of
+/// plain optional string/`Quantity` fields the mechanical walker walks inline — no delegate
+/// table needed.
+pub fn generate_node_allocatable_resource(descriptor_bytes: &[u8]) -> String {
     let set = FileDescriptorSet::decode(descriptor_bytes)
         .expect("descriptor set emitted by build.rs must decode");
-    let message = find_message(&set, NODE_ALLOCATABLE_RESOURCE_MAPPING);
-    let encode_stmts = generate_message_encode_only(
-        &set,
-        NODE_ALLOCATABLE_RESOURCE_MAPPING,
-        message,
-        |_| None,
-        "n",
-        "m",
-    );
+    let message = find_message(&set, NODE_ALLOCATABLE_RESOURCE);
+    let encode_stmts =
+        generate_message_encode_only(&set, NODE_ALLOCATABLE_RESOURCE, message, |_| None, "n", "m");
 
     let mut out = String::new();
     out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
     out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
     out.push_str(
-        "fn gen_node_allocatable_resource_mapping_to_json(n: resource_v1::NodeAllocatableResourceMapping) -> serde_json::Value {\n",
+        "fn gen_node_allocatable_resource_to_json(n: resource_v1::NodeAllocatableResource) -> serde_json::Value {\n",
     );
     out.push_str("    let mut m = serde_json::Map::new();\n");
     out.push_str(&encode_stmts);
@@ -9890,8 +9913,8 @@ fn device_delegated_field(field_name: &str) -> Option<&'static str> {
         "allowMultipleAllocations" => Some(
             "    if let Some(true) = d.allow_multiple_allocations {\n        m.insert(\"allowMultipleAllocations\".to_string(), serde_json::Value::Bool(true));\n    }\n",
         ),
-        "nodeAllocatableResourceMappings" => Some(
-            "    if !d.node_allocatable_resource_mappings.is_empty() {\n        let nam: serde_json::Map<String, serde_json::Value> = d.node_allocatable_resource_mappings.into_iter().map(|(k, v)| (k, gen_node_allocatable_resource_mapping_to_json(v))).collect();\n        m.insert(\"nodeAllocatableResourceMappings\".to_string(), serde_json::Value::Object(nam));\n    }\n",
+        "nodeAllocatableResources" => Some(
+            "    if !d.node_allocatable_resources.is_empty() {\n        let nam: serde_json::Map<String, serde_json::Value> = d.node_allocatable_resources.into_iter().map(|(k, v)| (k, gen_node_allocatable_resource_to_json(v))).collect();\n        m.insert(\"nodeAllocatableResources\".to_string(), serde_json::Value::Object(nam));\n    }\n",
         ),
         _ => None,
     }

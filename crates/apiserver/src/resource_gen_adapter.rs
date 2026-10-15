@@ -94,7 +94,7 @@ include!(concat!(
 ));
 include!(concat!(
     env!("OUT_DIR"),
-    "/node_allocatable_resource_mapping_gen.rs"
+    "/node_allocatable_resource_gen.rs"
 ));
 include!(concat!(env!("OUT_DIR"), "/device_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/device_configuration_gen.rs"));
@@ -1043,6 +1043,32 @@ mod tests {
     // failure mode a byte-for-byte diff against the known-good pre-migration output catches.
     #[test]
     fn codegen_migration_resource_v1_matches_pre_migration_hand_written_output() {
+        /// Fields added after the frozen pre-migration decoders below were written; their
+        /// coverage is the descriptor-derived `sentinel_completeness_decode_*` tests above.
+        fn without_post_migration_keys(v: Option<serde_json::Value>) -> Option<serde_json::Value> {
+            const NEW_KEYS: &[&str] = &[
+                "derivedAttributes",
+                "compatibilityGroups",
+                "skipNodeOperations",
+                "partitionTypeAttribute",
+            ];
+            fn strip(v: &mut serde_json::Value) {
+                match v {
+                    serde_json::Value::Object(m) => {
+                        m.retain(|k, _| !NEW_KEYS.contains(&k.as_str()));
+                        m.values_mut().for_each(strip);
+                    }
+                    serde_json::Value::Array(a) => a.iter_mut().for_each(strip),
+                    _ => {}
+                }
+            }
+            let mut v = v;
+            if let Some(v) = v.as_mut() {
+                strip(v);
+            }
+            v
+        }
+
         fn old_gen_device_taint_to_json(t: resource_v1::DeviceTaint) -> serde_json::Value {
             let mut m = serde_json::json!({
                 "key": t.key.unwrap_or_default(),
@@ -1244,15 +1270,32 @@ mod tests {
             serde_json::Value::Object(m)
         }
 
-        fn old_gen_node_allocatable_resource_mapping_to_json(
-            n: resource_v1::NodeAllocatableResourceMapping,
+        fn old_gen_node_allocatable_resource_to_json(
+            n: resource_v1::NodeAllocatableResource,
         ) -> serde_json::Value {
             let mut m = serde_json::Map::new();
-            if let Some(v) = n.capacity_key.filter(|s| !s.is_empty()) {
-                m.insert("capacityKey".to_string(), v.into());
+            if let Some(map) = n.mapping {
+                let mut mm = serde_json::Map::new();
+                if let Some(v) = map.capacity_key.filter(|s| !s.is_empty()) {
+                    mm.insert("capacityKey".to_string(), v.into());
+                }
+                if let Some(v) = gen_quantity_to_json(map.capacity_multiplier) {
+                    mm.insert("capacityMultiplier".to_string(), v);
+                }
+                if let Some(v) = gen_quantity_to_json(map.device_multiplier) {
+                    mm.insert("deviceMultiplier".to_string(), v);
+                }
+                m.insert("mapping".to_string(), serde_json::Value::Object(mm));
             }
-            if let Some(v) = gen_quantity_to_json(n.allocation_multiplier) {
-                m.insert("allocationMultiplier".to_string(), v);
+            if let Some(ov) = n.overhead {
+                let mut om = serde_json::Map::new();
+                if let Some(v) = gen_quantity_to_json(ov.per_pod) {
+                    om.insert("perPod".to_string(), v);
+                }
+                if let Some(v) = gen_quantity_to_json(ov.per_container) {
+                    om.insert("perContainer".to_string(), v);
+                }
+                m.insert("overhead".to_string(), serde_json::Value::Object(om));
             }
             serde_json::Value::Object(m)
         }
@@ -1333,14 +1376,14 @@ mod tests {
             if let Some(true) = d.allow_multiple_allocations {
                 m.insert("allowMultipleAllocations".to_string(), true.into());
             }
-            if !d.node_allocatable_resource_mappings.is_empty() {
+            if !d.node_allocatable_resources.is_empty() {
                 let nam: serde_json::Map<String, serde_json::Value> = d
-                    .node_allocatable_resource_mappings
+                    .node_allocatable_resources
                     .into_iter()
-                    .map(|(k, v)| (k, old_gen_node_allocatable_resource_mapping_to_json(v)))
+                    .map(|(k, v)| (k, old_gen_node_allocatable_resource_to_json(v)))
                     .collect();
                 m.insert(
-                    "nodeAllocatableResourceMappings".to_string(),
+                    "nodeAllocatableResources".to_string(),
                     serde_json::Value::Object(nam),
                 );
             }
@@ -1954,7 +1997,7 @@ mod tests {
         dc.encode(&mut dc_buf).unwrap();
         assert_eq!(
             old_decode_deviceclass_proto_gen(&dc_buf),
-            decode_deviceclass_proto_gen(&dc_buf),
+            without_post_migration_keys(decode_deviceclass_proto_gen(&dc_buf)),
             "codegen-generated decode_deviceclass_proto_gen must match the pre-migration \
              hand-written decoder field-for-field — any divergence here is a silent field drop \
              introduced by this migration"
@@ -2015,7 +2058,7 @@ mod tests {
         rc.encode(&mut rc_buf).unwrap();
         assert_eq!(
             old_decode_resourceclaim_proto_gen(&rc_buf),
-            decode_resourceclaim_proto_gen(&rc_buf),
+            without_post_migration_keys(decode_resourceclaim_proto_gen(&rc_buf)),
             "codegen-generated decode_resourceclaim_proto_gen must match the pre-migration \
              hand-written decoder field-for-field — any divergence here is a silent \
              spec.devices/status.allocation field drop introduced by this migration"
@@ -2049,7 +2092,7 @@ mod tests {
         rct.encode(&mut rct_buf).unwrap();
         assert_eq!(
             old_decode_resourceclaimtemplate_proto_gen(&rct_buf),
-            decode_resourceclaimtemplate_proto_gen(&rct_buf),
+            without_post_migration_keys(decode_resourceclaimtemplate_proto_gen(&rct_buf)),
             "codegen-generated decode_resourceclaimtemplate_proto_gen must match the \
              pre-migration hand-written decoder field-for-field"
         );
@@ -2062,7 +2105,7 @@ mod tests {
         rs.encode(&mut rs_buf).unwrap();
         assert_eq!(
             old_decode_resourceslice_proto_gen(&rs_buf),
-            decode_resourceslice_proto_gen(&rs_buf),
+            without_post_migration_keys(decode_resourceslice_proto_gen(&rs_buf)),
             "codegen-generated decode_resourceslice_proto_gen must match the pre-migration \
              hand-written decoder field-for-field"
         );
