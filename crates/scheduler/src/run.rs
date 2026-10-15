@@ -24,9 +24,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use politeia::{build_tls_connector, parse_kubeconfig};
 use tokio_rustls::TlsConnector;
 use tracing::{error, info};
-use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 
 use crate::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
@@ -429,7 +429,7 @@ const RESYNC_PODS_PATH: &str = "/api/v1/pods?fieldSelector=spec.nodeName%3D";
 
 /// Path for the scheduler's cluster-wide pod watch. `allowWatchBookmarks=true`
 /// requests the apiserver's 60s bookmark heartbeat so `watch_stream`'s 5-min
-/// per-frame idle timeout (`WATCH_IDLE_TIMEOUT` in `kubeconfig::lib`) never
+/// per-frame idle timeout (`WATCH_IDLE_TIMEOUT` in `politeia`) never
 /// trips on a healthy cluster that is simply quiet — without it, an idle
 /// cluster forces a harmless but unnecessary reconnect every 5 minutes.
 ///
@@ -2042,7 +2042,7 @@ mod tests {
         let cert = CertificateParams::default()
             .self_signed(&key)
             .expect("self-sign cert");
-        let creds = u7s_kubeconfig::ClientCreds {
+        let creds = politeia::ClientCreds {
             server: format!("https://{addr}"),
             ca_cert: cert.der().clone(),
             client_cert: cert.der().clone(),
