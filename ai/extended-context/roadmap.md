@@ -12,7 +12,7 @@ kind: roadmap
 See [north-star.md](north-star.md) for why u7s exists, how component
 decisions get made, and what "done" means in principle (changes rarely,
 needs operator sign-off). This file is current state and priorities.
-Figures are snapshots — check `dashboard.md` for the latest.
+Figures: see `dashboard.md`.
 
 ---
 
@@ -32,7 +32,7 @@ State: **NATIVE** (u7s Rust) · **UPSTREAM** (real binary) · **HYBRID**
 | **Kubelet** | UPSTREAM | Yes | MEASURED | Largest component (over 2x KCM). Config tuning landed; behavior-changing levers (`--max-pods`, change-detection strategy) deferred. Rewrite: same pending decision as KCM. |
 | **CRI-O + crun** | UPSTREAM | Yes | KEEP | No rewrite plan. |
 | **kube-proxy** | UPSTREAM | Yes | KEEP | East-west `ClusterIP`/`NodePort` only. Replacement is out of u7s scope (beep repo, post-v1.0). |
-| **ServiceLB** | UPSTREAM (beep) | Yes | KEEP | u7s ships `litehop/beep` (v0.5.0, per-node eBPF, Geneve) as its Service LoadBalancer, the klipper-lb role (`mayor-jlm8z`). |
+| **ServiceLB** | UPSTREAM (beep) | Yes | KEEP | Not shipped (no LB provider in `install.sh`). Planned: `litehop/beep` as klipper-lb role (`mayor-jlm8z`), pending v0.5.0 evaluation (`mayor-da224`). |
 | **konnectivity-server** | HYBRID | Yes | KEEP-as-dev-tool | Rig-only, bridges apiserver↔kubelet across Lima's NAT. Shipped webhook/aggregation reach Services by `ClusterIP` (PR #1799); production dials `kubelet:10250` directly. |
 | **CoreDNS** | UPSTREAM | Yes | KEEP | No rewrite plan. |
 | **metrics-server** | not shipped | n/a | KEEP | Not shipped; documented as user-applied (Gate 6 C4). |
@@ -47,13 +47,13 @@ Methodology: `ai/perf/mayor-5x0kh-k3s-matched-comparison-2026-08-20.md`.
 
 ## Gates (horizontal cuts across the matrix)
 
-Not a linear sequence; some run in parallel.
+Not linear; some run in parallel.
 
 ### Gate 1 — Conformance floor ✓ CLEARED, with known blind spots
 Full sonobuoy Conformance passes: single-node first green 2026-07-24;
 two-node 446/0/0/7133 2026-08-10. Current (1.37.1, two-node, iptables
 kube-proxy): 460/460 + 2/2 disruptive on 2026-10-14. Counts come from
-e2e.txt; script totals before #1771 also counted ginkgo suite nodes.
+e2e.txt.
 
 Green is necessary, not sufficient. (1) Single-node bias: the scheduler once
 shipped zero taint/toleration handling (Gate 5 keeps catching this class).
@@ -114,12 +114,18 @@ pre-built tarball to working `kubectl get nodes`/`logs`/`exec`, CoreDNS and
 kube-proxy running. Decided (audit `mayor-3kp5u`):
 - C1: releases are prereleases until the release gate passes; the unpinned
   install URL 404s intentionally.
-- C2: kubelet serving-cert CSR plus bootstrap tokens (`mayor-u251u`).
-- C3: PKI epic `mayor-xdw6u` (automated pre-expiry rotation); P1-P7
-  decisions pending. Control-plane kubelet's admin credentials: `mayor-zboqh`.
+- C3 goal: transparent pre-expiry rotation; compromise means manual cutover;
+  kubectl Warning headers plus Node Events.
 - C4: metrics-server not shipped, documented.
 - C5: agent-friendly install (`mayor-yxe9t`).
 - C6: networking flags (`mayor-rv1aw`).
+
+Pending operator confirmation:
+- C2 mechanism (`mayor-u251u`; direction set: per-node minting, no apiserver
+  restart, no private key in cmdline). Proposed: serverTLSBootstrap CSR plus
+  approver; Secret-backed bootstrap tokens with TTL.
+- C3 PKI design P1-P7 (`mayor-xdw6u`). Control-plane kubelet's admin
+  credentials: `mayor-zboqh`.
 
 ### Gate 7 — Migration story (STARTED)
 MVP epic `mayor-te4sn`: single-node k3s → u7s via `u7s migrate`, API-based
