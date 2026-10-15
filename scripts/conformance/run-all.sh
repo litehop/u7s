@@ -193,6 +193,8 @@ ORIGINAL_ARGV=("$@")
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$REPO/scripts/conformance"
+# shellcheck source=scripts/_kill-pattern.sh
+source "$REPO/scripts/_kill-pattern.sh"
 WORKDIR="$PWD/temp/u7s"
 FOCUS="${SONOBUOY_FOCUS:-}"
 ALL_E2E=0
@@ -647,9 +649,9 @@ else
     # scheduler + konnectivity-server aren't dhat-instrumented, but leaving
     # them running after the apiserver they talk to is gone just leaves
     # orphans — same full-cleanup scope as reset.sh.
-    pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
     WORKDIR_ABS="$(cd "$WORKDIR" && pwd)"
-    pkill -f "konnectivity-server.*${WORKDIR_ABS}" 2>/dev/null || true
+    pkill -f "$(workdir_kill_pattern scheduler "$WORKDIR_ABS")" 2>/dev/null || true
+    pkill -f "$(workdir_kill_pattern konnectivity-server "$WORKDIR_ABS")" 2>/dev/null || true
 
     # Route the flushed heap into this run's own temp/e2e/<TIMESTAMP>-<slug>/
     # directory (same place as host-logs/, the sonobuoy tarball, etc.)
