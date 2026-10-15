@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use serde_json::Value;
-use u7s_store::{ListOptions, Store, StoreError};
+use u7s_store::{CreateNamespacedError, ListOptions, Store, StoreError};
 
 use crate::state::{AppState, SERVICE_IP_PREFIX};
 use crate::status::{Status, StatusError};
@@ -74,6 +74,47 @@ impl<S: Store> Drop for ServiceAllocTxn<S> {
             });
         }
     }
+}
+
+/// A clusterIP taken from the pool before the Service is admitted. Dropping it frees the
+/// address, so a rejection between allocation and `begin` cannot leak it.
+pub(crate) struct AutoClusterIp<S: Store> {
+    ip: Ipv4Addr,
+    txn: ServiceAllocTxn<S>,
+}
+
+impl<S: Store> AutoClusterIp<S> {
+    pub(crate) fn new(store: Arc<S>, ip: Ipv4Addr) -> Self {
+        let mut txn = ServiceAllocTxn::new(store);
+        txn.created.push(ip_key(&ip.to_string()));
+        Self { ip, txn }
+    }
+}
+
+/// Write the Service object while holding its reservations. The write and the commit run on
+/// a spawned task so a client disconnect cannot drop the transaction after the write has
+/// landed. On failure the transaction comes back to the caller (it may retry the write).
+pub(crate) async fn create_committing<S: Store>(
+    store: Arc<S>,
+    ns_key: String,
+    key: String,
+    value: bytes::Bytes,
+    txn: ServiceAllocTxn<S>,
+) -> Result<u64, (CreateNamespacedError, ServiceAllocTxn<S>)> {
+    let joined = tokio::spawn(async move {
+        match store
+            .create_if_namespace_active(Some(&ns_key), &key, value)
+            .await
+        {
+            Ok(rv) => {
+                txn.commit().await;
+                Ok(rv)
+            }
+            Err(e) => Err((e, txn)),
+        }
+    })
+    .await;
+    joined.expect("service create task panicked")
 }
 
 async fn delete_sentinel<S: Store>(store: &S, key: &str) {
@@ -254,13 +295,13 @@ pub(crate) async fn begin<S: Store>(
     name: &str,
     old_spec: Option<&Value>,
     body: &mut Value,
-    auto_ip: Option<Ipv4Addr>,
+    auto_ip: Option<AutoClusterIp<S>>,
     dry_run: bool,
 ) -> Result<ServiceAllocTxn<S>, StatusError> {
-    let mut txn = ServiceAllocTxn::new(state.store.clone());
-    if let Some(ip) = auto_ip.filter(|_| !dry_run) {
-        txn.created.push(ip_key(&ip.to_string()));
-    }
+    let (txn, auto_ip) = match auto_ip {
+        Some(a) => (a.txn, Some(a.ip)),
+        None => (ServiceAllocTxn::new(state.store.clone()), None),
+    };
     let mut r = Reserver {
         state,
         dry_run,
@@ -381,6 +422,8 @@ async fn reserve_all<S: Store>(
                 ),
             ));
         }
+        // Upstream answers a healthCheckNodePort conflict with 500 (alloc.go); 422 is kept
+        // deliberately as the actionable, client-caused status.
         if !r.reserve(port_key(hc)).await? {
             return Err(invalid(
                 name,
