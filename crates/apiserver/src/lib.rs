@@ -12079,6 +12079,73 @@ mod tests {
                 assert_eq!(val["details"]["group"], *group, "GET {uri}");
             }
         }
+
+        // DELETE and PATCH reach NotFound through the write-path error mappers
+        // (`store_err` for core kinds, `store_err_cr` for CRs), not the GET path.
+        let write_cases: &[(&str, &str, &str)] = &[
+            ("/api/v1/namespaces/ns1/configmaps/nope", "configmaps", ""),
+            ("/apis/example.io/v1/widgets/nope", "widgets", "example.io"),
+        ];
+        for method in [Method::DELETE, Method::PATCH] {
+            for (uri, resource, group) in write_cases {
+                let (content_type, payload) = if method == Method::PATCH {
+                    ("application/merge-patch+json", r#"{"data":{"a":"b"}}"#)
+                } else {
+                    ("application/json", "")
+                };
+                let mut req = Request::builder()
+                    .method(method.clone())
+                    .uri(*uri)
+                    .header("content-type", content_type)
+                    .body(axum::body::Body::from(payload))
+                    .expect("request must build");
+                req.extensions_mut().insert(admin.clone());
+                let resp = router.call(req).await.expect("router must not error");
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+                let body = to_bytes(resp.into_body(), 8192).await.expect("body");
+                let val: serde_json::Value = serde_json::from_slice(&body).expect("Status JSON");
+                let qualified = if group.is_empty() {
+                    resource.to_string()
+                } else {
+                    format!("{resource}.{group}")
+                };
+                assert_eq!(
+                    val["message"],
+                    format!("{qualified} \"nope\" not found"),
+                    "{method} {uri}: write-path NotFound message must match upstream"
+                );
+                assert_eq!(val["details"]["name"], "nope", "{method} {uri}");
+                assert_eq!(
+                    val["details"]["kind"], *resource,
+                    "{method} {uri}: details.kind must be the plural resource"
+                );
+                if group.is_empty() {
+                    assert!(val["details"].get("group").is_none(), "{method} {uri}");
+                } else {
+                    assert_eq!(val["details"]["group"], *group, "{method} {uri}");
+                }
+            }
+        }
+
+        // Unknown discovery routes use upstream's generic route 404: no group suffix in the
+        // message and an empty (non-omitted) `details` object.
+        for uri in ["/apis/nope.example.io", "/apis/nope.example.io/v1"] {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("request must build");
+            req.extensions_mut().insert(admin.clone());
+            let resp = router.call(req).await.expect("router must not error");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "GET {uri}");
+            let body = to_bytes(resp.into_body(), 8192).await.expect("body");
+            let val: serde_json::Value = serde_json::from_slice(&body).expect("Status JSON");
+            assert_eq!(
+                val["message"], "the server could not find the requested resource",
+                "GET {uri}"
+            );
+            assert_eq!(val["details"], serde_json::json!({}), "GET {uri}");
+        }
     }
 
     /// The reconciler task must exit promptly when the shutdown signal fires.
