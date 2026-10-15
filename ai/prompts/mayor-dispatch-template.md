@@ -944,10 +944,9 @@ read the result from `podlogs/sonobuoy/.../logs/e2e.txt`, not `plugins/.../e2e.l
 "verify live" means kubectl-first per vm-operations.md, not a sonobuoy run per
 iteration.
 
-Your return MUST include, inline in the PR body or bead notes (a `temp/` path
-alone is not evidence): (a) the trimmed kubectl before/after output, and (b) the
-sonobuoy PASS line from `e2e.txt`. A return without both will be rejected.
-Still evacuate the run archive per "Final step".
+Your return MUST include, inline per "Final step": (a) the trimmed kubectl
+before/after output, and (b) the sonobuoy PASS line from `e2e.txt`. A return
+without both will be rejected.
 
 For script-only beads (no server restart needed): run the commands via
 `limactl shell <VM_NAME>` first, encode them in the script, run it, verify exit 0,
@@ -963,9 +962,7 @@ When a worker returns from a VM/sonobuoy-touching bead:
 - Check the return for sonobuoy delete output or `mcp__<VM_NAME>__run_shell_command` evidence.
 - If absent: **do not merge**. Send back: "Your return contains no VM execution
   evidence. Run `sonobuoy delete --all --wait` in your assigned VM and show the output."
-- If the return cites a run archive, confirm it was evacuated to the mayor
-  checkout's `temp/e2e/` and that the key facts are inline in the return,
-  never the archive alone.
+- Confirm evacuation and inline facts per "Final step".
 - The hook pre-checks cargo quality gates. VM verification is the mayor's gate.
 
 ---

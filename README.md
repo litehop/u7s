@@ -22,10 +22,10 @@ and kube-controller-manager, and writes a systemd unit for each.
 
    ```bash
    TAG=$(curl -sf "https://api.github.com/repos/litehop/u7s/releases?per_page=1" | grep -m1 '"tag_name"' | cut -d'"' -f4)
-   curl -sfL "https://u7s.dekiru.tech/${TAG}/install.sh" | sudo bash
+   curl -fsSL "https://u7s.dekiru.tech/${TAG:?could not resolve the latest release tag - set TAG manually}/install.sh" | sudo bash
    ```
 
-   The lookup needs only `curl` and coreutils (unauthenticated GitHub API
+   The lookup uses `curl`, `grep` and `cut` (unauthenticated GitHub API
    calls are rate-limited; if it fails, set `TAG` by hand from
    <https://github.com/litehop/u7s/releases>).
 

@@ -553,27 +553,12 @@ limactl shell <VM> sudo journalctl -u kubelet --no-pager --utc > kubelet.log
 
 ## Worktree removal — evacuate artifacts first (mayor)
 
-Uncommitted worker outputs (a findings doc not yet pushed under `ai/findings/`,
-and the gitignored `temp/e2e/<timestamp>-conformance/` + its `.tar.gz`,
-`temp/profile/`) live only inside the worker's own worktree.
 `git worktree remove --force` deletes the entire subtree, gitignored files
-included — there is no recovery once it runs.
+(`temp/e2e/`, `temp/profile/`) and unpushed `ai/findings/` docs included —
+there is no recovery once it runs.
 
-Before removing any worker worktree, evacuate first:
-1. Read the worker's return message for any file paths under
-   `<worktree>/(ai/findings|temp/e2e|temp/profile)/`.
-2. `mv` each mentioned artifact to the mayor-side equivalent path, e.g.:
-   ```bash
-   mv <worktree>/ai/findings/<slug>-YYYY-MM-DD.md <MAYOR_CHECKOUT>/ai/findings/
-   mv <worktree>/temp/e2e/<timestamp>-conformance <MAYOR_CHECKOUT>/temp/e2e/
-   mv <worktree>/temp/e2e/<timestamp>-conformance.tar.gz <MAYOR_CHECKOUT>/temp/e2e/
-   ```
-   The evacuated `temp/` copy is a "raw archive, if still present": extract
-   the PASS lines, counts and numbers into the bead note or a tracked doc.
-3. `ls -la` the destination to confirm the evacuation succeeded.
-4. Only THEN run `git worktree remove --force <worktree>`.
-
-Evacuation is for reference only: the facts a PR, bead or doc relies on must also
-be inline or committed, never solely a `temp/` path. See bd memory
-`evacuate-worker-run-artifacts-before-worktree-removal` for the full procedure
-and casualty history.
+Workers evacuate their own archives (dispatch-template "Final step"). As a
+backstop, before removing a worktree the mayor checks it for un-evacuated
+archives and copies any it finds to the same path under `<MAYOR_CHECKOUT>`,
+then confirms with `ls -la`. See bd memory
+`evacuate-worker-run-artifacts-before-worktree-removal` for the casualty history.
