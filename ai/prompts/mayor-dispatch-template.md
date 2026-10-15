@@ -960,8 +960,6 @@ When a worker returns from a VM/sonobuoy-touching bead:
 - If absent: **do not merge**. Send back: "Your return contains no VM execution
   evidence. Run `sonobuoy delete --all --wait` in your assigned VM and show the output."
 - The hook pre-checks cargo quality gates. VM verification is the mayor's gate.
-- If the return cites a run archive, confirm it is under the mayor checkout's
-  `temp/e2e/`; a worktree `temp/` path will not survive reaping.
 
 ---
 

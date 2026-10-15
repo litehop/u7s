@@ -553,8 +553,9 @@ limactl shell <VM> sudo journalctl -u kubelet --no-pager --utc > kubelet.log
 
 ## Worktree removal — evacuate artifacts first (mayor)
 
-Gitignored worker outputs (`ai/findings/*.md`, `temp/e2e/<timestamp>-conformance/`
-+ its `.tar.gz`, `temp/profile/`) live only inside the worker's own worktree.
+Uncommitted worker outputs (a findings doc not yet pushed under `ai/findings/`,
+and the gitignored `temp/e2e/<timestamp>-conformance/` + its `.tar.gz`,
+`temp/profile/`) live only inside the worker's own worktree.
 `git worktree remove --force` deletes the entire subtree, gitignored files
 included — there is no recovery once it runs.
 
@@ -567,6 +568,8 @@ Before removing any worker worktree, evacuate first:
    mv <worktree>/temp/e2e/<timestamp>-conformance <MAYOR_CHECKOUT>/temp/e2e/
    mv <worktree>/temp/e2e/<timestamp>-conformance.tar.gz <MAYOR_CHECKOUT>/temp/e2e/
    ```
+   The evacuated `temp/` copy is a "raw archive, if still present": extract
+   the PASS lines, counts and numbers into the bead note or a tracked doc.
 3. `ls -la` the destination to confirm the evacuation succeeded.
 4. Only THEN run `git worktree remove --force <worktree>`.
 
