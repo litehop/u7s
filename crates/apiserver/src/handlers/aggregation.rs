@@ -1714,7 +1714,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     async fn fallback_404() -> crate::status::StatusError {
-        crate::status::Status::not_found("flunders", "Resource")
+        crate::status::Status::route_not_found()
     }
 
     fn make_router(state: AppState) -> Router {

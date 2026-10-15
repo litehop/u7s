@@ -62,7 +62,7 @@ pub async fn put_approval<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, KIND))?;
+        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -86,7 +86,7 @@ pub async fn put_approval<S: Store>(
         .store
         .put(&key, current.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, &name, KIND))?;
+        .map_err(|e| store_err(e, GROUP, PLURAL, &name, KIND))?;
 
     current.set_resource_version(new_rv);
     Ok(Json(current.body))
@@ -114,7 +114,7 @@ pub async fn patch_approval<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, KIND))?;
+        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -205,7 +205,7 @@ pub async fn patch_approval<S: Store>(
         .store
         .put(&key, current.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, &name, KIND))?;
+        .map_err(|e| store_err(e, GROUP, PLURAL, &name, KIND))?;
 
     current.set_resource_version(new_rv);
     Ok(Json(current.body))

@@ -161,7 +161,7 @@ async fn resolve_log_target<S: Store>(
         .get(&pod_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
+        .ok_or_else(|| Status::not_found("", "pods", pod_name))?;
 
     let pod: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
@@ -183,7 +183,7 @@ async fn resolve_log_target<S: Store>(
         .get(&node_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(node_name, "Node"))?;
+        .ok_or_else(|| Status::not_found("", "nodes", node_name))?;
 
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
@@ -392,7 +392,7 @@ pub async fn resolve_attach_target<S: Store>(
         .get(&pod_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
+        .ok_or_else(|| Status::not_found("", "pods", pod_name))?;
 
     let pod: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
@@ -412,7 +412,7 @@ pub async fn resolve_attach_target<S: Store>(
         .get(&node_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(node_name, "Node"))?;
+        .ok_or_else(|| Status::not_found("", "nodes", node_name))?;
 
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
@@ -870,7 +870,7 @@ pub async fn resolve_exec_target<S: Store>(
         .get(&pod_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
+        .ok_or_else(|| Status::not_found("", "pods", pod_name))?;
 
     let pod: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
@@ -890,7 +890,7 @@ pub async fn resolve_exec_target<S: Store>(
         .get(&node_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(node_name, "Node"))?;
+        .ok_or_else(|| Status::not_found("", "nodes", node_name))?;
 
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
@@ -1395,7 +1395,7 @@ pub(crate) async fn validate_portforward<S: Store>(
         .get(&pod_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
+        .ok_or_else(|| Status::not_found("", "pods", pod_name))?;
 
     let pod: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
@@ -1418,7 +1418,7 @@ pub(crate) async fn validate_portforward<S: Store>(
         .get(&node_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&node_name, "Node"))?;
+        .ok_or_else(|| Status::not_found("", "nodes", &node_name))?;
 
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
@@ -1957,7 +1957,7 @@ pub async fn resolve_node_proxy_target<S: Store>(
         .get(&node_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(bare_name, "Node"))?;
+        .ok_or_else(|| Status::not_found("", "nodes", bare_name))?;
 
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
@@ -2295,7 +2295,7 @@ pub async fn resolve_pod_proxy_target<S: Store>(
         .get(&pod_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(bare_name, "Pod"))?;
+        .ok_or_else(|| Status::not_found("", "pods", bare_name))?;
 
     let pod: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
@@ -2919,7 +2919,7 @@ pub async fn resolve_service_proxy_target<S: Store>(
         .get(&svc_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(bare_name, "Service"))?;
+        .ok_or_else(|| Status::not_found("", "services", bare_name))?;
 
     // 2. List all EndpointSlices in the namespace and find one owned by this Service.
     //    KCM stamps the "kubernetes.io/service-name" label on every slice it manages.

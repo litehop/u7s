@@ -1,39 +1,36 @@
 ---
-updated: 2026-10-13T09:41Z
+updated: 2026-10-14T15:21Z
 ---
-# Dashboard — SESSION WRAPPED (2026-10-13 18:41 JST, main `65ceb945`)
-**Stance:** pre-alpha/greenfield; correctness (esp. Conformance) > security > perf > features; merge-on-green via queue, never `--admin`.
-**Resume:** `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register 3 crons (pass BARE hex ids to `--live-agents`); `git restore --staged --worktree .beads/issues.jsonl` if it blocks, then `git pull --ff-only origin main`.
+# Dashboard — SESSION WRAPPED (2026-10-14, main `a417e653`)
+**Stance:** pre-alpha/greenfield; correctness (esp. Conformance) > security > perf > features; merge-on-green via queue, never `--admin`; plan-first. Dispatch by bucket (`project-priority-hierarchy.md`). Idle u7s VMs get stopped. Upstream e2e defines behaviour → it's the gate. Every found issue gets a bead ("pre-existing" ≠ defer). Destructive scripts need end-to-end kill-path tests. Classifier denial → worker stops, mayor surfaces.
+**Resume:** `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register 3 crons (pass BARE hex ids to `--live-agents`).
 
 ## ▶ First thing next session
-1. Confirm **#1749** landed (cascades → KCM GC + namespace finalizers on all 5 create paths; conflict with #1752 resolved, 61/61 GC/Namespaces/Watchers; auto-merge armed at wrap, CI re-running). Pull; reap its worktree `agent-a2bf025b16f9598ea`.
-2. **Full 1.37.1 conformance on main** (everything from today in: #1741, #1748, #1749, #1752…). Last full: 490/497 on #1749's pre-#1748 build — the 7 CTB fails are explained by #1748; baseline 461/462.
-3. `cr.rs`/admission wave: `mxjh5` (P2, CR validation before mutating webhooks) · `r3ax1` (P2, NamespaceLifecycle admission) · `nore3` (P2, CRD delete may orphan CRs) · `mvkgo` (P3, CR create keeps client status).
-4. 1 GiB VM session on a quiet host: `w898x` (KCM/kubelet memory buckets → unblocks `vc844`) + `5icnm` (why CoreDNS requests made the 80-pod burst 0/3; capacity math first).
-5. Small/no-VM: `lgb33` (tick exits 1 when bead JSONL blocks pull) · `ncrw4` (flaky apiserver lib test) · `bdd4r` · `gzr5h` · `z2hw2` · `tzrzt` · `yw312`.
+1. **`1o0d2`** (bucket 1): kill-pattern sweep + guard test is pushed to `origin/worker/agent-a575f24723a79d456` (no PR). Its `reset.sh` fail-on-revert proof was blocked by the classifier. Operator to choose: (rec) open PR, reviewer read-verifies · operator runs the revert · allow the command class. Worktree `ai/worktrees/agent-a575f24723a79d456` kept — pass its id in `--live-agents` to hygiene until resolved.
+2. **`dq1gf`** (rename VMs → lima-node-1..6 + per-VM `.mcp.json`) — operator decision; rec: defer.
+3. Then by bucket: `bqncp` (golden-clone staleness gate) · `kv7cp` (per-shard metric series leak) · `7cq6a` (NamespaceLifecycle Update/Connect) · small test follow-ons `jtgeb`, `rjeh0`, `ke5pt` · `d3xjm` (bucket 4) · `o985u` (bucket 5, needs plan) · remaining triage backlog (17nj7 memory family, wordpress examples, 1 GiB quiet-host `w898x`+`5icnm`, narrow `jwbl3`).
 
 ## 🎯 NEEDS OPERATOR
-- None. `vc844` waits on `w898x`.
+- `1o0d2` and `dq1gf` above. Still pending from before: `sm91b.6` (docs workflow) · `44jyu` (bash vs Rust tick).
 
-## ✅ Landed this session (24 PRs + #1749 pending)
-- **Conformance/correctness:** #1748 mTLS regression (WATCH ignored `spec.signerName`) · #1752 one per-kind field-selector table for LIST+WATCH, 400 on unsupported labels · #1741 CRD rule fidelity (3 rounds) · #1740 path segments + generation on update · #1745 CR status after webhooks · #1744 PCR proof-of-possession (security) · #1737 CEL int binding · #1736 KCM storage-version-migrator.
-- **Tooling/docs:** #1753 install.sh heredoc fixes (silent empty `rm -rf`) + 1 GiB docs · #1754 tick git ops → REPO_ROOT · #1750 kubelet-port drift fail-loud · #1751 tick tests fail-on-revert · #1746 retired-findings facts · #1743/#1738 git-guard · #1742 resolvConf fail-loud · #1739 `--live-agents` prefixes · deps #1731–#1735, #1747 · #1755 bead snapshot.
-- **No PR:** beep v0.4.0 = ship-candidate (`re973`; next-release re-eval `da224`; klipper-lb rejected) · `p2k2s` audit (tag `archive/mayor-p2k2s-findings`) · `xiovg` closed (173 legacy findings retired).
-
-## 🧠 Banked / lessons
-`memories-for-operational-guidelines-not-point-in-time-facts` · `reevaluate-owned-dependencies-each-release` · `lima-mcp-connects-only-after-its-vm-starts` · profiling memory updated. Process: hold a PR as DRAFT when its review LGTMs but a fix round is still needed (the tick auto-queues approved PRs) · overlapping-surface PRs collide in the merge queue — merge main into the second after the first lands.
+## ✅ This session — 31 merged, conformance clean
+- **Conformance:** full 1.37.1 two-node iptables run on `1ed2f96e` (after the whole runtime wave) = **460/460 + 2/2 disruptive, 0 failed** — identical to the morning baseline on `42a7d8ff`. Archives `temp/e2e/1014-1518-conformance`, `1014-1455-conformance-disruptive`.
+- **P2 correctness:** #1765 `mxjh5` CR validation after mutating webhooks · #1766 `r3ax1` NamespaceLifecycle 404 · #1776 `nore3` CRD finalizer (event-driven) · #1760 `7lvto` CSI check on KEP-5030 opt-in (operator B) · #1770 `xajjs` stale cni0.
+- **Apiserver/scheduler/store:** #1785 `ta8wa` upstream NotFound 102/102 · #1787 `dm2pc`+`9kqgt` CRD condition + CR shard eviction · #1782 `zw1ou` event-driven requeue + backoff · #1774 `7b0tw` cache-sync gate · #1768 `gyx1k` generateName · #1762 store · #1761 tests.
+- **Rig/tooling:** sonobuoy exit codes + real counts + suite caps (#1771/#1778/#1780) · lima-start pre-flight (#1773) · konnectivity extra-node + agent recreate (#1777/#1781) · stale-stack reaper + anchored kill patterns (#1775/#1779/#1783/#1784) · kubelet flag test (#1786) · tick/hygiene (#1759/#1769/#1772) · VM-stop docs (#1758/#1763/#1767) · #1764 rustls · #1757.
+- **Memories banked:** `stop-idle-u7s-lima-vms`, `upstream-e2e-defines-behaviour-use-as-gate`, `we-own-preexisting-issues-file-and-prioritize`, `destructive-scripts-need-end-to-end-kill-path-test`, `worker-classifier-denial-stop-not-reshape`, `lima-mcp-requires-vm-already-running` (consolidated).
 
 ## 🔎 Open PRs
 <!-- BEGIN AUTO: open-prs -->
-#1749 (auto-merge armed; CI re-running on the merge commit)
+None open (besides this bookkeeping PR).
 <!-- END AUTO: open-prs -->
 ## 🔁 Cron loops
 <!-- BEGIN AUTO: cron-loops -->
-CANCELLED at wrap (session-only). Re-register on resume.
+Stopped at wrap (session-only; re-register next session).
 <!-- END AUTO: cron-loops -->
 ## Repo state
 <!-- BEGIN AUTO: repo-state -->
-2026-10-13T09:41Z — `main` @ `65ceb945`. Local `.beads/issues.jsonl` re-exported after the snapshot (discard before pull). VMs: lima-node-2/3/5/smoke running, lima-node-4 re-provisioned; no host stacks.
+As of 2026-10-14T15:21Z — `main` @ `a417e653`.
 <!-- END AUTO: repo-state -->
 
 ## 📋 Review queue
@@ -43,5 +40,5 @@ CANCELLED at wrap (session-only). Re-register on resume.
 
 ## 🌲 Worktrees / hygiene
 <!-- BEGIN AUTO: worktrees -->
-`agent-a2bf025b16f9598ea` (#1749 branch holder) — reap after merge.
+Kept: `ai/worktrees/agent-a575f24723a79d456` (`1o0d2`, pushed, no PR).
 <!-- END AUTO: worktrees -->

@@ -248,7 +248,7 @@ pub async fn get_csr<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, KIND))?;
+        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
     Ok((
         StatusCode::OK,
@@ -358,7 +358,11 @@ pub async fn create_csr<S: Store>(
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
-            Err(e) => return Err(crate::handlers::generic::store_err(e, &name, KIND)),
+            Err(e) => {
+                return Err(crate::handlers::generic::store_err(
+                    e, GROUP, PLURAL, &name, KIND,
+                ))
+            }
         }
     };
 

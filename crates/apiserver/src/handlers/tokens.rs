@@ -140,7 +140,7 @@ pub async fn create_token<S: Store>(
         .get(&sa_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&sa_name, "ServiceAccount"))?;
+        .ok_or_else(|| Status::not_found("", "serviceaccounts", &sa_name))?;
 
     // 3. Require a signing key.
     let encoding_key = state
@@ -704,8 +704,9 @@ mod handler_tests {
             "missing ServiceAccount must yield 404 NotFound"
         );
         assert!(
-            err.1.message.contains("ServiceAccount"),
-            "error message must name the missing kind"
+            err.1.message == "serviceaccounts \"ghost-sa\" not found",
+            "error message must name the missing resource as upstream does, got: {}",
+            err.1.message
         );
     }
 

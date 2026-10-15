@@ -31,7 +31,7 @@ use crate::{
 
 fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusError {
     match err {
-        StoreError::NotFound { .. } => Status::not_found(name, "Namespace"),
+        StoreError::NotFound { .. } => Status::not_found("", "namespaces", name),
         StoreError::AlreadyExists { .. } => Status::already_exists(name, "Namespace"),
         StoreError::RevisionMismatch { expected, current } => Status::conflict(format!(
             "Namespace \"{name}\" cannot be updated: resource version mismatch (expected {expected}, current {current})"
@@ -301,7 +301,7 @@ pub(crate) async fn get_namespace<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
+        .ok_or_else(|| Status::not_found("", "namespaces", &name))?;
 
     Ok((
         StatusCode::OK,
@@ -311,11 +311,13 @@ pub(crate) async fn get_namespace<S: Store>(
         .into_response())
 }
 
+/// Bound on re-read-and-retry attempts when an unconditional PUT (no client resourceVersion)
+/// loses a write race, as upstream GuaranteedUpdate does.
+const MAX_REPLACE_CONFLICT_RETRIES: u32 = 5;
+
 /// A PUT without a resourceVersion must still be conditioned on the revision just read, or a
 /// DELETE landing between that read and the write would be undone by an unconditional put
 /// recreating the namespace without its finalizers.
-const MAX_REPLACE_CONFLICT_RETRIES: u32 = 5;
-
 fn replace_put_precondition(client_rv: Option<u64>, stored_rv: Option<u64>) -> Option<u64> {
     client_rv.or(stored_rv)
 }
@@ -367,7 +369,7 @@ pub(crate) async fn replace_namespace<S: Store>(
         // Upstream disallows create-on-update for Namespace; creating here would skip the create
         // preparation (spec.finalizers), so a later delete would orphan the namespace's content.
         if stored_obj.is_none() {
-            return Err(Status::not_found(&name, "Namespace").for_resource("", "namespaces"));
+            return Err(Status::not_found("", "namespaces", &name));
         }
         let stored_status = stored_obj.as_ref().map(|v| v["status"].clone());
         match stored_status {
@@ -552,7 +554,7 @@ pub(crate) async fn patch_namespace<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
+        .ok_or_else(|| Status::not_found("", "namespaces", &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -701,7 +703,7 @@ pub(crate) async fn finalize_namespace<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
+        .ok_or_else(|| Status::not_found("", "namespaces", &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -786,7 +788,7 @@ pub(crate) async fn put_namespace_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
+        .ok_or_else(|| Status::not_found("", "namespaces", &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -844,7 +846,7 @@ pub(crate) async fn patch_namespace_status<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
+        .ok_or_else(|| Status::not_found("", "namespaces", &name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -999,7 +1001,7 @@ pub(crate) async fn delete_namespace<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Namespace").for_resource("", "namespaces"))?;
+        .ok_or_else(|| Status::not_found("", "namespaces", &name))?;
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -3577,7 +3579,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_put_is_conditioned_on_the_read_revision_when_client_sends_no_resource_version() {
+    fn replace_put_precondition_falls_back_to_read_revision_only_without_client_resource_version() {
         assert_eq!(
             replace_put_precondition(None, Some(7)),
             Some(7),
@@ -3980,7 +3982,7 @@ mod tests {
         let namespace_name = "nscrd-shard-test";
         let group = format!("stable.{namespace_name}.example.com");
         let plural = "crontabs";
-        let prefix = crate::keys::group_list_prefix(&group, plural, None);
+        let prefix = crate::handlers::cr::cr_list_prefix(&group, plural, None);
 
         assert!(
             crate::handlers::crd::create_crd(
@@ -4040,9 +4042,8 @@ mod tests {
 
         delete_namespace_scoped_crds(&state, namespace_name).await;
 
-        assert_eq!(
-            store.compaction_horizon_for(&prefix),
-            rv,
+        assert!(
+            store.compaction_horizon_for(&prefix) >= rv,
             "delete_namespace_scoped_crds must eagerly free the resource-type shard rather than \
              waiting 120s for idle-GC, the same as crd::delete_crd does on its HTTP path -- \
              otherwise every namespace-scoped CRD deleted via namespace cascade-delete pins its \

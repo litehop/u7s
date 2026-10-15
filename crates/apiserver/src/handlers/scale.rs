@@ -235,10 +235,7 @@ fn require_scale_resource(resource: &str) -> Result<(), crate::status::StatusErr
     if SCALE_RESOURCES.contains(&resource) {
         Ok(())
     } else {
-        Err(Status::not_found(
-            resource,
-            &format!("scale subresource for {resource}"),
-        ))
+        Err(Status::route_not_found())
     }
 }
 
@@ -390,7 +387,7 @@ async fn scale_get_impl<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(name, resource))?;
+        .ok_or_else(|| Status::not_found(group, resource, name))?;
 
     let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -466,7 +463,7 @@ async fn scale_put_impl<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(name, resource))?;
+        .ok_or_else(|| Status::not_found(group, resource, name))?;
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -498,7 +495,7 @@ async fn scale_put_impl<S: Store>(
         .store
         .put(&key, obj.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, name, resource))?;
+        .map_err(|e| store_err(e, group, resource, name, resource))?;
 
     Ok(Json(build_scale(
         name,
@@ -547,7 +544,7 @@ async fn scale_patch_impl<S: Store>(
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(name, resource))?;
+        .ok_or_else(|| Status::not_found(group, resource, name))?;
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -585,7 +582,7 @@ async fn scale_patch_impl<S: Store>(
         .store
         .put(&key, obj.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, name, resource))?;
+        .map_err(|e| store_err(e, group, resource, name, resource))?;
 
     Ok(Json(build_scale(
         name,

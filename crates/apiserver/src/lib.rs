@@ -1294,20 +1294,7 @@ fn build_router(state: AppState) -> Router {
 }
 
 async fn fallback_handler() -> status::StatusError {
-    use axum::http::StatusCode;
-    status::StatusError(
-        StatusCode::NOT_FOUND,
-        status::Status {
-            kind: "Status",
-            api_version: "v1",
-            status: "Failure",
-            message: "the server could not find the requested resource".into(),
-            reason: "NotFound",
-            code: 404,
-            metadata: None,
-            details: None,
-        },
-    )
+    status::Status::route_not_found()
 }
 
 /// The RFC3339 timestamp stamped as `creationTimestamp` on every object this apiserver seeds
@@ -11865,11 +11852,11 @@ mod tests {
     /// dns-common.go:495 polls this exact path to verify a pod exists before exec-ing into it.
     /// If the fallback fires instead of the pod handler, the client receives
     /// "the server could not find the requested resource" which is different from the
-    /// "Pod ... not found" the pod handler returns.  DNS conformance burns 614 s retrying.
+    /// "pods ... not found" the pod handler returns.  DNS conformance burns 614 s retrying.
     ///
     /// This test fails if the pod GET route is mis-registered so axum hits fallback_handler:
     /// the body message would be "the server could not find the requested resource" not
-    /// Pod "..." not found".
+    /// pods "..." not found".
     #[tokio::test]
     async fn get_pod_with_uuid_name_reaches_pod_handler_not_fallback() {
         use axum::body::to_bytes;
@@ -11921,16 +11908,177 @@ mod tests {
             .expect("body collect must not fail");
         let val: serde_json::Value = serde_json::from_slice(&body).expect("response must be JSON");
 
-        // The pod handler returns `Pod "..." not found`.
+        // The pod handler returns `pods "..." not found`.
         // The fallback returns `the server could not find the requested resource`.
         // Only the pod handler message proves the route is registered correctly.
         let message = val["message"].as_str().unwrap_or("");
         assert!(
-            message.starts_with("Pod"),
-            "GET {uri} must return 'Pod ... not found', not '{}' — \
+            message.starts_with("pods"),
+            "GET {uri} must return 'pods ... not found', not '{}' — \
              if the fallback fires dns-common.go will never see the pod and burns 614 s",
             message
         );
+    }
+
+    /// Every NotFound the apiserver emits for a missing object must match upstream's
+    /// `NewNotFound(GroupResource{group, resource}, name)`: message
+    /// `<resource>[.<group>] "<name>" not found`, `details.kind` = lowercase plural resource,
+    /// `details.group` = API group (absent for core). kubectl prints the message and client-go
+    /// callers key on the details, so a u7s Kind ("Pod") anywhere is an observable divergence.
+    #[tokio::test]
+    async fn not_found_status_matches_upstream_shape_across_kinds_and_subresources() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+        use u7s_store::Store;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let ns_key = keys::cluster_object_key("namespaces", "ns1");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace", "metadata": { "name": "ns1" }
+        });
+        store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("seed namespace must succeed");
+        let mut router = build_router(state);
+        let admin = auth::UserInfo {
+            username: "admin".to_string(),
+            uid: String::new(),
+            groups: vec!["system:masters".to_string()],
+            extra: Default::default(),
+        };
+
+        for (plural, kind, scope) in [
+            ("widgets", "Widget", "Cluster"),
+            ("gadgets", "Gadget", "Namespaced"),
+        ] {
+            let crd = serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": format!("{plural}.example.io") },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": plural, "singular": plural, "kind": kind, "listKind": format!("{kind}List") },
+                    "scope": scope,
+                    "versions": [{ "name": "v1", "served": true, "storage": true, "subresources": { "status": {} } }]
+                }
+            });
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(crd.to_string()))
+                .expect("CRD POST must build");
+            req.extensions_mut().insert(admin.clone());
+            let resp = router.call(req).await.expect("router must not error");
+            assert_eq!(
+                resp.status(),
+                StatusCode::CREATED,
+                "CRD {plural} must be created"
+            );
+        }
+
+        // (uri, resource, group)
+        let cases: &[(&str, &str, &str)] = &[
+            ("/api/v1/namespaces/ns1/pods/nope", "pods", ""),
+            ("/api/v1/namespaces/ns1/pods/nope/status", "pods", ""),
+            ("/api/v1/namespaces/ns1/pods/nope/log", "pods", ""),
+            ("/api/v1/namespaces/ns1/pods/nope/proxy/x", "pods", ""),
+            (
+                "/api/v1/namespaces/ns1/services/nope/proxy/x",
+                "services",
+                "",
+            ),
+            ("/api/v1/nodes/nope/proxy/metrics", "nodes", ""),
+            ("/api/v1/namespaces/nope", "namespaces", ""),
+            ("/api/v1/namespaces/ns1/configmaps/nope", "configmaps", ""),
+            (
+                "/apis/apps/v1/namespaces/ns1/deployments/nope",
+                "deployments",
+                "apps",
+            ),
+            (
+                "/apis/apps/v1/namespaces/ns1/deployments/nope/status",
+                "deployments",
+                "apps",
+            ),
+            (
+                "/apis/apps/v1/namespaces/ns1/deployments/nope/scale",
+                "deployments",
+                "apps",
+            ),
+            (
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/nope",
+                "customresourcedefinitions",
+                "apiextensions.k8s.io",
+            ),
+            (
+                "/apis/certificates.k8s.io/v1/certificatesigningrequests/nope",
+                "certificatesigningrequests",
+                "certificates.k8s.io",
+            ),
+            ("/apis/example.io/v1/widgets/nope", "widgets", "example.io"),
+            (
+                "/apis/example.io/v1/widgets/nope/status",
+                "widgets",
+                "example.io",
+            ),
+            (
+                "/apis/example.io/v1/namespaces/ns1/gadgets/nope",
+                "gadgets",
+                "example.io",
+            ),
+            (
+                "/apis/example.io/v1/namespaces/ns1/gadgets/nope/status",
+                "gadgets",
+                "example.io",
+            ),
+        ];
+        for (uri, resource, group) in cases {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(*uri)
+                .body(axum::body::Body::empty())
+                .expect("request must build");
+            req.extensions_mut().insert(admin.clone());
+            let resp = router.call(req).await.expect("router must not error");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "GET {uri}");
+            let body = to_bytes(resp.into_body(), 8192).await.expect("body");
+            let val: serde_json::Value = serde_json::from_slice(&body).expect("Status JSON");
+            let name = "nope";
+            let qualified = if group.is_empty() {
+                resource.to_string()
+            } else {
+                format!("{resource}.{group}")
+            };
+            assert_eq!(val["reason"], "NotFound", "GET {uri}");
+            assert_eq!(
+                val["message"],
+                format!("{qualified} \"{name}\" not found"),
+                "GET {uri}: message must be '<resource>[.<group>] \"<name>\" not found'"
+            );
+            assert_eq!(val["details"]["name"], name, "GET {uri}");
+            assert_eq!(
+                val["details"]["kind"], *resource,
+                "GET {uri}: details.kind must be the plural resource"
+            );
+            if group.is_empty() {
+                assert!(
+                    val["details"].get("group").is_none(),
+                    "GET {uri}: core group must be omitted"
+                );
+            } else {
+                assert_eq!(val["details"]["group"], *group, "GET {uri}");
+            }
+        }
     }
 
     /// The reconciler task must exit promptly when the shutdown signal fires.

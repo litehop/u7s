@@ -37,21 +37,18 @@ FAIL=0
 # Comments explain why a name was dropped, so only code lines count.
 code_lines() { grep -vE '^[[:space:]]*#' "$1"; }
 
-for f in "$LIMA_START" "$INSTALL"; do
-  code="$(code_lines "$f")"
-  for name in "${REMOVED_FLAGS[@]}" "${LOCKED_GATES[@]}"; do
-    if printf '%s' "$code" | grep -qF -- "$name"; then
-      echo "FAIL: $(basename "$f") passes '$name', which kubelet 1.37 rejects at startup (crash-loop)"
-      FAIL=$(( FAIL + 1 ))
-    else
-      echo "PASS: $(basename "$f") does not pass '$name'"
-      PASS=$(( PASS + 1 ))
-    fi
-  done
-done
-
+# lima-start.sh writes a single literal kubelet command line targeting the
+# current (1.37+) kubelet, so its code is checked as text.
 lima_code="$(code_lines "$LIMA_START")"
-install_code="$(code_lines "$INSTALL")"
+for name in "${REMOVED_FLAGS[@]}" "${LOCKED_GATES[@]}"; do
+  if printf '%s' "$lima_code" | grep -qF -- "$name"; then
+    echo "FAIL: lima-start.sh passes '$name', which kubelet 1.37 rejects at startup (crash-loop)"
+    FAIL=$(( FAIL + 1 ))
+  else
+    echo "PASS: lima-start.sh does not pass '$name'"
+    PASS=$(( PASS + 1 ))
+  fi
+done
 for gate in "${REQUIRED_OFF_IN_LIMA_START[@]}"; do
   if printf '%s' "$lima_code" | grep -qF -- "${gate}=false"; then
     echo "PASS: lima-start.sh disables '$gate' alongside PodLevelResources=false"
@@ -60,22 +57,64 @@ for gate in "${REQUIRED_OFF_IN_LIMA_START[@]}"; do
     echo "FAIL: lima-start.sh disables PodLevelResources but not '$gate'; 1.37 kubelet refuses to start"
     FAIL=$(( FAIL + 1 ))
   fi
-  # install.sh ships a tarball that may still be <1.37, where these gates are
-  # unrecognized, so they must be present but version-guarded.
-  if printf '%s' "$install_code" | grep -F -- "${gate}=false" | grep -q .; then
-    echo "PASS: install.sh disables '$gate' on 1.37+"
+done
+
+# install.sh ships a tarball that may still be 1.36, so assert the OUTPUT of its
+# flag builder per kubelet minor instead of grepping its source.
+fn_src="$(sed -n '/^kubelet_round2_flags() {$/,/^}$/p' "$INSTALL")"
+if [ -z "$fn_src" ]; then
+  echo "FAIL: kubelet_round2_flags not found in install.sh"
+  exit 1
+fi
+eval "$fn_src"
+
+flags_136="$(kubelet_round2_flags 1.36)"
+flags_137="$(kubelet_round2_flags 1.37)"
+
+check_absent() { # label flags name why
+  if printf '%s' "$2" | grep -qF -- "$3"; then
+    echo "FAIL: install.sh flags for $1 contain '$3'; $4"
+    FAIL=$(( FAIL + 1 ))
+  else
+    echo "PASS: install.sh flags for $1 omit '$3'"
+    PASS=$(( PASS + 1 ))
+  fi
+}
+
+for name in "${REMOVED_FLAGS[@]}" "${LOCKED_GATES[@]}"; do
+  check_absent "1.36" "$flags_136" "$name" "removed/locked in 1.37 and dropped for every version (crash-loop on 1.37)"
+  check_absent "1.37" "$flags_137" "$name" "kubelet 1.37 rejects it at startup (crash-loop)"
+done
+
+for gate in "${REQUIRED_OFF_IN_LIMA_START[@]}"; do
+  check_absent "1.36" "$flags_136" "${gate}=false" "a 1.36 kubelet rejects 1.37-only gates as unrecognized"
+  if printf '%s' "$flags_137" | grep -qF -- "${gate}=false"; then
+    echo "PASS: install.sh flags for 1.37 disable '$gate'"
     PASS=$(( PASS + 1 ))
   else
-    echo "FAIL: install.sh never disables '$gate'; a 1.37+ tarball would fail to start kubelet"
+    echo "FAIL: install.sh flags for 1.37 do not disable '$gate'; PodLevelResources=false makes kubelet refuse to start"
     FAIL=$(( FAIL + 1 ))
   fi
 done
 
-if printf '%s' "$install_code" | grep -qF 'KUBE_MINOR#*.}" -ge 37'; then
-  echo "PASS: install.sh guards the 1.37-only gates on the staged kubelet minor"
+if printf '%s' "$flags_136" | grep -qF -- 'PodLevelResources=false'; then
+  echo "PASS: install.sh keeps PodLevelResources=false on 1.36"
   PASS=$(( PASS + 1 ))
 else
-  echo "FAIL: install.sh must guard the 1.37-only gates; a 1.36 kubelet rejects them as unrecognized"
+  echo "FAIL: install.sh dropped PodLevelResources=false on 1.36"
+  FAIL=$(( FAIL + 1 ))
+fi
+
+# Anything 1.37 adds beyond 1.36 must be exactly the pinned 1.37-only gates, so
+# a new unguarded (or newly guarded) gate shows up as a diff here.
+only_137="$(printf '%s' "${flags_137#"$flags_136"}")"
+expected_137=""
+for gate in "${REQUIRED_OFF_IN_LIMA_START[@]}"; do expected_137="$expected_137,${gate}=false"; done
+if [ "$only_137" = "$expected_137" ]; then
+  echo "PASS: 1.37 flags differ from 1.36 only by the pinned 1.37-only gates"
+  PASS=$(( PASS + 1 ))
+else
+  echo "FAIL: 1.37-only flag delta is '$only_137', expected '$expected_137'; update the pinned lists if intentional"
   FAIL=$(( FAIL + 1 ))
 fi
 
