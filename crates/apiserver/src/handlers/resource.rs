@@ -1586,6 +1586,7 @@ pub(crate) async fn do_patch<S: Store>(
             Some(
                 crate::service_alloc::begin(
                     state,
+                    ns.unwrap_or_default(),
                     name,
                     None,
                     &mut obj.body,
@@ -1772,6 +1773,7 @@ pub(crate) async fn do_patch<S: Store>(
                     Some(
                         crate::service_alloc::begin(
                             state,
+                            ns.unwrap_or_default(),
                             name,
                             race_svc_spec.as_ref(),
                             &mut current.body,
@@ -2295,6 +2297,7 @@ pub(crate) async fn do_patch<S: Store>(
             Some(
                 crate::service_alloc::begin(
                     state,
+                    ns.unwrap_or_default(),
                     name,
                     svc_spec_before_patch.as_ref(),
                     &mut current.body,
@@ -3395,6 +3398,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         Some(
             crate::service_alloc::begin(
                 &state,
+                &ns,
                 &name,
                 None,
                 &mut obj.body,
@@ -4156,6 +4160,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         Some(
             crate::service_alloc::begin(
                 &state,
+                &ns,
                 &name,
                 svc_spec_before_replace.as_ref(),
                 &mut obj.body,

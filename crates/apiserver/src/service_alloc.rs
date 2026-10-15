@@ -112,6 +112,15 @@ fn spec_ports(spec: &Value) -> BTreeSet<i64> {
     ports
 }
 
+/// Sentinel body for a clusterIP reserved ahead of its Service's creation: only that
+/// Service may later claim it.
+pub(crate) fn owned_ip_sentinel(ns: &str, name: &str) -> bytes::Bytes {
+    bytes::Bytes::from(
+        serde_json::json!({"kind": "ServiceIPAllocation", "owner": format!("{ns}/{name}")})
+            .to_string(),
+    )
+}
+
 fn ip_key(ip: &str) -> String {
     format!("{SERVICE_IP_PREFIX}{ip}")
 }
@@ -167,6 +176,19 @@ impl<S: Store> Reserver<'_, S> {
             Err(StoreError::AlreadyExists { .. }) => Ok(false),
             Err(e) => Err(Status::internal(format!("service allocation error: {e}"))),
         }
+    }
+
+    /// True if the key's sentinel was reserved ahead of time for exactly this Service.
+    async fn pre_reserved_for(&self, key: &str, ns: &str, name: &str) -> Result<bool, StatusError> {
+        let held = self
+            .state
+            .store
+            .get(key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(held
+            .and_then(|o| serde_json::from_slice::<Value>(&o.value).ok())
+            .is_some_and(|v| v["owner"].as_str() == Some(&format!("{ns}/{name}"))))
     }
 
     async fn used_ports(&self) -> Result<BTreeSet<i64>, StatusError> {
@@ -228,6 +250,7 @@ fn drop_type_dependent_fields(spec: &mut Value) {
 /// `dry_run` performs the same validation and picks ports without taking any reservation.
 pub(crate) async fn begin<S: Store>(
     state: &AppState<S>,
+    ns: &str,
     name: &str,
     old_spec: Option<&Value>,
     body: &mut Value,
@@ -243,12 +266,13 @@ pub(crate) async fn begin<S: Store>(
         dry_run,
         txn,
     };
-    r.txn.stale = reserve_all(&mut r, name, old_spec, body, auto_ip).await?;
+    r.txn.stale = reserve_all(&mut r, ns, name, old_spec, body, auto_ip).await?;
     Ok(r.txn)
 }
 
 async fn reserve_all<S: Store>(
     r: &mut Reserver<'_, S>,
+    ns: &str,
     name: &str,
     old_spec: Option<&Value>,
     body: &mut Value,
@@ -292,7 +316,7 @@ async fn reserve_all<S: Store>(
                     ),
                 ));
             }
-            if !r.reserve(ip_key(ip)).await? {
+            if !r.reserve(ip_key(ip)).await? && !r.pre_reserved_for(&ip_key(ip), ns, name).await? {
                 return Err(invalid(
                     name,
                     "spec.clusterIPs",

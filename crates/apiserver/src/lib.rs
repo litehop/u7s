@@ -3346,7 +3346,7 @@ async fn seed_services(
     match store
         .put(
             &dns_ip_sentinel_key,
-            Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+            service_alloc::owned_ip_sentinel("kube-system", "kube-dns"),
             Some(0),
         )
         .await

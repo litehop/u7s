@@ -573,3 +573,39 @@ async fn multi_protocol_port_shares_one_node_port_and_releases_it_once() {
         .unwrap();
     assert!(left.items.is_empty());
 }
+
+/// The bootstrap reserves kube-dns's VIP before the CoreDNS manifest is applied. Without
+/// owner-aware reservation the manifest's own create is refused as "already allocated",
+/// the boot-time apply is fatal and no cluster ever comes up.
+#[tokio::test]
+async fn service_may_claim_its_own_pre_reserved_cluster_ip_but_nobody_else_can() {
+    let st = state();
+    st.store
+        .put(
+            &ip_key("10.96.0.50"),
+            super::owned_ip_sentinel("default", "pre"),
+            Some(0),
+        )
+        .await
+        .unwrap();
+    assert_422(
+        create(&st, "thief", json!({"clusterIP": "10.96.0.50"}), false).await,
+        "provided IP is already allocated",
+    );
+    let r = patch(
+        &st,
+        "pre",
+        "application/apply-patch+yaml",
+        svc(
+            "pre",
+            json!({"clusterIP": "10.96.0.50", "ports": [{"port": 53}]}),
+        ),
+    )
+    .await;
+    assert!(r.is_ok(), "owner's SSA create must succeed: {r:?}");
+    assert_422(
+        create(&st, "thief2", json!({"clusterIP": "10.96.0.50"}), false).await,
+        "provided IP is already allocated",
+    );
+    assert!(held(&st, &ip_key("10.96.0.50")).await);
+}
