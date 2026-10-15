@@ -4,7 +4,7 @@
 #
 # Bug: an apiserver-less scheduler+konnectivity-server orphan pair whose pid
 # files are stale/absent relies entirely on reset.sh's cmdline-pattern
-# fallback (host_kill_pattern_for + pkill -f) to be reaped. That fallback
+# fallback (workdir_kill_pattern + pkill -f) to be reaped. That fallback
 # fires unconditionally today, but reset.sh never re-checked whether the kill
 # actually worked -- it printed "Done (host-only)." and exited 0 regardless,
 # so a process immune to SIGTERM (or any other reason a targeted process

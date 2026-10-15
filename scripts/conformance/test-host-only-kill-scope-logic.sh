@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Regression test for reset.sh's host-process kill scope.
 #
-# Exercises the REAL script's host_kill_pattern_for() via its
+# Exercises the REAL script's workdir_kill_pattern() via its
 # `__call <fn> [args...]` entry point (same "real script, not a
 # reimplementation" technique scripts/test-worktree-hygiene-logic.sh uses for
 # worktree-hygiene.sh's kill_pattern_for()) -- a hardcoded copy of the
@@ -18,11 +18,11 @@
 # sharing that Lima network, not just the worktree being reset (confirmed
 # live: 'ip neigh' gateway goes INCOMPLETE). The fix scopes the kill to this
 # worktree's own u7s process by full cmdline (binary name + --workdir path)
-# via 'pkill -f' against reset.sh's own host_kill_pattern_for() output, which
+# via 'pkill -f' against reset.sh's own workdir_kill_pattern() output, which
 # by construction cannot match a process whose argv contains neither string.
 #
 # Covers two levels for each component:
-#   1. host_kill_pattern_for() itself returns the expected pattern string.
+#   1. workdir_kill_pattern() itself returns the expected pattern string.
 #   2. That REAL pattern, fed to a real 'pkill -f', kills a spawned process
 #      standing in for the u7s component and leaves a spawned process
 #      standing in for the shared Lima daemon alive -- a test that only
@@ -100,16 +100,16 @@ WORKDIR="/tmp/fake-worktree-$$/temp/u7s"
 FAKE_DAEMON_CMDLINE="limactl usernet -p /Users/x/.lima/_networks/user-v2-workers-b/usernet.pid --subnet 192.168.109.0/24"
 
 # ---------------------------------------------------------------------------
-# 1. host_kill_pattern_for() itself: exact pattern strings, so a drift in
+# 1. workdir_kill_pattern() itself: exact pattern strings, so a drift in
 #    reset.sh's derivation (e.g. anchoring on the wrong file, or dropping the
 #    workdir scope entirely) fails here even before any process is spawned.
 # ---------------------------------------------------------------------------
-assert_eq "host_kill_pattern_for builds the apiserver pattern anchored on this workdir's kubeconfig path" \
-  "$(call host_kill_pattern_for apiserver "$WORKDIR")" "u7s-apiserver.*${WORKDIR}/kubeconfig"
-assert_eq "host_kill_pattern_for builds the scheduler pattern anchored on this workdir's kubeconfig path" \
-  "$(call host_kill_pattern_for scheduler "$WORKDIR")" "u7s-scheduler.*${WORKDIR}/kubeconfig"
-assert_eq "host_kill_pattern_for builds the konnectivity-server pattern anchored on this workdir (no /kubeconfig suffix -- it has no such flag)" \
-  "$(call host_kill_pattern_for konnectivity-server "$WORKDIR")" "konnectivity-server.*${WORKDIR}"
+assert_eq "workdir_kill_pattern builds the apiserver pattern anchored on this workdir's kubeconfig path" \
+  "$(call workdir_kill_pattern apiserver "$WORKDIR")" "u7s-apiserver.*[ =]${WORKDIR}/kubeconfig"
+assert_eq "workdir_kill_pattern builds the scheduler pattern anchored on this workdir's kubeconfig path" \
+  "$(call workdir_kill_pattern scheduler "$WORKDIR")" "u7s-scheduler.*[ =]${WORKDIR}/kubeconfig"
+assert_eq "workdir_kill_pattern builds the konnectivity-server pattern anchored on this workdir (no /kubeconfig suffix -- it has no such flag)" \
+  "$(call workdir_kill_pattern konnectivity-server "$WORKDIR")" "konnectivity-server.*[ =]${WORKDIR}([/ ]|$)"
 
 # ---------------------------------------------------------------------------
 # 2. apiserver: the REAL derived pattern, fed to a real 'pkill -f', must kill
@@ -120,7 +120,7 @@ assert_eq "host_kill_pattern_for builds the konnectivity-server pattern anchored
 #    above or make this pkill match the daemon too -- this cannot pass
 #    against the old blanket-kill behavior.
 # ---------------------------------------------------------------------------
-APISERVER_PATTERN="$(call host_kill_pattern_for apiserver "$WORKDIR")"
+APISERVER_PATTERN="$(call workdir_kill_pattern apiserver "$WORKDIR")"
 FAKE_APISERVER_PID="$(spawn_fake_process "u7s-apiserver --db ${WORKDIR}/state.db --kubeconfig ${WORKDIR}/kubeconfig")"
 LEFTOVER_PIDS+=("$FAKE_APISERVER_PID")
 FAKE_NETWORK_DAEMON_PID="$(spawn_fake_process "$FAKE_DAEMON_CMDLINE")"
@@ -129,7 +129,7 @@ sleep 0.2 # let the backgrounded exec -a actually take effect before pkill -f
 
 pkill -f "$APISERVER_PATTERN" 2>/dev/null || true
 sleep 0.2
-assert_dead "apiserver fallback (real host_kill_pattern_for output) kills this worktree's own u7s-apiserver" "$FAKE_APISERVER_PID"
+assert_dead "apiserver fallback (real workdir_kill_pattern output) kills this worktree's own u7s-apiserver" "$FAKE_APISERVER_PID"
 assert_alive "apiserver fallback leaves the shared Lima network daemon untouched (the bug this guards against)" "$FAKE_NETWORK_DAEMON_PID"
 kill -9 "$FAKE_NETWORK_DAEMON_PID" 2>/dev/null || true
 
@@ -138,7 +138,7 @@ kill -9 "$FAKE_NETWORK_DAEMON_PID" 2>/dev/null || true
 #    konnectivity-agent talking to host.lima.internal:<agent-port> makes the
 #    shared daemon a legitimate holder of that port too.
 # ---------------------------------------------------------------------------
-KONNECTIVITY_PATTERN="$(call host_kill_pattern_for konnectivity-server "$WORKDIR")"
+KONNECTIVITY_PATTERN="$(call workdir_kill_pattern konnectivity-server "$WORKDIR")"
 FAKE_KONNECTIVITY_PID="$(spawn_fake_process "proxy-server-darwin-arm64 --cluster-cert=${WORKDIR}/konnectivity-server.crt --cluster-key=${WORKDIR}/konnectivity-server.key")"
 LEFTOVER_PIDS+=("$FAKE_KONNECTIVITY_PID")
 FAKE_NETWORK_DAEMON_PID2="$(spawn_fake_process "$FAKE_DAEMON_CMDLINE")"
@@ -147,7 +147,7 @@ sleep 0.2
 
 pkill -f "$KONNECTIVITY_PATTERN" 2>/dev/null || true
 sleep 0.2
-assert_dead "konnectivity-server fallback (real host_kill_pattern_for output) kills this worktree's own konnectivity-server" "$FAKE_KONNECTIVITY_PID"
+assert_dead "konnectivity-server fallback (real workdir_kill_pattern output) kills this worktree's own konnectivity-server" "$FAKE_KONNECTIVITY_PID"
 assert_alive "konnectivity-server fallback leaves the shared Lima network daemon untouched" "$FAKE_NETWORK_DAEMON_PID2"
 kill -9 "$FAKE_NETWORK_DAEMON_PID2" 2>/dev/null || true
 

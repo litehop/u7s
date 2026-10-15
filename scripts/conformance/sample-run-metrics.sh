@@ -114,6 +114,9 @@
 # teardown path without knowing in advance whether a sampler is running).
 set -euo pipefail
 
+# shellcheck source=scripts/_kill-pattern.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_kill-pattern.sh"
+
 SUBCOMMAND="${1:-}"
 case "$SUBCOMMAND" in
   start|stop|snapshot) shift ;;
@@ -183,11 +186,11 @@ resolve_scheduler_pid() {
   # u7s-scheduler is running embedded in the apiserver (--embedded-scheduler true)
   # rather than as its own process; that's a real "no separate PID exists"
   # answer, not a resolver bug.
-  pgrep -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null | head -1 || true
+  pgrep -f "$(workdir_kill_pattern scheduler "$WORKDIR")" 2>/dev/null | head -1 || true
 }
 
 resolve_konnectivity_pid() {
-  pgrep -f "konnectivity-server.*${WORKDIR}" 2>/dev/null | head -1 || true
+  pgrep -f "$(workdir_kill_pattern konnectivity-server "$WORKDIR")" 2>/dev/null | head -1 || true
 }
 
 # macOS-only: ps -o rss= overstates real memory by counting clean, evictable,
