@@ -4,11 +4,11 @@
 /// standing up an API server.
 use anyhow::{bail, Context};
 use hyper::{Method, StatusCode, Uri};
+use politeia::HyperApiClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info};
-use u7s_kubeconfig::HyperApiClient;
 
 mod run;
 /// The scheduler's watch/schedule loop as a callable library function — see
@@ -107,7 +107,7 @@ pub async fn http_patch_status(
 // 1. The canonical implementation lives alongside watch_stream (which calls it).
 // 2. Scheduler-level unit tests exercise the same function used in production,
 //    not a separate copy.
-pub use u7s_kubeconfig::drain_watch_buffer;
+pub use politeia::drain_watch_buffer;
 
 pub async fn stream_watch_events(
     connector: &TlsConnector,

@@ -2225,6 +2225,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "politeia"
+version = "0.1.0"
+source = "git+https://github.com/litehop/politeia?tag=v0.1.1#9b9f07df55c2cf5ec0fce0be1ce6434f2ce51da1"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-post-quantum",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3833,26 +3853,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "u7s-kubeconfig"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "rustls-post-quantum",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "tracing",
-]
-
-[[package]]
 name = "u7s-proto-generated"
 version = "0.1.0"
 dependencies = [
@@ -3874,6 +3874,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "politeia",
  "rcgen",
  "rustls",
  "rustls-pemfile",
@@ -3884,7 +3885,6 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
- "u7s-kubeconfig",
 ]
 
 [[package]]
