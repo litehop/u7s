@@ -222,6 +222,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         &args.service_cluster_ip_range,
     )
     .await?;
+    service_alloc::repair(&*store).await?;
     seed_serviceaccounts(&store).await?;
     seed_servicecidrs(&store, &args.service_cluster_ip_range).await?;
 
