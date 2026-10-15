@@ -1025,6 +1025,74 @@ mod tests {
         assert_fields_present(&paths, &expected);
     }
 
+    /// The byte-identical audit below strips these fields from both sides, so only this test
+    /// stands between a decoder that drops one and a silently lossy DRA allocation (a claim
+    /// losing `skipNodeOperations` makes the kubelet run node-side prepare for devices that
+    /// opted out). It pins each key at its exact path in both the descriptor-derived expectation
+    /// and the decoded output, so neither a stale descriptor nor a dropped decode can pass.
+    #[test]
+    fn post_migration_resource_v1_fields_are_decoded_at_exact_paths() {
+        let rs_expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.resource.v1.ResourceSlice",
+        ]);
+        let rc_expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.resource.v1.ResourceClaim",
+        ]);
+
+        let rs = resource_v1::ResourceSlice {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::ResourceSliceSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        rs.encode(&mut buf).unwrap();
+        let rs_json = decode_resourceslice_proto_gen(&buf).unwrap();
+
+        let rc = resource_v1::ResourceClaim {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::ResourceClaimSpec::sentinel()),
+            status: Some(resource_v1::ResourceClaimStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        rc.encode(&mut buf).unwrap();
+        let rc_json = decode_resourceclaim_proto_gen(&buf).unwrap();
+
+        let mut rs_paths = BTreeSet::new();
+        collect_leaf_paths(&rs_json, "", &mut rs_paths);
+        let mut rc_paths = BTreeSet::new();
+        collect_leaf_paths(&rc_json, "", &mut rc_paths);
+
+        let rs_keys = [
+            "spec.partitionTypeAttribute",
+            "spec.skipNodeOperations",
+            "spec.devices.consumesCounters.compatibilityGroups",
+        ];
+        let rc_keys = [
+            "spec.devices.requests.exactly.derivedAttributes",
+            "status.allocation.devices.results.skipNodeOperations",
+        ];
+        for (name, keys, expected, paths) in [
+            ("ResourceSlice", &rs_keys[..], &rs_expected, &rs_paths),
+            ("ResourceClaim", &rc_keys[..], &rc_expected, &rc_paths),
+        ] {
+            for key in keys {
+                let seg = key.rsplit('.').next().unwrap();
+                assert!(
+                    expected
+                        .iter()
+                        .any(|e| e.ends_with(key) || e.contains(&format!("{key}."))),
+                    "{name}: descriptor oracle does not list {key}; vendored proto is stale"
+                );
+                assert!(
+                    paths
+                        .iter()
+                        .any(|p| p.ends_with(key) || p.contains(&format!("{key}."))),
+                    "{name}: decoded JSON lacks {key} (segment {seg}); decoder dropped it. \
+                     paths={paths:?}"
+                );
+            }
+        }
+    }
+
     // ---- Byte-identical audit: codegen migration -------------------------------
     //
     // Reconstructs every pre-migration hand-written `gen_*_to_json`/`decode_*_proto_gen`
