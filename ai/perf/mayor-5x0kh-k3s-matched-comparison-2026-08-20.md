@@ -182,7 +182,7 @@ Flagged as a follow-on, not silently glossed over.
 
 ## Per-process RSS — single-node k3s (matched boundary)
 
-All figures from `temp/k3s-single/rss.csv` (216 raw samples, 15s interval).
+All figures are from 216 raw RSS samples at 15s interval (raw archive, if still present: `temp/k3s-single/rss.csv`); the figures below are the whole evidence.
 "Matched boundary" = the set of components u7s's own roadmap matrix
 measures on itself: control-plane processes + container runtime + CoreDNS +
 metrics-server, plus local-path-provisioner (no u7s equivalent, included
@@ -229,7 +229,7 @@ moved, consistent with a light 4-spec focus rather than a full suite.
 
 All 3 default addons (coredns, local-path-provisioner, metrics-server) run
 only on the server in this topology (they were never rescheduled to the
-agent). From `temp/k3s-two-node/rss.csv`:
+agent). From the 2-node RSS sampler (raw archive, if still present: `temp/k3s-two-node/rss.csv`):
 
 | Node | Process | RSS (MB) |
 |---|---|---:|
@@ -380,11 +380,11 @@ actual total lands.
 
 ## Raw data
 
-- `temp/k3s-single/{rss.csv,vm-free.csv,ring-age.csv,metrics-*.prom}` —
+- Raw archive, if still present: `temp/k3s-single/{rss.csv,vm-free.csv,ring-age.csv,metrics-*.prom}` —
   single-node leg (idle baseline through post-conformance peak).
-- `temp/k3s-two-node/{rss.csv,vm-free.csv,ring-age.csv}` — 2-node leg
+- Raw archive, if still present: `temp/k3s-two-node/{rss.csv,vm-free.csv,ring-age.csv}` — 2-node leg
   (idle, join, and the capped container-scaling load test).
-- `temp/k3s-compare.yaml`, `temp/k3s-compare-2.yaml` — the Lima VM configs
+- Raw archive, if still present: `temp/k3s-compare.yaml`, `temp/k3s-compare-2.yaml` — the Lima VM configs
   used (ephemeral; VMs torn down after measurement).
 
 These raw artifacts are local to the worker worktree that produced this
