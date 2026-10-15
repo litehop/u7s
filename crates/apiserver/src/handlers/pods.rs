@@ -1486,10 +1486,6 @@ pub(crate) async fn patch_pod<S: Store>(
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-        // Snapshotted before the patch mutates current_obj.body in place below — the only
-        // pre-patch copy available to pass as oldObject to the admission webhooks.
-        let pre_patch_obj = current_obj.body.clone();
-
         let spec_before = current_obj.body["spec"].clone();
         // Save the stored generation so a PATCH that sets metadata.generation
         // cannot downgrade it. generation is server-managed; only increment
@@ -1544,10 +1540,15 @@ pub(crate) async fn patch_pod<S: Store>(
             })),
             dry_run: patch_query.is_dry_run(),
         };
+        // Re-parsed from the stored bytes (current_obj.body was patched in place) only when
+        // admission can read it, so a PATCH with no webhooks never holds a second full tree.
+        let pre_patch_body =
+            crate::admission::load_old_object_for_admission(&state, &admission_ctx, &stored.value)
+                .await?;
         current_obj.body = run_mutating_webhooks(
             &state,
             current_obj.body,
-            Some(&pre_patch_obj),
+            pre_patch_body.as_ref(),
             &admission_ctx,
         )
         .await?;
@@ -1567,10 +1568,11 @@ pub(crate) async fn patch_pod<S: Store>(
         run_validating_webhooks(
             &state,
             &current_obj.body,
-            Some(&pre_patch_obj),
+            pre_patch_body.as_ref(),
             &admission_ctx,
         )
         .await?;
+        drop(pre_patch_body);
 
         // Restore the stored generation before computing the increment so that
         // a patch attempting to set generation is ignored.
@@ -5224,12 +5226,16 @@ pub(crate) fn validate_pod_spec_immutable(
     spec_before: &serde_json::Value,
     spec_after: &serde_json::Value,
 ) -> Result<(), String> {
+    // Defaulting is a pure function of the spec, so identical inputs cannot differ after it.
+    if spec_before == spec_after {
+        return Ok(());
+    }
     let mut old_pod = serde_json::json!({ "spec": spec_before.clone() });
     apply_pod_spec_defaults(&mut old_pod);
     let mut new_pod = serde_json::json!({ "spec": spec_after.clone() });
     apply_pod_spec_defaults(&mut new_pod);
-    let old_spec = old_pod["spec"].clone();
-    let new_spec = new_pod["spec"].clone();
+    let old_spec = old_pod["spec"].take();
+    let new_spec = new_pod["spec"].take();
 
     if old_spec == new_spec {
         return Ok(());
@@ -5657,6 +5663,9 @@ pub(crate) fn increment_pod_generation_if_spec_changed(
     pod: &mut serde_json::Value,
     spec_before: &serde_json::Value,
 ) {
+    if *spec_before == pod["spec"] {
+        return;
+    }
     let mut after_pod = serde_json::json!({ "spec": pod["spec"].clone() });
     apply_pod_spec_defaults(&mut after_pod);
 
@@ -21883,6 +21892,101 @@ mod admission_tests {
             v["metadata"]["labels"].get("x").is_none(),
             "denied patch must not be persisted — the stored pod must not carry the label \
              the (rejected) patch tried to add"
+        );
+    }
+
+    /// patch_pod must hand validating webhooks the pre-patch pod as oldObject even though it no
+    /// longer keeps a clone of it for the whole request — a webhook comparing oldObject to
+    /// object (e.g. "labels may not be removed") would otherwise approve every PATCH.
+    #[tokio::test]
+    async fn patch_pod_validating_webhook_receives_pre_patch_old_object() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+
+        let existing = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "old-obj-pod", "namespace": "default", "labels": {"v": "before"}},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(
+                "/registry/pods/default/old-obj-pod",
+                Bytes::from(serde_json::to_vec(&existing).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let captured: Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured_h = Arc::clone(&captured);
+        let router = Router::new().route(
+            "/webhook",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured_h = Arc::clone(&captured_h);
+                async move {
+                    let uid = body["request"]["uid"].as_str().unwrap_or("").to_string();
+                    *captured_h.lock().unwrap() = Some(body);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": uid, "allowed": true}
+                    }))
+                }
+            }),
+        );
+        let (url, _handle) = start_mock_webhook(router).await;
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "capture-old-object-pod"},
+            "webhooks": [{
+                "name": "capture.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["UPDATE"]}],
+                "sideEffects": "None",
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/capture-old-object-pod",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/strategic-merge-patch+json".parse().unwrap(),
+        );
+        patch_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(), "old-obj-pod".to_string())),
+            axum::extract::Query(crate::handlers::json_patch::PatchQuery::default()),
+            test_user(),
+            headers,
+            Bytes::from(serde_json::json!({"metadata": {"labels": {"v": "after"}}}).to_string()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("patch must succeed when the webhook allows it: {e:?}"));
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("validating webhook must have been called");
+        assert_eq!(
+            review["request"]["oldObject"]["metadata"]["labels"]["v"], "before",
+            "oldObject must be the stored pre-patch pod, not the patched one"
+        );
+        assert_eq!(
+            review["request"]["object"]["metadata"]["labels"]["v"],
+            "after"
         );
     }
 
