@@ -53,6 +53,9 @@ assert_contains "KubeletConfiguration enables ClusterTrustBundleProjection (kube
 assert_contains "KubeletConfiguration enables PodCertificateRequest (kubelet honors podCertificate projected sources)" \
   "$KUBELET_CONFIG_LINE" 'PodCertificateRequest: true'
 
+assert_contains "KubeletConfiguration enables AtomicWriteVolumeUserFields (Alpha, default-off: without it kubelet ignores projected defaultUser/user and files are owned by UID 0)" \
+  "$KUBELET_CONFIG_LINE" 'AtomicWriteVolumeUserFields: true'
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
