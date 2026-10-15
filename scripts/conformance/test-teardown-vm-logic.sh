@@ -33,6 +33,9 @@
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
 
+# shellcheck source=scripts/_kill-pattern.sh
+source "$(cd "$(dirname "$0")/.." && pwd)/_kill-pattern.sh"
+
 PASS=0
 FAIL=0
 LEFTOVER_PIDS=()
@@ -101,7 +104,7 @@ reap_hostagent() {
   fi
 
   local stray_pids
-  stray_pids="$(pgrep -f "limactl hostagent.*${ha_sock}" 2>/dev/null || true)"
+  stray_pids="$(pgrep -f "$(workdir_kill_pattern lima-hostagent "$ha_sock")" 2>/dev/null || true)"
   if [ -n "$stray_pids" ]; then
     echo "  found stray hostagent process(es) for $vm bound to $ha_sock — killing: $stray_pids"
     # shellcheck disable=SC2086

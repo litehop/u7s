@@ -257,6 +257,7 @@ fn schedule_idle_gc(
             // `reclaimed_horizons`' doc for why "no shard" alone can no longer mean "never
             // written" once idle-GC can reclaim one that genuinely held history.
             preserve_reclaimed_horizon(&reclaimed_horizons, &key, shard);
+            crate::metrics::remove_shard_series(&key);
             crate::metrics::WATCH_RING_SHARD_EVICTIONS_TOTAL
                 .with_label_values(&[crate::metrics::prefix_bucket(&key)])
                 .inc();
@@ -972,6 +973,7 @@ pub(crate) fn tear_down_shard(
     let removed = shards.write().expect("shards poisoned").remove(key);
     if let Some(shard) = &removed {
         preserve_reclaimed_horizon(reclaimed_horizons, key, shard);
+        crate::metrics::remove_shard_series(key);
     }
     removed
 }
@@ -7677,6 +7679,112 @@ mod tests {
                  evicted. Got: {other:?}"
             ),
         }
+    }
+
+    /// Number of gathered series (across every metric family) whose `shard` label contains
+    /// `marker`. The registry is process-global, so tests isolate themselves with a unique marker.
+    fn shard_series_count(marker: &str) -> usize {
+        prometheus::gather()
+            .iter()
+            .flat_map(|f| f.get_metric())
+            .filter(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "shard" && l.value().contains(marker))
+            })
+            .count()
+    }
+
+    /// Push one live event and one tombstone so all four per-shard families mint a series.
+    fn push_series_minting_events(store: &SqliteStore, prefix: &str) {
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: format!("{prefix}w-a"),
+                revision: 5,
+                value: Some(svc_value("w-a", 5)),
+                is_create: true,
+                deleted_body: None,
+            }),
+            None,
+        );
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: format!("{prefix}w-a"),
+                revision: 6,
+                value: None,
+                is_create: false,
+                deleted_body: Some(svc_value("w-a", 5)),
+            }),
+            None,
+        );
+    }
+
+    /// Creating and deleting CRDs in a loop must not grow the metrics registry: each torn-down
+    /// shard's per-shard series must go with it, or a long-running apiserver's memory and scrape
+    /// size grow without bound, one set of dead series per deleted CRD.
+    ///
+    /// Fails on revert: without `remove_shard_series` at shard teardown, every eviction leaves
+    /// four series behind and the count below stays at `N * 4`.
+    #[tokio::test]
+    async fn evicting_crd_shards_leaves_no_per_shard_metric_series_behind_unbounded_cardinality() {
+        const N: usize = 5;
+        let marker = "/registry/kv7cp-evict.example.com/";
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        assert_eq!(shard_series_count(marker), 0, "baseline must be empty");
+
+        for i in 0..N {
+            let root = format!("{marker}w{i}/");
+            push_series_minting_events(&store, &root);
+            assert_eq!(
+                shard_series_count(&root),
+                4,
+                "test setup: occupancy, span, deletion-log len and body-size must each mint a series"
+            );
+            store.evict_resource_type(&root);
+        }
+
+        assert_eq!(
+            shard_series_count(marker),
+            0,
+            "per-shard series survived CRD shard eviction: cardinality grows unbounded per \
+             deleted CRD over a long run"
+        );
+    }
+
+    /// Same harm as above via the idle-GC reclaim path, which does not go through
+    /// `tear_down_shard`.
+    ///
+    /// Fails on revert: without `remove_shard_series` in the idle-GC removal, the series from
+    /// every reclaimed shard remain.
+    #[tokio::test]
+    async fn idle_gc_reclaim_leaves_no_per_shard_metric_series_behind_unbounded_cardinality() {
+        const N: usize = 5;
+        let marker = "/registry/kv7cp-gc.example.com/";
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        for i in 0..N {
+            let root = format!("{marker}w{i}/");
+            push_series_minting_events(&store, &root);
+            drop(store.watch(&root, 0).await.expect("watch must succeed"));
+        }
+        assert_eq!(
+            shard_series_count(marker),
+            N * 4,
+            "test setup: every shard must have minted its four series"
+        );
+
+        tokio::time::sleep(RING_SHARD_IDLE_GRACE * 3).await;
+
+        assert!(
+            store.shards.read().expect("shards poisoned").is_empty(),
+            "test setup: idle-GC must have reclaimed every shard"
+        );
+        assert_eq!(
+            shard_series_count(marker),
+            0,
+            "per-shard series survived idle-GC reclaim: cardinality grows unbounded per \
+             deleted CRD over a long run"
+        );
     }
 
     /// A watch that reconnects to the same prefix DURING the grace window must cancel the

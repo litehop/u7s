@@ -9,7 +9,7 @@
 #
 # --port / --konnectivity-server-port are accepted (run-all.sh passes them
 #   unconditionally) but are documented no-ops: host processes are killed by
-#   cmdline pattern, never by port number -- see host_kill_pattern_for below.
+#   cmdline pattern, never by port number -- see workdir_kill_pattern in scripts/_kill-pattern.sh.
 #
 # After this script:
 #   - ./temp/u7s/ is gone (DB, certs, kubeconfig, PID files all wiped)
@@ -37,31 +37,17 @@
 #   scripts/conformance/run-all.sh
 set -euo pipefail
 
-# Pure: the pkill -f pattern that scopes a host-process kill to THIS
-# worktree's own u7s component, by full cmdline (binary name + this
-# workdir's path) — never by "whatever holds this port". A blanket
-# 'lsof -ti tcp:$PORT | kill' also matches Lima's shared 'limactl usernet'
-# network daemon: it proxies the guest VM's host.lima.internal:$PORT
-# connections (kubelet/KCM/kube-proxy talking to the apiserver, or the
-# konnectivity-agent talking to the agent port) through this exact host
-# port, so it legitimately shows up as a port holder. SIGTERMing it as
-# blanket-kill collateral breaks guest->host connectivity for every OTHER
-# worker VM sharing this Lima network, not just this worktree's own VM
-# (confirmed live: 'ip neigh' gateway goes INCOMPLETE). A cmdline-pattern
-# match can never hit it: 'limactl usernet ...' contains neither a u7s
-# binary name nor this workdir path. Mirrors scripts/worktree-hygiene.sh's
-# kill_pattern_for() — keep them in sync if either script's launch-argv
-# shape changes.
-host_kill_pattern_for() {
-  local component="$1" workdir="$2"
-  case "$component" in
-    apiserver) printf 'u7s-apiserver.*%s/kubeconfig' "$workdir" ;;
-    scheduler) printf 'u7s-scheduler.*%s/kubeconfig' "$workdir" ;;
-    konnectivity-server) printf 'konnectivity-server.*%s' "$workdir" ;;
-  esac
-}
+# shellcheck source=scripts/_kill-pattern.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_kill-pattern.sh"
 
-# Pure: lists still-alive PIDs matching any component's host_kill_pattern_for
+# Host processes are killed by full cmdline (binary name + this workdir's
+# path) via workdir_kill_pattern, never by "whatever holds this port": a blanket
+# 'lsof -ti tcp:$PORT | kill' also matches Lima's shared 'limactl usernet'
+# daemon, which proxies guest VM connections through the same host port, and
+# SIGTERMing it breaks guest->host connectivity for every OTHER worker VM on
+# the Lima network. A cmdline match can never hit it.
+
+# Pure: lists still-alive PIDs matching any component's workdir_kill_pattern
 # pattern for this workdir, one "component pid" line per survivor. The kill
 # attempts above are all '... || true': pkill's exit code can't tell "matched
 # and killed" apart from "nothing matched", so without re-checking here, an
@@ -72,7 +58,7 @@ host_process_survivors() {
   local workdir="$1"
   local component pattern surv_pid
   for component in apiserver scheduler konnectivity-server; do
-    pattern="$(host_kill_pattern_for "$component" "$workdir")"
+    pattern="$(workdir_kill_pattern "$component" "$workdir")"
     for surv_pid in $(pgrep -f "$pattern" 2>/dev/null || true); do
       printf '%s %s\n' "$component" "$surv_pid"
     done
@@ -162,7 +148,7 @@ teardown_vm() {
   # bare VM-name substring — "lima-node" is a substring of "lima-node-2" and
   # "lima-node-3", so a name-only match could kill a sibling VM's hostagent.
   local stray_pids
-  stray_pids="$(pgrep -f "limactl hostagent.*${ha_sock}" 2>/dev/null || true)"
+  stray_pids="$(pgrep -f "$(workdir_kill_pattern lima-hostagent "$ha_sock")" 2>/dev/null || true)"
   if [ -n "$stray_pids" ]; then
     echo "[reset]   found stray hostagent process(es) for $vm bound to $ha_sock — killing: $stray_pids"
     # shellcheck disable=SC2086 # word-split intentionally: pgrep can return multiple PIDs, one per line.
@@ -223,9 +209,9 @@ main() {
     fi
   done
 
-  # Fallback, scoped by cmdline (see host_kill_pattern_for above for why).
-  pkill -f "$(host_kill_pattern_for apiserver "$WORKDIR")" 2>/dev/null || true
-  pkill -f "$(host_kill_pattern_for scheduler "$WORKDIR")" 2>/dev/null || true
+  # Fallback, scoped by cmdline (see the note above host_process_survivors).
+  pkill -f "$(workdir_kill_pattern apiserver "$WORKDIR")" 2>/dev/null || true
+  pkill -f "$(workdir_kill_pattern scheduler "$WORKDIR")" 2>/dev/null || true
 
   # The run-metrics sampler (started by run-all.sh alongside the stack, see
   # sample-run-metrics.sh) is a peer of apiserver/scheduler for teardown
@@ -239,7 +225,7 @@ main() {
   # serving its old CA-signed cert. If left running, the next run's fresh CA/agent
   # reject that stale cert with "certificate signed by unknown authority ... ECDSA
   # verification failure" — kill it before regenerating certs, scoped by cmdline.
-  pkill -f "$(host_kill_pattern_for konnectivity-server "$WORKDIR")" 2>/dev/null || true
+  pkill -f "$(workdir_kill_pattern konnectivity-server "$WORKDIR")" 2>/dev/null || true
 
   if [ "$HOST_ONLY" -eq 1 ]; then
     # Verify-then-report: SIGTERM is not synchronous, so poll briefly (same
@@ -292,7 +278,7 @@ main() {
 }
 
 # `<script> __call <fn> [args...]` invokes a single pure function (e.g.
-# host_kill_pattern_for) from a test, without running the actual teardown --
+# workdir_kill_pattern) from a test, without running the actual teardown --
 # same convention as scripts/worktree-hygiene.sh.
 if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
   if [ "${1:-}" = "__call" ]; then

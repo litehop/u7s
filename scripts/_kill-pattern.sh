@@ -10,6 +10,7 @@
 # not match /temp/u7s2.
 
 # workdir_kill_pattern <apiserver|scheduler|konnectivity-server|sample-run-metrics> <workdir>
+# workdir_kill_pattern lima-hostagent <path-to-ha.sock>   (the path is the whole last argv word)
 workdir_kill_pattern() {
   local proc_type="$1" workdir="$2" esc
   esc=$(printf '%s' "$workdir" | sed -E 's/[][\.*^$+?(){}|\\]/\\&/g')
@@ -17,6 +18,7 @@ workdir_kill_pattern() {
     apiserver) printf 'u7s-apiserver.*[ =]%s/kubeconfig' "$esc" ;;
     scheduler) printf 'u7s-scheduler.*[ =]%s/kubeconfig' "$esc" ;;
     konnectivity-server) printf 'konnectivity-server.*[ =]%s([/ ]|$)' "$esc" ;;
+    lima-hostagent) printf 'limactl hostagent.*[ =]%s( |$)' "$esc" ;;
     sample-run-metrics) printf 'sample-run-metrics.sh.*[ =]%s([/ ]|$)' "$esc" ;;
     *) echo "workdir_kill_pattern: unknown process type '$proc_type'" >&2; return 1 ;;
   esac
