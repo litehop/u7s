@@ -49,12 +49,14 @@ use u7s_store::{ListOptions, Store};
 
 use crate::auth::UserInfo;
 use crate::keys::group_list_prefix;
+use crate::service_resolver::ResolveError;
 use crate::state::AppState;
 use crate::status::Status;
 use crate::types::Condition;
 
 const APISERVICE_GROUP: &str = "apiregistration.k8s.io";
 const APISERVICE_PLURAL: &str = "apiservices";
+const REASON_FAILED_DISCOVERY_CHECK: &str = "FailedDiscoveryCheck";
 
 // ---------------------------------------------------------------------------
 // Path parsing
@@ -127,6 +129,13 @@ pub async fn find_apiservice<S: Store>(
 /// webhook configs, so this is a defense against a privileged actor disclosing *other*
 /// callers' identities to an attacker-controlled endpoint, not a low-privilege escalation.
 fn backend_base_url(apiservice: &serde_json::Value) -> Result<Option<String>, String> {
+    Ok(service_ref(apiservice)?
+        .map(|(name, namespace, port)| format!("https://{name}.{namespace}.svc:{port}")))
+}
+
+/// `(name, namespace, port)` of `spec.service`; see `backend_base_url` for the `None`/`Err`
+/// contract.
+fn service_ref(apiservice: &serde_json::Value) -> Result<Option<(String, String, i32)>, String> {
     let spec: ApiServiceSpec = apiservice
         .get("spec")
         .and_then(|s| ApiServiceSpec::deserialize(s).ok())
@@ -144,7 +153,7 @@ fn backend_base_url(apiservice: &serde_json::Value) -> Result<Option<String>, St
     crate::handlers::generic::validate_name("spec.service.namespace", &namespace)
         .map_err(|e| e.1.message)?;
     let port = svc.port.unwrap_or(443);
-    Ok(Some(format!("https://{name}.{namespace}.svc:{port}")))
+    Ok(Some((name, namespace, port)))
 }
 
 /// The subset of upstream `APIServiceSpec` that `backend_base_url` reads: just
@@ -193,10 +202,29 @@ struct ApiServiceServiceRef {
 ///     (see `scripts/u7s-start.sh`) — the two CAs gate different downstream trust
 ///     decisions, but neither gates access to konnectivity itself (only u7s holds either
 ///     private key).
-fn build_backend_client<S: Store>(
+async fn build_backend_client<S: Store>(
     state: &AppState<S>,
-    spec: &serde_json::Value,
-) -> reqwest::Client {
+    apiservice: &serde_json::Value,
+) -> Result<reqwest::Client, ResolveError> {
+    let spec = apiservice.get("spec").unwrap_or(&serde_json::Value::Null);
+    let (name, namespace, port) = match service_ref(apiservice) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Err(ResolveError {
+                reason: crate::service_resolver::REASON_RESOLVE_FAILED,
+                message: "spec.service missing".to_owned(),
+            })
+        }
+        Err(message) => {
+            return Err(ResolveError {
+                reason: crate::service_resolver::REASON_RESOLVE_FAILED,
+                message: format!("invalid spec.service: {message}"),
+            })
+        }
+    };
+    let dial =
+        crate::service_resolver::resolve_service_addr(state, &namespace, &name, port).await?;
+
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .connect_timeout(std::time::Duration::from_secs(5));
@@ -234,13 +262,18 @@ fn build_backend_client<S: Store>(
         }
     }
 
+    // Without konnectivity the host dials the resolved ClusterIP (kube-proxy NATs it) while the
+    // URL host stays `<svc>.<ns>.svc` for TLS SNI/verification. A CONNECT proxy cannot split
+    // the tunnel target from the TLS server name, so the konnectivity path dials the DNS name.
     if let Some(addr) = state.konnectivity_proxy_addr.as_deref() {
         if let Ok(proxy) = reqwest::Proxy::all(format!("https://{addr}")) {
             builder = builder.proxy(proxy);
         }
+    } else {
+        builder = builder.resolve(&format!("{name}.{namespace}.svc"), dial);
     }
 
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    Ok(builder.build().unwrap_or_else(|_| reqwest::Client::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -350,10 +383,6 @@ pub async fn proxy_to_backend<S: Store>(
     body: Bytes,
     user: &UserInfo,
 ) -> Response {
-    let spec = apiservice
-        .get("spec")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
     let base = match backend_base_url(apiservice) {
         Ok(Some(base)) => base,
         Ok(None) => {
@@ -380,7 +409,15 @@ pub async fn proxy_to_backend<S: Store>(
         url.push_str(q);
     }
 
-    let client = build_backend_client(state, &spec);
+    let client = match build_backend_client(state, apiservice).await {
+        Ok(c) => c,
+        Err(e) => {
+            return Status::service_unavailable(format!(
+                "apiservice \"{version}.{group}\" backend: {e}"
+            ))
+            .into_response();
+        }
+    };
     let reqwest_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
 
@@ -524,7 +561,7 @@ pub async fn discovery_resources_for_apiservice<S: Store>(
     // to the discovery caller — the resource proxy path (proxy_middleware/proxy_to_backend)
     // is what surfaces the rejection explicitly.
     let base = backend_base_url(apiservice).ok().flatten()?;
-    let client = build_backend_client(state, spec);
+    let client = build_backend_client(state, apiservice).await.ok()?;
     let url = format!("{base}/apis/{group}/{version}");
     let mut req = client.get(&url);
     for (name, value) in discovery_request_headers(user) {
@@ -664,7 +701,7 @@ async fn check_and_persist_availability<S: Store>(
 
     let (status_str, reason, message) = match health_check_backend(state, apiservice).await {
         Ok(()) => ("True", "Passed", "all checks passed".to_owned()),
-        Err(e) => ("False", "FailedDiscoveryCheck", e),
+        Err((reason, message)) => ("False", reason, message),
     };
 
     let mut updated = apiservice.clone();
@@ -713,29 +750,38 @@ pub async fn ensure_availability_checked<S: Store>(state: &AppState<S>, name: &s
 async fn health_check_backend<S: Store>(
     state: &AppState<S>,
     apiservice: &serde_json::Value,
-) -> Result<(), String> {
-    let spec = apiservice.get("spec").ok_or("apiservice has no spec")?;
+) -> Result<(), (&'static str, String)> {
+    let fail = |m: &str| (REASON_FAILED_DISCOVERY_CHECK, m.to_owned());
+    let spec = apiservice
+        .get("spec")
+        .ok_or_else(|| fail("apiservice has no spec"))?;
     let group = spec
         .get("group")
         .and_then(|v| v.as_str())
-        .ok_or("spec.group missing")?;
+        .ok_or_else(|| fail("spec.group missing"))?;
     let version = spec
         .get("version")
         .and_then(|v| v.as_str())
-        .ok_or("spec.version missing")?;
+        .ok_or_else(|| fail("spec.version missing"))?;
     let base = match backend_base_url(apiservice) {
         Ok(Some(base)) => base,
-        Ok(None) => return Err("spec.service missing".to_string()),
-        Err(e) => return Err(format!("invalid spec.service: {e}")),
+        Ok(None) => return Err(fail("spec.service missing")),
+        Err(e) => return Err(fail(&format!("invalid spec.service: {e}"))),
     };
-    let client = build_backend_client(state, spec);
+    let client = build_backend_client(state, apiservice).await.map_err(|e| {
+        let reason = match e.reason {
+            crate::service_resolver::REASON_RESOLVE_FAILED => REASON_FAILED_DISCOVERY_CHECK,
+            r => r,
+        };
+        (reason, e.message)
+    })?;
     let url = format!("{base}/apis/{group}/{version}");
-    client
-        .get(&url)
-        .send()
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("failing or missing response from {url}: {e}"))
+    client.get(&url).send().await.map(|_| ()).map_err(|e| {
+        (
+            REASON_FAILED_DISCOVERY_CHECK,
+            format!("failing or missing response from {url}: {e}"),
+        )
+    })
 }
 
 /// Merge the `Available` condition into `status.conditions`, keeping it at index 0.
@@ -2008,5 +2054,113 @@ mod tests {
             "an already-checked apiservice must not be re-written — resourceVersion must \
              stay put, or every status read would churn it"
         );
+    }
+
+    fn wardle_apiservice(ca_bundle_b64: &str, port: u16) -> serde_json::Value {
+        serde_json::json!({
+            "spec": {
+                "group": "wardle.example.com",
+                "version": "v1alpha1",
+                "caBundle": ca_bundle_b64,
+                "service": {"namespace": "wardle-ns", "name": "api", "port": port}
+            }
+        })
+    }
+
+    /// An aggregated API backed by a Service must be reached through the Service's ClusterIP
+    /// for both the availability check and request proxying, with the `<svc>.<ns>.svc`
+    /// certificate name verified. On an install without konnectivity nothing resolves `*.svc`
+    /// on the host, so a path that dials by DNS leaves every APIService Available=False and
+    /// every aggregated request a 503.
+    #[tokio::test]
+    async fn aggregated_backend_is_reached_via_service_clusterip() {
+        use crate::service_resolver::test_support::{put_loopback_service, tls_json_backend};
+
+        let backend = tls_json_backend(
+            "api.wardle-ns.svc",
+            serde_json::json!({"kind": "APIResourceList", "resources": []}),
+        )
+        .await;
+        let state = make_state();
+        put_loopback_service(&*state.store, "wardle-ns", "api", backend.port).await;
+        let apiservice = wardle_apiservice(&backend.ca_bundle_b64, backend.port);
+
+        health_check_backend(&state, &apiservice)
+            .await
+            .expect("availability check must reach the backend via ClusterIP");
+
+        let user = UserInfo {
+            username: "u".to_owned(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let resp = proxy_to_backend(
+            &state,
+            &apiservice,
+            "wardle.example.com",
+            "v1alpha1",
+            "",
+            None,
+            axum::http::Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            &user,
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        assert!(
+            discovery_resources_for_apiservice(&state, &apiservice, &user)
+                .await
+                .is_some(),
+            "discovery fetch must reach the backend via ClusterIP"
+        );
+        assert_eq!(backend.hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Upstream's availability controller reports `ServiceNotFound` / `ServicePortError`
+    /// distinctly from a failed discovery call, so operators can tell a dangling
+    /// `spec.service` from an unhealthy backend.
+    #[tokio::test]
+    async fn availability_reasons_distinguish_missing_service_from_wrong_port() {
+        use crate::service_resolver::test_support::put_loopback_service;
+
+        let state = make_state();
+        let apiservice = wardle_apiservice("", 7443);
+
+        let err = health_check_backend(&state, &apiservice).await.unwrap_err();
+        assert_eq!(err.0, "ServiceNotFound", "{err:?}");
+
+        put_loopback_service(&*state.store, "wardle-ns", "api", 9999).await;
+        let err = health_check_backend(&state, &apiservice).await.unwrap_err();
+        assert_eq!(err.0, "ServicePortError", "{err:?}");
+    }
+
+    /// An unresolvable Service surfaces as 503 from the proxy, matching upstream's behaviour
+    /// when the aggregator cannot resolve a backend.
+    #[tokio::test]
+    async fn proxy_to_backend_returns_503_when_service_is_missing() {
+        let state = make_state();
+        let user = UserInfo {
+            username: "u".to_owned(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let resp = proxy_to_backend(
+            &state,
+            &wardle_apiservice("", 7443),
+            "wardle.example.com",
+            "v1alpha1",
+            "",
+            None,
+            axum::http::Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            &user,
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }
