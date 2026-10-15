@@ -2760,6 +2760,35 @@ mod tests {
         );
     }
 
+    /// Every protobuf-decoded field outside the vendored `generated.proto` schema is silently
+    /// dropped, and the descriptor-driven completeness oracles only know the vendored schema —
+    /// so a `/version` bump without re-vendoring leaves the whole suite green while new upstream
+    /// fields vanish on write. `UPSTREAM_VERSION` records the tag the protos were fetched from.
+    #[test]
+    fn vendored_protos_match_advertised_kubernetes_version() {
+        let recorded = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../proto-generated/proto-include/UPSTREAM_VERSION"),
+        )
+        .expect("proto-include/UPSTREAM_VERSION must record the kubernetes tag the protos were vendored from");
+        let advertised = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(version())
+            .0["gitVersion"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            recorded.trim(),
+            advertised,
+            "/version advertises {advertised} but the vendored generated.proto files were \
+             fetched from {}: re-vendor every proto-include/**/generated.proto from that tag \
+             (staging/src/k8s.io/...) and update UPSTREAM_VERSION",
+            recorded.trim()
+        );
+    }
+
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
         axum::Extension(crate::auth::UserInfo {
             username: "admin".into(),

@@ -63,6 +63,13 @@ and add it to the JSON `Value`. Add a proto-round-trip regression test
 (`decode_<kind>_proto_gen_preserves_<field>`). Only if the field is missing from the
 **generated** type too does the vendored `.proto` under `proto-include/` need updating from
 upstream — that is rare and a different (bigger) fix than the usual adapter oversight.
+Re-vendoring: fetch every `proto-include/**/generated.proto` from
+`staging/src/k8s.io/<same path>` at the tag recorded in `proto-include/UPSTREAM_VERSION`
+(`gh api -H "Accept: application/vnd.github.raw" ...?ref=<tag>`), add any newly imported package to
+`crates/proto-generated/{build.rs,src/lib.rs}`, then fix what `cargo test -p u7s-apiserver` flags;
+`vendored_protos_match_advertised_kubernetes_version` fails when `/version` moves past the
+recorded tag. Hand-listed `expected` arrays in sentinel tests do not notice new schema fields;
+descriptor-derived ones (`proto_descriptor::expected_json_keys_for`) do.
 **Higher-leverage move:** when fixing one, AUDIT the rest of that `gen_<kind>_to_json`
 function's fields against the generated struct in the same pass — there are likely
 siblings also missing.

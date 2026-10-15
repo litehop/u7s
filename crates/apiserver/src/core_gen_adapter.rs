@@ -61,10 +61,19 @@ fn gen_key_to_path_to_json(items: Vec<core_v1::KeyToPath>) -> serde_json::Value 
             if let Some(mode) = it.mode.filter(|&v| v != 0) {
                 m.insert("mode".to_string(), serde_json::Value::Number(mode.into()));
             }
+            insert_user(&mut m, "user", it.user);
             serde_json::Value::Object(m)
         })
         .collect();
     serde_json::Value::Array(arr)
+}
+
+/// `user`/`defaultUser` are `*int64` where `0` (root) is a meaningful value distinct from unset,
+/// so unlike the `mode` fields they are emitted whenever present.
+fn insert_user(m: &mut serde_json::Map<String, serde_json::Value>, key: &str, user: Option<i64>) {
+    if let Some(u) = user {
+        m.insert(key.to_string(), serde_json::Value::Number(u.into()));
+    }
 }
 
 fn gen_downward_api_volume_file_to_json(f: core_v1::DownwardApiVolumeFile) -> serde_json::Value {
@@ -107,12 +116,14 @@ fn gen_downward_api_volume_file_to_json(f: core_v1::DownwardApiVolumeFile) -> se
     if let Some(mode) = f.mode.filter(|&v| v != 0) {
         m.insert("mode".to_string(), serde_json::Value::Number(mode.into()));
     }
+    insert_user(&mut m, "user", f.user);
     serde_json::Value::Object(m)
 }
 
 fn gen_downward_api_volume_source_to_json(
     items: Vec<core_v1::DownwardApiVolumeFile>,
     default_mode: Option<i32>,
+    default_user: Option<i64>,
 ) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if !items.is_empty() {
@@ -135,6 +146,7 @@ fn gen_downward_api_volume_source_to_json(
         "defaultMode".to_string(),
         serde_json::Value::Number(dm.into()),
     );
+    insert_user(&mut m, "defaultUser", default_user);
     serde_json::Value::Object(m)
 }
 
@@ -167,7 +179,7 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                 if let Some(da) = src.downward_api {
                     sm.insert(
                         "downwardAPI".to_string(),
-                        gen_downward_api_volume_source_to_json(da.items, None),
+                        gen_downward_api_volume_source_to_json(da.items, None, None),
                     );
                 }
                 if let Some(cm) = src.config_map {
@@ -202,6 +214,7 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                     if let Some(p) = sat.path.filter(|s| !s.is_empty()) {
                         sat_map.insert("path".to_string(), serde_json::Value::String(p));
                     }
+                    insert_user(&mut sat_map, "user", sat.user);
                     sm.insert(
                         "serviceAccountToken".to_string(),
                         serde_json::Value::Object(sat_map),
@@ -236,6 +249,7 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                             serde_json::Value::String(v),
                         );
                     }
+                    insert_user(&mut pc_map, "user", pc.user);
                     // userAnnotations: copied verbatim into the PodCertificateRequest the
                     // kubelet creates for this projection (spec.unverifiedUserAnnotations), so a
                     // signer relying on them to authorize/deny a request would silently see none
@@ -274,6 +288,7 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                     if let Some(v) = ctb.path.filter(|s| !s.is_empty()) {
                         ctb_map.insert("path".to_string(), serde_json::Value::String(v));
                     }
+                    insert_user(&mut ctb_map, "user", ctb.user);
                     sm.insert(
                         "clusterTrustBundle".to_string(),
                         serde_json::Value::Object(ctb_map),
@@ -293,6 +308,7 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
             serde_json::Value::Number(dm.into()),
         );
     }
+    insert_user(&mut m, "defaultUser", proj.default_user);
     serde_json::Value::Object(m)
 }
 
@@ -321,6 +337,7 @@ fn gen_secret_volume_source_to_json(s: core_v1::SecretVolumeSource) -> Option<se
             serde_json::Value::Number(dm.into()),
         );
     }
+    insert_user(&mut secret_map, "defaultUser", s.default_user);
     if let Some(true) = optional {
         secret_map.insert("optional".to_string(), serde_json::Value::Bool(true));
     }
@@ -347,6 +364,7 @@ fn gen_config_map_volume_source_to_json(
             serde_json::Value::Number(dm.into()),
         );
     }
+    insert_user(&mut cm_map, "defaultUser", cm.default_user);
     if let Some(true) = optional {
         cm_map.insert("optional".to_string(), serde_json::Value::Bool(true));
     }
@@ -426,6 +444,9 @@ fn gen_http_get_to_json(http_get: core_v1::HttpGetAction) -> serde_json::Value {
     if let Some(s) = http_get.scheme.filter(|s| !s.is_empty()) {
         hg.insert("scheme".to_string(), serde_json::Value::String(s));
     }
+    if let Some(p) = http_get.protocol.filter(|s| !s.is_empty()) {
+        hg.insert("protocol".to_string(), serde_json::Value::String(p));
+    }
     // httpHeaders — custom headers for auth-gated health checks (e.g. a bearer token or
     // signed request header the target expects). Dropping them makes a probe that relies on
     // one indistinguishable from an anonymous request, so the endpoint answers 401/403 and
@@ -476,10 +497,11 @@ fn gen_probe_handler_to_json(
         m.insert("tcpSocket".to_string(), gen_tcp_socket_to_json(tcp));
     }
     if let Some(grpc) = handler.grpc {
-        m.insert(
-            "grpc".to_string(),
-            serde_json::json!({ "port": grpc.port, "service": grpc.service }),
-        );
+        let mut g = serde_json::json!({ "port": grpc.port, "service": grpc.service });
+        if let Some(mode) = grpc.mode.filter(|s| !s.is_empty()) {
+            g["mode"] = mode.into();
+        }
+        m.insert("grpc".to_string(), g);
     }
 }
 
@@ -1019,6 +1041,17 @@ fn gen_volume_mount_to_json(vm: core_v1::VolumeMount) -> serde_json::Value {
         m.insert(
             "recursiveReadOnly".to_string(),
             serde_json::Value::String(v),
+        );
+    }
+    if !vm.bind_mount_options.is_empty() {
+        m.insert(
+            "bindMountOptions".to_string(),
+            serde_json::Value::Array(
+                vm.bind_mount_options
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
         );
     }
     serde_json::Value::Object(m)
@@ -2178,6 +2211,9 @@ fn gen_node_system_info_to_json(info: core_v1::NodeSystemInfo) -> serde_json::Va
     if let Some(v) = info.swap.and_then(|s| s.capacity).filter(|&c| c != 0) {
         ni.insert("swap".to_string(), serde_json::json!({ "capacity": v }));
     }
+    if let Some(v) = info.running_in_user_namespace {
+        ni.insert("runningInUserNamespace".to_string(), v.into());
+    }
     serde_json::Value::Object(ni)
 }
 
@@ -2193,7 +2229,10 @@ fn json_to_node_system_info_proto(v: &serde_json::Value) -> core_v1::NodeSystemI
         kube_proxy_version: jstr(v, "kubeProxyVersion"),
         operating_system: jstr(v, "operatingSystem"),
         architecture: jstr(v, "architecture"),
-        ..Default::default()
+        swap: v.get("swap").map(|s| core_v1::NodeSwapStatus {
+            capacity: ji64(s, "capacity"),
+        }),
+        running_in_user_namespace: jbool(v, "runningInUserNamespace"),
     }
 }
 
@@ -3010,7 +3049,9 @@ fn json_to_volume_mount_proto(v: &serde_json::Value) -> core_v1::VolumeMount {
         mount_path: jstr(v, "mountPath"),
         sub_path: jstr(v, "subPath"),
         sub_path_expr: jstr(v, "subPathExpr"),
-        ..Default::default()
+        mount_propagation: jstr(v, "mountPropagation"),
+        recursive_read_only: jstr(v, "recursiveReadOnly"),
+        bind_mount_options: jstrs(v, "bindMountOptions"),
     }
 }
 
@@ -3116,6 +3157,7 @@ fn json_to_http_get_action_proto(v: &serde_json::Value) -> core_v1::HttpGetActio
                     .collect()
             })
             .unwrap_or_default(),
+        protocol: jstr(v, "protocol"),
     }
 }
 
@@ -3136,6 +3178,7 @@ fn json_to_probe_handler_proto(v: &serde_json::Value) -> core_v1::ProbeHandler {
         grpc: v.get("grpc").map(|g| core_v1::GrpcAction {
             port: ji32(g, "port"),
             service: jstr(g, "service"),
+            mode: jstr(g, "mode"),
         }),
     }
 }
@@ -3181,6 +3224,7 @@ fn json_to_key_to_path_proto(v: &serde_json::Value) -> core_v1::KeyToPath {
         key: jstr(v, "key"),
         path: jstr(v, "path"),
         mode: ji32(v, "mode"),
+        user: ji64(v, "user"),
     }
 }
 
@@ -3209,6 +3253,7 @@ fn json_to_downward_api_volume_file_proto(v: &serde_json::Value) -> core_v1::Dow
             .get("resourceFieldRef")
             .map(json_to_resource_field_selector_proto),
         mode: ji32(v, "mode"),
+        user: ji64(v, "user"),
     }
 }
 
@@ -3241,6 +3286,7 @@ fn json_to_downward_api_volume_source_proto(
             Some(m) if m != 0 => m,
             _ => 420,
         }),
+        default_user: ji64(v, "defaultUser"),
     }
 }
 
@@ -3276,6 +3322,7 @@ fn json_to_volume_projection_proto(v: &serde_json::Value) -> core_v1::VolumeProj
                 audience: jstr(sat, "audience"),
                 expiration_seconds: ji64(sat, "expirationSeconds"),
                 path: jstr(sat, "path"),
+                user: ji64(sat, "user"),
             }
         }),
         // podCertificate/clusterTrustBundle: supported on decode
@@ -3291,7 +3338,8 @@ fn json_to_volume_projection_proto(v: &serde_json::Value) -> core_v1::VolumeProj
                 credential_bundle_path: jstr(pc, "credentialBundlePath"),
                 key_path: jstr(pc, "keyPath"),
                 certificate_chain_path: jstr(pc, "certificateChainPath"),
-                ..Default::default()
+                user: ji64(pc, "user"),
+                user_annotations: jstrmap(pc, "userAnnotations"),
             }),
         cluster_trust_bundle: v.get("clusterTrustBundle").map(|ctb| {
             core_v1::ClusterTrustBundleProjection {
@@ -3300,6 +3348,7 @@ fn json_to_volume_projection_proto(v: &serde_json::Value) -> core_v1::VolumeProj
                 label_selector: ctb.get("labelSelector").map(json_to_label_selector_proto),
                 optional: jbool(ctb, "optional"),
                 path: jstr(ctb, "path"),
+                user: ji64(ctb, "user"),
             }
         }),
     }
@@ -3316,14 +3365,12 @@ fn json_to_projected_volume_source_proto(v: &serde_json::Value) -> core_v1::Proj
             .map(|a| a.iter().map(json_to_volume_projection_proto).collect())
             .unwrap_or_default(),
         default_mode: ji32(v, "defaultMode"),
+        default_user: ji64(v, "defaultUser"),
     }
 }
 
-/// Minimal JSON -> proto mirror of `gen_persistent_volume_claim_to_json`'s spec section, scoped
-/// to `EphemeralVolumeSource.volumeClaimTemplate.spec` — access modes and resource requests are
-/// what every real ephemeral-volume claim sets. selector/dataSource/dataSourceRef have no live
-/// consumer here, matching this file's existing PersistentVolumeSource decode precedent of
-/// covering what's actually exercised rather than the full upstream field set.
+/// JSON -> proto mirror of `gen_persistent_volume_claim_to_json`'s spec section, scoped to
+/// `EphemeralVolumeSource.volumeClaimTemplate.spec`.
 fn json_to_persistent_volume_claim_spec_proto(
     v: &serde_json::Value,
 ) -> core_v1::PersistentVolumeClaimSpec {
@@ -3338,7 +3385,23 @@ fn json_to_persistent_volume_claim_spec_proto(
         volume_name: jstr(v, "volumeName"),
         storage_class_name: jstr(v, "storageClassName"),
         volume_mode: jstr(v, "volumeMode"),
-        ..Default::default()
+        selector: v.get("selector").map(json_to_label_selector_proto),
+        data_source: v
+            .get("dataSource")
+            .map(|d| core_v1::TypedLocalObjectReference {
+                api_group: jstr(d, "apiGroup"),
+                kind: jstr(d, "kind"),
+                name: jstr(d, "name"),
+            }),
+        data_source_ref: v
+            .get("dataSourceRef")
+            .map(|d| core_v1::TypedObjectReference {
+                api_group: jstr(d, "apiGroup"),
+                kind: jstr(d, "kind"),
+                name: jstr(d, "name"),
+                namespace: jstr(d, "namespace"),
+            }),
+        volume_attributes_class_name: jstr(v, "volumeAttributesClassName"),
     }
 }
 
@@ -3347,10 +3410,20 @@ fn json_to_persistent_volume_claim_spec_proto(
 // walked mechanically, for the same reasons as their encode-side counterparts above. Extracted
 // verbatim from the inline branches the generated function replaces — no behaviour change.
 
+fn json_to_key_to_path_items_proto(v: &serde_json::Value) -> Vec<core_v1::KeyToPath> {
+    v.get("items")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().map(json_to_key_to_path_proto).collect())
+        .unwrap_or_default()
+}
+
 fn json_to_secret_volume_source_proto(v: &serde_json::Value) -> core_v1::SecretVolumeSource {
     core_v1::SecretVolumeSource {
         secret_name: jstr(v, "secretName"),
-        ..Default::default()
+        items: json_to_key_to_path_items_proto(v),
+        default_mode: ji32(v, "defaultMode"),
+        optional: jbool(v, "optional"),
+        default_user: ji64(v, "defaultUser"),
     }
 }
 
@@ -3358,7 +3431,10 @@ fn json_to_config_map_volume_source_proto(v: &serde_json::Value) -> core_v1::Con
     core_v1::ConfigMapVolumeSource {
         local_object_reference: jstr(v, "name")
             .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
-        ..Default::default()
+        items: json_to_key_to_path_items_proto(v),
+        default_mode: ji32(v, "defaultMode"),
+        optional: jbool(v, "optional"),
+        default_user: ji64(v, "defaultUser"),
     }
 }
 
@@ -4624,6 +4700,7 @@ mod tests {
                                         "example.com/rotation-reason".to_string(),
                                         "scheduled".to_string(),
                                     )]),
+                                    ..Default::default()
                                 }),
                                 ..Default::default()
                             }],
@@ -7253,6 +7330,7 @@ mod tests {
                                     string: Some("1Gi".to_string()),
                                 },
                             ),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     }),
@@ -9980,6 +10058,30 @@ mod tests {
         assert_fields_present(&paths, &expected);
     }
 
+    /// Descriptor-derived `PodSpec` round trip: unlike the hand-listed `expected` arrays in
+    /// `sentinel_completeness_encode_pod_proto_gen`, a field added to the vendored schema (a new
+    /// volume `user`, a new `PodSpec` field) is demanded here automatically, so a re-vendor
+    /// cannot silently reintroduce a protobuf field drop.
+    #[test]
+    fn sentinel_completeness_encode_pod_spec_proto_gen_is_descriptor_derived() {
+        let pod = core_v1::Pod {
+            spec: Some(core_v1::PodSpec::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+        let json = decode_pod_proto_gen(&buf).expect("sentinel PodSpec must decode");
+        let raw = encode_pod_proto_gen(&json);
+        let redecoded = decode_pod_proto_gen(&raw).expect("encoded sentinel PodSpec must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&redecoded["spec"], "", &mut paths);
+
+        let all = crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.PodSpec"]);
+        let expected: Vec<&str> = all.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
     /// PodSpec.securityContext, gated the same way `sentinel_completeness_gen_pod_security_
     /// context_to_json` gates the decode direction.
     #[test]
@@ -10607,6 +10709,46 @@ mod tests {
         assert_eq!(
             sources[3]["serviceAccountToken"]["audience"], "aud1",
             "projected serviceAccountToken source must survive"
+        );
+    }
+
+    /// The kubelet only chowns projected files to `defaultUser`/`user` (AtomicWriteVolumeUserFields)
+    /// if the fields reach it; a protobuf-negotiating pod create (the e2e binary) must not drop
+    /// them, or every mounted file silently ends up owned by UID 0.
+    #[test]
+    fn pod_proto_round_trips_projected_default_user_and_per_source_user() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "user-fields-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "volumes": [{
+                    "name": "proj",
+                    "projected": {
+                        "defaultUser": 1001,
+                        "sources": [
+                            { "clusterTrustBundle": { "name": "ctb", "path": "t.pem", "user": 1000 } },
+                            { "secret": { "name": "s", "items": [{ "key": "k", "path": "p", "user": 1002 }] } }
+                        ]
+                    }
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        let proj = &decoded["spec"]["volumes"][0]["projected"];
+        assert_eq!(
+            proj["defaultUser"], 1001,
+            "projected.defaultUser must survive protobuf: dropping it leaves files owned by UID 0"
+        );
+        assert_eq!(
+            proj["sources"][0]["clusterTrustBundle"]["user"], 1000,
+            "clusterTrustBundle.user must survive protobuf"
+        );
+        assert_eq!(
+            proj["sources"][1]["secret"]["items"][0]["user"], 1002,
+            "KeyToPath.user must survive protobuf"
         );
     }
 
