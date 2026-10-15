@@ -6,10 +6,12 @@ Date: 2026-10-15
 **Answer: feasible but not close — beep today covers none of the east-west
 contract (it only owns north-south LoadBalancer fronts on the uplink NIC), so
 replacing kube-proxy means building a second dataplane mode (pod-originated
-ClusterIP/NodePort), worth roughly 10-13 MB PSS per node versus
-kube-proxy-only and ~21-23 MB versus kube-proxy+beep; recommend a gated spike
+ClusterIP/NodePort), worth roughly 9-12 MB PSS per node versus
+kube-proxy-only and 20-23 MB versus kube-proxy+beep; recommend a gated spike
 (Phases 0-1) and no commitment to the default flip until Conformance parity is
-measured with kube-proxy absent.**
+measured with kube-proxy absent, including the host-apiserver -> webhook /
+aggregated-Service path (~25 specs), which today rides kube-proxy via the
+konnectivity agent pod.**
 
 Stale premises in the bead (checked, not assumed):
 
@@ -21,7 +23,9 @@ Stale premises in the bead (checked, not assumed):
   CHANGELOG `[Unreleased]`, untagged.
 - `bd recall kube-proxy-mode-rig-ipvs-vs-shipped-iptables` is stale: the rig now
   runs iptables (`scripts/conformance/lima-start.sh:694,784` `mode: iptables`),
-  matching `manifests/kube-proxy.yaml:54`. The memory should be corrected.
+  matching `manifests/kube-proxy.yaml:54`. Corrected statement for the memory:
+rig and shipped are both iptables; IPVS was rig-only and has been removed; the
+nf_tables-lacks-extensions belief was refuted by mayor-8g7f6.
 - beep's own doc states IPVS mode is unsupported (`docs/design/kube-proxy-coexistence.md`)
   because beep publishes every node's IP into `status.loadBalancer.ingress[]`
   and IPVS binds them to `kube-ipvs0`. Moot once kube-proxy is gone.
@@ -51,7 +55,7 @@ subsystem).
 | No-endpoint REJECT | 2419, 2464 ("rejected when no endpoints exist") | no | Silent drop (count 0); beep roadmap has RST/ICMP in flight (`beep-5lw.5`) | S |
 | Same port, different protocols | 3586 (C), 3708 | yes (1) | Key includes proto | S |
 | Hairpin / src pod IP preserved via ClusterIP | 1095, 1020; `no_snat.go` | no | None | M (trivial with socket-LB, hard with per-packet DNAT) |
-| UDP conntrack hygiene on endpoint churn | `conntrack.go` (7 specs), `loadbalancer.go` 707, 841 | no | Own LRU `FLOW_TABLE` with eviction on endpoint removal; P1 `beep-eto0` (remote-backend sweep misses, blackholes flows) open as of the 2026-10-09 roadmap, fix PR #200 not merged at that time | M |
+| UDP conntrack hygiene on endpoint churn | `conntrack.go` (7 specs), `loadbalancer.go` 707, 841 | no | Own LRU `FLOW_TABLE` with eviction on endpoint removal; remote-backend sweep (`beep-eto0`, `beep-b6qw`) fixed by beep PR #200 (merged 2026-10-09T06:18Z, in v0.4.0); restart-orphan sweep `beep-e28g` fixed by PR #209 (merged 2026-10-09T08:05Z, in v0.4.0; follow-ups `beep-tlbt` on main). Residual unverified: whether any new beep bead is open for a remote pod reusing an IP while the controller is down (beep's tracker was not read) | S (verify) |
 | Dual-stack | `dual_stack.go` (~30 specs) | no | Dual-stack LB fronts, IPv6-only nodes validated on Lima k3s; real-fleet pending (`beep-7qm`) | S (LB), M (ClusterIP) |
 | service-proxy-name / headless labels | 2294, 2345 | no | Not read | S |
 | kube-proxy healthz/metrics | `networking.go` 132 "should check kube-proxy urls" (healthz :10256, `/proxyMode` :10249) | no | None | S (serve, or skip-list) |
@@ -62,13 +66,68 @@ subsystem).
 | NodePort allocation/collision/range | 1575, 1629, 1696 | no | n/a: apiserver-side | none |
 | hostPort | `hostport.go` (C) | yes | n/a: CNI portmap, not kube-proxy | none |
 
-Reading the table: Conformance's real dependence on the proxy is narrow — DNS
-via ClusterIP, ClusterIP and NodePort sessionAffinity (4), NodePort (1),
-type-change specs (4), same-port-different-protocol (1), plus every pod's path
-to `10.96.0.1`. The non-Conformance sig-network set (which u7s's CI focus,
+Reading the table: Conformance's dependence on the proxy is not narrow.
+Counted from release-1.37 `conformance.yaml` (`temp/research/conformance.yaml`):
+47 `[sig-network]` Conformance specs, of which Services 15, DNS 8, Proxy 3,
+Networking Granular 4 (30 in those families) and the rest EndpointSlice 5,
+EndpointsController 2, API-only specs. By reading the spec names:
+
+- **Send traffic through a ClusterIP/NodePort/CoreDNS ClusterIP: ~16.**
+  Services 9 (4 type changes, functioning NodePort, 4 sessionAffinity), DNS 7
+  (every pod's resolv.conf nameserver is the CoreDNS ClusterIP; "/etc/hosts"
+  does not query).
+- **Need pod/host routing but not the Service proxy: 7.** Networking Granular
+  4 (pod IPs directly) and Proxy 3 (the apiserver proxies to the resolved pod
+  IP). They still need a working CNI and the host->pod path.
+- **Control-plane-only (no dataplane): the remaining 24** (6 Services, 1 DNS,
+  EndpointSlice, EndpointsController, Ingress/IngressClass, ServiceCIDR, etc.).
+- **Host-apiserver -> webhook/aggregated Service: 25 specs**
+  (22 AdmissionWebhook, 2 CustomResourceConversionWebhook, 1 Aggregator) in
+  `[sig-api-machinery]`; see "Host apiserver -> ClusterIP path" below.
+
+So ~16 + 25 = ~41 Conformance specs depend on the proxy dataplane (the
+sig-network share alone is a third of the 47), plus every pod's path to
+`10.96.0.1`. The non-Conformance sig-network set (which u7s's CI focus,
 `460/460 + 2/2 disruptive`, partly exercises) is far wider. Parity on the
 Conformance subset is achievable; correctness on the rest is what makes this
 "a kube-proxy".
+
+### Host apiserver -> ClusterIP path
+
+Verdict: the apiserver never dials a ClusterIP itself. It is a host process
+with no route to the service CIDR, so every Service-backed webhook and
+aggregated APIService call goes out through the konnectivity HTTP CONNECT
+proxy (`crates/apiserver/src/state.rs:1088` `reqwest::Proxy::all`, fed by
+`konnectivity_proxy_addr`, `args.rs:100`). The URL is the Service DNS name
+`https://{svc}.{ns}.svc:{svcPort}{path}` (`admission.rs:763-775`
+`webhook_url`; `handlers/aggregation.rs:33`, `:110` for APIServices). The
+konnectivity-agent runs as a non-hostNetwork Pod in kube-system
+(`scripts/conformance/lima-start.sh:640-666`, `hostNetwork: false`), resolves
+the name via CoreDNS (ClusterIP), and dials the ClusterIP; kube-proxy NATs
+`ClusterIP:svcPort -> PodIP:targetPort` (`admission.rs:578-580`, `:749-751`).
+u7s deliberately sends the Service port, not the target port, so that NAT is
+required: it does not resolve EndpointSlices itself
+(`handlers/aggregation.rs:33-40`). The 300 ms connect-retry budget
+(`admission.rs:25-35`) exists to absorb kube-proxy's NAT-programming race.
+
+What a kube-proxy-free node changes:
+- The agent pod's DNS query (to the CoreDNS ClusterIP) and its connect to the
+  webhook ClusterIP are both pod-originated, so both need the new east-west
+  hook (socket-LB covers it; tc on the uplink does not). This is the same
+  requirement as pod->`10.96.0.1`, but with the apiserver-visible failure mode
+  of 25 specs failing with webhook/aggregator timeouts.
+- The retry budget was tuned to iptables sync lag; beep's programming latency
+  for a new ClusterIP front is unmeasured and must be checked against it
+  (`WEBHOOK_CONNECT_RETRY_BACKOFFS_MS`, `admission.rs:35`), and the error
+  matcher assumes kube-proxy-specific connection-refused semantics.
+- The comments at `admission.rs:578`, `:749`, `:768` and `aggregation.rs:33`
+  assert "kube-proxy NATs ClusterIP" and would need rewording when beep owns
+  that translation.
+- An alternative that removes the dependence: resolve Service -> EndpointSlice
+  pod IPs inside the apiserver and dial them through konnectivity. That
+  duplicates a proxy function in the apiserver and hits the target-port
+  simplification noted in `aggregation.rs:35-40`; not recommended unless the
+  socket-LB path fails G1.
 
 **Core architectural gap.** beep's hooks are tc-bpf on the uplink NIC and
 `geneve0` (4 attach points; `ebpf-lb-dataplane.md` "Hooks"). Pod->ClusterIP
@@ -205,21 +264,22 @@ for external NodePort. beep has only the second.
 
 | Phase | Work | Lands in | Go/no-go gate |
 |---|---|---|---|
-| 0 | Re-evaluate beep on its next release (mayor-da224): tag a release containing multi-endpoint, multi-endpoint affinity test, churn round (scale/rolling/drain), image built from tag. Fix `beep-eto0`. | beep (release), u7s (rig run, existing bead) | G0: happy-path plus N-endpoint affinity plus churn green on shipped flannel+iptables; image digest verified |
-| 1 | East-west spike: ADR choosing socket-LB vs veth-tc; prototype ClusterIP DNAT for pod and host clients on Lima; measure RSS and reconcile CPU | beep | G1: pod->ClusterIP works incl. 10.96.0.1->host apiserver; beep total <= ~15 MiB RSS+maps with ClusterIP fronts for 100 Services; no kube-proxy needed for CoreDNS lookups |
-| 2 | Contract build-out behind a flag: ClusterIP, NodePort, sessionAffinity ClientIP+timeout, internalTrafficPolicy, publishNotReady, REJECT on no-endpoints, service-proxy-name, healthz/proxyMode, UDP stale-flow hygiene | beep | G2: beep-side smoke covers each table row marked S/M; zero P1 dataplane bugs open |
+| 0 | Re-evaluate beep on its next release (mayor-da224): tag a release containing multi-endpoint, multi-endpoint affinity test, churn round (scale/rolling/drain), image built from tag. `beep-eto0`/`beep-b6qw`/`beep-e28g` already shipped in v0.4.0: verify-only (re-run the churn round; check beep's tracker for any open remote-IP-reuse-while-controller-down bead). | beep (release), u7s (rig run, existing bead) | G0: happy-path plus N-endpoint affinity plus churn green on shipped flannel+iptables; image digest verified |
+| 1 | East-west spike: ADR choosing socket-LB vs veth-tc; prototype ClusterIP DNAT for pod and host clients on Lima; measure RSS and reconcile CPU | beep | G1: pod->ClusterIP works incl. 10.96.0.1->host apiserver; beep total <= ~15 MiB RSS+maps with ClusterIP fronts for 100 Services; no kube-proxy needed for CoreDNS lookups; a Service-backed webhook and an aggregated APIService (sample-apiserver) are reachable from the host apiserver via konnectivity-agent with kube-proxy absent, within the apiserver's connect-retry budget |
+| 2 | Contract build-out behind a flag: ClusterIP, NodePort, sessionAffinity ClientIP+timeout, internalTrafficPolicy, publishNotReady, REJECT on no-endpoints, service-proxy-name, healthz/proxyMode, UDP stale-flow hygiene | beep | G2: beep-side smoke covers each table row marked S/M; no open P1 dataplane bugs in beep's tracker (checked at G2, not assumed) |
 | 3 | u7s integration: install flag, beep manifest, rig lane with kube-proxy absent, memory harness comparison | u7s | G3: full sonobuoy Conformance + e2e-focus + disruptive green on kube-proxy-less lane, repeated (3 consecutive runs), measured memory delta >= ~15 MB vs B on the rss.csv harness, no CPU regression. A Conformance regression stops the phase |
 | 4 | Default flip; keep kube-proxy path one release, then delete it | u7s | G4: no operator-reported regressions over a release; kernel floor documented |
 
 Total honest effort: Phases 1-2 are weeks of beep work; Phase 0 is already
-queued. The memory case is decided at G1, before the large spend.
+queued and, with the beep P1s shipped, is now a release plus verification. The memory case is decided at G1, before the large spend.
 
 ## 6. Operator decisions
 
 1. **Pursue replacement at all?** (a) Stop at LB-only: beep north-south,
    kube-proxy stays (zero Conformance risk, no savings). (b) Pursue phased.
    Recommend (b), but commit only to Phases 0-1; decide on Phase 2 at G1 with
-   measured numbers, since the win (~20-23 MB vs B) is real but ~2% of RAM.
+   measured numbers, since the win (~20-23 MB vs B) is real but ~2% of RAM, while ~41 Conformance
+   specs (~16 sig-network plus ~25 webhook/aggregator) ride the proxy dataplane.
 2. **East-west hook.** (a) cgroup socket-LB: no per-packet conntrack, hairpin
    and source IP free, matches Cilium; cost is stale-socket handling and
    INET_DIAG kernel config. (b) tc on veth/cni0: reuses beep's tc code, but
@@ -243,7 +303,11 @@ queued. The memory case is decided at G1, before the large spend.
 7. **Kernel floor.** Accept Linux >= 6.6 plus cgroup v2 for beep-only mode, or
    keep kube-proxy as the supported path on older kernels. Recommend accept
    and enforce at install with a clear error.
-8. **Image provenance.** Build beep from the tag in u7s's release pipeline (or
+8. **Host-apiserver -> Service path.** Keep konnectivity-agent + Service DNS
+   (needs the east-west hook for the agent pod), versus resolving EndpointSlices
+   in the apiserver. Recommend keep, gated at G1 (see section 1); re-word the
+   "kube-proxy NATs" comments and re-check the connect-retry budget at G3.
+9. **Image provenance.** Build beep from the tag in u7s's release pipeline (or
    verify digest) instead of consuming `docker.io/valerauko/beep-lb`. Recommend
    build from tag (open item from mayor-da224).
 
