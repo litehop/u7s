@@ -2789,6 +2789,57 @@ mod tests {
         );
     }
 
+    /// `UPSTREAM_VERSION` is a hand-maintained string, so it alone cannot catch a partial
+    /// re-vendor or a hand-edited proto; `PROTO_SHA256SUMS` (written by `scripts/vendor-protos.sh`
+    /// from the upstream files) pins every vendored file's content.
+    #[test]
+    fn vendored_protos_match_sha256_manifest() {
+        use sha2::{Digest, Sha256};
+        let inc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../proto-generated/proto-include");
+        let manifest = std::fs::read_to_string(inc.join("PROTO_SHA256SUMS"))
+            .expect("proto-include/PROTO_SHA256SUMS missing: run scripts/vendor-protos.sh");
+
+        let mut listed = std::collections::BTreeMap::new();
+        for line in manifest.lines() {
+            let (sum, rel) = line
+                .split_once("  ")
+                .expect("manifest line is `<sha256>  <path>`");
+            listed.insert(rel.to_string(), sum.to_string());
+        }
+
+        let mut on_disk = Vec::new();
+        let mut stack = vec![inc.clone()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.file_name().is_some_and(|n| n == "generated.proto") {
+                    on_disk.push(p.strip_prefix(&inc).unwrap().to_str().unwrap().to_string());
+                }
+            }
+        }
+        on_disk.sort();
+        assert_eq!(
+            on_disk,
+            listed.keys().cloned().collect::<Vec<_>>(),
+            "vendored generated.proto set differs from PROTO_SHA256SUMS; run scripts/vendor-protos.sh"
+        );
+
+        for (rel, want) in &listed {
+            let got: String = Sha256::digest(std::fs::read(inc.join(rel)).unwrap())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(
+                &got, want,
+                "{rel} differs from the upstream content recorded in PROTO_SHA256SUMS (hand edit \
+                 or partial re-vendor): run scripts/vendor-protos.sh"
+            );
+        }
+    }
+
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
         axum::Extension(crate::auth::UserInfo {
             username: "admin".into(),
