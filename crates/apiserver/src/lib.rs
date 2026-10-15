@@ -20,6 +20,7 @@ mod inflight;
 mod keys;
 mod limit_range;
 mod metrics;
+pub mod migrate_tables;
 mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
 mod node_authz;
