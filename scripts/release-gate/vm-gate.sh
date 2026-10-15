@@ -18,6 +18,8 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
+COREDNS_REQ=0
+[ -f "$RG/gate.env" ] && . "$RG/gate.env"
 
 mkdir -p "$OUT"
 : > "$OUT/results.env"
@@ -82,7 +84,14 @@ rm -f "$RG"/u7s-gate-*.tar.gz*
 WATCH_PID=$!
 bash "$RG/vm-sampler.sh" "$OUT" 5 &
 SAMPLER_PID=$!
-trap 'kill $WATCH_PID $SAMPLER_PID 2>/dev/null' EXIT
+bash "$RG/vm-capture.sh" "$OUT" "$KCFG" 2 &
+CAPTURE_PID=$!
+trap 'kill $WATCH_PID $SAMPLER_PID $CAPTURE_PID 2>/dev/null' EXIT
+if [ "$COREDNS_REQ" = 1 ]; then
+  k -n kube-system set resources deployment/coredns --requests=cpu=100m,memory=70Mi >> "$OUT/run.log" 2>&1
+  kw -n kube-system rollout status deployment/coredns --timeout=180s >> "$OUT/run.log" 2>&1 || log "coredns rollout not complete"
+  log "coredns requests applied"
+fi
 
 phase idle
 sleep "$SETTLE_IDLE"
@@ -127,7 +136,13 @@ fi
 log "webhook-smoke webhook_ok=$(rg_get "$OUT/results.env" webhook_ok)"
 
 phase collect
-kill "$WATCH_PID" "$SAMPLER_PID" 2>/dev/null
+kill "$WATCH_PID" "$SAMPLER_PID" "$CAPTURE_PID" 2>/dev/null
+journalctl -u kubelet --no-pager -o short-iso > "$OUT/kubelet-full.log" 2>&1
+journalctl -u u7s-kcm --no-pager -o short-iso > "$OUT/kcm-full.log" 2>&1
+journalctl -u u7s-apiserver --no-pager -o short-iso > "$OUT/apiserver-full.log" 2>&1
+journalctl -u crio --no-pager -o short-iso > "$OUT/crio-full.log" 2>&1
+k get events -A -o custom-columns=LAST:.lastTimestamp,REASON:.reason,OBJ:.involvedObject.name,MSG:.message --no-headers > "$OUT/events-all.txt" 2>&1
+k describe node "$NODE" > "$OUT/describe-node.txt" 2>&1
 journalctl -k --no-pager -o short-iso > "$OUT/kernel.log" 2>&1
 journalctl -u kubelet --no-pager -o short-iso 2>&1 | grep -iE 'evict|PLEG is not healthy|NodeNotReady|memory pressure|oom' > "$OUT/kubelet-pressure.log"
 k get pods -A -o wide > "$OUT/pods.txt" 2>&1
