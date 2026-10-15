@@ -551,7 +551,8 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
         | "spec.volumes"
         | "spec.imagePullSecrets"
         | "spec.schedulingGates"
-        | "spec.resourceClaims" => MergeKeyKind::Key(vec!["name".to_string()]),
+        | "spec.resourceClaims"
+        | "spec.evictionResponders" => MergeKeyKind::Key(vec!["name".to_string()]),
 
         // The same PodSpec-typed fields as above, but reached through a PodTemplateSpec
         // wrapper. Upstream resolves these merge keys via reflection over the Go struct
@@ -569,7 +570,8 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
             || path.ends_with(".template.spec.volumes")
             || path.ends_with(".template.spec.imagePullSecrets")
             || path.ends_with(".template.spec.schedulingGates")
-            || path.ends_with(".template.spec.resourceClaims") =>
+            || path.ends_with(".template.spec.resourceClaims")
+            || path.ends_with(".template.spec.evictionResponders") =>
         {
             MergeKeyKind::Key(vec!["name".to_string()])
         }
@@ -661,6 +663,34 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
         // $patch:delete removing one claim's status returns 400 instead of removing just
         // that entry.
         path if path == "resourceClaimStatuses" || path.ends_with(".resourceClaimStatuses") => {
+            MergeKeyKind::Key(vec!["name".to_string()])
+        }
+
+        // PodStatus.nodeAllocatableResourceClaimStatuses (merge key resourceClaimName) and its
+        // two per-element lists, plus the volume-health lists the kubelet reports on
+        // PodStatus.volumeHealth / PersistentVolumeClaimStatus.healthStatus and the CSI driver
+        // health on CSINode.status.storageHealth. Same bare-vs-"status."-prefixed shape as
+        // resourceClaimStatuses above.
+        path if path == "nodeAllocatableResourceClaimStatuses"
+            || path.ends_with(".nodeAllocatableResourceClaimStatuses") =>
+        {
+            MergeKeyKind::Key(vec!["resourceClaimName".to_string()])
+        }
+        path if path == "nodeAllocatableResourceClaimStatuses.mapping"
+            || path == "nodeAllocatableResourceClaimStatuses.overhead"
+            || path.ends_with(".nodeAllocatableResourceClaimStatuses.mapping")
+            || path.ends_with(".nodeAllocatableResourceClaimStatuses.overhead") =>
+        {
+            MergeKeyKind::Key(vec!["name".to_string()])
+        }
+        path if path == "volumeHealth.healthConditions"
+            || path.ends_with(".volumeHealth.healthConditions")
+            || path == "healthStatus.healthConditions"
+            || path.ends_with(".healthStatus.healthConditions") =>
+        {
+            MergeKeyKind::Key(vec!["status".to_string()])
+        }
+        path if path == "storageHealth" || path.ends_with(".storageHealth") => {
             MergeKeyKind::Key(vec!["name".to_string()])
         }
 
@@ -3176,6 +3206,9 @@ mod tests {
             format!("spec.{field}"),
             format!("spec.template.spec.{field}"),
             format!("spec.containers.{field}"),
+            format!("nodeAllocatableResourceClaimStatuses.{field}"),
+            format!("volumeHealth.{field}"),
+            format!("healthStatus.{field}"),
         ];
         candidates.iter().any(|p| {
             matches!(merge_key_for_path(p, None), MergeKeyKind::Key(k) if k.iter().any(|f| f == expected_key))

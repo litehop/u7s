@@ -279,7 +279,7 @@ message CustomResourceDefinitionStatus {
 
 // CustomResourceDefinitionVersion describes a version for CRD.
 message CustomResourceDefinitionVersion {
-  // name is the version name, e.g. "v1", "v2beta1", etc.
+  // name is the version name, e.g. “v1”, “v2beta1”, etc.
   // The custom resources are served under this version at `/apis/<group>/<version>/...` if `served` is true.
   optional string name = 1;
 
@@ -838,3 +838,4 @@ message WebhookConversion {
   // +listType=atomic
   repeated string conversionReviewVersions = 3;
 }
+

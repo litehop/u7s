@@ -150,6 +150,12 @@ pub mod k8s {
                 pub mod v1 {
                     include!(concat!(env!("OUT_DIR"), "/k8s.io.api.scheduling.v1.rs"));
                 }
+                pub mod v1alpha3 {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/k8s.io.api.scheduling.v1alpha3.rs"
+                    ));
+                }
             }
             pub mod networking {
                 pub mod v1 {

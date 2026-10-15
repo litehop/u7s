@@ -282,6 +282,7 @@ mod tests {
                     allocatable: Some(storage_v1::VolumeNodeResources { count: Some(8) }),
                 }],
             }),
+            status: None,
         };
         let mut buf = Vec::new();
         obj.encode(&mut buf).unwrap();
@@ -935,6 +936,7 @@ mod tests {
         let obj = storage_v1::CsiNode {
             metadata: Some(meta_v1::ObjectMeta::sentinel()),
             spec: Some(storage_v1::CsiNodeSpec::sentinel()),
+            status: Some(storage_v1::CsiNodeStatus::sentinel()),
         };
         let mut buf = Vec::new();
         obj.encode(&mut buf).unwrap();
@@ -948,6 +950,14 @@ mod tests {
         // "spec"/"drivers"/"allocatable" are containers whose own field name is never itself a
         // leaf once populated; nodeID/topologyKeys/count are their genuine leaf children.
         expected.extend(["nodeID", "topologyKeys", "count"]);
+        expected.extend([
+            "status",
+            "reason",
+            "message",
+            "accessMode",
+            "volumeMode",
+            "lastTransitionTime",
+        ]);
         assert_fields_present(&paths, &expected);
     }
 
@@ -2387,7 +2397,13 @@ mod tests {
         }
 
         assert_matches_pre_migration!(
-            storage_v1::CsiNode::sentinel(),
+            {
+                // `status` post-dates the frozen pre-migration decoder; its coverage is
+                // `sentinel_completeness_decode_csinode_proto_gen`.
+                let mut n = storage_v1::CsiNode::sentinel();
+                n.status = None;
+                n
+            },
             old_decode_csinode_proto_gen,
             decode_csinode_proto_gen,
             "CSINode"

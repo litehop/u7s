@@ -6,7 +6,7 @@ Status: audit findings, no code changed. Scope: whole workspace, biased toward
 the apiserver and JSON handling.
 
 Baseline, measured from the run's own sampler
-(`temp/e2e/0903-1111-csi-hostpath/monitoring/rss.csv`, 128 apiserver samples):
+(128 apiserver samples; raw archive, if still present: `temp/e2e/0903-1111-csi-hostpath/monitoring/rss.csv`):
 **119.5 MiB peak, 86.1 MiB mean.** RSS climbs to a ~100 MiB plateau, makes one
 transient excursion to 119.5 MiB at 10:30:40, then settles to 78 MiB and is
 still declining (72.1 MiB) at end of run — no accretion signature in this run.
@@ -22,7 +22,7 @@ unbounded-growth defects exist, one of which is an unauthenticated remote
 memory-exhaustion vector.
 
 Method: `serde_json` figures are measured with a counting global allocator
-against a real 5,624-byte Pod (harness was `temp/memaudit/`, gitignored, not
+against a real 5,624-byte Pod (the harness was not
 committed). Everything else is static reading with arithmetic shown. Nothing was
 run against a live cluster; no before/after RSS was measured.
 
@@ -142,7 +142,7 @@ same write lock as its idle check, with a correct `Arc::ptr_eq` guard.
 ## 2. Ranked by growth order
 
 Absolute bytes at today's scale are misleading — the measured baseline is
-119.5 MiB peak / 86.1 MiB mean (`temp/e2e/0903-1111-csi-hostpath/monitoring/rss.csv`,
+119.5 MiB peak / 86.1 MiB mean (same run as above,
 128 samples), and the largest collection in that cluster is 87 KiB / 15 CRDs.
 What decides when u7s stops fitting on a cheap VPS is the *order*, so that is
 the sort key. Dimensions: `P` pods, `N` nodes, `NS` namespaces, `W` concurrent

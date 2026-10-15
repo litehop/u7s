@@ -18,6 +18,7 @@ fn gen_condition_common(
     last_transition_time: Option<meta_v1::Time>,
     reason: Option<String>,
     message: Option<String>,
+    observed_generation: Option<i64>,
 ) -> serde_json::Value {
     let mut m = serde_json::json!({
         "type": r#type.unwrap_or_default(),
@@ -33,6 +34,9 @@ fn gen_condition_common(
     }
     if let Some(v) = message.filter(|s| !s.is_empty()) {
         m["message"] = v.into();
+    }
+    if let Some(v) = observed_generation {
+        m["observedGeneration"] = v.into();
     }
     m
 }
@@ -787,6 +791,7 @@ mod tests {
                                     c.last_transition_time,
                                     c.reason,
                                     c.message,
+                                    c.observed_generation,
                                 )
                             })
                             .collect::<Vec<_>>()

@@ -144,7 +144,7 @@ Inputs (measured): idle PSS per node, 947 MiB `MemTotal` VM
 (`ai/extended-context/memory-management-state.md`, mayor-g0qp7): kube-proxy
 23 MB, flanneld 21, stack 240; idle `MemAvailable` 462 MiB, thrash below
 ~150-200 MiB. Conformance RSS
-(`temp/e2e/1014-1518-conformance/monitoring/rss.csv`, 2026-10-14T14:50Z-15:18Z,
+(2026-10-14T14:50Z-15:18Z; raw archive, if still present: `temp/e2e/1014-1518-conformance/monitoring/rss.csv`,
 mayor checkout): kube-proxy avg 46.2 MB (min 44.6, max 47.9) on lima-node-2
 and 45.7 MB (43.8-46.4) on lima-node-3. beep v0.4.0: ~10-11 MiB RSS per node
 (re973 round 5); beep design table: 6.9 MiB userspace + ~2.7 MiB kernel maps

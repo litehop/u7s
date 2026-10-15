@@ -53,6 +53,35 @@ assert_contains "KubeletConfiguration enables ClusterTrustBundleProjection (kube
 assert_contains "KubeletConfiguration enables PodCertificateRequest (kubelet honors podCertificate projected sources)" \
   "$KUBELET_CONFIG_LINE" 'PodCertificateRequest: true'
 
+assert_contains "KubeletConfiguration enables AtomicWriteVolumeUserFields (Alpha, default-off: without it kubelet ignores projected defaultUser/user and files are owned by UID 0)" \
+  "$KUBELET_CONFIG_LINE" 'AtomicWriteVolumeUserFields: true'
+
+# lima-start.sh patches the gate into VMs cloned from an older golden via set-kubelet-featuregate.sh.
+SET_GATE="$DIR/../set-kubelet-featuregate.sh"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+printf 'kind: KubeletConfiguration\nfeatureGates:\n  ClusterTrustBundle: true\n' >"$WORK/with-block.yaml"
+bash "$SET_GATE" "$WORK/with-block.yaml" AtomicWriteVolumeUserFields
+assert_contains "set-kubelet-featuregate.sh adds the gate under an existing featureGates block" \
+  "$(cat "$WORK/with-block.yaml")" '  AtomicWriteVolumeUserFields: true'
+assert_contains "set-kubelet-featuregate.sh keeps the gates already in the block" \
+  "$(cat "$WORK/with-block.yaml")" '  ClusterTrustBundle: true'
+
+printf 'kind: KubeletConfiguration\n' >"$WORK/no-block.yaml"
+bash "$SET_GATE" "$WORK/no-block.yaml" AtomicWriteVolumeUserFields
+assert_contains "set-kubelet-featuregate.sh creates a featureGates block when the config has none" \
+  "$(cat "$WORK/no-block.yaml")" 'featureGates:'
+
+printf 'featureGates:\n  AtomicWriteVolumeUserFields: false\n' >"$WORK/off.yaml"
+bash "$SET_GATE" "$WORK/off.yaml" AtomicWriteVolumeUserFields
+assert_contains "set-kubelet-featuregate.sh flips an explicit false to true" \
+  "$(cat "$WORK/off.yaml")" '  AtomicWriteVolumeUserFields: true'
+
+bash "$SET_GATE" "$WORK/with-block.yaml" AtomicWriteVolumeUserFields
+assert_contains "set-kubelet-featuregate.sh is idempotent (one occurrence after a second run)" \
+  "$(grep -c 'AtomicWriteVolumeUserFields' "$WORK/with-block.yaml")" '1'
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then

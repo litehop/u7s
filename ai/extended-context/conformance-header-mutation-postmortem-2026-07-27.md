@@ -282,12 +282,12 @@ This confirms the mayor's a-priori reasoning was correct at the type level: mech
 this specific mutation cannot touch the stream.
 
 **Tier 2 (minimal repro, real client-go client).** Built a standalone axum/tokio crate
-(`temp/mo96q-repro/`, gitignored) reproducing the exact shape: a Tower middleware with a
+(not committed; raw archive, if still present: `temp/mo96q-repro/`) reproducing the exact shape: a Tower middleware with a
 `broken` mode (unconditional `resp.headers_mut().insert("x-request-id", ...)`, mirroring
 pre-#907) and a `fixed` mode (skips the insert when `Transfer-Encoding: chunked`,
 mirroring the shipped fix), in front of an axum handler streaming NDJSON `ADDED` events
 every 300ms via `Body::from_stream`. Drove it with a **real** `k8s.io/client-go@v0.36.2`
-program (`temp/mo96q-repro/goclient/`) using the actual `tools/watch.RetryWatcher` against
+program (`goclient/` in that dir) using the actual `tools/watch.RetryWatcher` against
 a `rest.RESTClientFor`-built client — the same machinery kubelet/KCM informers use, per
 the postmortem's own suspicion that a naive HTTP client might not trigger whatever
 client-go's internals react to. Ran both modes for 8s each: `broken` mode delivered 23
@@ -317,12 +317,12 @@ otherwise ruled out at the safe-Rust level; (2) **concurrent watch load** — th
 conformance run has dozens of simultaneous long-lived watches sharing the same
 `ContentTypeService` and store `Arc`, and this repro tested one connection at a time. A
 future attempt should add TLS and concurrent watch load to the same repro harness (both
-are additive to what's already built in `temp/mo96q-repro/`) before concluding the
+are additive to what's already built in that repro) before concluding the
 mechanism is unreachable by direct experiment.
 
 ## Addendum 2026-07-30: TLS and concurrent-load preconditions also ruled out
 
-`mayor-e25ge` extended the mo96q repro (`temp/e25ge-repro/`, gitignored) with the two
+`mayor-e25ge` extended the mo96q repro (not committed; raw archive, if still present: `temp/e25ge-repro/`) with the two
 untested preconditions the previous addendum flagged: TLS layering (tokio-rustls 0.26.4
 + a real self-signed cert via rcgen 0.14.8, mirroring
 `crates/apiserver/src/lib.rs::serve_tls`'s exact
