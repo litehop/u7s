@@ -1,0 +1,27 @@
+# Lima template for the 1 GiB / 1 vCPU release-gate node (scripts/release-gate/burst-gate.sh).
+#
+# Models a small VPS: 1 vCPU, 1 GiB RAM (guest MemTotal ~947 MiB), no swap, no host
+# mounts, no port forwards. The image is pinned to a dated Ubuntu release directory
+# plus its sha256 so every gate run boots the same userspace. Deliberately has no
+# provision block: the gate must exercise scripts/install.sh on a bare cloud image.
+vmType: vz
+arch: aarch64
+cpus: 1
+memory: 1GiB
+disk: 12GiB
+
+images:
+  - location: https://cloud-images.ubuntu.com/releases/26.04/release-20260927/ubuntu-26.04-server-cloudimg-arm64.img
+    arch: aarch64
+    digest: sha256:63a93bd5a8d76e33b15ceb5daa3657bd79be804748051ab178e643b0f5da22e7
+
+mounts: []
+containerd:
+  system: false
+  user: false
+
+# Lima's guest-agent forwards every listening guest port to the host by default,
+# which adds load and noise on a 1 vCPU box; ignore everything.
+portForwards:
+  - guestPortRange: [1, 65535]
+    ignore: true
