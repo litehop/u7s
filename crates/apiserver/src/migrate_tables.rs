@@ -53,9 +53,17 @@ pub struct ShippedAddons {
     pub addons: &'static [String],
 }
 
-/// Addon names shipped by `tag`. Unknown versions are refused unless
-/// `allow_unknown` is set, in which case the same-minor table (else the newest
-/// supported one) is returned with `approximate = true`.
+/// Table for `tag`, by this policy:
+/// - listed tag: its table, `approximate = false`;
+/// - unlisted patch of a supported minor: that minor's table with
+///   `approximate = true` (file lists are identical within a minor); the
+///   caller must warn;
+/// - unknown minor: refused unless `allow_unknown`, then the nearest lower
+///   supported minor's table with `approximate = true` (the caller must warn);
+///   refused when no lower minor is supported or the tag is unparseable.
+///
+/// `allow_unknown` only widens which Addon table approximates the source; it
+/// never affects `strippable_finalizers`.
 pub fn shipped_addons(tag: &str, allow_unknown: bool) -> Result<ShippedAddons, LookupError> {
     let table = shipped();
     let resolve = |t: &'static str, approximate| ShippedAddons {
@@ -66,27 +74,44 @@ pub fn shipped_addons(tag: &str, allow_unknown: bool) -> Result<ShippedAddons, L
     if let Some(t) = SUPPORTED_TAGS.iter().find(|t| **t == tag) {
         return Ok(resolve(t, false));
     }
-    if !allow_unknown {
-        return Err(LookupError::UnknownVersion {
-            requested: tag.to_string(),
-        });
+    let refuse = || LookupError::UnknownVersion {
+        requested: tag.to_string(),
+    };
+    let want = k3s_minor(tag).ok_or_else(refuse)?;
+    let newest_where = |pred: &dyn Fn(u32) -> bool| {
+        SUPPORTED_TAGS
+            .iter()
+            .filter_map(|t| Some((*t, k3s_minor(t)?)))
+            .filter(|(_, m)| pred(*m))
+            .max_by_key(|(_, m)| *m)
+            .map(|(t, _)| t)
+    };
+    if let Some(t) = newest_where(&|m| m == want) {
+        return Ok(resolve(t, true));
     }
-    let minor = |t: &str| t.split('.').take(2).collect::<Vec<_>>().join(".");
-    let closest = SUPPORTED_TAGS
-        .iter()
-        .find(|t| minor(t) == minor(tag))
-        .unwrap_or_else(|| SUPPORTED_TAGS.last().expect("at least one supported tag"));
-    Ok(resolve(closest, true))
+    if !allow_unknown {
+        return Err(refuse());
+    }
+    newest_where(&|m| m < want)
+        .map(|t| resolve(t, true))
+        .ok_or_else(refuse)
+}
+
+fn k3s_minor(tag: &str) -> Option<u32> {
+    tag.strip_prefix('v')?.split('.').nth(1)?.parse().ok()
 }
 
 pub struct FinalizerEntry {
     pub name: &'static str,
-    /// Inclusive k3s minor range (`1.<n>`) the entry applies to.
+    /// Inclusive k3s minor range (`1.<n>`) whose behaviour was audited. Other
+    /// minors strip nothing; extend only after auditing the new minor.
     pub min_minor: u32,
     pub max_minor: u32,
     /// Why the guarded resource does not exist on u7s.
     pub justification: &'static str,
 }
+
+const LB_CLEANUP: &str = "service.kubernetes.io/load-balancer-cleanup";
 
 /// Exact finalizer names only; import strips them one named entry at a time,
 /// never `finalizers: null`.
@@ -94,26 +119,32 @@ pub const FINALIZER_ALLOWLIST: &[FinalizerEntry] = &[
     FinalizerEntry {
         name: "wrangler.cattle.io/on-helm-chart-remove",
         min_minor: 35,
-        max_minor: u32::MAX,
+        max_minor: 37,
         justification: "released by k3s's embedded helm-controller to clean up the chart's Helm release; u7s has no helm-controller, so nothing would ever remove it",
     },
     FinalizerEntry {
         name: "wrangler.cattle.io/node",
         min_minor: 35,
-        max_minor: u32::MAX,
+        max_minor: 37,
         justification: "added by k3s's embedded wrangler node controller; u7s nodes are registered by a real kubelet and no controller removes it",
     },
+    // Safe to strip ONLY while u7s's load-balancer provider (beep) does not
+    // implement this finalizer. If beep or any other LB provider starts
+    // setting or honouring it, stripping would orphan its load balancers:
+    // re-audit this entry. `no_workspace_code_uses_lb_cleanup_finalizer`
+    // trips when this repo starts referencing it.
     FinalizerEntry {
-        name: "service.kubernetes.io/load-balancer-cleanup",
+        name: LB_CLEANUP,
         min_minor: 35,
-        max_minor: u32::MAX,
+        max_minor: 37,
         justification: "upstream string, but on k3s the embedded ccm sets and removes it for servicelb; u7s runs no cloud-provider service controller, so the Service would never finish deleting (revisit if one is added)",
     },
 ];
 
-/// Finalizers safe to strip from objects of k3s `tag`.
+/// Finalizers safe to strip from objects of k3s `tag`: empty outside the
+/// audited minors, with or without `--allow-unknown-k3s-version`.
 pub fn strippable_finalizers(tag: &str) -> Vec<&'static str> {
-    let minor: Option<u32> = tag.split('.').nth(1).and_then(|m| m.parse().ok());
+    let minor = k3s_minor(tag);
     FINALIZER_ALLOWLIST
         .iter()
         .filter(|e| minor.is_some_and(|m| (e.min_minor..=e.max_minor).contains(&m)))
@@ -168,8 +199,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_or_newer_version_is_refused_by_default() {
-        for v in ["v1.36.3+k3s1", "v1.38.0+k3s1", "v1.34.1+k3s1", ""] {
+    fn unknown_minor_is_refused_by_default() {
+        for v in ["v1.38.0+k3s1", "v1.34.1+k3s1", "garbage", ""] {
             assert_eq!(
                 shipped_addons(v, false),
                 Err(LookupError::UnknownVersion {
@@ -181,11 +212,26 @@ mod tests {
     }
 
     #[test]
-    fn override_uses_same_minor_else_newest_and_flags_approximate() {
-        let r = shipped_addons("v1.36.3+k3s1", true).unwrap();
-        assert_eq!((r.table_tag, r.approximate), ("v1.36.5+k3s1", true));
+    fn unlisted_patch_of_known_minor_uses_that_minors_table_approximately() {
+        for allow in [false, true] {
+            let r = shipped_addons("v1.36.3+k3s1", allow).unwrap();
+            assert_eq!(
+                (r.table_tag, r.approximate),
+                ("v1.36.5+k3s1", true),
+                "file lists are identical within a minor; the caller must still warn"
+            );
+        }
+    }
+
+    #[test]
+    fn override_for_unknown_minor_uses_nearest_lower_never_newest() {
         let r = shipped_addons("v1.38.0+k3s1", true).unwrap();
         assert_eq!((r.table_tag, r.approximate), ("v1.37.1+k3s1", true));
+        assert!(
+            shipped_addons("v1.34.1+k3s1", true).is_err(),
+            "no lower supported minor: falling back to a newer table would classify with Addons the source never shipped"
+        );
+        assert!(shipped_addons("garbage", true).is_err());
     }
 
     #[test]
@@ -223,13 +269,61 @@ mod tests {
                 "{} needs a justification",
                 e.name
             );
+            assert!(
+                e.max_minor != u32::MAX,
+                "{}: an unbounded range strips on unaudited k3s minors",
+                e.name
+            );
         }
     }
 
     #[test]
-    fn strippable_finalizers_follow_the_version_range() {
-        assert_eq!(strippable_finalizers("v1.36.5+k3s1").len(), 3);
+    fn strippable_finalizers_follow_the_audited_range() {
+        for t in SUPPORTED_TAGS {
+            assert_eq!(strippable_finalizers(t).len(), 3, "{t}");
+        }
+        assert_eq!(strippable_finalizers("v1.36.3+k3s1").len(), 3);
         assert!(strippable_finalizers("v1.20.0+k3s1").is_empty());
         assert!(strippable_finalizers("garbage").is_empty());
+    }
+
+    #[test]
+    fn unaudited_minor_strips_nothing_with_or_without_the_override() {
+        for tag in ["v1.38.0+k3s1", "v1.34.9+k3s1"] {
+            assert!(
+                strippable_finalizers(tag).is_empty(),
+                "{tag}: unaudited minor must not lose finalizers (data loss)"
+            );
+            // The override only picks an approximate Addon table; the strip
+            // decision is keyed on the source tag alone.
+            if let Ok(r) = shipped_addons(tag, true) {
+                assert!(r.approximate);
+                assert!(strippable_finalizers(tag).is_empty(), "{tag}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_workspace_code_uses_lb_cleanup_finalizer() {
+        fn scan(dir: &std::path::Path, hits: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    scan(&p, hits);
+                } else if p.extension().is_some_and(|x| x == "rs")
+                    && !p.ends_with("migrate_tables.rs")
+                    && std::fs::read_to_string(&p).is_ok_and(|s| s.contains(LB_CLEANUP))
+                {
+                    hits.push(p.display().to_string());
+                }
+            }
+        }
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut hits = vec![];
+        scan(&crates, &mut hits);
+        assert!(
+            hits.is_empty(),
+            "{hits:?} now reference {LB_CLEANUP}: the migrate strip entry is only safe while no LB provider implements it; re-audit FINALIZER_ALLOWLIST"
+        );
     }
 }
