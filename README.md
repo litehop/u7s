@@ -21,12 +21,13 @@ and kube-controller-manager, and writes a systemd unit for each.
    returns 404 by design; pin a snapshot tag instead:
 
    ```bash
-   TAG=$(gh release list --repo litehop/u7s --limit 1 --json tagName --jq '.[0].tagName')
+   TAG=$(curl -sf "https://api.github.com/repos/litehop/u7s/releases?per_page=1" | grep -m1 '"tag_name"' | cut -d'"' -f4)
    curl -sfL "https://u7s.dekiru.tech/${TAG}/install.sh" | sudo bash
    ```
 
-   Without `gh`, take the newest tag from
-   <https://github.com/litehop/u7s/releases> and substitute it for `${TAG}`.
+   The lookup needs only `curl` and coreutils (unauthenticated GitHub API
+   calls are rate-limited; if it fails, set `TAG` by hand from
+   <https://github.com/litehop/u7s/releases>).
 
 2. With no flags, the node name defaults to the host's hostname and the
    cluster network binds to the first non-loopback interface. Override

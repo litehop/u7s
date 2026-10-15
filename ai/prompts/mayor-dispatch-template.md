@@ -959,6 +959,9 @@ When a worker returns from a VM/sonobuoy-touching bead:
 - Check the return for sonobuoy delete output or `mcp__<VM_NAME>__run_shell_command` evidence.
 - If absent: **do not merge**. Send back: "Your return contains no VM execution
   evidence. Run `sonobuoy delete --all --wait` in your assigned VM and show the output."
+- If the return cites a run archive, confirm it was evacuated to the mayor
+  checkout's `temp/e2e/` and that the key facts are inline in the return,
+  never the archive alone.
 - The hook pre-checks cargo quality gates. VM verification is the mayor's gate.
 
 ---
