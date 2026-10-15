@@ -352,6 +352,17 @@ pub fn prefix_bucket(prefix: &str) -> &str {
     prefix
 }
 
+/// Drop every series labeled with the raw shard key `shard`. Called where a shard leaves
+/// `shards`, so labelled series don't outlive their shard: a CRD created and deleted in a loop
+/// would otherwise mint dead series forever. Missing series are not an error (a shard that
+/// never pushed has none).
+pub fn remove_shard_series(shard: &str) {
+    let _ = WATCH_RING_OCCUPANCY.remove_label_values(&[shard]);
+    let _ = WATCH_RING_SPAN_SECONDS.remove_label_values(&[shard]);
+    let _ = DELETION_LOG_LEN.remove_label_values(&[shard]);
+    let _ = DELETION_LOG_BODY_SIZE_BYTES.remove_label_values(&[shard]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
