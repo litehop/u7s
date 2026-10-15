@@ -70,7 +70,8 @@ impl Status {
     }
 
     /// Upstream's response for a request path that names no served resource (no qualified
-    /// resource, so no `details`).
+    /// resource), built by `NewGenericServerResponse(404, ...)`, whose non-nil empty
+    /// `Details` serializes as `"details":{}`.
     pub fn route_not_found() -> StatusError {
         StatusError(
             StatusCode::NOT_FOUND,
@@ -82,7 +83,7 @@ impl Status {
                 reason: "NotFound",
                 code: 404,
                 metadata: None,
-                details: None,
+                details: Some(Box::new(serde_json::json!({}))),
             },
         )
     }

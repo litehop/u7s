@@ -891,18 +891,7 @@ pub async fn api_group<S: Store>(
         }))
         .into_response()
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "kind": "Status",
-                "apiVersion": "v1",
-                "status": "Failure",
-                "message": format!("the server could not find the requested resource ({})", group),
-                "reason": "NotFound",
-                "code": 404
-            })),
-        )
-            .into_response()
+        crate::status::Status::route_not_found().into_response()
     }
 }
 
@@ -985,18 +974,7 @@ pub async fn api_group_resources<S: Store>(
         }
     }
 
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "kind": "Status",
-            "apiVersion": "v1",
-            "status": "Failure",
-            "message": format!("the server could not find the requested resource ({}/{})", group, version),
-            "reason": "NotFound",
-            "code": 404
-        })),
-    )
-        .into_response()
+    crate::status::Status::route_not_found().into_response()
 }
 
 // ---------------------------------------------------------------------------
