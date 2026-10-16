@@ -5354,6 +5354,9 @@ pub async fn put_cr_status<S: Store>(
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
         .map_err(|e| store_err_cr(e, &group, &plural, &name, &kind))?;
+    if let Some(old) = &csr_before {
+        crate::handlers::csr::consume_join_token(state.store.as_ref(), old, &current).await;
+    }
     // `resourceVersion` is in merge_incoming_metadata's PROTECTED list, so `current`
     // still carries the pre-put (old) rv here, before it's overwritten below. A no-op
     // for the registry-resource branch above (its rv never appears in the CR conversion
@@ -5576,6 +5579,9 @@ pub async fn patch_cr_status<S: Store>(
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
         .map_err(|e| store_err_cr(e, &group, &plural, &name, &kind))?;
+    if let Some(old) = &csr_before {
+        crate::handlers::csr::consume_join_token(state.store.as_ref(), old, &current).await;
+    }
     // Same ordering as put_cr_status: `current["metadata"]["resourceVersion"]` here is
     // still the pre-put (old) rv for the merge/strategic-merge branches (protected by
     // merge_incoming_metadata), which is what the conversion cache is keyed on.
