@@ -380,7 +380,7 @@ struct KubeconfigCreds {
 }
 
 /// Parse the fixed kubeconfig shape `tls::write_component_kubeconfig` writes: manual
-/// line-based field extraction, same approach as `u7s-kubeconfig`'s `parse_kubeconfig`
+/// line-based field extraction, same approach as `politeia`'s `parse_kubeconfig`
 /// (duplicated here rather than depending on that crate, since it exists for the standalone
 /// scheduler binary, not for in-process use by the apiserver itself).
 fn read_kubeconfig_creds(path: &Path) -> anyhow::Result<KubeconfigCreds> {
