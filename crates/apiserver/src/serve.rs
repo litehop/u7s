@@ -867,6 +867,159 @@ mod tests {
             .unwrap();
     }
 
+    /// Client IO whose reads can be frozen, so the client neither sees the server's
+    /// GOAWAY nor answers its ping while frozen.
+    struct ReadGate<S> {
+        inner: S,
+        gate: Arc<Mutex<(bool, Option<std::task::Waker>)>>,
+    }
+
+    impl<S: AsyncReadExt + Unpin> tokio::io::AsyncRead for ReadGate<S> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            {
+                let mut g = self.gate.lock().unwrap();
+                if !g.0 {
+                    g.1 = Some(cx.waker().clone());
+                    return std::task::Poll::Pending;
+                }
+            }
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWriteExt + Unpin> tokio::io::AsyncWrite for ReadGate<S> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_opened_after_idle_goaway_runs_to_completion_then_connection_closes() {
+        let tls = test_tls();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let events = 8u32;
+        let app = Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/watch",
+                axum::routing::get(move || async move {
+                    let stream = futures_util::stream::unfold(0u32, move |i| async move {
+                        if i == events {
+                            return None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        Some((
+                            Ok::<_, std::convert::Infallible>(format!("event{i}\n")),
+                            i + 1,
+                        ))
+                    });
+                    axum::body::Body::from_stream(stream)
+                }),
+            );
+        let limits = ServeLimits {
+            h2_idle_timeout: Duration::from_millis(300),
+            header_read_timeout: Duration::from_millis(600),
+            ..test_limits()
+        };
+        start(listener, app, &tls, limits).await;
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let stream = tls.h2_connector.connect(name, tcp).await.unwrap();
+        let gate = Arc::new(Mutex::new((true, None::<std::task::Waker>)));
+        let io = ReadGate {
+            inner: stream,
+            gate: Arc::clone(&gate),
+        };
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(io),
+        )
+        .await
+        .unwrap();
+        let (closed_tx, mut closed) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = conn.await;
+            let _ = closed_tx.send(());
+        });
+
+        let resp = sender.send_request(h2_get("/")).await.unwrap();
+        resp.into_body().collect().await.unwrap();
+
+        // Frozen client: it misses the idle GOAWAY (t=300ms) and never pongs, so the server
+        // is still draining when this stream arrives (t=500ms).
+        gate.lock().unwrap().0 = false;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let pending = sender.send_request(h2_get("/watch"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let mut g = gate.lock().unwrap();
+            g.0 = true;
+            if let Some(w) = g.1.take() {
+                w.wake();
+            }
+        }
+
+        let started = Instant::now();
+        let body = pending
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .map(|b| b.to_bytes());
+        let body = body.expect("stream must not be reset by the post-GOAWAY drain");
+        assert!(
+            String::from_utf8_lossy(&body).contains(&format!("event{}", events - 1)),
+            "a stream that raced the idle GOAWAY must run to completion even past \
+             header_read_timeout, or watches are cut mid-stream; got {body:?}"
+        );
+        assert!(
+            started.elapsed() > Duration::from_millis(600),
+            "stream must outlast header_read_timeout for this test to mean anything"
+        );
+        assert!(
+            is_closed_within(&mut closed, Duration::from_secs(3)).await,
+            "once the drained stream ends the connection must close"
+        );
+    }
+
+    #[test]
+    fn v4_mapped_peer_shares_the_per_ip_cap_with_its_plain_ipv4_form() {
+        let limiter = PerIpLimiter::new(1);
+        let plain: IpAddr = "203.0.113.5".parse().unwrap();
+        let mapped: IpAddr = "::ffff:203.0.113.5".parse().unwrap();
+        let _held = limiter.acquire(plain).unwrap();
+        assert!(
+            limiter.acquire(mapped).is_err(),
+            "a dual-stack listener reports IPv4 peers as v4-mapped; they must count against \
+             the same cap or one client doubles its allowance"
+        );
+    }
+
     #[test]
     fn v4_mapped_loopback_is_exempt_from_the_per_ip_cap() {
         let limiter = PerIpLimiter::new(1);
