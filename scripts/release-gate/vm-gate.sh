@@ -18,8 +18,9 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
-COREDNS_REQ=0; ZRAM_MIB=0
+COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
+[ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
 
 mkdir -p "$OUT"
 : > "$OUT/results.env"
@@ -30,17 +31,41 @@ k() { timeout 30 kubectl --kubeconfig "$KCFG" "$@"; }
 kw() { kubectl --kubeconfig "$KCFG" "$@"; }
 
 # Scales deployment rg-burst to $1 replicas; echoes seconds until all Ready or "timeout".
+# One long-lived `get -w` instead of a kubectl fork per poll: each fork is a fresh Go
+# process on a memory-starved node. A dropped watch is re-established after 5 s.
 run_burst() {
-  local n="$1" start now ready
+  local n="$1" start now wpid
   start="$(date +%s)"
   k scale deployment/rg-burst --replicas="$n" >/dev/null 2>&1
   while :; do
     now="$(date +%s)"
-    ready="$(k get deployment rg-burst -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
-    if [ "${ready:-0}" = "$n" ]; then echo $((now - start)); return; fi
     if [ $((now - start)) -ge "$HARD_KILL_SECS" ]; then echo timeout; return; fi
-    sleep 2
+    exec 3< <(exec timeout $((HARD_KILL_SECS - (now - start))) kubectl --kubeconfig "$KCFG" \
+      get deployment rg-burst -w -o jsonpath='{.status.readyReplicas}{"\n"}' 2>/dev/null)
+    wpid=$!
+    if rg_wait_ready "$n" <&3; then
+      kill "$wpid" 2>/dev/null; exec 3<&-
+      echo $(( $(date +%s) - start )); return
+    fi
+    exec 3<&-
+    sleep 5
   done
+}
+
+# Kube-system/flannel pod UIDs, appended to ks-uids.txt. An evicted-and-recreated pod gets a
+# new UID, and the kernel OOM log can only be mapped back to a pod through the UID in its
+# cgroup path; evicted pods stay listed, so sampling between bursts is enough.
+record_uids() {
+  k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.uid}{"\n"}{end}' 2>/dev/null \
+    | awk '$1 == "kube-system" || $1 == "kube-flannel" {print $2}' >> "$OUT/ks-uids.txt"
+}
+
+# Kernel-log OOM victims since epoch $1, as "<host count> <kube-system count>".
+oom_since() {
+  local victims
+  victims="$(journalctl -k --no-pager --since "$(date -d "@$1" '+%Y-%m-%d %H:%M:%S')" 2>/dev/null \
+    | rg_oom_victims "$(sort -u "$OUT/ks-uids.txt" | tr - _ | tr '\n' ' ')")"
+  echo "$(echo "$victims" | grep -c '^host ') $(echo "$victims" | grep -c '^kube-system ')"
 }
 
 # Memory breakdown while a burst's pods are still running, for per-pod overhead:
@@ -66,10 +91,21 @@ snap() {
 burst_cleanup() {
   k scale deployment/rg-burst --replicas=1 >/dev/null 2>&1
   local i
-  for i in $(seq 1 150); do
-    [ "$(k get pods -l app=rg-burst --no-headers 2>/dev/null | wc -l)" -le 1 ] && break
-    sleep 2
+  for i in $(seq 1 60); do
+    [ "$(k get pods -l app=rg-burst --no-headers 2>/dev/null | wc -l)" -le 1 ] && return 0
+    sleep 5
   done
+  log "WARNING: burst pods not scaled down within 300s; continuing with leftover pods"
+  res "burst_cleanup_timeout_$(cat "$OUT/phase")" 1
+}
+
+wait_node_ready() {
+  local i
+  for i in $(seq 1 60); do
+    [ "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ] && return 0
+    sleep 5
+  done
+  return 1
 }
 
 if [ "$ZRAM_MIB" -gt 0 ]; then
@@ -106,23 +142,32 @@ rm -f "$RG"/u7s-gate-*.tar.gz*
 
 : > "$OUT/node-ready.log"
 : > "$OUT/ks-uids.txt"
-# Polled rather than `get -w`: a re-established watch replays the node's whole condition
-# history, which would be counted as fresh not-Ready observations. The poll also records
-# kube-system/kube-flannel pod UIDs: an evicted-and-recreated pod gets a new UID, and the
-# kernel OOM log can only be mapped back to a pod through the UID in its cgroup path.
+record_uids
+# One long-lived node watch instead of a get every 10 s. The watch replays the node's
+# condition history on (re)connect, so each line is stamped with the condition's own
+# lastTransitionTime, not the read time; callers count transitions at/after WATCH_T0, which
+# leaves the replay of install-time Unknown/False flaps out. A broken watch is logged as
+# "unreachable" and re-established.
+WATCH_T0="$(date +%s)"
 ( while :; do
-    s="$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
-    echo "$(date +%s) ${s:-unreachable}" >> "$OUT/node-ready.log"
-    k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.uid}{"\n"}{end}' 2>/dev/null \
-      | awk '$1 == "kube-system" || $1 == "kube-flannel" {print $2}' >> "$OUT/ks-uids.txt"
-    sleep 10
+    kubectl --kubeconfig "$KCFG" get node "$NODE" -w \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}' 2>/dev/null \
+      | rg_node_watch_stamp >> "$OUT/node-ready.log"
+    [ -e "$OUT/watch-stop" ] && break
+    printf '%(%s)T unreachable\n' -1 >> "$OUT/node-ready.log"
+    sleep 5
   done ) &
 WATCH_PID=$!
 bash "$RG/vm-sampler.sh" "$OUT" 5 &
 SAMPLER_PID=$!
-bash "$RG/vm-capture.sh" "$OUT" "$KCFG" 2 &
-CAPTURE_PID=$!
-trap 'kill $WATCH_PID $SAMPLER_PID $CAPTURE_PID 2>/dev/null' EXIT
+CAPTURE_PID=""
+[ "$CAPTURE" = 1 ] && { bash "$RG/vm-capture.sh" "$OUT" "$KCFG" 5 & CAPTURE_PID=$!; }
+stop_bg() {
+  touch "$OUT/watch-stop"
+  pkill -P "$WATCH_PID" 2>/dev/null
+  kill "$WATCH_PID" "$SAMPLER_PID" $CAPTURE_PID 2>/dev/null
+}
+trap stop_bg EXIT
 if [ "$COREDNS_REQ" = 1 ]; then
   k -n kube-system set resources deployment/coredns --requests=cpu=100m,memory=70Mi >> "$OUT/run.log" 2>&1
   kw -n kube-system rollout status deployment/coredns --timeout=180s >> "$OUT/run.log" 2>&1 || log "coredns rollout not complete"
@@ -147,35 +192,70 @@ phase warmup
 k create deployment rg-burst --image="$PAUSE_IMAGE" --replicas=1 >> "$OUT/run.log" 2>&1
 kw wait --for=condition=Available deployment/rg-burst --timeout=300s >> "$OUT/run.log" 2>&1 || log "warm-up pod not Available"
 
+wp_ok_poll() {
+  local _
+  for _ in $(seq 1 24); do
+    case "$(wp_code)" in 200|301|302) echo 1; return ;; esac
+    sleep 5
+  done
+  echo 0
+}
+
+# Ramp: one install + WordPress, bursts of increasing size with a probe hard-kill, each
+# followed by scale-down, node-Ready wait and settle. Stops at the first failing size.
+run_ramp() {
+  local n t0 oomh oomk secs
+  for n in ${RAMP//,/ }; do
+    t0="$(date +%s)"
+    phase "burst$n"
+    secs="$(run_burst "$n")"; log "$n-pod burst: $secs s"
+    snap "burst$n"
+    burst_cleanup; phase "settle$n"; wait_node_ready || log "node not Ready after $n-pod burst"
+    sleep "$SETTLE_STEP"
+    record_uids
+    read -r oomh oomk <<< "$(oom_since "$t0")"
+    res "ramp_${n}_secs" "$secs"
+    res "ramp_${n}_oom_host" "$oomh"
+    res "ramp_${n}_oom_kubesystem" "$oomk"
+    res "ramp_${n}_notready" "$(rg_notready_since "$OUT/node-ready.log" "$t0")"
+    res "ramp_${n}_ready_final" "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
+    res "ramp_${n}_wp_ok" "$(wp_ok_poll)"
+    if ! rg_ramp_step "$OUT/results.env" "$n" >/dev/null; then log "ramp stopped: $n-pod burst failed"; break; fi
+  done
+}
+
+run_full() {
+  phase burst20
+  b20="$(run_burst 20)"; res burst20_secs "$b20"; log "20-pod burst: $b20 s"
+  snap burst20
+  burst_cleanup; phase settle20; sleep "$SETTLE_STEP"
+  record_uids
+
+  phase burst80
+  b80="$(run_burst 80)"; res burst80_secs "$b80"; log "80-pod burst: $b80 s"
+  snap burst80
+  burst_cleanup; phase settle80; sleep "$SETTLE_STEP"
+  record_uids
+
+  phase wpcheck
+  wp_ok="$(wp_ok_poll)"
+  res wp_ok "$wp_ok"; log "WordPress after settle: ok=$wp_ok"
+
+  phase webhook
+  if timeout 900 bash "$RG/webhook-smoke.sh" --kubeconfig "$KCFG" > "$OUT/webhook-smoke.log" 2>&1; then
+    res webhook_ok 1
+  else
+    res webhook_ok 0; tail -15 "$OUT/webhook-smoke.log" | tee -a "$OUT/run.log"
+  fi
+  log "webhook-smoke webhook_ok=$(rg_get "$OUT/results.env" webhook_ok)"
+}
+
 snap pre-burst
-phase burst20
-b20="$(run_burst 20)"; res burst20_secs "$b20"; log "20-pod burst: $b20 s"
-snap burst20
-burst_cleanup; phase settle20; sleep "$SETTLE_STEP"
-
-phase burst80
-b80="$(run_burst 80)"; res burst80_secs "$b80"; log "80-pod burst: $b80 s"
-snap burst80
-burst_cleanup; phase settle80; sleep "$SETTLE_STEP"
-
-phase wpcheck
-wp_ok=0
-for _ in $(seq 1 60); do
-  case "$(wp_code)" in 200|301|302) wp_ok=1; break ;; esac
-  sleep 2
-done
-res wp_ok "$wp_ok"; log "WordPress after settle: ok=$wp_ok"
-
-phase webhook
-if timeout 900 bash "$RG/webhook-smoke.sh" --kubeconfig "$KCFG" > "$OUT/webhook-smoke.log" 2>&1; then
-  res webhook_ok 1
-else
-  res webhook_ok 0; tail -15 "$OUT/webhook-smoke.log" | tee -a "$OUT/run.log"
-fi
-log "webhook-smoke webhook_ok=$(rg_get "$OUT/results.env" webhook_ok)"
+if [ -n "$RAMP" ]; then run_ramp; else run_full; fi
 
 phase collect
-kill "$WATCH_PID" "$SAMPLER_PID" "$CAPTURE_PID" 2>/dev/null
+stop_bg
+record_uids
 journalctl -u kubelet --no-pager -o short-iso > "$OUT/kubelet-full.log" 2>&1
 journalctl -u u7s-kcm --no-pager -o short-iso > "$OUT/kcm-full.log" 2>&1
 journalctl -u u7s-apiserver --no-pager -o short-iso > "$OUT/apiserver-full.log" 2>&1
@@ -192,7 +272,7 @@ rg_oom_victims "$KS_UIDS" < "$OUT/kernel.log" > "$OUT/oom-victims.txt"
 res oom_host "$(grep -c '^host ' "$OUT/oom-victims.txt")"
 res oom_kubesystem "$(grep -c '^kube-system ' "$OUT/oom-victims.txt")"
 res oom_victims "$(awk '{print $1":"$2}' "$OUT/oom-victims.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
-res notready_events "$(grep -cE ' (False|Unknown)$' "$OUT/node-ready.log")"
+res notready_events "$(rg_notready_since "$OUT/node-ready.log" "$WATCH_T0")"
 res api_unreachable_polls "$(grep -c ' unreachable$' "$OUT/node-ready.log")"
 res evicted_pods "$(awk '{print $1"/"$2}' "$OUT/evictions.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
 res node_ready_final "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"

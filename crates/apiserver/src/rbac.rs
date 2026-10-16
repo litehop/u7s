@@ -43,6 +43,9 @@ pub struct RbacBinding {
     pub subjects: Vec<Subject>,
     #[serde(rename = "roleRef")]
     pub role_ref: RoleRef,
+    /// Always derived from the store key; never read from the body, where a top-level
+    /// `namespace` would otherwise bind the subjects in a namespace the writer chose.
+    #[serde(skip)]
     pub namespace: Option<String>,
 }
 
@@ -183,15 +186,9 @@ impl RbacIndex {
             }
         } else if key.contains("/rolebindings/") {
             if let Ok(mut binding) = serde_json::from_value::<RbacBinding>(value.clone()) {
-                // Kubernetes stores namespace in metadata.namespace, not as a top-level
-                // field. If the JSON body didn't include a top-level namespace, fall back
-                // to extracting it from the key path
-                // (/apis/rbac.../v1/namespaces/<ns>/rolebindings/<name>).
-                // Without this, namespace_bindings always has namespace=None and the
-                // is_allowed check (which compares binding_ns != req_ns) never matches.
-                if binding.namespace.is_none() {
-                    binding.namespace = extract_namespace(key);
-                }
+                // The namespace comes from the key path
+                // (/apis/rbac.../v1/namespaces/<ns>/rolebindings/<name>), never the body.
+                binding.namespace = extract_namespace(key);
                 if accept_update(
                     &mut inner.resource_versions,
                     &mut inner.resource_version_lru,
