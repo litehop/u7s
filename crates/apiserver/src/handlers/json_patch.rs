@@ -662,6 +662,99 @@ fn dup_key_message(e: &yaml_rust2::ScanError) -> String {
     )
 }
 
+/// go-yaml's `alias_ratio_range_{low,high}`: the share of decoded nodes allowed to come
+/// from alias expansion falls from 99% (<= low) to 10% (>= high).
+const ALIAS_RATIO_LOW: u64 = 400_000;
+const ALIAS_RATIO_HIGH: u64 = 4_000_000;
+
+/// Event receiver that counts expanded nodes (aliases counted at their anchor's full
+/// subtree size) without building any tree, so a "billion laughs" body is rejected in
+/// time linear in its length. `yaml_rust2::YamlLoader` deep-clones on every alias.
+#[derive(Default)]
+struct AliasBudget {
+    /// (anchor id, expanded node count so far) per open collection.
+    stack: Vec<(usize, u64)>,
+    anchor_sizes: std::collections::HashMap<usize, u64>,
+    decoded: u64,
+    from_aliases: u64,
+    excessive: bool,
+}
+
+impl AliasBudget {
+    /// Record a finished leaf or alias node of `size` expanded nodes.
+    fn add_node(&mut self, anchor: usize, size: u64) {
+        if anchor > 0 {
+            self.anchor_sizes.insert(anchor, size);
+        }
+        self.decoded = self.decoded.saturating_add(size);
+        if let Some(parent) = self.stack.last_mut() {
+            parent.1 = parent.1.saturating_add(size);
+        }
+    }
+
+    /// Mirrors go-yaml's `excessive aliasing` check in `decoder.unmarshal`.
+    fn over_budget(&self) -> bool {
+        if self.from_aliases <= 100 || self.decoded <= 1000 {
+            return false;
+        }
+        let allowed = if self.decoded <= ALIAS_RATIO_LOW {
+            0.99
+        } else if self.decoded >= ALIAS_RATIO_HIGH {
+            0.10
+        } else {
+            let frac = (self.decoded - ALIAS_RATIO_LOW) as f64
+                / (ALIAS_RATIO_HIGH - ALIAS_RATIO_LOW) as f64;
+            0.99 - 0.89 * frac
+        };
+        self.from_aliases as f64 / self.decoded as f64 > allowed
+    }
+}
+
+impl yaml_rust2::parser::MarkedEventReceiver for AliasBudget {
+    fn on_event(&mut self, ev: yaml_rust2::Event, _: yaml_rust2::scanner::Marker) {
+        use yaml_rust2::Event;
+        if self.excessive {
+            return;
+        }
+        match ev {
+            Event::Scalar(_, _, aid, _) => self.add_node(aid, 1),
+            Event::SequenceStart(aid, _) | Event::MappingStart(aid, _) => {
+                self.decoded = self.decoded.saturating_add(1);
+                self.stack.push((aid, 1));
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                if let Some((aid, size)) = self.stack.pop() {
+                    if aid > 0 {
+                        self.anchor_sizes.insert(aid, size);
+                    }
+                    if let Some(parent) = self.stack.last_mut() {
+                        parent.1 = parent.1.saturating_add(size);
+                    }
+                }
+            }
+            Event::Alias(id) => {
+                let size = self.anchor_sizes.get(&id).copied().unwrap_or(1);
+                self.from_aliases = self.from_aliases.saturating_add(size);
+                self.add_node(0, size);
+                self.excessive = self.over_budget();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Reject YAML whose alias expansion exceeds go-yaml's budget (upstream:
+/// `yaml: document contains excessive aliasing`). A scan error is not reported here;
+/// the real loader reports it.
+fn check_alias_budget(s: &str) -> Result<(), String> {
+    let mut budget = AliasBudget::default();
+    let _ = yaml_rust2::parser::Parser::new_from_str(s).load(&mut budget, true);
+    if budget.excessive {
+        return Err("error decoding YAML: yaml: document contains excessive aliasing".into());
+    }
+    Ok(())
+}
+
 /// Parse an `apply-patch+yaml` body (YAML or JSON) into a serde_json::Value.
 ///
 /// Shared by every PATCH handler that accepts the Server-Side Apply content type: real
@@ -677,6 +770,7 @@ pub(crate) fn ssa_body_to_json(
 ) -> Result<serde_json::Value, crate::status::StatusError> {
     let s = std::str::from_utf8(body)
         .map_err(|e| Status::bad_request(format!("SSA body is not valid UTF-8: {e}")))?;
+    check_alias_budget(s).map_err(Status::bad_request)?;
     let docs = yaml_rust2::YamlLoader::load_from_str(s)
         .map_err(|e| Status::bad_request(dup_key_message(&e)))?;
     let doc = docs
@@ -1524,6 +1618,61 @@ mod tests {
             Some(80),
             "integer values must parse as JSON numbers, not strings"
         );
+    }
+
+    fn alias_bomb(levels: usize) -> String {
+        let mut s = String::from("l0: &l0 [x, x, x, x, x, x, x, x, x, x]\n");
+        for i in 1..levels {
+            let r = format!("*l{}", i - 1);
+            s += &format!("l{i}: &l{i} [{}]\n", vec![r; 10].join(", "));
+        }
+        s
+    }
+
+    /// Runs on a spawned thread so a regression fails the test instead of hanging or
+    /// OOMing CI.
+    fn parse_within_2s(body: String) -> Result<serde_json::Value, crate::status::StatusError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ssa_body_to_json(body.as_bytes()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "alias bomb not rejected within 2s: it must be rejected quickly or one PATCH \
+                 exhausts apiserver memory"
+                )
+            })
+    }
+
+    /// yaml-rust2 deep-clones per alias, so a few hundred bytes of nested aliases would
+    /// take seconds and then exhaust memory for any user able to PATCH. The pre-parse
+    /// budget must reject it as 400 without expanding anything.
+    #[test]
+    fn ssa_body_to_json_rejects_alias_expansion_bomb_quickly() {
+        let bomb = alias_bomb(10);
+        assert!(bomb.len() < 600, "bomb must stay tiny: {}", bomb.len());
+        let err = parse_within_2s(bomb).expect_err("bomb must be rejected");
+        assert_eq!(err.0.as_u16(), 400);
+        assert!(
+            format!("{err:?}").contains("excessive aliasing"),
+            "message must match upstream go-yaml wording"
+        );
+    }
+
+    /// A deeper bomb must cost the same: the budget check is linear in input size.
+    #[test]
+    fn ssa_body_to_json_rejects_deep_alias_bomb() {
+        assert!(parse_within_2s(alias_bomb(40)).is_err());
+    }
+
+    /// Valid documents may reuse anchors (e.g. shared labels); the budget must not break
+    /// them.
+    #[test]
+    fn ssa_body_to_json_accepts_legit_aliases() {
+        let yaml = b"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n  labels: &l\n    a: b\ndata:\n  one: *l\n  two: *l\n";
+        let val = ssa_body_to_json(yaml).expect("a couple of aliases must parse");
+        assert_eq!(val["data"]["two"]["a"].as_str(), Some("b"));
     }
 
     /// A JSON body (as sent by kubelet SSA / resource.rs-style callers) must also
@@ -2472,7 +2621,6 @@ mod tests {
         "soft_delete_crd",
         "purge_crd",
         "delete_finalized_namespace",
-        "delete_namespace_scoped_crds",
         "update_quota_status",
         "write_vap_status",
         "write_flowcontrol_status",

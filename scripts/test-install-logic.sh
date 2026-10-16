@@ -774,7 +774,7 @@ write_manifest_copy_runner() {
     # flannel.yaml/kube-proxy.yaml fixture in play) aren't forced to.
     echo 'IFACE="${4:-eth0}"'
     echo 'POD_CLUSTER_CIDR="${5:-10.244.0.0/16}"'
-    echo 'KUBE_VERSION="${6:-1.36.4}"'
+    echo 'KUBE_VERSION="${6:-1.37.1}"'
     echo 'IFACE_IP="${7:-10.0.0.1}"'
     awk '/^if \[ "\$WORKER_MODE" -eq 0 \]; then$/,/^fi$/' "$install_script"
   } > "$runner"

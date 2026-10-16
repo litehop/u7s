@@ -11,6 +11,7 @@ mod auth;
 mod autoscaling_gen_adapter;
 mod batch_gen_adapter;
 mod bootstrap_apply;
+mod bootstrap_rbac;
 mod certificates_v1beta1_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
@@ -21,6 +22,7 @@ mod keys;
 mod limit_range;
 mod metrics;
 pub mod migrate_tables;
+mod namespace_guard;
 mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
 mod node_authz;
@@ -33,6 +35,7 @@ mod rbac;
 mod rbac_gen_adapter;
 mod resource_gen_adapter;
 mod sa_sig_cache;
+mod serve;
 mod service_alloc;
 mod service_resolver;
 mod state;
@@ -54,13 +57,11 @@ use axum::{
 };
 use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
-use tower_service::Service;
 use u7s_store::SqliteStore;
 
 pub use admission::{build_review, AdmissionContext, AdmissionReview};
 pub use args::Args;
-use auth::{AuthLayer, PeerCertificate};
+use auth::AuthLayer;
 use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
 pub use metrics::record_request_total;
@@ -1279,6 +1280,7 @@ fn build_router(state: AppState) -> Router {
                 .patch(handlers::status::patch_namespaced_resource_status),
         )
         .fallback(fallback_handler)
+        .layer(axum::middleware::from_fn(namespace_guard::guard))
         // API aggregation: for any /apis/{group}/{version}/* request whose group+version
         // matches a registered APIService with a live backend, proxy it there instead of
         // the routes above. Runs as a layer (not a route) so it covers every verb/subpath
@@ -1404,9 +1406,6 @@ async fn reconcile_system_node_binding_subjects(
 }
 
 async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
-    use bytes::Bytes;
-    use u7s_store::Store;
-
     const GROUP: &str = "rbac.authorization.k8s.io";
     // Never actually written to the store — the `put!` macro below overwrites
     // `metadata.creationTimestamp` on every body with `boot_timestamp()` before serializing
@@ -1415,27 +1414,15 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     // silently reintroducing the old "2024-01-01" lie.
     const TS: &str = "TIMESTAMP-OVERWRITTEN-BY-PUT-MACRO";
 
-    // Helper: create-only put for a single seeded RBAC object. Like upstream kube-apiserver,
-    // bootstrap RBAC is stamped once per cluster lifetime: on first boot this creates the
-    // object with `boot_timestamp()`; on every later boot the object already exists, so the
-    // write is rejected (AlreadyExists) and swallowed, leaving whatever an operator has since
-    // changed on it untouched. uid_suffix must be unique across all seeded objects.
+    // Helper: create-or-reconcile a single seeded RBAC object, as upstream's ensureRBACPolicy
+    // does: created when missing, otherwise only missing rules/subjects/labels/annotations are
+    // added (operator additions survive, autoupdate=false opts out, no write when up to date).
+    // uid must be unique across all seeded objects.
     macro_rules! put {
         ($key:expr, $body:expr, $name:expr, $kind:expr) => {{
             let mut body = $body;
             body["metadata"]["creationTimestamp"] = serde_json::Value::from(boot_timestamp());
-            match store
-                .put(&$key, Bytes::from(body.to_string()), Some(0))
-                .await
-            {
-                Ok(_) => tracing::info!("seeded {}: {}", $kind, $name),
-                Err(u7s_store::StoreError::AlreadyExists { .. }) => {
-                    // Already exists — idempotent, and intentionally not re-applied so an
-                    // operator's edit to a seeded Role/ClusterRole/ClusterRoleBinding survives
-                    // a restart instead of being silently reverted.
-                }
-                Err(e) => return Err(anyhow::anyhow!("seed {} {}: {}", $kind, $name, e)),
-            }
+            bootstrap_rbac::reconcile_object(store, &$key, body).await?;
         }};
     }
 
@@ -4480,6 +4467,14 @@ fn configure_accepted_socket(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::warn!("failed to set TCP_NODELAY on accepted connection: {e}");
     }
+    // Reap half-open peers (vanished clients, dropped NAT mappings) that would
+    // otherwise hold a connection slot and descriptor forever.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(15));
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!("failed to set TCP keepalive on accepted connection: {e}");
+    }
 }
 
 async fn serve_tls(
@@ -4487,71 +4482,8 @@ async fn serve_tls(
     app: Router,
     server_config: Arc<rustls::ServerConfig>,
 ) -> anyhow::Result<()> {
-    let acceptor = TlsAcceptor::from(server_config);
-    // Auto-negotiating builder: dispatches each connection to HTTP/1.1 or HTTP/2 by
-    // peeking at the first bytes for the HTTP/2 connection preface. Clients that
-    // saw h2 win ALPN (rustls ServerConfig.alpn_protocols in tls.rs) send that
-    // preface immediately, so in practice ALPN is what steers this — but the
-    // dispatch itself works from the wire, independent of the ALPN result.
-    let conn_builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     tracing::info!("listening on {}", listener.local_addr()?);
-
-    loop {
-        let (tcp_stream, _peer) = listener.accept().await?;
-        configure_accepted_socket(&tcp_stream);
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        let conn_builder = conn_builder.clone();
-
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(tcp_stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("TLS accept error: {e}");
-                    return;
-                }
-            };
-
-            // Extract the peer certificate once per connection, then share it
-            // across all requests on this connection via an Arc.
-            let peer_cert: Arc<Option<PeerCertificate>> = Arc::new(
-                tls_stream
-                    .get_ref()
-                    .1
-                    .peer_certificates()
-                    .and_then(|certs| certs.first())
-                    .map(|c| PeerCertificate(c.as_ref().to_vec())),
-            );
-
-            let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let service = hyper::service::service_fn(move |mut req: axum::http::Request<_>| {
-                let peer_cert = Arc::clone(&peer_cert);
-                let mut app = app.clone();
-                async move {
-                    if let Some(cert) = peer_cert.as_ref().as_ref() {
-                        req.extensions_mut().insert(cert.clone());
-                    }
-                    Ok::<_, std::convert::Infallible>(app.call(req).await.unwrap())
-                }
-            });
-            // serve_connection_with_upgrades() preserves WebSocket-upgrade support for
-            // connections that negotiate HTTP/1.1 (exec/attach/portforward use
-            // `Connection: Upgrade`, which has no HTTP/2 equivalent wired up here).
-            // Without it, hyper sends the 101 Switching Protocols response but never
-            // hands the connection off to the upgrade handler — the on_upgrade callback
-            // never runs, the splice never starts, and kubectl times out with
-            // "unexpected output from server". Connections that negotiate HTTP/2
-            // (kubelet's watch reflectors) skip this path entirely and get hyper's
-            // native h2 stream multiplexing instead of one TCP connection per watch.
-            if let Err(e) = conn_builder
-                .serve_connection_with_upgrades(io, service)
-                .await
-            {
-                tracing::debug!("connection error: {e}");
-            }
-        });
-    }
+    serve::serve_tls_with(listener, app, server_config, serve::ServeLimits::default()).await
 }
 
 #[cfg(test)]
@@ -5502,6 +5434,77 @@ mod tests {
         let store = make_store();
         seed_rbac(&store).await.expect("first seed must not fail");
         seed_rbac(&store).await.expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn restart_on_a_store_with_an_old_kcm_role_grants_kcm_the_new_signers_rule() {
+        // Bootstrap-role fixes (e.g. new certificates.k8s.io/signers grants for KCM) only
+        // reach existing clusters if startup reconciles stale roles, not just creates.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("first seed must not fail");
+
+        let key = keys::group_object_key(
+            GROUP,
+            "clusterroles",
+            None,
+            "system:kube-controller-manager",
+        );
+        let existing = store.get(&key).await.unwrap().expect("kcm role seeded");
+        let mut old: serde_json::Value = serde_json::from_slice(&existing.value).unwrap();
+        let rules = old["rules"].as_array_mut().unwrap();
+        let before = rules.len();
+        rules.retain(|r| r["resources"] != serde_json::json!(["signers"]));
+        assert_eq!(
+            rules.len(),
+            before - 1,
+            "test setup must strip the signers rule"
+        );
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(old.to_string()),
+                Some(existing.revision),
+            )
+            .await
+            .unwrap();
+
+        let attest = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &[],
+            verb: "attest",
+            api_group: "certificates.k8s.io",
+            resource: "signers",
+            subresource: "",
+            namespace: None,
+            name: Some("kubernetes.io/kube-apiserver-serving"),
+            non_resource_url: None,
+        };
+        let new_state = || {
+            state::AppState::new(
+                std::sync::Arc::clone(&store),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            )
+        };
+        let state = new_state();
+        state.init().await;
+        assert!(
+            !state.rbac_index.is_allowed(&attest),
+            "setup: stale role must lack the grant"
+        );
+
+        seed_rbac(&store).await.expect("restart seed must not fail");
+
+        let state = new_state();
+        state.init().await;
+        assert!(
+            state.rbac_index.is_allowed(&attest),
+            "after restart KCM must hold the rule added to the bootstrap role, else upgraded \
+             clusters never receive bootstrap-policy fixes"
+        );
     }
 
     #[tokio::test]
