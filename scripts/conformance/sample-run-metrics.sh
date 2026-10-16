@@ -178,7 +178,7 @@ TAB="$(printf '\t')"
 # genuine failure to the caller.
 # ---------------------------------------------------------------------------
 resolve_apiserver_pid() {
-  lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true
+  u7s_owned_pids apiserver "$WORKDIR" | head -1 || true
 }
 
 resolve_scheduler_pid() {

@@ -14,7 +14,7 @@ Never use absolute paths; they break the permission allowlist and are not portab
 
 - `<VM>` — your assigned Lima VM name, e.g. `lima-node-2`
 - `<PORT>` — your assigned host port, e.g. `6444` (mayor owns `6443`)
-- `<KUBELET_PORT>` — your assigned kubelet host port, e.g. `10251` (mayor owns `10250`)
+- `<KUBELET_PORT>` — your assigned kubelet host port, e.g. `10271` (mayor owns `10270`)
 - `<FOCUS>` — sonobuoy test filter regex, e.g. `AdmissionWebhook`
 
 **Networking note**: all apiservers bind to `127.0.0.1:<PORT>` (host loopback). Port

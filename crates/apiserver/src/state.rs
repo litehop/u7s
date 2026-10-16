@@ -74,24 +74,72 @@ impl ServiceIpAllocator {
 /// Maximum number of concurrent watch streams allowed per authenticated user.
 /// A client that already has this many open watches gets HTTP 429 on the next attempt.
 ///
-/// The kube-controller-manager's garbage collector opens one watch per registered
-/// resource type (50+ watches for all core + apps/v1 + extension resources). The
-/// limit must be high enough for the GC to establish all its watches simultaneously.
-pub const MAX_WATCHES_PER_CLIENT: usize = 64;
+/// Must stay above 100: sonobuoy runs the e2e suite as the non-exempt
+/// `system:serviceaccount:sonobuoy:sonobuoy-serviceaccount` (not the admin kubeconfig), and the
+/// "concurrent watches in same order" conformance spec opens 100 simultaneous watches as that one
+/// identity (64 fails it with 429s). The aggregate is bounded by `MAX_WATCHES_GLOBAL` instead.
+pub const MAX_WATCHES_PER_CLIENT: usize = 256;
+// A cap of 64 fails the 100-watch conformance spec with 429s.
+const _: () = assert!(MAX_WATCHES_PER_CLIENT > 100);
 
-/// Per-client watch stream concurrency limiter.
-///
-/// Holds a Semaphore per authenticated username. Each watch stream acquires one
-/// permit for its lifetime and releases it when the stream ends (RAII). Attempts
-/// beyond MAX_WATCHES_PER_CLIENT are rejected with HTTP 429.
-#[derive(Clone, Default)]
+/// Server-wide cap on concurrent watch streams from ordinary identities. The per-client
+/// limit keys on username, so anyone who can mint ServiceAccounts gets a fresh
+/// `MAX_WATCHES_PER_CLIENT` budget per SA; this bounds the aggregate (tasks, fds,
+/// broadcast receivers). Half the 1024-connection cap in `serve.rs`, leaving the rest for
+/// short requests. Per-watch cost (TLS session, h2 stream, task, receiver) is assumed, not
+/// measured, at ~50 KiB: 512 watches is ~25 MiB on a ~1 GiB host.
+pub const MAX_WATCHES_GLOBAL: usize = 512;
+
+/// Seconds a rejected watch client is told to wait before retrying.
+pub const WATCH_RETRY_AFTER_SECONDS: u64 = 1;
+
+/// Identities whose watches bypass both the per-client and global caps, so a tenant
+/// exhausting the pool cannot lock out the control plane (and the controller-manager's
+/// 100+ watches fit): the provisioned admin (CN=admin, O=system:masters), kubelets
+/// (`system:node:<name>`, O=system:nodes), the controller-manager and the scheduler.
+/// Mirrors upstream APF's exempt (system:masters), system-nodes and system-leader-election
+/// flow schemas. Matched on username, which is only as trustworthy as the cluster CA's
+/// issuance: a principal allowed to approve and sign `kubernetes.io/kube-apiserver-client`
+/// CSRs can mint a certificate with any CN here (upstream's signer likewise forbids only
+/// O=system:masters), so that RBAC grant is effectively a control-plane grant.
+pub fn is_system_priority_username(username: &str) -> bool {
+    matches!(
+        username,
+        "admin" | "system:kube-controller-manager" | "system:kube-scheduler"
+    ) || username.starts_with("system:node:")
+}
+
+/// Watch stream concurrency limiter: a semaphore per authenticated username plus one
+/// server-wide semaphore. Each watch stream acquires permits for its lifetime and releases
+/// them when the stream ends (RAII). Attempts beyond MAX_WATCHES_PER_CLIENT, or beyond the
+/// global cap for ordinary identities, are rejected with HTTP 429.
+#[derive(Clone)]
 pub struct WatchLimitState {
     inner: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    global: Arc<Semaphore>,
+}
+
+impl Default for WatchLimitState {
+    fn default() -> Self {
+        Self::with_global_capacity(MAX_WATCHES_GLOBAL)
+    }
 }
 
 impl WatchLimitState {
     pub fn new() -> Self {
         WatchLimitState::default()
+    }
+
+    pub fn with_global_capacity(capacity: usize) -> Self {
+        WatchLimitState {
+            inner: Arc::default(),
+            global: Arc::new(Semaphore::new(capacity)),
+        }
+    }
+
+    /// Take one slot from the server-wide pool, or `None` when it is exhausted.
+    pub fn try_acquire_global(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.global.clone().try_acquire_owned().ok()
     }
 
     /// Return the Semaphore for the given client key, creating one if absent.

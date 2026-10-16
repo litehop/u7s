@@ -20,18 +20,20 @@ use crate::types::{
     GroupVersionForDiscovery,
 };
 
-// Must track the Kubernetes release the conformance suite and CI target.
+// goVersion/compiler are fixed placeholders: client-go and kubectl only
+// display them, and a non-Go value risks tooling that expects the Go format.
 pub async fn version() -> Json<serde_json::Value> {
+    let (major, minor) = u7s_version::major_minor();
     Json(serde_json::json!({
-        "major": "1",
-        "minor": "37",
-        "gitVersion": "v1.37.1",
-        "gitCommit": "0000000000000000000000000000000000000000",
-        "gitTreeState": "clean",
-        "buildDate": "1970-01-01T00:00:00Z",
+        "major": major,
+        "minor": minor,
+        "gitVersion": u7s_version::git_version(),
+        "gitCommit": u7s_version::GIT_COMMIT,
+        "gitTreeState": if u7s_version::RELEASE == "dev" { "unknown" } else { "clean" },
+        "buildDate": u7s_version::BUILD_DATE,
         "goVersion": "go1.24.0",
         "compiler": "gc",
-        "platform": "linux/amd64"
+        "platform": u7s_version::platform()
     }))
 }
 
@@ -2760,6 +2762,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn version_endpoint_reports_build_metadata_not_prerelease_so_helm_kube_version_checks_pass(
+    ) {
+        let v = version().await.0;
+        let git_version = v["gitVersion"].as_str().unwrap();
+        assert!(
+            git_version.starts_with(&format!("v{}+u7s-", u7s_version::K8S_VERSION)),
+            "{git_version}"
+        );
+        assert_eq!(v["major"], "1");
+        assert_eq!(v["minor"], "37");
+        assert_ne!(
+            v["buildDate"], "1970-01-01T00:00:00Z",
+            "a faked epoch build date misleads operators"
+        );
+    }
+
     /// Every protobuf-decoded field outside the vendored `generated.proto` schema is silently
     /// dropped, and the descriptor-driven completeness oracles only know the vendored schema —
     /// so a `/version` bump without re-vendoring leaves the whole suite green while new upstream
@@ -2771,14 +2790,7 @@ mod tests {
                 .join("../proto-generated/proto-include/UPSTREAM_VERSION"),
         )
         .expect("proto-include/UPSTREAM_VERSION must record the kubernetes tag the protos were vendored from");
-        let advertised = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(version())
-            .0["gitVersion"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let advertised = format!("v{}", u7s_version::K8S_VERSION);
         assert_eq!(
             recorded.trim(),
             advertised,

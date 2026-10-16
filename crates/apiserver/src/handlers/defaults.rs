@@ -1091,6 +1091,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if group.is_empty() && (plural == "configmaps" || plural == "secrets") {
         validate_data_keys(obj, plural)?;
     }
+    if group.is_empty() && plural == "secrets" {
+        crate::bootstrap_token::validate_secret(obj)?;
+    }
     if group == "networking.k8s.io" && plural == "networkpolicies" {
         validate_network_policy_ports(obj)?;
     }
@@ -4663,6 +4666,20 @@ mod tests {
             result.unwrap_err().contains("Secret.data"),
             "error must reference Secret.data"
         );
+    }
+
+    /// A bootstrap-token Secret whose name does not match its token-id must be rejected at
+    /// the API: the authenticator only looks up `bootstrap-token-<id>`, so a mis-named one
+    /// would look like a live join token while authenticating nobody.
+    #[test]
+    fn validate_resource_rejects_misnamed_bootstrap_token_secret() {
+        let obj = serde_json::json!({
+            "kind": "Secret",
+            "metadata": {"name": "bootstrap-token-zzzzzz", "namespace": "kube-system"},
+            "type": "bootstrap.kubernetes.io/token",
+            "data": {"token-id": "YWJjZGVm", "token-secret": "MDEyMzQ1Njc4OWFiY2RlZg=="}
+        });
+        assert!(validate_resource("", "secrets", &obj).is_err());
     }
 
     // ---------------------------------------------------------------------------
