@@ -24,6 +24,7 @@ pub mod proxy;
 pub mod resource;
 pub mod scale;
 pub mod status;
+pub mod storage_versions;
 pub mod storagemigration;
 pub mod stream;
 pub mod table;

@@ -16,8 +16,7 @@ use crate::state::{
 use crate::types::{
     APIGroup, APIGroupDiscovery, APIGroupDiscoveryList, APIGroupDiscoveryListMeta,
     APIGroupDiscoveryMeta, APIGroupList, APIResourceDiscovery, APISubresourceDiscovery,
-    APIVersionDiscovery, APIVersions, ApiResourceList, DiscoveryResponseKind,
-    GroupVersionForDiscovery,
+    APIVersionDiscovery, APIVersions, DiscoveryResponseKind, GroupVersionForDiscovery,
 };
 
 // goVersion/compiler are fixed placeholders: client-go and kubectl only
@@ -151,8 +150,11 @@ pub async fn api_versions<S: Store>(
     Json(APIVersions::v1(state.server_address.clone())).into_response()
 }
 
-pub async fn api_v1_resources() -> Json<ApiResourceList> {
-    Json(ApiResourceList::v1())
+pub async fn api_v1_resources() -> Json<serde_json::Value> {
+    Json(with_storage_version_hashes(
+        "",
+        api_v1_resource_list_value(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +649,30 @@ fn storage_version_hash(group: &str, version: &str, kind: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(&digest[..8])
 }
 
+/// Stamp `storageVersionHash` on every top-level built-in resource of a legacy discovery list.
+/// Subresources never carry one.
+fn with_storage_version_hashes(group: &str, mut list: serde_json::Value) -> serde_json::Value {
+    let Some(resources) = list["resources"].as_array_mut() else {
+        return list;
+    };
+    for r in resources {
+        let (Some(name), Some(kind)) = (r["name"].as_str(), r["kind"].as_str()) else {
+            continue;
+        };
+        if name.contains('/') {
+            continue;
+        }
+        let Some((storage_group, storage_version)) =
+            super::storage_versions::storage_gv(group, name)
+        else {
+            continue;
+        };
+        let hash = storage_version_hash(storage_group, storage_version, kind);
+        r["storageVersionHash"] = serde_json::Value::String(hash);
+    }
+    list
+}
+
 /// Look up CRD-backed resources for a group/version from the store and return discovery entries.
 async fn crd_group_resources<S: Store>(
     state: &AppState<S>,
@@ -913,7 +939,7 @@ pub async fn api_group_resources<S: Store>(
     let static_list = static_group_resources(group.as_str(), version.as_str());
 
     if let Some(list) = static_list {
-        return Json(list).into_response();
+        return Json(with_storage_version_hashes(&group, list)).into_response();
     }
 
     // Dynamic: query CRDs that belong to this group.
@@ -3381,6 +3407,115 @@ mod tests {
             storage_version_hash("stable.example.com", "v1", "CronTab"),
             "EdX2FP+L0js="
         );
+    }
+
+    fn hash_of(list: &serde_json::Value, resource: &str) -> Option<String> {
+        list["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == resource)
+            .unwrap_or_else(|| panic!("{resource} not listed"))["storageVersionHash"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    // Expected values derived independently with
+    // `printf '%s' <group>/<version>/<Kind> | openssl dgst -sha256 -binary | head -c 8 | openssl base64`:
+    //   /v1/Pod -> xPOwRZ+Yhw8=, apps/v1/Deployment -> 8aSe+NMegvE=.
+    #[test]
+    fn builtin_pod_and_deployment_hashes_match_known_answers_so_migration_tools_detect_storage_changes(
+    ) {
+        let core = with_storage_version_hashes("", api_v1_resource_list_value());
+        assert_eq!(hash_of(&core, "pods").as_deref(), Some("xPOwRZ+Yhw8="));
+        let apps =
+            with_storage_version_hashes("apps", static_group_resources("apps", "v1").unwrap());
+        assert_eq!(
+            hash_of(&apps, "deployments").as_deref(),
+            Some("8aSe+NMegvE=")
+        );
+    }
+
+    // Upstream stores HPAs at autoscaling/v2, so /apis/autoscaling/v1 advertises the v2 hash:
+    // sha256("autoscaling/v2/HorizontalPodAutoscaler") first 8 bytes = qwQve8ut294=. A hash
+    // derived from the served v1 would make migration tools see a spurious storage change.
+    #[test]
+    fn multi_version_group_carries_storage_version_hash_on_every_served_version() {
+        for version in ["v1", "v2"] {
+            let list = with_storage_version_hashes(
+                "autoscaling",
+                static_group_resources("autoscaling", version).unwrap(),
+            );
+            assert_eq!(
+                hash_of(&list, "horizontalpodautoscalers").as_deref(),
+                Some("qwQve8ut294="),
+                "autoscaling/{version}"
+            );
+        }
+    }
+
+    // events.k8s.io events share core v1 Event storage: sha256("/v1/Event") = r2yiGXH7wu8=.
+    #[test]
+    fn events_k8s_io_events_hash_uses_core_storage_so_both_apis_report_one_storage_version() {
+        let list = with_storage_version_hashes(
+            "events.k8s.io",
+            static_group_resources("events.k8s.io", "v1").unwrap(),
+        );
+        assert_eq!(hash_of(&list, "events").as_deref(), Some("r2yiGXH7wu8="));
+    }
+
+    // Upstream publishes the hash only on resources, never subresources; a hash there would be
+    // read by migration tools as a second, bogus storage resource.
+    #[test]
+    fn subresources_omit_storage_version_hash_so_migration_tools_see_only_real_resources() {
+        let core = with_storage_version_hashes("", api_v1_resource_list_value());
+        let apps =
+            with_storage_version_hashes("apps", static_group_resources("apps", "v1").unwrap());
+        let mut seen = 0;
+        for list in [&core, &apps] {
+            for r in list["resources"].as_array().unwrap() {
+                if r["name"].as_str().unwrap().contains('/') {
+                    seen += 1;
+                    assert!(
+                        r.get("storageVersionHash").is_none(),
+                        "{} must not carry a hash",
+                        r["name"]
+                    );
+                }
+            }
+        }
+        assert!(seen > 0, "test must exercise at least one subresource");
+    }
+
+    // A built-in served without a storage-table entry silently loses its hash, so storage
+    // migration tooling can no longer detect when its storage version changes.
+    #[test]
+    fn every_served_builtin_has_a_storage_version_entry_or_is_declared_not_persisted() {
+        let mut lists = vec![("", api_v1_resource_list_value())];
+        let mut gvs: Vec<(&str, &str)> = STATIC_GROUPS.to_vec();
+        gvs.extend([
+            ("autoscaling", "v1"),
+            ("certificates.k8s.io", "v1beta1"),
+            ("coordination.k8s.io", "v1alpha2"),
+        ]);
+        for (g, v) in gvs {
+            lists.push((g, static_group_resources(g, v).unwrap()));
+        }
+        for (group, list) in lists {
+            for r in list["resources"].as_array().unwrap() {
+                let name = r["name"].as_str().unwrap();
+                if name.contains('/') {
+                    continue;
+                }
+                let persisted = super::super::storage_versions::storage_gv(group, name).is_some();
+                let declared =
+                    super::super::storage_versions::NOT_PERSISTED.contains(&(group, name));
+                assert!(
+                    persisted != declared,
+                    "{group}/{name}: needs exactly one of a storage-version entry or a NOT_PERSISTED entry"
+                );
+            }
+        }
     }
 
     // Clients (storage migrators) compare the hash across versions to detect storage-version
