@@ -162,6 +162,29 @@ teardown_vm() {
   fi
 }
 
+# Succeeds only when <workdir> resolves (physically, so symlinks and ".."
+# cannot escape) to a strict subdirectory of <checkout>/temp for some checkout
+# listed by `git worktree list` (main checkout and every linked worktree).
+# Full mode runs `rm -rf` on it, so anything else -- $PWD, a repo root, $HOME,
+# / -- is refused.
+workdir_allowed() {
+  local wd="$1" p rest="" base wt
+  case "/$wd/" in */../*) return 1 ;; esac
+  p="$wd"
+  while [ ! -d "$p" ]; do
+    rest="/$(basename "$p")$rest"
+    p="$(dirname "$p")"
+  done
+  p="$(cd "$p" && pwd -P)$rest"
+  while IFS= read -r wt; do
+    [ -d "$wt" ] || continue
+    base="$(cd "$wt" && pwd -P)/temp"
+    if [ -d "$base" ]; then base="$(cd "$base" && pwd -P)"; fi
+    case "$p" in "$base"/?*) return 0 ;; esac
+  done < <(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+  return 1
+}
+
 main() {
   local WORKDIR="$PWD/temp/u7s"
   local VM_NAME="${U7S_VM_NAME:-lima-node}"
@@ -199,6 +222,12 @@ main() {
       /*) ;;
       *) WORKDIR="$PWD/${WORKDIR#./}" ;;
     esac
+  fi
+
+  # Runs before any kill so a refusal has no side effects in either mode.
+  if ! workdir_allowed "$WORKDIR"; then
+    echo "[reset] ERROR: refusing --workdir $WORKDIR: it must be a strict subdirectory of <checkout>/temp/ for a checkout of this repo (git worktree list), with no '..' or symlink escape" >&2
+    exit 1
   fi
 
   echo "=== [reset] Conformance teardown ==="

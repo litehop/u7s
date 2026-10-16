@@ -44,10 +44,10 @@ spawn() {
 
 # A is the workdir acting. B embeds A as a path suffix, C extends A, D differs
 # from A only where the unescaped '.' wildcard would match.
-A="$T/wd/a.b"
+A="$T/temp/a.b"
 B="/zz$A"
 C="${A}2"
-D="$T/wd/aXb"
+D="$T/temp/aXb"
 
 # spawn_all <argv fmt with @ for the path>: sets PA PB PC PD.
 spawn_all() {
@@ -108,7 +108,7 @@ spawn_all "$APISERVER_FMT"; AP=("$PA" "$PB" "$PC" "$PD")
 spawn_all "$SCHED_FMT"; S=("$PA" "$PB" "$PC" "$PD")
 spawn_all "$KONN_FMT"; K=("$PA" "$PB" "$PC" "$PD")
 RESET_RC=0
-( cd "$REPO" && bash scripts/conformance/reset.sh --host-only --workdir "$A" ) >"$T/reset.out" 2>&1 || RESET_RC=$?
+( git init -q "$T" && cd "$T" && bash "$REPO/scripts/conformance/reset.sh" --host-only --workdir "$A" ) >"$T/reset.out" 2>&1 || RESET_RC=$?
 sleep 0.5
 assert_true "reset.sh --host-only exits 0 after reaping its own stack (rc=$RESET_RC)" [ "$RESET_RC" = 0 ]
 for i in 0 1 2 3; do
