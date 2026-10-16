@@ -143,7 +143,11 @@ impl RbacIndex {
             .as_str()
             .and_then(|s| s.parse::<u64>().ok());
 
-        if key.contains("/clusterroles/") {
+        let Some(parsed) = parse_rbac_key(key) else {
+            return;
+        };
+
+        if let RbacKey::ClusterRole { name } = parsed {
             if let Ok(role) = serde_json::from_value::<RbacRole>(value.clone()) {
                 if accept_update(
                     &mut inner.resource_versions,
@@ -152,11 +156,10 @@ impl RbacIndex {
                     key,
                     incoming_rv,
                 ) {
-                    let name = extract_last_segment(key);
-                    inner.cluster_roles.insert(name, role.rules);
+                    inner.cluster_roles.insert(name.to_owned(), role.rules);
                 }
             }
-        } else if key.contains("/clusterrolebindings/") {
+        } else if let RbacKey::ClusterRoleBinding = parsed {
             if let Ok(binding) = serde_json::from_value::<RbacBinding>(value.clone()) {
                 if accept_update(
                     &mut inner.resource_versions,
@@ -170,7 +173,7 @@ impl RbacIndex {
                     inner.cluster_bindings.push((key.to_owned(), binding));
                 }
             }
-        } else if key.contains("/roles/") {
+        } else if let RbacKey::Role { namespace, name } = parsed {
             if let Ok(role) = serde_json::from_value::<RbacRole>(value.clone()) {
                 if accept_update(
                     &mut inner.resource_versions,
@@ -179,16 +182,16 @@ impl RbacIndex {
                     key,
                     incoming_rv,
                 ) {
-                    let ns = extract_namespace(key).unwrap_or_default();
-                    let name = extract_last_segment(key);
-                    inner.roles.insert((ns, name), role.rules);
+                    inner
+                        .roles
+                        .insert((namespace.to_owned(), name.to_owned()), role.rules);
                 }
             }
-        } else if key.contains("/rolebindings/") {
+        } else if let RbacKey::RoleBinding { namespace } = parsed {
             if let Ok(mut binding) = serde_json::from_value::<RbacBinding>(value.clone()) {
                 // The namespace comes from the key path
                 // (/apis/rbac.../v1/namespaces/<ns>/rolebindings/<name>), never the body.
-                binding.namespace = extract_namespace(key);
+                binding.namespace = Some(namespace.to_owned());
                 if accept_update(
                     &mut inner.resource_versions,
                     &mut inner.resource_version_lru,
@@ -223,17 +226,20 @@ impl RbacIndex {
             key,
         );
 
-        if key.contains("/clusterroles/") {
-            let name = extract_last_segment(key);
-            inner.cluster_roles.remove(&name);
-        } else if key.contains("/clusterrolebindings/") {
-            inner.cluster_bindings.retain(|(k, _)| k != key);
-        } else if key.contains("/roles/") {
-            let ns = extract_namespace(key).unwrap_or_default();
-            let name = extract_last_segment(key);
-            inner.roles.remove(&(ns, name));
-        } else if key.contains("/rolebindings/") {
-            inner.namespace_bindings.retain(|(k, _)| k != key);
+        match parse_rbac_key(key) {
+            Some(RbacKey::ClusterRole { name }) => {
+                inner.cluster_roles.remove(name);
+            }
+            Some(RbacKey::ClusterRoleBinding) => {
+                inner.cluster_bindings.retain(|(k, _)| k != key);
+            }
+            Some(RbacKey::Role { namespace, name }) => {
+                inner.roles.remove(&(namespace.to_owned(), name.to_owned()));
+            }
+            Some(RbacKey::RoleBinding { .. }) => {
+                inner.namespace_bindings.retain(|(k, _)| k != key);
+            }
+            None => {}
         }
     }
 
@@ -584,22 +590,32 @@ fn touch_existing(
     lru.insert(tick, key.to_owned());
 }
 
-fn extract_last_segment(key: &str) -> String {
-    key.split('/')
-        .rfind(|s| !s.is_empty())
-        .unwrap_or("")
-        .to_owned()
+#[derive(Debug, PartialEq)]
+enum RbacKey<'a> {
+    ClusterRole { name: &'a str },
+    ClusterRoleBinding,
+    Role { namespace: &'a str, name: &'a str },
+    RoleBinding { namespace: &'a str },
 }
 
-/// Extract namespace from key segments like .../namespaces/<ns>/roles/<name>
-fn extract_namespace(key: &str) -> Option<String> {
+/// Classify an API key by segment position, never by substring: a namespace or
+/// object may be literally named `clusterroles`/`clusterrolebindings`, so only
+/// the segment at the kind position decides the kind.
+///
+///   /apis/rbac.authorization.k8s.io/<ver>/<plural>/<name>
+///   /apis/rbac.authorization.k8s.io/<ver>/namespaces/<ns>/<plural>/<name>
+fn parse_rbac_key(key: &str) -> Option<RbacKey<'_>> {
     let parts: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
-    for i in 0..parts.len().saturating_sub(1) {
-        if parts[i] == "namespaces" {
-            return Some(parts[i + 1].to_owned());
-        }
+    let ["apis", "rbac.authorization.k8s.io", _version, rest @ ..] = parts.as_slice() else {
+        return None;
+    };
+    match rest {
+        ["clusterroles", name] => Some(RbacKey::ClusterRole { name }),
+        ["clusterrolebindings", _] => Some(RbacKey::ClusterRoleBinding),
+        ["namespaces", namespace, "roles", name] => Some(RbacKey::Role { namespace, name }),
+        ["namespaces", namespace, "rolebindings", _] => Some(RbacKey::RoleBinding { namespace }),
+        _ => None,
     }
-    None
 }
 
 fn subject_matches(binding: &RbacBinding, username: &str, groups: &[String]) -> bool {
@@ -1184,6 +1200,119 @@ mod tests {
             "'*/log' must not match a different subresource (status) — the wildcard is \
              scoped to the exact subresource string, not all subresources"
         );
+    }
+
+    #[test]
+    fn rolebinding_in_namespace_named_clusterrolebindings_is_not_cluster_wide_escalation() {
+        // Anyone who can create namespaces can create one literally named
+        // "clusterrolebindings". A substring classifier would index that
+        // namespace's RoleBinding as a ClusterRoleBinding, turning a
+        // namespace-admin into a cluster-wide secret reader.
+        let idx = RbacIndex::new();
+        let (cr_key, cr_val) = make_cluster_role(
+            "secret-reader",
+            json!([{ "apiGroups": [""], "resources": ["secrets"], "verbs": ["get"] }]),
+        );
+        let (rb_key, rb_val) = make_role_binding(
+            "clusterrolebindings",
+            "mallory-rb",
+            "secret-reader",
+            json!([{ "kind": "User", "name": "mallory" }]),
+        );
+        let mut rb_val = rb_val;
+        rb_val["roleRef"]["kind"] = json!("ClusterRole");
+        idx.apply_object(&cr_key, &cr_val);
+        idx.apply_object(&rb_key, &rb_val);
+
+        let groups: Vec<String> = vec![];
+        assert!(
+            idx.is_allowed(&req(
+                "mallory",
+                &groups,
+                "get",
+                "secrets",
+                "",
+                Some("clusterrolebindings"),
+                None
+            )),
+            "the RoleBinding must still grant access inside its own namespace"
+        );
+        assert!(
+            !idx.is_allowed(&req(
+                "mallory",
+                &groups,
+                "get",
+                "secrets",
+                "",
+                Some("kube-system"),
+                None
+            )),
+            "RoleBinding in namespace 'clusterrolebindings' must not become a cluster-wide grant"
+        );
+    }
+
+    #[test]
+    fn role_in_namespace_named_clusterroles_cannot_overwrite_cluster_role_rules() {
+        // A Role named "cluster-admin" in a namespace literally named
+        // "clusterroles" must not replace the real ClusterRole's rules; doing
+        // so lets a namespace-admin rewrite what cluster-admin means.
+        let idx = RbacIndex::new();
+        let (cr_key, cr_val) = make_cluster_role(
+            "cluster-admin",
+            json!([{ "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }]),
+        );
+        idx.apply_object(&cr_key, &cr_val);
+        let (role_key, role_val) = make_role(
+            "clusterroles",
+            "cluster-admin",
+            json!([{ "apiGroups": [""], "resources": ["configmaps"], "verbs": ["get"] }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        assert_eq!(
+            idx.cluster_role_rules("cluster-admin")[0].resources,
+            vec!["*".to_owned()],
+            "ClusterRole cluster-admin must keep its own rules"
+        );
+        assert_eq!(
+            idx.role_rules("clusterroles", "cluster-admin").len(),
+            1,
+            "the namespaced Role must be indexed as a Role"
+        );
+
+        idx.remove_object(&role_key);
+        assert!(
+            !idx.cluster_role_rules("cluster-admin").is_empty(),
+            "deleting the namespaced Role must not delete the ClusterRole"
+        );
+    }
+
+    #[test]
+    fn real_cluster_scoped_keys_still_classified_as_cluster_scoped() {
+        assert_eq!(
+            parse_rbac_key("/apis/rbac.authorization.k8s.io/v1/clusterroles/x"),
+            Some(RbacKey::ClusterRole { name: "x" })
+        );
+        assert_eq!(
+            parse_rbac_key("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/x"),
+            Some(RbacKey::ClusterRoleBinding)
+        );
+        assert_eq!(
+            parse_rbac_key("/apis/rbac.authorization.k8s.io/v1/namespaces/clusterroles/roles/x"),
+            Some(RbacKey::Role {
+                namespace: "clusterroles",
+                name: "x"
+            })
+        );
+        assert_eq!(
+            parse_rbac_key(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/clusterrolebindings/rolebindings/x"
+            ),
+            Some(RbacKey::RoleBinding {
+                namespace: "clusterrolebindings"
+            })
+        );
+        assert_eq!(parse_rbac_key("/apis/other.io/v1/clusterroles/x"), None);
     }
 
     #[test]
