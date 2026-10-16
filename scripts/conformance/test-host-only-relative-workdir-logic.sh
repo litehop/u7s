@@ -106,6 +106,61 @@ for i in 0 1 2 3; do
   assert_alive "relative --workdir leaves the other worktree's ${KINDS[$i]} alone (killing another worker's stack breaks their run)" "${B_PIDS[$i]}"
 done
 
+# An empty --workdir must be refused before any kill: it would canonicalise to
+# "$PWD/", a prefix of every worktree-local path.
+WT_C="$TMPROOT/wt-c"
+mkdir -p "$WT_C/temp/u7s"
+SPAWNED=()
+spawn_stack "$WT_C/temp/u7s"
+C_PIDS=("${SPAWNED[@]}")
+sleep 0.3
+
+set +e
+OUT="$(cd "$WT_C" && bash "$SCRIPT" --host-only --workdir "" 2>&1)"
+EXIT=$?
+set -e
+
+if [ "$EXIT" -ne 0 ] && grep -q -- "--workdir must not be empty" <<<"$OUT"; then
+  echo "PASS: empty --workdir is rejected with a clear error"
+  PASS=$(( PASS + 1 ))
+else
+  echo "FAIL: empty --workdir: exit $EXIT (expected non-zero + 'must not be empty'), output: $OUT"
+  FAIL=$(( FAIL + 1 ))
+fi
+for i in 0 1 2 3; do
+  assert_alive "empty --workdir kills nothing (${KINDS[$i]}; a rejected run must not touch any stack)" "${C_PIDS[$i]}"
+done
+
+# A process that ignores SIGTERM survives the kill attempt; --host-only must
+# say so and exit 1, else a worker believes the port slot is free when it is not.
+WT_D="$TMPROOT/wt-d"
+mkdir -p "$WT_D/temp/u7s"
+bash -c "trap '' TERM; exec -a 'u7s-scheduler --kubeconfig $WT_D/temp/u7s/kubeconfig-scheduler' sleep 60" >/dev/null 2>&1 &
+STUBBORN_PID=$!
+LEFTOVER_PIDS+=("$STUBBORN_PID")
+sleep 0.3
+
+set +e
+OUT="$(cd "$WT_D" && bash "$SCRIPT" --host-only --workdir ./temp/u7s 2>&1)"
+EXIT=$?
+set -e
+
+if [ "$EXIT" -eq 1 ]; then
+  echo "PASS: SIGTERM-ignoring survivor makes --host-only exit 1"
+  PASS=$(( PASS + 1 ))
+else
+  echo "FAIL: SIGTERM-ignoring survivor: --host-only exit $EXIT (expected 1), output: $OUT"
+  FAIL=$(( FAIL + 1 ))
+fi
+if grep -q "scheduler (PID $STUBBORN_PID) still alive" <<<"$OUT"; then
+  echo "PASS: survivor error names the component and PID"
+  PASS=$(( PASS + 1 ))
+else
+  echo "FAIL: survivor not named in output: $OUT"
+  FAIL=$(( FAIL + 1 ))
+fi
+assert_alive "SIGTERM-ignoring dummy really survived (guards the test itself)" "$STUBBORN_PID"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then

@@ -180,6 +180,13 @@ main() {
     esac
   done
 
+  # An empty value would canonicalise to "$PWD/" and later feed the kill
+  # patterns and the `rm -rf` below.
+  if [ -z "$WORKDIR" ]; then
+    echo "[reset] ERROR: --workdir must not be empty" >&2
+    exit 1
+  fi
+
   # The start scripts launch processes with WORKDIR="$(cd "$WORKDIR" && pwd)",
   # so the kill patterns only match that exact canonical string: a relative or
   # unclean spelling ("$PWD/./temp/u7s") would match nothing. Canonicalise the
