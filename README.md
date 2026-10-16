@@ -49,6 +49,27 @@ apply upstream's release manifest:
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 ```
 
+## Upgrading
+
+Upgrade in place by re-running the install script of the newer release on each
+node. It needs no token and mints nothing.
+
+- **Control plane**: re-run with no flags. The binaries and unit files are
+  replaced and the services restarted; the CA and service-account keys
+  (`/var/lib/u7s/ca.key`, `ca.crt`, `sa.key`, `sa.pub`) and the cluster
+  state are kept, and the script fails if those keys changed.
+- **Joined worker**: re-run with no flags (no `--join`, no token). The script
+  recognises the node's identity (`/var/lib/u7s/kubeconfig`, `ca.pem`,
+  `kubelet-client.crt` and `.key`, plus the kubelet's rotated client cert in
+  `/var/lib/u7s/kubelet/pki/`), swaps the kubelet binary and config,
+  restarts kubelet, and waits for the Node to report Ready again. The
+  kubelet keeps its own rotating client and serving certificates.
+- **Expired or missing worker identity**: a worker offline past its client
+  certificate lifetime fails with an error naming the state to clear
+  (`systemctl stop kubelet; rm -rf /var/lib/u7s`); re-join it with a fresh
+  `install.sh --mint-join-token` token. A worker whose identity files are
+  missing needs a join too.
+
 ## Running on a 1 GiB host
 
 On a 1 vCPU / 1 GiB Ubuntu host the stack boots to Ready in about a minute
