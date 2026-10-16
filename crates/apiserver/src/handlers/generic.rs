@@ -978,17 +978,40 @@ pub(crate) fn check_crb_escalation<S: Store>(
     Ok(())
 }
 
-/// Escalation prevention for ClusterRole writes.
+/// Upstream `EscalationAllowed` || `RoleEscalationAuthorized`: members of
+/// system:masters, or callers holding the `escalate` verb on the role object, may
+/// author Role/ClusterRole rules without holding them.
+fn role_authoring_escalation_allowed<S: Store>(
+    resource: &str,
+    namespace: Option<&str>,
+    role_name: &str,
+    user: &UserInfo,
+    state: &AppState<S>,
+) -> bool {
+    if user.groups.iter().any(|g| g == "system:masters") {
+        return true;
+    }
+    state.rbac_index.is_allowed(&AuthzRequest {
+        username: &user.username,
+        groups: &user.groups,
+        verb: "escalate",
+        api_group: RBAC_GROUP,
+        resource,
+        subresource: "",
+        namespace,
+        name: Some(role_name),
+        non_resource_url: None,
+    })
+}
+
+/// Escalation prevention for ClusterRole writes (create, replace, patch, SSA).
 ///
-/// When a ClusterRole is created or updated with non-empty rules, and any
-/// ClusterRoleBinding already references that role, the caller must already
-/// hold every rule in the new role spec.  Without this check a user can
-/// do: (1) create CRB → references non-existent role → CRB check skipped;
-/// (2) create ClusterRole with wildcard rules → instant cluster-admin.
-///
-/// The check is skipped when the role has no rules (nothing to escalate)
-/// or when no binding references it yet (role-first ordering).
-/// system:masters members bypass via the RBAC cluster-admin binding.
+/// Mirrors upstream clusterrole/policybased: unless the caller is in system:masters or
+/// holds `escalate` on the ClusterRole, they must hold every rule they write, whether or
+/// not any binding references the role yet. Skipping unbound or empty roles lets a caller
+/// create an empty role, bind it, then widen it. A role with a non-empty aggregationRule
+/// additionally requires `*` on `*.*` and every non-resource URL, since it can gather
+/// any rules.
 ///
 /// Returns `Ok(())` if the check passes, or `Err(403 Forbidden)`.
 pub(crate) fn check_clusterrole_escalation<S: Store>(
@@ -1001,37 +1024,57 @@ pub(crate) fn check_clusterrole_escalation<S: Store>(
     if group != RBAC_GROUP || plural != CLUSTER_ROLES {
         return Ok(());
     }
+    let role_name = body["metadata"]["name"].as_str().unwrap_or("");
+    if role_authoring_escalation_allowed(CLUSTER_ROLES, None, role_name, user, state) {
+        return Ok(());
+    }
     let role_rules = crate::rbac::RbacRole::deserialize(body)
         .map(|r| r.rules)
         .unwrap_or_default();
-    if role_rules.is_empty() {
-        return Ok(());
-    }
-    let role_name = body["metadata"]["name"].as_str().unwrap_or("");
-    if !state.rbac_index.clusterrole_has_bindings(role_name) {
-        return Ok(());
-    }
     if !user_holds_all_rules(&user.username, &user.groups, &role_rules, &state.rbac_index) {
         return Err(Status::forbidden(
-            "cannot escalate privileges: ClusterRole is already bound and user does not hold all its rules".to_string(),
+            "cannot escalate privileges: user does not hold all rules of the ClusterRole and lacks the escalate verb".to_string(),
         ));
+    }
+    let has_aggregation = body["aggregationRule"]["clusterRoleSelectors"]
+        .as_array()
+        .is_some_and(|s| !s.is_empty());
+    if has_aggregation {
+        let full_authority = [
+            crate::rbac::PolicyRule {
+                api_groups: vec!["*".into()],
+                resources: vec!["*".into()],
+                verbs: vec!["*".into()],
+                resource_names: vec![],
+                non_resource_urls: vec![],
+            },
+            crate::rbac::PolicyRule {
+                api_groups: vec![],
+                resources: vec![],
+                verbs: vec!["*".into()],
+                resource_names: vec![],
+                non_resource_urls: vec!["*".into()],
+            },
+        ];
+        if !user_holds_all_rules(
+            &user.username,
+            &user.groups,
+            &full_authority,
+            &state.rbac_index,
+        ) {
+            return Err(Status::forbidden(
+                "must have cluster-admin privileges to use the aggregationRule".to_string(),
+            ));
+        }
     }
     Ok(())
 }
 
-/// Escalation prevention for namespaced Role writes.
+/// Escalation prevention for namespaced Role writes (create, replace, patch, SSA).
 ///
-/// When a Role is created or updated with non-empty rules, and any RoleBinding
-/// in the same namespace already references that role, the caller must already
-/// hold every rule in the new role spec, scoped to that namespace.  Mirrors
-/// check_clusterrole_escalation's race prevention for namespaced Roles: without
-/// this check a user can do: (1) create RoleBinding → references non-existent
-/// Role → RB check skipped; (2) create Role with wildcard rules → instant
-/// namespace-admin.
-///
-/// The check is skipped when the role has no rules (nothing to escalate)
-/// or when no RoleBinding in the namespace references it yet (role-first
-/// ordering).  system:masters members bypass via the RBAC cluster-admin binding.
+/// Mirrors upstream role/policybased: unless the caller is in system:masters or holds
+/// `escalate` on the Role in this namespace, they must hold every rule they write in
+/// this namespace, whether or not any RoleBinding references the role yet.
 ///
 /// Returns `Ok(())` if the check passes, or `Err(403 Forbidden)`.
 pub(crate) fn check_role_escalation<S: Store>(
@@ -1045,19 +1088,13 @@ pub(crate) fn check_role_escalation<S: Store>(
     if group != RBAC_GROUP || plural != ROLES {
         return Ok(());
     }
+    let role_name = body["metadata"]["name"].as_str().unwrap_or("");
+    if role_authoring_escalation_allowed(ROLES, Some(namespace), role_name, user, state) {
+        return Ok(());
+    }
     let role_rules = crate::rbac::RbacRole::deserialize(body)
         .map(|r| r.rules)
         .unwrap_or_default();
-    if role_rules.is_empty() {
-        return Ok(());
-    }
-    let role_name = body["metadata"]["name"].as_str().unwrap_or("");
-    if !state
-        .rbac_index
-        .namespace_binding_references_role(namespace, role_name)
-    {
-        return Ok(());
-    }
     if !user_holds_all_rules_in_namespace(
         &user.username,
         &user.groups,
@@ -1066,7 +1103,7 @@ pub(crate) fn check_role_escalation<S: Store>(
         &state.rbac_index,
     ) {
         return Err(Status::forbidden(
-            "cannot escalate privileges: Role is already bound and user does not hold all its rules in this namespace".to_string(),
+            "cannot escalate privileges: user does not hold all rules of the Role in this namespace and lacks the escalate verb".to_string(),
         ));
     }
     Ok(())
@@ -4062,36 +4099,202 @@ mod escalation_tests {
         );
     }
 
-    /// Creating a ClusterRole with no CRB referencing it must always be allowed,
-    /// regardless of the caller's permissions — the role grants nothing until bound.
-    #[test]
-    fn clusterrole_create_without_existing_crb_always_allowed() {
-        let state = make_state();
-        let group = "rbac.authorization.k8s.io";
-
-        // No CRB references "orphan-role".
-        let orphan_role_body = serde_json::json!({
-            "metadata": {"name": "orphan-role"},
-            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
-        });
-        let plain_user = crate::auth::UserInfo {
-            username: "alice".into(),
+    fn rbac_user(name: &str, groups: &[&str]) -> crate::auth::UserInfo {
+        crate::auth::UserInfo {
+            username: name.into(),
             uid: String::new(),
-            groups: vec![],
+            groups: groups.iter().map(|g| g.to_string()).collect(),
             extra: Default::default(),
-        };
-        let result = super::check_clusterrole_escalation(
-            "clusterroles",
-            group,
-            &plain_user,
-            &orphan_role_body,
+        }
+    }
+
+    /// Grants `user` the given rules through a ClusterRole + ClusterRoleBinding.
+    fn grant_cluster_rules(state: &crate::state::AppState, user: &str, rules: serde_json::Value) {
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{user}-grant"),
+            &serde_json::json!({ "rules": rules }),
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{user}-grant"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": user}],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": format!("{user}-grant"),
+                }
+            }),
+        );
+    }
+
+    fn clusterrole_body(name: &str, rules: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"metadata": {"name": name}, "rules": rules})
+    }
+
+    const SECRETS_GET: &str =
+        r#"[{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}]"#;
+
+    /// An unbound ClusterRole is the staging step of the empty-bind-widen escalation:
+    /// a caller who may only author roles must not be able to define rules they do not
+    /// hold just because nothing references the role yet.
+    #[test]
+    fn clusterrole_unbound_with_rules_caller_lacks_is_denied_to_prevent_privilege_escalation() {
+        let state = make_state();
+        grant_cluster_rules(
             &state,
+            "alice",
+            serde_json::json!([{"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles"], "verbs": ["create", "update"]}]),
+        );
+        let body = clusterrole_body("orphan-role", serde_json::from_str(SECRETS_GET).unwrap());
+        let err = super::check_clusterrole_escalation(
+            "clusterroles",
+            super::RBAC_GROUP,
+            &rbac_user("alice", &[]),
+            &body,
+            &state,
+        )
+        .expect_err("unbound ClusterRole with rules the caller lacks must be Forbidden");
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// The reported attack: create an empty ClusterRole (passes: nothing to hold),
+    /// bind it through a RoleBinding (which the old check ignored), then update it to
+    /// grant secrets. The final update must be denied even though only a RoleBinding
+    /// references the role.
+    #[test]
+    fn clusterrole_empty_then_widened_after_rolebinding_is_denied_to_prevent_privilege_escalation()
+    {
+        let state = make_state();
+        grant_cluster_rules(
+            &state,
+            "mallory",
+            serde_json::json!([{"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles", "rolebindings"], "verbs": ["create", "update"]}]),
+        );
+        let mallory = rbac_user("mallory", &[]);
+        let empty = clusterrole_body("sneaky", serde_json::json!([]));
+        super::check_clusterrole_escalation(
+            "clusterroles",
+            super::RBAC_GROUP,
+            &mallory,
+            &empty,
+            &state,
+        )
+        .expect("an empty ClusterRole grants nothing and must be creatable");
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns-a/rolebindings/sneaky-rb",
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "mallory"}],
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "sneaky"}
+            }),
+        );
+        let widened = clusterrole_body("sneaky", serde_json::from_str(SECRETS_GET).unwrap());
+        assert!(
+            super::check_clusterrole_escalation(
+                "clusterroles",
+                super::RBAC_GROUP,
+                &mallory,
+                &widened,
+                &state,
+            )
+            .is_err(),
+            "widening an empty, RoleBinding-bound ClusterRole to secrets/get must be denied"
+        );
+    }
+
+    /// `escalate` on the specific ClusterRole is the delegated way to author rules one
+    /// does not hold; without honouring it, RBAC controllers (clusterrole-aggregation)
+    /// and operators installing roles would be forced to hold every permission they grant.
+    #[test]
+    fn clusterrole_escalate_verb_permits_authoring_rules_caller_lacks() {
+        let state = make_state();
+        grant_cluster_rules(
+            &state,
+            "operator",
+            serde_json::json!([{"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles"], "verbs": ["escalate"], "resourceNames": ["delegated"]}]),
+        );
+        let operator = rbac_user("operator", &[]);
+        let secrets = serde_json::from_str::<serde_json::Value>(SECRETS_GET).unwrap();
+        assert!(
+            super::check_clusterrole_escalation(
+                "clusterroles",
+                super::RBAC_GROUP,
+                &operator,
+                &clusterrole_body("delegated", secrets.clone()),
+                &state,
+            )
+            .is_ok(),
+            "escalate on the named ClusterRole must permit writing rules the caller lacks"
         );
         assert!(
-            result.is_ok(),
-            "creating a ClusterRole with no existing CRB must always be allowed; \
-             the role grants nothing until a binding references it, so there is no escalation risk"
+            super::check_clusterrole_escalation(
+                "clusterroles",
+                super::RBAC_GROUP,
+                &operator,
+                &clusterrole_body("other", secrets),
+                &state,
+            )
+            .is_err(),
+            "escalate scoped by resourceNames must not extend to other ClusterRoles"
         );
+    }
+
+    /// system:masters is the loopback superuser upstream (EscalationAllowed); it must pass
+    /// with no RBAC objects at all, since seeded bindings may not exist yet at bootstrap.
+    #[test]
+    fn clusterrole_system_masters_permitted_without_any_rbac_objects() {
+        let state = make_state();
+        let body = clusterrole_body(
+            "anything",
+            serde_json::json!([{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]),
+        );
+        assert!(super::check_clusterrole_escalation(
+            "clusterroles",
+            super::RBAC_GROUP,
+            &rbac_user("root", &["system:masters"]),
+            &body,
+            &state,
+        )
+        .is_ok());
+    }
+
+    /// An aggregationRule can gather any rules and prevent tightening, so it needs
+    /// `*` on `*.*` even when the role's own rules are empty (upstream hasAggregationRule).
+    #[test]
+    fn clusterrole_aggregation_rule_without_cluster_admin_is_denied_to_prevent_privilege_escalation(
+    ) {
+        let state = make_state();
+        grant_cluster_rules(
+            &state,
+            "alice",
+            serde_json::json!([{"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles"], "verbs": ["create"]}]),
+        );
+        grant_cluster_rules(
+            &state,
+            "admin",
+            serde_json::json!([{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}, {"nonResourceURLs": ["*"], "verbs": ["*"]}]),
+        );
+        let mut body = clusterrole_body("agg", serde_json::json!([]));
+        body["aggregationRule"] =
+            serde_json::json!({"clusterRoleSelectors": [{"matchLabels": {"x": "y"}}]});
+        assert!(
+            super::check_clusterrole_escalation(
+                "clusterroles",
+                super::RBAC_GROUP,
+                &rbac_user("alice", &[]),
+                &body,
+                &state,
+            )
+            .is_err(),
+            "aggregationRule must require cluster-admin-level authority"
+        );
+        assert!(super::check_clusterrole_escalation(
+            "clusterroles",
+            super::RBAC_GROUP,
+            &rbac_user("admin", &[]),
+            &body,
+            &state,
+        )
+        .is_ok());
     }
 
     // -- namespaced Role create-time escalation (two-step loophole) --
@@ -4219,40 +4422,147 @@ mod escalation_tests {
         );
     }
 
-    /// Creating a namespaced Role with no RoleBinding referencing it must always be
-    /// allowed, regardless of the caller's permissions — the role grants nothing until
-    /// bound (role-first ordering, matching upstream and check_clusterrole_escalation).
-    #[test]
-    fn role_create_without_existing_rolebinding_always_allowed() {
-        let state = make_state();
-        let group = "rbac.authorization.k8s.io";
-        let ns = "ns-a";
+    fn grant_ns_rules(
+        state: &crate::state::AppState,
+        user: &str,
+        ns: &str,
+        rules: serde_json::Value,
+    ) {
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/roles/{user}-grant"),
+            &serde_json::json!({ "rules": rules }),
+        );
+        state.rbac_index.apply_object(
+            &format!(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/{user}-grant"
+            ),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": user}],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": format!("{user}-grant"),
+                }
+            }),
+        );
+    }
 
-        // No RoleBinding references "orphan-role".
-        let orphan_role_body = serde_json::json!({
-            "metadata": {"name": "orphan-role", "namespace": ns},
-            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
-        });
-        let plain_user = crate::auth::UserInfo {
-            username: "alice".into(),
-            uid: String::new(),
-            groups: vec![],
-            extra: Default::default(),
-        };
-        let result = super::check_role_escalation(
-            "roles",
-            group,
-            ns,
-            &plain_user,
-            &orphan_role_body,
+    fn role_body(name: &str, ns: &str, rules: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"metadata": {"name": name, "namespace": ns}, "rules": rules})
+    }
+
+    /// An unbound Role is the staging step of the empty-bind-widen escalation; a caller
+    /// who cannot read secrets must not be able to author a Role granting them.
+    #[test]
+    fn role_unbound_with_rules_caller_lacks_is_denied_to_prevent_privilege_escalation() {
+        let state = make_state();
+        grant_ns_rules(
             &state,
+            "alice",
+            "ns-a",
+            serde_json::json!([{"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles"], "verbs": ["create", "update"]}]),
         );
+        let body = role_body("orphan", "ns-a", serde_json::from_str(SECRETS_GET).unwrap());
+        let err = super::check_role_escalation(
+            "roles",
+            super::RBAC_GROUP,
+            "ns-a",
+            &rbac_user("alice", &[]),
+            &body,
+            &state,
+        )
+        .expect_err("unbound Role with rules the caller lacks must be Forbidden");
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// Empty Role then widened: the empty create passes (nothing to hold) but the later
+    /// update to secrets/get must be denied, with or without a RoleBinding referencing it.
+    #[test]
+    fn role_empty_then_widened_is_denied_to_prevent_privilege_escalation() {
+        let state = make_state();
+        grant_ns_rules(
+            &state,
+            "mallory",
+            "ns-a",
+            serde_json::json!([{"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles"], "verbs": ["create", "update"]}]),
+        );
+        let mallory = rbac_user("mallory", &[]);
+        assert!(super::check_role_escalation(
+            "roles",
+            super::RBAC_GROUP,
+            "ns-a",
+            &mallory,
+            &role_body("sneaky", "ns-a", serde_json::json!([])),
+            &state,
+        )
+        .is_ok());
         assert!(
-            result.is_ok(),
-            "creating a namespaced Role with no existing RoleBinding must always be \
-             allowed; the role grants nothing until a binding references it, so there is \
-             no escalation risk"
+            super::check_role_escalation(
+                "roles",
+                super::RBAC_GROUP,
+                "ns-a",
+                &mallory,
+                &role_body("sneaky", "ns-a", serde_json::from_str(SECRETS_GET).unwrap()),
+                &state,
+            )
+            .is_err(),
+            "widening a previously-empty Role to secrets/get must be denied"
         );
+    }
+
+    /// `escalate` on the Role in its own namespace delegates authoring; escalate in a
+    /// different namespace must not leak across namespaces.
+    #[test]
+    fn role_escalate_verb_permits_authoring_only_in_its_namespace() {
+        let state = make_state();
+        grant_ns_rules(
+            &state,
+            "operator",
+            "ns-a",
+            serde_json::json!([{"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles"], "verbs": ["escalate"]}]),
+        );
+        let operator = rbac_user("operator", &[]);
+        let secrets = serde_json::from_str::<serde_json::Value>(SECRETS_GET).unwrap();
+        assert!(super::check_role_escalation(
+            "roles",
+            super::RBAC_GROUP,
+            "ns-a",
+            &operator,
+            &role_body("r", "ns-a", secrets.clone()),
+            &state,
+        )
+        .is_ok());
+        assert!(
+            super::check_role_escalation(
+                "roles",
+                super::RBAC_GROUP,
+                "ns-b",
+                &operator,
+                &role_body("r", "ns-b", secrets),
+                &state,
+            )
+            .is_err(),
+            "escalate granted in ns-a must not permit escalation in ns-b"
+        );
+    }
+
+    /// system:masters bypasses the Role check with no RBAC objects present.
+    #[test]
+    fn role_system_masters_permitted_without_any_rbac_objects() {
+        let state = make_state();
+        assert!(super::check_role_escalation(
+            "roles",
+            super::RBAC_GROUP,
+            "ns-a",
+            &rbac_user("root", &["system:masters"]),
+            &role_body(
+                "r",
+                "ns-a",
+                serde_json::json!([{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}])
+            ),
+            &state,
+        )
+        .is_ok());
     }
 
     // -- wants_partial_object_metadata --

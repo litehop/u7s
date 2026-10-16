@@ -297,38 +297,6 @@ impl RbacIndex {
             .unwrap_or_default()
     }
 
-    /// Return true if any ClusterRoleBinding references the named ClusterRole.
-    ///
-    /// Used by escalation prevention: when a ClusterRole is created or updated
-    /// with rules, we must check whether any binding already points to it so that
-    /// the role-creator also holds those rules.
-    pub fn clusterrole_has_bindings(&self, role_name: &str) -> bool {
-        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        inner.cluster_bindings.iter().any(|(_, b)| {
-            b.role_ref.kind == "ClusterRole"
-                && b.role_ref.api_group == "rbac.authorization.k8s.io"
-                && b.role_ref.name == role_name
-        })
-    }
-
-    /// Return true if any RoleBinding in `namespace` references the named (namespaced)
-    /// Role.
-    ///
-    /// Used by escalation prevention: when a Role is created or updated with rules, we
-    /// must check whether any RoleBinding in the same namespace already points to it so
-    /// that the role-creator also holds those rules — the namespaced mirror of
-    /// `clusterrole_has_bindings`.
-    pub fn namespace_binding_references_role(&self, namespace: &str, role_name: &str) -> bool {
-        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        inner.namespace_bindings.iter().any(|(_, b)| {
-            let binding_ns = b.namespace.as_deref().unwrap_or("");
-            binding_ns == namespace
-                && b.role_ref.kind == "Role"
-                && b.role_ref.api_group == "rbac.authorization.k8s.io"
-                && b.role_ref.name == role_name
-        })
-    }
-
     pub fn is_allowed(&self, req: &AuthzRequest<'_>) -> bool {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
 
