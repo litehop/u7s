@@ -40,8 +40,13 @@ fi
 #                       existing joined worker (bootstrap tokens are
 #                       single-use, and re-running would silently rotate the
 #                       node's client identity). Re-running install.sh with
-#                       no flags against such a node upgrades kubelet alone,
-#                       leaving kubeconfig/kubelet-client.* untouched.
+#                       no flags against such a node needs no token: it
+#                       upgrades kubelet alone, leaving kubeconfig/
+#                       kubelet-client.* untouched, and waits for the Node to
+#                       report Ready again. An expired client identity fails
+#                       with instructions to re-join with a fresh token.
+#                       Re-running on the control plane upgrades in place and
+#                       fails if the CA / service-account keys changed.
 #
 # Usage:
 #   sudo scripts/install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>]
@@ -90,6 +95,12 @@ Usage:
   --mint-join-token     Run on an existing control-plane node: create a 24h
                          single-use join token and print the join command.
   --join <url>          Join an existing cluster at <url> (e.g. https://1.2.3.4:6443).
+                         Topology limit: an apiserver that reaches this node's
+                         kubelet through a 127.0.0.1 port forward (a Mac host
+                         in front of Lima VMs) cannot verify its serving cert,
+                         because the serving-CSR approver refuses 127.0.0.1
+                         SANs by design; kubectl logs/exec to such a worker
+                         fail. Real installs dial the node InternalIP.
   --token <token>       Join token from --mint-join-token (--join only). "-" or
                          absent prompts with echo off on a terminal, or reads
                          piped stdin; both keep it out of ps and history.
@@ -119,6 +130,8 @@ MINT_JOIN_TOKEN=0
 JOIN_SERVER=""
 JOIN_TOKEN=""
 CA_CERT_HASH=""
+# Set by join_cluster to the server-side creationTimestamp of this join's client CSR.
+JOIN_STARTED_AT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -525,11 +538,19 @@ join_cluster() {
   sleep 2
 
   echo "Submitting join CSR '$csr_name' to $JOIN_SERVER..."
-  curl -fsSL --cacert "$STATE_DIR/ca.pem" \
+  # The apiserver-stamped creationTimestamp of this join's client CSR is the
+  # lower bound for the serving CSR wait_for_joined_node accepts: a serving CSR
+  # issued to an earlier incarnation of the same node name is older than it.
+  # It is the server's clock on both sides, so node clock skew cannot matter.
+  JOIN_STARTED_AT="$(curl -fsSL --cacert "$STATE_DIR/ca.pem" \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$bootstrap_token") \
     -H "Content-Type: application/json" \
     -X POST "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" \
-    -d "$csr_body" >/dev/null
+    -d "$csr_body" | jq -r '.metadata.creationTimestamp // empty')"
+  if [ -z "$JOIN_STARTED_AT" ]; then
+    echo "error: the apiserver's reply to the join CSR carried no creationTimestamp" >&2
+    exit 1
+  fi
 
   # KCM's csrapproving/csrsigning controllers react to the create event; this
   # loop only waits on them, it approves nothing itself.
@@ -594,7 +615,8 @@ wait_for_joined_node() {
     fi
     if [ -z "$serving" ]; then
       resp="$(curl -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" 2>/dev/null || true)"
-      serving="$(printf '%s' "$resp" | jq -r --arg u "system:node:$NODE_NAME" '[.items[]? | select(.spec.signerName == "kubernetes.io/kubelet-serving" and .spec.username == $u and ((.status.certificate // "") != "") and any(.status.conditions[]?; .type == "Approved"))] | length' 2>/dev/null || true)"
+      # RFC3339 UTC timestamps compare correctly as strings.
+      serving="$(printf '%s' "$resp" | jq -r --arg u "system:node:$NODE_NAME" --arg since "$JOIN_STARTED_AT" '[.items[]? | select(.spec.signerName == "kubernetes.io/kubelet-serving" and .spec.username == $u and .metadata.creationTimestamp >= $since and ((.status.certificate // "") != "") and any(.status.conditions[]?; .type == "Approved"))] | length' 2>/dev/null || true)"
       [ "${serving:-0}" -ge 1 ] 2>/dev/null || serving=""
     fi
     if [ -n "$ready" ] && [ -n "$serving" ]; then
@@ -605,6 +627,116 @@ wait_for_joined_node() {
   done
   echo "error: after 5 min node $NODE_NAME Ready=$([ -n "$ready" ] && echo yes || echo no) and its kubelet serving CSR approved+issued=$([ -n "$serving" ] && echo yes || echo no). The join token is already consumed and this node holds a valid client identity; kubelet keeps retrying. Check 'journalctl -u kubelet' here and 'kubectl get csr' on the control plane (a Pending kubelet-serving CSR means the approver rejected its SANs against the Node's addresses; 'kubectl certificate describe' it, or approve it by hand). To start over: on the control plane 'kubectl delete node $NODE_NAME' and mint a new token (install.sh --mint-join-token); here 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
   return 1
+}
+
+# --- Upgrade in place: an already-joined worker, and the control plane --------
+#
+# A joined worker's identity is, all under $STATE_DIR: kubeconfig (server URL
+# and the join-time client cert), ca.pem, kubelet-client.crt/.key (written by
+# join_cluster) and kubelet/pki/kubelet-client-current.pem (the kubelet's
+# rotated client cert, from --cert-dir). It authenticates with its own client
+# cert, so an upgrade needs no token.
+
+# Prints the path of the newest still-valid client cert, rotated first.
+current_client_cert() {
+  local c
+  for c in "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" "$STATE_DIR/kubelet-client.crt"; do
+    if [ -s "$c" ] && openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Refuses an upgrade the node cannot authenticate: a missing identity needs a
+# join, an expired one (kubelet offline past its cert lifetime) needs a re-join.
+verify_worker_identity() {
+  local f missing=""
+  for f in kubeconfig ca.pem kubelet-client.crt kubelet-client.key; do
+    [ -s "$STATE_DIR/$f" ] || missing="$missing $STATE_DIR/$f"
+  done
+  if [ -n "$missing" ]; then
+    echo "error: this worker has no usable join identity (missing:$missing) -- a join is required. Mint a token on the control plane (install.sh --mint-join-token), then here: systemctl stop kubelet; rm -rf $STATE_DIR; re-run install.sh --join <url> --ca-cert-hash <hash> ..." >&2
+    return 1
+  fi
+  if ! current_client_cert >/dev/null; then
+    echo "error: this worker's kubelet client certificate has expired (notAfter $(openssl x509 -in "$STATE_DIR/kubelet-client.crt" -noout -enddate | cut -d= -f2); rotated copy: $STATE_DIR/kubelet/pki/kubelet-client-current.pem) -- the node can no longer authenticate, so it must re-join with a fresh token. On the control plane: install.sh --mint-join-token (and 'kubectl delete node $NODE_NAME' if it is still registered). Here: systemctl stop kubelet; rm -rf $STATE_DIR (clears kubeconfig, kubelet-client.*, ca.pem and kubelet/pki); re-run install.sh --join <url> --ca-cert-hash <hash> ... with the new token." >&2
+    return 1
+  fi
+}
+
+# GET $1 on the API server named in the worker's kubeconfig, as the node.
+worker_api_get() {
+  local cert key server
+  cert="$(current_client_cert)" || return 1
+  key="$STATE_DIR/kubelet-client.key"
+  [ "$cert" = "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" ] && key="$cert"
+  server="$(sed -n 's/^ *server: *//p' "$STATE_DIR/kubeconfig" | head -n1)"
+  curl -fsSL --cacert "$STATE_DIR/ca.pem" --cert "$cert" --key "$key" "$server$1"
+}
+
+# lastHeartbeatTime of the Node's Ready=True condition; empty when it is not Ready.
+worker_ready_heartbeat() {
+  worker_api_get "/api/v1/nodes/$NODE_NAME" 2>/dev/null \
+    | jq -r '.status.conditions[]? | select(.type == "Ready" and .status == "True") | .lastHeartbeatTime' 2>/dev/null || true
+}
+
+client_cert_fingerprint() {
+  local c
+  c="$(current_client_cert)" || return 1
+  openssl x509 -in "$c" -noout -fingerprint -sha256 | cut -d= -f2
+}
+
+# After the kubelet restart: the Node must report Ready with a heartbeat newer
+# than $1 (the pre-restart one, so a stale Ready cannot pass) and the client
+# cert must still be valid. $2 is the pre-restart cert fingerprint.
+wait_for_upgraded_worker() {
+  local before="$1" fp_before="$2" hb="" fp_after
+  echo "Waiting up to 5 min for node $NODE_NAME to report Ready again with its existing client identity..."
+  for _ in $(seq 1 150); do
+    hb="$(worker_ready_heartbeat)"
+    [ -n "$hb" ] && [ "$hb" != "$before" ] && break
+    hb=""
+    sleep 2
+  done
+  if [ -z "$hb" ]; then
+    echo "error: after 5 min node $NODE_NAME has not reported Ready since the kubelet restart (check: journalctl -u kubelet here, kubectl get node $NODE_NAME on the control plane). No token can fix a kubelet that fails to start; the client identity under $STATE_DIR was not modified." >&2
+    return 1
+  fi
+  if ! fp_after="$(client_cert_fingerprint)"; then
+    echo "error: node $NODE_NAME is Ready but no client certificate under $STATE_DIR is still valid" >&2
+    return 1
+  fi
+  if [ "$fp_after" = "$fp_before" ]; then
+    echo "Node $NODE_NAME is Ready; client certificate unchanged ($fp_after)."
+  else
+    echo "Node $NODE_NAME is Ready; kubelet rotated its client certificate ($fp_before -> $fp_after)."
+  fi
+}
+
+# Control-plane upgrades keep the cluster identity: the apiserver only generates
+# ca.*/sa.* when absent, and join tokens are Secrets in the store. The restart
+# below must leave all four files byte-identical, or every node's identity and
+# every issued service-account token is invalid.
+cp_identity_fingerprint() {
+  local f
+  for f in ca.key ca.crt sa.key sa.pub; do
+    if [ -f "$STATE_DIR/$f" ]; then
+      printf '%s ' "$f"
+      openssl dgst -sha256 -r "$STATE_DIR/$f" | cut -d' ' -f1
+    fi
+  done
+}
+
+verify_cp_identity_preserved() {
+  local before="$1" after
+  after="$(cp_identity_fingerprint)"
+  if [ "$before" != "$after" ]; then
+    echo "error: the control-plane CA / service-account keys under $STATE_DIR changed during the upgrade -- every node's client identity and every issued token is now invalid. Restore ca.key, ca.crt, sa.key and sa.pub from backup." >&2
+    return 1
+  fi
+  echo "Control-plane identity preserved (ca.key, ca.crt, sa.key, sa.pub unchanged); no CA or tokens re-minted."
 }
 
 if [ "$MINT_JOIN_TOKEN" -eq 1 ]; then
@@ -768,6 +900,12 @@ if [ "$EXISTING_INSTALL" -eq 1 ]; then
   echo "Upgrading u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
 else
   echo "Installing u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
+fi
+
+# An already-joined worker upgrades with its own identity and no token; refuse
+# before touching the host if that identity is missing or expired.
+if [ "$EXISTING_WORKER" -eq 1 ]; then
+  verify_worker_identity || exit 1
 fi
 
 # --- CRI-O + crun via apt -----------------------------------------------------
@@ -982,7 +1120,10 @@ if [ "$WORKER_MODE" -eq 1 ]; then
   if [ "$JOIN_MODE" -eq 1 ]; then
     join_cluster
   else
-    echo "Existing worker node detected -- upgrading kubelet only; kubeconfig and kubelet-client.crt/.key are left untouched."
+    echo "Existing worker node detected -- join skipped, no token needed; upgrading kubelet only, kubeconfig and kubelet-client.crt/.key are left untouched."
+    ensure_jq
+    HEARTBEAT_BEFORE="$(worker_ready_heartbeat)"
+    FINGERPRINT_BEFORE="$(client_cert_fingerprint)"
   fi
 
   cat > /etc/systemd/system/kubelet.service <<EOF
@@ -1026,6 +1167,8 @@ EOF
 
   if [ "$JOIN_MODE" -eq 1 ]; then
     wait_for_joined_node
+  else
+    wait_for_upgraded_worker "$HEARTBEAT_BEFORE" "$FINGERPRINT_BEFORE" || exit 1
   fi
 
   echo ""
@@ -1242,6 +1385,8 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
+CP_IDENTITY_BEFORE="$(cp_identity_fingerprint)"
+
 systemctl daemon-reload
 # restart rather than start: on a re-run against an already-active unit,
 # start is a no-op, so the running process would never re-exec against the
@@ -1278,6 +1423,9 @@ systemctl restart kubelet.service
 # kubectl-apply failure the way it used to.
 KUBECONFIG_PATH="$STATE_DIR/kubeconfig"
 wait_for_apiserver "$KUBECONFIG_PATH"
+if [ "$EXISTING_INSTALL" -eq 1 ]; then
+  verify_cp_identity_preserved "$CP_IDENTITY_BEFORE" || exit 1
+fi
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"
