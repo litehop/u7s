@@ -230,6 +230,29 @@ mod tests {
     }
 
     #[test]
+    fn expiration_with_numeric_offset_is_honoured_in_both_directions() {
+        // NOW is 2027-01-15T08:00:00Z == 17:00 at +09:00. A token minted with a local-time
+        // offset must neither be rejected while valid nor outlive its expiry.
+        let future = "2027-01-15T18:00:00+09:00";
+        assert!(authn(&token_secret(&[("expiration", future)])).is_some());
+        let past = "2027-01-15T16:59:59+09:00";
+        assert!(
+            authn(&token_secret(&[("expiration", past)])).is_none(),
+            "an expired offset-form token must not keep joining nodes"
+        );
+    }
+
+    #[test]
+    fn out_of_range_expiration_fields_count_as_expired() {
+        for bad in ["2099-13-01T00:00:00Z", "2099-01-32T00:00:00Z"] {
+            assert!(
+                authn(&token_secret(&[("expiration", bad)])).is_none(),
+                "{bad} is unparseable and must be treated as expired, as upstream does"
+            );
+        }
+    }
+
+    #[test]
     fn unparseable_expiration_counts_as_expired_not_immortal() {
         assert!(authn(&token_secret(&[("expiration", "tomorrow")])).is_none());
     }

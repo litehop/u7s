@@ -3933,19 +3933,40 @@ async fn seed_cluster_info(
         },
         "data": { "kubeconfig": kubeconfig }
     });
-    match store
-        .put(&key, Bytes::from(body.to_string()), Some(0))
-        .await
-    {
-        Ok(_) => tracing::info!("seeded ConfigMap: kube-public/cluster-info"),
-        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "seed ConfigMap kube-public/cluster-info: {e}"
-            ))
+    for _ in 0..5 {
+        let res = match store.get(&key).await? {
+            None => store
+                .put(&key, Bytes::from(body.to_string()), Some(0))
+                .await
+                .map(|_| tracing::info!("seeded ConfigMap: kube-public/cluster-info")),
+            Some(stored) => {
+                let mut cm: serde_json::Value = serde_json::from_slice(&stored.value)?;
+                if cm["data"]["kubeconfig"].as_str() == Some(kubeconfig.as_str()) {
+                    return Ok(());
+                }
+                cm["data"]["kubeconfig"] = serde_json::Value::String(kubeconfig.clone());
+                store
+                    .put(&key, Bytes::from(cm.to_string()), Some(stored.revision))
+                    .await
+                    .map(|_| tracing::info!("updated kube-public/cluster-info kubeconfig"))
+            }
+        };
+        match res {
+            Ok(()) => return Ok(()),
+            Err(
+                u7s_store::StoreError::AlreadyExists { .. }
+                | u7s_store::StoreError::RevisionMismatch { .. },
+            ) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "seed ConfigMap kube-public/cluster-info: {e}"
+                ))
+            }
         }
     }
-    Ok(())
+    Err(anyhow::anyhow!(
+        "seed ConfigMap kube-public/cluster-info: gave up after conflicting writes"
+    ))
 }
 
 /// Seed the default API Priority and Fairness resources.
@@ -8788,6 +8809,25 @@ mod tests {
         let after: serde_json::Value =
             serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
         assert_eq!(after["data"]["jws-kubeconfig-abcdef"], "sig");
+
+        seed_cluster_info(&store, "https://10.0.0.2:6443", b"other-ca-der")
+            .await
+            .expect("reseed with new server/CA must not fail");
+        let after: serde_json::Value =
+            serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
+        let kubeconfig = after["data"]["kubeconfig"].as_str().unwrap();
+        assert!(
+            kubeconfig.contains("server: https://10.0.0.2:6443"),
+            "a changed advertise address must reach cluster-info or joining nodes discover a dead server"
+        );
+        assert_ne!(
+            after["data"]["kubeconfig"], cm["data"]["kubeconfig"],
+            "a rotated CA must update the kubeconfig (a stale CA breaks join pinning)"
+        );
+        assert_eq!(
+            after["data"]["jws-kubeconfig-abcdef"], "sig",
+            "signer-written jws keys must survive; bootstrapsigner re-signs on the content change"
+        );
     }
 
     #[tokio::test]
