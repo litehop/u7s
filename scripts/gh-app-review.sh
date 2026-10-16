@@ -16,11 +16,22 @@
 # (`curl -K -`), never as a command-line argument.
 #
 # Usage:
-#   scripts/gh-app-review.sh <pr-number> < review-payload.json
+#   scripts/gh-app-review.sh [--repo owner/name] <pr-number> < review-payload.json
+# --repo defaults to litehop/u7s.
 set -euo pipefail
 
-PR_NUMBER="${1:?usage: gh-app-review.sh <pr-number> < review-payload.json}"
+USAGE="usage: gh-app-review.sh [--repo owner/name] <pr-number> < review-payload.json"
 REPO="litehop/u7s"
+if [ "${1:-}" = "--repo" ]; then
+  REPO="${2:?$USAGE}"
+  shift 2
+fi
+PR_NUMBER="${1:?$USAGE}"
+if ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  echo "gh-app-review: --repo must look like owner/name, got: $REPO" >&2
+  exit 2
+fi
+export U7S_REVIEWER_REPO="$REPO"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 BODY_FILE=$(mktemp)

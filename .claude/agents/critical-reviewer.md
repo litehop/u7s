@@ -222,9 +222,14 @@ Then post it yourself, per deliverable type:
   again if a PR is ever authored by the bot itself, which is not a live case
   today (workers push under the operator identity).
 
+  **Other repos:** a PR URL on another litehop repo (e.g.
+  `github.com/litehop/politeia/pull/<N>`) is posted with
+  `scripts/gh-app-review.sh --repo <owner/name> <N> < temp/<file>`; the
+  default repo is `litehop/u7s`.
+
   **Mint-failure fallback:** if `scripts/gh-app-review.sh <N>` exits
   non-zero, retry ONCE — post the same body as `"event": "COMMENT"` via `gh
-  api repos/litehop/u7s/pulls/<N>/reviews -X POST --input temp/<file>` under
+  api repos/<owner/name>/pulls/<N>/reviews -X POST --input temp/<file>` under
   the operator's own token — and say so explicitly in your returned
   confirmation: the App mint failed and the review posted as a fallback
   comment. Without this, a key hiccup means no review posts at all and the

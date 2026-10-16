@@ -12,6 +12,11 @@ set -euo pipefail
 APP_ID="${U7S_REVIEWER_APP_ID:?U7S_REVIEWER_APP_ID must be set to the litehop-reviewer App ID}"
 APP_KEY="${U7S_REVIEWER_APP_KEY:?U7S_REVIEWER_APP_KEY must be set to the litehop-reviewer private key path}"
 
+# Repo whose installation is looked up; a per-repo lookup (rather than
+# orgs/litehop/installation) fails here, not at POST time, if the App is not
+# installed on that repo.
+REPO="${U7S_REVIEWER_REPO:-litehop/u7s}"
+
 # The operator's own settings.local.json stores this path with a literal
 # leading `~`, which bash does not expand once it has come through a
 # variable rather than a bare word.
@@ -46,10 +51,10 @@ curl_auth_config() {
 }
 
 INSTALLATION_ID=$(curl_auth_config | curl -sSf -K - \
-  https://api.github.com/repos/litehop/u7s/installation | jq -r '.id')
+  "https://api.github.com/repos/$REPO/installation" | jq -r '.id')
 
 if [ -z "$INSTALLATION_ID" ] || [ "$INSTALLATION_ID" = "null" ]; then
-  echo "gh-app-token: could not resolve an installation id for litehop/u7s" >&2
+  echo "gh-app-token: could not resolve an installation id for $REPO" >&2
   exit 1
 fi
 
