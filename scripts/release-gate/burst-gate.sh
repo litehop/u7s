@@ -14,13 +14,21 @@
 #   (e) scripts/e2e-workload/webhook-smoke.sh passes on the shipped-install VM
 # Exits non-zero if any criterion of any run FAILs.
 #
-# Usage: burst-gate.sh [--runs N] [--keep] [--memory GiB] [--zram-mib N] [--coredns-requests]
+# Usage: burst-gate.sh [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --keep            do not delete the VMs afterwards
 #   --memory GiB      override the template's VM memory (forced-failure checks, e.g. 0.625)
 #   --coredns-requests experiment: set CoreDNS cpu/memory requests after install
 #   --zram-mib N      experiment: give the VM an N MiB zram swap device before install
+#   --capture         also run vm-capture.sh (PSI/CPU/refault diagnostics; its kubectl probes
+#                     cost memory, so off by default)
+#   --ramp LIST       one install, then bursts of each size in LIST (e.g. 30,40,50,60,70),
+#                     scaling down and settling between sizes, stopping at the first failure.
+#                     Prints the largest passing size as an approximate candidate N (single VM,
+#                     state carryover). Criteria (a)-(d) per size; implies --runs 1.
+#   --probe-kill SECS ramp-mode hard-kill per burst (default 180; deliberately
+#                     tighter than the 300 s criterion (c) cap so probes fail fast)
 #   --burst-cap SECS  criterion (c) cap (default 300)
 #   --tarball-dir DIR reuse the output of build-arm64-tarball.sh instead of rebuilding
 #   --out DIR         results directory (default: ./temp/release-gate/<timestamp>)
@@ -29,7 +37,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-COREDNS_REQ=0; ZRAM_MIB=0
+COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
 BURST_CAP_SECS=300
 RUN_WALL_SECS=3300
@@ -40,6 +48,9 @@ while [ $# -gt 0 ]; do
     --keep) KEEP=1; shift ;;
     --coredns-requests) COREDNS_REQ=1; shift ;;
     --zram-mib) ZRAM_MIB="$2"; shift 2 ;;
+    --capture) CAPTURE=1; shift ;;
+    --ramp) RAMP="$2"; shift 2 ;;
+    --probe-kill) PROBE_KILL_SECS="$2"; shift 2 ;;
     --memory) MEMORY="$2"; shift 2 ;;
     --burst-cap) BURST_CAP_SECS="$2"; shift 2 ;;
     --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
@@ -52,9 +63,22 @@ export BURST_CAP_SECS
 case "$ZRAM_MIB" in
   ''|*[!0-9]*) echo "--zram-mib must be a non-negative integer (MiB), got '$ZRAM_MIB'" >&2; exit 2 ;;
 esac
+case "$RUNS" in
+  ''|*[!0-9]*) echo "--runs must be a positive integer, got '$RUNS'" >&2; exit 2 ;;
+esac
+[ "$RUNS" -ge 1 ] || { echo "--runs must be a positive integer, got '$RUNS'" >&2; exit 2; }
 
 # shellcheck source=lib.sh
 . "$HERE/lib.sh"
+
+case "$PROBE_KILL_SECS" in
+  ''|*[!0-9]*|0) echo "--probe-kill must be a positive integer (seconds), got '$PROBE_KILL_SECS'" >&2; exit 2 ;;
+esac
+if [ -n "$RAMP" ]; then
+  RAMP_SIZES="$(rg_parse_ramp "$RAMP")" \
+    || { echo "--ramp must be strictly increasing positive integers like 30,40,50, got '$RAMP'" >&2; exit 2; }
+  RUNS=1
+fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${OUT:-$PWD/temp/release-gate/$STAMP}"
@@ -76,7 +100,8 @@ STAGE="$OUT/stage"
 mkdir -p "$STAGE/wordpress"
 cp "$TARBALL_DIR"/u7s-gate-*.tar.gz "$TARBALL_DIR"/u7s-gate-*.tar.gz.sha256 "$TARBALL_DIR/install.sh" "$STAGE/"
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
-printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\n' "$COREDNS_REQ" "$ZRAM_MIB" > "$STAGE/gate.env"
+printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\n' \
+  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" > "$STAGE/gate.env"
 cp "$ROOT/examples/e2e/wordpress/wordpress.yaml" "$STAGE/wordpress/"
 # MariaDB data on emptyDir: the gate VM has no csi-hostpath, and the PVC is not what is under test.
 awk '
@@ -88,7 +113,9 @@ awk '
 grep -q 'name: data' "$STAGE/wordpress/mariadb-emptydir.yaml" || { echo "mariadb emptyDir rewrite failed" >&2; exit 2; }
 
 overall=0; passed=0
-for i in $(seq 1 "$RUNS"); do
+i=0
+while [ "$i" -lt "$RUNS" ]; do
+  i=$((i + 1))
   VM="u7s-rg-$STAMP-$i"; VMS="$VMS $VM"
   RUN_OUT="$OUT/run-$i"; mkdir -p "$RUN_OUT"
   echo "==== run $i/$RUNS: VM $VM ===="
@@ -118,7 +145,11 @@ for i in $(seq 1 "$RUNS"); do
   host_state end | tee -a "$RUN_OUT/host.txt"
   mkdir -p "$RUN_OUT/out"; touch "$RUN_OUT/out/results.env"
   echo "---- run $i verdict ----"
-  rg_verdict "$RUN_OUT/out/results.env" > "$RUN_OUT/verdict.txt"; rc=$?
+  if [ -n "$RAMP" ]; then
+    rg_ramp_verdict "$RUN_OUT/out/results.env" "$RAMP_SIZES" "$RUN_OUT/out/samples.tsv" > "$RUN_OUT/verdict.txt"; rc=$?
+  else
+    rg_verdict "$RUN_OUT/out/results.env" > "$RUN_OUT/verdict.txt"; rc=$?
+  fi
   cat "$RUN_OUT/verdict.txt"
   if [ "$rc" -eq 0 ]; then passed=$((passed + 1)); else overall=1; fi
   [ -s "$RUN_OUT/out/samples.tsv" ] && "$HERE/summarize.sh" "$RUN_OUT/out" | tee "$RUN_OUT/summary.md"

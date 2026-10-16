@@ -115,5 +115,124 @@ for bad in abc -5 1.5 ""; do
     "$([ "$rc" = 2 ] && echo "$err" | grep -q 'non-negative integer' && [ ! -e "$TMP/out-bad/stage" ] && echo 1 || echo 0)"
 done
 
+# --runs validation: BSD `seq 1 0` counts down, so --runs 0 once created a real VM.
+printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\nexit 1\n' > "$TMP/bin/limactl"
+export LIMA_CALLS="$TMP/lima-calls"
+for bad in 0 00 -1 abc 1.5 ""; do
+  : > "$LIMA_CALLS"; rm -rf "$TMP/out-runs"
+  rc=0; err="$("$HERE/burst-gate.sh" --runs "$bad" --tarball-dir "$TMP/tb" --out "$TMP/out-runs" 2>&1 >/dev/null)" || rc=$?
+  assert "--runs '$bad' rejected with exit 2 and zero limactl calls (a bad count must not spawn a VM)" \
+    "$([ "$rc" = 2 ] && echo "$err" | grep -q 'positive integer' && [ ! -s "$LIMA_CALLS" ] && echo 1 || echo 0)"
+done
+: > "$LIMA_CALLS"; rm -rf "$TMP/out-runs"
+"$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-runs" >/dev/null 2>&1 || true
+assert "--runs 1 creates exactly one VM" "$([ "$(grep -c '^create ' "$LIMA_CALLS")" = 1 ] && echo 1 || echo 0)"
+: > "$LIMA_CALLS"; rm -rf "$TMP/out-runs"
+"$HERE/burst-gate.sh" --runs 2 --tarball-dir "$TMP/tb" --out "$TMP/out-runs" >/dev/null 2>&1 || true
+assert "--runs 2 creates exactly two VMs" "$([ "$(grep -c '^create ' "$LIMA_CALLS")" = 2 ] && echo 1 || echo 0)"
+
+# Watch-stream reader: a burst is done only when readyReplicas reaches the target.
+assert "rg_wait_ready succeeds when readyReplicas reaches the target mid-stream" \
+  "$(printf '1\n\n12\n20\n' | rg_wait_ready 20 && echo 1 || echo 0)"
+assert "rg_wait_ready fails when the stream ends short (dropped watch must not look like success)" \
+  "$(printf '1\n12\n19\n' | rg_wait_ready 20 && echo 0 || echo 1)"
+assert "rg_wait_ready does not match 2 against 20 (prefix) or an empty line" \
+  "$(printf '20\n\n' | rg_wait_ready 2 && echo 0 || echo 1)"
+
+printf '100 True\n200 False\n300 Unknown\n400 unreachable\n500 True\n' > "$TMP/nr.log"
+assert "rg_notready_since counts only observations at/after the burst start" "$([ "$(rg_notready_since "$TMP/nr.log" 300)" = 1 ] && echo 1 || echo 0)"
+assert "rg_notready_since counts False and Unknown but not unreachable" "$([ "$(rg_notready_since "$TMP/nr.log" 0)" = 2 ] && echo 1 || echo 0)"
+
+# Node-watch stamping: the watch replays install-time flaps on (re)connect.
+T0=$(( $(date +%s) - 3600 ))
+iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ; }
+PRE="$(iso $((T0 - 600)))"; POST="$(iso $((T0 + 60)))"
+printf 'False %s\nTrue %s\n' "$PRE" "$(iso $((T0 - 500)))" | rg_node_watch_stamp > "$TMP/w1.log"
+assert "replayed pre-burst False (lastTransitionTime < burst start) is not counted: install flaps must not fail (b)" \
+  "$([ "$(rg_notready_since "$TMP/w1.log" "$T0")" = 0 ] && echo 1 || echo 0)"
+printf 'True %s\nFalse %s\n' "$PRE" "$POST" | rg_node_watch_stamp > "$TMP/w2.log"
+assert "False transition after burst start is counted: a real flap during the burst must fail (b)" \
+  "$([ "$(rg_notready_since "$TMP/w2.log" "$T0")" = 1 ] && echo 1 || echo 0)"
+printf 'False %s\nFalse %s\nFalse %s\n' "$POST" "$POST" "$POST" | rg_node_watch_stamp > "$TMP/w3.log"
+assert "duplicate watch lines are deduped: one flap is one observation" \
+  "$([ "$(wc -l < "$TMP/w3.log" | tr -d ' ')" = 1 ] && [ "$(rg_notready_since "$TMP/w3.log" "$T0")" = 1 ] && echo 1 || echo 0)"
+printf 'False %s\n' "$PRE" | rg_node_watch_stamp > "$TMP/w4.log"
+ramp_env_stuck="$(printf 'ramp_30_secs=20\nramp_30_oom_host=0\nramp_30_oom_kubesystem=0\nramp_30_notready=%s\nramp_30_ready_final=False\nramp_30_wp_ok=1\n' "$(rg_notready_since "$TMP/w4.log" "$T0")")"
+printf '%s\n' "$ramp_env_stuck" > "$TMP/stuck.env"
+assert "node still False from before the burst is not counted as a flap but fails (b) via the final-Ready check" \
+  "$([ "$(rg_ramp_step "$TMP/stuck.env" 30)" = "PASS FAIL PASS PASS" ] && echo 1 || echo 0)"
+printf 'True %s\n' "$PRE" | rg_node_watch_stamp > "$TMP/w5.log"
+assert "a lastTransitionTime is stamped as its own epoch, not the read time" "$([ "$(cut -d' ' -f1 "$TMP/w5.log")" = "$((T0 - 600))" ] && echo 1 || echo 0)"
+
+printf '1\tburst30\tMEM\t204800\n2\tburst30\tMEM\t102400\n3\tburst30\tkubelet\t1\t1\n4\tburst40\tMEM\t51200\n' > "$TMP/s.tsv"
+assert "rg_phase_memmin takes the per-phase minimum in MiB" "$([ "$(rg_phase_memmin "$TMP/s.tsv" burst30)" = 100 ] && echo 1 || echo 0)"
+assert "rg_phase_memmin reports - for a phase that never ran" "$([ "$(rg_phase_memmin "$TMP/s.tsv" burst70)" = - ] && echo 1 || echo 0)"
+
+assert "rg_parse_ramp accepts 30,40,50" "$([ "$(rg_parse_ramp 30,40,50)" = "30 40 50" ] && echo 1 || echo 0)"
+for bad in "" abc 30,,40 30, ,30 0,10 40,30 30,30 30,x -5; do
+  assert "rg_parse_ramp rejects '$bad' (a malformed list must not start an hour-long probe)" "$(rg_parse_ramp "$bad" >/dev/null && echo 0 || echo 1)"
+done
+
+ramp_env() {
+  printf 'install_ok=1\n'
+  local n
+  for n in "$@"; do
+    case "$n" in
+      *:bad) n="${n%:bad}"; printf 'ramp_%s_secs=timeout\nramp_%s_oom_host=0\nramp_%s_oom_kubesystem=0\nramp_%s_notready=1\nramp_%s_ready_final=False\nramp_%s_wp_ok=0\n' "$n" "$n" "$n" "$n" "$n" "$n" ;;
+      *) printf 'ramp_%s_secs=20\nramp_%s_oom_host=0\nramp_%s_oom_kubesystem=0\nramp_%s_notready=0\nramp_%s_ready_final=True\nramp_%s_wp_ok=1\n' "$n" "$n" "$n" "$n" "$n" "$n" ;;
+    esac
+  done
+}
+ramp_env 30 40 50:bad > "$TMP/ramp.env"
+out="$(rg_ramp_verdict "$TMP/ramp.env" "30 40 50 60" "$TMP/s.tsv")" && rrc=0 || rrc=$?
+assert "ramp candidate is the largest size before the first failure, labelled approximate" \
+  "$(echo "$out" | grep -q '^RAMP: candidate N=40 -- approximate (single VM, state carryover)' && [ "$rrc" = 0 ] && echo 1 || echo 0)"
+assert "ramp table shows the failed size and the size never run" \
+  "$(echo "$out" | grep -E '^50 +PASS +FAIL +FAIL +FAIL' >/dev/null && echo "$out" | grep -q '^60 .*not run' && echo 1 || echo 0)"
+assert "ramp summary states webhook-smoke (e) is not evaluated per size" \
+  "$(echo "$out" | grep -q '^RAMP: criterion (e) webhook-smoke is NOT evaluated per size' && echo 1 || echo 0)"
+assert "ramp summary says stopped at the first criterion failure (50), not VM death" \
+  "$(echo "$out" | grep -q '^RAMP: stopped at the first criterion failure (50-pod burst)' && echo 1 || echo 0)"
+ramp_env 30 40 > "$TMP/rampd.env"
+out="$(rg_ramp_verdict "$TMP/rampd.env" "30 40 50 60" "$TMP/s.tsv")" || true
+assert "ramp that ends with sizes unrun and no failure is reported as VM death / cap, not as a criterion failure" \
+  "$(echo "$out" | grep -q '^RAMP: ended early with no criterion failure; sizes not run: 50 60' && echo 1 || echo 0)"
+ramp_env 30 40 | grep -v '^ramp_40_ready_final=' > "$TMP/rampu.env"
+out="$(rg_ramp_verdict "$TMP/rampu.env" "30 40" "$TMP/s.tsv")" || true
+assert "ramp step with no node status (API unreachable) is reported as unreachable" \
+  "$(echo "$out" | grep -q '^RAMP: API unreachable at the end of the 40-pod step' && echo 1 || echo 0)"
+ramp_env 30:bad > "$TMP/ramp0.env"
+out="$(rg_ramp_verdict "$TMP/ramp0.env" "30 40" "$TMP/s.tsv")" && rrc=0 || rrc=$?
+assert "ramp with a failing first size has no candidate and exits non-zero" "$([ "$rrc" != 0 ] && echo "$out" | grep -q 'no size passed' && echo 1 || echo 0)"
+for key in secs oom_host oom_kubesystem notready ready_final wp_ok; do
+  ramp_env 30 | grep -v "^ramp_30_$key=" > "$TMP/rampm.env"
+  assert "ramp step missing ramp_30_$key is not a pass (a step that died midway must not become the candidate)" \
+    "$(rg_ramp_step "$TMP/rampm.env" 30 >/dev/null && echo 0 || echo 1)"
+done
+ramp_env 30 | sed 's/^ramp_30_oom_kubesystem=0/ramp_30_oom_kubesystem=1/' > "$TMP/rampo.env"
+assert "ramp step with a kube-system OOM fails criterion (a) only" "$([ "$(rg_ramp_step "$TMP/rampo.env" 30)" = "FAIL PASS PASS PASS" ] && echo 1 || echo 0)"
+ramp_env 30 | sed 's/^ramp_30_secs=20/ramp_30_secs=181/' > "$TMP/rampc.env"
+assert "ramp step slower than the burst cap fails (c)" "$(BURST_CAP_SECS=180 rg_ramp_step "$TMP/rampc.env" 30 >/dev/null && echo 0 || echo 1)"
+printf 'install_ok=0\n' > "$TMP/rampi.env"
+assert "ramp with failed install fails" "$(rg_ramp_verdict "$TMP/rampi.env" "30" "$TMP/s.tsv" >/dev/null && echo 0 || echo 1)"
+
+# Ramp/capture flags: malformed lists never reach a VM; valid ones reach the VM env.
+for bad in abc 30,30 40,30 30,; do
+  : > "$LIMA_CALLS"; rm -rf "$TMP/out-ramp"
+  rc=0; "$HERE/burst-gate.sh" --ramp "$bad" --tarball-dir "$TMP/tb" --out "$TMP/out-ramp" >/dev/null 2>&1 || rc=$?
+  assert "--ramp '$bad' rejected with exit 2 and zero limactl calls" "$([ "$rc" = 2 ] && [ ! -s "$LIMA_CALLS" ] && echo 1 || echo 0)"
+done
+rc=0; "$HERE/burst-gate.sh" --probe-kill 0 --tarball-dir "$TMP/tb" --out "$TMP/out-ramp" >/dev/null 2>&1 || rc=$?
+assert "--probe-kill 0 rejected (a zero hard-kill would fail every size instantly)" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
+: > "$LIMA_CALLS"; rm -rf "$TMP/out-ramp"
+"$HERE/burst-gate.sh" --ramp 30,40 --runs 5 --tarball-dir "$TMP/tb" --out "$TMP/out-ramp" >/dev/null 2>&1 || true
+assert "--ramp reaches the VM env with the default 180 s probe kill" \
+  "$(grep -qx 'RAMP=30,40' "$TMP/out-ramp/stage/gate.env" && grep -qx 'RAMP_KILL_SECS=180' "$TMP/out-ramp/stage/gate.env" && echo 1 || echo 0)"
+assert "--ramp uses a single VM regardless of --runs (one install is the point)" "$([ "$(grep -c '^create ' "$LIMA_CALLS")" = 1 ] && echo 1 || echo 0)"
+assert "--probe-kill reaches the VM env" "$("$HERE/burst-gate.sh" --ramp 30 --probe-kill 90 --tarball-dir "$TMP/tb" --out "$TMP/out-pk" >/dev/null 2>&1; grep -qx 'RAMP_KILL_SECS=90' "$TMP/out-pk/stage/gate.env" && echo 1 || echo 0)"
+assert "vm-capture is off by default (its kubectl probes cost memory on the 1 GiB node)" "$(grep -qx 'CAPTURE=0' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
+"$HERE/burst-gate.sh" --capture --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-cap" >/dev/null 2>&1 || true
+assert "--capture opts vm-capture in" "$(grep -qx 'CAPTURE=1' "$TMP/out-cap/stage/gate.env" && echo 1 || echo 0)"
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
