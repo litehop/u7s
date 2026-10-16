@@ -3247,25 +3247,9 @@ fn parse_node_kubelet_ports(
 
 /// Parse "https://HOST:PORT" into (host, port). Returns ("127.0.0.1", 6443) on any parse error.
 fn parse_advertise_address(addr: &str) -> (String, u16) {
-    let without_scheme = addr
-        .strip_prefix("https://")
-        .or_else(|| addr.strip_prefix("http://"))
-        .unwrap_or(addr);
-    // Handle IPv6 bracketed addresses like [::1]:6443.
-    if let Some(bracket_end) = without_scheme.find(']') {
-        let host = without_scheme[1..bracket_end].to_owned();
-        let port = without_scheme
-            .get(bracket_end + 2..)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(6443);
-        return (host, port);
-    }
-    match without_scheme.rsplit_once(':') {
-        Some((host, port_str)) => {
-            let port = port_str.parse().unwrap_or(6443);
-            (host.to_owned(), port)
-        }
-        None => ("127.0.0.1".to_owned(), 6443),
+    match tls::parse_advertise(addr) {
+        Ok(Some((host, port))) => (host, port.unwrap_or(6443)),
+        _ => ("127.0.0.1".to_owned(), 6443),
     }
 }
 
