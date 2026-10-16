@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// Apply a JSON Merge Patch (RFC 7396) to `target`.
@@ -34,6 +35,27 @@ pub enum PatchError {
     NotAnObject,
     #[error("invalid $patch directive: {0}")]
     InvalidDirective(String),
+    #[error("strategic merge patch exceeds the work budget of {0} list-element operations")]
+    TooComplex(usize),
+}
+
+/// List-element operations one strategic merge patch may perform. Matching is linear, so this
+/// only bounds patches that are themselves enormous (the request body cap alone admits ~250k
+/// elements); upstream has no equivalent and relies on the request timeout instead.
+const MAX_WORK: usize = 1_000_000;
+
+thread_local! {
+    static WORK_LEFT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn charge(units: usize) -> Result<(), PatchError> {
+    WORK_LEFT.with(|w| match w.get().checked_sub(units) {
+        Some(left) => {
+            w.set(left);
+            Ok(())
+        }
+        None => Err(PatchError::TooComplex(MAX_WORK)),
+    })
 }
 
 /// Apply a strategic merge patch to `target`.
@@ -48,11 +70,25 @@ pub fn strategic_merge_patch(
     target: &mut serde_json::Value,
     patch: &serde_json::Value,
 ) -> Result<(), PatchError> {
-    strategic_merge_patch_at(target, patch, "", None)
+    run_strategic_merge(target, patch, None, false, MAX_WORK)
 }
 
 thread_local! {
     static SSA_KEYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn run_strategic_merge(
+    target: &mut serde_json::Value,
+    patch: &serde_json::Value,
+    schema: Option<&serde_json::Value>,
+    ssa: bool,
+    budget: usize,
+) -> Result<(), PatchError> {
+    SSA_KEYS.with(|f| f.set(ssa));
+    WORK_LEFT.with(|w| w.set(budget));
+    let r = strategic_merge_patch_at(target, patch, "", schema);
+    SSA_KEYS.with(|f| f.set(false));
+    r
 }
 
 /// Strategic-merge a server-side-apply body: lists use apply's list-map keys, which are
@@ -61,10 +97,7 @@ pub fn strategic_merge_patch_ssa(
     target: &mut serde_json::Value,
     patch: &serde_json::Value,
 ) -> Result<(), PatchError> {
-    SSA_KEYS.with(|f| f.set(true));
-    let r = strategic_merge_patch_at(target, patch, "", None);
-    SSA_KEYS.with(|f| f.set(false));
-    r
+    run_strategic_merge(target, patch, None, true, MAX_WORK)
 }
 
 pub(crate) fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKeyKind {
@@ -111,7 +144,7 @@ pub fn strategic_merge_patch_for_cr(
     patch: &serde_json::Value,
     schema: Option<&serde_json::Value>,
 ) -> Result<(), PatchError> {
-    strategic_merge_patch_at(target, patch, "", schema)
+    run_strategic_merge(target, patch, schema, false, MAX_WORK)
 }
 
 fn strategic_merge_patch_at(
@@ -140,7 +173,9 @@ fn strategic_merge_patch_at(
         if let Some(field) = key.strip_prefix("$deleteFromPrimitiveList/") {
             if let Some(to_remove) = value.as_array() {
                 if let Some(target_arr) = target_obj.get_mut(field).and_then(|v| v.as_array_mut()) {
-                    target_arr.retain(|elem| !to_remove.contains(elem));
+                    charge(to_remove.len() + target_arr.len())?;
+                    let doomed: HashSet<String> = to_remove.iter().map(|v| v.to_string()).collect();
+                    target_arr.retain(|elem| !doomed.contains(&elem.to_string()));
                 }
             }
             continue;
@@ -183,7 +218,7 @@ fn strategic_merge_patch_at(
                     let entry = target_obj
                         .entry(key)
                         .or_insert(serde_json::Value::Array(vec![]));
-                    strategic_merge_set_array(entry, value);
+                    strategic_merge_set_array(entry, value)?;
                 }
                 MergeKeyKind::Replace | MergeKeyKind::Unknown => {
                     // $patch:delete can only be honored by matching a merge key; an array
@@ -236,7 +271,7 @@ fn strategic_merge_patch_at(
         };
         if let MergeKeyKind::Key(merge_key) = merge_key_for_path(&child_path, schema) {
             if let Some(target_arr) = target_obj.get_mut(field).and_then(|v| v.as_array_mut()) {
-                apply_set_element_order(target_arr, order_arr, &merge_key);
+                apply_set_element_order(target_arr, order_arr, &merge_key)?;
             }
         }
     }
@@ -245,7 +280,7 @@ fn strategic_merge_patch_at(
 }
 
 /// Extracts, for element `v`, the subset of `merge_keys` fields it actually carries, as owned
-/// (field, value) pairs. See `matches_key_fields`'s doc for why "whichever fields are present"
+/// (field, value) pairs. See `KeyFields`'s doc for why "whichever fields are present"
 /// (not "every composite field must be present") is the semantics a composite merge key needs.
 fn present_key_fields(
     v: &serde_json::Value,
@@ -257,10 +292,11 @@ fn present_key_fields(
         .collect()
 }
 
-/// True if `existing` agrees with every field named in `fields` (typically the result of
-/// `present_key_fields` on some OTHER element: a full patch fragment, a `$patch:delete`
-/// directive, or a `$setElementOrder` entry). Fields `fields` doesn't mention are "don't
-/// care", not "must be absent".
+/// Key fields of one element. An element `existing`
+/// matches key fields `fields` (typically the result of `present_key_fields` on some OTHER
+/// element: a full patch fragment, a `$patch:delete` directive, or a `$setElementOrder`
+/// entry) when it agrees with every field named in `fields`; fields `fields` doesn't mention
+/// are "don't care", not "must be absent". A missing `protocol` counts as "TCP".
 ///
 /// This "whichever fields are present" semantics — rather than requiring every field a
 /// composite key declares — is load-bearing for Service.spec.ports' composite `["port",
@@ -277,18 +313,105 @@ fn present_key_fields(
 /// fragments, turning "find and update/delete the one matching port" into "match nothing,
 /// silently append a duplicate (or 400) instead" — regressing far more common traffic than the
 /// composite key was added to fix.
-fn matches_key_fields(
-    existing: &serde_json::Value,
-    fields: &[(String, serde_json::Value)],
-) -> bool {
-    let tcp = serde_json::Value::String("TCP".into());
-    !fields.is_empty()
-        && fields.iter().all(|(k, v)| {
-            existing
-                .get(k)
-                .or_else(|| (k == "protocol").then_some(&tcp))
-                == Some(v)
-        })
+type KeyFields = Vec<(String, serde_json::Value)>;
+
+/// Index-side fields of an existing element: its present key fields plus the implicit
+/// `protocol: TCP`.
+fn index_fields(v: &serde_json::Value, merge_keys: &[String]) -> KeyFields {
+    let mut f = present_key_fields(v, merge_keys);
+    if merge_keys.iter().any(|k| k == "protocol") && !f.iter().any(|(k, _)| k == "protocol") {
+        f.push(("protocol".into(), serde_json::Value::String("TCP".into())));
+    }
+    f
+}
+
+fn key_of<'a>(fields: impl IntoIterator<Item = &'a (String, serde_json::Value)>) -> String {
+    let mut s = String::new();
+    for (k, v) in fields {
+        s.push_str(k);
+        s.push('=');
+        s.push_str(&v.to_string());
+        s.push('\0');
+    }
+    s
+}
+
+/// The distinct field-name sets (in merge-key order) the lookups will be made with.
+fn masks_of<'a>(lookups: impl IntoIterator<Item = &'a KeyFields>) -> Vec<Vec<String>> {
+    let mut masks: Vec<Vec<String>> = Vec::new();
+    for f in lookups {
+        if f.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = f.iter().map(|(k, _)| k.clone()).collect();
+        if !masks.contains(&names) {
+            masks.push(names);
+        }
+    }
+    masks
+}
+
+/// Every lookup key an element with `fields` satisfies, one per mask it carries completely.
+fn keys_for<'a>(
+    fields: &'a KeyFields,
+    masks: &'a [Vec<String>],
+) -> impl Iterator<Item = String> + 'a {
+    masks.iter().filter_map(move |mask| {
+        let sel: Option<Vec<&(String, serde_json::Value)>> = mask
+            .iter()
+            .map(|n| fields.iter().find(|(k, _)| k == n))
+            .collect();
+        sel.map(key_of)
+    })
+}
+
+/// Maps lookup key to the ascending positions of elements satisfying it.
+struct KeyIndex {
+    masks: Vec<Vec<String>>,
+    map: HashMap<String, Vec<usize>>,
+}
+
+impl KeyIndex {
+    fn new(masks: Vec<Vec<String>>) -> Self {
+        Self {
+            masks,
+            map: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, pos: usize, fields: &KeyFields) {
+        for k in keys_for(fields, &self.masks) {
+            self.map.entry(k).or_default().push(pos);
+        }
+    }
+
+    fn get(&self, lookup: &KeyFields) -> &[usize] {
+        if lookup.is_empty() {
+            return &[];
+        }
+        self.map.get(&key_of(lookup)).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Position of the first lookup (in `lookups` order) that `fields` satisfies.
+fn first_matching(
+    first_by_key: &HashMap<String, usize>,
+    masks: &[Vec<String>],
+    fields: &KeyFields,
+) -> Option<usize> {
+    keys_for(fields, masks)
+        .filter_map(|k| first_by_key.get(&k).copied())
+        .min()
+}
+
+fn first_by_key(lookups: &[KeyFields]) -> HashMap<String, usize> {
+    let mut m = HashMap::new();
+    for (i, f) in lookups.iter().enumerate() {
+        if !f.is_empty() {
+            m.entry(key_of(f)).or_insert(i);
+        }
+    }
+    m
 }
 
 /// Reorder `target_arr` (an already-merged array) to match the ordering `order_arr`
@@ -300,17 +423,18 @@ fn apply_set_element_order(
     target_arr: &mut [serde_json::Value],
     order_arr: &[serde_json::Value],
     merge_keys: &[String],
-) {
-    let order_fields: Vec<Vec<(String, serde_json::Value)>> = order_arr
+) -> Result<(), PatchError> {
+    charge(order_arr.len() + target_arr.len())?;
+    let order_fields: Vec<KeyFields> = order_arr
         .iter()
         .map(|v| present_key_fields(v, merge_keys))
         .collect();
-    target_arr.sort_by_key(|elem| {
-        order_fields
-            .iter()
-            .position(|fields| matches_key_fields(elem, fields))
-            .unwrap_or(usize::MAX)
+    let masks = masks_of(&order_fields);
+    let first = first_by_key(&order_fields);
+    target_arr.sort_by_cached_key(|elem| {
+        first_matching(&first, &masks, &index_fields(elem, merge_keys)).unwrap_or(usize::MAX)
     });
+    Ok(())
 }
 
 /// Merge patch array into target array using `merge_key`.
@@ -354,7 +478,7 @@ fn strategic_merge_array(
     // Index (not clone) the pre-patch order: reorder_merged_array only ever needs an
     // element's merge-key field values and its position to replicate upstream's
     // element-ordering rule, not a copy of the whole (potentially large) element.
-    let original_positions: Vec<(Vec<(String, serde_json::Value)>, usize)> = target
+    let original_positions: Vec<(KeyFields, usize)> = target
         .as_array()
         .unwrap()
         .iter()
@@ -365,21 +489,33 @@ fn strategic_merge_array(
         })
         .collect();
     let target_arr = target.as_array_mut().unwrap();
+    charge(patch_arr.len() + target_arr.len())?;
 
-    for patch_elem in patch_arr {
+    let patch_fields: Vec<KeyFields> = patch_arr
+        .iter()
+        .map(|e| present_key_fields(e, merge_keys))
+        .collect();
+    let mut index = KeyIndex::new(masks_of(&patch_fields));
+    for (i, e) in target_arr.iter().enumerate() {
+        index.insert(i, &index_fields(e, merge_keys));
+    }
+    let mut deleted = vec![false; target_arr.len()];
+
+    for (patch_elem, key_fields) in patch_arr.iter().zip(&patch_fields) {
         let directive = patch_elem.get("$patch").and_then(|v| v.as_str());
 
         match directive {
             Some("delete") => {
                 // Remove element with matching merge key from target.
-                let key_fields = present_key_fields(patch_elem, merge_keys);
                 if key_fields.is_empty() {
                     return Err(PatchError::InvalidDirective(format!(
                         "$patch:delete element missing merge key '{}'",
                         merge_keys.join(",")
                     )));
                 }
-                target_arr.retain(|t| !matches_key_fields(t, &key_fields));
+                for &i in index.get(key_fields) {
+                    deleted[i] = true;
+                }
             }
             Some("replace") => {
                 // Already handled above; unreachable here but be explicit.
@@ -392,23 +528,19 @@ fn strategic_merge_array(
             }
             None => {
                 // Normal merge: find by merge key and deep-merge, or append.
-                let key_fields = present_key_fields(patch_elem, merge_keys);
-                let found = if key_fields.is_empty() {
-                    None
-                } else {
-                    target_arr
-                        .iter_mut()
-                        .find(|t| matches_key_fields(t, &key_fields))
-                };
+                let found = index.get(key_fields).iter().copied().find(|&i| !deleted[i]);
 
                 match found {
-                    Some(target_elem) => {
+                    Some(i) => {
+                        let target_elem = &mut target_arr[i];
                         // Deep-merge the patch element into the target element.
                         // Pass `path` (the array's own path) so nested lists like env,
                         // volumeMounts, ports resolve their merge keys correctly.
                         strategic_merge_patch_at(target_elem, patch_elem, path, schema)?;
                     }
                     None => {
+                        index.insert(target_arr.len(), &index_fields(patch_elem, merge_keys));
+                        deleted.push(false);
                         target_arr.push(patch_elem.clone());
                     }
                 }
@@ -416,9 +548,16 @@ fn strategic_merge_array(
         }
     }
 
-    reorder_merged_array(target, &original_positions, patch_arr, merge_keys);
+    let mut deleted = deleted.into_iter();
+    target_arr.retain(|_| !deleted.next().unwrap_or(false));
 
-    Ok(())
+    reorder_merged_array(
+        target,
+        &original_positions,
+        &patch_fields,
+        patch_arr,
+        merge_keys,
+    )
 }
 
 /// Merge a `x-kubernetes-list-type: set` patch array into `target`: elements have no merge
@@ -428,19 +567,25 @@ fn strategic_merge_array(
 /// pre-existing element the patch doesn't mention is never dropped — atomic-replacing the
 /// whole array on every patch would silently discard fields the patch never touched, which
 /// is not what upstream's "set" list-type declaration promises.
-fn strategic_merge_set_array(target: &mut serde_json::Value, patch: &serde_json::Value) {
+fn strategic_merge_set_array(
+    target: &mut serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<(), PatchError> {
     let Some(patch_arr) = patch.as_array() else {
-        return;
+        return Ok(());
     };
     if !target.is_array() {
         *target = serde_json::Value::Array(vec![]);
     }
     let target_arr = target.as_array_mut().unwrap();
+    charge(patch_arr.len() + target_arr.len())?;
+    let mut seen: HashSet<String> = target_arr.iter().map(|e| e.to_string()).collect();
     for elem in patch_arr {
-        if !target_arr.contains(elem) {
+        if seen.insert(elem.to_string()) {
             target_arr.push(elem.clone());
         }
     }
+    Ok(())
 }
 
 /// Reorder a just-merged strategic-merge-patch array to match upstream ordering semantics
@@ -463,21 +608,24 @@ fn strategic_merge_set_array(target: &mut serde_json::Value, patch: &serde_json:
 /// fails immediately — no controller or watch behavior involved, purely a patch-storage bug.
 fn reorder_merged_array(
     target: &mut serde_json::Value,
-    original_positions: &[(Vec<(String, serde_json::Value)>, usize)],
+    original_positions: &[(KeyFields, usize)],
+    patch_fields: &[KeyFields],
     patch_arr: &[serde_json::Value],
     merge_keys: &[String],
-) {
+) -> Result<(), PatchError> {
     // Only patch elements that carry at least one merge-key field participate in ordering; an
     // element with none of them can't be matched against anything, so it keeps the
     // append-at-the-end placement it got from the merge loop above. `patch_arr` elements can be
-    // partial (see `matches_key_fields`'s doc), so this deliberately doesn't require every
+    // partial (see `KeyFields`'s doc), so this deliberately doesn't require every
     // composite field to be present — only `present_key_fields` non-empty.
-    let patch_keys: Vec<Vec<(String, serde_json::Value)>> = patch_arr
+    let patch_keys: Vec<KeyFields> = patch_arr
         .iter()
-        .filter(|e| e.get("$patch").is_none())
-        .map(|e| present_key_fields(e, merge_keys))
-        .filter(|fields| !fields.is_empty())
+        .zip(patch_fields)
+        .filter(|(e, f)| e.get("$patch").is_none() && !f.is_empty())
+        .map(|(_, f)| f.clone())
         .collect();
+    let patch_masks = masks_of(&patch_keys);
+    let patch_first = first_by_key(&patch_keys);
 
     // `target` is unconditionally overwritten below, so take its array instead of
     // cloning it — the merge loop above already finished mutating it in place.
@@ -485,37 +633,38 @@ fn reorder_merged_array(
         serde_json::Value::Array(a) => a,
         _ => unreachable!("strategic_merge_array always leaves target as an array"),
     };
+    charge(merged.len() + original_positions.len())?;
     let (keyed, keyless): (Vec<_>, Vec<_>) = merged
         .into_iter()
         .partition(|v| !present_key_fields(v, merge_keys).is_empty());
 
-    let (mut patch_items, mut server_only): (Vec<_>, Vec<_>) = keyed.into_iter().partition(|v| {
-        patch_keys
-            .iter()
-            .any(|fields| matches_key_fields(v, fields))
-    });
-
-    // patch_items must appear in the order they were given in the raw patch.
-    patch_items.sort_by_key(|v| {
-        patch_keys
-            .iter()
-            .position(|fields| matches_key_fields(v, fields))
-            .unwrap_or(usize::MAX)
-    });
-    let original_index = |v: &serde_json::Value| {
-        let fields = present_key_fields(v, merge_keys);
-        if fields.is_empty() {
-            None
-        } else {
-            original_positions
-                .iter()
-                .find(|(of, _)| key_fields_subset(&fields, of))
-                .map(|(_, idx)| *idx)
+    let keyed_fields: Vec<KeyFields> = keyed
+        .iter()
+        .map(|v| present_key_fields(v, merge_keys))
+        .collect();
+    let orig_masks = masks_of(&keyed_fields);
+    let mut orig_first: HashMap<String, usize> = HashMap::new();
+    for (of, idx) in original_positions {
+        for k in keys_for(of, &orig_masks) {
+            orig_first.entry(k).or_insert(*idx);
         }
-    };
+    }
+
+    // (element, first pre-patch position carrying all of its key fields); computed once each.
+    let mut patch_items: Vec<(usize, serde_json::Value, Option<usize>)> = Vec::new();
+    let mut server_only: Vec<(serde_json::Value, Option<usize>)> = Vec::new();
+    for (v, fields) in keyed.into_iter().zip(&keyed_fields) {
+        let orig = orig_first.get(&key_of(fields)).copied();
+        match first_matching(&patch_first, &patch_masks, &index_fields(&v, merge_keys)) {
+            Some(pos) => patch_items.push((pos, v, orig)),
+            None => server_only.push((v, orig)),
+        }
+    }
+    // patch_items must appear in the order they were given in the raw patch.
+    patch_items.sort_by_key(|(pos, _, _)| *pos);
     // server_only elements always existed pre-patch, so this is always Some(_) in
     // practice; unwrap_or is defensive only.
-    server_only.sort_by_key(|v| original_index(v).unwrap_or(usize::MAX));
+    server_only.sort_by_key(|(_, orig)| orig.unwrap_or(usize::MAX));
 
     // Merge server_only and patch_items by taking ownership (via peekable iterators)
     // instead of cloning each element again — both Vecs are otherwise unused after this.
@@ -525,40 +674,24 @@ fn reorder_merged_array(
     loop {
         match (server_only.peek(), patch_items.peek()) {
             (None, None) => break,
-            (Some(_), None) => result.push(server_only.next().unwrap()),
-            (None, Some(_)) => result.push(patch_items.next().unwrap()),
-            (Some(so), Some(pi)) => {
+            (Some(_), None) => result.push(server_only.next().unwrap().0),
+            (None, Some(_)) => result.push(patch_items.next().unwrap().1),
+            (Some((_, so)), Some((_, _, pi))) => {
                 // Take the server-only element only if it demonstrably preceded the patch
                 // element pre-patch; a brand-new patch element (no original position) always
                 // loses this comparison, so it's emitted next instead.
-                let take_left = matches!(
-                    (original_index(so), original_index(pi)),
-                    (Some(l), Some(r)) if l < r
-                );
+                let take_left = matches!((so, pi), (Some(l), Some(r)) if l < r);
                 if take_left {
-                    result.push(server_only.next().unwrap());
+                    result.push(server_only.next().unwrap().0);
                 } else {
-                    result.push(patch_items.next().unwrap());
+                    result.push(patch_items.next().unwrap().1);
                 }
             }
         }
     }
     result.extend(keyless);
     *target = serde_json::Value::Array(result);
-}
-
-/// True if every (key, value) pair in `fields` also appears in `other` — the same
-/// semantics as `matches_key_fields`, but comparing two already-extracted merge-key field
-/// sets (see `present_key_fields`) instead of a field set against a full element. Lets
-/// `reorder_merged_array` index the pre-patch array's merge-key fields once instead of
-/// keeping a clone of every (potentially large) pre-patch element around.
-fn key_fields_subset(
-    fields: &[(String, serde_json::Value)],
-    other: &[(String, serde_json::Value)],
-) -> bool {
-    fields
-        .iter()
-        .all(|(k, v)| other.iter().any(|(ok, ov)| ok == k && ov == v))
+    Ok(())
 }
 
 pub(crate) enum MergeKeyKind {
@@ -3786,6 +3919,97 @@ mod tests {
             target["metadata"]["ownerReferences"],
             json!([{ "uid": "owner-2", "name": "b" }]),
             "only the orphaned owner's reference may be removed"
+        );
+    }
+
+    fn containers(n: usize) -> serde_json::Value {
+        json!((0..n)
+            .map(|i| json!({"name": format!("c{i}"), "image": "old"}))
+            .collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn one_patch_on_a_huge_container_list_must_not_stall_the_tokio_worker_with_quadratic_matching()
+    {
+        // Quadratic matching took ~20s of CPU at n=8000 on a worker thread, stalling health
+        // checks and watches on a 2-worker host; n=30000 here would take minutes if it regressed.
+        let n = 30_000;
+        let mut target = json!({"spec": {"containers": containers(n)}});
+        let mut patch_items: Vec<_> = (0..n)
+            .step_by(3)
+            .map(|i| json!({"name": format!("c{i}"), "image": "new"}))
+            .collect();
+        patch_items.push(json!({"$patch": "delete", "name": "c1"}));
+        patch_items.push(json!({"name": "fresh", "image": "new"}));
+        let patch = json!({"spec": {"containers": patch_items}});
+
+        let started = std::time::Instant::now();
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "list matching regressed to superlinear: {:?}",
+            started.elapsed()
+        );
+
+        let out = target["spec"]["containers"].as_array().unwrap();
+        assert_eq!(out.len(), n, "one deleted, one added");
+        assert_eq!(out[0], json!({"name": "c0", "image": "new"}));
+        assert_eq!(
+            out[1]["name"], "c2",
+            "deleted entry is gone, order preserved"
+        );
+        assert_eq!(out[1]["image"], "old", "untouched entry keeps its fields");
+        assert_eq!(out[2], json!({"name": "c3", "image": "new"}));
+        assert!(
+            out.iter().all(|c| c["name"] != "c1"),
+            "$patch:delete must remove the entry"
+        );
+        assert_eq!(
+            out.iter().filter(|c| c["name"] == "fresh").count(),
+            1,
+            "an unmatched patch entry is added exactly once"
+        );
+    }
+
+    #[test]
+    fn patch_exceeding_the_work_budget_is_rejected_instead_of_pinning_a_worker() {
+        let mut target = json!({"spec": {"containers": containers(1000)}});
+        let patch = json!({"spec": {"containers": containers(1000)}});
+        let err = run_strategic_merge(&mut target, &patch, None, false, 1500).unwrap_err();
+        assert!(matches!(err, PatchError::TooComplex(_)), "got {err:?}");
+        assert!(
+            run_strategic_merge(&mut target, &patch, None, false, 1_000_000).is_ok(),
+            "the same patch fits a realistic budget"
+        );
+    }
+
+    #[test]
+    fn budget_overrun_surfaces_as_422_not_400() {
+        let status = crate::status::Status::patch_error(PatchError::TooComplex(1));
+        assert_eq!(status.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        let status = crate::status::Status::patch_error(PatchError::NotAnObject);
+        assert_eq!(status.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn huge_primitive_and_set_lists_dedupe_without_quadratic_scans() {
+        let n = 30_000;
+        let mut target = json!({"metadata": {"finalizers": (0..n).map(|i| format!("f{i}")).collect::<Vec<_>>()}});
+        let patch = json!({"metadata": {"$deleteFromPrimitiveList/finalizers": (0..n).step_by(2).map(|i| format!("f{i}")).collect::<Vec<_>>()}});
+        let started = std::time::Instant::now();
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        let left = target["metadata"]["finalizers"].as_array().unwrap();
+        assert_eq!(left.len(), n / 2);
+        assert_eq!(left[0], "f1");
+
+        let mut set = json!((0..n).collect::<Vec<_>>());
+        let add = json!((n / 2..n + 10).collect::<Vec<_>>());
+        strategic_merge_set_array(&mut set, &add).unwrap();
+        assert_eq!(
+            set.as_array().unwrap().len(),
+            n + 10,
+            "only new values appended"
         );
     }
 }

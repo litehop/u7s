@@ -1780,7 +1780,7 @@ pub(crate) async fn do_patch<S: Store>(
                     None
                 };
                 crate::patch::strategic_merge_patch_ssa(&mut current.body, &patch)
-                    .map_err(|e| Status::bad_request(e.to_string()))?;
+                    .map_err(Status::patch_error)?;
                 race_plan.remove_dropped_fields(&mut current.body);
                 super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
                 restore_or_strip_status(
@@ -2167,7 +2167,7 @@ pub(crate) async fn do_patch<S: Store>(
                 } else {
                     crate::patch::strategic_merge_patch(&mut current.body, &patch)
                 };
-                merged.map_err(|e| Status::bad_request(e.to_string()))?;
+                merged.map_err(Status::patch_error)?;
             }
             PatchType::Json => {
                 apply_json_patch(&mut current.body, &patch)?;
