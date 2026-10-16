@@ -62,6 +62,38 @@ const REASON_FAILED_DISCOVERY_CHECK: &str = "FailedDiscoveryCheck";
 // Path parsing
 // ---------------------------------------------------------------------------
 
+/// False when the raw (still percent-encoded) path tail has a segment that, once decoded,
+/// is `.`/`..` or contains `/` or `\`. The backend decodes and may clean the path, so such a
+/// segment could land the request outside `/apis/{group}/{version}` with the caller's
+/// asserted identity. Upstream never reaches this state because its mux rejects/redirects
+/// unclean paths before the proxy handler runs.
+fn tail_stays_under_prefix(tail: &str) -> bool {
+    tail.split('/').all(|seg| {
+        let decoded = percent_decode(seg);
+        decoded != b"." && decoded != b".." && !decoded.iter().any(|b| matches!(b, b'/' | b'\\'))
+    })
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |k: usize| b.get(i + k).and_then(|c| (*c as char).to_digit(16));
+        match (b[i], hex(1), hex(2)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Split `/apis/{group}/{version}[/tail]` into (group, version, tail).
 ///
 /// Returns `None` for anything that isn't at least a group+version pair — this
@@ -399,6 +431,13 @@ pub async fn proxy_to_backend<S: Store>(
         }
     };
 
+    if !tail_stays_under_prefix(tail) {
+        return Status::bad_request(format!(
+            "invalid path \"{tail}\": dot segments and encoded separators are not allowed"
+        ))
+        .into_response();
+    }
+
     let mut url = format!("{base}/apis/{group}/{version}");
     if !tail.is_empty() {
         url.push('/');
@@ -504,9 +543,14 @@ pub async fn proxy_middleware<S: Store>(
     let query = req.uri().query().map(str::to_owned);
     let method = req.method().clone();
     let headers = req.headers().clone();
-    let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body = match axum::body::to_bytes(req.into_body(), crate::MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
+            if std::error::Error::source(&e)
+                .is_some_and(|s| s.is::<http_body_util::LengthLimitError>())
+            {
+                return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            }
             return Status::bad_request(format!("failed to read request body: {e}"))
                 .into_response();
         }
@@ -2065,6 +2109,147 @@ mod tests {
                 "service": {"namespace": "wardle-ns", "name": "api", "port": port}
             }
         })
+    }
+
+    /// An authenticated user must not be able to make the aggregator buffer an unbounded
+    /// request body: the proxy read bypassed `DefaultBodyLimit`, so one large POST to an
+    /// aggregated group could exhaust a ~1 GiB host. Oversized bodies get 413 before any dial.
+    #[tokio::test]
+    async fn proxy_middleware_rejects_oversized_request_body_with_413_instead_of_buffering_it() {
+        let state = make_state();
+        let key = crate::keys::group_object_key(
+            "apiregistration.k8s.io",
+            "apiservices",
+            None,
+            "v1alpha1.wardle.example.com",
+        );
+        let svc = serde_json::json!({
+            "spec": {
+                "group": "wardle.example.com",
+                "version": "v1alpha1",
+                "service": { "namespace": "agg-1", "name": "sample-api", "port": 7443 }
+            }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(svc.to_string()), Some(0))
+            .await
+            .expect("seed apiservice");
+
+        let router = make_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/apis/wardle.example.com/v1alpha1/namespaces/default/flunders")
+            .body(Body::from(vec![b'x'; crate::MAX_BODY_BYTES + 1]))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "a body over the apiserver-wide cap must be refused, not buffered"
+        );
+    }
+
+    #[test]
+    fn tail_guard_rejects_dot_segments_and_encoded_variants_that_escape_the_group_prefix() {
+        for tail in [
+            "..",
+            "../../api/v1/secrets",
+            "namespaces/../../../api/v1/secrets",
+            "%2e%2e/%2e%2e/x",
+            "%2E%2e/x",
+            ".%2e/x",
+            "a/./b",
+            "a/%2e/b",
+            "a%2f..%2fb",
+            "a%2F%2e%2e%2Fb",
+            "a%5c..%5cb",
+        ] {
+            assert!(
+                !tail_stays_under_prefix(tail),
+                "{tail:?} would let the backend resolve a path outside the APIService prefix \
+                 under the caller's asserted identity"
+            );
+        }
+    }
+
+    #[test]
+    fn tail_guard_accepts_ordinary_resource_paths() {
+        for tail in [
+            "",
+            "namespaces/default/flunders/a.b",
+            "flunders/..foo",
+            "flunders/foo..",
+            "flunders/a%2eb",
+            "flunders/%252e%252e",
+            "flunders/100%",
+            "flunders/%zz",
+        ] {
+            assert!(
+                tail_stays_under_prefix(tail),
+                "{tail:?} is a legitimate name and must keep working"
+            );
+        }
+    }
+
+    /// A traversal tail must be refused before any backend connection; a normal tail must
+    /// still reach the backend.
+    #[tokio::test]
+    async fn proxy_to_backend_refuses_traversal_tail_but_forwards_normal_tail() {
+        use crate::service_resolver::test_support::{put_loopback_service, tls_json_backend};
+
+        let backend = tls_json_backend(
+            "api.wardle-ns.svc",
+            serde_json::json!({"kind": "FlunderList", "items": []}),
+        )
+        .await;
+        let state = make_state();
+        put_loopback_service(&*state.store, "wardle-ns", "api", backend.port).await;
+        let apiservice = wardle_apiservice(&backend.ca_bundle_b64, backend.port);
+        let user = UserInfo {
+            username: "u".to_owned(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let call = |tail: &'static str| {
+            let state = &state;
+            let apiservice = &apiservice;
+            let user = &user;
+            async move {
+                proxy_to_backend(
+                    state,
+                    apiservice,
+                    "wardle.example.com",
+                    "v1alpha1",
+                    tail,
+                    None,
+                    axum::http::Method::GET,
+                    &HeaderMap::new(),
+                    Bytes::new(),
+                    user,
+                )
+                .await
+            }
+        };
+
+        for tail in ["../../api/v1/secrets", "%2e%2e/%2e%2e/x", "a%2f..%2f..%2fx"] {
+            let resp = call(tail).await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{tail:?} must be refused"
+            );
+        }
+        assert_eq!(
+            backend.hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused traversal must never reach the backend"
+        );
+
+        let resp = call("namespaces/default/flunders").await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(backend.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// An aggregated API backed by a Service must be reached through the Service's ClusterIP
