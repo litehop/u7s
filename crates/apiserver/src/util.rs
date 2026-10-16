@@ -393,28 +393,70 @@ pub fn normalize_rfc3339_to_micro(s: &str) -> String {
     s.to_string()
 }
 
-/// Parse an RFC3339 timestamp of the exact shape produced by `secs_to_rfc3339`/
-/// `utc_now_rfc3339` (`YYYY-MM-DDThh:mm:ss[.ffffff]Z`) back into Unix seconds.
-/// Returns `None` if the string doesn't match that shape. Uses only `std::time` — no
-/// chrono dependency, mirroring `secs_to_rfc3339`.
-///
-/// Needed by the SA-token bound-object liveness check (auth.rs): comparing "now" against a
-/// stored `metadata.deletionTimestamp` requires converting that RFC3339 string back to a
-/// Unix offset so the 60s grace-period leeway can be computed as plain integer arithmetic.
+/// Parse an RFC 3339 timestamp into Unix seconds, as Go's `time.Parse(time.RFC3339, ..)`
+/// does: `YYYY-MM-DDThh:mm:ss[.f+](Z|z|±hh:mm)` with a calendar-valid date and in-range
+/// time fields; anything else is `None`. Fractional seconds are dropped. Uses only `std`
+/// — no chrono dependency, mirroring `secs_to_rfc3339`.
 pub fn rfc3339_to_unix_secs(s: &str) -> Option<i64> {
-    let s = s.strip_suffix('Z')?;
-    let (date, time) = s.split_once('T')?;
-    let time = time.split('.').next()?; // drop fractional seconds if present
-    let mut date_parts = date.splitn(3, '-');
-    let year: i64 = date_parts.next()?.parse().ok()?;
-    let month: i64 = date_parts.next()?.parse().ok()?;
-    let day: i64 = date_parts.next()?.parse().ok()?;
-    let mut time_parts = time.splitn(3, ':');
-    let hour: i64 = time_parts.next()?.parse().ok()?;
-    let minute: i64 = time_parts.next()?.parse().ok()?;
-    let second: i64 = time_parts.next()?.parse().ok()?;
+    fn digits(b: &[u8]) -> Option<i64> {
+        b.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| b.iter().fold(0i64, |acc, d| acc * 10 + i64::from(d - b'0')))
+    }
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let year = digits(&b[0..4])?;
+    let month = digits(&b[5..7])?;
+    let day = digits(&b[8..10])?;
+    let hour = digits(&b[11..13])?;
+    let minute = digits(&b[14..16])?;
+    let second = digits(&b[17..19])?;
+    let mut rest = &b[19..];
+    if rest.first() == Some(&b'.') {
+        let n = rest[1..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if n == 0 {
+            return None;
+        }
+        rest = &rest[1 + n..];
+    }
+    let offset_secs = match rest {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), h0, h1, b':', m0, m1] => {
+            let oh = digits(&[*h0, *h1])?;
+            let om = digits(&[*m0, *m1])?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = oh * 3600 + om * 60;
+            if *sign == b'+' {
+                off
+            } else {
+                -off
+            }
+        }
+        _ => return None,
+    };
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day < 1 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
     let days = ymd_to_days(year, month, day);
-    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+    Some(days * 86400 + hour * 3600 + minute * 60 + second - offset_secs)
 }
 
 /// Inverse of `days_to_ymd`: proleptic-Gregorian year/month/day to days since 1970-01-01.
@@ -829,6 +871,37 @@ mod tests {
         assert_eq!(rfc3339_to_unix_secs(""), None);
         assert_eq!(rfc3339_to_unix_secs("not-a-timestamp"), None);
         assert_eq!(rfc3339_to_unix_secs("2024-01-01T00:00:00"), None); // missing 'Z'
+    }
+
+    /// Shared by the SA-liveness check, CSR expiry/duration math and pod deletion math, all of
+    /// which previously rejected any non-`Z` timestamp a client sent; offsets must convert to
+    /// the same instant as the UTC form, and impossible dates must not silently normalize.
+    #[test]
+    fn rfc3339_to_unix_secs_handles_offsets_fractions_and_range() {
+        let utc = rfc3339_to_unix_secs("2027-01-15T08:00:00Z").unwrap();
+        assert_eq!(rfc3339_to_unix_secs("2027-01-15T08:00:00z"), Some(utc));
+        assert_eq!(rfc3339_to_unix_secs("2027-01-15T17:00:00+09:00"), Some(utc));
+        assert_eq!(rfc3339_to_unix_secs("2027-01-15T02:30:00-05:30"), Some(utc));
+        assert_eq!(
+            rfc3339_to_unix_secs("2027-01-15T17:00:00.123456789+09:00"),
+            Some(utc)
+        );
+        for bad in [
+            "2027-13-15T08:00:00Z",
+            "2027-00-15T08:00:00Z",
+            "2027-01-32T08:00:00Z",
+            "2027-02-29T08:00:00Z",
+            "2027-01-15T24:00:00Z",
+            "2027-01-15T08:60:00Z",
+            "2027-01-15T08:00:60Z",
+            "2027-01-15T08:00:00.Z",
+            "2027-01-15T08:00:00+0900",
+            "2027-01-15T08:00:00+24:00",
+            "2027-01-15 08:00:00Z",
+        ] {
+            assert_eq!(rfc3339_to_unix_secs(bad), None, "{bad:?} must be rejected");
+        }
+        assert!(rfc3339_to_unix_secs("2028-02-29T00:00:00Z").is_some());
     }
 
     /// secs_to_rfc3339 must render pre-1970 (negative Unix seconds) dates correctly instead

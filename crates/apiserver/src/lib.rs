@@ -12,6 +12,7 @@ mod autoscaling_gen_adapter;
 mod batch_gen_adapter;
 mod bootstrap_apply;
 mod bootstrap_rbac;
+mod bootstrap_token;
 mod certificates_v1beta1_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
@@ -241,6 +242,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // at boot. KCM's publisher still POSTs its own copy later — that becomes a 409 which
     // the generic create-conflict path already handles.
     seed_kube_root_ca(&store, &tls_material.ca_cert_der).await?;
+    seed_cluster_info(&store, &server_address_early, &tls_material.ca_cert_der).await?;
 
     // 5. Write kubeconfig.
     write_kubeconfig(&args.kubeconfig, &tls_material, &args)?;
@@ -3215,6 +3217,81 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "Role"
     );
 
+    // -----------------------------------------------------------------------
+    // Bootstrap-signer / token-cleaner namespace Roles and bindings, as upstream's
+    // namespace_policy.go, plus kubeadm's anonymous read of kube-public/cluster-info
+    // (the discovery document a joining node fetches before it has any credential).
+    // -----------------------------------------------------------------------
+    let events_rule = serde_json::json!(
+        { "apiGroups": ["", "events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] }
+    );
+    let sa_subject = |name: &str| serde_json::json!([{ "kind": "ServiceAccount", "name": name, "namespace": "kube-system" }]);
+    let anonymous_subject = serde_json::json!([
+        { "kind": "User", "apiGroup": "rbac.authorization.k8s.io", "name": "system:anonymous" }
+    ]);
+    let namespace_policy = [
+        (
+            "kube-system",
+            "system:controller:bootstrap-signer",
+            serde_json::json!([{ "apiGroups": [""], "resources": ["secrets"], "verbs": ["get","list","watch"] }]),
+            sa_subject("bootstrap-signer"),
+            "00000000-0000-0000-0000-000000000301",
+            "00000000-0000-0000-0000-000000000302",
+        ),
+        (
+            "kube-system",
+            "system:controller:token-cleaner",
+            serde_json::json!([
+                { "apiGroups": [""], "resources": ["secrets"], "verbs": ["get","list","watch","delete"] },
+                events_rule.clone()
+            ]),
+            sa_subject("token-cleaner"),
+            "00000000-0000-0000-0000-000000000303",
+            "00000000-0000-0000-0000-000000000304",
+        ),
+        (
+            "kube-public",
+            "system:controller:bootstrap-signer",
+            serde_json::json!([
+                { "apiGroups": [""], "resources": ["configmaps"], "verbs": ["get","list","watch"] },
+                { "apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["cluster-info"], "verbs": ["update"] },
+                events_rule.clone()
+            ]),
+            sa_subject("bootstrap-signer"),
+            "00000000-0000-0000-0000-000000000305",
+            "00000000-0000-0000-0000-000000000306",
+        ),
+        (
+            "kube-public",
+            "kubeadm:bootstrap-signer-clusterinfo",
+            serde_json::json!([
+                { "apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["cluster-info"], "verbs": ["get"] }
+            ]),
+            anonymous_subject,
+            "00000000-0000-0000-0000-000000000307",
+            "00000000-0000-0000-0000-000000000308",
+        ),
+    ];
+    for (ns, name, rules, subjects, role_uid, binding_uid) in namespace_policy {
+        let key = keys::group_object_key(GROUP, "roles", Some(ns), name);
+        let body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": { "name": name, "namespace": ns, "uid": role_uid, "creationTimestamp": TS },
+            "rules": rules
+        });
+        put!(key, body, name, "Role");
+        let key = keys::group_object_key(GROUP, "rolebindings", Some(ns), name);
+        let body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": { "name": name, "namespace": ns, "uid": binding_uid, "creationTimestamp": TS },
+            "subjects": subjects,
+            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": name }
+        });
+        put!(key, body, name, "RoleBinding");
+    }
+
     Ok(())
 }
 
@@ -3824,6 +3901,72 @@ async fn seed_kube_root_ca(store: &SqliteStore, ca_cert_der: &[u8]) -> anyhow::R
         }
     }
     Ok(())
+}
+
+/// Seed `kube-public/cluster-info` as kubeadm does (a credential-less kubeconfig carrying
+/// the CA and server URL) so KCM's bootstrapsigner has a ConfigMap to sign with each
+/// bootstrap token's `jws-kubeconfig-<id>`. Create-only: later `jws-*` keys written by the
+/// signer must survive restarts.
+async fn seed_cluster_info(
+    store: &SqliteStore,
+    server: &str,
+    ca_cert_der: &[u8],
+) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    let ca_pem_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        tls::pem_encode("CERTIFICATE", ca_cert_der),
+    );
+    let kubeconfig = format!(
+        "apiVersion: v1\nclusters:\n- cluster:\n    certificate-authority-data: {ca_pem_b64}\n    server: {server}\n  name: \"\"\ncontexts: null\ncurrent-context: \"\"\nkind: Config\npreferences: {{}}\nusers: null\n"
+    );
+    let key = keys::object_key("configmaps", "kube-public", "cluster-info");
+    let body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "cluster-info",
+            "namespace": "kube-public",
+            "creationTimestamp": boot_timestamp()
+        },
+        "data": { "kubeconfig": kubeconfig }
+    });
+    for _ in 0..5 {
+        let res = match store.get(&key).await? {
+            None => store
+                .put(&key, Bytes::from(body.to_string()), Some(0))
+                .await
+                .map(|_| tracing::info!("seeded ConfigMap: kube-public/cluster-info")),
+            Some(stored) => {
+                let mut cm: serde_json::Value = serde_json::from_slice(&stored.value)?;
+                if cm["data"]["kubeconfig"].as_str() == Some(kubeconfig.as_str()) {
+                    return Ok(());
+                }
+                cm["data"]["kubeconfig"] = serde_json::Value::String(kubeconfig.clone());
+                store
+                    .put(&key, Bytes::from(cm.to_string()), Some(stored.revision))
+                    .await
+                    .map(|_| tracing::info!("updated kube-public/cluster-info kubeconfig"))
+            }
+        };
+        match res {
+            Ok(()) => return Ok(()),
+            Err(
+                u7s_store::StoreError::AlreadyExists { .. }
+                | u7s_store::StoreError::RevisionMismatch { .. },
+            ) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "seed ConfigMap kube-public/cluster-info: {e}"
+                ))
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "seed ConfigMap kube-public/cluster-info: gave up after conflicting writes"
+    ))
 }
 
 /// Seed the default API Priority and Fairness resources.
@@ -8629,6 +8772,86 @@ mod tests {
         seed_serviceaccounts(&store)
             .await
             .expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn seed_cluster_info_carries_server_and_ca_and_keeps_signer_jws_across_restart() {
+        // bootstrapsigner only signs an existing kube-public/cluster-info, and a restart
+        // must not wipe the jws-kubeconfig-<id> entries it wrote or joining nodes lose
+        // their ability to verify the discovery document until the next signer resync.
+        let store = make_store();
+        seed_cluster_info(&store, "https://10.0.0.1:6443", b"fake-ca-der")
+            .await
+            .expect("seed must not fail");
+        let key = keys::object_key("configmaps", "kube-public", "cluster-info");
+        let stored = store
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("cluster-info must exist");
+        let mut cm: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let kubeconfig = cm["data"]["kubeconfig"].as_str().unwrap();
+        assert!(kubeconfig.contains("server: https://10.0.0.1:6443"));
+        assert!(kubeconfig.contains("certificate-authority-data: "));
+        cm["data"]["jws-kubeconfig-abcdef"] = serde_json::json!("sig");
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(cm.to_string()),
+                Some(stored.revision),
+            )
+            .await
+            .unwrap();
+
+        seed_cluster_info(&store, "https://10.0.0.1:6443", b"fake-ca-der")
+            .await
+            .expect("reseed must not fail");
+        let after: serde_json::Value =
+            serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
+        assert_eq!(after["data"]["jws-kubeconfig-abcdef"], "sig");
+
+        seed_cluster_info(&store, "https://10.0.0.2:6443", b"other-ca-der")
+            .await
+            .expect("reseed with new server/CA must not fail");
+        let after: serde_json::Value =
+            serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
+        let kubeconfig = after["data"]["kubeconfig"].as_str().unwrap();
+        assert!(
+            kubeconfig.contains("server: https://10.0.0.2:6443"),
+            "a changed advertise address must reach cluster-info or joining nodes discover a dead server"
+        );
+        assert_ne!(
+            after["data"]["kubeconfig"], cm["data"]["kubeconfig"],
+            "a rotated CA must update the kubeconfig (a stale CA breaks join pinning)"
+        );
+        assert_eq!(
+            after["data"]["jws-kubeconfig-abcdef"], "sig",
+            "signer-written jws keys must survive; bootstrapsigner re-signs on the content change"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_grants_tokencleaner_and_bootstrapsigner_their_namespace_roles() {
+        // Upstream's per-controller roles for the two opt-in bootstrap controllers; without
+        // them a deployment running them under their own service accounts could neither
+        // delete expired join tokens nor sign cluster-info.
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+        for (ns, name) in [
+            ("kube-system", "system:controller:token-cleaner"),
+            ("kube-system", "system:controller:bootstrap-signer"),
+            ("kube-public", "system:controller:bootstrap-signer"),
+            ("kube-public", "kubeadm:bootstrap-signer-clusterinfo"),
+        ] {
+            for plural in ["roles", "rolebindings"] {
+                let key =
+                    keys::group_object_key("rbac.authorization.k8s.io", plural, Some(ns), name);
+                assert!(
+                    store.get(&key).await.unwrap().is_some(),
+                    "{plural} {ns}/{name} must be seeded"
+                );
+            }
+        }
     }
 
     #[tokio::test]
