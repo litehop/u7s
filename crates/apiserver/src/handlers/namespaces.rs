@@ -525,6 +525,8 @@ pub(crate) async fn patch_namespace<S: Store>(
                 name: &name,
                 is_ssa: true,
                 field_manager: patch_query.field_manager.as_deref(),
+                user_agent: crate::handlers::json_patch::user_agent(&headers),
+                force: patch_query.force.unwrap_or(false),
                 patch_type: PatchType::StrategicMerge,
                 body,
                 dry_run: patch_query.is_dry_run(),
@@ -860,6 +862,7 @@ pub(crate) async fn patch_namespace_status<S: Store>(
         serde_json::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
+    crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, Some(&name))?;
 
     match patch_type {
         PatchType::Json => {
@@ -2217,6 +2220,7 @@ mod tests {
             field_manager: None,
             _field_validation: None,
             dry_run: Some("All".to_string()),
+            ..Default::default()
         };
 
         assert!(
@@ -5645,6 +5649,7 @@ mod tests {
                 field_manager: Some("kubectl".to_string()),
                 _field_validation: None,
                 dry_run: None,
+                ..Default::default()
             }),
             test_user(),
             ssa_headers,
@@ -5728,6 +5733,7 @@ mod tests {
                 field_manager: Some("e2e-test".to_string()),
                 _field_validation: None,
                 dry_run: None,
+                ..Default::default()
             }),
             test_user(),
             ssa_headers,
@@ -5810,6 +5816,7 @@ mod tests {
                 field_manager: Some("kubectl-apply".to_string()),
                 _field_validation: None,
                 dry_run: None,
+                ..Default::default()
             }),
             test_user(),
             ssa_headers,
@@ -5876,6 +5883,7 @@ mod tests {
                 field_manager: Some("kubectl-apply".to_string()),
                 _field_validation: None,
                 dry_run: None,
+                ..Default::default()
             }),
             test_user(),
             ssa_headers,

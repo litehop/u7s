@@ -638,6 +638,15 @@ fn version_declares_scale_subresource(subresources: Option<&serde_json::Value>) 
         .unwrap_or(false)
 }
 
+/// Mirrors upstream `discovery.StorageVersionHash`: base64 of the first 8 bytes of
+/// sha256("group/version/kind") of the storage version.
+fn storage_version_hash(group: &str, version: &str, kind: &str) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{group}/{version}/{kind}").as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(&digest[..8])
+}
+
 /// Look up CRD-backed resources for a group/version from the store and return discovery entries.
 async fn crd_group_resources<S: Store>(
     state: &AppState<S>,
@@ -933,14 +942,20 @@ pub async fn api_group_resources<S: Store>(
                     .iter()
                     .find(|v| v.name == version)
                     .and_then(|v| v.subresources.as_ref());
-                let mut entries = vec![serde_json::json!({
+                let mut main_entry = serde_json::json!({
                     "name": crd.spec.names.plural,
                     "singularName": crd.spec.names.singular,
                     "namespaced": namespaced,
                     "kind": crd.spec.names.kind,
                     "shortNames": crd.spec.names.short_names,
                     "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                })];
+                });
+                if let Some(sv) = crd.spec.versions.iter().find(|v| v.served && v.storage) {
+                    main_entry["storageVersionHash"] = serde_json::Value::String(
+                        storage_version_hash(&crd.spec.group, &sv.name, &crd.spec.names.kind),
+                    );
+                }
+                let mut entries = vec![main_entry];
                 if version_declares_status_subresource(subresources_decl) {
                     entries.push(serde_json::json!({
                         "name": format!("{}/status", crd.spec.names.plural),
@@ -3356,6 +3371,76 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Expected value derived independently: sha256("stable.example.com/v1/CronTab") via
+    // `openssl dgst -sha256 -hex` = 11d5f614ff8bd23b..., first 8 bytes base64-encoded by hand.
+    #[test]
+    fn storage_version_hash_matches_upstream_known_answer_so_storage_migration_clients_agree() {
+        assert_eq!(
+            storage_version_hash("stable.example.com", "v1", "CronTab"),
+            "EdX2FP+L0js="
+        );
+    }
+
+    // Clients (storage migrators) compare the hash across versions to detect storage-version
+    // changes; deriving it from the listed version instead of the storage version breaks that.
+    #[tokio::test]
+    async fn crd_storage_version_hash_derives_from_storage_version_on_every_served_version() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "crontabs.stable.example.com" },
+                "spec": {
+                    "group": "stable.example.com",
+                    "names": { "plural": "crontabs", "singular": "crontab", "kind": "CronTab" },
+                    "scope": "Namespaced",
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": true,
+                          "subresources": { "status": {} } },
+                        { "name": "v2", "served": true, "storage": false,
+                          "subresources": { "status": {} } }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        assert!(create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body
+        )
+        .await
+        .is_ok());
+
+        for v in ["v1", "v2"] {
+            let resp = api_group_resources(
+                State(state.clone()),
+                Path(("stable.example.com".to_string(), v.to_string())),
+            )
+            .await;
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let resources = val["resources"].as_array().unwrap();
+            let main = resources.iter().find(|r| r["name"] == "crontabs").unwrap();
+            assert_eq!(
+                main["storageVersionHash"], "EdX2FP+L0js=",
+                "{v} entry must carry the v1 (storage) hash"
+            );
+            let status = resources
+                .iter()
+                .find(|r| r["name"] == "crontabs/status")
+                .unwrap();
+            assert!(
+                status.get("storageVersionHash").is_none(),
+                "upstream omits storageVersionHash on subresources"
+            );
+        }
     }
 
     // A CRD with multiple served versions must expose ALL of them in the APIGroup.versions

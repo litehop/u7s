@@ -29,9 +29,8 @@ use super::generic::{
     LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
 use super::json_patch::{
-    apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
-    is_dry_run_header, ssa_body_to_json, strip_managed_fields, CreateQuery, PatchQuery, PatchType,
-    ReplaceQuery,
+    apply_field_validation, apply_json_patch, detect_patch_type, is_dry_run_header,
+    ssa_body_to_json, strip_managed_fields, CreateQuery, PatchQuery, PatchType, ReplaceQuery,
 };
 use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
@@ -465,6 +464,11 @@ pub(crate) async fn create_resource<S: Store>(
             // extractor of its own; forward the already-parsed ?fieldValidation= value via a
             // header rather than adding a parameter to its ~60 existing call sites.
             let mut headers = headers;
+            crate::field_manager::forward_query(
+                &mut headers,
+                create_query.field_manager.as_deref(),
+                false,
+            );
             if let Some(fv) = create_query.field_validation.as_deref() {
                 if let Ok(hv) = axum::http::HeaderValue::from_str(fv) {
                     headers.insert(
@@ -577,6 +581,14 @@ pub(crate) async fn create_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::force_generation_on_create(&group, &plural, &mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+    crate::field_manager::WriteIdentity::new(create_query.field_manager.as_deref(), &headers)
+        .record(
+            &serde_json::Value::Null,
+            &mut obj.body,
+            &api_version,
+            None,
+            None,
+        );
 
     // Dry-run: validation and admission passed; return the would-be created object without persisting.
     if create_query.is_dry_run() {
@@ -758,6 +770,12 @@ pub(crate) async fn replace_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
+            let mut headers = headers;
+            crate::field_manager::forward_query(
+                &mut headers,
+                replace_query.field_manager.as_deref(),
+                false,
+            );
             return super::cr::replace_cr(
                 State(state),
                 Path((group, version, plural, name)),
@@ -1045,6 +1063,14 @@ pub(crate) async fn replace_resource<S: Store>(
     // Restore the stored status: controllers write status via /status; a full PUT on
     // the main endpoint must preserve whatever the controller last wrote.
     restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
+    crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
+        .record(
+            old_object.as_ref().unwrap_or(&serde_json::Value::Null),
+            &mut obj.body,
+            &group_version(&group, &version),
+            None,
+            None,
+        );
 
     // Dry-run: validation and admission passed; return the would-be result without persisting.
     if replace_query.is_dry_run() {
@@ -1397,9 +1423,12 @@ pub(crate) struct PatchConfig<'a> {
     pub ns: Option<&'a str>,
     pub name: &'a str,
     pub is_ssa: bool,
-    /// Value of the `?fieldManager=` query param; used only for SSA to
-    /// populate the synthetic `managedFields` echo in the response.
+    /// Value of the `?fieldManager=` query param; when absent the manager is derived from
+    /// `user_agent`.
     pub field_manager: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+    /// `?force=true`: an apply takes ownership of conflicting fields instead of failing.
+    pub force: bool,
     pub patch_type: PatchType,
     pub body: Bytes,
     /// When true, run all validation but skip the store write.
@@ -1413,12 +1442,34 @@ pub(crate) struct PatchConfig<'a> {
     pub user: &'a UserInfo,
 }
 
+use crate::field_manager::applied_fields;
+
+fn group_version(group: &str, version: &str) -> String {
+    if group.is_empty() {
+        version.to_string()
+    } else {
+        format!("{group}/{version}")
+    }
+}
+
+fn field_request<'a>(
+    manager: &'a str,
+    api_version: &'a str,
+    now: &'a str,
+) -> crate::field_manager::Request<'a> {
+    crate::field_manager::Request {
+        manager,
+        api_version,
+        subresource: None,
+        schema: None,
+        now,
+    }
+}
+
 /// Shared patch logic for cluster-scoped and namespaced resources.
 ///
 /// `cfg.ns` is `None` for cluster-scoped resources and `Some(namespace)` for namespaced ones.
 /// The caller supplies the pre-computed `cfg.key` and resolved `cfg.meta`.
-/// `cfg.field_manager` is the value of the `?fieldManager=` query param; used only for SSA to
-/// populate the synthetic `managedFields` echo in the response.
 pub(crate) async fn do_patch<S: Store>(
     state: &AppState<S>,
     cfg: PatchConfig<'_>,
@@ -1433,12 +1484,20 @@ pub(crate) async fn do_patch<S: Store>(
         name,
         is_ssa,
         field_manager,
+        user_agent,
+        force,
         patch_type,
         body,
         dry_run,
         user_info,
         user,
     } = cfg;
+    let manager = crate::field_manager::request_manager(field_manager, user_agent);
+    let api_version = if group.is_empty() {
+        version.to_string()
+    } else {
+        format!("{group}/{version}")
+    };
     let stored_opt = state
         .store
         .get(key)
@@ -1452,27 +1511,23 @@ pub(crate) async fn do_patch<S: Store>(
         let mut obj = Object {
             body: ssa_body_to_json(&body)?,
         };
-        // Strip any managedFields the client sent — we don't track field ownership.
+        // managedFields are server-owned: whatever the client sent is discarded.
         strip_managed_fields(&mut obj.body);
-        let mut obj_meta: ObjectMeta =
-            ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
-        obj_meta.name = Some(name.to_string());
-        if let Some(namespace) = ns {
-            obj_meta.namespace = Some(namespace.to_string());
-        }
-        obj.body["metadata"] =
-            serde_json::to_value(obj_meta).map_err(|e| Status::internal(e.to_string()))?;
+        super::json_patch::enforce_patch_identity(&mut obj.body, name, ns)?;
+        let now = crate::util::utc_now_rfc3339();
+        let ssa_plan = crate::field_manager::plan_apply(
+            &serde_json::Value::Null,
+            &applied_fields(&obj.body, meta.has_status_subresource),
+            force,
+            &field_request(&manager, &api_version, &now),
+        )
+        .map_err(crate::field_manager::Conflict::into_status)?;
         resolve_valid_name(&mut obj, group, plural, &meta.kind)?;
         stamp_metadata(&mut obj);
         // An SSA apply-create is a create just like create_resource/create_namespaced_resource
         // — without this, `kubectl apply --server-side` on a not-yet-existing built-in with a
         // status subresource persisted whatever `status` the client's apply manifest carried,
         // scalar or not, since it never went through either POST create path's guard.
-        let api_version = if group.is_empty() {
-            version.to_string()
-        } else {
-            format!("{group}/{version}")
-        };
         clear_create_status(
             meta.has_status_subresource,
             &api_version,
@@ -1594,6 +1649,7 @@ pub(crate) async fn do_patch<S: Store>(
         super::defaults::apply_defaults(group, plural, &mut obj.body);
         super::defaults::force_generation_on_create(group, plural, &mut obj.body);
         run_validating_webhooks(state, &obj.body, None, &admission_ctx).await?;
+        ssa_plan.record(&mut obj.body);
 
         let svc_alloc = if group.is_empty() && plural == "services" {
             Some(
@@ -1614,11 +1670,6 @@ pub(crate) async fn do_patch<S: Store>(
 
         if dry_run {
             // Dry-run: validation passed; return the would-be created object without persisting.
-            if let Some(fm) = field_manager {
-                let api_ver = obj.body["apiVersion"].as_str().unwrap_or("").to_string();
-                let now = crate::util::utc_now_rfc3339();
-                inject_managed_fields(&mut obj.body, fm, &api_ver, &now);
-            }
             return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
         }
         // Namespace-Terminating check (when namespaced) and the create are one atomic store
@@ -1673,6 +1724,13 @@ pub(crate) async fn do_patch<S: Store>(
                     .then(|| current.body.clone());
                 let mut patch: serde_json::Value = ssa_body_to_json(&body)?;
                 strip_managed_fields(&mut patch);
+                let race_plan = crate::field_manager::plan_apply(
+                    &current.body,
+                    &applied_fields(&patch, meta.has_status_subresource),
+                    force,
+                    &field_request(&manager, &api_version, &now),
+                )
+                .map_err(crate::field_manager::Conflict::into_status)?;
                 // The winner of the create race already persisted this object, so from here
                 // this is an update, not a create — same has_status_subresource restore as
                 // the main patch loop below (see its stored_status), needed here too since
@@ -1682,8 +1740,9 @@ pub(crate) async fn do_patch<S: Store>(
                 } else {
                     None
                 };
-                crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                crate::patch::strategic_merge_patch_ssa(&mut current.body, &patch)
                     .map_err(|e| Status::bad_request(e.to_string()))?;
+                race_plan.remove_dropped_fields(&mut current.body);
                 super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
                 restore_or_strip_status(
                     meta.has_status_subresource,
@@ -1775,14 +1834,7 @@ pub(crate) async fn do_patch<S: Store>(
                 );
                 run_validating_webhooks(state, &current.body, None, &admission_ctx).await?;
 
-                if let Some(fm) = field_manager {
-                    let api_ver = current.body["apiVersion"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let now = crate::util::utc_now_rfc3339();
-                    inject_managed_fields(&mut current.body, fm, &api_ver, &now);
-                }
+                race_plan.record(&mut current.body);
                 let race_svc_alloc = if group.is_empty() && plural == "services" {
                     Some(
                         crate::service_alloc::begin(
@@ -1840,11 +1892,6 @@ pub(crate) async fn do_patch<S: Store>(
                 Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
             };
             state.rbac_index.apply_object(&rbac_key, &obj.body);
-        }
-        if let Some(fm) = field_manager {
-            let api_ver = obj.body["apiVersion"].as_str().unwrap_or("").to_string();
-            let now = crate::util::utc_now_rfc3339();
-            inject_managed_fields(&mut obj.body, fm, &api_ver, &now);
         }
         // ResourceQuota: refresh status.used so a count/* quota's usage reflects this
         // SSA-create, matching create_namespaced_resource's own update_quota_status call.
@@ -2016,10 +2063,25 @@ pub(crate) async fn do_patch<S: Store>(
                 .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
         };
 
-        // Strip managedFields the client sent in the apply body — we don't track field ownership.
-        if is_ssa {
+        // managedFields are server-owned: whatever the client sent is discarded.
+        let now = crate::util::utc_now_rfc3339();
+        let ssa_plan = if is_ssa {
             strip_managed_fields(&mut patch);
-        }
+            Some(
+                crate::field_manager::plan_apply(
+                    &current.body,
+                    &applied_fields(&patch, meta.has_status_subresource),
+                    force,
+                    &field_request(&manager, &api_version, &now),
+                )
+                .map_err(crate::field_manager::Conflict::into_status)?,
+            )
+        } else {
+            None
+        };
+        // The pre-patch object, so the fields this write changes can be attributed to its
+        // manager (an apply instead owns exactly the fields it names).
+        let before_patch = (!is_ssa).then(|| current.body.clone());
 
         // Snapshot .status before applying the patch: status is a separate RBAC subresource,
         // so a patch on the main endpoint (merge, strategic-merge, or JSON Patch — a JSON Patch
@@ -2043,14 +2105,21 @@ pub(crate) async fn do_patch<S: Store>(
         match patch_type {
             PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
             PatchType::StrategicMerge => {
-                crate::patch::strategic_merge_patch(&mut current.body, &patch)
-                    .map_err(|e| Status::bad_request(e.to_string()))?;
+                let merged = if is_ssa {
+                    crate::patch::strategic_merge_patch_ssa(&mut current.body, &patch)
+                } else {
+                    crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                };
+                merged.map_err(|e| Status::bad_request(e.to_string()))?;
             }
             PatchType::Json => {
                 apply_json_patch(&mut current.body, &patch)?;
             }
         }
 
+        if let Some(plan) = &ssa_plan {
+            plan.remove_dropped_fields(&mut current.body);
+        }
         current.body["metadata"]["uid"] = stored_uid;
         super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
 
@@ -2311,6 +2380,16 @@ pub(crate) async fn do_patch<S: Store>(
                 serde_json::to_value(patch_meta).map_err(|e| Status::internal(e.to_string()))?;
         }
 
+        match (&ssa_plan, &before_patch) {
+            (Some(plan), _) => plan.record(&mut current.body),
+            (None, Some(before)) => crate::field_manager::record_update(
+                before,
+                &mut current.body,
+                &field_request(&manager, &api_version, &now),
+            ),
+            (None, None) => {}
+        }
+
         let svc_alloc = if group.is_empty() && plural == "services" {
             Some(
                 crate::service_alloc::begin(
@@ -2330,16 +2409,6 @@ pub(crate) async fn do_patch<S: Store>(
 
         // Dry-run: validation and admission passed; return the would-be result without persisting.
         if dry_run {
-            if is_ssa {
-                if let Some(fm) = field_manager {
-                    let api_ver = current.body["apiVersion"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let now = crate::util::utc_now_rfc3339();
-                    inject_managed_fields(&mut current.body, fm, &api_ver, &now);
-                }
-            }
             inject_type_meta(&mut current.body, group, version, &meta.kind);
             return Ok(Json(current.body).into_response());
         }
@@ -2365,17 +2434,6 @@ pub(crate) async fn do_patch<S: Store>(
                 }
                 if group == APISERVICE_GROUP {
                     state.refresh_apiservice_cache().await;
-                }
-                // SSA: echo synthetic managedFields so clients (e.g. Argo CD) can track field ownership.
-                if is_ssa {
-                    if let Some(fm) = field_manager {
-                        let api_ver = current.body["apiVersion"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        let now = crate::util::utc_now_rfc3339();
-                        inject_managed_fields(&mut current.body, fm, &api_ver, &now);
-                    }
                 }
                 inject_type_meta(&mut current.body, group, version, &meta.kind);
                 return Ok(Json(current.body).into_response());
@@ -2927,6 +2985,11 @@ pub(crate) async fn patch_resource<S: Store>(
                     );
                 }
             }
+            crate::field_manager::forward_query(
+                &mut headers,
+                patch_query.field_manager.as_deref(),
+                patch_query.force.unwrap_or(false),
+            );
             return super::cr::patch_cr(
                 State(state),
                 Path((group, version, plural, name)),
@@ -2952,6 +3015,8 @@ pub(crate) async fn patch_resource<S: Store>(
             name: &name,
             is_ssa,
             field_manager: patch_query.field_manager.as_deref(),
+            user_agent: super::json_patch::user_agent(&headers),
+            force: patch_query.force.unwrap_or(false),
             patch_type,
             body,
             dry_run: patch_query.is_dry_run(),
@@ -3273,6 +3338,11 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             // See create_resource: cr::create_cr_namespaced has no Query extractor of its
             // own, so forward ?fieldValidation= via a header instead of a new parameter.
             let mut headers = headers;
+            crate::field_manager::forward_query(
+                &mut headers,
+                create_query.field_manager.as_deref(),
+                false,
+            );
             if let Some(fv) = create_query.field_validation.as_deref() {
                 if let Ok(hv) = axum::http::HeaderValue::from_str(fv) {
                     headers.insert(
@@ -3399,6 +3469,15 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::force_generation_on_create(&group, &plural, &mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+
+    crate::field_manager::WriteIdentity::new(create_query.field_manager.as_deref(), &headers)
+        .record(
+            &serde_json::Value::Null,
+            &mut obj.body,
+            &api_version,
+            None,
+            None,
+        );
 
     // LimitRange: inject defaults then validate min/max bounds (pods only).
     obj.body = limit_range::apply_limit_ranges(&state, obj.body, &ns, &plural).await?;
@@ -3778,6 +3857,12 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
+            let mut headers = headers;
+            crate::field_manager::forward_query(
+                &mut headers,
+                replace_query.field_manager.as_deref(),
+                false,
+            );
             return super::cr::replace_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
@@ -4161,6 +4246,14 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // Restore the stored status: controllers write status via /status; a full PUT on
     // the main endpoint must preserve whatever the controller last wrote.
     restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
+    crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
+        .record(
+            old_object.as_ref().unwrap_or(&serde_json::Value::Null),
+            &mut obj.body,
+            &group_version(&group, &version),
+            None,
+            None,
+        );
 
     // A user PUT on an Endpoints object signals that the endpoints are now user-managed,
     // not service-controller-managed.  Clear the annotation the KCM endpoints-controller
@@ -4540,6 +4633,11 @@ pub(crate) async fn patch_namespaced_resource<S: Store>(
                     );
                 }
             }
+            crate::field_manager::forward_query(
+                &mut headers,
+                patch_query.field_manager.as_deref(),
+                patch_query.force.unwrap_or(false),
+            );
             return super::cr::patch_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
@@ -4565,6 +4663,8 @@ pub(crate) async fn patch_namespaced_resource<S: Store>(
             name: &name,
             is_ssa,
             field_manager: patch_query.field_manager.as_deref(),
+            user_agent: super::json_patch::user_agent(&headers),
+            force: patch_query.force.unwrap_or(false),
             patch_type,
             body,
             dry_run: patch_query.is_dry_run(),
@@ -4656,6 +4756,8 @@ pub(crate) async fn patch_collection_namespaced_resource<S: Store>(
                 name: &name,
                 is_ssa,
                 field_manager: patch_query.field_manager.as_deref(),
+                user_agent: super::json_patch::user_agent(&headers),
+                force: patch_query.force.unwrap_or(false),
                 patch_type,
                 body: body.clone(),
                 dry_run: patch_query.is_dry_run(),
@@ -6134,6 +6236,461 @@ mod tests {
         assert!(store.get(key).await.unwrap().is_some());
     }
 
+    /// An apply that would create an object under a different name or namespace than the URL
+    /// must be a 400 (upstream `checkName`); silently creating it under the URL name hides a
+    /// client that applied the wrong manifest to the wrong endpoint, and nothing is persisted.
+    #[tokio::test]
+    async fn apply_create_with_mismatched_name_or_namespace_is_rejected_and_persists_nothing() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        for (body_name, body_ns) in [("other", "kube-node-lease"), ("lima-node", "other-ns")] {
+            let patch = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": body_name, "namespace": body_ns },
+                "spec": { "holderIdentity": "x" }
+            });
+            let mut ssa_headers = axum::http::HeaderMap::new();
+            ssa_headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+            );
+            let err = patch_namespaced_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "coordination.k8s.io".to_string(),
+                    "v1".to_string(),
+                    "kube-node-lease".to_string(),
+                    "leases".to_string(),
+                    "lima-node".to_string(),
+                )),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                ssa_headers,
+                bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("apply of {body_name}/{body_ns} onto lima-node must fail"));
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        }
+        assert!(store
+            .get("/registry/coordination.k8s.io/leases/kube-node-lease/lima-node")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get("/registry/coordination.k8s.io/leases/kube-node-lease/other")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    fn ssa_deployment(replicas: Option<i64>, port: bool) -> serde_json::Value {
+        let mut container = serde_json::json!({"name": "nginx", "image": "nginx"});
+        if port {
+            container["ports"] = serde_json::json!([{"containerPort": 80, "protocol": "TCP"}]);
+        }
+        let mut d = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "nginx"}},
+                "template": {
+                    "metadata": {"labels": {"app": "nginx"}},
+                    "spec": {"containers": [container]}
+                }
+            }
+        });
+        if let Some(r) = replicas {
+            d["spec"]["replicas"] = serde_json::json!(r);
+        }
+        d
+    }
+
+    async fn patch_deployment(
+        state: &crate::state::AppState<u7s_store::SqliteStore>,
+        content_type: &'static str,
+        query: PatchQuery,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        use axum::response::IntoResponse;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static(content_type),
+        );
+        let resp = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "deployments".to_string(),
+                "web".to_string(),
+            )),
+            axum::extract::Query(query),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await?
+        .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        Ok(serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn apply_as(manager: &str, force: bool) -> PatchQuery {
+        PatchQuery {
+            field_manager: Some(manager.into()),
+            force: Some(force),
+            ..Default::default()
+        }
+    }
+
+    const APPLY: &str = "application/apply-patch+yaml";
+
+    /// A second tool applying a different value for a field another tool applied must get a
+    /// 409 naming the field and its owner, or two controllers silently fight over config.
+    /// `force` is the explicit opt-in to take the field over.
+    #[tokio::test]
+    async fn apply_over_a_field_owned_by_another_manager_conflicts_unless_forced() {
+        let state = make_state();
+        patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+
+        let err = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-b", false),
+            ssa_deployment(Some(5), false),
+        )
+        .await
+        .expect_err("a different value for tool-a's field must conflict");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+        let causes = &err.1.details.as_ref().expect("conflict carries causes")["causes"];
+        assert_eq!(causes.as_array().unwrap().len(), 1);
+        assert_eq!(causes[0]["reason"], "FieldManagerConflict");
+        assert_eq!(causes[0]["field"], ".spec.replicas");
+        assert!(causes[0]["message"].as_str().unwrap().contains("tool-a"));
+
+        let forced = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-b", true),
+            ssa_deployment(Some(5), false),
+        )
+        .await
+        .expect("force takes ownership instead of conflicting");
+        assert_eq!(forced["spec"]["replicas"], 5);
+    }
+
+    /// A merge patch (no applier involved) that changes an applied field must make the next
+    /// apply of the old value conflict, not silently revert the patch — the scenario of
+    /// `kubectl scale` followed by a GitOps re-apply.
+    #[tokio::test]
+    async fn merge_patch_takes_a_field_from_the_applier() {
+        let state = make_state();
+        patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+        patch_deployment(
+            &state,
+            "application/merge-patch+json",
+            PatchQuery {
+                field_manager: Some("kubectl-scale".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"spec": {"replicas": 5}}),
+        )
+        .await
+        .unwrap();
+
+        let err = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .expect_err("re-applying over another manager's change must conflict");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+        assert!(err.1.message.contains("kubectl-scale"), "{}", err.1.message);
+    }
+
+    /// A DNS workload serves 53/TCP and 53/UDP. Re-applying between that shape and a
+    /// single-port shape (either order) must add/remove only the UDP item, never wipe the
+    /// container's ports.
+    #[tokio::test]
+    async fn apply_never_wipes_container_ports_when_same_port_number_has_two_protocols() {
+        let ports = |list: serde_json::Value| {
+            let mut d = ssa_deployment(Some(1), false);
+            d["spec"]["template"]["spec"]["containers"][0]["ports"] = list;
+            d
+        };
+        let both = serde_json::json!([
+            {"containerPort": 53, "protocol": "TCP"},
+            {"containerPort": 53, "protocol": "UDP"}
+        ]);
+        let tcp = serde_json::json!([{"containerPort": 53, "protocol": "TCP"}]);
+        let got =
+            |v: &serde_json::Value| v["spec"]["template"]["spec"]["containers"][0]["ports"].clone();
+
+        let state = make_state();
+        let a = apply_as("tool-a", false);
+        let r = patch_deployment(&state, APPLY, a, ports(both.clone()))
+            .await
+            .unwrap();
+        assert_eq!(got(&r), both);
+        let r = patch_deployment(&state, APPLY, apply_as("tool-a", false), ports(tcp.clone()))
+            .await
+            .unwrap();
+        assert_eq!(got(&r), tcp, "dropping UDP removes only that item");
+        let r = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ports(both.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got(&r), both, "adding UDP back keeps TCP");
+    }
+
+    /// An HPA (or `kubectl scale`) writing spec.replicas through the scale subresource owns
+    /// that value: a later apply that no longer names replicas must keep it, not reset the
+    /// workload to the default and undo the autoscaler.
+    #[tokio::test]
+    async fn scale_subresource_write_is_co_owned_so_apply_without_replicas_keeps_it() {
+        let state = make_state();
+        patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_static("hpa-controller/v1.37"),
+        );
+        crate::handlers::scale::put_scale(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".into(), "deployments".into(), "web".into())),
+            headers,
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "autoscaling/v1",
+                    "kind": "Scale",
+                    "metadata": {"name": "web", "namespace": "default"},
+                    "spec": {"replicas": 5}
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("scale put must succeed: {e:?}"));
+
+        let after = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(None, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            after["spec"]["replicas"], 5,
+            "the scale writer co-owns replicas, so dropping it from the manifest must not delete it"
+        );
+    }
+
+    /// A whole-object PUT body carries no managedFields; it must not wipe ownership, and the
+    /// fields it changed belong to its writer so a later apply that drops them keeps them.
+    #[tokio::test]
+    async fn put_keeps_ownership_and_co_owns_what_it_changed() {
+        let state = make_state();
+        let created = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+        let mut put = created.clone();
+        put["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("managedFields");
+        put["spec"]["replicas"] = serde_json::json!(8);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_static("kubectl-edit/v1.37"),
+        );
+        use axum::response::IntoResponse;
+        let resp = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "web".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&put).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("PUT must succeed: {e:?}"))
+        .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replaced: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let managers: Vec<_> = replaced["metadata"]["managedFields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["manager"].as_str().unwrap().to_string())
+            .collect();
+        assert!(managers.contains(&"tool-a".to_string()), "{managers:?}");
+        assert!(
+            managers.contains(&"kubectl-edit".to_string()),
+            "{managers:?}"
+        );
+
+        let after = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(None, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after["spec"]["replicas"], 8);
+    }
+
+    /// A patch that carries `metadata.managedFields: [{}]` resets ownership (upstream's
+    /// documented reset); the patch's own changes are still attributed to its manager rather
+    /// than the whole write being skipped.
+    #[tokio::test]
+    async fn patch_with_managed_fields_reset_is_recorded_not_skipped() {
+        let state = make_state();
+        patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+        let reset = patch_deployment(
+            &state,
+            "application/merge-patch+json",
+            PatchQuery {
+                field_manager: Some("resetter".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"metadata": {"managedFields": [{}]}, "spec": {"replicas": 9}}),
+        )
+        .await
+        .unwrap();
+        let managers = reset["metadata"]["managedFields"].as_array().unwrap();
+        assert_eq!(managers.len(), 1, "{managers:?}");
+        assert_eq!(managers[0]["manager"], "resetter");
+        assert_eq!(managers[0]["operation"], "Update");
+    }
+
+    /// Dropping a field from the manifest must delete the field the applier owned, or
+    /// `kubectl apply` can never remove configuration (a removed port keeps being served).
+    #[tokio::test]
+    async fn apply_removes_a_field_the_manager_stopped_applying() {
+        let state = make_state();
+        patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), true),
+        )
+        .await
+        .unwrap();
+        let after = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+        let container = &after["spec"]["template"]["spec"]["containers"][0];
+        assert!(
+            container.get("ports").is_none(),
+            "port dropped from the manifest must be removed: {container}"
+        );
+    }
+
+    /// The applied object reports upstream-format ownership, which kubectl and GitOps tools
+    /// read back.
+    #[tokio::test]
+    async fn apply_create_records_the_appliers_fields_in_managed_fields() {
+        let state = make_state();
+        let created = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+        let entry = &created["metadata"]["managedFields"][0];
+        assert_eq!(entry["manager"], "tool-a");
+        assert_eq!(entry["operation"], "Apply");
+        assert_eq!(entry["fieldsType"], "FieldsV1");
+        assert_eq!(
+            entry["fieldsV1"]["f:spec"]["f:replicas"],
+            serde_json::json!({})
+        );
+    }
+
     /// apply-patch+yaml SSA-create-on-missing is a third CREATE surface (alongside plain POST
     /// and create_namespaced_resource) that must not let a client inject a corrupt `status`
     /// into a not-yet-existing built-in: `do_patch`'s upsert branch writes `obj.body` (the raw
@@ -7281,7 +7838,7 @@ mod tests {
                 "cm-2".to_string(),
             )),
             axum::extract::Query(ReplaceQuery {
-                _field_manager: None,
+                field_manager: None,
                 dry_run: Some("All".to_string()),
             }),
             test_user(),
@@ -8006,7 +8563,10 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
-            axum::extract::Query(PatchQuery::default()),
+            axum::extract::Query(PatchQuery {
+                force: Some(true),
+                ..Default::default()
+            }),
             test_user(),
             ssa_headers,
             patch_bytes,
@@ -8074,7 +8634,10 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
-            axum::extract::Query(PatchQuery::default()),
+            axum::extract::Query(PatchQuery {
+                force: Some(true),
+                ..Default::default()
+            }),
             test_user(),
             ssa_headers,
             yaml_patch,
@@ -8156,6 +8719,7 @@ mod tests {
                 field_manager: Some("argocd".to_string()),
                 _field_validation: None,
                 dry_run: None,
+                ..Default::default()
             }),
             test_user(),
             ssa_headers.clone(),
@@ -8232,6 +8796,7 @@ mod tests {
                 field_manager: Some("argocd".to_string()),
                 _field_validation: None,
                 dry_run: None,
+                ..Default::default()
             }),
             test_user(),
             ssa_headers,
@@ -19755,6 +20320,7 @@ mod tests {
             field_manager: None,
             _field_validation: None,
             dry_run: Some("All".to_string()),
+            ..Default::default()
         };
         let patch_resp = patch_namespaced_resource(
             axum::extract::State(state.clone()),
@@ -19831,7 +20397,7 @@ mod tests {
 
         // PUT with dryRun=All: change holderIdentity to "new-holder".
         let dry_run_query = ReplaceQuery {
-            _field_manager: None,
+            field_manager: None,
             dry_run: Some("All".to_string()),
         };
         let put_resp = replace_namespaced_resource(
@@ -19902,7 +20468,7 @@ mod tests {
             "spec": { "holderIdentity": "new-node", "leaseDurationSeconds": 40 }
         });
         let dry_run_query = CreateQuery {
-            _field_manager: None,
+            field_manager: None,
             field_validation: None,
             dry_run: Some("All".to_string()),
         };
@@ -20021,7 +20587,7 @@ mod tests {
             "data": { "k": "v" }
         });
         let dry_run_query = CreateQuery {
-            _field_manager: None,
+            field_manager: None,
             field_validation: None,
             dry_run: Some("All".to_string()),
         };
@@ -20351,6 +20917,7 @@ mod tests {
             field_manager: Some("kubectl-client-side-apply".to_string()),
             _field_validation: None,
             dry_run: Some("All".to_string()),
+            ..Default::default()
         };
 
         let mut ssa_headers = axum::http::HeaderMap::new();

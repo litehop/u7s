@@ -17,6 +17,8 @@ mod certificates_v1beta1_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
 mod core_gen_adapter;
+mod csr_approver;
+mod field_manager;
 pub mod handlers;
 mod inflight;
 mod keys;
@@ -507,6 +509,36 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                     _ = apiservice_reconciler_shutdown_rx.changed() => break,
+                }
+            }
+        });
+    }
+
+    // 10e1. Auto-approve kubelet-serving CSRs that match the requesting node (see
+    // csr_approver for why this is a poll rather than an informer-driven controller).
+    let (_csr_approver_shutdown_tx, mut csr_approver_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+    {
+        let approver_state = state.clone();
+        let apiserver_ips: Vec<std::net::IpAddr> = [
+            tls::parse_advertise(&state.server_address)
+                .ok()
+                .flatten()
+                .and_then(|(h, _)| h.parse().ok()),
+            args.listen
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|a| a.ip()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        tokio::spawn(async move {
+            loop {
+                csr_approver::approve_kubelet_serving_csrs(&approver_state, &apiserver_ips).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(csr_approver::APPROVAL_INTERVAL) => {}
+                    _ = csr_approver_shutdown_rx.changed() => break,
                 }
             }
         });
@@ -1812,9 +1844,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // ClusterRole (e.g. CoreDNS's system:coredns) whose rules it doesn't hold
             // itself — without it, RBAC escalation-prevention on the SSA-create path
             // makes every real cluster boot fail to install CoreDNS's RBAC. This is
-            // distinct from "escalate", which only bypasses the check when authoring a
-            // Role/ClusterRole's own rules, not when creating a binding to one.
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update","bind"] },
+            // distinct from "escalate", which bypasses the check when authoring a
+            // Role/ClusterRole's own rules (needed to apply system:coredns itself).
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update","bind","escalate"] },
             { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services","namespaces"], "verbs": ["get","create","patch","update"] },
             { "apiGroups": ["apps"], "resources": ["deployments","daemonsets"], "verbs": ["get","create","patch","update"] }
         ]

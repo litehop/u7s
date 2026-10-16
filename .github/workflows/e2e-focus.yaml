@@ -97,8 +97,8 @@ jobs:
         uses: ./.github/actions/e2e-focus-run
         with:
           k8s_version: ${{ matrix.k8s }}
-          focus: "RollingUpdateDeployment should delete old pods and create new ones|Kubectl logs logs should be able to retrieve and filter logs|Job should adopt matching orphans and release non-matching pods|ConfigMap should be consumable in multiple volumes in the same pod"
-          expected_specs: "4"
+          focus: "RollingUpdateDeployment should delete old pods and create new ones|Kubectl logs logs should be able to retrieve and filter logs|Job should adopt matching orphans and release non-matching pods|ConfigMap should be consumable in multiple volumes in the same pod|\\[sig-api-machinery\\] ServerSideApply"
+          expected_specs: "11"
           run_label: e2e-focus
 
   # Guards known-recurring-regression files (.githooks/sensitive-conformance-focus.yaml)

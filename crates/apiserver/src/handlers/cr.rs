@@ -2888,6 +2888,14 @@ pub async fn create_cr<S: Store>(
     prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    record_cr_write(
+        &headers,
+        &serde_json::Value::Null,
+        &mut obj,
+        &group,
+        &version,
+        ctx.schema.as_deref(),
+    );
 
     // Dry-run: validation and admission passed; return the would-be created object without
     // persisting — mirrors create_resource's dry-run early-return in resource.rs.
@@ -3115,6 +3123,15 @@ pub async fn replace_cr<S: Store>(
         &mut obj,
     )
     .await?;
+
+    record_cr_write(
+        &headers,
+        &existing,
+        &mut obj,
+        &group,
+        &version,
+        ctx.schema.as_deref(),
+    );
 
     // Dry-run: validation and admission passed; return the would-be replaced object without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -3887,6 +3904,14 @@ pub async fn create_cr_namespaced<S: Store>(
     prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    record_cr_write(
+        &headers,
+        &serde_json::Value::Null,
+        &mut obj,
+        &group,
+        &version,
+        ctx.schema.as_deref(),
+    );
 
     // ResourceQuota: ensure object count does not exceed hard limits (e.g. `count/<crd>.<group>`).
     // Custom resources went through admission webhooks above but were never checked against
@@ -4144,6 +4169,14 @@ pub async fn replace_cr_namespaced<S: Store>(
     );
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    record_cr_write(
+        &headers,
+        &existing,
+        &mut obj,
+        &group,
+        &version,
+        ctx.schema.as_deref(),
+    );
     prepare_cr_generation_for_update(
         &state,
         &ctx,
@@ -4469,6 +4502,87 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
     .into_response())
 }
 
+/// Record the writer of a non-apply custom-resource write as owner of the fields it changed
+/// (`before` is `Value::Null` for a create).
+fn record_cr_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    obj: &mut serde_json::Value,
+    group: &str,
+    version: &str,
+    schema: Option<&serde_json::Value>,
+) {
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        obj,
+        &format!("{group}/{version}"),
+        None,
+        schema,
+    );
+}
+
+fn record_cr_status_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    obj: &mut serde_json::Value,
+    group: &str,
+    version: &str,
+) {
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        obj,
+        &format!("{group}/{version}"),
+        Some("status"),
+        None,
+    );
+}
+
+fn record_cr_scale_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    obj: &mut serde_json::Value,
+    group: &str,
+    version: &str,
+    ctx: &CrContext,
+) {
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        obj,
+        &format!("{group}/{version}"),
+        Some("scale"),
+        ctx.schema.as_deref(),
+    );
+}
+
+fn cr_field_request<'a>(
+    manager: &'a str,
+    api_version: &'a str,
+    schema: Option<&'a serde_json::Value>,
+    now: &'a str,
+) -> crate::field_manager::Request<'a> {
+    crate::field_manager::Request {
+        manager,
+        api_version,
+        subresource: None,
+        schema,
+        now,
+    }
+}
+
+/// Persist field ownership for a CR patch: an apply owns exactly what it named, any other
+/// write owns what it changed.
+fn record_cr_ownership(
+    plan: Option<&crate::field_manager::ApplyPlan>,
+    old: &serde_json::Value,
+    obj: &mut serde_json::Value,
+    req: &crate::field_manager::Request<'_>,
+) {
+    match plan {
+        Some(plan) => plan.record(obj),
+        None => crate::field_manager::record_update(old, obj, req),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cluster-scoped CR patch handler
 // ---------------------------------------------------------------------------
@@ -4511,6 +4625,17 @@ pub async fn patch_cr<S: Store>(
         ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
+        crate::handlers::json_patch::strip_managed_fields(&mut obj);
+        let (manager, force) = crate::field_manager::forwarded_query(&headers);
+        let api_version = format!("{group}/{version}");
+        let now = crate::util::utc_now_rfc3339();
+        let ssa_plan = crate::field_manager::plan_apply(
+            &serde_json::Value::Null,
+            &crate::field_manager::applied_fields(&obj, ctx.has_status_subresource),
+            force,
+            &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
+        )
+        .map_err(crate::field_manager::Conflict::into_status)?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
             ctx.schema.as_deref(),
@@ -4540,6 +4665,7 @@ pub async fn patch_cr<S: Store>(
         prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+        ssa_plan.record(&mut obj);
 
         // Dry-run: validation and admission passed; return the would-be created object
         // without persisting — mirrors create_cr's dry-run early-return.
@@ -4598,7 +4724,7 @@ pub async fn patch_cr<S: Store>(
 
     // apply-patch+yaml bodies are genuine YAML (same conformance client as the create path
     // above); every other patch type here is JSON.
-    let patch: serde_json::Value = if is_ssa {
+    let mut patch: serde_json::Value = if is_ssa {
         crate::handlers::json_patch::ssa_body_to_json(&body)?
     } else {
         serde_json::from_slice(&body)
@@ -4619,6 +4745,24 @@ pub async fn patch_cr<S: Store>(
     // old_object to run_validating_webhooks.
     let old = obj.clone();
 
+    let (manager, force) = crate::field_manager::forwarded_query(&headers);
+    let api_version = format!("{group}/{version}");
+    let now = crate::util::utc_now_rfc3339();
+    let ssa_plan = if is_ssa {
+        crate::handlers::json_patch::strip_managed_fields(&mut patch);
+        Some(
+            crate::field_manager::plan_apply(
+                &old,
+                &crate::field_manager::applied_fields(&patch, ctx.has_status_subresource),
+                force,
+                &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
+            )
+            .map_err(crate::field_manager::Conflict::into_status)?,
+        )
+    } else {
+        None
+    };
+
     match patch_type {
         crate::handlers::json_patch::PatchType::Json => {
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
@@ -4630,6 +4774,9 @@ pub async fn patch_cr<S: Store>(
         crate::handlers::json_patch::PatchType::Merge => {
             crate::patch::merge_patch(&mut obj, &patch);
         }
+    }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut obj);
     }
 
     if let Some(s) = stored_status {
@@ -4700,6 +4847,12 @@ pub async fn patch_cr<S: Store>(
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
     apply_cr_generation_on_update(&old, &mut obj);
+    record_cr_ownership(
+        ssa_plan.as_ref(),
+        &old,
+        &mut obj,
+        &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
+    );
 
     // Dry-run: validation and admission passed; return the would-be patched object without
     // persisting — mirrors do_patch's dry-run early-return in resource.rs.
@@ -4774,6 +4927,17 @@ pub async fn patch_cr_namespaced<S: Store>(
         ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
+        crate::handlers::json_patch::strip_managed_fields(&mut obj);
+        let (manager, force) = crate::field_manager::forwarded_query(&headers);
+        let api_version = format!("{group}/{version}");
+        let now = crate::util::utc_now_rfc3339();
+        let ssa_plan = crate::field_manager::plan_apply(
+            &serde_json::Value::Null,
+            &crate::field_manager::applied_fields(&obj, ctx.has_status_subresource),
+            force,
+            &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
+        )
+        .map_err(crate::field_manager::Conflict::into_status)?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
             ctx.schema.as_deref(),
@@ -4809,6 +4973,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+        ssa_plan.record(&mut obj);
 
         // ResourceQuota: an SSA apply-create is a create just like create_cr_namespaced, so
         // it must be checked against a `count/<plural>.<group>` (or compute) quota too —
@@ -4902,7 +5067,7 @@ pub async fn patch_cr_namespaced<S: Store>(
 
     // apply-patch+yaml bodies are genuine YAML (same conformance client as the create path
     // above); every other patch type here is JSON.
-    let patch: serde_json::Value = if is_ssa {
+    let mut patch: serde_json::Value = if is_ssa {
         crate::handlers::json_patch::ssa_body_to_json(&body)?
     } else {
         serde_json::from_slice(&body)
@@ -4923,6 +5088,24 @@ pub async fn patch_cr_namespaced<S: Store>(
     // old_object to run_validating_webhooks.
     let old = obj.clone();
 
+    let (manager, force) = crate::field_manager::forwarded_query(&headers);
+    let api_version = format!("{group}/{version}");
+    let now = crate::util::utc_now_rfc3339();
+    let ssa_plan = if is_ssa {
+        crate::handlers::json_patch::strip_managed_fields(&mut patch);
+        Some(
+            crate::field_manager::plan_apply(
+                &old,
+                &crate::field_manager::applied_fields(&patch, ctx.has_status_subresource),
+                force,
+                &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
+            )
+            .map_err(crate::field_manager::Conflict::into_status)?,
+        )
+    } else {
+        None
+    };
+
     match patch_type {
         crate::handlers::json_patch::PatchType::Json => {
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
@@ -4934,6 +5117,9 @@ pub async fn patch_cr_namespaced<S: Store>(
         crate::handlers::json_patch::PatchType::Merge => {
             crate::patch::merge_patch(&mut obj, &patch);
         }
+    }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut obj);
     }
 
     if let Some(s) = stored_status {
@@ -5004,6 +5190,12 @@ pub async fn patch_cr_namespaced<S: Store>(
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
     apply_cr_generation_on_update(&old, &mut obj);
+    record_cr_ownership(
+        ssa_plan.as_ref(),
+        &old,
+        &mut obj,
+        &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
+    );
 
     // Dry-run: validation and admission passed; return the would-be patched object without
     // persisting — mirrors do_patch's dry-run early-return in resource.rs.
@@ -5110,6 +5302,7 @@ pub async fn put_cr_status<S: Store>(
     }
 
     let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
+    let before_write = current.clone();
 
     // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
     // Typed dispatch first: a registry-hit built-in kind with a registered status codec
@@ -5148,6 +5341,7 @@ pub async fn put_cr_status<S: Store>(
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
+    record_cr_status_write(&headers, &before_write, &mut current, &group, &version);
     if is_dry_run_header(&headers) {
         return Ok(Json(current));
     }
@@ -5306,6 +5500,7 @@ pub async fn patch_cr_status<S: Store>(
     }
 
     let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
+    let before_write = current.clone();
 
     // apply-patch+yaml bodies are genuine YAML; every other patch type here is JSON.
     let patch: serde_json::Value = if is_ssa {
@@ -5314,6 +5509,7 @@ pub async fn patch_cr_status<S: Store>(
         serde_json::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
+    crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, None)?;
 
     match patch_type {
         PatchType::Json => {
@@ -5373,6 +5569,7 @@ pub async fn patch_cr_status<S: Store>(
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
+    record_cr_status_write(&headers, &before_write, &mut current, &group, &version);
     if is_dry_run_header(&headers) {
         return Ok(Json(current));
     }
@@ -5557,6 +5754,14 @@ async fn cr_scale_put_impl<S: Store>(
     let before = obj.clone();
     scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas as i64);
     apply_cr_generation_on_update(&before, &mut obj);
+    record_cr_scale_write(
+        headers,
+        &before,
+        &mut obj,
+        target.group,
+        target.version,
+        ctx,
+    );
 
     let old_rv = obj["metadata"]["resourceVersion"]
         .as_str()
@@ -5637,6 +5842,14 @@ async fn cr_scale_patch_impl<S: Store>(
         None => scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
     };
     apply_cr_generation_on_update(&before, &mut obj);
+    record_cr_scale_write(
+        headers,
+        &before,
+        &mut obj,
+        target.group,
+        target.version,
+        ctx,
+    );
 
     let old_rv = obj["metadata"]["resourceVersion"]
         .as_str()
@@ -14776,6 +14989,7 @@ mod tests {
             axum::http::header::CONTENT_TYPE,
             "application/apply-patch+yaml".parse().unwrap(),
         );
+        crate::field_manager::forward_query(&mut headers, None, true);
 
         let result = patch_cr(
             State(state.clone()),
@@ -18878,6 +19092,68 @@ mod tests {
              patch_cr_namespaced's SSA-create branch calling update_quota_status, this stays \
              unset/stale even though the object itself was correctly admitted and persisted"
         );
+    }
+
+    async fn apply_app(
+        state: &AppState,
+        manager: &str,
+        force: bool,
+        destination_namespace: &str,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        crate::field_manager::forward_query(&mut headers, Some(manager), force);
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": "owned", "namespace": "argocd" },
+                "spec": { "destination": { "namespace": destination_namespace } }
+            })
+            .to_string(),
+        );
+        let resp = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".into(),
+                "v1alpha1".into(),
+                "argocd".into(),
+                "applications".into(),
+                "owned".into(),
+            )),
+            test_user(),
+            headers,
+            body,
+        )
+        .await?
+        .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        Ok(serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Two appliers of one custom resource must not silently overwrite each other: the second
+    /// applier changing a field the first owns gets a 409 unless it forces.
+    #[tokio::test]
+    async fn cr_apply_conflicts_with_the_manager_that_owns_the_field_unless_forced() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+        let created = apply_app(&state, "tool-a", false, "default").await.unwrap();
+        assert_eq!(created["metadata"]["managedFields"][0]["manager"], "tool-a");
+
+        let err = apply_app(&state, "tool-b", false, "other")
+            .await
+            .expect_err("tool-b changing tool-a's field must conflict");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+        let causes = &err.1.details.as_ref().unwrap()["causes"];
+        assert_eq!(causes[0]["field"], ".spec.destination.namespace");
+
+        let forced = apply_app(&state, "tool-b", true, "other").await.unwrap();
+        assert_eq!(forced["spec"]["destination"]["namespace"], "other");
     }
 
     // ---------------------------------------------------------------------------

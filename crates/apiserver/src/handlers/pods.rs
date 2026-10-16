@@ -328,9 +328,31 @@ pub(crate) async fn create_pod<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let body = extract_body(&body, ct)?;
-    let mut obj =
+    let obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let writer =
+        crate::field_manager::WriteIdentity::new(create_query.field_manager.as_deref(), &headers);
+    create_pod_from_object(
+        &state,
+        &ns,
+        &user,
+        create_query.is_dry_run(),
+        Some(&writer),
+        obj,
+    )
+    .await
+}
 
+/// Admission, defaulting, quota and persistence of a new pod, shared by the POST create
+/// path and the server-side-apply create-on-missing branch of `patch_pod`.
+async fn create_pod_from_object<S: Store>(
+    state: &AppState<S>,
+    ns: &Namespace,
+    user: &UserInfo,
+    dry_run: bool,
+    writer: Option<&crate::field_manager::WriteIdentity>,
+    mut obj: Object,
+) -> Result<Response, crate::status::StatusError> {
     // NodeRestriction-equivalent enforcement: `authorize_pod`'s coarse (pre-body) check lets
     // a `system:node:*` identity's pod CREATE through unconditionally (matching upstream, which
     // authorizes pod-create via RBAC and defers the actual restriction to admission) — so this
@@ -363,7 +385,7 @@ pub(crate) async fn create_pod<S: Store>(
     apply_pod_create_defaults(&mut obj.body);
     apply_default_toleration_seconds(&mut obj.body);
     initialize_pod_generation(&mut obj.body);
-    apply_automount_sa_token_default(&state, &mut obj.body, ns.as_str()).await;
+    apply_automount_sa_token_default(state, &mut obj.body, ns.as_str()).await;
     inject_sa_token_volume(&mut obj.body, &name);
 
     if let Some(rc_name) = obj.body["spec"]["runtimeClassName"]
@@ -458,9 +480,9 @@ pub(crate) async fn create_pod<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: create_query.is_dry_run(),
+        dry_run,
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
     // Re-clear status after mutating webhooks: a webhook's JSON patch can reinject a
     // forged/scalar status the earlier clear_create_status already stripped — matches
     // upstream ordering (mutating admission runs BEFORE PrepareForCreate's unconditional
@@ -482,24 +504,26 @@ pub(crate) async fn create_pod<S: Store>(
     validate_pod_sysctls(&obj.body).map_err(Status::unprocessable_entity)?;
     super::defaults::validate_pod_certificate_projections(&obj.body)
         .map_err(Status::unprocessable_entity)?;
-    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(state, &obj.body, None, &admission_ctx).await?;
 
     // LimitRange: inject defaults then validate min/max bounds.
-    obj.body =
-        crate::limit_range::apply_limit_ranges(&state, obj.body, ns.as_str(), "pods").await?;
+    obj.body = crate::limit_range::apply_limit_ranges(state, obj.body, ns.as_str(), "pods").await?;
 
     // ResourceQuota: ensure pod count does not exceed hard limits, respecting scope selectors.
     // Held across check-then-write: without this, concurrent pod creates in the same
     // namespace (e.g. a ReplicationController's burst replica creation) can each observe
     // pre-write usage, all pass the check, and collectively exceed the quota.
     let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
-    crate::quota::check_resource_quota(&state, ns.as_str(), "", "pods", Some(&obj.body)).await?;
+    crate::quota::check_resource_quota(state, ns.as_str(), "", "pods", Some(&obj.body)).await?;
 
     obj.body["status"]["qosClass"] =
         serde_json::Value::String(compute_qos_class(&obj.body).to_owned());
 
+    if let Some(writer) = writer {
+        writer.record(&serde_json::Value::Null, &mut obj.body, "v1", None, None);
+    }
     // Dry-run: validation passed; return the would-be created object without persisting.
-    if create_query.is_dry_run() {
+    if dry_run {
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
@@ -565,7 +589,7 @@ pub(crate) async fn create_pod<S: Store>(
                     })),
                     dry_run: false,
                 };
-                run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
+                run_validating_webhooks(state, &obj.body, None, &retry_ctx).await?;
             }
             Err(CreateNamespacedError::Store(e)) => return Err(store_err_to_status(e, &name)),
         }
@@ -577,7 +601,7 @@ pub(crate) async fn create_pod<S: Store>(
     // set (a static/pre-scheduled pod) — most pods get their nodeName later, via bind_pod.
     state.node_graph.apply_pod(ns.as_str(), &name, &obj.body);
 
-    crate::quota::record_pod_created(&state, ns.as_str(), &obj.body).await;
+    crate::quota::record_pod_created(state, ns.as_str(), &obj.body).await;
 
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
@@ -826,6 +850,8 @@ pub(crate) async fn replace_pod<S: Store>(
     // status the client's PUT body carried (see stored_status comment above) is
     // discarded in favor of the server's own record.
     obj.body["status"] = stored_status;
+    crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
+        .record(&stored_obj.body, &mut obj.body, "v1", None, None);
 
     // Dry-run: validation and admission passed; return the would-be replaced object without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -1461,11 +1487,26 @@ pub(crate) async fn patch_pod<S: Store>(
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
-    let patch: serde_json::Value = if is_ssa {
+    let mut patch: serde_json::Value = if is_ssa {
         super::json_patch::ssa_body_to_json(&body)?
     } else {
         serde_json::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
+    // managedFields are server-owned: whatever the client sent is discarded.
+    super::json_patch::strip_managed_fields(&mut patch);
+    let manager = crate::field_manager::request_manager(
+        patch_query.field_manager.as_deref(),
+        super::json_patch::user_agent(&headers),
+    );
+    let force = patch_query.force.unwrap_or(false);
+    let now = utc_now_rfc3339();
+    let field_request = crate::field_manager::Request {
+        manager: &manager,
+        api_version: "v1",
+        subresource: None,
+        schema: None,
+        now: &now,
     };
 
     // Retry loop: PATCH semantics are "apply this change to the current state". If a
@@ -1481,11 +1522,48 @@ pub(crate) async fn patch_pod<S: Store>(
             .store
             .get(&key)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("", "pods", &name))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let Some(stored) = stored else {
+            if !is_ssa {
+                return Err(Status::not_found("", "pods", &name));
+            }
+            // Server-side apply on a missing pod creates it, through the same admission,
+            // defaulting and quota path as POST.
+            let mut obj = Object { body: patch };
+            super::json_patch::enforce_patch_identity(&mut obj.body, &name, Some(ns.as_str()))?;
+            crate::field_manager::plan_apply(
+                &serde_json::Value::Null,
+                &crate::field_manager::applied_fields(&obj.body, true),
+                force,
+                &field_request,
+            )
+            .map_err(crate::field_manager::Conflict::into_status)?
+            .record(&mut obj.body);
+            let resp =
+                create_pod_from_object(&state, &ns, &user, patch_query.is_dry_run(), None, obj)
+                    .await?;
+            return Ok(resp);
+        };
 
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        let ssa_plan = if is_ssa {
+            Some(
+                crate::field_manager::plan_apply(
+                    &current_obj.body,
+                    &crate::field_manager::applied_fields(&patch, true),
+                    force,
+                    &field_request,
+                )
+                .map_err(crate::field_manager::Conflict::into_status)?,
+            )
+        } else {
+            None
+        };
+        // The pre-patch object, so the fields this write changes can be attributed to its
+        // manager (an apply instead owns exactly the fields it names).
+        let before_patch = (!is_ssa).then(|| current_obj.body.clone());
 
         let spec_before = current_obj.body["spec"].clone();
         // Save the stored generation so a PATCH that sets metadata.generation
@@ -1508,8 +1586,12 @@ pub(crate) async fn patch_pod<S: Store>(
 
         match patch_type {
             super::json_patch::PatchType::StrategicMerge => {
-                crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
-                    .map_err(|e| Status::bad_request(e.to_string()))?;
+                let merged = if is_ssa {
+                    crate::patch::strategic_merge_patch_ssa(&mut current_obj.body, &patch)
+                } else {
+                    crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
+                };
+                merged.map_err(|e| Status::bad_request(e.to_string()))?;
             }
             super::json_patch::PatchType::Merge => {
                 crate::patch::merge_patch(&mut current_obj.body, &patch);
@@ -1519,6 +1601,9 @@ pub(crate) async fn patch_pod<S: Store>(
             }
         }
 
+        if let Some(plan) = &ssa_plan {
+            plan.remove_dropped_fields(&mut current_obj.body);
+        }
         current_obj.body["status"] = stored_status.clone();
         current_obj.body["metadata"]["uid"] = stored_uid;
         super::json_patch::enforce_patch_identity(&mut current_obj.body, &name, Some(ns.as_str()))?;
@@ -1576,6 +1661,14 @@ pub(crate) async fn patch_pod<S: Store>(
         .await?;
         drop(pre_patch_body);
 
+        match (&ssa_plan, &before_patch) {
+            (Some(plan), _) => plan.record(&mut current_obj.body),
+            (None, Some(before)) => {
+                crate::field_manager::record_update(before, &mut current_obj.body, &field_request)
+            }
+            (None, None) => {}
+        }
+
         // Restore the stored generation before computing the increment so that
         // a patch attempting to set generation is ignored.
         current_obj.body["metadata"]["generation"] = stored_generation;
@@ -1600,7 +1693,7 @@ pub(crate) async fn patch_pod<S: Store>(
         // or hard-deleting — checked BEFORE the hard-delete branch below, since a patch that
         // drains the last finalizer must not actually delete the pod under dryRun=All.
         if patch_query.is_dry_run() {
-            return Ok(Json(current_obj.body));
+            return Ok(Json(current_obj.body).into_response());
         }
 
         if deletion_ts_set && finalizers_empty {
@@ -1617,7 +1710,7 @@ pub(crate) async fn patch_pod<S: Store>(
             // lose an update.
             let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
             crate::quota::record_pod_removed(&state, ns.as_str(), &current_obj.body).await;
-            return Ok(Json(current_obj.body));
+            return Ok(Json(current_obj.body).into_response());
         }
 
         let expected_revision = parse_resource_version(current_obj.resource_version())?;
@@ -1640,7 +1733,7 @@ pub(crate) async fn patch_pod<S: Store>(
                     &current_obj.body,
                 )
                 .await;
-                return Ok(Json(current_obj.body));
+                return Ok(Json(current_obj.body).into_response());
             }
             Err(StoreError::RevisionMismatch { .. }) => {
                 // A concurrent write advanced the stored revision between our read and write.
@@ -2560,6 +2653,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
 
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let before_write = current_obj.body.clone();
 
     // Typed dispatch: Pod is always registered in status_dispatch (mirrors
     // put_namespace_status's identical null/typed-decode split), so a scalar or
@@ -2575,6 +2669,13 @@ pub(crate) async fn replace_pod_status<S: Store>(
     }
 
     crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, "Pod");
+    crate::field_manager::WriteIdentity::new(None, &headers).record(
+        &before_write,
+        &mut current_obj.body,
+        "v1",
+        Some("status"),
+        None,
+    );
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
@@ -2605,6 +2706,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
 fn accepts_patch_content_type(ct: &str) -> bool {
     ct.contains("application/strategic-merge-patch+json")
         || ct.contains("application/merge-patch+json")
+        || ct.contains("application/apply-patch+yaml")
 }
 
 /// The two fields needed to enforce the hostNetwork/podIP status invariant below: a pod
@@ -2825,7 +2927,7 @@ pub(crate) async fn patch_pod_status<S: Store>(
     // Kubelet uses strategic-merge-patch; both patch types update only the status field.
     if !accepts_patch_content_type(content_type) {
         return Err(Status::unsupported_media_type(format!(
-            "unsupported media type '{content_type}'; use application/merge-patch+json or application/strategic-merge-patch+json"
+            "unsupported media type '{content_type}'; use application/merge-patch+json, application/strategic-merge-patch+json or application/apply-patch+yaml"
         )));
     }
 
@@ -2838,8 +2940,15 @@ pub(crate) async fn patch_pod_status<S: Store>(
 
     let key = object_key("pods", ns.as_str(), &name);
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side --subresource
+    // status); every other patch type here is JSON.
+    let patch: serde_json::Value = if content_type.contains("apply-patch+yaml") {
+        super::json_patch::ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
+    super::status::reject_patch_identity_mismatch(&patch, &name, Some(ns.as_str()))?;
 
     // Retry on RevisionMismatch: PATCH is not a conditional operation — re-read and
     // re-apply when a concurrent write advances the stored rv between our read and write.
@@ -2854,7 +2963,15 @@ pub(crate) async fn patch_pod_status<S: Store>(
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+        let before_write = current_obj.body.clone();
         current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
+        crate::field_manager::WriteIdentity::new(None, &headers).record(
+            &before_write,
+            &mut current_obj.body,
+            "v1",
+            Some("status"),
+            None,
+        );
 
         // Dry-run: validation passed; return the would-be patched status without
         // persisting — mirrors replace_pod_status's dry-run early-return.
@@ -18308,6 +18425,147 @@ mod handler_tests {
             StatusCode::OK,
             "apply-patch+yaml with a genuine YAML body must succeed, not 400 'invalid patch JSON'"
         );
+    }
+
+    fn ssa_pod_yaml(name: &str) -> String {
+        format!(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\nspec:\n  containers:\n  - name: c\n    image: img\n"
+        )
+    }
+
+    async fn ssa_patch_pod(
+        state: crate::state::AppState<SqliteStore>,
+        uri: &str,
+        ct: &str,
+        body: String,
+    ) -> axum::response::Response {
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
+            .with_state(state);
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, ct)
+            .body(Body::from(body))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
+    }
+
+    /// `kubectl apply --server-side -f pod.yaml` on a Pod that does not exist yet must
+    /// create it (201) with create defaulting applied, not 404.
+    #[tokio::test]
+    async fn ssa_apply_of_missing_pod_creates_it_instead_of_404() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let resp = ssa_patch_pod(
+            state,
+            "/api/v1/namespaces/default/pods/new-pod",
+            "application/apply-patch+yaml",
+            ssa_pod_yaml("new-pod"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "SSA on a missing Pod must create it; 404 breaks `kubectl apply --server-side` of any new Pod"
+        );
+        let stored = store
+            .get("/registry/pods/default/new-pod")
+            .await
+            .unwrap()
+            .expect("apply-created pod must be persisted");
+        let pod: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(pod["metadata"]["namespace"], "default");
+        assert_eq!(
+            pod["status"]["phase"], "Pending",
+            "apply-create must run create defaulting like POST, or the scheduler never sees a Pending pod"
+        );
+        assert!(
+            pod["metadata"]["uid"]
+                .as_str()
+                .is_some_and(|u| !u.is_empty()),
+            "apply-create must stamp a uid like POST"
+        );
+    }
+
+    /// `kubectl apply --server-side --subresource=status` sends apply-patch+yaml to
+    /// pods/status; refusing the content type (415) breaks applying status conditions.
+    #[tokio::test]
+    async fn apply_patch_to_pod_status_subresource_updates_status() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .layer(auth_layer())
+            .with_state(state);
+        let body = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: my-pod\nstatus:\n  conditions:\n  - type: MyStatus\n    status: \"True\"\n";
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status")
+            .header(header::CONTENT_TYPE, "application/apply-patch+yaml")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pod: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(pod["status"]["conditions"][0]["type"], "MyStatus");
+    }
+
+    /// Two appliers of one Pod must not silently overwrite each other's fields.
+    #[tokio::test]
+    async fn pod_apply_conflicts_with_the_manager_that_owns_the_field() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let apply = |manager: &str, image: &str| {
+            let uri = format!("/api/v1/namespaces/default/pods/owned?fieldManager={manager}");
+            let body = format!(
+                "apiVersion: v1\nkind: Pod\nmetadata:\n  name: owned\nspec:\n  containers:\n  - name: c\n    image: {image}\n"
+            );
+            (uri, body)
+        };
+        let (uri, body) = apply("tool-a", "img:1");
+        let created =
+            ssa_patch_pod(state.clone(), &uri, "application/apply-patch+yaml", body).await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let (uri, body) = apply("tool-b", "img:2");
+        let conflict = ssa_patch_pod(
+            state.clone(),
+            &uri,
+            "application/apply-patch+yaml",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            conflict.status(),
+            StatusCode::CONFLICT,
+            "a second manager changing the container image must conflict"
+        );
+    }
+
+    /// A non-apply PATCH on a missing Pod stays 404: only server-side apply has
+    /// create-on-missing semantics.
+    #[tokio::test]
+    async fn merge_patch_of_missing_pod_stays_404() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let resp = ssa_patch_pod(
+            state,
+            "/api/v1/namespaces/default/pods/ghost",
+            "application/merge-patch+json",
+            "{\"metadata\":{\"labels\":{\"a\":\"b\"}}}".into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // -----------------------------------------------------------------------
