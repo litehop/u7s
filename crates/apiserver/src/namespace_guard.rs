@@ -368,7 +368,7 @@ mod tests {
                 send(
                     &state,
                     "PATCH",
-                    &format!("{base}/w?fieldManager=m"),
+                    &format!("{base}/w"),
                     "application/apply-patch+yaml",
                     cr,
                 )

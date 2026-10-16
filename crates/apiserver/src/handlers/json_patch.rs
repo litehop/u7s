@@ -1,5 +1,4 @@
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::{status::Status, util::content_type};
@@ -123,53 +122,6 @@ pub(crate) async fn inject_dry_run_header(
             HeaderName::from_static(DRY_RUN_HEADER),
             HeaderValue::from_static("true"),
         );
-    }
-    next.run(req).await
-}
-
-/// The 422 upstream's `ValidatePatchOptions` produces for one bad `PatchOptions` field.
-fn invalid_patch_options(field: &str, reason: &str, body: &str) -> Response {
-    let mut e = Status::unprocessable_entity(format!(
-        "PatchOptions.meta.k8s.io \"\" is invalid: {field}: {body}"
-    ));
-    e.1.details = Some(Box::new(serde_json::json!({
-        "name": "",
-        "group": "meta.k8s.io",
-        "kind": "PatchOptions",
-        "causes": [{"reason": reason, "message": body, "field": field}]
-    })));
-    e.into_response()
-}
-
-/// Router-wide layer mirroring upstream's `ValidatePatchOptions` before any patch handler runs:
-/// an apply patch needs a `fieldManager` (a controller that omits it would otherwise be
-/// silently recorded under its user agent), and `force` is only meaningful for apply. A patch
-/// with an unsupported Content-Type is left for the handler's 415, as upstream rejects the
-/// media type first (that includes `application/apply-patch+cbor`, which u7s does not serve).
-pub(crate) async fn validate_patch_options(
-    req: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next,
-) -> Response {
-    if req.method() == axum::http::Method::PATCH && detect_patch_type(req.headers()).is_ok() {
-        if let Ok(axum::extract::Query(q)) =
-            axum::extract::Query::<PatchQuery>::try_from_uri(req.uri())
-        {
-            if content_type(req.headers()).contains("application/apply-patch+yaml") {
-                if q.field_manager.as_deref().is_none_or(str::is_empty) {
-                    return invalid_patch_options(
-                        "fieldManager",
-                        "FieldValueRequired",
-                        "Required value: is required for apply patch",
-                    );
-                }
-            } else if q.force.is_some() {
-                return invalid_patch_options(
-                    "force",
-                    "FieldValueForbidden",
-                    "Forbidden: may not be specified for non-apply patch",
-                );
-            }
-        }
     }
     next.run(req).await
 }
@@ -2524,105 +2476,6 @@ mod tests {
             b"true",
             "a genuine ?dryRun=All request must still be recognized as dry-run"
         );
-    }
-
-    async fn patch_options_status(
-        uri: &str,
-        content_type: &str,
-        method: &str,
-    ) -> (u16, serde_json::Value) {
-        use tower::ServiceExt as _;
-
-        let router = axum::Router::new()
-            .route("/", axum::routing::any(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(validate_patch_options));
-        let req = axum::http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("content-type", content_type)
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
-        let code = resp.status().as_u16();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        (
-            code,
-            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
-        )
-    }
-
-    /// `?force` on a merge patch is a client bug upstream rejects; accepting it hides that a
-    /// controller believes it can take over field ownership with a non-apply patch.
-    #[tokio::test]
-    async fn force_on_non_apply_patch_is_rejected_like_upstream() {
-        for ct in [
-            "application/merge-patch+json",
-            "application/strategic-merge-patch+json",
-            "application/json-patch+json",
-        ] {
-            for q in ["force=true", "force=false"] {
-                let (code, st) = patch_options_status(&format!("/?{q}"), ct, "PATCH").await;
-                assert_eq!(code, 422, "{ct} ?{q} must be refused");
-                assert_eq!(st["reason"], "Invalid");
-                assert_eq!(
-                    st["message"],
-                    "PatchOptions.meta.k8s.io \"\" is invalid: force: Forbidden: may not be specified for non-apply patch"
-                );
-                assert_eq!(st["details"]["group"], "meta.k8s.io");
-                assert_eq!(st["details"]["kind"], "PatchOptions");
-                assert_eq!(st["details"]["causes"][0]["reason"], "FieldValueForbidden");
-                assert_eq!(st["details"]["causes"][0]["field"], "force");
-            }
-        }
-        let (code, _) = patch_options_status("/", "application/merge-patch+json", "PATCH").await;
-        assert_eq!(code, 200, "a plain merge patch without force must pass");
-    }
-
-    /// An apply without `fieldManager` would be recorded under the user agent, so two
-    /// controllers sharing one binary would silently fight over one ownership set.
-    #[tokio::test]
-    async fn apply_patch_without_field_manager_is_rejected_like_upstream() {
-        for q in ["/", "/?fieldManager="] {
-            let (code, st) = patch_options_status(q, "application/apply-patch+yaml", "PATCH").await;
-            assert_eq!(code, 422, "apply with {q} must be refused");
-            assert_eq!(
-                st["message"],
-                "PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: Required value: is required for apply patch"
-            );
-            assert_eq!(st["details"]["causes"][0]["reason"], "FieldValueRequired");
-            assert_eq!(st["details"]["causes"][0]["field"], "fieldManager");
-        }
-        for q in ["/?fieldManager=m", "/?fieldManager=m&force=true"] {
-            let (code, _) = patch_options_status(q, "application/apply-patch+yaml", "PATCH").await;
-            assert_eq!(code, 200, "apply with {q} is valid");
-        }
-    }
-
-    /// u7s serves no CBOR apply; the media type must fail 415 in the handler, not be
-    /// mistaken for a valid apply, and `force` must not mask it as a 422.
-    #[tokio::test]
-    async fn apply_cbor_is_left_to_the_handlers_unsupported_media_type() {
-        let (code, _) =
-            patch_options_status("/?force=true", "application/apply-patch+cbor", "PATCH").await;
-        assert_eq!(code, 200, "validation passes it through to the handler");
-        let mut h = HeaderMap::new();
-        h.insert(
-            axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/apply-patch+cbor"),
-        );
-        assert_eq!(
-            detect_patch_type(&h).unwrap_err().0,
-            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
-        );
-    }
-
-    /// Only PATCH carries PatchOptions: a PUT with `force` is not this layer's business.
-    #[tokio::test]
-    async fn patch_option_validation_ignores_non_patch_requests() {
-        let (code, _) = patch_options_status("/?force=true", "application/json", "PUT").await;
-        assert_eq!(code, 200);
     }
 
     /// A repeated `dryRun` query key must not let a non-"All" duplicate suppress a genuine

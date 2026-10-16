@@ -1759,6 +1759,44 @@ mod tests {
         );
     }
 
+    // A client-supplied creationTimestamp must be replaced on create (upstream
+    // FillObjectMetaSystemFields); keeping it would let a namespace be backdated.
+    #[tokio::test]
+    async fn create_namespace_replaces_backdated_creation_timestamp() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "old-ns", "creationTimestamp": "2001-01-01T00:00:00Z" }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "old-ns"))
+            .await
+            .unwrap()
+            .expect("namespace must exist in store");
+        let stored: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let ts = stored["metadata"]["creationTimestamp"].as_str().unwrap();
+        assert!(
+            ts > "2024-",
+            "backdated creationTimestamp must be replaced, got {ts}"
+        );
+    }
+
     // replace_namespace must reflect updated labels in the response body.
     // This verifies that PUT applies the full replacement, not a partial update.
     #[tokio::test]

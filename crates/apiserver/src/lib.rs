@@ -1333,9 +1333,6 @@ fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             handlers::json_patch::inject_dry_run_header,
         ))
-        .layer(axum::middleware::from_fn(
-            handlers::json_patch::validate_patch_options,
-        ))
         .with_state(state)
 }
 
