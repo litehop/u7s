@@ -360,9 +360,11 @@ fn resource_url(server: &str, meta: &DocMeta) -> anyhow::Result<String> {
     Ok(format!("{server}{resource_path}"))
 }
 
+/// `force=true`: these manifests are the cluster's own addon definitions; an operator edit to a
+/// field they name is overwritten on restart rather than failing startup with a conflict.
 fn ssa_url(server: &str, meta: &DocMeta) -> anyhow::Result<String> {
     Ok(format!(
-        "{}?fieldManager={FIELD_MANAGER}",
+        "{}?fieldManager={FIELD_MANAGER}&force=true",
         resource_url(server, meta)?
     ))
 }
@@ -575,7 +577,7 @@ mod tests {
         let url = ssa_url("https://127.0.0.1:6443", &meta).expect("known kind must build a URL");
         assert_eq!(
             url,
-            "https://127.0.0.1:6443/api/v1/namespaces/kube-system/configmaps/coredns?fieldManager=bootstrap-installer"
+            "https://127.0.0.1:6443/api/v1/namespaces/kube-system/configmaps/coredns?fieldManager=bootstrap-installer&force=true"
         );
     }
 
@@ -590,7 +592,7 @@ mod tests {
         let url = ssa_url("https://127.0.0.1:6443", &meta).expect("known kind must build a URL");
         assert_eq!(
             url,
-            "https://127.0.0.1:6443/apis/rbac.authorization.k8s.io/v1/clusterroles/coredns?fieldManager=bootstrap-installer"
+            "https://127.0.0.1:6443/apis/rbac.authorization.k8s.io/v1/clusterroles/coredns?fieldManager=bootstrap-installer&force=true"
         );
     }
 

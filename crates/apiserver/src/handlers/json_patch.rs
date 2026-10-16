@@ -20,6 +20,8 @@ pub(crate) struct PatchQuery {
     /// Only "All" is meaningful server-side; "client" is handled by kubectl itself.
     #[serde(rename = "dryRun")]
     pub dry_run: Option<String>,
+    /// `?force=true`: a server-side apply takes ownership of conflicting fields.
+    pub force: Option<bool>,
 }
 
 impl PatchQuery {
@@ -27,6 +29,12 @@ impl PatchQuery {
     pub(crate) fn is_dry_run(&self) -> bool {
         self.dry_run.as_deref() == Some("All")
     }
+}
+
+pub(crate) fn user_agent(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
 }
 
 /// Query parameters accepted by CREATE endpoints (POST).
@@ -592,43 +600,13 @@ pub(crate) fn apply_field_validation(
 
 /// Strip `managedFields` from an SSA apply body before merging.
 ///
-/// Kubernetes clients (including Argo CD) include a `managedFields` key in the
-/// apply body to indicate their previous ownership. We don't track field
-/// ownership, so we discard it before the merge to avoid persisting stale data.
+/// Clients (including Argo CD) echo `managedFields` back in the apply body, but ownership is
+/// the server's record; a client-supplied one must never replace it.
 pub(crate) fn strip_managed_fields(patch: &mut serde_json::Value) {
     if let Some(map) = patch.as_object_mut() {
         if let Some(meta) = map.get_mut("metadata") {
             if let Some(meta_map) = meta.as_object_mut() {
                 meta_map.remove("managedFields");
-            }
-        }
-    }
-}
-
-/// Inject a synthetic `managedFields` entry into a response object.
-///
-/// Argo CD's client library reads `managedFields` from apply responses to
-/// determine field ownership. Without it, Argo CD treats every resource as
-/// OutOfSync and loops forever. We echo back a single entry for the applying
-/// manager; we do not implement full SSA field-level tracking.
-pub(crate) fn inject_managed_fields(
-    obj: &mut serde_json::Value,
-    manager: &str,
-    api_version: &str,
-    now: &str,
-) {
-    if let Some(map) = obj.as_object_mut() {
-        if let Some(meta) = map.get_mut("metadata") {
-            if let Some(meta_map) = meta.as_object_mut() {
-                meta_map.insert(
-                    "managedFields".to_string(),
-                    serde_json::json!([{
-                        "manager": manager,
-                        "operation": "Apply",
-                        "apiVersion": api_version,
-                        "time": now
-                    }]),
-                );
             }
         }
     }
@@ -1614,25 +1592,6 @@ mod tests {
         });
         strip_managed_fields(&mut obj);
         assert_eq!(obj["metadata"]["name"], "clean");
-    }
-
-    /// inject_managed_fields inserts a synthetic SSA entry with the expected shape.
-    /// Argo CD reads manager, operation, apiVersion, and time from this entry.
-    #[test]
-    fn inject_managed_fields_inserts_synthetic_ssa_entry() {
-        let mut obj = serde_json::json!({
-            "apiVersion": "apps/v1",
-            "metadata": { "name": "my-deploy" }
-        });
-
-        inject_managed_fields(&mut obj, "argocd", "apps/v1", "2026-05-23T00:00:00Z");
-
-        let mf = &obj["metadata"]["managedFields"];
-        assert!(mf.is_array(), "managedFields must be an array");
-        assert_eq!(mf[0]["manager"], "argocd");
-        assert_eq!(mf[0]["operation"], "Apply");
-        assert_eq!(mf[0]["apiVersion"], "apps/v1");
-        assert_eq!(mf[0]["time"], "2026-05-23T00:00:00Z");
     }
 
     // ---------------------------------------------------------------------------

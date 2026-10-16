@@ -120,6 +120,24 @@ impl Status {
         )
     }
 
+    /// A 409 whose `details.causes` carry machine-readable reasons, as server-side apply's
+    /// field-manager conflicts do (`FieldManagerConflict`).
+    pub fn conflict_with_causes(message: String, causes: Vec<serde_json::Value>) -> StatusError {
+        StatusError(
+            StatusCode::CONFLICT,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "Conflict",
+                code: 409,
+                metadata: None,
+                details: Some(Box::new(serde_json::json!({ "causes": causes }))),
+            },
+        )
+    }
+
     pub fn bad_request(message: String) -> StatusError {
         StatusError(
             StatusCode::BAD_REQUEST,

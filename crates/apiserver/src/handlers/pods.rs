@@ -1471,11 +1471,26 @@ pub(crate) async fn patch_pod<S: Store>(
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
-    let patch: serde_json::Value = if is_ssa {
+    let mut patch: serde_json::Value = if is_ssa {
         super::json_patch::ssa_body_to_json(&body)?
     } else {
         serde_json::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
+    // managedFields are server-owned: whatever the client sent is discarded.
+    super::json_patch::strip_managed_fields(&mut patch);
+    let manager = crate::field_manager::request_manager(
+        patch_query.field_manager.as_deref(),
+        super::json_patch::user_agent(&headers),
+    );
+    let force = patch_query.force.unwrap_or(false);
+    let now = utc_now_rfc3339();
+    let field_request = crate::field_manager::Request {
+        manager: &manager,
+        api_version: "v1",
+        subresource: None,
+        schema: None,
+        now: &now,
     };
 
     // Retry loop: PATCH semantics are "apply this change to the current state". If a
@@ -1499,8 +1514,15 @@ pub(crate) async fn patch_pod<S: Store>(
             // Server-side apply on a missing pod creates it, through the same admission,
             // defaulting and quota path as POST.
             let mut obj = Object { body: patch };
-            super::json_patch::strip_managed_fields(&mut obj.body);
             super::json_patch::enforce_patch_identity(&mut obj.body, &name, Some(ns.as_str()))?;
+            crate::field_manager::plan_apply(
+                &serde_json::Value::Null,
+                &crate::field_manager::applied_fields(&obj.body, true),
+                force,
+                &field_request,
+            )
+            .map_err(crate::field_manager::Conflict::into_status)?
+            .record(&mut obj.body);
             let resp =
                 create_pod_from_object(&state, &ns, &user, patch_query.is_dry_run(), obj).await?;
             return Ok(resp);
@@ -1508,6 +1530,23 @@ pub(crate) async fn patch_pod<S: Store>(
 
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        let ssa_plan = if is_ssa {
+            Some(
+                crate::field_manager::plan_apply(
+                    &current_obj.body,
+                    &crate::field_manager::applied_fields(&patch, true),
+                    force,
+                    &field_request,
+                )
+                .map_err(crate::field_manager::Conflict::into_status)?,
+            )
+        } else {
+            None
+        };
+        // The pre-patch object, so the fields this write changes can be attributed to its
+        // manager (an apply instead owns exactly the fields it names).
+        let before_patch = (!is_ssa).then(|| current_obj.body.clone());
 
         let spec_before = current_obj.body["spec"].clone();
         // Save the stored generation so a PATCH that sets metadata.generation
@@ -1541,6 +1580,9 @@ pub(crate) async fn patch_pod<S: Store>(
             }
         }
 
+        if let Some(plan) = &ssa_plan {
+            plan.remove_dropped_fields(&mut current_obj.body);
+        }
         current_obj.body["status"] = stored_status.clone();
         current_obj.body["metadata"]["uid"] = stored_uid;
         super::json_patch::enforce_patch_identity(&mut current_obj.body, &name, Some(ns.as_str()))?;
@@ -1597,6 +1639,14 @@ pub(crate) async fn patch_pod<S: Store>(
         )
         .await?;
         drop(pre_patch_body);
+
+        match (&ssa_plan, &before_patch) {
+            (Some(plan), _) => plan.record(&mut current_obj.body),
+            (None, Some(before)) => {
+                crate::field_manager::record_update(before, &mut current_obj.body, &field_request)
+            }
+            (None, None) => {}
+        }
 
         // Restore the stored generation before computing the increment so that
         // a patch attempting to set generation is ignored.
@@ -2627,6 +2677,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
 fn accepts_patch_content_type(ct: &str) -> bool {
     ct.contains("application/strategic-merge-patch+json")
         || ct.contains("application/merge-patch+json")
+        || ct.contains("application/apply-patch+yaml")
 }
 
 /// The two fields needed to enforce the hostNetwork/podIP status invariant below: a pod
@@ -2847,7 +2898,7 @@ pub(crate) async fn patch_pod_status<S: Store>(
     // Kubelet uses strategic-merge-patch; both patch types update only the status field.
     if !accepts_patch_content_type(content_type) {
         return Err(Status::unsupported_media_type(format!(
-            "unsupported media type '{content_type}'; use application/merge-patch+json or application/strategic-merge-patch+json"
+            "unsupported media type '{content_type}'; use application/merge-patch+json, application/strategic-merge-patch+json or application/apply-patch+yaml"
         )));
     }
 
@@ -2860,8 +2911,14 @@ pub(crate) async fn patch_pod_status<S: Store>(
 
     let key = object_key("pods", ns.as_str(), &name);
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side --subresource
+    // status); every other patch type here is JSON.
+    let patch: serde_json::Value = if content_type.contains("apply-patch+yaml") {
+        super::json_patch::ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
     super::status::reject_patch_identity_mismatch(&patch, &name, Some(ns.as_str()))?;
 
     // Retry on RevisionMismatch: PATCH is not a conditional operation — re-read and
@@ -18393,6 +18450,68 @@ mod handler_tests {
                 .as_str()
                 .is_some_and(|u| !u.is_empty()),
             "apply-create must stamp a uid like POST"
+        );
+    }
+
+    /// `kubectl apply --server-side --subresource=status` sends apply-patch+yaml to
+    /// pods/status; refusing the content type (415) breaks applying status conditions.
+    #[tokio::test]
+    async fn apply_patch_to_pod_status_subresource_updates_status() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .layer(auth_layer())
+            .with_state(state);
+        let body = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: my-pod\nstatus:\n  conditions:\n  - type: MyStatus\n    status: \"True\"\n";
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status")
+            .header(header::CONTENT_TYPE, "application/apply-patch+yaml")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pod: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(pod["status"]["conditions"][0]["type"], "MyStatus");
+    }
+
+    /// Two appliers of one Pod must not silently overwrite each other's fields.
+    #[tokio::test]
+    async fn pod_apply_conflicts_with_the_manager_that_owns_the_field() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let apply = |manager: &str, image: &str| {
+            let uri = format!("/api/v1/namespaces/default/pods/owned?fieldManager={manager}");
+            let body = format!(
+                "apiVersion: v1\nkind: Pod\nmetadata:\n  name: owned\nspec:\n  containers:\n  - name: c\n    image: {image}\n"
+            );
+            (uri, body)
+        };
+        let (uri, body) = apply("tool-a", "img:1");
+        let created =
+            ssa_patch_pod(state.clone(), &uri, "application/apply-patch+yaml", body).await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let (uri, body) = apply("tool-b", "img:2");
+        let conflict = ssa_patch_pod(
+            state.clone(),
+            &uri,
+            "application/apply-patch+yaml",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            conflict.status(),
+            StatusCode::CONFLICT,
+            "a second manager changing the container image must conflict"
         );
     }
 

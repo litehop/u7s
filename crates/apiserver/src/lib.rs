@@ -16,6 +16,7 @@ mod certificates_v1beta1_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
 mod core_gen_adapter;
+mod field_manager;
 pub mod handlers;
 mod inflight;
 mod keys;

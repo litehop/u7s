@@ -506,7 +506,7 @@ fn key_fields_subset(
         .all(|(k, v)| other.iter().any(|(ok, ov)| ok == k && ov == v))
 }
 
-enum MergeKeyKind {
+pub(crate) enum MergeKeyKind {
     /// Array uses these field(s) as the merge key. A single-element vec is the common case
     /// (e.g. `["name"]` for containers); a composite key (e.g. `["port", "protocol"]` for
     /// Service.spec.ports) is needed wherever one field alone doesn't uniquely identify an
@@ -539,7 +539,7 @@ enum MergeKeyKind {
 /// nothing to do with the Pod/Service shapes this table encodes, so a coincidental path
 /// collision (e.g. a CRD that happens to have its own unrelated `spec.containers` field) must
 /// not silently inherit Pod's merge-by-name semantics.
-fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKeyKind {
+pub(crate) fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKeyKind {
     if let Some(schema) = schema {
         return crd_merge_key_for_path(schema, path);
     }
