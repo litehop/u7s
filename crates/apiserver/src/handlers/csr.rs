@@ -301,16 +301,8 @@ pub async fn create_csr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
-    reject_system_masters_client_csr(&obj.body)?;
+    finalize_csr_create(&mut obj.body, &user)?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
-
-    // Re-stamp spec identity from the authenticated caller and strip status — neither may
-    // survive a client, OR a mutating webhook, attempting to set them. spec is immutable
-    // after create; status is the signer's exclusive write.
-    stamp_csr_identity(&mut obj.body, &user);
-    if let Some(map) = obj.body.as_object_mut() {
-        map.remove("status");
-    }
 
     // Dry-run: validation and admission passed; return the would-be created object without
     // persisting — mirrors create_resource's dry-run early-return in resource.rs.
@@ -405,6 +397,22 @@ pub(crate) fn is_csr(group: &str, plural: &str) -> bool {
 /// requester could get a benign request approved, then swap in a different request/signer.
 pub(crate) fn preserve_csr_spec(old: &serde_json::Value, new: &mut serde_json::Value) {
     new["spec"] = old["spec"].clone();
+}
+
+/// Create-time admission shared by POST and SSA apply-create, run after mutating webhooks:
+/// subject restriction, then identity re-stamped from the authenticated caller and status
+/// stripped — neither may survive a client, or a mutating webhook, setting them. Spec is
+/// immutable after create; status is the signer's exclusive write.
+pub(crate) fn finalize_csr_create(
+    body: &mut serde_json::Value,
+    user: &UserInfo,
+) -> Result<(), crate::status::StatusError> {
+    reject_system_masters_client_csr(body)?;
+    stamp_csr_identity(body, user);
+    if let Some(map) = body.as_object_mut() {
+        map.remove("status");
+    }
+    Ok(())
 }
 
 const KUBE_APISERVER_CLIENT_SIGNER: &str = "kubernetes.io/kube-apiserver-client";
@@ -2316,13 +2324,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_side_apply_cannot_create_a_missing_csr_because_it_would_skip_the_subject_restriction(
-    ) {
+    async fn server_side_apply_create_runs_the_subject_restriction_like_post() {
         let state = make_state();
         let body = csr_body("evil", CLIENT_SIGNER, Some("system:masters")).to_string();
         assert_eq!(
             generic_patch(&state, "evil", "application/apply-patch+yaml", body).await,
-            StatusCode::NOT_FOUND
+            StatusCode::FORBIDDEN
         );
         assert!(state
             .store
@@ -2330,6 +2337,28 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn server_side_apply_creates_a_normal_csr_with_status_stripped_and_identity_stamped() {
+        let state = make_state();
+        let mut body = csr_body("ok", CLIENT_SIGNER, Some("developers"));
+        body["status"] = serde_json::json!({"conditions": [approved()]});
+        body["spec"]["username"] = "spoofed".into();
+        let code = generic_patch(
+            &state,
+            "ok",
+            "application/apply-patch+yaml",
+            body.to_string(),
+        )
+        .await;
+        assert!(code.is_success(), "apply-create of a CSR must work: {code}");
+        let s = stored_csr(&state, "ok").await;
+        assert!(
+            s["status"]["conditions"].is_null(),
+            "apply must not pre-approve"
+        );
+        assert_eq!(s["spec"]["username"], "admin", "identity is server-stamped");
     }
 
     #[tokio::test]

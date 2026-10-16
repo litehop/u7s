@@ -1445,12 +1445,6 @@ pub(crate) async fn do_patch<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    // CSRs are created only through create_csr (upstream AllowCreateOnUpdate=false), which
-    // runs the subject restriction an apply-create would otherwise skip.
-    if stored_opt.is_none() && super::csr::is_csr(group, plural) {
-        return Err(Status::not_found(group, plural, name));
-    }
-
     // SSA upsert: apply-patch+yaml on a missing resource creates it.
     if is_ssa && stored_opt.is_none() {
         // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side), which
@@ -1505,6 +1499,10 @@ pub(crate) async fn do_patch<S: Store>(
         }
         super::defaults::validate_resource(group, plural, &obj.body)
             .map_err(Status::unprocessable_entity)?;
+        let is_csr = super::csr::is_csr(group, plural);
+        if is_csr {
+            super::csr::validate_csr_spec(&obj.body)?;
+        }
         // Escalation prevention: SSA-create is a create just like create_resource /
         // create_namespaced_resource, so it must run the same checks before persisting
         // a ClusterRoleBinding/ClusterRole/RoleBinding — otherwise `kubectl apply
@@ -1580,6 +1578,9 @@ pub(crate) async fn do_patch<S: Store>(
             dry_run,
         };
         obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
+        if is_csr {
+            super::csr::finalize_csr_create(&mut obj.body, user)?;
+        }
         // Re-clear status after mutating webhooks — see create_resource's identical call
         // for why: a webhook can reinject a forged/scalar status the earlier
         // clear_create_status already stripped, and this is the last point before
