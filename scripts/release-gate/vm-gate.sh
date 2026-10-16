@@ -141,13 +141,21 @@ rm -f "$RG"/u7s-gate-*.tar.gz*
 : > "$OUT/node-ready.log"
 : > "$OUT/ks-uids.txt"
 record_uids
-# One long-lived node watch instead of a get every 10 s. The jsonpath prints only the
-# current Ready status per event, so a re-established watch adds one fresh observation, not
-# the condition history. A broken watch is logged as "unreachable" and re-established.
+# One long-lived node watch instead of a get every 10 s. The watch replays the node's
+# condition history on (re)connect, so each line is stamped with the condition's own
+# lastTransitionTime, not the read time; callers count transitions at/after WATCH_T0, which
+# leaves the replay of install-time Unknown/False flaps out. A broken watch is logged as
+# "unreachable" and re-established.
+WATCH_T0="$(date +%s)"
 ( while :; do
     kubectl --kubeconfig "$KCFG" get node "$NODE" -w \
-      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}' 2>/dev/null \
-      | while IFS= read -r s; do printf '%(%s)T %s\n' -1 "${s:-Unknown}" >> "$OUT/node-ready.log"; done
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}' 2>/dev/null \
+      | while read -r s tt; do
+          [ -n "$tt" ] && t="$(date -d "$tt" +%s 2>/dev/null)" || t=""
+          [ -n "$t" ] || printf -v t '%(%s)T' -1
+          [ "$t $s" = "${last:-}" ] || printf '%s %s\n' "$t" "${s:-Unknown}" >> "$OUT/node-ready.log"
+          last="$t $s"
+        done
     [ -e "$OUT/watch-stop" ] && break
     printf '%(%s)T unreachable\n' -1 >> "$OUT/node-ready.log"
     sleep 5
@@ -267,7 +275,7 @@ rg_oom_victims "$KS_UIDS" < "$OUT/kernel.log" > "$OUT/oom-victims.txt"
 res oom_host "$(grep -c '^host ' "$OUT/oom-victims.txt")"
 res oom_kubesystem "$(grep -c '^kube-system ' "$OUT/oom-victims.txt")"
 res oom_victims "$(awk '{print $1":"$2}' "$OUT/oom-victims.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
-res notready_events "$(grep -cE ' (False|Unknown)$' "$OUT/node-ready.log")"
+res notready_events "$(rg_notready_since "$OUT/node-ready.log" "$WATCH_T0")"
 res api_unreachable_polls "$(grep -c ' unreachable$' "$OUT/node-ready.log")"
 res evicted_pods "$(awk '{print $1"/"$2}' "$OUT/evictions.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
 res node_ready_final "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
