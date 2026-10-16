@@ -5636,6 +5636,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_rbac_second_pass_writes_nothing_for_every_seeded_object() {
+        // A seeded rule that reconcile can never see as covered (e.g. a mixed
+        // resourceNames + nonResourceURLs rule) is re-appended on every restart, growing the
+        // role and bumping its revision forever.
+        use u7s_store::{ListOptions, Store};
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = make_store();
+        seed_rbac(&store).await.expect("first seed must not fail");
+
+        let snapshot = || async {
+            let mut all = Vec::new();
+            for plural in [
+                "clusterroles",
+                "roles",
+                "clusterrolebindings",
+                "rolebindings",
+            ] {
+                let prefix = keys::group_list_prefix(GROUP, plural, None);
+                let l = store.list(&prefix, ListOptions::default()).await.unwrap();
+                all.extend(l.items.into_iter().map(|o| (o.key, o.revision)));
+            }
+            all.sort();
+            all
+        };
+        let first = snapshot().await;
+        assert!(
+            first.len() >= 49,
+            "setup: seeding must create the bootstrap objects"
+        );
+        seed_rbac(&store).await.expect("second seed must not fail");
+        let second = snapshot().await;
+        let rewritten: Vec<_> = second.iter().filter(|o| !first.contains(o)).collect();
+        assert!(
+            rewritten.is_empty() && first.len() == second.len(),
+            "restart must not rewrite bootstrap RBAC objects that already satisfy policy; \
+             rewritten: {rewritten:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn restart_on_a_store_with_an_old_kcm_role_grants_kcm_the_new_signers_rule() {
         // Bootstrap-role fixes (e.g. new certificates.k8s.io/signers grants for KCM) only
         // reach existing clusters if startup reconciles stale roles, not just creates.

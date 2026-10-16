@@ -52,8 +52,6 @@ fn resource_matches(have: &[&str], want: &str) -> bool {
             || *h == want
             || h.strip_prefix("*/")
                 .is_some_and(|sub| want.rsplit_once('/').is_some_and(|(_, s)| s == sub))
-            || h.strip_suffix("/*")
-                .is_some_and(|res| want.split_once('/').is_some_and(|(r, _)| r == res))
     })
 }
 
@@ -429,6 +427,26 @@ mod tests {
             reconcile(&existing, &expected),
             Reconciled::Unchanged,
             "a wildcard grant already covers pods/get so no duplicate rule may be appended"
+        );
+    }
+
+    #[test]
+    fn owner_resource_slash_star_does_not_cover_its_subresource() {
+        // Upstream's resourceCoversAll accepts only '*', exact and '*/sub'; honouring 'pods/*'
+        // would skip appending a bootstrap grant that the authorizer does not treat as covered.
+        let log_get = json!({ "apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"] });
+        let owner_star =
+            role(json!([{ "apiGroups": [""], "resources": ["pods/*"], "verbs": ["get"] }]));
+        assert!(matches!(
+            reconcile(&owner_star, &role(json!([log_get.clone()]))),
+            Reconciled::Update(..)
+        ));
+        let any_owner = stamped(role(
+            json!([{ "apiGroups": [""], "resources": ["*/log"], "verbs": ["get"] }]),
+        ));
+        assert_eq!(
+            reconcile(&any_owner, &stamped(role(json!([log_get])))),
+            Reconciled::Unchanged
         );
     }
 

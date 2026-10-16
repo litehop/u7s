@@ -21,6 +21,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
@@ -30,7 +32,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
-        run: cargo clippy --workspace --tests --no-deps -- -D warnings
+        run: cargo clippy --locked --workspace --tests --no-deps -- -D warnings
 
       # Untrusted-hook-bypass defense for .githooks/pre-commit's own bead-ID
       # check: a pusher can skip local hooks, so CI is the backstop that
@@ -45,6 +47,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
@@ -71,6 +75,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Some discovered test-*-logic.sh invoke cargo (e.g.
       # test-release-tarball-licenses.sh, scripts/conformance/test-dhat-depth-
       # logic.sh, test-profile-flag-logic.sh) -- needs cargo on PATH.
@@ -106,6 +112,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       # save-if: only main writes the shared cache; branches restore it read-only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -116,4 +124,4 @@ jobs:
         run: cargo install cargo-llvm-cov --locked
 
       - name: Coverage
-        run: cargo llvm-cov --workspace --summary-only --fail-under-lines 90
+        run: cargo llvm-cov --locked --workspace --summary-only --fail-under-lines 90
