@@ -49,7 +49,7 @@ rustup target add "$TARGET" >&2
 U7S_RELEASE="${VERSION#v}" \
 U7S_GIT_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)" \
 U7S_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  cargo build --release --target "$TARGET" --manifest-path "$ROOT_DIR/Cargo.toml" -p u7s-apiserver -p u7s-scheduler
+  cargo build --locked --release --target "$TARGET" --manifest-path "$ROOT_DIR/Cargo.toml" -p u7s-apiserver -p u7s-scheduler
 
 cp "$ROOT_DIR/target/$TARGET/release/u7s-apiserver" "$STAGE_DIR/"
 cp "$ROOT_DIR/target/$TARGET/release/u7s-scheduler" "$STAGE_DIR/"
