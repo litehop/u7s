@@ -94,6 +94,7 @@ pub fn build_table(
         ("batch", "cronjobs") => build_cronjob_table(objects),
         ("", "persistentvolumeclaims") => build_pvc_table(objects),
         ("", "persistentvolumes") => build_pv_table(objects),
+        ("certificates.k8s.io", "certificatesigningrequests") => build_csr_table(objects),
         _ => build_generic_table(objects),
     }
 }
@@ -1399,6 +1400,134 @@ fn access_modes_short_string(modes: &[String]) -> String {
 }
 
 // ── Generic ───────────────────────────────────────────────────────────────────
+
+// ── CertificateSigningRequests ────────────────────────────────────────────────
+
+fn build_csr_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+    let columns = vec![
+        col("Name", "Name of the resource", "string"),
+        col("Age", "Time since creation", "string"),
+        col(
+            "SignerName",
+            "Signer indicates the requested signer, and is a qualified name.",
+            "string",
+        ),
+        col(
+            "Requestor",
+            "Information about the requesting user. Populated by the API server on creation.",
+            "string",
+        ),
+        col(
+            "RequestedDuration",
+            "expirationSeconds is the requested duration of validity of the issued certificate.",
+            "string",
+        ),
+        col(
+            "Condition",
+            "Conditions applied to the request, such as approval or denial.",
+            "string",
+        ),
+    ];
+    let rows: Vec<serde_json::Value> = objects.into_iter().map(csr_row).collect();
+    serde_json::json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "Table",
+        "columnDefinitions": columns,
+        "rows": rows
+    })
+}
+
+fn csr_row(obj: serde_json::Value) -> serde_json::Value {
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+    let signer = match obj["spec"]["signerName"].as_str() {
+        Some(s) if !s.is_empty() => s,
+        _ => "<none>",
+    };
+    let requestor = obj["spec"]["username"].as_str().unwrap_or("");
+    let duration = obj["spec"]["expirationSeconds"]
+        .as_i64()
+        .map_or_else(|| "<none>".to_string(), |s| human_duration(s));
+    serde_json::json!({
+        "cells": [name, age, signer, requestor, duration, csr_condition_string(&obj)],
+        "object": make_object_ref(&obj, "CertificateSigningRequest")
+    })
+}
+
+/// Upstream `extractCSRStatus`: Denied beats Approved beats Pending, then `,Failed` and
+/// `,Issued` suffixes.
+fn csr_condition_string(obj: &serde_json::Value) -> String {
+    let has = |ty: &str| {
+        obj["status"]["conditions"]
+            .as_array()
+            .is_some_and(|cs| cs.iter().any(|c| c["type"] == ty))
+    };
+    let mut s = if has("Denied") {
+        "Denied"
+    } else if has("Approved") {
+        "Approved"
+    } else {
+        "Pending"
+    }
+    .to_string();
+    if has("Failed") {
+        s.push_str(",Failed");
+    }
+    if obj["status"]["certificate"]
+        .as_str()
+        .is_some_and(|c| !c.is_empty())
+    {
+        s.push_str(",Issued");
+    }
+    s
+}
+
+/// Port of apimachinery `duration.HumanDuration` for whole seconds.
+fn human_duration(secs: i64) -> String {
+    if secs < 0 {
+        return if secs < -1 { "<invalid>" } else { "0s" }.to_string();
+    }
+    if secs < 120 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    if minutes < 10 {
+        return match secs % 60 {
+            0 => format!("{minutes}m"),
+            s => format!("{minutes}m{s}s"),
+        };
+    }
+    if minutes < 180 {
+        return format!("{minutes}m");
+    }
+    let hours = secs / 3600;
+    if hours < 8 {
+        return match minutes % 60 {
+            0 => format!("{hours}h"),
+            m => format!("{hours}h{m}m"),
+        };
+    }
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    if hours < 24 * 8 {
+        return match hours % 24 {
+            0 => format!("{}d", hours / 24),
+            h => format!("{}d{h}h", hours / 24),
+        };
+    }
+    if hours < 24 * 365 * 2 {
+        return format!("{}d", hours / 24);
+    }
+    if hours < 24 * 365 * 8 {
+        return match (hours / 24) % 365 {
+            0 => format!("{}y", hours / 24 / 365),
+            d => format!("{}y{d}d", hours / 24 / 365),
+        };
+    }
+    format!("{}y", hours / 24 / 365)
+}
 
 fn build_generic_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     let columns = vec![
@@ -2819,5 +2948,109 @@ mod tests {
             "a single-object GET Table has no list to paginate; adding an empty metadata \
              object would be a needless shape change from today's behavior"
         );
+    }
+
+    fn csr(name: &str, status: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": name, "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {"signerName": "kubernetes.io/kube-apiserver-client",
+                     "username": "alice", "expirationSeconds": 3600},
+            "status": status
+        })
+    }
+
+    /// `kubectl get csr` prints exactly the Table's columns; without them operators lose the
+    /// requestor/signer/condition view they use to triage pending requests.
+    #[test]
+    fn csr_table_has_upstream_columns_and_pending_approved_issued_denied_conditions() {
+        let table = build_table(
+            "certificates.k8s.io",
+            "certificatesigningrequests",
+            vec![
+                csr("pending", serde_json::json!({})),
+                csr(
+                    "approved",
+                    serde_json::json!({"conditions": [{"type": "Approved", "status": "True"}]}),
+                ),
+                csr(
+                    "issued",
+                    serde_json::json!({"certificate": "Y2VydA==",
+                        "conditions": [{"type": "Approved", "status": "True"}]}),
+                ),
+                csr(
+                    "denied",
+                    serde_json::json!({"conditions": [
+                        {"type": "Approved", "status": "True"},
+                        {"type": "Denied", "status": "True"},
+                        {"type": "Failed", "status": "True"}]}),
+                ),
+            ],
+        );
+        let names: Vec<_> = table["columnDefinitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Name",
+                "Age",
+                "SignerName",
+                "Requestor",
+                "RequestedDuration",
+                "Condition"
+            ]
+        );
+        let cond: Vec<_> = table["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["cells"][5].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            cond,
+            ["Pending", "Approved", "Approved,Issued", "Denied,Failed"]
+        );
+        let cells = &table["rows"][0]["cells"];
+        assert_eq!(cells[0], "pending");
+        assert_eq!(cells[2], "kubernetes.io/kube-apiserver-client");
+        assert_eq!(cells[3], "alice");
+        assert_eq!(cells[4], "60m");
+    }
+
+    #[test]
+    fn csr_table_shows_none_when_signer_and_duration_are_unset() {
+        let table = build_table(
+            "certificates.k8s.io",
+            "certificatesigningrequests",
+            vec![serde_json::json!({"metadata": {"name": "x"}, "spec": {}})],
+        );
+        let cells = &table["rows"][0]["cells"];
+        assert_eq!(cells[2], "<none>");
+        assert_eq!(cells[4], "<none>");
+    }
+
+    #[test]
+    fn human_duration_matches_apimachinery_so_requested_duration_reads_like_kubectl() {
+        for (secs, want) in [
+            (0, "0s"),
+            (119, "119s"),
+            (120, "2m"),
+            (125, "2m5s"),
+            (600, "10m"),
+            (3600, "60m"),
+            (10800, "3h"),
+            (12600, "3h30m"),
+            (86400, "24h"),
+            (172800, "2d"),
+            (180000, "2d2h"),
+            (31_536_000, "365d"),
+        ] {
+            assert_eq!(human_duration(secs), want, "{secs}s");
+        }
     }
 }
