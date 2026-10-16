@@ -2226,8 +2226,8 @@ dependencies = [
 
 [[package]]
 name = "politeia"
-version = "0.2.0"
-source = "git+https://github.com/litehop/politeia?tag=v0.2.0#96c33a7ef5a1111a8d2ee392668c9cc78a734388"
+version = "0.2.1"
+source = "git+https://github.com/litehop/politeia?tag=v0.2.1#8005d9a015137d6e2b0d345288f0a7c8fe7c68b5"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2236,7 +2236,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
- "rustls-pemfile",
  "rustls-post-quantum",
  "serde_json",
  "tokio",
@@ -2916,15 +2915,6 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]
