@@ -146,28 +146,19 @@ fn load_or_generate_ca(
     let key_exists = std::path::Path::new(ca_key_path).exists();
     let cert_exists = std::path::Path::new(ca_cert_path).exists();
 
-    // Detect partial state: exactly one of the two files exists (e.g. the server
-    // crashed between the two fs::write calls). Silently falling through to
-    // generate a fresh CA would rotate the CA and break kubelets that already
-    // trust the old cert. Instead: log an error, delete the stale file, and
-    // fall through to the normal "generate fresh CA" path so the state is clean.
-    if key_exists ^ cert_exists {
-        if key_exists {
-            tracing::error!(
-                "partial CA state: {ca_key_path} exists but {ca_cert_path} is missing; \
-                 deleting stale key and regenerating CA"
-            );
-            std::fs::remove_file(ca_key_path)
-                .map_err(|e| anyhow::anyhow!("remove stale CA key {ca_key_path}: {e}"))?;
+    // Exactly one file present: regenerating would replace trust for every kubelet,
+    // kubeconfig and component cert at once, so refuse and leave both files untouched.
+    if key_exists != cert_exists {
+        let (present, missing) = if key_exists {
+            (ca_key_path, ca_cert_path)
         } else {
-            tracing::error!(
-                "partial CA state: {ca_cert_path} exists but {ca_key_path} is missing; \
-                 deleting stale cert and regenerating CA"
-            );
-            std::fs::remove_file(ca_cert_path)
-                .map_err(|e| anyhow::anyhow!("remove stale CA cert {ca_cert_path}: {e}"))?;
-        }
-        // Fall through to generate a fresh CA below.
+            (ca_cert_path, ca_key_path)
+        };
+        anyhow::bail!(
+            "partial CA state: {present} exists but {missing} is missing; refusing to \
+             regenerate the CA (that would invalidate every certificate it signed). \
+             Restore {missing}, or delete {present} to deliberately start a new CA"
+        );
     }
 
     if key_exists && cert_exists {
@@ -175,12 +166,16 @@ fn load_or_generate_ca(
         let key_pem =
             std::fs::read_to_string(validate_cli_path(std::path::Path::new(ca_key_path))?)
                 .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
-        let ca_key =
-            KeyPair::from_pem(&key_pem).map_err(|e| anyhow::anyhow!("parse CA key: {e}"))?;
+        let ca_key = KeyPair::from_pem(&key_pem)
+            .map_err(|e| anyhow::anyhow!("parse CA key {ca_key_path}: {e}"))?;
 
         // Load the persisted CA cert DER (stable — handed to TlsMaterial as-is).
         let ca_cert_der = std::fs::read(validate_cli_path(std::path::Path::new(ca_cert_path))?)
             .map_err(|e| anyhow::anyhow!("read CA cert {ca_cert_path}: {e}"))?;
+
+        ca_key_matches_cert(&ca_key, &ca_cert_der).map_err(|e| {
+            anyhow::anyhow!("CA key {ca_key_path} and cert {ca_cert_path} are unusable: {e}")
+        })?;
 
         // Reconstruct CertificateParams matching the CA cert so callers can
         // build an Issuer for signing leaf certs with the rcgen 0.14 API.
@@ -226,19 +221,45 @@ fn load_or_generate_ca(
         .der()
         .to_vec();
 
-    // Persist: key as PEM with 0o600 (owner-only), cert as DER with default perms.
+    // Persist both files to temp names first, then rename cert and finally key. A crash
+    // before the first rename leaves neither final file (next boot is a clean first
+    // boot); the key is renamed last so a crash between renames leaves cert-only,
+    // which the next boot reports as partial state instead of using a half-written key.
+    let key_tmp = format!("{ca_key_path}.tmp");
+    let cert_tmp = format!("{ca_cert_path}.tmp");
     write_private_key(
-        validate_cli_path(std::path::Path::new(ca_key_path))?,
+        validate_cli_path(std::path::Path::new(&key_tmp))?,
         ca_key.serialize_pem().as_bytes(),
     )
-    .map_err(|e| anyhow::anyhow!("write CA key {ca_key_path}: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("write CA key {key_tmp}: {e}"))?;
     std::fs::write(
-        validate_cli_path(std::path::Path::new(ca_cert_path))?,
+        validate_cli_path(std::path::Path::new(&cert_tmp))?,
         &ca_cert_der,
     )
-    .map_err(|e| anyhow::anyhow!("write CA cert {ca_cert_path}: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("write CA cert {cert_tmp}: {e}"))?;
+    std::fs::rename(&cert_tmp, ca_cert_path)
+        .map_err(|e| anyhow::anyhow!("rename {cert_tmp} -> {ca_cert_path}: {e}"))?;
+    std::fs::rename(&key_tmp, ca_key_path)
+        .map_err(|e| anyhow::anyhow!("rename {key_tmp} -> {ca_key_path}: {e}"))?;
 
     Ok((ca_key, ca_params, ca_cert_der))
+}
+
+/// Err unless `cert_der` parses as X.509 and its public key is `key`'s public key.
+fn ca_key_matches_cert(key: &KeyPair, cert_der: &[u8]) -> anyhow::Result<()> {
+    use x509_cert::der::Decode as _;
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|e| anyhow::anyhow!("cert is not valid DER X.509: {e}"))?;
+    let cert_pub = cert
+        .tbs_certificate()
+        .subject_public_key_info()
+        .subject_public_key
+        .raw_bytes();
+    anyhow::ensure!(
+        cert_pub == key.public_key_raw(),
+        "cert public key does not match the private key"
+    );
+    Ok(())
 }
 
 /// True if `leaf_der` cryptographically chain-validates against `ca_der` as the sole trust
@@ -1307,52 +1328,96 @@ mod tests {
         load_or_generate_ca(&ca_key_path, &ca_cert_path)
     }
 
+    /// Generate a CA in `dir`, returning its (key_path, cert_path).
+    fn generated_ca(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        run_load_or_generate_ca(dir).expect("first boot generates");
+        (dir.join("ca.key"), dir.join("ca.crt"))
+    }
+
+    /// Assert the CA load fails and leaves every listed file byte-identical:
+    /// regenerating would silently replace trust for the whole cluster.
+    fn assert_refuses_and_preserves(dir: &std::path::Path, files: &[&std::path::Path]) {
+        let before: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect(); // lgtm[rust/path-injection]
+        let err = run_load_or_generate_ca(dir).expect_err("partial CA state must refuse to start");
+        assert!(
+            err.to_string().contains("ca."),
+            "error must name the files: {err}"
+        );
+        for (p, b) in files.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(p).unwrap(), // lgtm[rust/path-injection]
+                b,
+                "{} must not be modified",
+                p.display()
+            );
+        }
+    }
+
     #[test]
-    fn partial_state_only_key_recovers() {
-        // Simulate a crash after ca.key was written but before ca.crt was written.
-        // load_or_generate_ca must: delete the stale key, generate a fresh CA,
-        // and return Ok with both files present. Without this fix the stale key
-        // would be silently overwritten and kubelets trusting the previous CA
-        // would break on server restart.
-        let dir = test_temp_dir("partial-key");
-        let ca_key_path = dir.join("ca.key");
-        let ca_cert_path = dir.join("ca.crt");
-
-        // Write only ca.key — no ca.crt.
-        std::fs::write(&ca_key_path, b"dummy-key-content").expect("write dummy ca.key"); // lgtm[rust/path-injection]
-        assert!(ca_key_path.exists());
-        assert!(!ca_cert_path.exists());
-
-        let result = run_load_or_generate_ca(&dir);
-        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
-
-        assert!(ca_key_path.exists(), "ca.key must exist after recovery");
-        assert!(ca_cert_path.exists(), "ca.crt must exist after recovery");
-
+    fn ca_cert_only_refuses_to_start_and_keeps_cert() {
+        let dir = test_temp_dir("ca-cert-only");
+        let (key, cert) = generated_ca(&dir);
+        std::fs::remove_file(&key).unwrap(); // lgtm[rust/path-injection]
+        assert_refuses_and_preserves(&dir, &[&cert]);
+        assert!(!key.exists(), "no new key may be generated");
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     #[test]
-    fn partial_state_only_cert_recovers() {
-        // Simulate a crash after ca.crt was written but after ca.key was deleted
-        // (or ca.key was never written, e.g. manual operator error).
-        // load_or_generate_ca must: delete the stale cert, generate a fresh CA,
-        // and return Ok with both files present.
-        let dir = test_temp_dir("partial-cert");
-        let ca_key_path = dir.join("ca.key");
-        let ca_cert_path = dir.join("ca.crt");
+    fn ca_key_only_refuses_to_start_and_keeps_key() {
+        let dir = test_temp_dir("ca-key-only");
+        let (key, cert) = generated_ca(&dir);
+        std::fs::remove_file(&cert).unwrap(); // lgtm[rust/path-injection]
+        assert_refuses_and_preserves(&dir, &[&key]);
+        assert!(!cert.exists(), "no new cert may be generated");
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
 
-        // Write only ca.crt — no ca.key.
-        std::fs::write(&ca_cert_path, b"dummy-cert-content").expect("write dummy ca.crt"); // lgtm[rust/path-injection]
-        assert!(!ca_key_path.exists());
-        assert!(ca_cert_path.exists());
+    #[test]
+    fn ca_mismatched_key_and_cert_refuses_to_start() {
+        let dir = test_temp_dir("ca-mismatch");
+        let (key, cert) = generated_ca(&dir);
+        let other = test_temp_dir("ca-mismatch-other");
+        let (_, other_cert) = generated_ca(&other);
+        std::fs::copy(&other_cert, &cert).unwrap(); // lgtm[rust/path-injection]
+        assert_refuses_and_preserves(&dir, &[&key, &cert]);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+        let _ = std::fs::remove_dir_all(&other); // lgtm[rust/path-injection]
+    }
 
-        let result = run_load_or_generate_ca(&dir);
-        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
+    #[test]
+    fn ca_corrupt_cert_refuses_to_start() {
+        let dir = test_temp_dir("ca-corrupt-cert");
+        let (key, cert) = generated_ca(&dir);
+        std::fs::write(&cert, b"not a certificate").unwrap(); // lgtm[rust/path-injection]
+        assert_refuses_and_preserves(&dir, &[&key, &cert]);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
 
-        assert!(ca_key_path.exists(), "ca.key must exist after recovery");
-        assert!(ca_cert_path.exists(), "ca.crt must exist after recovery");
+    #[test]
+    fn ca_corrupt_key_refuses_to_start() {
+        let dir = test_temp_dir("ca-corrupt-key");
+        let (key, cert) = generated_ca(&dir);
+        std::fs::write(&key, b"dummy-key-content").unwrap(); // lgtm[rust/path-injection]
+        assert_refuses_and_preserves(&dir, &[&key, &cert]);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
 
+    #[test]
+    fn ca_first_boot_generates_and_leaves_no_temp_files() {
+        let dir = test_temp_dir("ca-first-boot");
+        let (key, cert) = generated_ca(&dir);
+        assert!(key.exists() && cert.exists());
+        assert!(!dir.join("ca.key.tmp").exists() && !dir.join("ca.crt.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_valid_pair_loads_the_same_ca() {
+        let dir = test_temp_dir("ca-reload");
+        let (_, _, first) = run_load_or_generate_ca(&dir).unwrap();
+        let (_, _, second) = run_load_or_generate_ca(&dir).unwrap();
+        assert_eq!(first, second, "restart must keep the same CA cert");
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
@@ -1399,8 +1464,14 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            proxy_client_ca_key: "./proxy-client-ca.key".into(),
-            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1540,8 +1611,14 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            proxy_client_ca_key: "./proxy-client-ca.key".into(),
-            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1595,8 +1672,14 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            proxy_client_ca_key: "./proxy-client-ca.key".into(),
-            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1700,8 +1783,14 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            proxy_client_ca_key: "./proxy-client-ca.key".into(),
-            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1747,8 +1836,14 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: ca_key_path.to_string_lossy().into_owned(),
             ca_cert: ca_cert_path.to_string_lossy().into_owned(),
-            proxy_client_ca_key: "./proxy-client-ca.key".into(),
-            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1815,8 +1910,14 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            proxy_client_ca_key: "./proxy-client-ca.key".into(),
-            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
