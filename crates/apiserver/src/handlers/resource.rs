@@ -1671,6 +1671,7 @@ pub(crate) async fn do_patch<S: Store>(
                 };
                 crate::patch::strategic_merge_patch(&mut current.body, &patch)
                     .map_err(|e| Status::bad_request(e.to_string()))?;
+                super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
                 restore_or_strip_status(
                     meta.has_status_subresource,
                     &mut current.body,
@@ -2038,6 +2039,7 @@ pub(crate) async fn do_patch<S: Store>(
         }
 
         current.body["metadata"]["uid"] = stored_uid;
+        super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
 
         restore_or_strip_status(
             meta.has_status_subresource,
@@ -11599,6 +11601,87 @@ mod tests {
         let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["spec"]["holderIdentity"], "updated");
+    }
+
+    /// A PATCH (any type) that rewrites metadata.name/namespace must be refused with
+    /// upstream's 400 and leave the stored object untouched: the store key stays URL-derived
+    /// while informer-style consumers key by body, so a rewritten body shadows another
+    /// object (e.g. a ConfigMap/Endpoints claiming kube-system/kube-dns).
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_identity_rewrite_for_every_patch_type() {
+        use crate::handlers::test_support::{
+            assert_identity_mismatch, content_type_headers, identity_rewrite_patches,
+            make_state_with_store,
+        };
+        use axum::extract::{Path, State};
+
+        let store = std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").unwrap());
+        let state = make_state_with_store(store.clone());
+        let key = "/registry/configmaps/default/cm1";
+        let cm = serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "cm1", "namespace": "default", "resourceVersion": "1"},
+            "data": {"k": "v"}
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let before = store.get(key).await.unwrap().unwrap();
+
+        for (field, value) in [("name", "kube-dns"), ("namespace", "kube-system")] {
+            for (label, ct, body) in identity_rewrite_patches(field, value, "v1", "ConfigMap") {
+                let err = patch_namespaced_resource(
+                    State(state.clone()),
+                    Path((
+                        String::new(),
+                        "v1".into(),
+                        "default".into(),
+                        "configmaps".into(),
+                        "cm1".into(),
+                    )),
+                    axum::extract::Query(PatchQuery::default()),
+                    test_user(),
+                    content_type_headers(ct),
+                    body,
+                )
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{label} patch of metadata.{field} must be rejected"));
+                assert_identity_mismatch(&err, label, field);
+                let after = store.get(key).await.unwrap().unwrap();
+                assert_eq!(
+                    after.value, before.value,
+                    "{label} patch of metadata.{field} must not change the stored object"
+                );
+            }
+        }
+
+        let ok = patch_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "cm1".into(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            content_type_headers("application/merge-patch+json"),
+            bytes::Bytes::from(
+                r#"{"data":{"k":"v2"},"metadata":{"name":"cm1","namespace":"default"}}"#,
+            ),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "a patch restating the URL's own name/namespace must still succeed"
+        );
     }
 
     /// create_resource returns 409 Conflict when creating the same name twice.

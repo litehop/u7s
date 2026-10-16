@@ -1521,6 +1521,7 @@ pub(crate) async fn patch_pod<S: Store>(
 
         current_obj.body["status"] = stored_status.clone();
         current_obj.body["metadata"]["uid"] = stored_uid;
+        super::json_patch::enforce_patch_identity(&mut current_obj.body, &name, Some(ns.as_str()))?;
 
         // Admission webhook pipeline (mutating then validating), threading the pre-patch
         // stored pod as oldObject — mirrors replace_pod's UPDATE call above. Previously
@@ -14810,7 +14811,9 @@ mod handler_tests {
             &store,
             "default",
             "my-pod",
-            serde_json::json!({"metadata": {"uid": "real-uid-0001"}}),
+            serde_json::json!({"metadata": {
+                "name": "my-pod", "namespace": "default", "uid": "real-uid-0001"
+            }}),
         )
         .await;
 
@@ -21925,6 +21928,56 @@ mod admission_tests {
             "mutating webhook label must be present after replace_pod — \
              without the fix, replace_pod bypassed admission and the label was never injected"
         );
+    }
+
+    /// patch_pod must refuse any patch type that rewrites metadata.name/namespace (upstream's
+    /// 400) and keep the stored pod byte-identical: kubelet/KCM informers key pods by body, so
+    /// a pod stored under default/p1 but claiming kube-system/<other> shadows that pod.
+    #[tokio::test]
+    async fn patch_pod_rejects_identity_rewrite_for_every_patch_type() {
+        use crate::handlers::test_support::{
+            assert_identity_mismatch, content_type_headers, identity_rewrite_patches,
+        };
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+        let pod_key = "/registry/pods/default/p1";
+        let existing = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p1", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(
+                pod_key,
+                Bytes::from(serde_json::to_vec(&existing).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let before = store.get(pod_key).await.unwrap().unwrap().value;
+
+        for (field, value) in [("name", "coredns"), ("namespace", "kube-system")] {
+            for (label, ct, body) in identity_rewrite_patches(field, value, "v1", "Pod") {
+                let err = patch_pod(
+                    axum::extract::State(state.clone()),
+                    axum::extract::Path(("default".to_string(), "p1".to_string())),
+                    axum::extract::Query(crate::handlers::json_patch::PatchQuery::default()),
+                    test_user(),
+                    content_type_headers(ct),
+                    body,
+                )
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{label} patch of metadata.{field} must be rejected"));
+                assert_identity_mismatch(&err, label, field);
+                assert_eq!(
+                    store.get(pod_key).await.unwrap().unwrap().value,
+                    before,
+                    "{label} patch of metadata.{field} must not change the stored pod"
+                );
+            }
+        }
     }
 
     /// patch_pod must invoke the validating admission pipeline.
