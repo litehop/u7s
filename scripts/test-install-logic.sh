@@ -1113,8 +1113,26 @@ assert_false "set-kubelet-resolvconf must exit non-zero when the config has no r
 assert_false "install.sh unquoted heredoc bodies must not contain backticks: bash command-substitutes them and prints 'command not found' at install time" \
   awk '/<<-?[A-Za-z_]+$/{h=1; next} /^EOF$/{h=0} h&&/`/{bad=1} END{exit !bad}' "$INSTALL"
 
+# Release payload scratch dirs must be disk-backed: on Ubuntu 26.04 /tmp is
+# tmpfs, so extracting the tarball there OOMs the 1 GiB hosts u7s targets.
+# Only the small mint_dir (kubelet serving key) may stay on plain mktemp, so it
+# never reaches disk.
+assert_true "install.sh payload dirs (download + stage) use mktemp_disk_dir, not tmpfs-backed mktemp -d, or install OOMs on 1 GiB hosts" \
+  bash -c 'test "$(grep -c "mktemp -d" "$1")" -eq 2 && grep -q "DOWNLOAD_DIR=\"\$(mktemp_disk_dir)\"" "$1" && grep -q "STAGE_DIR=\"\$(mktemp_disk_dir)\"" "$1"' _ "$INSTALL"
+MKDISK_RUNNER="$(mktemp)"
+{
+  echo 'set -euo pipefail'
+  awk '/^mktemp_disk_dir\(\) \{/,/^\}/' "$INSTALL"
+  echo 'd="$(mktemp_disk_dir)"; trap "rm -rf $d" EXIT; findmnt -n -o FSTYPE -T "$d"'
+} > "$MKDISK_RUNNER"
+if command -v findmnt >/dev/null 2>&1 && [ -d /var/tmp ]; then
+  assert_false "mktemp_disk_dir must not return a tmpfs/ramfs path (RAM-backed extraction OOMs 1 GiB hosts)" \
+    bash -c 'bash "$1" | grep -qE "^(tmpfs|ramfs)$"' _ "$MKDISK_RUNNER"
+fi
+rm -f "$MKDISK_RUNNER"
+
 echo ""
-echo "Results: ${PASS} passed, ${FAIL} failed"
+echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
