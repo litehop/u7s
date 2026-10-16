@@ -713,8 +713,31 @@ sync_checkout_to_main() {
   run_cmd git -C "$REPO_ROOT" remote prune origin
 }
 
+extract_bead_ids() {
+  printf '%s' "$1" | grep -oE 'mayor-[a-z0-9]+(\.[0-9]+)*' | sort -u || true
+}
+
+# Beads close when their PR merges. IDs come from the PR title only (bodies
+# carry no reliable bead line). Never fails the tick: a bd error is logged and
+# the next tick retries while the worktree still exists.
+close_merged_pr_beads() {
+  local num="$1" title="$2" sha="$3" id status
+  for id in $(extract_bead_ids "$title"); do
+    status=$(bd show "$id" --json 2>/dev/null | jq -r '.[0].status // empty' 2>/dev/null || true)
+    case "$status" in
+      closed) echo "mayor-tick: bead $id already closed (PR #$num)"; continue ;;
+      "") echo "mayor-tick: bead $id not found, not closing (PR #$num)"; continue ;;
+    esac
+    if run_cmd bd close "$id" --reason "merged in #$num ($sha)" >/dev/null 2>&1; then
+      echo "mayor-tick: closed bead $id (merged in #$num, $sha)"
+    else
+      echo "mayor-tick: bd close $id failed (PR #$num); will retry next tick" >&2
+    fi
+  done
+}
+
 cleanup_merged_worktrees() {
-  local path branch pr_state st num did_pull=0
+  local path branch pr_state st num title sha did_pull=0
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     [ "$path" = "$REPO_ROOT" ] && continue
@@ -723,7 +746,7 @@ cleanup_merged_worktrees() {
       worker/agent-*) ;;
       *) continue ;;
     esac
-    pr_state=$(gh pr list --head "$branch" --state all --json number,state --jq '.[0] // empty' 2>/dev/null || true)
+    pr_state=$(gh pr list --head "$branch" --state all --json number,state,title,mergeCommit --jq '.[0] // empty' 2>/dev/null || true)
     [ -z "$pr_state" ] && continue
     st=$(printf '%s' "$pr_state" | jq -r '.state')
     num=$(printf '%s' "$pr_state" | jq -r '.number')
@@ -732,6 +755,9 @@ cleanup_merged_worktrees() {
         sync_checkout_to_main
         did_pull=1
       fi
+      title=$(printf '%s' "$pr_state" | jq -r '.title // ""')
+      sha=$(printf '%s' "$pr_state" | jq -r '.mergeCommit.oid // "unknown"' | cut -c1-10)
+      close_merged_pr_beads "$num" "$title" "$sha"
       run_cmd git -C "$REPO_ROOT" worktree remove "$path"
       run_cmd git -C "$REPO_ROOT" branch -D "$branch"
       MERGED_PRS+=("$num")

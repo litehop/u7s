@@ -16,9 +16,10 @@ Workers have every tool the mayor has, including the lima-node MCP server
 (`mcp__lima-node__*`) for live VM debugging. Write a better brief.
 
 **Beads is the spine.** Track all real work in `bd` — no TodoWrite, no markdown
-TODOs, no parallel trackers. Run `bd prime` for the canonical commands. Close
-beads only after merge or verifiable completion; record close reasons concretely
-with cross-refs to PRs. Decisions go in BOTH the bead notes AND the merging
+TODOs, no parallel trackers. Run `bd prime` for the canonical commands. A
+bead closes when its PR merges (main is the authoritative state), never at PR
+open; the mayor closes it with a reason citing the PR and merge commit. Beads
+with no PR close on verifiable completion with a concrete reason. Decisions go in BOTH the bead notes AND the merging
 PR's body — the PR body is the durable git-history record. `bd prime`'s memory
 section is index-only (pull-on-demand via `bd recall <key>`) — see CLAUDE.md
 "Memory access pattern".
@@ -63,7 +64,8 @@ explicit write scope; project stance injected into the preamble; enumerate
 other in-flight workers and their write surfaces so the receiver pattern-matches
 for collisions; explicit "do not edit the mayor checkout" and "do not merge PRs";
 require tests + final report (changed files, commands run, branch/PR, risks).
-Worker may close its own bead after opening the PR with a cross-ref reason.
+Workers never close their bead: they leave it in_progress with a
+`bd note <id> "PR #N opened: <url>"`.
 Before dispatching, run `scripts/bead-premise-check.sh <bead-id>`. Exit 0
 (still-broken) — proceed with dispatch. Exit 1 (no-longer-broken) — the
 alleged broken symbol/missing file/stale convention already landed; close
@@ -81,8 +83,8 @@ Workers must never hard-code `lima-node`, port `6443`, or kubelet port `10250`.
 **PRs.** Workers open; mayor reviews and merges on green. NEVER use `--admin` to
 bypass a failing check — read the log first; if it is a transient GitHub infra
 flake, rerun with `gh run rerun <run-id> --failed` and wait for green; only
-merge when ALL checks pass. Post-merge: `git pull --ff-only`, verify worker
-closed the bead (close it if not), update `ai/dashboard.md`, mention follow-on
+merge when ALL checks pass. Post-merge: `git pull --ff-only`, close the PR's
+beads (`scripts/mayor-tick.sh` does this on merge; verify), update `ai/dashboard.md`, mention follow-on
 beads filed by the worker. For each merged PR's "merged this session"
 dashboard entry, invoke `Agent(subagent_type="diff-summarizer", prompt="gh pr
 diff <N>")` instead of re-reading the full diff yourself.

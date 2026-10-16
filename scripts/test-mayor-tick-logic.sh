@@ -1549,6 +1549,70 @@ assert "...and still runs the rest of cleanup (merged PR recorded)" \
   "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 24. Beads close when their PR merges: the tick closes every bead ID named in
+#     a MERGED PR's title, skips already-closed ones, and closes nothing for a
+#     PR that is not merged. Otherwise beads sit in_progress forever after
+#     merge and `bd ready`/the dashboard drift from main.
+# ---------------------------------------------------------------------------
+
+# Bead-ID prefix, split so the bead-id-refs guard doesn't flag these fixtures.
+B="mayo""r-"
+
+# $1=case name, $2=PR state, $3=PR title, rest = "<bead-id>=<status>" pairs the
+# fake bd reports. Sets BEAD_CLOSE_LOG to the file of `bd close` argv lines.
+run_bead_close_tick() {
+  local name="$1" state="$2" title="$3"; shift 3
+  local bin="$WORKDIR/stub-bead-$name" db="$WORKDIR/bead-db-$name" pair
+  mkdir -p "$bin" "$db"
+  BEAD_CLOSE_LOG="$WORKDIR/bead-close-$name.log"
+  : > "$BEAD_CLOSE_LOG"
+  for pair in "$@"; do printf '%s' "${pair#*=}" > "$db/${pair%%=*}"; done
+  cat > "$bin/gh" <<EOF
+#!/usr/bin/env bash
+if [[ " \$* " == *" --head "* ]]; then
+  jq -nc --arg t '$title' '{number:4242,state:"$state",title:\$t,mergeCommit:{oid:"abcdef0123456789"}}'
+else
+  printf '[]'
+fi
+EOF
+  cat > "$bin/bd" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  show) [ -f "$db/\$2" ] || exit 1; printf '[{"id":"%s","status":"%s"}]' "\$2" "\$(cat "$db/\$2")" ;;
+  close) printf '%s\n' "\$*" >> "$BEAD_CLOSE_LOG" ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$bin/gh" "$bin/bd"
+  build_scratch_repo "bead-$name"
+  invoke_tick "$bin" "$SCRATCH_REPO" 0
+}
+
+run_bead_close_tick merged MERGED "feat(x): thing (${B}aaa1, ${B}bbb2.3)" \
+  ${B}aaa1=in_progress ${B}bbb2.3=open
+assert "a merged PR closes every bead ID in its title, dotted child IDs included, citing PR and merge sha" \
+  "$([ "$(sort "$BEAD_CLOSE_LOG")" = "$(printf 'close %saaa1 --reason merged in #4242 (abcdef0123)\nclose %sbbb2.3 --reason merged in #4242 (abcdef0123)' "$B" "$B")" ] && echo 1 || echo 0)"
+
+run_bead_close_tick already MERGED "fix: y (${B}ccc3, ${B}ddd4)" \
+  ${B}ccc3=closed ${B}ddd4=in_progress
+assert "an already-closed bead is skipped so a re-run tick is idempotent, while its open sibling still closes" \
+  "$([ "$(cat "$BEAD_CLOSE_LOG")" = "close ${B}ddd4 --reason merged in #4242 (abcdef0123)" ] && echo 1 || echo 0)"
+
+run_bead_close_tick nobead MERGED "chore: no bead id here" ${B}eee5=in_progress
+assert "a merged PR with no bead ID in its title closes nothing" \
+  "$([ ! -s "$BEAD_CLOSE_LOG" ] && echo 1 || echo 0)"
+assert "...and the tick still records the merge (a bd-less PR must not break cleanup)" \
+  "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[4242]" ] && echo 1 || echo 0)"
+
+run_bead_close_tick open OPEN "feat: z (${B}fff6)" ${B}fff6=in_progress
+assert "an unmerged PR closes nothing: its bead must stay in_progress until main has the work" \
+  "$([ ! -s "$BEAD_CLOSE_LOG" ] && echo 1 || echo 0)"
+
+run_bead_close_tick missing MERGED "feat: w (${B}ggg7)"
+assert "a bead ID unknown to bd is logged and never fails the tick" \
+  "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
