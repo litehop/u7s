@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct PolicyRule {
     #[serde(rename = "apiGroups", default)]
     pub api_groups: Vec<String>,
@@ -71,6 +71,8 @@ pub struct RbacIndex {
 
 struct RbacInner {
     cluster_roles: HashMap<String, Vec<PolicyRule>>,
+    /// aggregationRule.clusterRoleSelectors of ClusterRoles that have a non-empty one.
+    cluster_role_aggregations: HashMap<String, serde_json::Value>,
     roles: HashMap<(String, String), Vec<PolicyRule>>,
     cluster_bindings: Vec<(String, RbacBinding)>, // (key, binding)
     namespace_bindings: Vec<(String, RbacBinding)>,
@@ -114,6 +116,7 @@ impl RbacIndex {
         RbacIndex {
             inner: Arc::new(RwLock::new(RbacInner {
                 cluster_roles: HashMap::new(),
+                cluster_role_aggregations: HashMap::new(),
                 roles: HashMap::new(),
                 cluster_bindings: Vec::new(),
                 namespace_bindings: Vec::new(),
@@ -157,6 +160,14 @@ impl RbacIndex {
                     incoming_rv,
                 ) {
                     inner.cluster_roles.insert(name.to_owned(), role.rules);
+                    match aggregation_selectors(value) {
+                        Some(sel) => {
+                            inner.cluster_role_aggregations.insert(name.to_owned(), sel);
+                        }
+                        None => {
+                            inner.cluster_role_aggregations.remove(name);
+                        }
+                    }
                 }
             }
         } else if let RbacKey::ClusterRoleBinding = parsed {
@@ -229,6 +240,7 @@ impl RbacIndex {
         match parse_rbac_key(key) {
             Some(RbacKey::ClusterRole { name }) => {
                 inner.cluster_roles.remove(name);
+                inner.cluster_role_aggregations.remove(name);
             }
             Some(RbacKey::ClusterRoleBinding) => {
                 inner.cluster_bindings.retain(|(k, _)| k != key);
@@ -285,6 +297,28 @@ impl RbacIndex {
     pub fn cluster_role_rules(&self, name: &str) -> Vec<PolicyRule> {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.cluster_roles.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Rules for the named ClusterRole, or `None` if it does not exist (as opposed to
+    /// existing with no rules).
+    pub fn cluster_role_rules_if_exists(&self, name: &str) -> Option<Vec<PolicyRule>> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.cluster_roles.get(name).cloned()
+    }
+
+    /// Rules for the named Role, or `None` if it does not exist.
+    pub fn role_rules_if_exists(&self, namespace: &str, name: &str) -> Option<Vec<PolicyRule>> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner
+            .roles
+            .get(&(namespace.to_owned(), name.to_owned()))
+            .cloned()
+    }
+
+    /// The stored aggregationRule selectors of the named ClusterRole, if it has any.
+    pub fn cluster_role_aggregation(&self, name: &str) -> Option<serde_json::Value> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.cluster_role_aggregations.get(name).cloned()
     }
 
     /// Return a copy of the rules for the named Role in the given namespace, or empty if unknown.
@@ -370,6 +404,14 @@ impl Default for RbacIndex {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `aggregationRule.clusterRoleSelectors` when non-empty, else `None`.
+pub fn aggregation_selectors(body: &serde_json::Value) -> Option<serde_json::Value> {
+    let sel = &body["aggregationRule"]["clusterRoleSelectors"];
+    sel.as_array()
+        .is_some_and(|s| !s.is_empty())
+        .then(|| sel.clone())
 }
 
 /// Check whether `username`/`groups` already hold every permission enumerated
