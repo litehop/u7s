@@ -4878,6 +4878,127 @@ mod tests {
         );
     }
 
+    async fn install_widget_crd(state: &AppState<u7s_store::SqliteStore>, group: &str) -> String {
+        let name = format!("widgets.{group}");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(&name, group, "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+        name
+    }
+
+    async fn delete_crd_ok(state: &AppState<u7s_store::SqliteStore>, name: &str) {
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
+    }
+
+    /// `find_crd` checks its context cache before any tombstone/404 fallback, so a missed
+    /// eviction keeps validating CR writes against the schema of a CRD that no longer exists.
+    ///
+    /// Fails on revert: without `evict_cr_context_cache` in `purge_crd`, `find_crd` returns
+    /// the stale cached context instead of 410 Gone.
+    #[tokio::test]
+    async fn delete_crd_evicts_cr_context_cache_so_find_crd_does_not_serve_a_deleted_crd() {
+        let state = make_state();
+        let group = "ctx.example.com";
+        let name = install_widget_crd(&state, group).await;
+        crate::handlers::cr::find_crd(&state, group, "v1", "widgets")
+            .await
+            .expect("CRD must be found right after install, warming cr_context_cache");
+
+        delete_crd_ok(&state, &name).await;
+
+        let err = match crate::handlers::cr::find_crd(&state, group, "v1", "widgets").await {
+            Ok(_) => panic!("find_crd must not serve a stale CrContext for a deleted CRD"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GONE,
+            "must be 410 Gone (group tombstone), not a stale Ok(ctx) or an uncached 404"
+        );
+    }
+
+    /// A deleted CRD's served versions can never be requested again, so conversion-cache
+    /// entries targeting them leak for the life of the process if not swept.
+    ///
+    /// Fails on revert: without `invalidate_by_target_api_versions` in `purge_crd` the entry
+    /// stays cached.
+    #[tokio::test]
+    async fn delete_crd_evicts_cr_conversion_cache_entries_for_its_target_api_versions() {
+        let state = make_state();
+        let group = "conv.example.com";
+        let name = install_widget_crd(&state, group).await;
+        let cache_key = ("42".to_string(), format!("{group}/v1"));
+        state.cr_conversion_cache.insert(
+            cache_key.clone(),
+            &serde_json::json!({ "apiVersion": format!("{group}/v1"), "kind": "Widget" }),
+        );
+        assert!(
+            state.cr_conversion_cache.contains(&cache_key),
+            "precondition: the converted body must be cached before the CRD delete"
+        );
+
+        delete_crd_ok(&state, &name).await;
+
+        assert!(
+            !state.cr_conversion_cache.contains(&cache_key),
+            "CRD delete must evict conversion-cache entries targeting its served versions"
+        );
+    }
+
+    /// Aggregated /apis discovery is served from a cache with no TTL, refreshed only by an
+    /// explicit call. A stale entry keeps advertising the deleted group, so KCM's namespace
+    /// controller keeps rediscovering it and the namespace drain never finishes.
+    ///
+    /// Fails on revert: without `refresh_discovery_cache` in `purge_crd` the group stays listed.
+    #[tokio::test]
+    async fn delete_crd_refreshes_discovery_so_the_deleted_group_is_no_longer_listed() {
+        let state = make_state();
+        let group = "disc.example.com";
+        let name = install_widget_crd(&state, group).await;
+        let list_groups = || async {
+            crate::handlers::discovery::build_aggregated_discovery(
+                &state,
+                "v2beta1",
+                false,
+                &crate::auth::UserInfo::default(),
+                "/apis",
+            )
+            .await
+        };
+        assert!(
+            list_groups()
+                .await
+                .items
+                .iter()
+                .any(|g| g.metadata.name == group),
+            "precondition: the CRD's group must be in discovery right after creation"
+        );
+
+        delete_crd_ok(&state, &name).await;
+
+        assert!(
+            !list_groups()
+                .await
+                .items
+                .iter()
+                .any(|g| g.metadata.name == group),
+            "the deleted CRD's group must disappear from discovery immediately"
+        );
+    }
+
     /// A connected CR watcher must see its objects DELETED when the CRD goes away, and the
     /// CRD's CR watch-ring shard must be reclaimed while that watcher is still attached —
     /// otherwise every deleted CRD leaks ring memory for as long as any client stays connected.

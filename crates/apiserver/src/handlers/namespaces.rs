@@ -3582,11 +3582,12 @@ mod tests {
         }
 
         let cr_keys = [
-            "/registry/example.io/widgets/io/in-ns",
-            "/registry/example.io/widgets/other/other-ns",
-            "/registry/io/clusterthings/cluster-cr",
+            crate::handlers::cr::cr_list_prefix("example.io", "widgets", Some("io")) + "in-ns",
+            crate::handlers::cr::cr_list_prefix("example.io", "widgets", Some("other"))
+                + "other-ns",
+            crate::handlers::cr::cr_list_prefix("io", "clusterthings", None) + "cluster-cr",
         ];
-        for key in cr_keys {
+        for key in &cr_keys {
             state
                 .store
                 .put(key, Bytes::from_static(b"{}"), Some(0))
@@ -3635,7 +3636,7 @@ mod tests {
                 "CRD {crd_name} is cluster-scoped and must survive deletion of namespace io"
             );
         }
-        for key in cr_keys {
+        for key in &cr_keys {
             assert!(
                 state.store.get(key).await.unwrap().is_some(),
                 "namespace deletion must not remove {key} itself; only the namespace \
