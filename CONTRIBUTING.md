@@ -14,7 +14,7 @@ Every unit of work is a bead, tracked with [beads](https://github.com/gastownhal
 1. Run `bd ready` to see unclaimed work.
 2. Run `bd show <id>` to read a bead in full before starting.
 3. Run `bd update <id> --claim` to claim it.
-4. Run `bd close <id> --reason="..."` when the work lands.
+4. Leave the bead in_progress and run `bd note <id> "PR #N opened: <url>"` once the PR is up. The mayor closes it when the PR merges.
 
 Do not track work in a separate TODO list, GitHub Projects board, or issue
 labels — beads is the single source of truth. See

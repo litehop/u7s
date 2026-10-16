@@ -191,7 +191,8 @@ if [ -z "$DELIVERABLE_TYPE" ]; then
   fi
 fi
 
-# 3. Bead close. The worker reports `bd close mayor-XXXXX -r "..."` in output.
+# 3. Bead close. PR flows no longer emit `bd close` (the mayor tick closes on
+# merge); this only matches non-PR bead-close deliverables. The worker reports `bd close mayor-XXXXX -r "..."` in output.
 if [ -z "$DELIVERABLE_TYPE" ]; then
   BEAD_ID=$(printf '%s' "$MSG" | grep -oE 'bd close (mayor-[a-z0-9]+)' | head -1 | awk '{print $3}' || true)
   if [ -n "$BEAD_ID" ]; then

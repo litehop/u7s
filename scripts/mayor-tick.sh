@@ -714,30 +714,53 @@ sync_checkout_to_main() {
 }
 
 extract_bead_ids() {
-  printf '%s' "$1" | grep -oE 'mayor-[a-z0-9]+(\.[0-9]+)*' | sort -u || true
+  printf '%s' "$1" | { grep -oE '(^|[^A-Za-z0-9_-])mayor-[a-z0-9]+(\.[0-9]+)*' || true; } \
+    | sed -E 's/^[^m]*//' | sort -u
 }
 
 # Beads close when their PR merges. IDs come from the PR title only (bodies
-# carry no reliable bead line). Never fails the tick: a bd error is logged and
-# the next tick retries while the worktree still exists.
+# carry no reliable bead line). A close failure is recorded as a gate
+# exception (exit 20); the scan repeats every tick, so it retries naturally.
 close_merged_pr_beads() {
   local num="$1" title="$2" sha="$3" id status
   for id in $(extract_bead_ids "$title"); do
     status=$(bd show "$id" --json 2>/dev/null | jq -r '.[0].status // empty' 2>/dev/null || true)
     case "$status" in
-      closed) echo "mayor-tick: bead $id already closed (PR #$num)"; continue ;;
+      closed) continue ;;
       "") echo "mayor-tick: bead $id not found, not closing (PR #$num)"; continue ;;
     esac
     if run_cmd bd close "$id" --reason "merged in #$num ($sha)" >/dev/null 2>&1; then
       echo "mayor-tick: closed bead $id (merged in #$num, $sha)"
     else
-      echo "mayor-tick: bd close $id failed (PR #$num); will retry next tick" >&2
+      echo "mayor-tick: bd close $id failed (PR #$num); retrying next tick" >&2
+      GATE_EXCEPTIONS+=("$(jq -nc --argjson pr "$num" --arg bead "$id" '{pr:$pr, bead:$bead, reason:"bead-close-failed"}')")
     fi
   done
 }
 
+# Independent of any worktree or branch name: scans PRs merged within the
+# lookback window, so a failed close is retried and non-worker branches are
+# covered. Already-closed beads are skipped, which bounds repeat work to the
+# window and keeps re-scans idempotent.
+BEAD_CLOSE_LOOKBACK_DAYS="${MAYOR_TICK_BEAD_LOOKBACK_DAYS:-3}"
+
+close_beads_of_merged_prs() {
+  local since prs_json row
+  since=$(date -u -v-"${BEAD_CLOSE_LOOKBACK_DAYS}"d +%Y-%m-%d 2>/dev/null \
+    || date -u -d "$BEAD_CLOSE_LOOKBACK_DAYS days ago" +%Y-%m-%d)
+  prs_json=$(gh pr list --state merged --search "merged:>=$since" --limit 100 \
+    --json number,title,mergeCommit 2>/dev/null || echo '[]')
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    close_merged_pr_beads \
+      "$(printf '%s' "$row" | jq -r '.number')" \
+      "$(printf '%s' "$row" | jq -r '.title // ""')" \
+      "$(printf '%s' "$row" | jq -r '.mergeCommit.oid // "unknown"' | cut -c1-10)"
+  done < <(printf '%s' "$prs_json" | jq -c '.[]?' 2>/dev/null || true)
+}
+
 cleanup_merged_worktrees() {
-  local path branch pr_state st num title sha did_pull=0
+  local path branch pr_state st num did_pull=0
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     [ "$path" = "$REPO_ROOT" ] && continue
@@ -746,7 +769,7 @@ cleanup_merged_worktrees() {
       worker/agent-*) ;;
       *) continue ;;
     esac
-    pr_state=$(gh pr list --head "$branch" --state all --json number,state,title,mergeCommit --jq '.[0] // empty' 2>/dev/null || true)
+    pr_state=$(gh pr list --head "$branch" --state all --json number,state --jq '.[0] // empty' 2>/dev/null || true)
     [ -z "$pr_state" ] && continue
     st=$(printf '%s' "$pr_state" | jq -r '.state')
     num=$(printf '%s' "$pr_state" | jq -r '.number')
@@ -755,9 +778,6 @@ cleanup_merged_worktrees() {
         sync_checkout_to_main
         did_pull=1
       fi
-      title=$(printf '%s' "$pr_state" | jq -r '.title // ""')
-      sha=$(printf '%s' "$pr_state" | jq -r '.mergeCommit.oid // "unknown"' | cut -c1-10)
-      close_merged_pr_beads "$num" "$title" "$sha"
       run_cmd git -C "$REPO_ROOT" worktree remove "$path"
       run_cmd git -C "$REPO_ROOT" branch -D "$branch"
       MERGED_PRS+=("$num")
@@ -938,6 +958,7 @@ main() {
   process_review_queue
   reconcile_missing_queue_entries
   gate_and_merge_prs
+  close_beads_of_merged_prs
   cleanup_merged_worktrees
   check_bd_ready
   check_worktree_anomalies
