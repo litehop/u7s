@@ -106,14 +106,17 @@ cm_yaml() {
     "$NAME" "$1" "$NS" "$1" "$NAME"
 }
 
-# The apiserver picks up new webhook configs asynchronously; retry until the deny lands.
+# The apiserver picks up new webhook configs asynchronously, and kube-proxy may not
+# have programmed the Service yet ("failed to respond"); retry until the deny lands.
 denied=""
 for _ in $(seq 1 15); do
   if out="$(cm_yaml deny | k create -f - 2>&1)"; then
     k -n "$NS" delete configmap "$NAME-deny" --ignore-not-found >/dev/null
     sleep 2
   else
-    denied="$out"; break
+    denied="$out"
+    [[ "$out" == *"denied the request"* ]] && break
+    sleep 2
   fi
 done
 [[ "$denied" == *"denied the request"* ]] || fail "deny webhook did not deny the ConfigMap; last output: ${denied:-<created>}"

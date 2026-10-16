@@ -19,6 +19,7 @@
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --keep            do not delete the VMs afterwards
 #   --memory GiB      override the template's VM memory (forced-failure checks, e.g. 0.625)
+#   --zram-mib N      experiment: give the VM an N MiB zram swap device before install
 #   --burst-cap SECS  criterion (c) cap (default 300)
 #   --tarball-dir DIR reuse the output of build-arm64-tarball.sh instead of rebuilding
 #   --out DIR         results directory (default: ./temp/release-gate/<timestamp>)
@@ -27,7 +28,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-COREDNS_REQ=0
+COREDNS_REQ=0; ZRAM_MIB=0
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
 BURST_CAP_SECS=300
 RUN_WALL_SECS=3300
@@ -37,6 +38,7 @@ while [ $# -gt 0 ]; do
     --runs) RUNS="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --coredns-requests) COREDNS_REQ=1; shift ;;
+    --zram-mib) ZRAM_MIB="$2"; shift 2 ;;
     --memory) MEMORY="$2"; shift 2 ;;
     --burst-cap) BURST_CAP_SECS="$2"; shift 2 ;;
     --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
@@ -70,7 +72,7 @@ STAGE="$OUT/stage"
 mkdir -p "$STAGE/wordpress"
 cp "$TARBALL_DIR"/u7s-gate-*.tar.gz "$TARBALL_DIR"/u7s-gate-*.tar.gz.sha256 "$TARBALL_DIR/install.sh" "$STAGE/"
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
-echo "COREDNS_REQ=$COREDNS_REQ" > "$STAGE/gate.env"
+printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\n' "$COREDNS_REQ" "$ZRAM_MIB" > "$STAGE/gate.env"
 cp "$ROOT/examples/e2e/wordpress/wordpress.yaml" "$STAGE/wordpress/"
 # MariaDB data on emptyDir: the gate VM has no csi-hostpath, and the PVC is not what is under test.
 awk '

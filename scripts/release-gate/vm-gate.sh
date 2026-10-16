@@ -18,7 +18,7 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
-COREDNS_REQ=0
+COREDNS_REQ=0; ZRAM_MIB=0
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 
 mkdir -p "$OUT"
@@ -43,6 +43,26 @@ run_burst() {
   done
 }
 
+# Memory breakdown while a burst's pods are still running, for per-pod overhead:
+# /proc/meminfo kernel-side counters, PSS of the per-pod helper processes, and the
+# memory.current of the top-level cgroups (does kubepods.slice or system.slice dominate).
+snap() {
+  {
+    echo "== $1 pods_running=$(pgrep -c -x pause) conmon=$(pgrep -c -x conmon)"
+    grep -E '^(MemTotal|MemAvailable|Cached|Active\(file\)|Inactive\(file\)|AnonPages|Slab|SReclaimable|SUnreclaim|PageTables|KernelStack|Percpu|Shmem):' /proc/meminfo
+    for comm in conmon pause crio kubelet kube-controller u7s-apiserver; do
+      for p in $(pgrep -x "$comm" || true); do cat "/proc/$p/smaps_rollup" 2>/dev/null; done \
+        | awk -v n="$comm" '/^Pss:/ {pss+=$2} END {printf "pss_kb %s %d\n", n, pss}'
+    done
+    for c in /sys/fs/cgroup/*.slice /sys/fs/cgroup/*/*.slice; do
+      [ -f "$c/memory.current" ] && echo "cgroup $c $(( $(cat "$c/memory.current") / 1024 )) kB"
+    done
+    echo "system.slice memory.low=$(cat /sys/fs/cgroup/system.slice/memory.low) memory.min=$(cat /sys/fs/cgroup/system.slice/memory.min)"
+    echo "cgroup-of-kubelet $(cut -d: -f3 /proc/$(pgrep -x kubelet | head -1)/cgroup) crio $(cut -d: -f3 /proc/$(pgrep -x crio | head -1)/cgroup)"
+    awk '$1 == "kmalloc-256" || /^(cred_jar|task_struct|veth|kmalloc-cg-)/ {printf "slab %s objs=%s\n", $1, $2}' /proc/slabinfo 2>/dev/null
+  } >> "$OUT/snap.txt"
+}
+
 burst_cleanup() {
   k scale deployment/rg-burst --replicas=1 >/dev/null 2>&1
   local i
@@ -51,6 +71,15 @@ burst_cleanup() {
     sleep 2
   done
 }
+
+if [ "$ZRAM_MIB" -gt 0 ]; then
+  modprobe zram num_devices=1
+  [ -e /sys/block/zram0 ] || cat /sys/class/zram-control/hot_add > /dev/null
+  echo zstd > /sys/block/zram0/comp_algorithm
+  echo "${ZRAM_MIB}M" > /sys/block/zram0/disksize
+  mkswap /dev/zram0 > /dev/null && swapon -p 100 /dev/zram0 && sysctl -q vm.page-cluster=0
+  echo "zram swap ${ZRAM_MIB} MiB: $(swapon --show --noheadings | tr -s ' ')" | tee -a "$OUT/run.log"
+fi
 
 phase install
 log "zero-arg install.sh"
@@ -111,12 +140,15 @@ phase warmup
 k create deployment rg-burst --image="$PAUSE_IMAGE" --replicas=1 >> "$OUT/run.log" 2>&1
 kw wait --for=condition=Available deployment/rg-burst --timeout=300s >> "$OUT/run.log" 2>&1 || log "warm-up pod not Available"
 
+snap pre-burst
 phase burst20
 b20="$(run_burst 20)"; res burst20_secs "$b20"; log "20-pod burst: $b20 s"
+snap burst20
 burst_cleanup; phase settle20; sleep "$SETTLE_STEP"
 
 phase burst80
 b80="$(run_burst 80)"; res burst80_secs "$b80"; log "80-pod burst: $b80 s"
+snap burst80
 burst_cleanup; phase settle80; sleep "$SETTLE_STEP"
 
 phase wpcheck

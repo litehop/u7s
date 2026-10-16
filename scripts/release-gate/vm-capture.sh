@@ -3,6 +3,7 @@
 #   <epoch>\t<phase>\tPSI\t<cpu some total us>\t<cpu full total us>\t<mem some total us>\t<mem full total us>
 #   <epoch>\t<phase>\tSTAT\t<user>\t<nice>\t<system>\t<idle>\t<iowait>\t<irq>\t<softirq>\t<steal>   (jiffies)
 #   <epoch>\t<phase>\tPROC\t<component>\t<utime+stime jiffies>       (summed over pids of a comm)
+#   <epoch>\t<phase>\tCG\t<cgroup>\t<cgroup workingset_refault_file>\t<cgroup file bytes>
 #   <epoch>\t<phase>\tNODE\t<Ready status>\t<node Lease renewTime>
 # and <epoch>\t<counter>\t<value> for pgmajfault/workingset_refault/pswp* to $OUT/vmstat.tsv.
 set -u
@@ -26,6 +27,9 @@ while true; do
       name="${entry%%:*}"; comm="${entry#*:}"
       for p in $(pgrep -x "$comm" || true); do cut -d' ' -f14,15 "/proc/$p/stat" 2>/dev/null; done \
         | awk -v ts="$ts" -v ph="$phase" -v n="$name" '{j+=$1+$2; seen=1} END {if (seen) printf "%s\t%s\tPROC\t%s\t%d\n", ts, ph, n, j}'
+    done
+    for cg in system.slice kubepods.slice user.slice system.slice/crio.service system.slice/kubelet.service system.slice/u7s-kcm.service system.slice/u7s-apiserver.service; do
+      awk -v ts="$ts" -v ph="$phase" -v cg="$cg" '/^workingset_refault_file / {r=$2} /^file / {f=$2} END {printf "%s\t%s\tCG\t%s\t%s\t%s\n", ts, ph, cg, r, f}' "/sys/fs/cgroup/$cg/memory.stat" 2>/dev/null
     done
     ready="$(timeout 5 kubectl --kubeconfig "$KCFG" get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
     lease="$(timeout 5 kubectl --kubeconfig "$KCFG" -n kube-node-lease get lease "$NODE" -o jsonpath='{.spec.renewTime}' 2>/dev/null)"
