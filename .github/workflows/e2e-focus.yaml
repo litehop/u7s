@@ -22,6 +22,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       # save-if: only main writes the shared cache; branches restore it read-only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -45,7 +47,7 @@ jobs:
           key: release-bin-${{ runner.os }}-${{ steps.os-version.outputs.v }}-${{ runner.arch }}-${{ steps.rustc-version.outputs.v }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'crates/**/*.rs', 'crates/**/*.proto') }}
       - name: Build release binaries
         if: steps.release-bin-cache.outputs.cache-hit != 'true'
-        run: cargo build --release --timings -p u7s-apiserver -p u7s-scheduler
+        run: cargo build --locked --release --timings -p u7s-apiserver -p u7s-scheduler
       # --timings writes target/cargo-timings/cargo-timing.html; upload it even on
       # build failure (a timeout still yields a partial report) but only when the
       # build actually ran -- a cache hit produces no report.
@@ -93,6 +95,8 @@ jobs:
     name: e2e-focus ${{ matrix.k8s }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Run baseline e2e-focus
         uses: ./.github/actions/e2e-focus-run
         with:

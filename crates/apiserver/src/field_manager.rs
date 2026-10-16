@@ -740,7 +740,7 @@ impl Conflict {
 const FIELD_MANAGER_MAX_LENGTH: usize = 128;
 
 fn go_printable(c: char) -> bool {
-    !c.is_control() && (c == ' ' || !c.is_whitespace())
+    crate::go_unicode::is_print(c)
 }
 
 /// Go's `strconv.Quote`, which upstream's error messages use for string values.
@@ -775,10 +775,9 @@ type FieldError = (String, &'static str, String);
 /// media type is already known to be supported.
 fn validate_patch_options(is_apply: bool, query: &[(String, String)]) -> Vec<FieldError> {
     let first = |k: &str| query.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-    let manager = first("fieldManager").unwrap_or_default();
     let mut errs: Vec<FieldError> = Vec::new();
     if is_apply {
-        if manager.is_empty() {
+        if first("fieldManager").unwrap_or_default().is_empty() {
             errs.push((
                 "fieldManager".into(),
                 "FieldValueRequired",
@@ -792,6 +791,66 @@ fn validate_patch_options(is_apply: bool, query: &[(String, String)]) -> Vec<Fie
             "Forbidden: may not be specified for non-apply patch".into(),
         ));
     }
+    errs.extend(validate_common_options(query));
+    errs
+}
+
+/// Upstream's `ValidateDryRun`.
+fn validate_dry_run(query: &[(String, String)]) -> Option<FieldError> {
+    let dry_run: Vec<&str> = query
+        .iter()
+        .filter(|(n, _)| n == "dryRun")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    dry_run.iter().any(|v| *v != "All").then(|| {
+        (
+            "dryRun".into(),
+            "FieldValueNotSupported",
+            format!(
+                "Unsupported value: {}: supported values: \"All\"",
+                serde_json::to_string(&dry_run).unwrap_or_default()
+            ),
+        )
+    })
+}
+
+/// Upstream's `ValidateDeleteOptions` over the query parameters of a DELETE.
+fn validate_delete_options(query: &[(String, String)]) -> Vec<FieldError> {
+    let first = |k: &str| query.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let mut errs: Vec<FieldError> = Vec::new();
+    let policy = first("propagationPolicy");
+    if let (Some(p), Some(_)) = (policy, first("orphanDependents")) {
+        errs.push((
+            "propagationPolicy".into(),
+            "FieldValueInvalid",
+            format!(
+                "Invalid value: {}: orphanDependents and deletionPropagation cannot be both set",
+                go_quote(p)
+            ),
+        ));
+    }
+    if let Some(p) = policy {
+        if !["Foreground", "Background", "Orphan"].contains(&p) {
+            errs.push((
+                "propagationPolicy".into(),
+                "FieldValueNotSupported",
+                format!(
+                    "Unsupported value: {}: supported values: \"Foreground\", \"Background\", \"Orphan\", \"nil\"",
+                    go_quote(p)
+                ),
+            ));
+        }
+    }
+    errs.extend(validate_dry_run(query));
+    errs
+}
+
+/// The fieldManager, dryRun and fieldValidation checks shared by upstream's
+/// `ValidateCreateOptions`, `ValidateUpdateOptions` and `ValidatePatchOptions`.
+fn validate_common_options(query: &[(String, String)]) -> Vec<FieldError> {
+    let first = |k: &str| query.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let manager = first("fieldManager").unwrap_or_default();
+    let mut errs: Vec<FieldError> = Vec::new();
     if manager.len() > FIELD_MANAGER_MAX_LENGTH {
         errs.push((
             "fieldManager".into(),
@@ -812,21 +871,7 @@ fn validate_patch_options(is_apply: bool, query: &[(String, String)]) -> Vec<Fie
             ));
         }
     }
-    let dry_run: Vec<&str> = query
-        .iter()
-        .filter(|(n, _)| n == "dryRun")
-        .map(|(_, v)| v.as_str())
-        .collect();
-    if dry_run.iter().any(|v| *v != "All") {
-        errs.push((
-            "dryRun".into(),
-            "FieldValueNotSupported",
-            format!(
-                "Unsupported value: {}: supported values: \"All\"",
-                serde_json::to_string(&dry_run).unwrap_or_default()
-            ),
-        ));
-    }
+    errs.extend(validate_dry_run(query));
     if let Some(fv) = first("fieldValidation") {
         if !["", "Ignore", "Warn", "Strict"].contains(&fv) {
             errs.push((
@@ -857,17 +902,25 @@ pub(crate) async fn resolve_field_manager(
     let query = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(req.uri())
         .map(|q| q.0)
         .unwrap_or_default();
-    if req.method() == axum::http::Method::PATCH
-        && crate::handlers::json_patch::detect_patch_type(req.headers()).is_ok()
-    {
-        let is_apply = req
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.contains("apply-patch+yaml"));
-        let errs = validate_patch_options(is_apply, &query);
+    let validated = match *req.method() {
+        axum::http::Method::PATCH
+            if crate::handlers::json_patch::detect_patch_type(req.headers()).is_ok() =>
+        {
+            let is_apply = req
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.contains("apply-patch+yaml"));
+            Some(("PatchOptions", validate_patch_options(is_apply, &query)))
+        }
+        axum::http::Method::POST => Some(("CreateOptions", validate_common_options(&query))),
+        axum::http::Method::PUT => Some(("UpdateOptions", validate_common_options(&query))),
+        axum::http::Method::DELETE => Some(("DeleteOptions", validate_delete_options(&query))),
+        _ => None,
+    };
+    if let Some((kind, errs)) = validated {
         if !errs.is_empty() {
-            return crate::status::Status::invalid_patch_options(&errs).into_response();
+            return crate::status::Status::invalid_options(kind, &errs).into_response();
         }
     }
     let manager = query
@@ -1469,6 +1522,214 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), 200);
+        }
+
+        async fn send(method: &str, uri: &str) -> (axum::http::StatusCode, Value) {
+            let app = axum::Router::new()
+                .route(
+                    "/x",
+                    axum::routing::post(|| async { "ok" })
+                        .put(|| async { "ok" })
+                        .delete(|| async { "ok" }),
+                )
+                .layer(axum::middleware::from_fn(resolve_field_manager));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+
+        const CREATE_UPDATE: [(&str, &str); 2] =
+            [("POST", "CreateOptions"), ("PUT", "UpdateOptions")];
+
+        /// A bad fieldManager/dryRun/fieldValidation on a create or update must be refused
+        /// with the kind-specific upstream Status, not silently written with a corrupt
+        /// manager or as a real write instead of a dry run.
+        #[tokio::test]
+        async fn create_and_update_options_are_validated_like_upstream() {
+            let long = format!("/x?fieldManager={}", "a".repeat(129));
+            let cases = [
+                (
+                    long.as_str(),
+                    "fieldManager: Too long: may not be more than 128 bytes".to_string(),
+                    "FieldValueTooLong",
+                ),
+                (
+                    "/x?fieldManager=a%07b",
+                    "fieldManager: Invalid value: \"a\\ab\": invalid character U+0007 (at position 1)"
+                        .to_string(),
+                    "FieldValueInvalid",
+                ),
+                (
+                    "/x?dryRun=None",
+                    "dryRun: Unsupported value: [\"None\"]: supported values: \"All\"".to_string(),
+                    "FieldValueNotSupported",
+                ),
+                (
+                    "/x?fieldValidation=strict",
+                    "fieldValidation: Unsupported value: \"strict\": supported values: \"\", \
+                     \"Ignore\", \"Strict\", \"Warn\""
+                        .to_string(),
+                    "FieldValueNotSupported",
+                ),
+            ];
+            for (method, kind) in CREATE_UPDATE {
+                for (uri, tail, reason) in &cases {
+                    let (status, body) = send(method, uri).await;
+                    assert_eq!(status, 422, "{method} {uri}: {body}");
+                    assert_eq!(
+                        body["message"],
+                        format!("{kind}.meta.k8s.io \"\" is invalid: {tail}"),
+                        "{method} {uri}"
+                    );
+                    assert_eq!(body["details"]["kind"], kind);
+                    assert_eq!(body["details"]["causes"][0]["reason"], *reason);
+                }
+            }
+        }
+
+        /// Create/update have no apply semantics: an empty manager is defaulted from the
+        /// user agent, `force` is ignored, and valid options reach the handler untouched.
+        #[tokio::test]
+        async fn valid_create_and_update_options_are_unaffected() {
+            for (method, _) in CREATE_UPDATE {
+                for uri in [
+                    "/x",
+                    "/x?fieldManager=",
+                    "/x?force=true",
+                    "/x?dryRun=All&fieldValidation=Strict&fieldManager=kubectl-edit",
+                    "/x?fieldManager=%E2%82%AC%20caf%C3%A9",
+                ] {
+                    assert_eq!(send(method, uri).await.0, 200, "{method} {uri}");
+                }
+            }
+            let at_limit = format!("/x?fieldManager={}", "a".repeat(128));
+            assert_eq!(send("POST", &at_limit).await.0, 200);
+        }
+
+        /// Go's `unicode.IsPrint` rejects format characters; a zero-width space or soft
+        /// hyphen would make two visually identical managers distinct owners.
+        #[tokio::test]
+        async fn format_characters_in_field_manager_are_rejected_like_go() {
+            for (method, kind) in CREATE_UPDATE {
+                for (q, cp) in [("a%E2%80%8Bb", "U+200B"), ("a%C2%ADb", "U+00AD")] {
+                    let (status, body) = send(method, &format!("/x?fieldManager={q}")).await;
+                    assert_eq!(status, 422, "{method} {cp}");
+                    assert!(
+                        body["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains(&format!("invalid character {cp} (at position 1)")),
+                        "{kind}: {body}"
+                    );
+                }
+            }
+            let (status, _, _) = patch(MERGE, "/x?fieldManager=a%E2%80%8Bb", false).await;
+            assert_eq!(status, 422, "PATCH shares the check");
+        }
+
+        #[test]
+        fn go_printable_matches_go_unicode_is_print() {
+            for c in [
+                'a',
+                'Z',
+                '0',
+                ' ',
+                '~',
+                '€',
+                'é',
+                '中',
+                '\u{1F600}',
+                '\u{301}',
+            ] {
+                assert!(go_printable(c), "{c:?} is printable in Go");
+            }
+            for c in [
+                '\u{0}',
+                '\u{7}',
+                '\u{7f}',
+                '\u{85}',
+                '\u{A0}',
+                '\u{AD}',
+                '\u{200B}',
+                '\u{2028}',
+                '\u{3000}',
+                '\u{E000}',
+                '\u{378}',
+                '\u{FFFF}',
+                '\u{10FFFF}',
+            ] {
+                assert!(!go_printable(c), "{c:?} is not printable in Go");
+            }
+        }
+
+        /// `kubectl delete --dry-run` typos and bogus propagation policies must fail loudly
+        /// on DELETE as they do on every other write, not silently become a real delete.
+        #[tokio::test]
+        async fn delete_options_are_validated_like_upstream() {
+            let (status, body) = send("DELETE", "/x?dryRun=None").await;
+            assert_eq!(status, 422, "{body}");
+            assert_eq!(
+                body["message"],
+                "DeleteOptions.meta.k8s.io \"\" is invalid: dryRun: Unsupported value: \
+                 [\"None\"]: supported values: \"All\""
+            );
+            assert_eq!(body["details"]["kind"], "DeleteOptions");
+
+            let (status, body) = send("DELETE", "/x?propagationPolicy=Bogus").await;
+            assert_eq!(status, 422, "{body}");
+            assert_eq!(
+                body["message"],
+                "DeleteOptions.meta.k8s.io \"\" is invalid: propagationPolicy: Unsupported \
+                 value: \"Bogus\": supported values: \"Foreground\", \"Background\", \
+                 \"Orphan\", \"nil\""
+            );
+
+            let (status, body) = send(
+                "DELETE",
+                "/x?propagationPolicy=Orphan&orphanDependents=true",
+            )
+            .await;
+            assert_eq!(status, 422, "{body}");
+            assert_eq!(
+                body["message"],
+                "DeleteOptions.meta.k8s.io \"\" is invalid: propagationPolicy: Invalid value: \
+                 \"Orphan\": orphanDependents and deletionPropagation cannot be both set"
+            );
+            assert_eq!(body["details"]["causes"][0]["reason"], "FieldValueInvalid");
+
+            for ok in [
+                "/x",
+                "/x?dryRun=All",
+                "/x?propagationPolicy=Foreground",
+                "/x?propagationPolicy=Background&gracePeriodSeconds=0",
+                "/x?orphanDependents=false",
+            ] {
+                assert_eq!(send("DELETE", ok).await.0, 200, "{ok}");
+            }
+        }
+
+        /// Upstream's `req.URL.Query()` drops malformed pairs and the option types have no
+        /// field whose conversion can fail, so odd query strings are not an error there;
+        /// they must not become one here.
+        #[tokio::test]
+        async fn malformed_query_pairs_are_tolerated_like_upstream() {
+            for method in ["POST", "PUT"] {
+                for uri in ["/x?%FF&&=&a", "/x?fieldManager=%FF", "/x?=x&;"] {
+                    assert_eq!(send(method, uri).await.0, 200, "{method} {uri}");
+                }
+            }
         }
 
         /// Only apply requires it: merge patches fall back to the user agent, as upstream.
