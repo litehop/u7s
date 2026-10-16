@@ -114,10 +114,18 @@ checkout. A scratch worktree is required only when checking PR code out
 onto disk: `git worktree add temp/review-scratch/<pr-num>-<ts> <ref>`, then
 run every git command against it via `git -C <scratch-path>` — including
 read/inspect commands, not just mutating ones. Either way, the mayor
-checkout is never mutated. `scripts/guard-destructive-git.sh` blocks
-destructive git (reset --hard, checkout -- <path>, restore, stash, clean
--f, switch -f) against the mayor checkout at the tool layer, but do not
-rely on it as your only safeguard.
+checkout is never mutated.
+
+Never run any git command that changes HEAD, the index or the working
+tree of the checkout you run in: checkout, switch, reset (any mode),
+stash, merge, pull, rebase, cherry-pick, revert, am, restore, clean. To
+read PR code use `gh pr diff <n>`; `git fetch origin <branch>` then
+`git show <ref>:<path>` / `git diff <a>..<b>`; or a scratch worktree.
+`scripts/guard-destructive-git.sh` refuses destructive git (reset --hard,
+checkout -- <path>, restore, stash, clean -f, switch -f) and HEAD-moving
+git (checkout/switch to another ref, reset, rebase, merge, cherry-pick,
+revert, am) in the mayor checkout at the tool layer, but do not rely on
+it as your only safeguard.
 
 A hypothesis-driven check (e.g. constructing an input the worker didn't
 test, or reproducing a suspected vacuous pass) sometimes needs to run code
