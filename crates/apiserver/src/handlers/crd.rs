@@ -1766,7 +1766,7 @@ pub async fn patch_crd_status<S: Store>(
                         PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
                         PatchType::StrategicMerge => {
                             crate::patch::strategic_merge_patch(entry, status_patch)
-                                .map_err(|e| Status::bad_request(e.to_string()))?;
+                                .map_err(Status::patch_error)?;
                         }
                         PatchType::Json => unreachable!(),
                     }
