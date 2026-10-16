@@ -550,6 +550,48 @@ pub(crate) fn guard_csr_status_write<S: Store>(
     Ok(())
 }
 
+const KUBELET_CLIENT_SIGNER: &str = "kubernetes.io/kube-apiserver-client-kubelet";
+
+/// Join tokens are single-use: the Secret to delete when `new` is the write that first
+/// issues an approved kubelet client certificate to a bootstrap-token identity. `None` for
+/// everything else — an approve-only write (the joiner still needs the token to fetch the
+/// certificate), non-bootstrap requestors, other signers, or an already-issued certificate.
+pub(crate) fn join_token_secret_to_consume(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> Option<String> {
+    if !csr_certificate(old).is_empty() || csr_certificate(new).is_empty() {
+        return None;
+    }
+    if new["spec"]["signerName"].as_str() != Some(KUBELET_CLIENT_SIGNER) {
+        return None;
+    }
+    let conditions = csr_conditions(new);
+    if condition_indices(&conditions, "Approved").is_empty()
+        || !condition_indices(&conditions, "Denied").is_empty()
+    {
+        return None;
+    }
+    let id = new["spec"]["username"]
+        .as_str()?
+        .strip_prefix(crate::bootstrap_token::USER_PREFIX)?;
+    crate::bootstrap_token::is_valid_token_id(id)
+        .then(|| format!("{}{id}", crate::bootstrap_token::SECRET_NAME_PREFIX))
+}
+
+/// Deletes the join token Secret once its CSR has been issued (see
+/// [`join_token_secret_to_consume`]). Already gone (expired, cleaned, re-delivered write) is
+/// fine; a store failure is logged and left to the token's TTL.
+pub(crate) async fn consume_join_token<S: Store>(
+    store: &S,
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) {
+    if let Some(name) = join_token_secret_to_consume(old, new) {
+        crate::bootstrap_token::delete_token_secret(store, &name).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2414,5 +2456,191 @@ mod tests {
             s["spec"]["request"] != swapped["spec"]["request"],
             "the approved request must not be swappable for an O=system:masters one"
         );
+    }
+
+    fn join_csr(username: &str, signer: &str, is_approved: bool, cert: &str) -> serde_json::Value {
+        let mut status = serde_json::json!({});
+        if is_approved {
+            status["conditions"] = serde_json::json!([approved()]);
+        }
+        if !cert.is_empty() {
+            status["certificate"] = cert.into();
+        }
+        serde_json::json!({
+            "metadata": {"name": "c1"},
+            "spec": {"username": username, "signerName": signer},
+            "status": status
+        })
+    }
+
+    const BOOTSTRAP_USER: &str = "system:bootstrap:abcdef";
+
+    #[test]
+    fn issued_kubelet_client_cert_for_bootstrap_user_consumes_that_token_so_a_leaked_token_cannot_join_again(
+    ) {
+        let old = join_csr(BOOTSTRAP_USER, KUBELET_CLIENT_SIGNER, true, "");
+        let new = join_csr(BOOTSTRAP_USER, KUBELET_CLIENT_SIGNER, true, "Q0VSVA==");
+        assert_eq!(
+            join_token_secret_to_consume(&old, &new).as_deref(),
+            Some("bootstrap-token-abcdef")
+        );
+    }
+
+    #[test]
+    fn approve_only_keeps_the_token_because_the_joiner_still_needs_it_to_fetch_the_certificate() {
+        let old = join_csr(BOOTSTRAP_USER, KUBELET_CLIENT_SIGNER, false, "");
+        let new = join_csr(BOOTSTRAP_USER, KUBELET_CLIENT_SIGNER, true, "");
+        assert_eq!(join_token_secret_to_consume(&old, &new), None);
+    }
+
+    #[test]
+    fn non_bootstrap_requestors_and_other_signers_never_delete_a_token_secret() {
+        for (user, signer) in [
+            ("system:node:n1", KUBELET_CLIENT_SIGNER),
+            ("alice", KUBELET_CLIENT_SIGNER),
+            ("system:bootstrap:", KUBELET_CLIENT_SIGNER),
+            ("system:bootstrap:../x", KUBELET_CLIENT_SIGNER),
+            (BOOTSTRAP_USER, CLIENT_SIGNER),
+            (BOOTSTRAP_USER, "kubernetes.io/kubelet-serving"),
+        ] {
+            let old = join_csr(user, signer, true, "");
+            let new = join_csr(user, signer, true, "Q0VSVA==");
+            assert_eq!(
+                join_token_secret_to_consume(&old, &new),
+                None,
+                "{user} / {signer}"
+            );
+        }
+    }
+
+    #[test]
+    fn already_issued_certificate_does_not_consume_again_on_later_status_writes() {
+        let old = join_csr(BOOTSTRAP_USER, KUBELET_CLIENT_SIGNER, true, "Q0VSVA==");
+        let new = join_csr(BOOTSTRAP_USER, KUBELET_CLIENT_SIGNER, true, "Q0VSVA==");
+        assert_eq!(join_token_secret_to_consume(&old, &new), None);
+    }
+
+    #[test]
+    fn unapproved_or_denied_csr_with_a_certificate_does_not_consume_the_token() {
+        let old = join_csr(BOOTSTRAP_USER, KUBELET_CLIENT_SIGNER, false, "");
+        let new = join_csr(BOOTSTRAP_USER, KUBELET_CLIENT_SIGNER, false, "Q0VSVA==");
+        assert_eq!(join_token_secret_to_consume(&old, &new), None);
+        let mut denied = join_csr(BOOTSTRAP_USER, KUBELET_CLIENT_SIGNER, true, "Q0VSVA==");
+        denied["status"]["conditions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "Denied", "status": "True"}));
+        assert_eq!(join_token_secret_to_consume(&old, &denied), None);
+    }
+
+    async fn seed_join_token_and_csr(state: &AppState, csr_user: &str) {
+        crate::handlers::test_support::grant_signer_verb(
+            state,
+            "signer",
+            "sign",
+            KUBELET_CLIENT_SIGNER,
+        );
+        let secret = serde_json::json!({
+            "kind": "Secret",
+            "metadata": {"name": "bootstrap-token-abcdef", "namespace": "kube-system"},
+            "type": "bootstrap.kubernetes.io/token",
+            "data": {}
+        });
+        let secret_key =
+            crate::keys::object_key("secrets", "kube-system", "bootstrap-token-abcdef");
+        state
+            .store
+            .put(
+                &secret_key,
+                bytes::Bytes::from(serde_json::to_vec(&secret).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut csr = join_csr(csr_user, KUBELET_CLIENT_SIGNER, true, "");
+        csr["apiVersion"] = "certificates.k8s.io/v1".into();
+        csr["kind"] = "CertificateSigningRequest".into();
+        csr["spec"]["request"] = csr_b64_with_org(None).into();
+        state
+            .store
+            .put(
+                &group_object_key(GROUP, PLURAL, None, "c1"),
+                bytes::Bytes::from(serde_json::to_vec(&csr).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn token_secret_exists(state: &AppState) -> bool {
+        let key = crate::keys::object_key("secrets", "kube-system", "bootstrap-token-abcdef");
+        state.store.get(&key).await.unwrap().is_some()
+    }
+
+    #[tokio::test]
+    async fn status_write_issuing_the_join_certificate_deletes_the_token_secret() {
+        let state = make_state();
+        seed_join_token_and_csr(&state, BOOTSTRAP_USER).await;
+        status_put(
+            &state,
+            &user("signer"),
+            "c1",
+            serde_json::json!({"conditions": [approved()], "certificate": "Q0VSVA=="}),
+        )
+        .await
+        .expect("signer writes the certificate");
+        assert!(
+            !token_secret_exists(&state).await,
+            "a join token must die with its first issued certificate, or a leaked token joins nodes forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_patch_issuing_the_join_certificate_deletes_the_token_secret() {
+        let state = make_state();
+        seed_join_token_and_csr(&state, BOOTSTRAP_USER).await;
+        status_patch(
+            &state,
+            &user("signer"),
+            "c1",
+            serde_json::json!({"certificate": "Q0VSVA=="}),
+        )
+        .await
+        .expect("signer patches the certificate");
+        assert!(!token_secret_exists(&state).await);
+    }
+
+    #[tokio::test]
+    async fn issuing_a_certificate_to_a_non_bootstrap_requestor_leaves_token_secrets_alone() {
+        let state = make_state();
+        seed_join_token_and_csr(&state, "system:node:n1").await;
+        status_put(
+            &state,
+            &user("signer"),
+            "c1",
+            serde_json::json!({"conditions": [approved()], "certificate": "Q0VSVA=="}),
+        )
+        .await
+        .expect("signer writes the certificate");
+        assert!(
+            token_secret_exists(&state).await,
+            "a node's own cert rotation must not revoke an unrelated join token"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuing_when_the_token_is_already_gone_still_succeeds() {
+        let state = make_state();
+        seed_join_token_and_csr(&state, BOOTSTRAP_USER).await;
+        let key = crate::keys::object_key("secrets", "kube-system", "bootstrap-token-abcdef");
+        state.store.delete(&key, None).await.unwrap();
+        status_put(
+            &state,
+            &user("signer"),
+            "c1",
+            serde_json::json!({"conditions": [approved()], "certificate": "Q0VSVA=="}),
+        )
+        .await
+        .expect("an expired or already-cleaned token must not fail certificate issuance");
     }
 }

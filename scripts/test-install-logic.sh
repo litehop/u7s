@@ -1118,8 +1118,8 @@ assert_false "install.sh unquoted heredoc bodies must not contain backticks: bas
 
 # Release payload scratch dirs must be disk-backed: on Ubuntu 26.04 /tmp is
 # tmpfs, so extracting the tarball there OOMs the 1 GiB hosts u7s targets.
-# Only the small mint_dir (kubelet serving key) may stay on plain mktemp, so it
-# never reaches disk.
+# Only discover_cluster_ca's small, public cluster-info scratch dir may stay on
+# plain mktemp.
 assert_true "install.sh payload dirs (download + stage) use mktemp_disk_dir, not tmpfs-backed mktemp -d, or install OOMs on 1 GiB hosts" \
   bash -c 'test "$(grep -c "mktemp -d" "$1")" -eq 2 && grep -q "DOWNLOAD_DIR=\"\$(mktemp_disk_dir)\"" "$1" && grep -q "STAGE_DIR=\"\$(mktemp_disk_dir)\"" "$1"' _ "$INSTALL"
 MKDISK_RUNNER="$(mktemp)"
@@ -1133,6 +1133,133 @@ if command -v findmnt >/dev/null 2>&1 && [ -d /var/tmp ]; then
     bash -c 'bash "$1" | grep -qE "^(tmpfs|ramfs)$"' _ "$MKDISK_RUNNER"
 fi
 rm -f "$MKDISK_RUNNER"
+
+# ---------------------------------------------------------------------------
+# Join tokens: Secret-backed, 24h, minted without an apiserver restart; the
+# joiner discovers the CA through cluster-info (JWS + SPKI hash pin) and never
+# receives or sends a private key. Functions are extracted from install.sh's
+# own source and run against stubbed kubectl/curl, with GNU-only base64 -w0 and
+# date -d shimmed so the logic runs on a macOS host too.
+# ---------------------------------------------------------------------------
+JOIN_WORK="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK" "$WORKER_MODE_WORK" "$JOIN_WORK"' EXIT
+
+write_join_runner() {
+  local runner="$1" body="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'STATE_DIR="$1"; JOIN_SERVER="https://cp.example:6443"; CA_CERT_HASH="${CA_CERT_HASH:-}"; JOIN_TOKEN="${JOIN_TOKEN:-}"'
+    echo 'base64() { local a=() x; for x in "$@"; do [ "$x" = -w0 ] || a+=("$x"); done; command base64 ${a[@]+"${a[@]}"}; }'
+    echo 'date() { if [ "$1" = -u ] && [ "$2" = -d ]; then command date -u -r "${3#@}" "${@:4}"; else command date "$@"; fi; }'
+    echo 'sleep() { :; }'
+    echo 'ensure_jq() { :; }'
+    grep '^JOIN_TOKEN_TTL_SECONDS=' "$INSTALL"
+    for fn in b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
+      awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
+    done
+    echo "$body"
+  } > "$runner"
+}
+
+JOIN_CA_DIR="$JOIN_WORK/cp-state"
+mkdir -p "$JOIN_CA_DIR"
+openssl ecparam -name prime256v1 -genkey -noout -out "$JOIN_WORK/ca.key"
+openssl req -x509 -new -key "$JOIN_WORK/ca.key" -subj "/CN=u7s-test-ca" -days 2 -out "$JOIN_CA_DIR/ca.pem" 2>/dev/null
+touch "$JOIN_CA_DIR/kubeconfig"
+EXPECTED_CA_HASH="sha256:$(openssl x509 -in "$JOIN_CA_DIR/ca.pem" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 | sed 's/^.* //')"
+
+MINT_RUNNER="$JOIN_WORK/mint.sh"
+write_join_runner "$MINT_RUNNER" '
+kubectl() {
+  printf "%s\n" "$*" >> "$STATE_DIR/kubectl-argv"
+  case "$*" in
+    *"config view"*) printf "https://cp.example:6443" ;;
+    *"create -f -"*) cat > "$STATE_DIR/created-secret.json" ;;
+  esac
+}
+systemctl() { echo "$*" >> "$STATE_DIR/systemctl-calls"; }
+mint_join_token'
+mint_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR" 2>&1)"
+SECRET_JSON="$JOIN_CA_DIR/created-secret.json"
+mint_field() { jq -r ".stringData[\"$1\"]" "$SECRET_JSON"; }
+
+assert "mint creates a bootstrap.kubernetes.io/token Secret named bootstrap-token-<id> in kube-system -- the type and name are what the apiserver authenticator, tokencleaner and bootstrapsigner key on, so a wrong shape means a minted token no node can use" \
+  "$([ "$(jq -r .type "$SECRET_JSON")" = bootstrap.kubernetes.io/token ] && [ "$(jq -r .metadata.namespace "$SECRET_JSON")" = kube-system ] && [ "$(jq -r .metadata.name "$SECRET_JSON")" = "bootstrap-token-$(mint_field token-id)" ] && echo 1 || echo 0)"
+assert "mint enables authentication AND signing usage -- without signing the joiner cannot verify cluster-info, without authentication the token is rejected" \
+  "$([ "$(mint_field usage-bootstrap-authentication)" = true ] && [ "$(mint_field usage-bootstrap-signing)" = true ] && echo 1 || echo 0)"
+exp_epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$(mint_field expiration)" +%s 2>/dev/null || date -u -d "$(mint_field expiration)" +%s)"
+now_epoch="$(date +%s)"
+assert "mint sets expiration to now+24h (a leaked, never-used join token must stop working by itself within a day)" \
+  "$([ "$exp_epoch" -ge $(( now_epoch + 86400 - 120 )) ] && [ "$exp_epoch" -le $(( now_epoch + 86400 + 120 )) ] && echo 1 || echo 0)"
+assert "mint never restarts the apiserver (a restart drops every in-flight request cluster-wide for each node added)" \
+  "$([ ! -e "$JOIN_CA_DIR/systemctl-calls" ] && echo 1 || echo 0)"
+assert "mint writes no static token-auth-file (a file entry never expires and is never consumed, so a leaked token would join nodes forever)" \
+  "$([ ! -e "$JOIN_CA_DIR/token-auth-file" ] && echo 1 || echo 0)"
+assert "mint passes the Secret to kubectl on stdin, never argv (token secret visible to every local user via ps otherwise)" \
+  "$(grep -qF "$(mint_field token-secret)" "$JOIN_CA_DIR/kubectl-argv" && echo 0 || echo 1)"
+assert "mint prints the complete join command: the token on stdin (--token -) and the CA pin matching the cluster CA's SPKI hash, so the operator never has to compute either" \
+  "$(printf '%s' "$mint_out" | grep -qF -- "--token -" && printf '%s' "$mint_out" | grep -qF -- "--ca-cert-hash $EXPECTED_CA_HASH" && printf '%s' "$mint_out" | grep -qF "$(mint_field token-id).$(mint_field token-secret)" && echo 1 || echo 0)"
+assert_false "install.sh no longer passes --token-auth-file to the apiserver unit (static tokens survive restarts forever and cannot be revoked without editing a file)" \
+  grep -q -- '--token-auth-file \$STATE_DIR' "$INSTALL"
+assert_false "no join artifact exists any more: nothing in install.sh packs a serving private key into a base64(JSON) blob passed on a command line" \
+  grep -qE 'servingKey|artifact' "$INSTALL"
+assert_true "the joiner generates its own kubelet serving key locally and asks the CA for a cert via a kubelet-serving CSR (the private key never leaves the node)" \
+  bash -c 'awk "/^request_serving_cert\(\) \{/,/^\}/" "$1" | grep -q "ecparam -name prime256v1 -genkey -noout -out \"\$STATE_DIR/kubelet-serving.key\"" && awk "/^request_serving_cert\(\) \{/,/^\}/" "$1" | grep -q "kubernetes.io/kubelet-serving"' _ "$INSTALL"
+
+# Token input: flag, "-" and absent all work; stdin keeps the secret off argv.
+TOKEN_RUNNER="$JOIN_WORK/token.sh"
+write_join_runner "$TOKEN_RUNNER" 'read_join_token'
+GOOD_TOKEN="abcdef.0123456789abcdef"
+assert "join reads the token from stdin when --token is '-' (keeps it out of ps, /proc/<pid>/cmdline and shell history)" \
+  "$([ "$(printf '%s\n' "$GOOD_TOKEN" | JOIN_TOKEN=- bash "$TOKEN_RUNNER" "$JOIN_WORK" 2>&1)" = "$GOOD_TOKEN" ] && echo 1 || echo 0)"
+assert "join reads the token from stdin when --token is absent" \
+  "$([ "$(printf '%s\n' "$GOOD_TOKEN" | bash "$TOKEN_RUNNER" "$JOIN_WORK" 2>&1)" = "$GOOD_TOKEN" ] && echo 1 || echo 0)"
+assert "join accepts the token directly from the --token flag value" \
+  "$([ "$(JOIN_TOKEN=$GOOD_TOKEN bash "$TOKEN_RUNNER" "$JOIN_WORK" </dev/null 2>&1)" = "$GOOD_TOKEN" ] && echo 1 || echo 0)"
+bad_status=0
+printf 'not-a-token\n' | bash "$TOKEN_RUNNER" "$JOIN_WORK" >/dev/null 2>&1 || bad_status=$?
+assert "a malformed token is rejected before any network call" \
+  "$([ "$bad_status" -ne 0 ] && echo 1 || echo 0)"
+
+# Discovery: the cluster-info JWS must verify under the token and the CA must
+# match the pinned hash -- either failing means trusting an impostor endpoint.
+b64u() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+DISCOVER_KUBECONFIG="$(printf 'apiVersion: v1\nclusters:\n- cluster:\n    certificate-authority-data: %s\n    server: https://cp.example:6443\n  name: ""\n' "$(openssl base64 -A -in "$JOIN_CA_DIR/ca.pem")")"
+sign_cluster_info() {
+  local secret="$1" hdr payload
+  hdr="$(printf '{"alg":"HS256","kid":"abcdef"}' | b64u)"
+  payload="$(printf '%s\n' "$DISCOVER_KUBECONFIG" | b64u)"
+  printf '%s..%s' "$hdr" "$(printf '%s.%s' "$hdr" "$payload" | openssl dgst -sha256 -hmac "$secret" -binary | b64u)"
+}
+write_cluster_info() {
+  jq -n --arg kc "$DISCOVER_KUBECONFIG
+" --arg jws "$1" '{data: {kubeconfig: $kc, "jws-kubeconfig-abcdef": $jws}}' > "$JOIN_WORK/cluster-info.json"
+}
+DISCOVER_RUNNER="$JOIN_WORK/discover.sh"
+write_join_runner "$DISCOVER_RUNNER" '
+curl() { cat "$CLUSTER_INFO"; }
+discover_cluster_ca abcdef "$TOKEN_SECRET"'
+export CLUSTER_INFO="$JOIN_WORK/cluster-info.json"
+
+write_cluster_info "$(sign_cluster_info 0123456789abcdef)"
+worker_state="$JOIN_WORK/worker-ok"; mkdir -p "$worker_state"
+ok_status=0
+TOKEN_SECRET=0123456789abcdef CA_CERT_HASH="$EXPECTED_CA_HASH" bash "$DISCOVER_RUNNER" "$worker_state" >/dev/null 2>&1 || ok_status=$?
+assert "discovery with a validly signed cluster-info and the right CA hash trusts and stores the CA" \
+  "$([ "$ok_status" -eq 0 ] && cmp -s "$worker_state/ca.pem" "$JOIN_CA_DIR/ca.pem" && echo 1 || echo 0)"
+
+wrong_sig_state="$JOIN_WORK/worker-wrong-sig"; mkdir -p "$wrong_sig_state"
+wrong_sig_status=0
+TOKEN_SECRET=ffffffffffffffff CA_CERT_HASH="$EXPECTED_CA_HASH" bash "$DISCOVER_RUNNER" "$wrong_sig_state" >/dev/null 2>&1 || wrong_sig_status=$?
+assert "discovery refuses cluster-info whose JWS does not verify under the token -- an impostor endpoint cannot hand the joiner its own CA (and with it, the token)" \
+  "$([ "$wrong_sig_status" -ne 0 ] && [ ! -e "$wrong_sig_state/ca.pem" ] && echo 1 || echo 0)"
+
+wrong_hash_state="$JOIN_WORK/worker-wrong-hash"; mkdir -p "$wrong_hash_state"
+wrong_hash_status=0
+TOKEN_SECRET=0123456789abcdef CA_CERT_HASH="sha256:$(printf '0%.0s' $(seq 1 64))" bash "$DISCOVER_RUNNER" "$wrong_hash_state" >/dev/null 2>&1 || wrong_hash_status=$?
+assert "discovery refuses a CA that does not match --ca-cert-hash even when the signature verifies (a stolen token must not be enough to substitute the CA)" \
+  "$([ "$wrong_hash_status" -ne 0 ] && [ ! -e "$wrong_hash_state/ca.pem" ] && echo 1 || echo 0)"
 
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"

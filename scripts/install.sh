@@ -27,12 +27,15 @@ fi
 # csrapproving/csrsigning controllers auto-approve and sign join CSRs against
 # u7s's CA once the nodeclient/selfnodeclient RBAC grants exist. Two
 # additional modes:
-#   --mint-join-token   On an existing control-plane node: mint a bootstrap
-#                       token plus a pre-signed kubelet serving cert, printed
-#                       as one base64(JSON) join artifact.
-#   --join <url>        On a fresh node with --token <artifact>: submit a
-#                       client CSR, wait for it to be signed, and join as a
-#                       kubelet with its own x509 identity. One-shot: refuses
+#   --mint-join-token   On an existing control-plane node: create a 24h,
+#                       single-use bootstrap-token Secret via the live
+#                       apiserver (no restart) and print the join command.
+#   --join <url>        On a fresh node: verify the cluster CA via
+#                       kube-public/cluster-info and --ca-cert-hash, submit a
+#                       client CSR under the token (from --token, or stdin
+#                       when --token is "-" or absent), wait for it to be
+#                       signed, and join as a kubelet with its own x509
+#                       identity. One-shot: refuses
 #                       to run against a node already classified as an
 #                       existing joined worker (bootstrap tokens are
 #                       single-use, and re-running would silently rotate the
@@ -42,8 +45,8 @@ fi
 #
 # Usage:
 #   sudo scripts/install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>]
-#   sudo scripts/install.sh --mint-join-token --node-name <name> --node-ip <ip>
-#   sudo scripts/install.sh --join <url> --token <artifact> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
+#   sudo scripts/install.sh --mint-join-token
+#   echo <token> | sudo scripts/install.sh --join <url> --token - --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 #
 # Knobs on the zero-argument path are env-settable
 # (docs/decisions/install-script-ux.md):
@@ -68,15 +71,14 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>]
-  install.sh --mint-join-token --node-name <name> --node-ip <ip>
-  install.sh --join <url> --token <artifact> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
+  install.sh --mint-join-token
+  install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 
-  --tarball <path>      Path to an already-downloaded u7s release tarball.
+  --tarball <path>     Path to an already-downloaded u7s release tarball.
                          Overrides the release URL baked into this copy.
   --tarball-url <url>   Fetch the release tarball from <url> instead of the
                          one baked into this copy at release time.
-  --node-name <name>    Node identity (default: hostname). For --mint-join-token
-                         this is the NAME OF THE JOINING NODE, not this host.
+  --node-name <name>    Node identity (default: hostname).
   --iface <iface>       Network interface used for cluster traffic
                          (default: first non-loopback interface).
   --manifest-output-dir <path>
@@ -85,13 +87,14 @@ Usage:
                          well-known auto-applied folder). An alternate path
                          leaves the well-known folder empty, for GitOps to
                          manage instead.
-  --mint-join-token     Run on an existing control-plane node: mint a join
-                         artifact for a new node (requires --node-name, --node-ip).
-  --node-ip <ip>        IP address of the joining node (--mint-join-token only).
-  --join <url>          Join an existing cluster at <url> (e.g. https://1.2.3.4:6443)
-                         using the artifact passed via --token.
-  --token <artifact>    base64(JSON) join artifact produced by --mint-join-token
-                         (--join only).
+  --mint-join-token     Run on an existing control-plane node: create a 24h
+                         single-use join token and print the join command.
+  --join <url>          Join an existing cluster at <url> (e.g. https://1.2.3.4:6443).
+  --token <token>       Join token from --mint-join-token (--join only). "-" or
+                         absent reads it from stdin, which keeps it out of ps.
+  --ca-cert-hash sha256:<hash>
+                         Pin for the cluster CA (--join only), printed by
+                         --mint-join-token.
 EOF
 }
 
@@ -112,9 +115,9 @@ TARBALL_URL_EXPLICIT=0
 # Set by fetch_tarball; removed by the same EXIT trap as STAGE_DIR.
 DOWNLOAD_DIR=""
 MINT_JOIN_TOKEN=0
-NODE_IP=""
 JOIN_SERVER=""
 JOIN_TOKEN=""
+CA_CERT_HASH=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -124,9 +127,9 @@ while [ $# -gt 0 ]; do
     --tarball) TARBALL="$2"; shift 2 ;;
     --tarball-url) TARBALL_URL="$2"; TARBALL_URL_EXPLICIT=1; shift 2 ;;
     --mint-join-token) MINT_JOIN_TOKEN=1; shift ;;
-    --node-ip) NODE_IP="$2"; shift 2 ;;
     --join) JOIN_SERVER="$2"; shift 2 ;;
     --token) JOIN_TOKEN="$2"; shift 2 ;;
+    --ca-cert-hash) CA_CERT_HASH="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; usage; exit 1 ;;
   esac
@@ -172,9 +175,9 @@ SCHEDULER_UNIT_FILE=/etc/systemd/system/u7s-scheduler.service
 # --- Shared helpers (used by more than one mode) -----------------------------
 
 # Poll the local apiserver's /healthz via its own admin kubeconfig. Polling
-# rather than assuming: apiserver's first-run bootstrap (and the restart that
-# picks up a new token-auth-file entry) races its own listener bind, so
-# neither the kubeconfig nor a live listener exists when systemctl returns.
+# rather than assuming: apiserver's first-run bootstrap races its own listener
+# bind, so neither the kubeconfig nor a live listener exists when systemctl
+# returns.
 #
 # /healthz itself only returns 200 once the boot-time bootstrap manifest apply
 # (crates/apiserver/src/bootstrap_apply.rs, raced against the listener via
@@ -275,7 +278,7 @@ stage_binaries() {
 # then get nameserver 127.0.0.1 and CoreDNS forwards to itself.
 #
 # tlsCertFile/tlsPrivateKeyFile -- a serving cert signed by the cluster CA,
-# minted by kubelet.service's ExecStartPre or delivered in the join artifact.
+# minted by kubelet.service's ExecStartPre or issued by the join's serving CSR.
 # Without it kubelet self-signs and the apiserver's kubelet-client rejects it,
 # breaking kubectl logs/exec.
 #
@@ -315,94 +318,167 @@ rotateCertificates: true
 EOF
 }
 
-# --mint-join-token: run on a control-plane node that already has ca.key/ca.pem
-# from its own bootstrap. Mints a bootstrap token authorized (by the
-# apiserver's seeded system:node-bootstrapper/nodeclient grants for group
-# system:bootstrappers) to submit exactly one join CSR, restarts
-# u7s-apiserver.service to load it -- the token map is read once at startup,
-# with no hot-reload path -- and signs a kubelet serving cert for the joining
-# node. CA cert, token and serving cert+key go into one base64(JSON) artifact.
+# --mint-join-token: run on a control-plane node. Creates a
+# kube-system/bootstrap-token-<id> Secret through the live apiserver (no
+# restart) and prints the full join command. The token authenticates as
+# system:bootstrap:<id> in group system:bootstrappers, which the seeded RBAC
+# allows to submit exactly the kubelet client CSR that KCM auto-approves.
+# Single-use: the apiserver deletes the Secret when that CSR's certificate is
+# issued; the 24h expiry (reaped by KCM's tokencleaner) is only the backstop
+# for a token that was never used. A join that fails after the certificate was
+# issued needs a fresh --mint-join-token.
+JOIN_TOKEN_TTL_SECONDS=86400
+
 mint_join_token() {
-  if [ -z "$NODE_NAME" ] || [ -z "$NODE_IP" ]; then
-    echo "error: --mint-join-token requires --node-name <joining-node-name> and --node-ip <joining-node-ip>" >&2
-    exit 1
-  fi
-  if [ ! -f "$STATE_DIR/ca.pem" ] || [ ! -f "$STATE_DIR/ca.key" ]; then
-    echo "error: $STATE_DIR/ca.pem or ca.key not found -- run install.sh's default single-node bootstrap on this control-plane node first" >&2
+  if [ ! -f "$STATE_DIR/ca.pem" ] || [ ! -f "$STATE_DIR/kubeconfig" ]; then
+    echo "error: $STATE_DIR/ca.pem or kubeconfig not found -- run install.sh's default single-node bootstrap on this control-plane node first" >&2
     exit 1
   fi
   ensure_jq
 
-  local secret bootstrap_id bootstrap_uid token_file
-  secret="$(openssl rand -hex 32)"
-  bootstrap_id="$(openssl rand -hex 3)"
-  bootstrap_uid="$(cat /proc/sys/kernel/random/uuid)"
-  token_file="$STATE_DIR/token-auth-file"
-  touch "$token_file"
-  echo "${secret},system:bootstrap:${bootstrap_id},${bootstrap_uid},system:bootstrappers" >> "$token_file"
-  chmod 600 "$token_file"
+  local token_id token_secret expiration
+  token_id="$(openssl rand -hex 3)"
+  token_secret="$(openssl rand -hex 8)"
+  expiration="$(date -u -d "@$(( $(date +%s) + JOIN_TOKEN_TTL_SECONDS ))" +%Y-%m-%dT%H:%M:%SZ)"
 
-  echo "Restarting u7s-apiserver.service to load the new bootstrap token..."
-  systemctl restart u7s-apiserver.service
-  wait_for_apiserver "$STATE_DIR/kubeconfig"
+  # The Secret goes to kubectl on stdin: the token secret never appears on argv.
+  jq -n -c \
+    --arg id "$token_id" --arg secret "$token_secret" --arg expiration "$expiration" \
+    '{apiVersion: "v1", kind: "Secret",
+      metadata: {name: ("bootstrap-token-" + $id), namespace: "kube-system"},
+      type: "bootstrap.kubernetes.io/token",
+      stringData: {"token-id": $id, "token-secret": $secret, expiration: $expiration,
+                   "usage-bootstrap-authentication": "true", "usage-bootstrap-signing": "true",
+                   description: "u7s join token (single-use)"}}' \
+    | kubectl --kubeconfig="$STATE_DIR/kubeconfig" create -f - >/dev/null
 
-  local mint_dir
-  mint_dir="$(mktemp -d)"
-  # Double-quoted so $mint_dir is baked in now: it is `local` and out of scope
-  # by the time this EXIT trap fires at real process exit, where a
-  # single-quoted trap would re-evaluate it against an unset var under `set -u`.
-  # shellcheck disable=SC2064 # intentional: see above
-  trap "rm -rf '$mint_dir'" EXIT
+  local ca_hash server
+  ca_hash="$(openssl x509 -in "$STATE_DIR/ca.pem" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 | sed 's/^.* //')"
+  server="$(kubectl --kubeconfig="$STATE_DIR/kubeconfig" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 
-  openssl ecparam -name prime256v1 -genkey -noout -out "$mint_dir/kubelet-serving.key"
-  chmod 600 "$mint_dir/kubelet-serving.key"
-  openssl req -new -key "$mint_dir/kubelet-serving.key" -subj "/CN=$NODE_NAME" -out "$mint_dir/kubelet-serving.csr"
-  openssl x509 -req -in "$mint_dir/kubelet-serving.csr" -CA "$STATE_DIR/ca.pem" -CAkey "$STATE_DIR/ca.key" \
-    -CAcreateserial -days 3650 \
-    -extfile <(printf 'subjectAltName=IP:%s\nextendedKeyUsage=serverAuth\n' "$NODE_IP") \
-    -out "$mint_dir/kubelet-serving.crt"
-
-  local artifact
-  artifact="$(jq -n -c \
-    --arg caCert "$(cat "$STATE_DIR/ca.pem")" \
-    --arg bootstrapToken "$secret" \
-    --arg servingCert "$(cat "$mint_dir/kubelet-serving.crt")" \
-    --arg servingKey "$(cat "$mint_dir/kubelet-serving.key")" \
-    '{caCert: $caCert, bootstrapToken: $bootstrapToken, servingCert: $servingCert, servingKey: $servingKey}' \
-    | base64 -w0)"
-
-  echo ""
-  echo "Join artifact minted for node '$NODE_NAME' ($NODE_IP)."
-  echo "On the joining node, run (as root):"
-  echo "  install.sh --join <this-control-plane-URL, e.g. https://<this-host-ip>:6443> \\"
-  echo "    --token '$artifact' --tarball <path> --node-name $NODE_NAME [--iface <iface>]"
+  echo "Join token ${token_id}.<secret> created in kube-system, expires $expiration (single-use)."
+  echo "On the joining node, run as root (the token on stdin keeps it out of ps and shell history):"
+  echo "  echo '${token_id}.${token_secret}' | install.sh --join $server --token - \\"
+  echo "    --ca-cert-hash sha256:$ca_hash --tarball <path> --node-name <name> [--iface <iface>]"
+  echo "Then approve the node's kubelet serving certificate (no auto-approver yet):"
+  echo "  kubectl certificate approve join-serving-<name>"
 }
 
-# --join: run on a fresh node. Decodes the artifact locally (so CA trust needs
-# no network), then builds a PKCS#10 CSR shaped exactly as upstream
+# base64url without padding, from stdin.
+b64url() {
+  base64 -w0 | tr '+/' '-_' | tr -d '='
+}
+
+# Emits $1 (hex key, already zero-padded to the 64-byte SHA-256 block) XOR the
+# byte $2 as raw bytes on stdout. Streamed, never held in a shell variable, as
+# the result can contain NUL bytes.
+hmac_pad() {
+  local key_hex="$1" xor="$2" i
+  for i in $(seq 0 63); do
+    printf "\\x$(printf '%02x' $(( 16#${key_hex:$((i * 2)):2} ^ xor )))"
+  done
+}
+
+# HMAC-SHA256 (raw bytes on stdout) of the file $2 under the ASCII key $1.
+# openssl's own -hmac takes the key on argv, which would expose the token
+# secret in ps.
+hmac_sha256() {
+  local key_hex
+  key_hex="$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')"
+  while [ "${#key_hex}" -lt 128 ]; do key_hex="${key_hex}00"; done
+  {
+    hmac_pad "$key_hex" $(( 0x5c ))
+    { hmac_pad "$key_hex" $(( 0x36 )); cat "$2"; } | openssl dgst -sha256 -binary
+  } | openssl dgst -sha256 -binary
+}
+
+# kubeadm-style discovery: fetch the anonymous kube-public/cluster-info over an
+# unverified connection, require the bootstrapsigner's detached HS256 JWS for
+# this token's id to verify under the token secret, then pin the CA it carries
+# to --ca-cert-hash (sha256 of the CA's SPKI). Writes the CA to $STATE_DIR/ca.pem.
+discover_cluster_ca() {
+  local token_id="$1" token_secret="$2"
+  local work info jws=""
+  work="$(mktemp -d)"
+  info="$work/info.json"
+  # KCM's bootstrapsigner signs a new token's JWS asynchronously after the mint.
+  for _ in $(seq 1 30); do
+    curl -fsSk "$JOIN_SERVER/api/v1/namespaces/kube-public/configmaps/cluster-info" > "$info" 2>/dev/null || true
+    jws="$(jq -r --arg k "jws-kubeconfig-$token_id" '.data[$k] // empty' "$info" 2>/dev/null || true)"
+    [ -n "$jws" ] && break
+    sleep 2
+  done
+  if [ -z "$jws" ]; then
+    rm -rf "$work"
+    echo "error: kube-public/cluster-info at $JOIN_SERVER carries no signature for token id '$token_id' (token unknown, expired or already used? check that kube-controller-manager's bootstrap-signer-controller is running)" >&2
+    exit 1
+  fi
+
+  # -j: the signed content is the exact string, trailing newline included.
+  jq -j '.data.kubeconfig' "$info" > "$work/kubeconfig.yaml"
+  printf '%s.%s' "${jws%%.*}" "$(b64url < "$work/kubeconfig.yaml")" > "$work/signing-input"
+  local expected actual
+  actual="${jws##*.}"
+  expected="$(hmac_sha256 "$token_secret" "$work/signing-input" | b64url)"
+  if [ "$expected" != "$actual" ]; then
+    rm -rf "$work"
+    echo "error: cluster-info signature does not verify under this token -- refusing to trust $JOIN_SERVER (wrong token, or the endpoint is not the cluster that minted it)" >&2
+    exit 1
+  fi
+
+  local ca_pem actual_hash
+  ca_pem="$(sed -n 's/^ *certificate-authority-data: *//p' "$work/kubeconfig.yaml" | head -n1 | base64 -d)"
+  rm -rf "$work"
+  actual_hash="sha256:$(printf '%s\n' "$ca_pem" | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 | sed 's/^.* //')"
+  if [ "$actual_hash" != "$CA_CERT_HASH" ]; then
+    echo "error: cluster CA hash $actual_hash does not match --ca-cert-hash $CA_CERT_HASH -- refusing to join" >&2
+    exit 1
+  fi
+  printf '%s\n' "$ca_pem" > "$STATE_DIR/ca.pem"
+}
+
+# Reads the join token from the --token flag, or from stdin when the flag is
+# absent or "-". Stdin keeps it out of argv, /proc/<pid>/cmdline and history.
+read_join_token() {
+  local token="$JOIN_TOKEN"
+  if [ -z "$token" ] || [ "$token" = "-" ]; then
+    if [ -t 0 ]; then
+      read -rsp "Join token: " token
+      echo >&2
+    else
+      read -r token
+    fi
+  fi
+  if ! printf '%s' "$token" | grep -Eq '^[a-z0-9]{6}\.[a-z0-9]{16}$'; then
+    echo "error: join token must look like <6 chars>.<16 chars> (as printed by --mint-join-token)" >&2
+    exit 1
+  fi
+  printf '%s' "$token"
+}
+
+# --join: run on a fresh node. Verifies the cluster CA via cluster-info and the
+# pinned hash, then builds a PKCS#10 CSR shaped exactly as upstream
 # csrapproving's isNodeClientCert recognizer requires (CN=system:node:<name>,
 # O=system:nodes, signerName kubernetes.io/kube-apiserver-client-kubelet,
 # usages digital signature/key encipherment/client auth) and submits it under
 # the bootstrap token. KCM auto-approves and signs it -- no manual step -- and
-# the result becomes kubelet's own x509 identity, not a shared admin one.
+# the result becomes kubelet's own x509 identity, not a shared admin one. All
+# private keys are generated here and never leave this node. The kubelet
+# serving cert follows via a kubernetes.io/kubelet-serving CSR submitted with
+# that new identity; no KCM controller approves those, so the operator does.
 join_cluster() {
-  if [ -z "$JOIN_TOKEN" ]; then
-    echo "error: --join requires --token <join-artifact>" >&2
+  if [ -z "$CA_CERT_HASH" ]; then
+    echo "error: --join requires --ca-cert-hash sha256:<hash> (printed by --mint-join-token)" >&2
     exit 1
   fi
   ensure_jq
 
-  local artifact_json ca_cert bootstrap_token serving_cert serving_key
-  artifact_json="$(printf '%s' "$JOIN_TOKEN" | base64 -d)"
-  ca_cert="$(printf '%s' "$artifact_json" | jq -r '.caCert')"
-  bootstrap_token="$(printf '%s' "$artifact_json" | jq -r '.bootstrapToken')"
-  serving_cert="$(printf '%s' "$artifact_json" | jq -r '.servingCert')"
-  serving_key="$(printf '%s' "$artifact_json" | jq -r '.servingKey')"
+  local bootstrap_token token_id token_secret
+  bootstrap_token="$(read_join_token)"
+  token_id="${bootstrap_token%%.*}"
+  token_secret="${bootstrap_token##*.}"
 
-  printf '%s\n' "$ca_cert" > "$STATE_DIR/ca.pem"
-  printf '%s\n' "$serving_cert" > "$STATE_DIR/kubelet-serving.crt"
-  printf '%s\n' "$serving_key" > "$STATE_DIR/kubelet-serving.key"
-  chmod 600 "$STATE_DIR/kubelet-serving.key"
+  discover_cluster_ca "$token_id" "$token_secret"
 
   openssl ecparam -name prime256v1 -genkey -noout -out "$STATE_DIR/kubelet-client.key"
   chmod 600 "$STATE_DIR/kubelet-client.key"
@@ -422,9 +498,23 @@ join_cluster() {
              signerName: "kubernetes.io/kube-apiserver-client-kubelet",
              usages: ["digital signature", "key encipherment", "client auth"]}}')"
 
+  # The apiserver deletes the token when the certificate is issued, so the
+  # wait is a watch opened beforehand: its authentication happened at connect,
+  # whereas a later GET with the spent token would 401. The token reaches curl
+  # as a config file on a pipe, never argv.
+  local watch_out watch_pid
+  watch_out="$(mktemp)"
+  curl -fsSN --cacert "$STATE_DIR/ca.pem" \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$bootstrap_token") \
+    "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests?watch=true&fieldSelector=metadata.name%3D$csr_name&timeoutSeconds=150" \
+    > "$watch_out" 2>/dev/null &
+  watch_pid=$!
+  # Let the watch authenticate before the CSR is created.
+  sleep 2
+
   echo "Submitting join CSR '$csr_name' to $JOIN_SERVER..."
   curl -fsSL --cacert "$STATE_DIR/ca.pem" \
-    -H "Authorization: Bearer $bootstrap_token" \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$bootstrap_token") \
     -H "Content-Type: application/json" \
     -X POST "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" \
     -d "$csr_body" >/dev/null
@@ -432,19 +522,18 @@ join_cluster() {
   # KCM's csrapproving/csrsigning controllers react to the create event; this
   # loop only waits on them, it approves nothing itself.
   echo "Waiting for kube-controller-manager to auto-approve and sign the CSR..."
-  local signed_cert_b64="" resp
+  local signed_cert_b64=""
   for _ in $(seq 1 60); do
-    resp="$(curl -fsSL --cacert "$STATE_DIR/ca.pem" \
-      -H "Authorization: Bearer $bootstrap_token" \
-      "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests/$csr_name" 2>/dev/null || true)"
-    signed_cert_b64="$(printf '%s' "$resp" | jq -r '.status.certificate // empty' 2>/dev/null || true)"
+    signed_cert_b64="$(jq -r 'select(.object.status.certificate != null) | .object.status.certificate' "$watch_out" 2>/dev/null | head -n1 || true)"
     if [ -n "$signed_cert_b64" ]; then
       break
     fi
     sleep 2
   done
+  kill "$watch_pid" 2>/dev/null || true
+  rm -f "$watch_out"
   if [ -z "$signed_cert_b64" ]; then
-    echo "error: CSR '$csr_name' was not approved+signed within 120s (check: kubectl get csr $csr_name, kube-controller-manager logs on the control-plane node)" >&2
+    echo "error: CSR '$csr_name' was not approved+signed within 120s (check: kubectl get csr $csr_name, kube-controller-manager logs on the control-plane node). The join token is spent once a certificate was issued; mint a new one to retry." >&2
     exit 1
   fi
   printf '%s' "$signed_cert_b64" | base64 -d > "$STATE_DIR/kubelet-client.crt"
@@ -475,6 +564,49 @@ users:
 EOF
   chmod 600 "$STATE_DIR/kubeconfig"
   echo "Join CSR approved and signed -- kubelet's dedicated x509 kubeconfig written to $STATE_DIR/kubeconfig"
+
+  request_serving_cert
+}
+
+# The kubelet serving cert must chain to the cluster CA or the apiserver's
+# kubelet-client rejects it (kubectl logs/exec -> BadGateway). Own key, own
+# CSR, submitted as the freshly issued node identity.
+request_serving_cert() {
+  openssl ecparam -name prime256v1 -genkey -noout -out "$STATE_DIR/kubelet-serving.key"
+  chmod 600 "$STATE_DIR/kubelet-serving.key"
+  openssl req -new -key "$STATE_DIR/kubelet-serving.key" \
+    -subj "/O=system:nodes/CN=system:node:$NODE_NAME" \
+    -addext "subjectAltName=IP:$IFACE_IP,DNS:$NODE_NAME" \
+    -out "$STATE_DIR/kubelet-serving.csr"
+
+  local csr_name="join-serving-$NODE_NAME" csr_body
+  csr_body="$(jq -n -c \
+    --arg name "$csr_name" \
+    --arg request "$(base64 -w0 "$STATE_DIR/kubelet-serving.csr")" \
+    '{apiVersion: "certificates.k8s.io/v1", kind: "CertificateSigningRequest",
+      metadata: {name: $name},
+      spec: {request: $request,
+             signerName: "kubernetes.io/kubelet-serving",
+             usages: ["digital signature", "key encipherment", "server auth"]}}')"
+  local node_auth=(--cacert "$STATE_DIR/ca.pem" --cert "$STATE_DIR/kubelet-client.crt" --key "$STATE_DIR/kubelet-client.key")
+
+  echo "Submitting kubelet serving CSR '$csr_name'..."
+  curl -fsSL "${node_auth[@]}" -H "Content-Type: application/json" \
+    -X POST "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" \
+    -d "$csr_body" >/dev/null
+  echo "Waiting up to 5 min for an operator to approve it: kubectl certificate approve $csr_name"
+  local resp cert_b64=""
+  for _ in $(seq 1 150); do
+    resp="$(curl -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests/$csr_name" 2>/dev/null || true)"
+    cert_b64="$(printf '%s' "$resp" | jq -r '.status.certificate // empty' 2>/dev/null || true)"
+    [ -n "$cert_b64" ] && break
+    sleep 2
+  done
+  if [ -z "$cert_b64" ]; then
+    echo "error: kubelet serving CSR '$csr_name' was not approved within 5 min (kubectl certificate approve $csr_name, then delete it and re-run the join if it expired)" >&2
+    exit 1
+  fi
+  printf '%s' "$cert_b64" | base64 -d > "$STATE_DIR/kubelet-serving.crt"
 }
 
 if [ "$MINT_JOIN_TOKEN" -eq 1 ]; then
@@ -523,7 +655,7 @@ fi
 # likely fail outright anyway, since the token was already consumed --
 # refuse loudly instead of attempting it.
 if [ "$JOIN_MODE" -eq 1 ] && [ "$EXISTING_WORKER" -eq 1 ]; then
-  echo "error: this node already joined a cluster ($STATE_DIR/kubeconfig exists with no local CA key) -- refusing to re-run the join CSR flow, which would submit a fresh CSR and overwrite this node's existing kubelet-client.crt/.key and kubeconfig. Bootstrap tokens are single-use, so this would likely fail outright anyway. To upgrade this worker, re-run install.sh with no --join/--token flags. To force a genuine re-join, stop kubelet, rm -rf $STATE_DIR, and re-run install.sh --join <url> --token <artifact>." >&2
+  echo "error: this node already joined a cluster ($STATE_DIR/kubeconfig exists with no local CA key) -- refusing to re-run the join CSR flow, which would submit a fresh CSR and overwrite this node's existing kubelet-client.crt/.key and kubeconfig. Bootstrap tokens are single-use, so this would likely fail outright anyway. To upgrade this worker, re-run install.sh with no --join/--token flags. To force a genuine re-join, stop kubelet, rm -rf $STATE_DIR, and re-run install.sh --join <url> --token - --ca-cert-hash <hash> with a freshly minted token." >&2
   exit 1
 fi
 
@@ -977,12 +1109,9 @@ if [ "$WORKER_MODE" -eq 0 ]; then
   fi
 fi
 
-# --token-auth-file is always passed so a later --mint-join-token needs no unit
-# edit plus extra restart to enable it. An empty file is a valid token map
-# (auth::load_token_file skips blank lines), so the default path is unchanged
-# until a token is appended.
-touch "$STATE_DIR/token-auth-file"
-chmod 600 "$STATE_DIR/token-auth-file"
+# Join tokens are Secrets now; a static token file left by an older install
+# would keep authenticating forever, but is no longer passed to the apiserver.
+rm -f "$STATE_DIR/token-auth-file"
 
 cat > /etc/systemd/system/u7s-apiserver.service <<EOF
 [Unit]
@@ -997,7 +1126,7 @@ WorkingDirectory=$STATE_DIR
 # process rather than a separate u7s-scheduler binary+unit -- never also
 # start u7s-scheduler against this same cluster (see the retirement
 # block above this section for why: uncoordinated double-preemption).
-ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --token-auth-file $STATE_DIR/token-auth-file --embedded-scheduler true
+ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --embedded-scheduler true
 # SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.

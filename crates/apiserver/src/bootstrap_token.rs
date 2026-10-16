@@ -17,8 +17,8 @@ use crate::util::rfc3339_to_unix_secs;
 
 pub(crate) const SECRET_TYPE: &str = "bootstrap.kubernetes.io/token";
 pub(crate) const SECRET_NAME_PREFIX: &str = "bootstrap-token-";
-const NAMESPACE: &str = "kube-system";
-const USER_PREFIX: &str = "system:bootstrap:";
+pub(crate) const NAMESPACE: &str = "kube-system";
+pub(crate) const USER_PREFIX: &str = "system:bootstrap:";
 const DEFAULT_GROUP: &str = "system:bootstrappers";
 const GROUP_PREFIX: &str = "system:bootstrappers:";
 const TOKEN_ID_LEN: usize = 6;
@@ -151,6 +151,16 @@ pub(crate) async fn authenticate<S: Store>(token: &str, store: &S) -> Option<Use
         .unwrap_or_default()
         .as_secs() as i64;
     authenticate_secret(&body, id, secret, now)
+}
+
+/// Deletes a token Secret by name. Already gone (expired, cleaned) counts as done; a store
+/// failure is logged and left to the token's TTL.
+pub(crate) async fn delete_token_secret<S: Store>(store: &S, name: &str) {
+    let key = object_key("secrets", NAMESPACE, name);
+    match store.delete(&key, None).await {
+        Ok(_) | Err(u7s_store::StoreError::NotFound { .. }) => {}
+        Err(e) => tracing::warn!("failed to delete bootstrap token Secret {name}: {e}"),
+    }
 }
 
 /// Create/update validation for `type: bootstrap.kubernetes.io/token` Secrets. Upstream's
