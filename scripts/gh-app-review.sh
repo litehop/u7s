@@ -16,7 +16,7 @@
 # (`curl -K -`), never as a command-line argument.
 #
 # Usage:
-#   jq -n '{body:"...",event:"REQUEST_CHANGES"}' | scripts/gh-app-review.sh <pr-number>
+#   scripts/gh-app-review.sh <pr-number> < review-payload.json
 set -euo pipefail
 
 PR_NUMBER="${1:?usage: gh-app-review.sh <pr-number> < review-payload.json}"
