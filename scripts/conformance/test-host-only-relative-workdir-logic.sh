@@ -78,6 +78,8 @@ TMPROOT="$(cd "$(mktemp -d)" && pwd)"
 WT_A="$TMPROOT/wt-a"
 WT_B="$TMPROOT/wt-b"
 mkdir -p "$WT_A/temp/u7s" "$WT_B/temp/u7s"
+git init -q "$WT_A"
+git init -q "$WT_B"
 
 SPAWNED=()
 spawn_stack "$WT_A/temp/u7s"
@@ -110,6 +112,7 @@ done
 # "$PWD/", a prefix of every worktree-local path.
 WT_C="$TMPROOT/wt-c"
 mkdir -p "$WT_C/temp/u7s"
+git init -q "$WT_C"
 SPAWNED=()
 spawn_stack "$WT_C/temp/u7s"
 C_PIDS=("${SPAWNED[@]}")
@@ -135,6 +138,7 @@ done
 # say so and exit 1, else a worker believes the port slot is free when it is not.
 WT_D="$TMPROOT/wt-d"
 mkdir -p "$WT_D/temp/u7s"
+git init -q "$WT_D"
 bash -c "trap '' TERM; exec -a 'u7s-scheduler --kubeconfig $WT_D/temp/u7s/kubeconfig-scheduler' sleep 60" >/dev/null 2>&1 &
 STUBBORN_PID=$!
 LEFTOVER_PIDS+=("$STUBBORN_PID")

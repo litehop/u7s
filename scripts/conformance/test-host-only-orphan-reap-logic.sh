@@ -109,6 +109,8 @@ STUB
 }
 
 TMPROOT="$(mktemp -d)"
+git init -q "$TMPROOT"
+cd "$TMPROOT"
 
 # ---------------------------------------------------------------------------
 # 1. Apiserver-less orphan pair, NO pid files: --host-only must reap both via
@@ -117,7 +119,7 @@ TMPROOT="$(mktemp -d)"
 #    pin down that reaping-without-pidfiles keeps working alongside the new
 #    verify step, so a future change to either can't silently break it.
 # ---------------------------------------------------------------------------
-WORKDIR1="$TMPROOT/reapable/temp/u7s"
+WORKDIR1="$TMPROOT/temp/reapable"
 mkdir -p "$WORKDIR1"
 
 SCHED_PID="$(spawn_fake_process "u7s-scheduler --db ${WORKDIR1}/sched.db --kubeconfig ${WORKDIR1}/kubeconfig-scheduler --other ${WORKDIR1}/kubeconfig")"
@@ -142,7 +144,7 @@ assert_dead "orphan konnectivity-server (no pid file) is reaped by the cmdline f
 #    (dropping the post-kill re-check) makes this assertion fail because the
 #    old code exits 0 unconditionally after firing the kill commands.
 # ---------------------------------------------------------------------------
-WORKDIR2="$TMPROOT/unreapable/temp/u7s"
+WORKDIR2="$TMPROOT/temp/unreapable"
 mkdir -p "$WORKDIR2"
 
 IMMUNE_PID="$(spawn_sigterm_immune_process "u7s-scheduler --db ${WORKDIR2}/sched.db --kubeconfig ${WORKDIR2}/kubeconfig-scheduler --other ${WORKDIR2}/kubeconfig")"
@@ -173,7 +175,7 @@ fi
 #    --host-only check) makes this fail: the script would exit 1 and skip
 #    $WORKDIR wipe / VM teardown instead of completing them.
 # ---------------------------------------------------------------------------
-WORKDIR3="$TMPROOT/full-reset/temp/u7s"
+WORKDIR3="$TMPROOT/temp/full-reset"
 mkdir -p "$WORKDIR3"
 STUBBIN="$TMPROOT/bin"
 setup_limactl_stub "$STUBBIN"

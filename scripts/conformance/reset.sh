@@ -162,29 +162,26 @@ teardown_vm() {
   fi
 }
 
-# Pure: prints why <workdir> must never be wiped and returns 0, or returns 1
-# when it is safe. Compares physical paths so symlinked spellings (macOS
-# /var -> /private/var) cannot slip past.
-workdir_protected_reason() {
-  local wd="$1" p top
-  p="$(cd "$wd" 2>/dev/null && pwd -P)" || p="$wd"
-  if [ "$p" = "/" ]; then
-    echo "the filesystem root"; return 0
-  fi
-  if [ -n "${HOME:-}" ] && [ "$p" = "$(cd "$HOME" 2>/dev/null && pwd -P)" ]; then
-    echo "\$HOME"; return 0
-  fi
-  local cwd
-  cwd="$(pwd -P)"
-  if [ "$p" = "$cwd" ] || [[ "$cwd/" == "$p/"* ]]; then
-    echo "the current directory or one of its ancestors"; return 0
-  fi
-  if top="$(git rev-parse --show-toplevel 2>/dev/null)"; then
-    top="$(cd "$top" && pwd -P)"
-    if [[ "$top/" == "$p/"* ]]; then
-      echo "the git repo/worktree root or one of its ancestors"; return 0
-    fi
-  fi
+# Succeeds only when <workdir> resolves (physically, so symlinks and ".."
+# cannot escape) to a strict subdirectory of <checkout>/temp for some checkout
+# listed by `git worktree list` (main checkout and every linked worktree).
+# Full mode runs `rm -rf` on it, so anything else -- $PWD, a repo root, $HOME,
+# / -- is refused.
+workdir_allowed() {
+  local wd="$1" p rest="" base wt
+  case "/$wd/" in */../*) return 1 ;; esac
+  p="$wd"
+  while [ ! -d "$p" ]; do
+    rest="/$(basename "$p")$rest"
+    p="$(dirname "$p")"
+  done
+  p="$(cd "$p" && pwd -P)$rest"
+  while IFS= read -r wt; do
+    [ -d "$wt" ] || continue
+    base="$(cd "$wt" && pwd -P)/temp"
+    if [ -d "$base" ]; then base="$(cd "$base" && pwd -P)"; fi
+    case "$p" in "$base"/?*) return 0 ;; esac
+  done < <(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
   return 1
 }
 
@@ -227,14 +224,9 @@ main() {
     esac
   fi
 
-  # Full mode runs `rm -rf "$WORKDIR"`: refuse anything that is, or contains,
-  # the caller's cwd or repo/worktree root, plus $HOME and /. Deny-list only:
-  # a "temp/u7s" naming rule would reject the other dedicated state dirs
-  # callers pass to run-all.sh --workdir. Runs before any kill so a refusal
-  # has no side effects in either mode.
-  local protected_reason
-  if protected_reason="$(workdir_protected_reason "$WORKDIR")"; then
-    echo "[reset] ERROR: refusing --workdir $WORKDIR: it is $protected_reason" >&2
+  # Runs before any kill so a refusal has no side effects in either mode.
+  if ! workdir_allowed "$WORKDIR"; then
+    echo "[reset] ERROR: refusing --workdir $WORKDIR: it must be a strict subdirectory of <checkout>/temp/ for a checkout of this repo (git worktree list), with no '..' or symlink escape" >&2
     exit 1
   fi
 
