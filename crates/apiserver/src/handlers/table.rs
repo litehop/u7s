@@ -1448,7 +1448,7 @@ fn csr_row(obj: serde_json::Value) -> serde_json::Value {
     let requestor = obj["spec"]["username"].as_str().unwrap_or("");
     let duration = obj["spec"]["expirationSeconds"]
         .as_i64()
-        .map_or_else(|| "<none>".to_string(), |s| human_duration(s));
+        .map_or_else(|| "<none>".to_string(), human_duration);
     serde_json::json!({
         "cells": [name, age, signer, requestor, duration, csr_condition_string(&obj)],
         "object": make_object_ref(&obj, "CertificateSigningRequest")
