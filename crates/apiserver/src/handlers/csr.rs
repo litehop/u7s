@@ -592,6 +592,11 @@ pub(crate) fn guard_csr_status_write<S: Store>(
     let changed = csr_certificate(old) != csr_certificate(new)
         || without_timestamps(&old_conditions) != without_timestamps(&new_conditions);
     if !changed {
+        // Equal modulo timestamps: restore the stored conditions so a caller without `sign`
+        // cannot rewrite timestamps of existing Approved/Denied/Failed conditions.
+        if new["status"]["conditions"].is_array() {
+            new["status"]["conditions"] = serde_json::Value::Array(old_conditions);
+        }
         populate_condition_timestamps(new, old, &crate::util::utc_now_rfc3339());
         return Ok(());
     }
@@ -2575,6 +2580,40 @@ mod tests {
         let t = body(resp).await;
         assert_eq!(t["kind"], "Table");
         assert_eq!(t["rows"][0]["cells"][0], "tbl");
+    }
+
+    /// Upstream silently preserves existing Approved/Denied conditions on /status; a caller
+    /// without `sign` must not be able to rewrite the recorded approval time.
+    #[tokio::test]
+    async fn status_write_without_sign_cannot_alter_existing_condition_timestamps() {
+        let state = make_state();
+        let ts = "2020-01-01T00:00:00Z";
+        let mk = |ty: &str, t: &str| {
+            serde_json::json!({"type": ty, "status": "True",
+                "lastUpdateTime": t, "lastTransitionTime": t})
+        };
+        seed_csr_with(
+            &state,
+            "ts2",
+            CLIENT_SIGNER,
+            serde_json::json!({"conditions": [mk("Approved", ts), mk("Failed", ts)]}),
+        )
+        .await;
+        let nobody = user("nobody");
+        let forged = "2030-01-01T00:00:00Z";
+        status_put(
+            &state,
+            &nobody,
+            "ts2",
+            serde_json::json!({"conditions": [mk("Approved", forged), mk("Failed", forged)]}),
+        )
+        .await
+        .expect("timestamp-only write is a no-op, not an error, as upstream");
+        let c = &stored_csr(&state, "ts2").await["status"]["conditions"];
+        for i in 0..2 {
+            assert_eq!(c[i]["lastTransitionTime"], ts, "{c}");
+            assert_eq!(c[i]["lastUpdateTime"], ts, "{c}");
+        }
     }
 
     /// A signer adding a Failed condition through /status must get timestamps, like /approval.
