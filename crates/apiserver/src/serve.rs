@@ -1,12 +1,15 @@
 //! TLS accept loop and the connection-level limits that keep an unauthenticated
 //! flood from exhausting or killing the apiserver.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use http_body_util::BodyExt as _;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
@@ -14,39 +17,136 @@ use tower_service::Service as _;
 
 use crate::auth::PeerCertificate;
 
-/// Limits that apply to the pre-request phases of a connection. Once a request is
-/// being served (watch, exec, log streams) none of the timeouts apply.
+/// Limits that apply outside of request processing. A request being served (watch,
+/// exec, log streams) is never cut by the handshake, header or idle timeouts.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ServeLimits {
     /// Accepted connections in flight, including those still handshaking. Above this
     /// the loop stops calling `accept()` so the kernel backlog absorbs the burst.
-    /// 1024 connections at roughly 50-100 KiB each (rustls + hyper buffers) is
+    /// 1024 connections at an unmeasured 50-100 KiB each (rustls + hyper buffers) is
     /// ~50-100 MiB on a 1 GiB host, and stays under the raised RLIMIT_NOFILE.
     pub max_connections: usize,
+    /// Connections one non-loopback source IP may hold, so a single client or
+    /// slowloris burst cannot take every slot. Loopback is exempt: the control-plane
+    /// components and the VM port-forward all arrive from 127.0.0.1. Nodes behind one
+    /// NAT address share this budget.
+    pub max_connections_per_ip: usize,
     /// Upper bound on the TLS handshake (Go's net/http has no default; 10 s is
     /// generous for the slowest legitimate client).
     pub tls_handshake_timeout: Duration,
     /// Upper bound on receiving a request's headers (net/http ReadHeaderTimeout).
+    /// For HTTP/1 hyper restarts this timer after every response, so a kept-alive
+    /// connection that stays idle is also closed after this long (Go's net/http
+    /// keeps it until IdleTimeout).
     pub header_read_timeout: Duration,
+    /// An HTTP/2 connection with no request or open stream for this long is sent
+    /// GOAWAY and closed. Matches kube-apiserver's `http2.Server.IdleTimeout` of 90 s.
+    pub h2_idle_timeout: Duration,
 }
 
 impl Default for ServeLimits {
     fn default() -> Self {
         Self {
             max_connections: 1024,
+            max_connections_per_ip: 256,
             tls_handshake_timeout: Duration::from_secs(10),
             header_read_timeout: Duration::from_secs(10),
+            h2_idle_timeout: Duration::from_secs(90),
         }
     }
 }
 
 pub(crate) trait AcceptTcp {
-    fn accept_tcp(&self) -> impl Future<Output = std::io::Result<TcpStream>> + Send;
+    fn accept_tcp(&self) -> impl Future<Output = std::io::Result<(TcpStream, SocketAddr)>> + Send;
 }
 
 impl AcceptTcp for TcpListener {
-    async fn accept_tcp(&self) -> std::io::Result<TcpStream> {
-        self.accept().await.map(|(s, _)| s)
+    async fn accept_tcp(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        self.accept().await
+    }
+}
+
+/// Counts connections per source IP. Loopback is never counted.
+#[derive(Clone)]
+struct PerIpLimiter {
+    max: usize,
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+struct IpSlot {
+    ip: IpAddr,
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl PerIpLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            counts: Arc::default(),
+        }
+    }
+
+    /// `Ok(None)` for exempt (loopback) peers, `Err` when `ip` is at its cap.
+    fn acquire(&self, ip: IpAddr) -> Result<Option<IpSlot>, ()> {
+        let ip = ip.to_canonical();
+        if ip.is_loopback() {
+            return Ok(None);
+        }
+        let mut counts = self.counts.lock().unwrap();
+        let n = counts.entry(ip).or_insert(0);
+        if *n >= self.max {
+            return Err(());
+        }
+        *n += 1;
+        Ok(Some(IpSlot {
+            ip,
+            counts: Arc::clone(&self.counts),
+        }))
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap();
+        if let Some(n) = counts.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Requests (and their response bodies) currently open on one connection.
+struct InFlight(tokio::sync::watch::Sender<usize>);
+
+struct InFlightGuard(Arc<InFlight>);
+
+impl InFlight {
+    fn start(self: &Arc<Self>) -> InFlightGuard {
+        self.0.send_modify(|n| *n += 1);
+        InFlightGuard(Arc::clone(self))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        (self.0).0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// Resolves once nothing has been in flight for `window`.
+async fn idle_for(mut in_flight: tokio::sync::watch::Receiver<usize>, window: Duration) {
+    loop {
+        while *in_flight.borrow_and_update() != 0 {
+            if in_flight.changed().await.is_err() {
+                return;
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(window) => return,
+            r = in_flight.changed() => if r.is_err() { return },
+        }
     }
 }
 
@@ -89,7 +189,9 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
         .timer(hyper_util::rt::TokioTimer::new());
 
     let permits = Arc::new(Semaphore::new(limits.max_connections));
+    let per_ip = PerIpLimiter::new(limits.max_connections_per_ip);
     let mut last_error_log: Option<Instant> = None;
+    let mut last_ip_log: Option<Instant> = None;
 
     loop {
         // Take the permit before accepting: at the cap, connections wait in the kernel
@@ -98,7 +200,7 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
             .acquire_owned()
             .await
             .expect("semaphore is never closed");
-        let tcp_stream = match listener.accept_tcp().await {
+        let (tcp_stream, peer_addr) = match listener.accept_tcp().await {
             Ok(s) => s,
             Err(e) => {
                 if last_error_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
@@ -109,6 +211,20 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
                 continue;
             }
         };
+        let ip_slot = match per_ip.acquire(peer_addr.ip()) {
+            Ok(slot) => slot,
+            Err(()) => {
+                if last_ip_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                    tracing::warn!(
+                        "rejecting connection from {}: per-IP limit of {} reached",
+                        peer_addr.ip(),
+                        limits.max_connections_per_ip
+                    );
+                    last_ip_log = Some(Instant::now());
+                }
+                continue;
+            }
+        };
         crate::configure_accepted_socket(&tcp_stream);
         let acceptor = acceptor.clone();
         let app = app.clone();
@@ -116,6 +232,7 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
 
         tokio::spawn(async move {
             let _permit = permit;
+            let _ip_slot = ip_slot;
             let tls_stream = match tokio::time::timeout(
                 limits.tls_handshake_timeout,
                 acceptor.accept(tcp_stream),
@@ -144,18 +261,29 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
                     .map(|c| PeerCertificate(c.as_ref().to_vec())),
             );
 
+            let is_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
             let io = hyper_util::rt::TokioIo::new(tls_stream);
             let request_seen = Arc::new(AtomicBool::new(false));
             let seen = Arc::clone(&request_seen);
+            let (in_flight_tx, in_flight_rx) = tokio::sync::watch::channel(0usize);
+            let in_flight = Arc::new(InFlight(in_flight_tx));
             let service = hyper::service::service_fn(move |mut req: axum::http::Request<_>| {
                 seen.store(true, Ordering::Relaxed);
+                let guard = in_flight.start();
                 let peer_cert = Arc::clone(&peer_cert);
                 let mut app = app.clone();
                 async move {
                     if let Some(cert) = peer_cert.as_ref().as_ref() {
                         req.extensions_mut().insert(cert.clone());
                     }
-                    Ok::<_, std::convert::Infallible>(app.call(req).await.unwrap())
+                    let (parts, body) = app.call(req).await.unwrap().into_parts();
+                    // The guard lives as long as the response body, so a watch or log
+                    // stream keeps the connection out of the idle window.
+                    let body = body.map_frame(move |frame| {
+                        let _ = &guard;
+                        frame
+                    });
+                    Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(parts, body))
                 }
             });
             // serve_connection_with_upgrades() preserves WebSocket-upgrade support for
@@ -178,6 +306,14 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
                     std::future::pending::<()>().await;
                 }
             };
+            // HTTP/1 idleness is already bounded by header_read_timeout.
+            let idle_deadline = async {
+                if is_h2 {
+                    idle_for(in_flight_rx, limits.h2_idle_timeout).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
             tokio::select! {
                 res = &mut conn => {
                     if let Err(e) = res {
@@ -186,6 +322,11 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
                 }
                 () = first_request_deadline => {
                     tracing::debug!("no request received within header read timeout");
+                }
+                () = idle_deadline => {
+                    tracing::debug!("closing idle HTTP/2 connection");
+                    conn.as_mut().graceful_shutdown();
+                    let _ = tokio::time::timeout(limits.header_read_timeout, &mut conn).await;
                 }
             }
         });
@@ -203,14 +344,17 @@ mod tests {
     fn test_limits() -> ServeLimits {
         ServeLimits {
             max_connections: 1024,
+            max_connections_per_ip: 1024,
             tls_handshake_timeout: SHORT,
             header_read_timeout: SHORT,
+            h2_idle_timeout: SHORT,
         }
     }
 
     struct TestTls {
         server: Arc<rustls::ServerConfig>,
         connector: tokio_rustls::TlsConnector,
+        h2_connector: tokio_rustls::TlsConnector,
     }
 
     fn test_tls() -> TestTls {
@@ -231,9 +375,70 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let mut h2_client = client.clone();
+        h2_client.alpn_protocols = vec![b"h2".to_vec()];
         TestTls {
             server: Arc::new(server),
             connector: tokio_rustls::TlsConnector::from(Arc::new(client)),
+            h2_connector: tokio_rustls::TlsConnector::from(Arc::new(h2_client)),
+        }
+    }
+
+    type H2Sender = hyper::client::conn::http2::SendRequest<axum::body::Body>;
+
+    /// Opens an h2 connection; the receiver resolves when the server side closes it.
+    async fn h2_connect(
+        tls: &TestTls,
+        addr: SocketAddr,
+    ) -> (H2Sender, tokio::sync::oneshot::Receiver<()>) {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let stream = tls.h2_connector.connect(name, tcp).await.unwrap();
+        let (sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(stream),
+        )
+        .await
+        .unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = conn.await;
+            let _ = closed_tx.send(());
+        });
+        (sender, closed_rx)
+    }
+
+    fn h2_get(path: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::get(format!("https://localhost{path}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    async fn is_closed_within(
+        rx: &mut tokio::sync::oneshot::Receiver<()>,
+        within: Duration,
+    ) -> bool {
+        tokio::time::timeout(within, rx).await.is_ok()
+    }
+
+    /// Reports each accepted connection as coming from the next queued address
+    /// (then `fallback`), so per-IP behaviour can be tested without extra local IPs.
+    struct FakePeerListener {
+        inner: TcpListener,
+        peers: Mutex<std::collections::VecDeque<IpAddr>>,
+        fallback: IpAddr,
+    }
+
+    impl AcceptTcp for FakePeerListener {
+        async fn accept_tcp(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+            let (s, real) = self.inner.accept().await?;
+            let ip = self
+                .peers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(self.fallback);
+            Ok((s, SocketAddr::new(ip, real.port())))
         }
     }
 
@@ -281,13 +486,22 @@ mod tests {
             .starts_with("HTTP/1.1 200")
     }
 
+    async fn get_ok_on<S: AsyncReadExt + AsyncWriteExt + Unpin>(s: &mut S) -> bool {
+        s.write_all(GET).await.unwrap();
+        let mut buf = [0u8; 512];
+        let n = s.read(&mut buf).await.unwrap();
+        std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("HTTP/1.1 200")
+    }
+
     struct FlakyListener {
         inner: TcpListener,
         remaining_errors: AtomicUsize,
     }
 
     impl AcceptTcp for FlakyListener {
-        async fn accept_tcp(&self) -> std::io::Result<TcpStream> {
+        async fn accept_tcp(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
             if self
                 .remaining_errors
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -387,6 +601,7 @@ mod tests {
             max_connections: 1,
             tls_handshake_timeout: Duration::from_secs(30),
             header_read_timeout: Duration::from_secs(30),
+            ..test_limits()
         };
         start(listener, ok_app(), &tls, limits).await;
 
@@ -449,6 +664,140 @@ mod tests {
         assert!(
             text.contains("event5"),
             "a watch/log stream must not be cut by handshake or header timeouts; got {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_h2_connection_is_closed_so_it_cannot_pin_a_slot_forever() {
+        let tls = test_tls();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        start(listener, ok_app(), &tls, test_limits()).await;
+
+        let (mut sender, mut closed) = h2_connect(&tls, addr).await;
+        let resp = sender.send_request(h2_get("/")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        resp.into_body().collect().await.unwrap();
+
+        assert!(
+            is_closed_within(&mut closed, SHORT * 10).await,
+            "an h2 connection that served one request and went quiet must be closed after the \
+             idle window, otherwise 1024 such clients lock every other client out"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_connection_with_open_stream_is_not_closed_by_idle_policy() {
+        let tls = test_tls();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/watch",
+            axum::routing::get(|| async {
+                let stream = futures_util::stream::unfold(0u32, |i| async move {
+                    if i == 8 {
+                        return None;
+                    }
+                    tokio::time::sleep(SHORT / 2).await;
+                    Some((
+                        Ok::<_, std::convert::Infallible>(format!("event{i}\n")),
+                        i + 1,
+                    ))
+                });
+                axum::body::Body::from_stream(stream)
+            }),
+        );
+        start(listener, app, &tls, test_limits()).await;
+
+        let (mut sender, mut closed) = h2_connect(&tls, addr).await;
+        let started = Instant::now();
+        let resp = sender.send_request(h2_get("/watch")).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            started.elapsed() > SHORT * 3,
+            "stream must outlast several idle windows for this test to mean anything"
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("event7"),
+            "a watch/exec/log stream on an otherwise quiet h2 connection must not be cut by the \
+             idle policy; got {body:?}"
+        );
+        assert!(
+            is_closed_within(&mut closed, SHORT * 10).await,
+            "once the stream ends the connection is idle and must be closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_ip_cannot_take_every_slot_but_other_ips_and_loopback_still_connect() {
+        let tls = test_tls();
+        let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inner.local_addr().unwrap();
+        let abuser: IpAddr = "203.0.113.7".parse().unwrap();
+        let kubelet: IpAddr = "198.51.100.9".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let listener = FakePeerListener {
+            inner,
+            peers: Mutex::new(
+                [
+                    abuser, abuser, abuser, kubelet, loopback, loopback, loopback,
+                ]
+                .into(),
+            ),
+            fallback: abuser,
+        };
+        let limits = ServeLimits {
+            max_connections_per_ip: 2,
+            tls_handshake_timeout: Duration::from_secs(30),
+            header_read_timeout: Duration::from_secs(30),
+            ..test_limits()
+        };
+        start(listener, ok_app(), &tls, limits).await;
+
+        let first = tls_connect(&tls, addr).await;
+        let _second = tls_connect(&tls, addr).await;
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        assert!(
+            tls.connector.connect(name, tcp).await.is_err(),
+            "the 3rd connection from one IP must be refused so one client cannot exhaust the cap"
+        );
+
+        let mut others = vec![tls_connect(&tls, addr).await];
+        for _ in 0..3 {
+            others.push(tls_connect(&tls, addr).await);
+        }
+        assert!(
+            get_ok_on(others.last_mut().unwrap()).await,
+            "loopback is exempt: control-plane components share 127.0.0.1 and must not be capped"
+        );
+
+        drop(first);
+        let mut served = false;
+        for _ in 0..50 {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            if tls.connector.connect(name, tcp).await.is_ok() {
+                served = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            served,
+            "closing a connection must free its per-IP slot or the client is locked out for good"
+        );
+    }
+
+    #[test]
+    fn v4_mapped_loopback_is_exempt_from_the_per_ip_cap() {
+        let limiter = PerIpLimiter::new(1);
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let held: Vec<_> = (0..3).map(|_| limiter.acquire(mapped).unwrap()).collect();
+        assert!(
+            held.iter().all(Option::is_none),
+            "a dual-stack listener reports IPv4 loopback as ::ffff:127.0.0.1; it must stay exempt"
         );
     }
 }
