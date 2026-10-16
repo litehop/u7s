@@ -671,36 +671,41 @@ pub(crate) async fn create_resource<S: Store>(
             Err(e) => return Err(store_err(e, &group, &plural, &name, &meta.kind)),
         }
     };
-    // Recomputed rather than threaded out of the loop above: cheap string formatting, and
-    // always matches the name the successful put() used (whether the first attempt or a
-    // generateName retry).
-    let key = group_object_key(&group, &plural, None, &name);
-
     obj.set_resource_version(new_rv);
-    if group == RBAC_GROUP {
-        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
-        state.rbac_index.apply_object(&rbac_key, &obj.body);
-    }
-    if group == ADMISSION_GROUP {
-        state.refresh_admission_config(&plural).await;
-    }
-    if group == APISERVICE_GROUP {
-        state.refresh_apiservice_cache().await;
-    }
-    if group == FLOWCONTROL_GROUP {
-        state.refresh_flowcontrol_cache().await;
-        if plural == PLC_PLURAL {
-            record_priority_level_metric(&obj.body);
-        }
-    }
-    write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
-    write_flowcontrol_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
+    apply_cluster_write_effects(
+        &state,
+        &group,
+        &version,
+        &plural,
+        &name,
+        &mut obj.body,
+        new_rv,
+    )
+    .await;
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
     if let Some(hv) = warn_header {
         resp.headers_mut().insert(axum::http::header::WARNING, hv);
     }
     Ok(resp)
+}
+
+/// Whether upstream's registry strategy for this built-in has `AllowCreateOnUpdate() == true`
+/// (release-1.37 `pkg/registry/**/strategy.go`). A PUT naming a missing object of any other
+/// kind is a 404: creating it would run none of that kind's create-time admission (POST-only
+/// checks, defaulting, finalizers, allocation).
+fn allows_create_on_update(group: &str, plural: &str) -> bool {
+    matches!(
+        (group, plural),
+        ("", "services" | "endpoints" | "events" | "limitranges")
+            | ("events.k8s.io", "events")
+            | (
+                RBAC_GROUP,
+                "roles" | "rolebindings" | "clusterroles" | "clusterrolebindings"
+            )
+            | ("coordination.k8s.io", "leases" | "leasecandidates")
+            | ("node.k8s.io", "runtimeclasses")
+    )
 }
 
 /// Reject a PUT whose declared `resourceVersion` no longer matches the object's current
@@ -975,11 +980,12 @@ pub(crate) async fn replace_resource<S: Store>(
         }
     }
 
-    if old_object.is_none() && super::csr::is_csr(&group, &plural) {
+    if old_object.is_none() && !allows_create_on_update(&group, &plural) {
         return Err(Status::not_found(&group, &plural, &name));
     }
     if old_object.is_none() {
         resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
+        stamp_metadata(&mut obj);
     }
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
@@ -1045,7 +1051,11 @@ pub(crate) async fn replace_resource<S: Store>(
         resource: &plural,
         name: &name,
         namespace: None,
-        operation: "UPDATE",
+        operation: if old_object.is_some() {
+            "UPDATE"
+        } else {
+            "CREATE"
+        },
         user_info: Some(serde_json::json!({
             "username": user.username,
             "uid": user.uid,
@@ -1114,12 +1124,40 @@ pub(crate) async fn replace_resource<S: Store>(
     let new_rv = put_result.map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
 
     obj.set_resource_version(new_rv);
+    apply_cluster_write_effects(
+        &state,
+        &group,
+        &version,
+        &plural,
+        &name,
+        &mut obj.body,
+        new_rv,
+    )
+    .await;
+    inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+    Ok(Json(obj.body).into_response())
+}
+
+/// Index, cache and synthetic-status updates that must follow every persisted write of a
+/// cluster-scoped built-in (POST, PUT, SSA create): without them an object written by one path
+/// is invisible to the authorizer, the webhook/APIService/APF caches, or the status pollers
+/// that the other paths feed.
+async fn apply_cluster_write_effects<S: Store>(
+    state: &AppState<S>,
+    group: &str,
+    version: &str,
+    plural: &str,
+    name: &str,
+    body: &mut serde_json::Value,
+    rv: u64,
+) {
+    let key = group_object_key(group, plural, None, name);
     if group == RBAC_GROUP {
-        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
-        state.rbac_index.apply_object(&rbac_key, &obj.body);
+        let rbac_key = rbac_cluster_key(group, version, plural, name);
+        state.rbac_index.apply_object(&rbac_key, body);
     }
     if group == ADMISSION_GROUP {
-        state.refresh_admission_config(&plural).await;
+        state.refresh_admission_config(plural).await;
     }
     if group == APISERVICE_GROUP {
         state.refresh_apiservice_cache().await;
@@ -1127,13 +1165,11 @@ pub(crate) async fn replace_resource<S: Store>(
     if group == FLOWCONTROL_GROUP {
         state.refresh_flowcontrol_cache().await;
         if plural == PLC_PLURAL {
-            record_priority_level_metric(&obj.body);
+            record_priority_level_metric(body);
         }
     }
-    write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
-    write_flowcontrol_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
-    inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
-    Ok(Json(obj.body).into_response())
+    write_vap_status(&*state.store, group, plural, &key, body, rv).await;
+    write_flowcontrol_status(&*state.store, group, plural, &key, body, rv).await;
 }
 
 pub(crate) async fn delete_resource<S: Store>(
@@ -1524,6 +1560,9 @@ pub(crate) async fn do_patch<S: Store>(
         .map_err(crate::field_manager::Conflict::into_status)?;
         resolve_valid_name(&mut obj, group, plural, &meta.kind)?;
         stamp_metadata(&mut obj);
+        if meta.kind == "VolumeAttributesClass" {
+            add_vac_protection_finalizer(&mut obj);
+        }
         // An SSA apply-create is a create just like create_resource/create_namespaced_resource
         // — without this, `kubectl apply --server-side` on a not-yet-existing built-in with a
         // status subresource persisted whatever `status` the client's apply manifest carried,
@@ -1886,12 +1925,27 @@ pub(crate) async fn do_patch<S: Store>(
         // which SSAs every manifest in the well-known manifest dir including coredns.yaml) is
         // persisted correctly but never enters the authorizer's index, so SubjectAccessReview
         // denies every request until the object is later touched by an ordinary PATCH/PUT.
-        if group == RBAC_GROUP {
-            let rbac_key = match ns {
-                None => rbac_cluster_key(group, version, plural, name),
-                Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
-            };
-            state.rbac_index.apply_object(&rbac_key, &obj.body);
+        if group.is_empty() && plural == "namespaces" {
+            super::namespaces::seed_root_ca_configmap(state, name).await;
+        }
+        match ns {
+            None => {
+                apply_cluster_write_effects(
+                    state,
+                    group,
+                    version,
+                    plural,
+                    name,
+                    &mut obj.body,
+                    new_rv,
+                )
+                .await;
+            }
+            Some(namespace) if group == RBAC_GROUP => {
+                let rbac_key = rbac_namespaced_key(group, version, namespace, plural, name);
+                state.rbac_index.apply_object(&rbac_key, &obj.body);
+            }
+            Some(_) => {}
         }
         // ResourceQuota: refresh status.used so a count/* quota's usage reflects this
         // SSA-create, matching create_namespaced_resource's own update_quota_status call.
@@ -4075,9 +4129,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         )
     };
 
-    // PodCertificateRequest forbids create-on-update (upstream AllowCreateOnUpdate=false): a
-    // PUT must not bypass the POST-only NodeRestriction by creating the object.
-    if !object_existed && group == "certificates.k8s.io" && plural == "podcertificaterequests" {
+    if !object_existed && !allows_create_on_update(&group, &plural) {
         return Err(Status::not_found(&group, &plural, &name));
     }
 
@@ -4174,6 +4226,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
 
     if !object_existed {
         resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
+        stamp_metadata(&mut obj);
     }
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
@@ -4220,7 +4273,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         resource: &plural,
         name: &name,
         namespace: Some(&ns),
-        operation: "UPDATE",
+        operation: if object_existed { "UPDATE" } else { "CREATE" },
         user_info: Some(serde_json::json!({
             "username": user.username,
             "uid": user.uid,
@@ -4395,6 +4448,9 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     if group == RBAC_GROUP {
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
+    }
+    if !object_existed {
+        quota::update_quota_status(&state, &ns).await;
     }
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     Ok(Json(obj.body).into_response())
@@ -5769,6 +5825,60 @@ mod tests {
             groups: vec![],
             extra: Default::default(),
         })
+    }
+
+    /// Seeds a cluster-scoped object through POST: kinds upstream refuses create-on-update for
+    /// have no other create path.
+    async fn post_seed_cluster(
+        state: &crate::state::AppState,
+        group: &str,
+        version: &str,
+        plural: &str,
+        body: &serde_json::Value,
+    ) -> serde_json::Value {
+        use axum::extract::{Path, Query, State};
+        let resp = create_resource(
+            State(state.clone()),
+            Path((group.into(), version.into(), plural.into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed POST of {plural} must succeed: {e:?}"))
+        .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Namespaced counterpart of `post_seed_cluster`.
+    async fn post_seed_namespaced(
+        state: &crate::state::AppState,
+        group: &str,
+        version: &str,
+        ns: &str,
+        plural: &str,
+        body: &serde_json::Value,
+    ) -> serde_json::Value {
+        use axum::extract::{Path, Query, State};
+        let resp = create_namespaced_resource(
+            State(state.clone()),
+            Path((group.into(), version.into(), ns.into(), plural.into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed POST of {plural} must succeed: {e:?}"))
+        .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     // -- cr_status_put_updates_status_field --
@@ -7684,7 +7794,7 @@ mod tests {
     /// still succeed, proving the fix gates on "object didn't already exist" rather than
     /// blanket-denying every PUT.
     #[tokio::test]
-    async fn replace_namespaced_resource_put_create_denies_second_configmap_when_count_quota_at_limit(
+    async fn replace_namespaced_resource_put_create_denies_second_service_when_count_quota_at_limit(
     ) {
         let state = make_state();
         let ns = "default";
@@ -7693,7 +7803,7 @@ mod tests {
             "apiVersion": "v1",
             "kind": "ResourceQuota",
             "metadata": { "name": "cm-quota", "namespace": ns },
-            "spec": { "hard": { "count/configmaps": "1" } }
+            "spec": { "hard": { "count/services": "1" } }
         });
         state
             .store
@@ -7707,9 +7817,9 @@ mod tests {
 
         let cm1 = serde_json::json!({
             "apiVersion": "v1",
-            "kind": "ConfigMap",
+            "kind": "Service",
             "metadata": { "name": "cm-1", "namespace": ns },
-            "data": { "k": "v" }
+            "spec": { "type": "ExternalName", "externalName": "x.example.com" }
         });
         let first = replace_namespaced_resource(
             axum::extract::State(state.clone()),
@@ -7717,7 +7827,7 @@ mod tests {
                 "".to_string(),
                 "v1".to_string(),
                 ns.to_string(),
-                "configmaps".to_string(),
+                "services".to_string(),
                 "cm-1".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
@@ -7735,9 +7845,9 @@ mod tests {
 
         let cm2 = serde_json::json!({
             "apiVersion": "v1",
-            "kind": "ConfigMap",
+            "kind": "Service",
             "metadata": { "name": "cm-2", "namespace": ns },
-            "data": { "k": "v" }
+            "spec": { "type": "ExternalName", "externalName": "x.example.com" }
         });
         let second = replace_namespaced_resource(
             axum::extract::State(state.clone()),
@@ -7745,7 +7855,7 @@ mod tests {
                 "".to_string(),
                 "v1".to_string(),
                 ns.to_string(),
-                "configmaps".to_string(),
+                "services".to_string(),
                 "cm-2".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
@@ -7756,17 +7866,17 @@ mod tests {
         .await;
         assert!(
             second.is_err(),
-            "PUT create-on-missing must be denied once count/configmaps=1 is already \
+            "PUT create-on-missing must be denied once count/services=1 is already \
              claimed — without ResourceQuota admission wired into \
              replace_namespaced_resource's create-on-missing branch, `kubectl replace` (or \
              any PUT resolving to a create) bypasses built-in resource quota enforcement \
              entirely"
         );
 
-        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "cm-2");
+        let key = crate::keys::group_object_key("", "services", Some(ns), "cm-2");
         assert!(
             state.store.get(&key).await.unwrap().is_none(),
-            "the over-quota ConfigMap must not have been created in the store"
+            "the over-quota Service must not have been created in the store"
         );
     }
 
@@ -7787,7 +7897,7 @@ mod tests {
             "apiVersion": "v1",
             "kind": "ResourceQuota",
             "metadata": { "name": "cm-quota", "namespace": ns },
-            "spec": { "hard": { "count/configmaps": "1" } }
+            "spec": { "hard": { "count/services": "1" } }
         });
         state
             .store
@@ -7801,9 +7911,9 @@ mod tests {
 
         let cm1 = serde_json::json!({
             "apiVersion": "v1",
-            "kind": "ConfigMap",
+            "kind": "Service",
             "metadata": { "name": "cm-1", "namespace": ns },
-            "data": { "k": "v" }
+            "spec": { "type": "ExternalName", "externalName": "x.example.com" }
         });
         replace_namespaced_resource(
             axum::extract::State(state.clone()),
@@ -7811,7 +7921,7 @@ mod tests {
                 "".to_string(),
                 "v1".to_string(),
                 ns.to_string(),
-                "configmaps".to_string(),
+                "services".to_string(),
                 "cm-1".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
@@ -7824,9 +7934,9 @@ mod tests {
 
         let cm2 = serde_json::json!({
             "apiVersion": "v1",
-            "kind": "ConfigMap",
+            "kind": "Service",
             "metadata": { "name": "cm-2", "namespace": ns },
-            "data": { "k": "v" }
+            "spec": { "type": "ExternalName", "externalName": "x.example.com" }
         });
         let dry_run_result = replace_namespaced_resource(
             axum::extract::State(state.clone()),
@@ -7834,7 +7944,7 @@ mod tests {
                 "".to_string(),
                 "v1".to_string(),
                 ns.to_string(),
-                "configmaps".to_string(),
+                "services".to_string(),
                 "cm-2".to_string(),
             )),
             axum::extract::Query(ReplaceQuery {
@@ -7848,12 +7958,12 @@ mod tests {
         .await;
         assert!(
             dry_run_result.is_err(),
-            "`kubectl replace --dry-run=server` over an exhausted count/configmaps=1 quota \
+            "`kubectl replace --dry-run=server` over an exhausted count/services=1 quota \
              must be denied exactly like a real create — the dry-run early-return must not \
              skip quota admission"
         );
 
-        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "cm-2");
+        let key = crate::keys::group_object_key("", "services", Some(ns), "cm-2");
         assert!(
             state.store.get(&key).await.unwrap().is_none(),
             "dry-run must never persist the object regardless of admission outcome"
@@ -7893,7 +8003,7 @@ mod tests {
 
         let cm = serde_json::json!({
             "apiVersion": "v1",
-            "kind": "ConfigMap",
+            "kind": "Service",
             "metadata": { "name": "test-cm", "namespace": ns }
         });
 
@@ -7903,7 +8013,7 @@ mod tests {
                 "".to_string(),
                 "v1".to_string(),
                 ns.to_string(),
-                "configmaps".to_string(),
+                "services".to_string(),
                 "test-cm".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
@@ -7927,10 +8037,10 @@ mod tests {
             "Terminating namespace must return 403 Forbidden for PUT-create just like POST"
         );
 
-        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "test-cm");
+        let key = crate::keys::group_object_key("", "services", Some(ns), "test-cm");
         assert!(
             state.store.get(&key).await.unwrap().is_none(),
-            "the ConfigMap must not have been created in the Terminating namespace"
+            "the Service must not have been created in the Terminating namespace"
         );
     }
 
@@ -7940,16 +8050,16 @@ mod tests {
     /// root-ca-cert publisher) leave orphans no namespace controller will ever drain.
     ///
     /// Fails on revert: without the store-level NamespaceNotFound gate each path returns
-    /// 201/200 and persists the ConfigMap.
+    /// 201/200 and persists the Service.
     #[tokio::test]
     async fn namespaced_creates_into_a_missing_namespace_are_404_on_every_create_path() {
         let state = make_state();
         let ns = "ghost-ns";
         let cm = serde_json::json!({
             "apiVersion": "v1",
-            "kind": "ConfigMap",
+            "kind": "Service",
             "metadata": { "name": "orphan", "namespace": ns },
-            "data": { "k": "v" }
+            "spec": { "type": "ExternalName", "externalName": "x.example.com" }
         });
         let body = bytes::Bytes::from(serde_json::to_vec(&cm).unwrap());
         let path = || {
@@ -7957,7 +8067,7 @@ mod tests {
                 "".to_string(),
                 "v1".to_string(),
                 ns.to_string(),
-                "configmaps".to_string(),
+                "services".to_string(),
                 "orphan".to_string(),
             ))
         };
@@ -7968,7 +8078,7 @@ mod tests {
                 "".to_string(),
                 "v1".to_string(),
                 ns.to_string(),
-                "configmaps".to_string(),
+                "services".to_string(),
             )),
             axum::extract::Query(CreateQuery::default()),
             test_user(),
@@ -8015,7 +8125,7 @@ mod tests {
                 "{label}: message must match upstream NamespaceLifecycle"
             );
         }
-        let key = crate::keys::group_object_key("", "configmaps", Some(ns), "orphan");
+        let key = crate::keys::group_object_key("", "services", Some(ns), "orphan");
         assert!(
             state.store.get(&key).await.unwrap().is_none(),
             "no create path may leave an orphan in a namespace that does not exist"
@@ -11559,8 +11669,8 @@ mod tests {
         );
     }
 
-    /// replace_resource (PUT) on a new object with no resourceVersion creates it.
-    /// When no resourceVersion is given, this is an unconditional write (create-or-update).
+    /// replace_resource (PUT) on a new object of a kind whose upstream strategy allows
+    /// create-on-update (RuntimeClass) creates it.
     #[tokio::test]
     async fn replace_resource_creates_object_when_no_resource_version() {
         use axum::extract::{Path, State};
@@ -11569,18 +11679,18 @@ mod tests {
         let state = make_state();
 
         let csinode = serde_json::json!({
-            "apiVersion": "storage.k8s.io/v1",
-            "kind": "CSINode",
+            "apiVersion": "node.k8s.io/v1",
+            "kind": "RuntimeClass",
             "metadata": { "name": "replace-node" },
-            "spec": { "drivers": [] }
+            "handler": "runc"
         });
 
         let rr_result = replace_resource(
             State(state),
             Path((
-                "storage.k8s.io".into(),
+                "node.k8s.io".into(),
                 "v1".into(),
-                "csinodes".into(),
+                "runtimeclasses".into(),
                 "replace-node".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
@@ -11605,9 +11715,7 @@ mod tests {
     /// replace_resource (PUT) with matching resourceVersion updates the object.
     #[tokio::test]
     async fn replace_resource_updates_object_with_matching_rv() {
-        use axum::body::to_bytes;
         use axum::extract::{Path, State};
-        use axum::response::IntoResponse;
         use std::sync::Arc;
         use u7s_store::SqliteStore;
 
@@ -11620,39 +11728,13 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        // First PUT — no rv → creates
         let v1 = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
             "kind": "CSINode",
             "metadata": { "name": "rv-node" },
             "spec": { "drivers": [] }
         });
-        let rr1 = replace_resource(
-            State(state.clone()),
-            Path((
-                "storage.k8s.io".into(),
-                "v1".into(),
-                "csinodes".into(),
-                "rv-node".into(),
-            )),
-            axum::extract::Query(ReplaceQuery::default()),
-            Extension(crate::auth::UserInfo {
-                username: "admin".into(),
-                uid: String::new(),
-                groups: vec!["system:masters".into()],
-                extra: Default::default(),
-            }),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&v1).unwrap()),
-        )
-        .await;
-        let resp1 = match rr1 {
-            Ok(r) => r.into_response(),
-            Err(_) => panic!("first replace must succeed"),
-        };
-
-        let body = to_bytes(resp1.into_body(), usize::MAX).await.unwrap();
-        let stored: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let stored = post_seed_cluster(&state, "storage.k8s.io", "v1", "csinodes", &v1).await;
         let rv = stored["metadata"]["resourceVersion"]
             .as_str()
             .unwrap()
@@ -11706,29 +11788,7 @@ mod tests {
             "metadata": { "name": "stale-node" },
             "spec": { "drivers": [] }
         });
-        match replace_resource(
-            State(state.clone()),
-            Path((
-                "storage.k8s.io".into(),
-                "v1".into(),
-                "csinodes".into(),
-                "stale-node".into(),
-            )),
-            axum::extract::Query(ReplaceQuery::default()),
-            Extension(crate::auth::UserInfo {
-                username: "admin".into(),
-                uid: String::new(),
-                groups: vec!["system:masters".into()],
-                extra: Default::default(),
-            }),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&v1).unwrap()),
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(_) => panic!("first replace must succeed"),
-        }
+        post_seed_cluster(&state, "storage.k8s.io", "v1", "csinodes", &v1).await;
 
         // Try with a known-stale rv
         let stale = serde_json::json!({
@@ -14580,15 +14640,15 @@ mod tests {
         // client that relies on the server to stamp TypeMeta on the response.
         let csinode_without_type_meta = serde_json::json!({
             "metadata": { "name": "no-type-meta-node" },
-            "spec": { "drivers": [] }
+            "handler": "runc"
         });
 
         let resp = replace_resource(
             State(state),
             Path((
-                "storage.k8s.io".into(),
+                "node.k8s.io".into(),
                 "v1".into(),
-                "csinodes".into(),
+                "runtimeclasses".into(),
                 "no-type-meta-node".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
@@ -14603,13 +14663,13 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            v["kind"], "CSINode",
+            v["kind"], "RuntimeClass",
             "PUT response must include kind even when the request body lacks it; \
              dynamic/unstructured clients reject the response with 'Object Kind is missing' \
              otherwise, breaking every dynamic-client Update (e.g. Deployment lifecycle conformance)"
         );
         assert_eq!(
-            v["apiVersion"], "storage.k8s.io/v1",
+            v["apiVersion"], "node.k8s.io/v1",
             "PUT response must include apiVersion even when the request body lacks it; \
              dynamic clients require both kind and apiVersion to decode an Update response"
         );
@@ -21607,11 +21667,10 @@ mod tests {
     #[tokio::test]
     async fn replace_immutable_secret_returns_422() {
         use axum::extract::{Path, Query, State};
-        use axum::response::IntoResponse;
 
         let state = make_state();
 
-        // Step 1: create the secret with immutable:true via PUT (upsert)
+        // Step 1: create the secret with immutable:true via POST
         let secret_v1 = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
@@ -21619,24 +21678,7 @@ mod tests {
             "immutable": true,
             "data": { "key1": "dmFsdWUx" }
         });
-        let result = replace_namespaced_resource(
-            State(state.clone()),
-            Path((
-                String::new(),
-                "v1".into(),
-                "default".into(),
-                "secrets".into(),
-                "my-immutable".into(),
-            )),
-            Query(ReplaceQuery::default()),
-            test_user(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&secret_v1).unwrap()),
-        )
-        .await;
-        let _ = result
-            .expect("initial secret create must succeed")
-            .into_response();
+        post_seed_namespaced(&state, "", "v1", "default", "secrets", &secret_v1).await;
 
         // Step 2: try to modify data — must be rejected with 422
         let secret_v2 = serde_json::json!({
@@ -21686,7 +21728,6 @@ mod tests {
     #[tokio::test]
     async fn patch_immutable_secret_returns_422() {
         use axum::extract::{Path, Query, State};
-        use axum::response::IntoResponse;
 
         let state = make_state();
 
@@ -21698,24 +21739,7 @@ mod tests {
             "immutable": true,
             "data": { "key1": "dmFsdWUx" }
         });
-        let result = replace_namespaced_resource(
-            State(state.clone()),
-            Path((
-                String::new(),
-                "v1".into(),
-                "default".into(),
-                "secrets".into(),
-                "patched-immutable".into(),
-            )),
-            Query(ReplaceQuery::default()),
-            test_user(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&secret_v1).unwrap()),
-        )
-        .await;
-        let _ = result
-            .expect("initial secret create must succeed")
-            .into_response();
+        post_seed_namespaced(&state, "", "v1", "default", "secrets", &secret_v1).await;
 
         // Step 2: PATCH to modify data — must be rejected with 422
         let patch = serde_json::json!({ "data": { "key1": "bmV3dmFsdWU=" } });
@@ -21778,24 +21802,7 @@ mod tests {
             "immutable": true,
             "data": { "key1": "dmFsdWUx" }
         });
-        let result = replace_namespaced_resource(
-            State(state.clone()),
-            Path((
-                String::new(),
-                "v1".into(),
-                "default".into(),
-                "secrets".into(),
-                "labelled-immutable".into(),
-            )),
-            Query(ReplaceQuery::default()),
-            test_user(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&secret_v1).unwrap()),
-        )
-        .await;
-        let _ = result
-            .expect("initial secret create must succeed")
-            .into_response();
+        post_seed_namespaced(&state, "", "v1", "default", "secrets", &secret_v1).await;
 
         let patch = serde_json::json!({ "metadata": { "labels": { "team": "platform" } } });
         let mut merge_headers = json_headers();
@@ -21853,7 +21860,6 @@ mod tests {
     #[tokio::test]
     async fn patch_clearing_immutable_flag_on_secret_returns_422() {
         use axum::extract::{Path, Query, State};
-        use axum::response::IntoResponse;
 
         let state = make_state();
 
@@ -21864,24 +21870,7 @@ mod tests {
             "immutable": true,
             "data": { "key1": "dmFsdWUx" }
         });
-        let result = replace_namespaced_resource(
-            State(state.clone()),
-            Path((
-                String::new(),
-                "v1".into(),
-                "default".into(),
-                "secrets".into(),
-                "unfreeze-immutable".into(),
-            )),
-            Query(ReplaceQuery::default()),
-            test_user(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&secret_v1).unwrap()),
-        )
-        .await;
-        let _ = result
-            .expect("initial secret create must succeed")
-            .into_response();
+        post_seed_namespaced(&state, "", "v1", "default", "secrets", &secret_v1).await;
 
         let patch = serde_json::json!({ "immutable": false });
         let mut merge_headers = json_headers();
@@ -21940,24 +21929,7 @@ mod tests {
             "immutable": true,
             "data": { "key1": "value1" }
         });
-        let result = replace_namespaced_resource(
-            State(state.clone()),
-            Path((
-                String::new(),
-                "v1".into(),
-                "default".into(),
-                "configmaps".into(),
-                "labelled-immutable-cm".into(),
-            )),
-            Query(ReplaceQuery::default()),
-            test_user(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&cm_v1).unwrap()),
-        )
-        .await;
-        let _ = result
-            .expect("initial configmap create must succeed")
-            .into_response();
+        post_seed_namespaced(&state, "", "v1", "default", "configmaps", &cm_v1).await;
 
         let patch = serde_json::json!({ "metadata": { "labels": { "team": "platform" } } });
         let mut merge_headers = json_headers();
@@ -22010,7 +21982,6 @@ mod tests {
     #[tokio::test]
     async fn patch_data_on_immutable_configmap_returns_422() {
         use axum::extract::{Path, Query, State};
-        use axum::response::IntoResponse;
 
         let state = make_state();
 
@@ -22021,24 +21992,7 @@ mod tests {
             "immutable": true,
             "data": { "key1": "value1" }
         });
-        let result = replace_namespaced_resource(
-            State(state.clone()),
-            Path((
-                String::new(),
-                "v1".into(),
-                "default".into(),
-                "configmaps".into(),
-                "data-immutable-cm".into(),
-            )),
-            Query(ReplaceQuery::default()),
-            test_user(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&cm_v1).unwrap()),
-        )
-        .await;
-        let _ = result
-            .expect("initial configmap create must succeed")
-            .into_response();
+        post_seed_namespaced(&state, "", "v1", "default", "configmaps", &cm_v1).await;
 
         let patch = serde_json::json!({ "data": { "key1": "newvalue" } });
         let mut merge_headers = json_headers();
@@ -22085,7 +22039,6 @@ mod tests {
     #[tokio::test]
     async fn patch_clearing_immutable_flag_on_configmap_returns_422() {
         use axum::extract::{Path, Query, State};
-        use axum::response::IntoResponse;
 
         let state = make_state();
 
@@ -22096,24 +22049,7 @@ mod tests {
             "immutable": true,
             "data": { "key1": "value1" }
         });
-        let result = replace_namespaced_resource(
-            State(state.clone()),
-            Path((
-                String::new(),
-                "v1".into(),
-                "default".into(),
-                "configmaps".into(),
-                "unfreeze-immutable-cm".into(),
-            )),
-            Query(ReplaceQuery::default()),
-            test_user(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&cm_v1).unwrap()),
-        )
-        .await;
-        let _ = result
-            .expect("initial configmap create must succeed")
-            .into_response();
+        post_seed_namespaced(&state, "", "v1", "default", "configmaps", &cm_v1).await;
 
         let patch = serde_json::json!({ "immutable": false });
         let mut merge_headers = json_headers();
@@ -22164,7 +22100,6 @@ mod tests {
     #[tokio::test]
     async fn replace_priorityclass_value_is_immutable() {
         use axum::extract::{Path, Query, State};
-        use axum::response::IntoResponse;
 
         let state = make_state();
 
@@ -22175,23 +22110,7 @@ mod tests {
             "value": 1000,
             "description": "original"
         });
-        let result = replace_resource(
-            State(state.clone()),
-            Path((
-                "scheduling.k8s.io".into(),
-                "v1".into(),
-                "priorityclasses".into(),
-                "my-pc".into(),
-            )),
-            Query(ReplaceQuery::default()),
-            test_user(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&pc_v1).unwrap()),
-        )
-        .await;
-        let _ = result
-            .expect("initial priorityclass create must succeed")
-            .into_response();
+        post_seed_cluster(&state, "scheduling.k8s.io", "v1", "priorityclasses", &pc_v1).await;
 
         // Changing .value must be rejected with 422.
         let pc_changed_value = serde_json::json!({
@@ -22267,7 +22186,6 @@ mod tests {
     #[tokio::test]
     async fn patch_priorityclass_value_is_immutable() {
         use axum::extract::{Path, Query, State};
-        use axum::response::IntoResponse;
 
         let state = make_state();
 
@@ -22278,23 +22196,7 @@ mod tests {
             "value": 500,
             "description": "original"
         });
-        let result = replace_resource(
-            State(state.clone()),
-            Path((
-                "scheduling.k8s.io".into(),
-                "v1".into(),
-                "priorityclasses".into(),
-                "patched-pc".into(),
-            )),
-            Query(ReplaceQuery::default()),
-            test_user(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&pc_v1).unwrap()),
-        )
-        .await;
-        let _ = result
-            .expect("initial priorityclass create must succeed")
-            .into_response();
+        post_seed_cluster(&state, "scheduling.k8s.io", "v1", "priorityclasses", &pc_v1).await;
 
         let patch = serde_json::json!({ "value": 5000 });
         let mut merge_headers = json_headers();
@@ -30202,15 +30104,15 @@ mod tests {
         use axum::http::StatusCode;
         let state = make_state();
         let csinode = serde_json::json!({
-            "apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
-            "metadata": {"name": "Bad_Name"}, "spec": {"drivers": []}
+            "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+            "metadata": {"name": "Bad_Name"}, "handler": "runc"
         });
         let err = replace_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((
-                "storage.k8s.io".into(),
+                "node.k8s.io".into(),
                 "v1".into(),
-                "csinodes".into(),
+                "runtimeclasses".into(),
                 "Bad_Name".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
@@ -30224,7 +30126,7 @@ mod tests {
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
 
         let cm = serde_json::json!({
-            "apiVersion": "v1", "kind": "ConfigMap",
+            "apiVersion": "v1", "kind": "Endpoints",
             "metadata": {"name": "Bad_Name", "namespace": "default"}
         });
         let err = replace_namespaced_resource(
@@ -30233,7 +30135,7 @@ mod tests {
                 "".into(),
                 "v1".into(),
                 "default".into(),
-                "configmaps".into(),
+                "endpoints".into(),
                 "Bad_Name".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
@@ -30940,11 +30842,14 @@ mod tests {
     /// `body` — the `AdmissionContext` field every `run_mutating_webhooks` call site in
     /// this codebase builds right above the call.
     fn nearest_preceding_operation(body: &str, before: usize) -> Option<&str> {
-        let marker = "operation: \"";
+        let marker = "operation: ";
         let start = body[..before].rfind(marker)? + marker.len();
+        // A PUT that may create picks its operation with `if existed { "UPDATE" } else
+        // { "CREATE" }`; the first literal is the one this scan classifies the site by.
         let rest = &body[start..];
-        let end = rest.find('"')?;
-        Some(&rest[..end])
+        let open = rest.find('"')? + 1;
+        let end = rest[open..].find('"')?;
+        Some(&rest[open..open + end])
     }
 
     /// Byte offset of the next store-write entry point (`.put(` or
@@ -30960,5 +30865,323 @@ mod tests {
             (None, Some(b)) => from + b,
             (None, None) => body.len(),
         }
+    }
+
+    // -- create-on-update: PUT/SSA on a missing object must not skip create-time admission --
+
+    async fn put_missing(
+        state: &AppState,
+        group: &str,
+        version: &str,
+        plural: &str,
+        ns: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, axum::http::StatusCode> {
+        let name = body["metadata"]["name"].as_str().unwrap().to_string();
+        let bytes = bytes::Bytes::from(serde_json::to_vec(body).unwrap());
+        let resp = match ns {
+            None => replace_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((group.into(), version.into(), plural.into(), name)),
+                axum::extract::Query(ReplaceQuery::default()),
+                admin_ext(),
+                json_headers(),
+                bytes,
+            )
+            .await
+            .map(IntoResponse::into_response),
+            Some(ns) => replace_namespaced_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((group.into(), version.into(), ns.into(), plural.into(), name)),
+                axum::extract::Query(ReplaceQuery::default()),
+                admin_ext(),
+                json_headers(),
+                bytes,
+            )
+            .await
+            .map(IntoResponse::into_response),
+        }
+        .map_err(|e| e.0)?;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        Ok(serde_json::from_slice(&body).unwrap())
+    }
+
+    /// A PUT on a missing object skips every POST-only check (NodeRestriction, finalizers,
+    /// allocation, defaulting), so for kinds whose upstream strategy has
+    /// AllowCreateOnUpdate=false it must be a 404 and must persist nothing.
+    #[tokio::test]
+    async fn put_on_a_missing_object_is_404_for_kinds_upstream_forbids_create_on_update_because_it_bypasses_create_admission(
+    ) {
+        let state = make_state();
+        let cluster: &[(&str, &str, &str)] = &[
+            ("", "v1", "nodes"),
+            ("", "v1", "persistentvolumes"),
+            ("certificates.k8s.io", "v1", "clustertrustbundles"),
+            ("storage.k8s.io", "v1", "volumeattributesclasses"),
+            ("storage.k8s.io", "v1", "csinodes"),
+            ("scheduling.k8s.io", "v1", "priorityclasses"),
+        ];
+        let namespaced: &[(&str, &str, &str)] = &[
+            ("", "v1", "configmaps"),
+            ("", "v1", "secrets"),
+            ("", "v1", "serviceaccounts"),
+            ("", "v1", "persistentvolumeclaims"),
+            ("apps", "v1", "deployments"),
+            ("batch", "v1", "jobs"),
+            ("discovery.k8s.io", "v1", "endpointslices"),
+            ("certificates.k8s.io", "v1", "podcertificaterequests"),
+        ];
+        for (group, version, plural) in cluster {
+            let body = serde_json::json!({"metadata": {"name": "ghost"}});
+            let status = put_missing(&state, group, version, plural, None, &body)
+                .await
+                .expect_err(&format!("PUT-create of {plural} must be refused"));
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{plural}");
+            let key = crate::keys::group_object_key(group, plural, None, "ghost");
+            assert!(state.store.get(&key).await.unwrap().is_none(), "{plural}");
+        }
+        for (group, version, plural) in namespaced {
+            let body = serde_json::json!({"metadata": {"name": "ghost", "namespace": "default"}});
+            let status = put_missing(&state, group, version, plural, Some("default"), &body)
+                .await
+                .expect_err(&format!("PUT-create of {plural} must be refused"));
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{plural}");
+            let key = crate::keys::group_object_key(group, plural, Some("default"), "ghost");
+            assert!(state.store.get(&key).await.unwrap().is_none(), "{plural}");
+        }
+    }
+
+    /// The allow-list is upstream's AllowCreateOnUpdate=true set (release-1.37
+    /// pkg/registry/**/strategy.go); widening it re-opens the create bypass above for that kind.
+    #[test]
+    fn allows_create_on_update_is_exactly_the_upstream_true_set() {
+        for (group, plural) in [
+            ("", "services"),
+            ("", "endpoints"),
+            ("", "events"),
+            ("", "limitranges"),
+            ("events.k8s.io", "events"),
+            (RBAC_GROUP, "roles"),
+            (RBAC_GROUP, "rolebindings"),
+            (RBAC_GROUP, "clusterroles"),
+            (RBAC_GROUP, "clusterrolebindings"),
+            ("coordination.k8s.io", "leases"),
+            ("coordination.k8s.io", "leasecandidates"),
+            ("node.k8s.io", "runtimeclasses"),
+        ] {
+            assert!(allows_create_on_update(group, plural), "{group}/{plural}");
+        }
+        for (group, plural) in [
+            ("", "nodes"),
+            ("", "configmaps"),
+            ("", "secrets"),
+            ("", "serviceaccounts"),
+            ("", "persistentvolumes"),
+            ("", "persistentvolumeclaims"),
+            ("", "resourcequotas"),
+            ("apps", "deployments"),
+            ("certificates.k8s.io", "clustertrustbundles"),
+            ("certificates.k8s.io", "certificatesigningrequests"),
+            ("certificates.k8s.io", "podcertificaterequests"),
+            ("discovery.k8s.io", "endpointslices"),
+            ("storage.k8s.io", "volumeattributesclasses"),
+            (
+                "admissionregistration.k8s.io",
+                "validatingwebhookconfigurations",
+            ),
+            ("apiregistration.k8s.io", "apiservices"),
+        ] {
+            assert!(!allows_create_on_update(group, plural), "{group}/{plural}");
+        }
+    }
+
+    /// A PUT-create is a create: the server, not the client, owns uid and creationTimestamp.
+    /// Without stamping, a client-chosen uid forges identity against ownerReferences and GC.
+    #[tokio::test]
+    async fn put_create_stamps_server_owned_uid_and_creation_timestamp_because_a_client_uid_would_forge_identity(
+    ) {
+        let state = make_state();
+        let rc = serde_json::json!({
+            "metadata": {"name": "forged-rc", "uid": "client-chosen"}, "handler": "runc"
+        });
+        let created = put_missing(&state, "node.k8s.io", "v1", "runtimeclasses", None, &rc)
+            .await
+            .expect("RuntimeClass allows create-on-update");
+        assert_ne!(created["metadata"]["uid"], "client-chosen");
+        assert!(!created["metadata"]["uid"].as_str().unwrap_or("").is_empty());
+        assert!(created["metadata"]["creationTimestamp"].is_string());
+
+        let ep = serde_json::json!({
+            "metadata": {"name": "forged-ep", "namespace": "default", "uid": "client-chosen"}
+        });
+        let created = put_missing(&state, "", "v1", "endpoints", Some("default"), &ep)
+            .await
+            .expect("Endpoints allows create-on-update");
+        assert_ne!(created["metadata"]["uid"], "client-chosen");
+        assert!(!created["metadata"]["uid"].as_str().unwrap_or("").is_empty());
+        assert!(created["metadata"]["creationTimestamp"].is_string());
+    }
+
+    /// A webhook registered for CREATE must see a PUT that creates; reporting it as UPDATE lets
+    /// the create skip every CREATE-scoped policy webhook.
+    #[tokio::test]
+    async fn put_create_runs_mutating_webhooks_as_a_create_operation_because_create_policies_must_see_it(
+    ) {
+        let state = make_state();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_capturing_mutating_webhook_server(std::sync::Arc::clone(&captured)).await;
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": { "name": "create-only" },
+            "webhooks": [{
+                "name": "create-only.test.example.com",
+                "clientConfig": { "url": url },
+                "rules": [{
+                    "apiGroups": [""], "apiVersions": ["*"], "resources": ["endpoints"],
+                    "operations": ["CREATE"]
+                }],
+                "sideEffects": "None",
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/create-only",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ep = serde_json::json!({"metadata": {"name": "hooked", "namespace": "default"}});
+        put_missing(&state, "", "v1", "endpoints", Some("default"), &ep)
+            .await
+            .expect("PUT-create must succeed");
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("a CREATE-scoped webhook must be called for a PUT that creates");
+        assert_eq!(review["request"]["operation"], "CREATE");
+        assert!(review["request"]["oldObject"].is_null());
+    }
+
+    /// SSA-create of a VolumeAttributesClass must get the vac-protection finalizer POST gives
+    /// it, or the class can be deleted while PVs still reference it.
+    #[tokio::test]
+    async fn ssa_create_of_a_volumeattributesclass_gets_the_protection_finalizer_like_post() {
+        let state = make_state();
+        let vac = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1", "kind": "VolumeAttributesClass",
+            "metadata": {"name": "ssa-vac"}, "driverName": "x.csi.io",
+            "parameters": {"iops": "100"}
+        });
+        let status = ssa_create_cluster(
+            &state,
+            "storage.k8s.io",
+            "volumeattributesclasses",
+            "ssa-vac",
+            vac,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let key = crate::keys::group_object_key(
+            "storage.k8s.io",
+            "volumeattributesclasses",
+            None,
+            "ssa-vac",
+        );
+        let stored: serde_json::Value =
+            serde_json::from_slice(&state.store.get(&key).await.unwrap().unwrap().value).unwrap();
+        assert_eq!(
+            stored["metadata"]["finalizers"],
+            serde_json::json!(["kubernetes.io/vac-protection"])
+        );
+    }
+
+    /// SSA-create must run the same post-persist effects as POST: a created ValidatingAdmissionPolicy
+    /// gets its synthetic status, which conformance pollers wait for.
+    #[tokio::test]
+    async fn ssa_create_of_a_validatingadmissionpolicy_gets_its_status_like_post() {
+        let state = make_state();
+        let vap = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": { "name": "ssa-vap" },
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{ "apiGroups": [""], "apiVersions": ["v1"],
+                                        "operations": ["CREATE"], "resources": ["pods"] }]
+                },
+                "validations": [{ "expression": "true" }]
+            }
+        });
+        let status = ssa_create_cluster(
+            &state,
+            "admissionregistration.k8s.io",
+            "validatingadmissionpolicies",
+            "ssa-vap",
+            vap,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        let key = crate::keys::group_object_key(
+            "admissionregistration.k8s.io",
+            "validatingadmissionpolicies",
+            None,
+            "ssa-vap",
+        );
+        let stored: serde_json::Value =
+            serde_json::from_slice(&state.store.get(&key).await.unwrap().unwrap().value).unwrap();
+        assert!(
+            stored["status"]["observedGeneration"].as_i64().unwrap_or(0) >= 1,
+            "SSA-created VAP must get status.observedGeneration like POST: {:?}",
+            stored["status"]
+        );
+    }
+
+    /// SSA-create of a Namespace must stamp kubernetes.io/metadata.name and seed
+    /// kube-root-ca.crt like POST: namespaceSelectors match on the label, and pods hang
+    /// mounting a missing root CA ConfigMap.
+    #[tokio::test]
+    async fn ssa_create_of_a_namespace_gets_name_label_and_root_ca_configmap_like_post() {
+        let mut state = make_state();
+        state.cluster_ca_der = Some(std::sync::Arc::new(vec![1, 2, 3]));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        super::super::namespaces::patch_namespace(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("ssa-ns".to_string()),
+            axum::extract::Query(PatchQuery::default()),
+            admin_ext(),
+            headers,
+            bytes::Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ssa-ns"}
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SSA-create of a Namespace must succeed: {:?}", e.0));
+        let key = crate::keys::cluster_object_key("namespaces", "ssa-ns");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&state.store.get(&key).await.unwrap().unwrap().value).unwrap();
+        assert_eq!(
+            stored["metadata"]["labels"]["kubernetes.io/metadata.name"],
+            "ssa-ns"
+        );
+        let cm_key = crate::keys::object_key("configmaps", "ssa-ns", "kube-root-ca.crt");
+        assert!(
+            state.store.get(&cm_key).await.unwrap().is_some(),
+            "SSA-created namespace must get kube-root-ca.crt"
+        );
     }
 }

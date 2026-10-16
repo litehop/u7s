@@ -197,6 +197,24 @@ impl Status {
         )
     }
 
+    /// Upstream's 422 for an apply patch without `?fieldManager=` (`ValidatePatchOptions`).
+    pub fn apply_field_manager_required() -> StatusError {
+        let detail = "Required value: is required for apply patch";
+        let mut e = Status::unprocessable_entity(format!(
+            "PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: {detail}"
+        ));
+        e.1.details = Some(Box::new(serde_json::json!({
+            "group": "meta.k8s.io",
+            "kind": "PatchOptions",
+            "causes": [{
+                "reason": "FieldValueRequired",
+                "message": detail,
+                "field": "fieldManager"
+            }]
+        })));
+        e
+    }
+
     pub fn expired(message: String) -> StatusError {
         StatusError(
             StatusCode::GONE,

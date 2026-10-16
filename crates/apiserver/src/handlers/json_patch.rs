@@ -2628,6 +2628,8 @@ mod tests {
         "release_service_ip",
         "allocate_service_ip",
         "propagate_rs_revision_to_deployment",
+        // Called only by create_namespace and do_patch's SSA-create, after their dry-run returns.
+        "seed_root_ca_configmap",
         // Background APIService health-probe reconciler (reconcile_apiservice_availability /
         // ensure_availability_checked) — runs off a timer / a GET's side effect, never as part
         // of any client write request, so no dryRun=All ever reaches it to check.
