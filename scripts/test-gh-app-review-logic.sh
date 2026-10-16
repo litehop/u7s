@@ -137,24 +137,24 @@ assert "the review payload piped to the wrapper's stdin reaches curl's request b
   "$([ "$(cat "$CURL_BODY_CAPTURE" 2>/dev/null)" = "$PAYLOAD" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 5b. --repo selects the target repo; default stays litehop/u7s.
+# 5b. Optional owner/repo second argument; default stays litehop/u7s.
 # ---------------------------------------------------------------------------
 curl_url() { tail -n 1 "$CURL_ARGV_CAPTURE"; }
 
-assert "with no --repo the review POSTs to litehop/u7s -- existing callers must not change target" \
+assert "with no repo argument the review POSTs to litehop/u7s -- existing callers must not change target" \
   "$([ "$(curl_url)" = "https://api.github.com/repos/litehop/u7s/pulls/482/reviews" ] && echo 1 || echo 0)"
 
 rm -f "$CURL_ARGV_CAPTURE" "$CURL_CALLED_MARKER"
-RUN_OUT=$(printf '%s' "$PAYLOAD" | PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" --repo litehop/politeia 77 2>"$WORK/stderr") \
+RUN_OUT=$(printf '%s' "$PAYLOAD" | PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" 77 litehop/politeia 2>"$WORK/stderr") \
   && RUN_RC=0 || RUN_RC=$?
-assert "--repo litehop/politeia POSTs to politeia -- otherwise critical reviews on other repos 404 or land on the wrong PR" \
+assert "an explicit litehop/politeia POSTs to politeia -- otherwise reviews on other repos land on the same-numbered u7s PR" \
   "$([ "$RUN_RC" -eq 0 ] && [ "$(curl_url)" = "https://api.github.com/repos/litehop/politeia/pulls/77/reviews" ] && echo 1 || echo 0)"
 
-for BAD in "politeia" "litehop/politeia/extra" "litehop/po litia" 'litehop/x"y' "/politeia"; do
+for BAD in "politeia" "litehop/politeia/extra" "litehop/po litia" 'litehop/x"y' "/politeia" "litehop/.." "../politeia" "./."; do
   rm -f "$CURL_CALLED_MARKER"
-  RUN_OUT=$(printf '%s' "$PAYLOAD" | PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" --repo "$BAD" 77 2>"$WORK/stderr") \
+  RUN_OUT=$(printf '%s' "$PAYLOAD" | PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" 77 "$BAD" 2>"$WORK/stderr") \
     && RUN_RC=0 || RUN_RC=$?
-  assert "malformed --repo '$BAD' is rejected before any network call -- the value is interpolated into a URL" \
+  assert "invalid repo '$BAD' is rejected before any network call -- it is interpolated into an authenticated POST URL" \
     "$([ "$RUN_RC" -ne 0 ] && [ -z "$RUN_OUT" ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
 done
 

@@ -222,18 +222,17 @@ Then post it yourself, per deliverable type:
   again if a PR is ever authored by the bot itself, which is not a live case
   today (workers push under the operator identity).
 
-  **Other repos:** a PR URL on another litehop repo (e.g.
-  `github.com/litehop/politeia/pull/<N>`) is posted with
-  `scripts/gh-app-review.sh --repo <owner/name> <N> < temp/<file>`; the
-  default repo is `litehop/u7s`.
+  **Other repos:** for a PR outside `litehop/u7s`, pass the repo as the
+  second argument: `scripts/gh-app-review.sh <N> litehop/<repo> <
+  temp/<file>`. Omitting it targets `litehop/u7s`, so a bare `<N>` against
+  another repo's PR number reviews the wrong PR. Take the repo from the PR
+  URL you were given.
 
-  **Mint-failure fallback:** if `scripts/gh-app-review.sh <N>` exits
-  non-zero, retry ONCE — post the same body as `"event": "COMMENT"` via `gh
-  api repos/<owner/name>/pulls/<N>/reviews -X POST --input temp/<file>` under
-  the operator's own token — and say so explicitly in your returned
-  confirmation: the App mint failed and the review posted as a fallback
-  comment. Without this, a key hiccup means no review posts at all and the
-  merge gate holds the PR with no visible cause.
+  **No operator-token fallback:** a review posts as `litehop-reviewer[bot]`
+  or not at all. If `scripts/gh-app-review.sh` exits non-zero, do NOT post
+  via `gh api`, `gh pr review`, or any other path under the operator's own
+  token. Return the script's exact error and the full findings text to the
+  mayor instead.
 
   Partition your findings before building the JSON payload:
   - Each **Confirmed findings** / **Suspicions** bullet whose Evidence cites
@@ -285,13 +284,10 @@ Then post it yourself, per deliverable type:
      output goes to the file via Bash): `jq -n --arg body "$BODY" --arg
      event "$EVENT" --argjson comments "$COMMENTS" '{body:$body,
      event:$event, comments:$comments}' > temp/review-<N>.json`. Then, as a
-     SEPARATE Bash call, post it: `scripts/gh-app-review.sh <N> <
+     SEPARATE Bash call, post it: `scripts/gh-app-review.sh <N> [owner/repo] <
      temp/review-<N>.json`. Never chain the two, and put any `bd` note in a
-     third call. On a non-zero exit, retry once per the mint-failure
-     fallback above: derive a COMMENT payload from the saved file
-     (`jq '.event="COMMENT"' temp/review-<N>.json > temp/review-<N>-c.json`,
-     own call), then `gh api repos/litehop/u7s/pulls/<N>/reviews -X POST
-     --input temp/review-<N>-c.json` (own call). Shell variables do not persist across
+     third call. On a non-zero exit, follow "No operator-token fallback"
+     above. Shell variables do not persist across
      Bash calls, so steps 1-4 (heredocs through `jq ... > temp/<file>`) are
      one call.
 - **`deliverable_type: findings`** (ref is a file path under `ai/findings/`):
