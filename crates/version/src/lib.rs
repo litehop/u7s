@@ -56,6 +56,7 @@ pub fn version_string() -> &'static str {
 
 /// Go-style `os/arch` of the running binary.
 pub fn platform() -> String {
+    // Only amd64/arm64 are mapped because only those ship.
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",

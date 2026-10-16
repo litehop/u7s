@@ -32,11 +32,17 @@ jobs:
 
       - name: Determine version and release kind
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            V="${{ inputs.version }}"
+            V="${INPUT_VERSION}"
           else
             V="${GITHUB_REF_NAME}"
+          fi
+          if ! printf '%s' "$V" | grep -Eq '^[0-9A-Za-z.-]+$'; then
+            echo "error: version must match [0-9A-Za-z.-] (semver build metadata; got: '$V')" >&2
+            exit 1
           fi
           case "$V" in
             v*-*) PRERELEASE=true
