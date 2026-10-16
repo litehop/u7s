@@ -79,6 +79,8 @@ impl ServiceIpAllocator {
 /// "concurrent watches in same order" conformance spec opens 100 simultaneous watches as that one
 /// identity (64 fails it with 429s). The aggregate is bounded by `MAX_WATCHES_GLOBAL` instead.
 pub const MAX_WATCHES_PER_CLIENT: usize = 256;
+// A cap of 64 fails the 100-watch conformance spec with 429s.
+const _: () = assert!(MAX_WATCHES_PER_CLIENT > 100);
 
 /// Server-wide cap on concurrent watch streams from ordinary identities. The per-client
 /// limit keys on username, so anyone who can mint ServiceAccounts gets a fresh
@@ -2165,10 +2167,6 @@ mod tests {
     // the per-client limit entirely, since semaphore_for would hand out a fresh
     // MAX_WATCHES_PER_CLIENT-permit semaphore instead of the shared one the live watch is
     // enforcing against).
-    // sonobuoy's non-exempt service account opens 100 simultaneous watches in the
-    // "concurrent watches in same order" conformance spec; a cap of 64 fails it with 429s.
-    const _: () = assert!(MAX_WATCHES_PER_CLIENT > 100);
-
     #[test]
     fn watch_limit_sweep_idle_evicts_only_entries_with_no_live_permit() {
         let limiter = WatchLimitState::new();
