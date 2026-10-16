@@ -1435,9 +1435,7 @@ where
                     let Ok(v) = value.to_str() else {
                         continue;
                     };
-                    let Some(key) = percent_decode(raw_key) else {
-                        continue;
-                    };
+                    let key = percent_decode(raw_key).unwrap_or_else(|| raw_key.to_owned());
                     impersonate_extra.entry(key).or_default().push(v.to_owned());
                 }
                 for (key, values) in &impersonate_extra {
@@ -4209,6 +4207,110 @@ mod tests {
             Some(&vec!["v1".to_owned()]),
             "the final UserInfo.extra key must be the decoded key, not the raw \
              percent-encoded header name"
+        );
+    }
+
+    /// Upstream `unescapeExtraKey` falls back to the raw key when the decoded key is not
+    /// valid UTF-8 and still records the extra; dropping it would silently strip an
+    /// impersonated identity's extra attributes.
+    #[tokio::test]
+    async fn impersonate_extra_key_decoding_to_invalid_utf8_is_kept_under_raw_key() {
+        use axum::{body::Body, http::Request, routing::get, Extension, Router};
+        use tower::ServiceExt;
+
+        let idx = Arc::new(RbacIndex::new());
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/extra-impersonator",
+            &serde_json::json!({
+                "rules": [
+                    { "apiGroups": [""], "resources": ["users"], "verbs": ["impersonate"] },
+                    {
+                        "apiGroups": ["authentication.k8s.io"],
+                        "resources": ["userextras/bad%ff"],
+                        "verbs": ["impersonate"]
+                    }
+                ]
+            }),
+        );
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/alice-extra-impersonator",
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": "alice" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "extra-impersonator"
+                }
+            }),
+        );
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/pod-lister-extra",
+            &serde_json::json!({
+                "rules": [{ "apiGroups": [""], "resources": ["pods"], "verbs": ["list"] }]
+            }),
+        );
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/bob-pod-lister-extra",
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": "bob" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "pod-lister-extra"
+                }
+            }),
+        );
+
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        async fn whoami(Extension(user): Extension<UserInfo>) -> String {
+            serde_json::to_string(&user.extra).unwrap()
+        }
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(whoami))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-User", "bob")
+            .header("Impersonate-Extra-bad%ff", "v1")
+            .header("Impersonate-Extra-bad%ff", "v2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let extra: HashMap<String, Vec<String>> = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            extra.get("bad%ff"),
+            Some(&vec!["v1".to_owned(), "v2".to_owned()]),
+            "an extra whose key decodes to invalid UTF-8 must be kept under the raw key \
+             with all values, as upstream does"
         );
     }
 
