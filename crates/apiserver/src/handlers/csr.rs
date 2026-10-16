@@ -472,6 +472,55 @@ pub(crate) fn authorize_csr_approval<S: Store>(
     )))
 }
 
+fn is_unset(v: &serde_json::Value) -> bool {
+    v.is_null() || v.as_str() == Some("")
+}
+
+/// Upstream `populateConditionTimestamps`: defaults an unset `lastUpdateTime` to `now`, and an
+/// unset `lastTransitionTime` to the old condition's value for the same type+status, else `now`.
+pub(crate) fn populate_condition_timestamps(
+    new: &mut serde_json::Value,
+    old: &serde_json::Value,
+    now: &str,
+) {
+    let old_conditions = csr_conditions(old);
+    let Some(conditions) = new["status"]["conditions"].as_array_mut() else {
+        return;
+    };
+    for c in conditions {
+        if is_unset(&c["lastUpdateTime"]) {
+            c["lastUpdateTime"] = now.into();
+        }
+        if is_unset(&c["lastTransitionTime"]) {
+            let carried = old_conditions
+                .iter()
+                .find(|o| {
+                    o["type"] == c["type"]
+                        && o["status"] == c["status"]
+                        && !is_unset(&o["lastTransitionTime"])
+                })
+                .map(|o| o["lastTransitionTime"].clone());
+            c["lastTransitionTime"] = carried.unwrap_or_else(|| now.into());
+        }
+    }
+}
+
+/// Server-defaulted timestamps are not a client-intended change, so a client that omits them
+/// when echoing the stored conditions is not "changing" anything.
+fn without_timestamps(conditions: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    conditions
+        .iter()
+        .cloned()
+        .map(|mut c| {
+            if let Some(m) = c.as_object_mut() {
+                m.remove("lastUpdateTime");
+                m.remove("lastTransitionTime");
+            }
+            c
+        })
+        .collect()
+}
+
 fn csr_conditions(body: &serde_json::Value) -> Vec<serde_json::Value> {
     body["status"]["conditions"]
         .as_array()
@@ -502,8 +551,10 @@ pub(crate) fn guard_csr_status_write<S: Store>(
 ) -> Result<(), crate::status::StatusError> {
     let old_conditions = csr_conditions(old);
     let mut new_conditions = csr_conditions(new);
-    let changed = csr_certificate(old) != csr_certificate(new) || old_conditions != new_conditions;
+    let changed = csr_certificate(old) != csr_certificate(new)
+        || without_timestamps(&old_conditions) != without_timestamps(&new_conditions);
     if !changed {
+        populate_condition_timestamps(new, old, &crate::util::utc_now_rfc3339());
         return Ok(());
     }
     let signer = old["spec"]["signerName"].as_str().unwrap_or("");
@@ -547,6 +598,7 @@ pub(crate) fn guard_csr_status_write<S: Store>(
     if new["status"]["conditions"].is_array() {
         new["status"]["conditions"] = serde_json::Value::Array(new_conditions);
     }
+    populate_condition_timestamps(new, old, &crate::util::utc_now_rfc3339());
     Ok(())
 }
 
@@ -2414,5 +2466,45 @@ mod tests {
             s["spec"]["request"] != swapped["spec"]["request"],
             "the approved request must not be swappable for an O=system:masters one"
         );
+    }
+
+    /// Dropping the carried-over transition time would make a CSR look freshly approved
+    /// every time a signer or controller rewrites its conditions.
+    #[test]
+    fn populate_timestamps_keeps_transition_for_unchanged_type_and_status_but_resets_on_flip() {
+        let old = serde_json::json!({"status": {"conditions": [
+            {"type": "Failed", "status": "True", "lastTransitionTime": "2020-01-01T00:00:00Z"}
+        ]}});
+        let mut new = serde_json::json!({"status": {"conditions": [
+            {"type": "Failed", "status": "True", "lastUpdateTime": "2021-01-01T00:00:00Z"},
+            {"type": "Failed", "status": "False"}
+        ]}});
+        populate_condition_timestamps(&mut new, &old, "2030-01-01T00:00:00Z");
+        let c = &new["status"]["conditions"];
+        assert_eq!(c[0]["lastTransitionTime"], "2020-01-01T00:00:00Z");
+        assert_eq!(c[0]["lastUpdateTime"], "2021-01-01T00:00:00Z");
+        assert_eq!(c[1]["lastTransitionTime"], "2030-01-01T00:00:00Z");
+        assert_eq!(c[1]["lastUpdateTime"], "2030-01-01T00:00:00Z");
+    }
+
+    /// A signer adding a Failed condition through /status must get timestamps, like /approval.
+    #[tokio::test]
+    async fn status_write_adding_failed_condition_defaults_timestamps() {
+        let state = make_state();
+        let who = user("signer");
+        crate::handlers::test_support::grant_signer_verb(&state, "signer", "sign", CLIENT_SIGNER);
+        seed_csr_with(&state, "ts1", CLIENT_SIGNER, serde_json::json!({})).await;
+        status_put(
+            &state,
+            &who,
+            "ts1",
+            serde_json::json!({"conditions": [{"type": "Failed", "status": "True"}]}),
+        )
+        .await
+        .expect("status write");
+        let s = stored_csr(&state, "ts1").await;
+        let c = &s["status"]["conditions"][0];
+        assert!(c["lastUpdateTime"].is_string(), "{c}");
+        assert!(c["lastTransitionTime"].is_string(), "{c}");
     }
 }
