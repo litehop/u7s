@@ -188,13 +188,7 @@ pub(crate) async fn create_namespace<S: Store>(
         }
     }
 
-    {
-        let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
-        if meta.creation_timestamp.is_none() {
-            obj.body["metadata"]["creationTimestamp"] =
-                serde_json::Value::String(utc_now_rfc3339());
-        }
-    }
+    obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {

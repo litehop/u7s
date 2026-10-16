@@ -355,9 +355,7 @@ fn stamp_server_fields(crd: &mut CustomResourceDefinition) {
     if crd.metadata.uid.is_empty() {
         crd.metadata.uid = new_uid();
     }
-    if crd.metadata.creation_timestamp.is_empty() {
-        crd.metadata.creation_timestamp = utc_now_rfc3339();
-    }
+    crd.metadata.creation_timestamp = utc_now_rfc3339();
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
 }
@@ -1906,9 +1904,10 @@ mod tests {
         assert_ne!(uid1, uid2, "consecutive UIDs must differ (CSPRNG source)");
     }
 
-    // stamp_server_fields must not overwrite existing uid/timestamp.
+    // A client-supplied creationTimestamp must be replaced on create (upstream
+    // FillObjectMetaSystemFields), else a CRD can be backdated.
     #[test]
-    fn stamp_server_fields_preserves_existing() {
+    fn stamp_server_fields_resets_client_supplied_creation_timestamp() {
         let body = minimal_crd_bytes("foo.example.com");
         let mut crd = ok_crd(parse_crd(&body));
         crd.metadata.uid = "my-uid".into();
@@ -1917,7 +1916,10 @@ mod tests {
         stamp_server_fields(&mut crd);
 
         assert_eq!(crd.metadata.uid, "my-uid");
-        assert_eq!(crd.metadata.creation_timestamp, "2024-01-01T00:00:00Z");
+        assert_ne!(
+            crd.metadata.creation_timestamp, "2024-01-01T00:00:00Z",
+            "a backdated creationTimestamp must not survive create"
+        );
     }
 
     fn crd_with_versions(

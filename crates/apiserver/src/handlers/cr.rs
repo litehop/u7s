@@ -778,14 +778,7 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.uid = Some(new_cr_uid());
     meta.generation = Some(1);
-    if meta
-        .creation_timestamp
-        .as_deref()
-        .map(|s| s.is_empty())
-        .unwrap_or(true)
-    {
-        meta.creation_timestamp = Some(utc_now_rfc3339());
-    }
+    meta.creation_timestamp = Some(utc_now_rfc3339());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
 }
 
@@ -10172,9 +10165,9 @@ mod tests {
             "server must always overwrite a client-supplied uid on create — letting it \
              through would let any CR create request forge object identity"
         );
-        assert_eq!(
+        assert_ne!(
             obj["metadata"]["creationTimestamp"], "2024-01-01T00:00:00Z",
-            "existing creationTimestamp must still be preserved"
+            "a client-backdated creationTimestamp must be replaced on create"
         );
     }
 
