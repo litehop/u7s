@@ -795,15 +795,20 @@ fn get_verb(name: Option<&str>, query: Option<&str>) -> &'static str {
 ///
 /// Kubernetes clients (client-go) percent-encode `fieldSelector` values, e.g.
 /// `metadata.name%3Dfoo` for `metadata.name=foo`. Bytes that don't form a valid
-/// `%XX` escape are passed through unchanged.
-pub(crate) fn percent_decode(s: &str) -> String {
+/// `%XX` escape are passed through unchanged. Returns `None` when the decoded bytes are
+/// not valid UTF-8: lossy replacement would let distinct attacker-chosen inputs collapse
+/// onto the same string and match a real name.
+pub(crate) fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(byte);
+        if bytes[i] == b'%' {
+            if let (Some(h), Some(l)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            ) {
+                out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
             }
@@ -811,7 +816,7 @@ pub(crate) fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).ok()
 }
 
 /// Extract the resource name implied by a `fieldSelector=metadata.name=<name>` query
@@ -834,7 +839,7 @@ fn field_selector_name(query: Option<&str>) -> Option<String> {
     let raw = query
         .split('&')
         .find_map(|pair| pair.strip_prefix("fieldSelector="))?;
-    let decoded = percent_decode(raw);
+    let decoded = percent_decode(raw)?;
     if decoded.contains(',') {
         return None;
     }
@@ -1430,7 +1435,9 @@ where
                     let Ok(v) = value.to_str() else {
                         continue;
                     };
-                    let key = percent_decode(raw_key);
+                    let Some(key) = percent_decode(raw_key) else {
+                        continue;
+                    };
                     impersonate_extra.entry(key).or_default().push(v.to_owned());
                 }
                 for (key, values) in &impersonate_extra {
@@ -5694,6 +5701,99 @@ mod tests {
                  bounded \"other\" label, not the raw attacker-chosen path segments \
                  ({path}) — otherwise an unauthenticated caller can mint one permanent \
                  Prometheus series per distinct URL it invents, exhausting apiserver memory"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_decode_multibyte_after_percent_does_not_panic() {
+        // Byte-index slicing of "%aé" landed inside 'é' and panicked: an anonymous
+        // request could crash the apiserver's connection task.
+        assert_eq!(percent_decode("%a\u{e9}").as_deref(), Some("%a\u{e9}"));
+        assert_eq!(percent_decode("%\u{e9}").as_deref(), Some("%\u{e9}"));
+        assert_eq!(
+            percent_decode("%\u{e9}\u{e9}").as_deref(),
+            Some("%\u{e9}\u{e9}")
+        );
+    }
+
+    #[test]
+    fn percent_decode_leaves_malformed_escapes_literal() {
+        for s in ["%", "%a", "%zz", "%4", "%g1", "%1g", "a%"] {
+            assert_eq!(
+                percent_decode(s).as_deref(),
+                Some(s),
+                "a malformed escape must stay literal, not be dropped or half-decoded: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_decode_decodes_valid_escapes_and_passes_multibyte_through() {
+        assert_eq!(percent_decode("a%2Fb").as_deref(), Some("a/b"));
+        assert_eq!(percent_decode("a%2fb").as_deref(), Some("a/b"));
+        assert_eq!(
+            percent_decode("\u{e9}%3D\u{65e5}").as_deref(),
+            Some("\u{e9}=\u{65e5}")
+        );
+        assert_eq!(percent_decode("%C3%A9").as_deref(), Some("\u{e9}"));
+    }
+
+    #[test]
+    fn percent_decode_rejects_invalid_utf8_after_decoding() {
+        // Lossy replacement would map distinct inputs to the same U+FFFD string.
+        assert_eq!(percent_decode("%ff"), None);
+        assert_eq!(percent_decode("a%C3"), None);
+    }
+
+    #[test]
+    fn field_selector_name_with_invalid_utf8_yields_no_name() {
+        assert!(field_selector_name(Some("fieldSelector=metadata.name%3D%ff")).is_none());
+        assert!(field_selector_name(Some("fieldSelector=metadata.name%3D%a\u{e9}")).is_some());
+    }
+
+    /// An anonymous `?fieldSelector=%aé` request used to panic inside `field_selector_name`
+    /// before authorization ran; it must now be denied like any other anonymous request.
+    #[tokio::test]
+    async fn anonymous_request_with_multibyte_after_percent_in_field_selector_is_denied_not_panicked(
+    ) {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/configmaps",
+                get(|| async { "unreachable: RBAC denies before the handler runs" }),
+            )
+            .layer(AuthLayer::new(
+                Arc::new(RbacIndex::new()),
+                HashMap::new(),
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
+            ));
+
+        for query in [
+            "%a\u{e9}",
+            "metadata.name%3D%a\u{e9}",
+            "metadata.name%3D%ff",
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/default/configmaps?fieldSelector={query}"
+                ))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert!(
+                resp.status().is_client_error(),
+                "anonymous request with fieldSelector={query:?} must get a 4xx, got {}",
+                resp.status()
             );
         }
     }
