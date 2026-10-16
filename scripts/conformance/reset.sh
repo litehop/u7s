@@ -165,6 +165,7 @@ teardown_vm() {
 # Succeeds only when <workdir> resolves (physically, so symlinks and ".."
 # cannot escape) to a strict subdirectory of <checkout>/temp for some checkout
 # listed by `git worktree list` (main checkout and every linked worktree).
+# A checkout whose temp is itself a symlink is skipped.
 # Full mode runs `rm -rf` on it, so anything else -- $PWD, a repo root, $HOME,
 # / -- is refused.
 workdir_allowed() {
@@ -178,6 +179,7 @@ workdir_allowed() {
   p="$(cd "$p" && pwd -P)$rest"
   while IFS= read -r wt; do
     [ -d "$wt" ] || continue
+    [ -L "$wt/temp" ] && continue
     base="$(cd "$wt" && pwd -P)/temp"
     if [ -d "$base" ]; then base="$(cd "$base" && pwd -P)"; fi
     case "$p" in "$base"/?*) return 0 ;; esac
