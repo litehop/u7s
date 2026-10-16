@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, Response, StatusCode};
+use futures_util::StreamExt as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Layer;
 use tower_service::Service;
@@ -50,6 +51,15 @@ const MAX_MUTATING: usize = 100;
 /// never 429s, while still bounding how long a request waits against a
 /// genuinely stuck or overloaded backend.
 const MUTATING_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Max time a mutating request may take to deliver its body once admitted.
+///
+/// Matches kube-apiserver's default 60s request timeout, which bounds every
+/// non-long-running request (and so releases its max-in-flight seat). Only the
+/// body read is bounded here, not the handler: u7s has no long-running
+/// classifier for mutating verbs (exec/attach/portforward/proxy upgrades), and
+/// those send no body past the handshake.
+const MUTATING_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Max number of mutating requests allowed to queue for a permit at once.
 ///
@@ -180,6 +190,31 @@ async fn acquire_mutating_permit(
     }
 }
 
+/// Rewrap the request body so the whole read must finish within
+/// MUTATING_BODY_TIMEOUT of permit admission; on expiry the body yields a
+/// TimedOut error, the handler fails, and the permits drop.
+fn with_body_deadline(req: Request<Body>) -> Request<Body> {
+    let deadline = tokio::time::Instant::now() + MUTATING_BODY_TIMEOUT;
+    req.map(|body| {
+        let frames =
+            futures_util::stream::unfold(body.into_data_stream(), move |mut s| async move {
+                match tokio::time::timeout_at(deadline, s.next()).await {
+                    Ok(Some(item)) => Some((item.map_err(axum::BoxError::from), s)),
+                    Ok(None) => None,
+                    Err(_) => Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "request body read timed out",
+                        )
+                        .into()),
+                        s,
+                    )),
+                }
+            });
+        Body::from_stream(frames)
+    })
+}
+
 fn too_many_requests_response(req: &Request<Body>, limit_kind: &str) -> Response<Body> {
     let user_agent = req
         .headers()
@@ -288,7 +323,7 @@ where
             // when this future completes, automatically releasing the semaphore.
             let _mutating = mutating_permit;
             let _inflight = inflight_permit;
-            inner.call(req).await
+            inner.call(with_body_deadline(req)).await
         })
     }
 }
@@ -754,5 +789,145 @@ mod tests {
              client (e2e.test vs kube-controller-manager vs kubelet) is generating the \
              rejected load; log was: {log}"
         );
+    }
+
+    // Inner service that drains the whole body like a real extractor: 200 on
+    // success, 408 when the body read errors.
+    #[derive(Clone)]
+    struct ReadBodyService;
+
+    impl Service<Request<Body>> for ReadBodyService {
+        type Response = Response<Body>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<Body>) -> Self::Future {
+            Box::pin(async move {
+                let status = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+                    Ok(_) => StatusCode::OK,
+                    Err(_) => StatusCode::REQUEST_TIMEOUT,
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap())
+            })
+        }
+    }
+
+    fn channel_body() -> (tokio::sync::mpsc::Sender<Vec<u8>>, Body) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), rx))
+        });
+        (tx, Body::from_stream(stream))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slowloris_body_exhausts_the_mutating_pool_unless_the_read_times_out() {
+        // 100 authenticated clients that open a POST and never finish the
+        // body used to pin every mutating permit forever, so kubelet lease
+        // writes and controller updates queued then 429ed cluster-wide. The
+        // body deadline must fail those reads and give the permits back.
+        let layer = InflightLayer::new();
+        let mutating = Arc::clone(&layer.mutating);
+        let inflight = Arc::clone(&layer.inflight);
+
+        let mut senders = Vec::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..MAX_MUTATING {
+            let (tx, body) = channel_body();
+            tx.send(b"{".to_vec()).await.unwrap();
+            senders.push(tx);
+            let mut svc = layer.layer(ReadBodyService);
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/x")
+                .body(body)
+                .unwrap();
+            tasks.spawn(async move { svc.call(req).await.unwrap().status() });
+        }
+
+        // Join late enough that its queue wait outlives the body deadline.
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert_eq!(
+            mutating.available_permits(),
+            0,
+            "setup: pool must be pinned"
+        );
+
+        // A legitimate write now has to queue behind the stuck bodies.
+        let mut other = layer.layer(ReadBodyService);
+        let healthy = tokio::spawn(async move {
+            other
+                .call(make_request(Method::POST))
+                .await
+                .unwrap()
+                .status()
+        });
+
+        tokio::time::sleep(MUTATING_BODY_TIMEOUT).await;
+
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut out = Vec::new();
+            while let Some(res) = tasks.join_next().await {
+                out.push(res.unwrap());
+            }
+            out
+        })
+        .await
+        .expect("stuck bodies still hold their permits after the deadline");
+        for res in drained {
+            assert_eq!(
+                res,
+                StatusCode::REQUEST_TIMEOUT,
+                "a body that never completes must fail its read"
+            );
+        }
+        assert_eq!(
+            healthy.await.unwrap(),
+            StatusCode::OK,
+            "other writes must get a permit once stuck bodies time out"
+        );
+        assert_eq!(
+            mutating.available_permits(),
+            MAX_MUTATING,
+            "mutating permits leaked"
+        );
+        assert_eq!(
+            inflight.available_permits(),
+            MAX_INFLIGHT,
+            "inflight permits leaked"
+        );
+        drop(senders);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_but_finishing_body_within_deadline_is_not_cut_off() {
+        // The deadline must not break clients that are merely slow: a body
+        // that completes before it expires still reaches the handler intact.
+        let layer = InflightLayer::new();
+        let mut svc = layer.layer(ReadBodyService);
+        let (tx, body) = channel_body();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/x")
+            .body(body)
+            .unwrap();
+        let call = tokio::spawn(async move { svc.call(req).await.unwrap().status() });
+
+        for _ in 0..3 {
+            tokio::time::sleep(MUTATING_BODY_TIMEOUT / 4).await;
+            tx.send(b"chunk".to_vec()).await.unwrap();
+        }
+        drop(tx);
+
+        assert_eq!(call.await.unwrap(), StatusCode::OK);
     }
 }

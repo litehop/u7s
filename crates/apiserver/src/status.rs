@@ -181,6 +181,15 @@ impl Status {
         )
     }
 
+    /// A rejected strategic merge patch: 422 when the patch is well-formed but exceeds the
+    /// work budget, 400 for a malformed patch.
+    pub fn patch_error(e: crate::patch::PatchError) -> StatusError {
+        match e {
+            crate::patch::PatchError::TooComplex(_) => Status::unprocessable_entity(e.to_string()),
+            _ => Status::bad_request(e.to_string()),
+        }
+    }
+
     pub fn unprocessable_entity(message: String) -> StatusError {
         StatusError(
             StatusCode::UNPROCESSABLE_ENTITY,

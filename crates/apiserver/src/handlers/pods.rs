@@ -1591,7 +1591,7 @@ pub(crate) async fn patch_pod<S: Store>(
                 } else {
                     crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
                 };
-                merged.map_err(|e| Status::bad_request(e.to_string()))?;
+                merged.map_err(Status::patch_error)?;
             }
             super::json_patch::PatchType::Merge => {
                 crate::patch::merge_patch(&mut current_obj.body, &patch);
