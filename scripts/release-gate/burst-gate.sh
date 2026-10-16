@@ -14,11 +14,13 @@
 #   (e) scripts/e2e-workload/webhook-smoke.sh passes on the shipped-install VM
 # Exits non-zero if any criterion of any run FAILs.
 #
-# Usage: burst-gate.sh [--runs N] [--keep] [--memory GiB] [--burst-cap SECS]
-#                      [--tarball-dir DIR] [--out DIR]
+# Usage: burst-gate.sh [--runs N] [--keep] [--memory GiB] [--zram-mib N] [--coredns-requests]
+#                      [--burst-cap SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --keep            do not delete the VMs afterwards
 #   --memory GiB      override the template's VM memory (forced-failure checks, e.g. 0.625)
+#   --coredns-requests experiment: set CoreDNS cpu/memory requests after install
+#   --zram-mib N      experiment: give the VM an N MiB zram swap device before install
 #   --burst-cap SECS  criterion (c) cap (default 300)
 #   --tarball-dir DIR reuse the output of build-arm64-tarball.sh instead of rebuilding
 #   --out DIR         results directory (default: ./temp/release-gate/<timestamp>)
@@ -27,6 +29,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
+COREDNS_REQ=0; ZRAM_MIB=0
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
 BURST_CAP_SECS=300
 RUN_WALL_SECS=3300
@@ -35,6 +38,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --runs) RUNS="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --coredns-requests) COREDNS_REQ=1; shift ;;
+    --zram-mib) ZRAM_MIB="$2"; shift 2 ;;
     --memory) MEMORY="$2"; shift 2 ;;
     --burst-cap) BURST_CAP_SECS="$2"; shift 2 ;;
     --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
@@ -44,6 +49,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 export BURST_CAP_SECS
+case "$ZRAM_MIB" in
+  ''|*[!0-9]*) echo "--zram-mib must be a non-negative integer (MiB), got '$ZRAM_MIB'" >&2; exit 2 ;;
+esac
 
 # shellcheck source=lib.sh
 . "$HERE/lib.sh"
@@ -67,7 +75,8 @@ fi
 STAGE="$OUT/stage"
 mkdir -p "$STAGE/wordpress"
 cp "$TARBALL_DIR"/u7s-gate-*.tar.gz "$TARBALL_DIR"/u7s-gate-*.tar.gz.sha256 "$TARBALL_DIR/install.sh" "$STAGE/"
-cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
+cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
+printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\n' "$COREDNS_REQ" "$ZRAM_MIB" > "$STAGE/gate.env"
 cp "$ROOT/examples/e2e/wordpress/wordpress.yaml" "$STAGE/wordpress/"
 # MariaDB data on emptyDir: the gate VM has no csi-hostpath, and the PVC is not what is under test.
 awk '
@@ -91,7 +100,7 @@ for i in $(seq 1 "$RUNS"); do
      && limactl start "$VM" >"$RUN_OUT/lima-start.log" 2>&1; then
     limactl shell "$VM" sudo install -d -m 0777 /var/tmp/rg
     limactl shell "$VM" grep -E 'MemTotal|SwapTotal' /proc/meminfo | tee "$RUN_OUT/meminfo-total.txt"
-    for f in "$STAGE"/*.tar.gz "$STAGE"/*.sha256 "$STAGE"/*.sh "$STAGE/wordpress"; do
+    for f in "$STAGE"/*.tar.gz "$STAGE"/*.sha256 "$STAGE"/*.sh "$STAGE"/*.env "$STAGE/wordpress"; do
       limactl copy -r "$f" "$VM:/var/tmp/rg/" >/dev/null
     done
     limactl shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh >"$RUN_OUT/vm-gate.log" 2>&1 &
