@@ -23,14 +23,15 @@ cat >"$TMP/bin/gcloud" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"$STUB_LOG"
 echo "${CLOUDSDK_ACTIVE_CONFIG_NAME-<unset>}" >>"$STUB_LOG.cfg"
+env | grep '^CLOUDSDK_' >>"$STUB_LOG.env" || true
 case "$*" in
   "config configurations describe "*) [ "${STUB_NO_CONFIG:-0}" = 1 ] && exit 1; exit 0 ;;
   "config get-value project") echo "${CLOUDSDK_CORE_PROJECT:-${STUB_PROJECT-proj}}"; exit 0 ;;
   "config get-value account") echo "${CLOUDSDK_CORE_ACCOUNT:-${STUB_ACCOUNT-acct@example.com}}"; exit 0 ;;
-  "config get-value compute/zone") echo "${STUB_ZONE-us-west1-b}"; exit 0 ;;
+  "config get-value compute/zone") echo "${CLOUDSDK_COMPUTE_ZONE:-${STUB_ZONE-us-west1-b}}"; exit 0 ;;
   "services list "*) echo "${STUB_SERVICES:-}"; exit 0 ;;
   "compute instances list "*) echo "${STUB_INSTANCES:-}"; exit 0 ;;
-  "compute instances describe "*) echo "${STUB_LABEL-1}"; exit 0 ;;
+  "compute instances describe "*) case "$* " in *" ${STUB_DESCRIBE_FAIL:-<none>} "*) exit 1 ;; esac; echo "${STUB_LABEL-1}"; exit 0 ;;
   "compute operations list "*) echo "${STUB_OPS:-}"; exit 0 ;;
   "compute "*" list "*)
     [ "${STUB_LIST_FAIL:-0}" = 1 ] && exit 1
@@ -43,11 +44,12 @@ chmod +x "$TMP/bin/gcloud"
 
 # run <script> args... -> sets OUT, RC, LOG (gcloud calls)
 run() {
-  : >"$TMP/log"; : >"$TMP/log.cfg"
+  : >"$TMP/log"; : >"$TMP/log.cfg"; : >"$TMP/log.env"
   RC=0
   OUT="$(PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/log" "$@" 2>&1)" || RC=$?
   LOG="$(cat "$TMP/log")"
   CFG="$(sort -u "$TMP/log.cfg")"
+  ENVS="$(sort -u "$TMP/log.env")"
 }
 
 SETUP="$HERE/setup.sh"
@@ -58,7 +60,11 @@ export STUB_SERVICES="compute.googleapis.com"
 unset STUB_EXISTING || true
 run "$SETUP" --dry-run
 assert "dry-run exits 0 on an empty project" "$([ "$RC" = 0 ] && echo 1 || echo 0)"
-not_read_only="$(grep -vE '^(config get-value |config configurations describe |services list |compute [a-z -]* (list|describe) )' <<<"$LOG" || true)"
+READ_ONLY_RE='^(config get-value |config configurations describe |services list |compute [a-z-]+( subnets)? (list|describe) )'
+admitted="$(grep -E "$READ_ONLY_RE" <<<$'compute instances delete list x\ncompute networks delete describe x\ncompute instances list x' || true)"
+assert "the read-only allowlist admits only list/describe verbs, not a delete of a resource named list/describe (else a mutating dry run would pass the check)" \
+  "$([ "$admitted" = 'compute instances list x' ] && echo 1 || echo 0)"
+not_read_only="$(grep -vE "$READ_ONLY_RE" <<<"$LOG" || true)"
 assert "dry-run issues only allowlisted read-only gcloud calls (a mutating dry run would change the operator's project without review); offender: '$not_read_only'" \
   "$([ -z "$not_read_only" ] && [ -n "$LOG" ] && echo 1 || echo 0)"
 assert "dry-run prints its target first so the operator approves the real run against the right project" \
@@ -143,6 +149,10 @@ assert "up caps lifetime at 16h (a forgotten VPS stops itself)" "$(has '--max-ru
 assert "up labels u7s-test=1 (gc and list find it by label)" "$(has '--labels=u7s-test=1' "$create")"
 assert "up joins the u7s-test network/subnet (the IAP-only firewall applies there)" "$(has '--network=u7s-test --subnet=u7s-test' "$create")"
 assert "up is e2-micro on the ubuntu-2604 family" "$(has '--machine-type=e2-micro' "$create")$(has '--image-family=ubuntu-2604-lts-amd64' "$create")"
+assert "up pins the configured zone explicitly (else gcloud may prompt for one interactively)" "$(has '--zone=us-west1-b' "$create")"
+STUB_ZONE= run "$VPS" up t1
+assert "up without a configured zone fails instead of prompting or guessing" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'instances create' "$LOG")"
 assert "up adds no firewall rules (ingress stays limited to the IAP and intra-subnet rules from setup)" "$(hasnt 'firewall' "$LOG")"
 
 # --- ssh / scp go through IAP
@@ -158,6 +168,11 @@ assert "gc lists only labels.u7s-test=1 (other instances in the project must sur
 assert "gc deletes every listed instance in the zone it was listed in (a project-wide gc spans zones)" \
   "$(has 'instances delete a --zone=us-west1-b --quiet' "$LOG")$(has 'instances delete b --zone=us-east1-c --quiet' "$LOG")"
 assert "gc deletes nothing it did not list" "$([ "$(grep -c 'instances delete' <<<"$LOG")" = 2 ] && echo 1 || echo 0)"
+STUB_DESCRIBE_FAIL=a run "$VPS" gc
+assert "gc continues past an instance it cannot describe (later instances must not be left running and billing)" \
+  "$(has 'instances delete b --zone=us-east1-c --quiet' "$LOG")$(hasnt 'instances delete a ' "$LOG")"
+assert "gc reports the failed instance and exits non-zero (a silent partial sweep looks like a clean one)" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)$(has 'failed to delete: a' "$OUT")$(hasnt 'failed to delete: a b' "$OUT")"
 unset STUB_INSTANCES
 run "$VPS" gc
 assert "gc with no labelled instances deletes nothing" "$(hasnt 'delete' "$LOG")"
@@ -165,6 +180,12 @@ assert "gc with no labelled instances deletes nothing" "$(hasnt 'delete' "$LOG")
 # --- down
 run "$VPS" down t1
 assert "down deletes a u7s-test=1 instance in the configured zone" "$(has 'instances delete t1 --zone=us-west1-b --quiet' "$LOG")"
+CLOUDSDK_COMPUTE_ZONE=evil-zone run "$VPS" down t1
+assert "a stray CLOUDSDK_COMPUTE_ZONE cannot redirect down to another zone" \
+  "$(has 'instances delete t1 --zone=us-west1-b --quiet' "$LOG")$(hasnt 'evil-zone' "$LOG")"
+CLOUDSDK_CONFIG=/nonexistent CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=sa@example.com CLOUDSDK_CORE_PROJECT=evil run "$VPS" list
+assert "only CLOUDSDK_ACTIVE_CONFIG_NAME survives into gcloud (config dir / impersonation vars would bypass the named configuration)" \
+  "$([ "$ENVS" = 'CLOUDSDK_ACTIVE_CONFIG_NAME=u7s-gcp' ] && echo 1 || echo 0)"
 STUB_LABEL= run "$VPS" down t1
 assert "down refuses an unlabelled instance (it is not ours to delete)" \
   "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'instances delete' "$LOG")"
