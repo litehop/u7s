@@ -283,9 +283,10 @@ Then post it yourself, per deliverable type:
      SEPARATE Bash call, post it: `scripts/gh-app-review.sh <N> <
      temp/review-<N>.json`. Never chain the two, and put any `bd` note in a
      third call. On a non-zero exit, retry once per the mint-failure
-     fallback above: rewrite the file with `--arg event COMMENT` (own call),
-     then `gh api repos/litehop/u7s/pulls/<N>/reviews -X POST --input
-     temp/review-<N>.json` (own call). Shell variables do not persist across
+     fallback above: derive a COMMENT payload from the saved file
+     (`jq '.event="COMMENT"' temp/review-<N>.json > temp/review-<N>-c.json`,
+     own call), then `gh api repos/litehop/u7s/pulls/<N>/reviews -X POST
+     --input temp/review-<N>-c.json` (own call). Shell variables do not persist across
      Bash calls, so steps 1-4 (heredocs through `jq ... > temp/<file>`) are
      one call.
 - **`deliverable_type: findings`** (ref is a file path under `ai/findings/`):

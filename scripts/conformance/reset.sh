@@ -57,7 +57,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_kill-pattern.sh"
 host_process_survivors() {
   local workdir="$1"
   local component pattern surv_pid
-  for component in apiserver scheduler konnectivity-server; do
+  for component in apiserver scheduler konnectivity-server sample-run-metrics; do
     pattern="$(workdir_kill_pattern "$component" "$workdir")"
     for surv_pid in $(pgrep -f "$pattern" 2>/dev/null || true); do
       printf '%s %s\n' "$component" "$surv_pid"
@@ -180,14 +180,19 @@ main() {
     esac
   done
 
-  # Resolve to absolute without requiring WORKDIR to exist (a fresh worktree's
-  # first --reset targets a WORKDIR that isn't there yet) so the pkill match
-  # below is worktree-unique instead of matching another worktree that was
-  # invoked with the same relative --workdir.
-  case "$WORKDIR" in
-    /*) ;;
-    *) WORKDIR="$PWD/$WORKDIR" ;;
-  esac
+  # The start scripts launch processes with WORKDIR="$(cd "$WORKDIR" && pwd)",
+  # so the kill patterns only match that exact canonical string: a relative or
+  # unclean spelling ("$PWD/./temp/u7s") would match nothing. Canonicalise the
+  # same way; a not-yet-existing WORKDIR (fresh worktree's first --reset) has
+  # no process to match, so fall back to a plain absolute prefix.
+  if [ -d "$WORKDIR" ]; then
+    WORKDIR="$(cd "$WORKDIR" && pwd)"
+  else
+    case "$WORKDIR" in
+      /*) ;;
+      *) WORKDIR="$PWD/${WORKDIR#./}" ;;
+    esac
+  fi
 
   echo "=== [reset] Conformance teardown ==="
 
@@ -218,7 +223,8 @@ main() {
   # purposes too — without this, a --stack-only session's sampler survives
   # `rm -rf "$WORKDIR"` below as an orphan still appending to its now-unlinked
   # CSVs. Its own `stop` does the SIGTERM+poll reap; harmless if none is running.
-  bash scripts/conformance/sample-run-metrics.sh stop --workdir "$WORKDIR" >/dev/null 2>&1 || true
+  bash "$(dirname "${BASH_SOURCE[0]}")/sample-run-metrics.sh" stop --workdir "$WORKDIR" >/dev/null 2>&1 || true
+  pkill -f "$(workdir_kill_pattern sample-run-metrics "$WORKDIR")" 2>/dev/null || true
 
   # konnectivity-server is started via `disown` (scripts/u7s-start.sh), so it survives
   # even after its origin worktree is deleted, still bound to this port slot and still

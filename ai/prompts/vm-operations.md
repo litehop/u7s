@@ -30,7 +30,7 @@ don't collide. Always pass `--kubelet-port <KUBELET_PORT>` to `run-all.sh` and
 automatically on first run; no separate provisioning step is needed.
 
 **When you finish**, reap your host processes with
-`scripts/conformance/reset.sh --host-only --workdir "$PWD/temp/u7s" --port <PORT>`,
+`scripts/conformance/reset.sh --host-only --workdir ./temp/u7s --port <PORT>`,
 then `limactl stop <VM_NAME>`, unless the mayor's brief says to leave the VM up for an
 immediate continuation round. See "Final step — reap your host processes" in
 `ai/prompts/mayor-dispatch-template.md`.
