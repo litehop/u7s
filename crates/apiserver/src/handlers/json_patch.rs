@@ -937,6 +937,48 @@ impl UndoOp {
     }
 }
 
+/// Reject a patched/applied object whose `metadata.name` or `metadata.namespace` differs
+/// from the request URL (400, upstream's wording); an unset namespace is filled in and a
+/// cluster-scoped object's namespace is cleared. The store key is URL-derived, so a body
+/// that diverges would shadow another object for every consumer that keys by body.
+pub(crate) fn enforce_patch_identity(
+    body: &mut serde_json::Value,
+    name: &str,
+    ns: Option<&str>,
+) -> Result<(), crate::status::StatusError> {
+    let meta = body
+        .get_mut("metadata")
+        .and_then(|m| m.as_object_mut())
+        .ok_or_else(|| Status::bad_request("metadata must be an object".into()))?;
+    let body_ns = meta
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    match ns {
+        Some(req_ns) if body_ns.is_empty() => {
+            meta.insert("namespace".into(), req_ns.into());
+        }
+        Some(req_ns) if body_ns != req_ns => {
+            return Err(Status::bad_request(
+                "the namespace of the provided object does not match the namespace sent on the request"
+                    .into(),
+            ));
+        }
+        Some(_) => {}
+        None => {
+            meta.remove("namespace");
+        }
+    }
+    let body_name = meta.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if body_name != name {
+        return Err(Status::bad_request(format!(
+            "the name of the object ({body_name}) does not match the name on the URL ({name})"
+        )));
+    }
+    Ok(())
+}
+
 /// Apply a JSON Patch (RFC 6902) to `obj`.
 /// Supports `add`, `remove`, `replace`, and `test` operations.
 /// Returns Err(422) for unsupported operations, invalid paths, or a failing `test`.

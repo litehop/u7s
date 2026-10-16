@@ -4510,6 +4510,7 @@ pub async fn patch_cr<S: Store>(
     if is_ssa && stored_opt.is_none() {
         ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
+        crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
             ctx.schema.as_deref(),
@@ -4694,6 +4695,7 @@ pub async fn patch_cr<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
+    crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
@@ -4771,6 +4773,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     if is_ssa && stored_opt.is_none() {
         ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
+        crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
             ctx.schema.as_deref(),
@@ -4996,6 +4999,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
+    crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
@@ -9626,6 +9630,137 @@ mod tests {
         assert_eq!(
             after_json["metadata"]["uid"], real_uid,
             "a merge-patch carrying metadata.uid must not change the stored uid"
+        );
+    }
+
+    /// A CR PATCH/apply (any type, either scope) that rewrites metadata.name/namespace must
+    /// be refused with upstream's 400 and leave the stored CR untouched, and an apply that
+    /// would create a CR whose body name differs from the URL must create nothing: the store
+    /// key is URL-derived, so a divergent body shadows another object for body-keyed consumers.
+    #[tokio::test]
+    async fn patch_cr_rejects_identity_rewrite_for_every_patch_type_and_scope() {
+        use crate::handlers::test_support::{
+            assert_identity_mismatch, content_type_headers, identity_rewrite_patches,
+        };
+
+        let state = make_state();
+        install_cluster_crd(&state).await;
+        install_namespaced_crd(&state).await;
+        assert!(create_cr(
+            State(state.clone()),
+            Path(("example.io".into(), "v1".into(), "widgets".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body("w1"),
+        )
+        .await
+        .is_ok());
+        assert!(create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".into(),
+                "v1alpha1".into(),
+                "argocd".into(),
+                "applications".into()
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body("a1", "argocd"),
+        )
+        .await
+        .is_ok());
+        let cluster_key = cr_store_key("example.io", "widgets", None, "w1");
+        let ns_key = cr_store_key("argoproj.io", "applications", Some("argocd"), "a1");
+        let cluster_before = state.store.get(&cluster_key).await.unwrap().unwrap().value;
+        let ns_before = state.store.get(&ns_key).await.unwrap().unwrap().value;
+
+        for (field, value) in [("name", "kube-dns"), ("namespace", "kube-system")] {
+            for (label, ct, body) in
+                identity_rewrite_patches(field, value, "example.io/v1", "Widget")
+            {
+                // A cluster-scoped object has no namespace, so a namespace rewrite there is
+                // cleared rather than rejected (upstream EnsureObjectNamespaceMatchesRequestNamespace).
+                if field == "name" {
+                    let err = patch_cr(
+                        State(state.clone()),
+                        Path((
+                            "example.io".into(),
+                            "v1".into(),
+                            "widgets".into(),
+                            "w1".into(),
+                        )),
+                        test_user(),
+                        content_type_headers(ct),
+                        body.clone(),
+                    )
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("cluster {label} {field} rewrite must be rejected"));
+                    assert_identity_mismatch(&err, label, field);
+                }
+                let err = patch_cr_namespaced(
+                    State(state.clone()),
+                    Path((
+                        "argoproj.io".into(),
+                        "v1alpha1".into(),
+                        "argocd".into(),
+                        "applications".into(),
+                        "a1".into(),
+                    )),
+                    test_user(),
+                    content_type_headers(ct),
+                    body,
+                )
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("namespaced {label} {field} rewrite must be rejected"));
+                assert_identity_mismatch(&err, label, field);
+            }
+        }
+        assert_eq!(
+            state.store.get(&cluster_key).await.unwrap().unwrap().value,
+            cluster_before,
+            "rejected patches must leave the cluster-scoped CR untouched"
+        );
+        assert_eq!(
+            state.store.get(&ns_key).await.unwrap().unwrap().value,
+            ns_before,
+            "rejected patches must leave the namespaced CR untouched"
+        );
+
+        let apply_create = |name: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1", "kind": "Widget",
+                    "metadata": {"name": name}, "spec": {"color": "red"}
+                })
+                .to_string(),
+            )
+        };
+        let err = patch_cr(
+            State(state.clone()),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "widgets".into(),
+                "ghost".into(),
+            )),
+            test_user(),
+            content_type_headers("application/apply-patch+yaml"),
+            apply_create("kube-dns"),
+        )
+        .await
+        .err()
+        .expect("apply-create with a mismatched body name must be rejected");
+        assert_identity_mismatch(&err, "apply-create", "name");
+        assert!(
+            state
+                .store
+                .get(&cr_store_key("example.io", "widgets", None, "ghost"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected apply-create must not store anything"
         );
     }
 

@@ -37,6 +37,74 @@ pub(crate) fn assert_invalid_name_field(err: &crate::status::StatusError, field:
     assert!(body["details"]["group"].is_string(), "{body}");
 }
 
+/// One PATCH per patch type (merge, strategic-merge, JSON Patch, server-side apply) that
+/// tries to rewrite `metadata.name` (`field == "name"`) or `metadata.namespace`
+/// (`field == "namespace"`) to `value`: `(label, content-type, body)`. `api_version`/`kind`
+/// fill the apply body's type meta.
+pub(crate) fn identity_rewrite_patches(
+    field: &str,
+    value: &str,
+    api_version: &str,
+    kind: &str,
+) -> Vec<(&'static str, &'static str, bytes::Bytes)> {
+    let obj = |v: serde_json::Value| bytes::Bytes::from(v.to_string());
+    vec![
+        (
+            "merge",
+            "application/merge-patch+json",
+            obj(serde_json::json!({"metadata": {field: value}})),
+        ),
+        (
+            "strategic-merge",
+            "application/strategic-merge-patch+json",
+            obj(serde_json::json!({"metadata": {field: value}})),
+        ),
+        (
+            "json-patch",
+            "application/json-patch+json",
+            obj(serde_json::json!([
+                {"op": "add", "path": format!("/metadata/{field}"), "value": value}
+            ])),
+        ),
+        (
+            "apply",
+            "application/apply-patch+yaml",
+            obj(serde_json::json!({
+                "apiVersion": api_version, "kind": kind, "metadata": {field: value}
+            })),
+        ),
+    ]
+}
+
+pub(crate) fn content_type_headers(ct: &'static str) -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(ct),
+    );
+    h
+}
+
+/// Assert a patch was refused as upstream's 400 BadRequest identity mismatch.
+pub(crate) fn assert_identity_mismatch(err: &crate::status::StatusError, label: &str, field: &str) {
+    assert_eq!(
+        err.0,
+        axum::http::StatusCode::BAD_REQUEST,
+        "{label}: {}",
+        err.1.message
+    );
+    let want = if field == "name" {
+        "does not match the name on the URL"
+    } else {
+        "namespace of the provided object does not match the namespace sent on the request"
+    };
+    assert!(
+        err.1.message.contains(want),
+        "{label}: message {:?} must contain {want:?}",
+        err.1.message
+    );
+}
+
 /// Create an Active Namespace so namespaced creates into it pass NamespaceLifecycle.
 /// Idempotent: an existing namespace is left untouched.
 pub(crate) async fn seed_namespace(state: &AppState, name: &str) {

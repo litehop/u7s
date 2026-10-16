@@ -31,8 +31,29 @@ fn write_private_key(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> std::io
         .truncate(true)
         .mode(0o600)
         .open(path)?;
-    f.write_all(bytes)
+    f.write_all(bytes)?;
+    f.sync_all()
 }
+
+/// Write `bytes` to `path` and fsync, so a later rename cannot publish a zero-length file
+/// after a power loss.
+fn write_synced(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// fsync the directory containing `path` so renames into it are durable.
+fn sync_parent_dir(path: &str) -> std::io::Result<()> {
+    let parent = std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
+}
+
+const CA_REMEDY: &str = "restore from backup, or delete both files to deliberately start a new CA";
 
 // ---------------------------------------------------------------------------
 // SA signing key — RSA 2048, persisted across restarts
@@ -145,6 +166,19 @@ fn load_or_generate_ca(
 ) -> anyhow::Result<(KeyPair, CertificateParams, Vec<u8>)> {
     let key_exists = std::path::Path::new(ca_key_path).exists();
     let cert_exists = std::path::Path::new(ca_cert_path).exists();
+    let key_tmp = format!("{ca_key_path}.tmp");
+
+    // An interrupted first boot (cert renamed, key not yet) leaves cert + key.tmp. If the
+    // tmp key provably belongs to the cert, finishing the rename loses nothing; anything
+    // else falls through to the partial-state refusal below.
+    let key_exists =
+        if cert_exists && !key_exists && roll_forward_key_tmp(ca_cert_path, &key_tmp, ca_key_path)?
+        {
+            tracing::warn!("rolled forward interrupted CA key write {key_tmp} -> {ca_key_path}");
+            true
+        } else {
+            key_exists
+        };
 
     // Exactly one file present: regenerating would replace trust for every kubelet,
     // kubeconfig and component cert at once, so refuse and leave both files untouched.
@@ -166,15 +200,18 @@ fn load_or_generate_ca(
         let key_pem =
             std::fs::read_to_string(validate_cli_path(std::path::Path::new(ca_key_path))?)
                 .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
-        let ca_key = KeyPair::from_pem(&key_pem)
-            .map_err(|e| anyhow::anyhow!("parse CA key {ca_key_path}: {e}"))?;
+        let ca_key = KeyPair::from_pem(&key_pem).map_err(|e| {
+            anyhow::anyhow!("parse CA key {ca_key_path} (cert {ca_cert_path}): {e}; {CA_REMEDY}")
+        })?;
 
         // Load the persisted CA cert DER (stable — handed to TlsMaterial as-is).
         let ca_cert_der = std::fs::read(validate_cli_path(std::path::Path::new(ca_cert_path))?)
             .map_err(|e| anyhow::anyhow!("read CA cert {ca_cert_path}: {e}"))?;
 
         ca_key_matches_cert(&ca_key, &ca_cert_der).map_err(|e| {
-            anyhow::anyhow!("CA key {ca_key_path} and cert {ca_cert_path} are unusable: {e}")
+            anyhow::anyhow!(
+                "CA key {ca_key_path} and cert {ca_cert_path} are unusable: {e}; {CA_REMEDY}"
+            )
         })?;
 
         // Reconstruct CertificateParams matching the CA cert so callers can
@@ -225,24 +262,63 @@ fn load_or_generate_ca(
     // before the first rename leaves neither final file (next boot is a clean first
     // boot); the key is renamed last so a crash between renames leaves cert-only,
     // which the next boot reports as partial state instead of using a half-written key.
-    let key_tmp = format!("{ca_key_path}.tmp");
+    // Both tmp files are fsynced before any rename and the directory after, so a power
+    // loss cannot leave a renamed zero-length CA file.
     let cert_tmp = format!("{ca_cert_path}.tmp");
     write_private_key(
         validate_cli_path(std::path::Path::new(&key_tmp))?,
         ca_key.serialize_pem().as_bytes(),
     )
     .map_err(|e| anyhow::anyhow!("write CA key {key_tmp}: {e}"))?;
-    std::fs::write(
+    write_synced(
         validate_cli_path(std::path::Path::new(&cert_tmp))?,
         &ca_cert_der,
     )
     .map_err(|e| anyhow::anyhow!("write CA cert {cert_tmp}: {e}"))?;
     std::fs::rename(&cert_tmp, ca_cert_path)
         .map_err(|e| anyhow::anyhow!("rename {cert_tmp} -> {ca_cert_path}: {e}"))?;
+    sync_parent_dir(ca_cert_path).map_err(|e| anyhow::anyhow!("fsync CA directory: {e}"))?;
     std::fs::rename(&key_tmp, ca_key_path)
         .map_err(|e| anyhow::anyhow!("rename {key_tmp} -> {ca_key_path}: {e}"))?;
+    sync_parent_dir(ca_cert_path)
+        .and_then(|()| sync_parent_dir(ca_key_path))
+        .map_err(|e| anyhow::anyhow!("fsync CA directory: {e}"))?;
 
     Ok((ca_key, ca_params, ca_cert_der))
+}
+
+/// Rename `key_tmp` to `key_path` iff it is a key matching the cert at `cert_path`.
+/// Returns whether the rename happened; never deletes or rewrites anything.
+fn roll_forward_key_tmp(cert_path: &str, key_tmp: &str, key_path: &str) -> anyhow::Result<bool> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(cert_der) = std::fs::read(cert_path) else {
+        return Ok(false);
+    };
+    match std::fs::symlink_metadata(key_tmp) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => anyhow::bail!(
+            "{key_tmp} is not a regular file (symlink or other); refusing to adopt it as the \
+             CA key; {CA_REMEDY}"
+        ),
+        Err(_) => return Ok(false),
+    }
+    let Ok(key_pem) = std::fs::read_to_string(key_tmp) else {
+        return Ok(false);
+    };
+    let Ok(key) = KeyPair::from_pem(&key_pem) else {
+        return Ok(false);
+    };
+    if ca_key_matches_cert(&key, &cert_der).is_err() {
+        return Ok(false);
+    }
+    let f = std::fs::File::open(key_tmp).map_err(|e| anyhow::anyhow!("open {key_tmp}: {e}"))?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| f.sync_all())
+        .map_err(|e| anyhow::anyhow!("chmod 0600 {key_tmp}: {e}"))?;
+    std::fs::rename(key_tmp, key_path)
+        .map_err(|e| anyhow::anyhow!("rename {key_tmp} -> {key_path}: {e}"))?;
+    sync_parent_dir(key_path).map_err(|e| anyhow::anyhow!("fsync dir of {key_path}: {e}"))?;
+    Ok(true)
 }
 
 /// Err unless `cert_der` parses as X.509 and its public key is `key`'s public key.
@@ -1361,13 +1437,22 @@ mod tests {
 
     /// Assert the CA load fails and leaves every listed file byte-identical:
     /// regenerating would silently replace trust for the whole cluster.
-    fn assert_refuses_and_preserves(dir: &std::path::Path, files: &[&std::path::Path]) {
+    fn assert_refuses_and_preserves(
+        key: &std::path::Path,
+        cert: &std::path::Path,
+        files: &[&std::path::Path],
+    ) -> String {
         let before: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect(); // lgtm[rust/path-injection]
-        let err = run_load_or_generate_ca(dir).expect_err("partial CA state must refuse to start");
-        assert!(
-            err.to_string().contains("ca."),
-            "error must name the files: {err}"
-        );
+        let err = load_or_generate_ca(&key.to_string_lossy(), &cert.to_string_lossy())
+            .expect_err("partial CA state must refuse to start");
+        let msg = err.to_string();
+        for p in [key, cert] {
+            assert!(
+                msg.contains(&*p.to_string_lossy()),
+                "error must name the full path {}: {msg}",
+                p.display()
+            );
+        }
         for (p, b) in files.iter().zip(before) {
             assert_eq!(
                 std::fs::read(p).unwrap(), // lgtm[rust/path-injection]
@@ -1376,6 +1461,140 @@ mod tests {
                 p.display()
             );
         }
+        msg
+    }
+
+    #[test]
+    fn ca_interrupted_first_boot_rolls_forward_instead_of_bricking_the_cluster() {
+        let dir = test_temp_dir("ca-roll-forward");
+        let (key, cert) = generated_ca(&dir);
+        let (_, _, original) = run_load_or_generate_ca(&dir).unwrap();
+        let key_tmp = dir.join("ca.key.tmp");
+        std::fs::rename(&key, &key_tmp).unwrap(); // lgtm[rust/path-injection]
+        let (_, _, loaded) = run_load_or_generate_ca(&dir)
+            .expect("cert + matching key.tmp is an interrupted first boot and must recover");
+        assert_eq!(loaded, original, "roll-forward must keep the same CA");
+        assert!(
+            key.exists() && !key_tmp.exists(),
+            "key.tmp must be renamed into place"
+        );
+        assert!(cert.exists());
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_symlinked_key_tmp_is_refused_so_a_planted_link_never_becomes_the_ca_key() {
+        let dir = test_temp_dir("ca-tmp-symlink");
+        let (key, cert) = generated_ca(&dir);
+        let target = dir.join("elsewhere.key");
+        std::fs::rename(&key, &target).unwrap(); // lgtm[rust/path-injection]
+        let key_tmp = dir.join("ca.key.tmp");
+        std::os::unix::fs::symlink(&target, &key_tmp).unwrap(); // lgtm[rust/path-injection]
+        let err = load_or_generate_ca(&key.to_string_lossy(), &cert.to_string_lossy())
+            .expect_err("symlinked key.tmp must be refused");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert!(!key.exists(), "symlink must not be renamed into place");
+        assert!(
+            std::fs::symlink_metadata(&key_tmp) // lgtm[rust/path-injection]
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link must be left untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_rolled_forward_key_is_owner_only_even_if_key_tmp_was_world_readable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = test_temp_dir("ca-tmp-mode");
+        let (key, _) = generated_ca(&dir);
+        let key_tmp = dir.join("ca.key.tmp");
+        std::fs::rename(&key, &key_tmp).unwrap(); // lgtm[rust/path-injection]
+        std::fs::set_permissions(&key_tmp, std::fs::Permissions::from_mode(0o644)).unwrap(); // lgtm[rust/path-injection]
+        run_load_or_generate_ca(&dir).expect("rolls forward");
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777; // lgtm[rust/path-injection]
+        assert_eq!(
+            mode, 0o600,
+            "a group/world-readable CA private key leaks the CA"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_roll_forward_ignores_a_stale_cert_tmp_and_leaves_it_in_place() {
+        let dir = test_temp_dir("ca-stale-cert-tmp");
+        let (key, _) = generated_ca(&dir);
+        std::fs::rename(&key, dir.join("ca.key.tmp")).unwrap(); // lgtm[rust/path-injection]
+        let stale = dir.join("ca.crt.tmp");
+        std::fs::write(&stale, b"stale").unwrap(); // lgtm[rust/path-injection]
+        run_load_or_generate_ca(&dir).expect("key.tmp alone decides the roll-forward");
+        assert!(key.exists());
+        assert_eq!(std::fs::read(&stale).unwrap(), b"stale"); // lgtm[rust/path-injection]
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_mismatched_key_tmp_is_not_rolled_forward_so_a_foreign_key_never_becomes_the_ca() {
+        let dir = test_temp_dir("ca-tmp-mismatch");
+        let (key, cert) = generated_ca(&dir);
+        let other = test_temp_dir("ca-tmp-mismatch-other");
+        let (other_key, _) = generated_ca(&other);
+        std::fs::remove_file(&key).unwrap(); // lgtm[rust/path-injection]
+        let key_tmp = dir.join("ca.key.tmp");
+        std::fs::copy(&other_key, &key_tmp).unwrap(); // lgtm[rust/path-injection]
+        assert_refuses_and_preserves(&key, &cert, &[&cert, &key_tmp]);
+        assert!(
+            !key.exists(),
+            "mismatched tmp must not be renamed into place"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+        let _ = std::fs::remove_dir_all(&other); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_empty_key_tmp_from_a_power_loss_is_not_rolled_forward() {
+        let dir = test_temp_dir("ca-tmp-empty");
+        let (key, cert) = generated_ca(&dir);
+        std::fs::remove_file(&key).unwrap(); // lgtm[rust/path-injection]
+        let key_tmp = dir.join("ca.key.tmp");
+        std::fs::write(&key_tmp, b"").unwrap(); // lgtm[rust/path-injection]
+        assert_refuses_and_preserves(&key, &cert, &[&cert, &key_tmp]);
+        assert!(!key.exists(), "zero-length tmp must not become the CA key");
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn front_proxy_ca_partial_state_is_refused_and_preserved_like_the_cluster_ca() {
+        let dir = test_temp_dir("fp-ca-partial");
+        let key = dir.join("front-proxy-ca.key");
+        let cert = dir.join("front-proxy-ca.crt");
+        load_or_generate_ca(&key.to_string_lossy(), &cert.to_string_lossy()).unwrap();
+        std::fs::remove_file(&key).unwrap(); // lgtm[rust/path-injection]
+        let msg = assert_refuses_and_preserves(&key, &cert, &[&cert]);
+        assert!(msg.contains("front-proxy-ca"), "{msg}");
+        assert!(!key.exists(), "no new front-proxy key may be generated");
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_corrupt_and_mismatch_errors_tell_the_operator_how_to_recover() {
+        let dir = test_temp_dir("ca-remedy");
+        let (key, cert) = generated_ca(&dir);
+        std::fs::write(&key, b"garbage").unwrap(); // lgtm[rust/path-injection]
+        let corrupt = assert_refuses_and_preserves(&key, &cert, &[&key, &cert]);
+        let other = test_temp_dir("ca-remedy-other");
+        let (other_key, _) = generated_ca(&other);
+        std::fs::copy(&other_key, &key).unwrap(); // lgtm[rust/path-injection]
+        let mismatch = assert_refuses_and_preserves(&key, &cert, &[&key, &cert]);
+        for msg in [corrupt, mismatch] {
+            assert!(
+                msg.contains("restore from backup, or delete both files"),
+                "an operator staring at a boot failure needs the remedy: {msg}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+        let _ = std::fs::remove_dir_all(&other); // lgtm[rust/path-injection]
     }
 
     #[test]
@@ -1383,7 +1602,7 @@ mod tests {
         let dir = test_temp_dir("ca-cert-only");
         let (key, cert) = generated_ca(&dir);
         std::fs::remove_file(&key).unwrap(); // lgtm[rust/path-injection]
-        assert_refuses_and_preserves(&dir, &[&cert]);
+        assert_refuses_and_preserves(&key, &cert, &[&cert]);
         assert!(!key.exists(), "no new key may be generated");
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
@@ -1393,7 +1612,7 @@ mod tests {
         let dir = test_temp_dir("ca-key-only");
         let (key, cert) = generated_ca(&dir);
         std::fs::remove_file(&cert).unwrap(); // lgtm[rust/path-injection]
-        assert_refuses_and_preserves(&dir, &[&key]);
+        assert_refuses_and_preserves(&key, &cert, &[&key]);
         assert!(!cert.exists(), "no new cert may be generated");
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
@@ -1405,7 +1624,7 @@ mod tests {
         let other = test_temp_dir("ca-mismatch-other");
         let (_, other_cert) = generated_ca(&other);
         std::fs::copy(&other_cert, &cert).unwrap(); // lgtm[rust/path-injection]
-        assert_refuses_and_preserves(&dir, &[&key, &cert]);
+        assert_refuses_and_preserves(&key, &cert, &[&key, &cert]);
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
         let _ = std::fs::remove_dir_all(&other); // lgtm[rust/path-injection]
     }
@@ -1415,7 +1634,7 @@ mod tests {
         let dir = test_temp_dir("ca-corrupt-cert");
         let (key, cert) = generated_ca(&dir);
         std::fs::write(&cert, b"not a certificate").unwrap(); // lgtm[rust/path-injection]
-        assert_refuses_and_preserves(&dir, &[&key, &cert]);
+        assert_refuses_and_preserves(&key, &cert, &[&key, &cert]);
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
@@ -1424,7 +1643,7 @@ mod tests {
         let dir = test_temp_dir("ca-corrupt-key");
         let (key, cert) = generated_ca(&dir);
         std::fs::write(&key, b"dummy-key-content").unwrap(); // lgtm[rust/path-injection]
-        assert_refuses_and_preserves(&dir, &[&key, &cert]);
+        assert_refuses_and_preserves(&key, &cert, &[&key, &cert]);
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
