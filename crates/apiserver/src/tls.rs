@@ -277,6 +277,7 @@ fn load_or_generate_ca(
     .map_err(|e| anyhow::anyhow!("write CA cert {cert_tmp}: {e}"))?;
     std::fs::rename(&cert_tmp, ca_cert_path)
         .map_err(|e| anyhow::anyhow!("rename {cert_tmp} -> {ca_cert_path}: {e}"))?;
+    sync_parent_dir(ca_cert_path).map_err(|e| anyhow::anyhow!("fsync CA directory: {e}"))?;
     std::fs::rename(&key_tmp, ca_key_path)
         .map_err(|e| anyhow::anyhow!("rename {key_tmp} -> {ca_key_path}: {e}"))?;
     sync_parent_dir(ca_cert_path)
@@ -289,9 +290,18 @@ fn load_or_generate_ca(
 /// Rename `key_tmp` to `key_path` iff it is a key matching the cert at `cert_path`.
 /// Returns whether the rename happened; never deletes or rewrites anything.
 fn roll_forward_key_tmp(cert_path: &str, key_tmp: &str, key_path: &str) -> anyhow::Result<bool> {
+    use std::os::unix::fs::PermissionsExt as _;
     let Ok(cert_der) = std::fs::read(cert_path) else {
         return Ok(false);
     };
+    match std::fs::symlink_metadata(key_tmp) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => anyhow::bail!(
+            "{key_tmp} is not a regular file (symlink or other); refusing to adopt it as the \
+             CA key; {CA_REMEDY}"
+        ),
+        Err(_) => return Ok(false),
+    }
     let Ok(key_pem) = std::fs::read_to_string(key_tmp) else {
         return Ok(false);
     };
@@ -301,6 +311,10 @@ fn roll_forward_key_tmp(cert_path: &str, key_tmp: &str, key_path: &str) -> anyho
     if ca_key_matches_cert(&key, &cert_der).is_err() {
         return Ok(false);
     }
+    let f = std::fs::File::open(key_tmp).map_err(|e| anyhow::anyhow!("open {key_tmp}: {e}"))?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| f.sync_all())
+        .map_err(|e| anyhow::anyhow!("chmod 0600 {key_tmp}: {e}"))?;
     std::fs::rename(key_tmp, key_path)
         .map_err(|e| anyhow::anyhow!("rename {key_tmp} -> {key_path}: {e}"))?;
     sync_parent_dir(key_path).map_err(|e| anyhow::anyhow!("fsync dir of {key_path}: {e}"))?;
@@ -1465,6 +1479,58 @@ mod tests {
             "key.tmp must be renamed into place"
         );
         assert!(cert.exists());
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_symlinked_key_tmp_is_refused_so_a_planted_link_never_becomes_the_ca_key() {
+        let dir = test_temp_dir("ca-tmp-symlink");
+        let (key, cert) = generated_ca(&dir);
+        let target = dir.join("elsewhere.key");
+        std::fs::rename(&key, &target).unwrap(); // lgtm[rust/path-injection]
+        let key_tmp = dir.join("ca.key.tmp");
+        std::os::unix::fs::symlink(&target, &key_tmp).unwrap(); // lgtm[rust/path-injection]
+        let err = load_or_generate_ca(&key.to_string_lossy(), &cert.to_string_lossy())
+            .expect_err("symlinked key.tmp must be refused");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert!(!key.exists(), "symlink must not be renamed into place");
+        assert!(
+            std::fs::symlink_metadata(&key_tmp) // lgtm[rust/path-injection]
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link must be left untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_rolled_forward_key_is_owner_only_even_if_key_tmp_was_world_readable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = test_temp_dir("ca-tmp-mode");
+        let (key, _) = generated_ca(&dir);
+        let key_tmp = dir.join("ca.key.tmp");
+        std::fs::rename(&key, &key_tmp).unwrap(); // lgtm[rust/path-injection]
+        std::fs::set_permissions(&key_tmp, std::fs::Permissions::from_mode(0o644)).unwrap(); // lgtm[rust/path-injection]
+        run_load_or_generate_ca(&dir).expect("rolls forward");
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777; // lgtm[rust/path-injection]
+        assert_eq!(
+            mode, 0o600,
+            "a group/world-readable CA private key leaks the CA"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn ca_roll_forward_ignores_a_stale_cert_tmp_and_leaves_it_in_place() {
+        let dir = test_temp_dir("ca-stale-cert-tmp");
+        let (key, _) = generated_ca(&dir);
+        std::fs::rename(&key, dir.join("ca.key.tmp")).unwrap(); // lgtm[rust/path-injection]
+        let stale = dir.join("ca.crt.tmp");
+        std::fs::write(&stale, b"stale").unwrap(); // lgtm[rust/path-injection]
+        run_load_or_generate_ca(&dir).expect("key.tmp alone decides the roll-forward");
+        assert!(key.exists());
+        assert_eq!(std::fs::read(&stale).unwrap(), b"stale"); // lgtm[rust/path-injection]
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
