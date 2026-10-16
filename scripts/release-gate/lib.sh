@@ -13,6 +13,8 @@
 #   burst80_secs=N|timeout
 #   wp_ok=1|0                WordPress page answered after the burst settled
 #   webhook_ok=1|0           scripts/e2e-workload/webhook-smoke.sh passed
+# Ramp mode writes install_ok plus, per burst size N: ramp_N_secs (N|timeout),
+# ramp_N_oom_host, ramp_N_oom_kubesystem, ramp_N_notready, ramp_N_ready_final, ramp_N_wp_ok.
 # A missing key is a FAIL, never a pass: a run that died halfway must not look green.
 
 BURST_CAP_SECS="${BURST_CAP_SECS:-300}"
@@ -48,6 +50,88 @@ rg_oom_victims() {
     memcg="${line#*task_memcg=}"; memcg="${memcg%%,*}"
     echo "$(rg_classify_oom "$task" "$memcg" "$uids") $task"
   done
+}
+
+_rg_is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# Reads `kubectl get deployment -w -o jsonpath={.status.readyReplicas}` lines on stdin;
+# returns 0 once a line equals $1 (all replicas Ready), 1 if the stream ends first. An
+# unset readyReplicas prints an empty line, which never equals a positive target.
+rg_wait_ready() {
+  local want="$1" line
+  while IFS= read -r line; do
+    [ "$line" = "$want" ] && return 0
+  done
+  return 1
+}
+
+# Counts Ready!=True observations with epoch >= $2 in a node-ready.log ("<epoch> <status>").
+# "unreachable" is not counted, matching criterion (b) of the full gate.
+rg_notready_since() {
+  awk -v t0="$2" '$1 >= t0 && ($2 == "False" || $2 == "Unknown") {n++} END {print n + 0}' "$1"
+}
+
+# Minimum MemAvailable (MiB) over samples.tsv rows of phase $2, or "-" when none.
+rg_phase_memmin() {
+  awk -F'\t' -v ph="$2" '$2 == ph && $3 == "MEM" {v = $4 / 1024; if (!s || v < m) {m = v; s = 1}} END {if (s) printf "%.0f\n", m; else print "-"}' "$1"
+}
+
+# Validates a ramp list ("30,40,50": strictly increasing positive integers) and prints it
+# space-separated. Non-zero on anything else.
+rg_parse_ramp() {
+  local list="$1" part prev=0 out=""
+  [ -n "$list" ] || return 1
+  case "$list" in *,|,*|*,,*) return 1 ;; esac
+  local IFS=,
+  for part in $list; do
+    _rg_is_num "$part" || return 1
+    [ "$part" -gt "$prev" ] || return 1
+    prev="$part"; out="$out $part"
+  done
+  echo "${out# }"
+}
+
+# One ramp step's criteria (a)-(d) from the results file. Prints "<a> <b> <c> <d>" as
+# PASS/FAIL, or "notrun" when the step produced no burst result. Returns 0 iff all PASS.
+# Criterion (e) (webhook-smoke) is not per-size and is left to the full-gate confirmation.
+rg_ramp_step() {
+  local f="$1" n="$2" secs oomh oomk nr rf wp a=FAIL b=FAIL c=FAIL d=FAIL
+  secs="$(rg_get "$f" "ramp_${n}_secs")"
+  [ -n "$secs" ] || { echo notrun; return 1; }
+  oomh="$(rg_get "$f" "ramp_${n}_oom_host")"; oomk="$(rg_get "$f" "ramp_${n}_oom_kubesystem")"
+  nr="$(rg_get "$f" "ramp_${n}_notready")"; rf="$(rg_get "$f" "ramp_${n}_ready_final")"
+  wp="$(rg_get "$f" "ramp_${n}_wp_ok")"
+  if _rg_is_num "$oomh" && _rg_is_num "$oomk" && [ "$oomh" -eq 0 ] && [ "$oomk" -eq 0 ]; then a=PASS; fi
+  if _rg_is_num "$nr" && [ "$nr" -eq 0 ] && [ "$rf" = True ]; then b=PASS; fi
+  if _rg_is_num "$secs" && [ "$secs" -le "$BURST_CAP_SECS" ]; then c=PASS; fi
+  [ "$wp" = 1 ] && d=PASS
+  echo "$a $b $c $d"
+  [ "$a $b $c $d" = "PASS PASS PASS PASS" ]
+}
+
+# Ramp summary: $1 results file, $2 space-separated sizes, $3 samples.tsv. Prints the
+# per-size table and the candidate N (largest size before the first failure). Returns 0
+# iff install succeeded and at least one size passed.
+rg_ramp_verdict() {
+  local f="$1" sizes="$2" samples="$3" n cand="" stopped="" row secs ok
+  printf '%-6s %-5s %-5s %-5s %-5s %-9s %s\n' size '(a)' '(b)' '(c)' '(d)' burst_s memavail_min_MiB
+  for n in $sizes; do
+    row="$(rg_ramp_step "$f" "$n")" && ok=1 || ok=0
+    if [ "$row" = notrun ]; then
+      printf '%-6s not run\n' "$n"; continue
+    fi
+    secs="$(rg_get "$f" "ramp_${n}_secs")"
+    printf '%-6s %-5s %-5s %-5s %-5s %-9s %s\n' "$n" $row "$secs" "$(rg_phase_memmin "$samples" "burst$n")"
+    if [ "$ok" = 1 ] && [ -z "$stopped" ]; then cand="$n"; else stopped=1; fi
+  done
+  if [ "$(rg_get "$f" install_ok)" != 1 ]; then
+    echo "RAMP: install failed (install_ok=$(rg_get "$f" install_ok))"; return 1
+  fi
+  if [ -n "$cand" ]; then
+    echo "RAMP: candidate N=$cand -- approximate (single VM, state carryover); confirm with fresh full-gate runs"
+    return 0
+  fi
+  echo "RAMP: no size passed"; return 1
 }
 
 _rg_row() { printf '%-4s %-5s %s\n' "$1" "$2" "$3"; }
