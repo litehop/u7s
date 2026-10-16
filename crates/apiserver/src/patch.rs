@@ -40,11 +40,15 @@ pub enum PatchError {
 }
 
 /// List-element operations one strategic merge patch may perform. Matching is linear, so this
-/// only bounds patches that are themselves enormous (the request body cap alone admits ~250k
-/// elements); upstream has no equivalent and relies on the request timeout instead.
+/// only bounds patches that are themselves enormous (a `$deleteFromPrimitiveList` of ~2M tiny
+/// numbers fits the request body cap); upstream has no equivalent and relies on the request
+/// timeout instead.
 const MAX_WORK: usize = 1_000_000;
 
 thread_local! {
+    /// Remaining budget for the merge in progress on this thread. `run_strategic_merge` sets
+    /// it; the default 0 means a list helper called without going through it is refused
+    /// (fail closed) rather than running unbounded.
     static WORK_LEFT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -3944,11 +3948,16 @@ mod tests {
         let patch = json!({"spec": {"containers": patch_items}});
 
         let started = std::time::Instant::now();
-        strategic_merge_patch(&mut target, &patch).unwrap();
+        let budget = 10 * n;
+        run_strategic_merge(&mut target, &patch, None, false, budget).unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
             "list matching regressed to superlinear: {:?}",
             started.elapsed()
+        );
+        assert!(
+            budget - WORK_LEFT.with(|w| w.get()) <= 5 * n,
+            "charged work must stay linear in list size"
         );
 
         let out = target["spec"]["containers"].as_array().unwrap();
@@ -3997,19 +4006,104 @@ mod tests {
         let mut target = json!({"metadata": {"finalizers": (0..n).map(|i| format!("f{i}")).collect::<Vec<_>>()}});
         let patch = json!({"metadata": {"$deleteFromPrimitiveList/finalizers": (0..n).step_by(2).map(|i| format!("f{i}")).collect::<Vec<_>>()}});
         let started = std::time::Instant::now();
-        strategic_merge_patch(&mut target, &patch).unwrap();
+        let budget = 4 * n;
+        run_strategic_merge(&mut target, &patch, None, false, budget).unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(
+            budget - WORK_LEFT.with(|w| w.get()) <= 3 * n,
+            "primitive-list deletion charged superlinear work"
+        );
         let left = target["metadata"]["finalizers"].as_array().unwrap();
         assert_eq!(left.len(), n / 2);
         assert_eq!(left[0], "f1");
 
         let mut set = json!((0..n).collect::<Vec<_>>());
         let add = json!((n / 2..n + 10).collect::<Vec<_>>());
+        WORK_LEFT.with(|w| w.set(4 * n));
         strategic_merge_set_array(&mut set, &add).unwrap();
+        assert_eq!(
+            4 * n - WORK_LEFT.with(|w| w.get()),
+            n + n / 2 + 10,
+            "set merge must charge exactly patch + target length"
+        );
         assert_eq!(
             set.as_array().unwrap().len(),
             n + 10,
             "only new values appended"
+        );
+    }
+
+    #[test]
+    fn duplicate_merge_keys_in_the_original_only_update_the_first_match() {
+        // A stored list with two same-name entries must not have both rewritten, nor the
+        // patch dropped, by one patch for that name.
+        let mut target = json!({"spec": {"containers": [
+            {"name": "a", "image": "one"},
+            {"name": "a", "image": "two"},
+        ]}});
+        let patch = json!({"spec": {"containers": [{"name": "a", "image": "new"}]}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(
+            target["spec"]["containers"],
+            json!([{"name": "a", "image": "new"}, {"name": "a", "image": "two"}]),
+            "first match wins; the later duplicate is left untouched"
+        );
+    }
+
+    #[test]
+    fn duplicate_merge_keys_in_the_patch_collapse_onto_one_element() {
+        // Two patch entries for one name must merge sequentially into a single element, not
+        // append a second copy that makes the stored list non-unique.
+        let patch = json!({"spec": {"containers": [
+            {"name": "a", "image": "first"},
+            {"name": "a", "image": "second", "stdin": true},
+        ]}});
+        let mut target =
+            json!({"spec": {"containers": [{"name": "a", "image": "old", "tty": true}]}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(
+            target["spec"]["containers"],
+            json!([{"name": "a", "image": "second", "tty": true, "stdin": true}])
+        );
+
+        let mut target = json!({"spec": {"containers": []}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(
+            target["spec"]["containers"],
+            json!([{"name": "a", "image": "second", "stdin": true}]),
+            "a duplicated new name is added once, not twice"
+        );
+    }
+
+    #[test]
+    fn nulling_a_composite_key_field_does_not_leave_a_stale_index_entry() {
+        // The match index is built before the merge; a patch entry carrying a null key field
+        // must not make a later entry match through a stale index record.
+        let mut target = json!({"spec": {"containers": [{"name": "c", "ports": [
+            {"containerPort": 80, "protocol": "UDP"},
+        ]}]}});
+        let patch = json!({"spec": {"containers": [{"name": "c", "ports": [
+            {"containerPort": 80, "protocol": null},
+            {"containerPort": 80, "protocol": "UDP", "name": "dns"},
+        ]}]}});
+        strategic_merge_patch_ssa(&mut target, &patch).unwrap();
+        let ports = target["spec"]["containers"][0]["ports"].as_array().unwrap();
+        let udp: Vec<_> = ports.iter().filter(|p| p["protocol"] == "UDP").collect();
+        assert_eq!(udp.len(), 1, "got {ports:?}");
+        assert_eq!(
+            udp[0]["name"], "dns",
+            "UDP entry gets its own patch: {ports:?}"
+        );
+    }
+
+    #[test]
+    fn direct_set_array_call_without_a_budget_fails_closed() {
+        WORK_LEFT.with(|w| w.set(0));
+        let mut set = json!([1, 2]);
+        let err = strategic_merge_set_array(&mut set, &json!([3])).unwrap_err();
+        assert!(
+            matches!(err, PatchError::TooComplex(_)),
+            "an unbudgeted merge must be refused, not run unbounded: {err:?}"
         );
     }
 }

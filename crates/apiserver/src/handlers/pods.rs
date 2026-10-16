@@ -2769,14 +2769,9 @@ pub(crate) fn apply_status_patch(
                         let wrapper_patch = serde_json::json!({ key: val });
                         let mut wrapper_target =
                             serde_json::json!({ key: result["status"][key].clone() });
-                        // Ignore errors — unknown $patch directives fall through to merge_patch.
-                        if crate::patch::strategic_merge_patch(&mut wrapper_target, &wrapper_patch)
-                            .is_ok()
-                        {
-                            result["status"][key] = wrapper_target[key].clone();
-                        } else {
-                            crate::patch::merge_patch(&mut result["status"][key], val);
-                        }
+                        crate::patch::strategic_merge_patch(&mut wrapper_target, &wrapper_patch)
+                            .map_err(Status::patch_error)?;
+                        result["status"][key] = wrapper_target[key].clone();
                     } else {
                         crate::patch::merge_patch(&mut result["status"][key], val);
                     }
@@ -4093,6 +4088,26 @@ mod status_tests {
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "a scalar status must be rejected with 422, matching upstream schema validation"
         );
+    }
+
+    /// A strategic-merge error on a status array field (here an unknown `$patch` directive)
+    /// must reach the client as 400, as upstream does. Falling back to merge-patch would
+    /// store the directive literally and report success for a patch that was never applied.
+    #[test]
+    fn apply_status_patch_propagates_strategic_merge_errors_instead_of_storing_directives() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "resourceVersion": "1"},
+            "spec": {},
+            "status": {"phase": "Running", "podIPs": [{"ip": "10.0.0.1"}]}
+        });
+        let patch = serde_json::json!({
+            "status": {"podIPs": [{"ip": "10.0.0.1", "$patch": "bogus"}]}
+        });
+
+        let err = apply_status_patch(&stored, &patch)
+            .expect_err("an invalid $patch directive must be rejected, not merged literally");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
     /// apply_status_patch must ACCEPT a merge-patch body `{"status": null}` — RFC 7396's
