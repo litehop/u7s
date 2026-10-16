@@ -36,7 +36,18 @@ impl std::fmt::Debug for StatusError {
 
 impl IntoResponse for StatusError {
     fn into_response(self) -> Response {
-        (self.0, axum::Json(self.1)).into_response()
+        let retry_after = self
+            .1
+            .details
+            .as_ref()
+            .and_then(|d| d.get("retryAfterSeconds"))
+            .and_then(|v| v.as_u64());
+        let mut resp = (self.0, axum::Json(self.1)).into_response();
+        if let Some(secs) = retry_after {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
+        resp
     }
 }
 
@@ -233,6 +244,16 @@ impl Status {
                 details: None,
             },
         )
+    }
+
+    /// 429 carrying `details.retryAfterSeconds` (also emitted as a `Retry-After` header),
+    /// which client-go's rate-limit backoff honours instead of hammering a saturated server.
+    pub fn too_many_requests_retry_after(message: String, retry_after_seconds: u64) -> StatusError {
+        let mut err = Self::too_many_requests(message);
+        err.1.details = Some(Box::new(
+            serde_json::json!({ "retryAfterSeconds": retry_after_seconds }),
+        ));
+        err
     }
 
     /// 429 with a `status.details.causes[]` entry, so client-go's

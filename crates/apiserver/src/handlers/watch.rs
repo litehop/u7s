@@ -1000,22 +1000,48 @@ async fn watch_generic_impl<S: Store>(
     };
     let watch_version = derive_watch_version(&api_version).to_string();
     let watch_scope = derive_watch_scope(&prefix, &plural);
-    // Enforce per-client watch concurrency limit. Try to acquire a permit from
-    // this user's semaphore. If the semaphore is exhausted (client already has
-    // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
-    let sem = state.watch_limit.semaphore_for(&username);
-    let _watch_permit = sem.try_acquire_owned().map_err(|_| {
-        crate::metrics::REQUEST_TOTAL
-            .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "429"])
-            .inc();
-        u7s_store::metrics::WATCH_CLOSED_TOTAL
-            .with_label_values(&["client_limit_exceeded"])
-            .inc();
-        crate::status::Status::too_many_requests(format!(
-            "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
-            crate::state::MAX_WATCHES_PER_CLIENT
-        ))
-    })?;
+    // System identities (kubelets, controller-manager, scheduler, admin) take no permits:
+    // they are few and trusted, and the controller-manager alone opens well over
+    // MAX_WATCHES_PER_CLIENT streams (one informer per type plus one GC watch per resource),
+    // so a per-client cap would break it, and an exhausted tenant pool must not starve it.
+    let _watch_permit = if crate::state::is_system_priority_username(&username) {
+        None
+    } else {
+        // Per-client cap first, then the server-wide pool: SAs are free to mint, so the
+        // per-client budget alone does not bound the aggregate.
+        let sem = state.watch_limit.semaphore_for(&username);
+        let client_permit = sem.try_acquire_owned().map_err(|_| {
+            crate::metrics::REQUEST_TOTAL
+                .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "429"])
+                .inc();
+            u7s_store::metrics::WATCH_CLOSED_TOTAL
+                .with_label_values(&["client_limit_exceeded"])
+                .inc();
+            crate::status::Status::too_many_requests_retry_after(
+                format!(
+                    "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
+                    crate::state::MAX_WATCHES_PER_CLIENT
+                ),
+                crate::state::WATCH_RETRY_AFTER_SECONDS,
+            )
+        })?;
+        let global_permit = state.watch_limit.try_acquire_global().ok_or_else(|| {
+            crate::metrics::REQUEST_TOTAL
+                .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "429"])
+                .inc();
+            u7s_store::metrics::WATCH_CLOSED_TOTAL
+                .with_label_values(&["global_limit_exceeded"])
+                .inc();
+            crate::status::Status::too_many_requests_retry_after(
+                format!(
+                    "too many concurrent watch streams on this server: maximum {}",
+                    crate::state::MAX_WATCHES_GLOBAL
+                ),
+                crate::state::WATCH_RETRY_AFTER_SECONDS,
+            )
+        })?;
+        Some((client_permit, global_permit))
+    };
     tracing::debug!(username = %username, "watch: permit acquired");
     // Moved into the stream below: a generator captures only the variables it names, so
     // without that the permit would drop when this function returns, not when the stream ends.
@@ -2961,6 +2987,195 @@ mod tests {
         watch_generic(state.clone(), cfg())
             .await
             .unwrap_or_else(|_| panic!("a freed slot must admit a new watch"));
+    }
+
+    fn global_cap_state(capacity: usize) -> crate::state::AppState<u7s_store::SqliteStore> {
+        use std::sync::Arc;
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let mut state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.watch_limit = crate::state::WatchLimitState::with_global_capacity(capacity);
+        state
+    }
+
+    fn global_cap_cfg(username: &str) -> WatchConfig {
+        WatchConfig {
+            prefix: "/registry/test/".into(),
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            from_revision: 0,
+            initial_items: None,
+            label_selector: None,
+            field_selector: None,
+            allow_watch_bookmarks: false,
+            username: username.into(),
+            as_partial_object_metadata: false,
+            group: "".into(),
+            plural: "".into(),
+            timeout_seconds: None,
+        }
+    }
+
+    /// One tenant minting ServiceAccounts gets a fresh per-client budget per SA, so without a
+    /// server-wide cap it can open unbounded watch streams and exhaust the host's tasks/fds.
+    #[tokio::test]
+    async fn global_watch_cap_rejects_many_distinct_serviceaccounts() {
+        let state = global_cap_state(3);
+        let mut held = Vec::new();
+        for i in 0..3 {
+            let sa = format!("system:serviceaccount:tenant:sa-{i}");
+            held.push(
+                watch_generic(state.clone(), global_cap_cfg(&sa))
+                    .await
+                    .unwrap_or_else(|_| panic!("watch {i} is within the global cap")),
+            );
+        }
+        let over = watch_generic(
+            state.clone(),
+            global_cap_cfg("system:serviceaccount:tenant:sa-fresh"),
+        )
+        .await
+        .expect_err("a fresh SA identity must not bypass the server-wide watch cap");
+        assert_eq!(over.0, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(over.1.reason, "TooManyRequests");
+    }
+
+    /// When tenants exhaust the global pool, kubelets, KCM, the scheduler and the admin must
+    /// still be able to watch -- otherwise a single tenant locks out the whole control plane.
+    /// A tenant ServiceAccount must not be able to claim the same exemption.
+    #[tokio::test]
+    async fn system_identities_still_admitted_when_global_watch_pool_exhausted() {
+        let state = global_cap_state(1);
+        let _tenant = watch_generic(state.clone(), global_cap_cfg("system:serviceaccount:t:a"))
+            .await
+            .expect("first tenant watch fits the pool");
+        assert!(
+            watch_generic(state.clone(), global_cap_cfg("system:serviceaccount:t:b"))
+                .await
+                .is_err(),
+            "pool must be exhausted for ordinary identities"
+        );
+        let mut held = Vec::new();
+        for system in [
+            "admin",
+            "system:node:lima-node-5",
+            "system:kube-controller-manager",
+            "system:kube-scheduler",
+        ] {
+            held.push(
+                watch_generic(state.clone(), global_cap_cfg(system))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("{system} must bypass the exhausted global watch pool")
+                    }),
+            );
+        }
+        assert!(
+            watch_generic(
+                state.clone(),
+                global_cap_cfg("system:serviceaccount:kube-system:pretender")
+            )
+            .await
+            .is_err(),
+            "a kube-system ServiceAccount is a tenant-mintable name and must not be exempt"
+        );
+    }
+
+    /// The controller-manager shares one identity across every informer and GC watch (100+
+    /// streams); a per-client cap on it leaves GC unsynced and the cluster unhealthy.
+    #[tokio::test]
+    async fn system_identity_is_not_bound_by_per_client_watch_limit() {
+        let state = global_cap_state(1);
+        let mut held = Vec::new();
+        for i in 0..crate::state::MAX_WATCHES_PER_CLIENT + 10 {
+            held.push(
+                watch_generic(
+                    state.clone(),
+                    global_cap_cfg("system:kube-controller-manager"),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("kcm watch {i} must not hit a per-client cap")),
+            );
+        }
+    }
+
+    /// Both rejections must tell clients when to retry (details.retryAfterSeconds and the
+    /// Retry-After header); without it client-go retries in a tight loop against a server
+    /// that is already saturated.
+    #[tokio::test]
+    async fn watch_429_carries_retry_after_for_client_and_global_rejections() {
+        use axum::response::IntoResponse;
+
+        let state = global_cap_state(1);
+        let client_sem = state.watch_limit.semaphore_for("alice");
+        let _client_permits: Vec<_> = (0..crate::state::MAX_WATCHES_PER_CLIENT)
+            .map(|_| client_sem.clone().try_acquire_owned().unwrap())
+            .collect();
+        let _held = watch_generic(state.clone(), global_cap_cfg("bob"))
+            .await
+            .expect("bob takes the only global slot");
+
+        for (who, what) in [("alice", "per-client"), ("carol", "global")] {
+            let err = watch_generic(state.clone(), global_cap_cfg(who))
+                .await
+                .expect_err("must be rejected");
+            let details = err.1.details.as_ref().expect("429 must carry details");
+            assert_eq!(
+                details["retryAfterSeconds"],
+                crate::state::WATCH_RETRY_AFTER_SECONDS,
+                "{what} rejection must set details.retryAfterSeconds"
+            );
+            let resp = err.into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+                &crate::state::WATCH_RETRY_AFTER_SECONDS.to_string(),
+                "{what} rejection must set the Retry-After header"
+            );
+        }
+    }
+
+    /// Global slots must come back when streams end, and a per-client rejection must not leak
+    /// a global slot; otherwise the pool drains permanently and every tenant is locked out.
+    #[tokio::test]
+    async fn global_watch_permits_released_on_drop_and_not_leaked_by_client_rejection() {
+        let state = global_cap_state(2);
+        let global = || state.watch_limit.try_acquire_global();
+
+        let a = watch_generic(state.clone(), global_cap_cfg("a"))
+            .await
+            .unwrap();
+        let b = watch_generic(state.clone(), global_cap_cfg("b"))
+            .await
+            .unwrap();
+        assert!(global().is_none(), "two open watches must hold both slots");
+        drop(a);
+        drop(b);
+        let reclaimed = [global(), global()];
+        assert!(
+            reclaimed.iter().all(Option::is_some),
+            "dropping the streams must return both global slots"
+        );
+        drop(reclaimed);
+
+        let client_sem = state.watch_limit.semaphore_for("alice");
+        let _client_permits: Vec<_> = (0..crate::state::MAX_WATCHES_PER_CLIENT)
+            .map(|_| client_sem.clone().try_acquire_owned().unwrap())
+            .collect();
+        for _ in 0..5 {
+            assert!(watch_generic(state.clone(), global_cap_cfg("alice"))
+                .await
+                .is_err());
+        }
+        assert!(
+            global().is_some() && global().is_some(),
+            "per-client rejections must not leak global slots"
+        );
     }
 
     /// A different user's watch succeeds even when another user has exhausted their quota.
