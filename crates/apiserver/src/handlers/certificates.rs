@@ -1930,7 +1930,10 @@ mod tests {
             _ => super::super::resource::patch_resource(
                 State(state.clone()),
                 path,
-                Query(PatchQuery::default()),
+                Query(PatchQuery {
+                    force: Some(true),
+                    ..Default::default()
+                }),
                 Extension(test_user()),
                 headers,
                 Bytes::from(match mode {
@@ -2181,7 +2184,10 @@ mod tests {
                 super::super::resource::patch_namespaced_resource(
                     State(state.clone()),
                     path,
-                    Query(PatchQuery::default()),
+                    Query(PatchQuery {
+                        force: Some(true),
+                        ..Default::default()
+                    }),
                     Extension(test_user()),
                     headers_for(mode),
                     match mode {
