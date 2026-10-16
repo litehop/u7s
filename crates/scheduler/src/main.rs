@@ -9,7 +9,11 @@ use clap::Parser;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "u7s-scheduler", about = "Minimal u7s pod scheduler")]
+#[command(
+    name = "u7s-scheduler",
+    about = "Minimal u7s pod scheduler",
+    version = u7s_version::version_string()
+)]
 struct Args {
     /// Path to kubeconfig file.
     #[arg(long, default_value = "./kubeconfig")]
