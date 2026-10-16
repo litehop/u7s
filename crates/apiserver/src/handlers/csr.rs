@@ -141,6 +141,7 @@ pub async fn list_csr<S: Store>(
     State(state): State<AppState<S>>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     // Lookup is infallible for the built-in CSR resource type.
     let meta = lookup(&state, GROUP, VERSION, PLURAL)?;
@@ -217,6 +218,21 @@ pub async fn list_csr<S: Store>(
         items
     };
 
+    let accept = accept_header(&headers);
+    if super::table::wants_table(accept) {
+        let continue_token = resp.continue_key.map(|key| {
+            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
+        });
+        let built = super::table::build_table(GROUP, PLURAL, items);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &super::table::table_api_version(accept),
+            Some(&list_revision.to_string()),
+            continue_token,
+        ))
+        .into_response());
+    }
+
     let body = build_list_response(
         &kind,
         GROUP,
@@ -230,6 +246,13 @@ pub async fn list_csr<S: Store>(
     Ok(Json(body).into_response())
 }
 
+fn accept_header(headers: &HeaderMap) -> &str {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 /// GET /apis/certificates.k8s.io/v1/certificatesigningrequests/{name}
 /// (also used for the /approval subresource GET)
 ///
@@ -240,6 +263,7 @@ pub async fn list_csr<S: Store>(
 pub async fn get_csr<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let key = group_object_key(GROUP, PLURAL, None, &name);
@@ -249,6 +273,20 @@ pub async fn get_csr<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
+
+    let accept = accept_header(&headers);
+    if super::table::wants_table(accept) {
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        let built = super::table::build_table(GROUP, PLURAL, vec![obj]);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &super::table::table_api_version(accept),
+            Some(&stored.revision.to_string()),
+            None,
+        ))
+        .into_response());
+    }
 
     Ok((
         StatusCode::OK,
@@ -828,6 +866,7 @@ mod tests {
         let result = get_csr(
             axum::extract::State(state),
             axum::extract::Path("existing-csr".to_string()),
+            HeaderMap::new(),
         )
         .await;
 
@@ -848,6 +887,7 @@ mod tests {
         let result = get_csr(
             axum::extract::State(state),
             axum::extract::Path("no-such-csr".to_string()),
+            HeaderMap::new(),
         )
         .await;
 
@@ -1322,6 +1362,7 @@ mod tests {
                 timeout_seconds: None,
             }),
             axum::Extension(user),
+            HeaderMap::new(),
         )
         .await;
 
@@ -2485,6 +2526,55 @@ mod tests {
         assert_eq!(c[0]["lastUpdateTime"], "2021-01-01T00:00:00Z");
         assert_eq!(c[1]["lastTransitionTime"], "2030-01-01T00:00:00Z");
         assert_eq!(c[1]["lastUpdateTime"], "2030-01-01T00:00:00Z");
+    }
+
+    /// `kubectl get csr [name]` asks for a Table; the dedicated CSR GET/LIST handlers must honour
+    /// it or kubectl falls back to NAME/AGE only.
+    #[tokio::test]
+    async fn get_and_list_csr_return_table_when_kubectl_asks_for_one() {
+        let state = make_state();
+        seed_csr_for_get(&state, "tbl").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v1"),
+        );
+        let body = |resp: Response| async move {
+            let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+        };
+
+        let resp = get_csr(State(state.clone()), Path("tbl".into()), headers.clone())
+            .await
+            .unwrap();
+        let t = body(resp).await;
+        assert_eq!(t["kind"], "Table");
+        assert_eq!(t["columnDefinitions"][5]["name"], "Condition");
+        assert_eq!(t["rows"][0]["cells"][5], "Pending");
+
+        let resp = list_csr(
+            State(state),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            Extension(user("x")),
+            headers,
+        )
+        .await
+        .unwrap();
+        let t = body(resp).await;
+        assert_eq!(t["kind"], "Table");
+        assert_eq!(t["rows"][0]["cells"][0], "tbl");
     }
 
     /// A signer adding a Failed condition through /status must get timestamps, like /approval.

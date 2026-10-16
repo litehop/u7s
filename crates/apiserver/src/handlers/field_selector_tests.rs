@@ -107,7 +107,7 @@ mod tests {
                 .await
             }
             Route::Namespaces => crate::handlers::namespaces::list_namespaces(st, q, user()).await,
-            Route::Csr => crate::handlers::csr::list_csr(st, q, user()).await,
+            Route::Csr => crate::handlers::csr::list_csr(st, q, user(), HeaderMap::new()).await,
             Route::Cluster(version) => {
                 crate::handlers::resource::list_resource(
                     st,
