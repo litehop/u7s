@@ -98,5 +98,22 @@ assert "one victim per oom-kill line (the 'Killed process' companion line is not
 assert "host process classified by cgroup even if comm is unknown (e.g. renamed unit binary)" \
   "$([ "$(rg_classify_oom mystery /system.slice/crio.service "$UIDS")" = host ] && echo 1 || echo 0)"
 
+# Experiment-flag parsing, with a stub limactl that fails every call so no VM is ever created;
+# gate.env is staged before the first VM and shows what the VM would receive.
+mkdir -p "$TMP/tb" "$TMP/bin"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/limactl"; chmod +x "$TMP/bin/limactl"
+PATH="$TMP/bin:$PATH"
+gate_env() { "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-$1" "${@:2}" >/dev/null 2>&1; cat "$TMP/out-$1/stage/gate.env"; }
+assert "--zram-mib 512 reaches the VM env" "$(gate_env z512 --zram-mib 512 | grep -qx 'ZRAM_MIB=512' && echo 1 || echo 0)"
+assert "--zram-mib 0 is accepted and means no swap" "$(gate_env z0 --zram-mib 0 | grep -qx 'ZRAM_MIB=0' && echo 1 || echo 0)"
+assert "--zram-mib defaults to off" "$(gate_env zdef | grep -qx 'ZRAM_MIB=0' && echo 1 || echo 0)"
+assert "--coredns-requests reaches the VM env" "$(gate_env cd --coredns-requests | grep -qx 'COREDNS_REQ=1' && echo 1 || echo 0)"
+assert "--coredns-requests defaults to off" "$(gate_env cddef | grep -qx 'COREDNS_REQ=0' && echo 1 || echo 0)"
+for bad in abc -5 1.5 ""; do
+  rc=0; err="$("$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-bad" --zram-mib "$bad" 2>&1 >/dev/null)" || rc=$?
+  assert "--zram-mib '$bad' rejected on the host with exit 2 before any VM exists (a bad size must not look like 'zram did not help')" \
+    "$([ "$rc" = 2 ] && echo "$err" | grep -q 'non-negative integer' && [ ! -e "$TMP/out-bad/stage" ] && echo 1 || echo 0)"
+done
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]

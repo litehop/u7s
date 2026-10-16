@@ -12,6 +12,11 @@
 # Requires: kubectl and openssl on PATH; a cluster that can pull the agnhost image.
 set -euo pipefail
 
+# Stop retrying only on the webhook's own denial; transient errors ("failed to respond",
+# connection refused, timeouts) mean the backend is not programmed yet and must be retried.
+smoke_should_stop() { [[ "$1" == *"denied the request"* ]]; }
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
+
 NS="default"
 NAME="u7s-webhook-smoke"
 AGNHOST_IMAGE="registry.k8s.io/e2e-test-images/agnhost:2.63.0"
@@ -115,11 +120,11 @@ for _ in $(seq 1 15); do
     sleep 2
   else
     denied="$out"
-    [[ "$out" == *"denied the request"* ]] && break
+    smoke_should_stop "$out" && break
     sleep 2
   fi
 done
-[[ "$denied" == *"denied the request"* ]] || fail "deny webhook did not deny the ConfigMap; last output: ${denied:-<created>}"
+smoke_should_stop "$denied" || fail "deny webhook did not deny the ConfigMap; last output: ${denied:-<created>}"
 echo "PASS: webhook denied -> $denied"
 
 allow_out="$(cm_yaml allow | k create -f - 2>&1)" || fail "allow webhook rejected the ConfigMap: $allow_out"

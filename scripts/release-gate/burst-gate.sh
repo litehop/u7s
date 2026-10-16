@@ -14,11 +14,12 @@
 #   (e) scripts/e2e-workload/webhook-smoke.sh passes on the shipped-install VM
 # Exits non-zero if any criterion of any run FAILs.
 #
-# Usage: burst-gate.sh [--runs N] [--keep] [--memory GiB] [--burst-cap SECS]
-#                      [--tarball-dir DIR] [--out DIR]
+# Usage: burst-gate.sh [--runs N] [--keep] [--memory GiB] [--zram-mib N] [--coredns-requests]
+#                      [--burst-cap SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --keep            do not delete the VMs afterwards
 #   --memory GiB      override the template's VM memory (forced-failure checks, e.g. 0.625)
+#   --coredns-requests experiment: set CoreDNS cpu/memory requests after install
 #   --zram-mib N      experiment: give the VM an N MiB zram swap device before install
 #   --burst-cap SECS  criterion (c) cap (default 300)
 #   --tarball-dir DIR reuse the output of build-arm64-tarball.sh instead of rebuilding
@@ -48,6 +49,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 export BURST_CAP_SECS
+case "$ZRAM_MIB" in
+  ''|*[!0-9]*) echo "--zram-mib must be a non-negative integer (MiB), got '$ZRAM_MIB'" >&2; exit 2 ;;
+esac
 
 # shellcheck source=lib.sh
 . "$HERE/lib.sh"

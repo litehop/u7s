@@ -4,9 +4,10 @@ Bead: mayor-i4bvb
 
 Answer: systemd MemoryLow/MemoryMin protection of the control-plane units does
 not fix the 80-pod burst (3 gate/screening measurements, node still goes
-NotReady or API-unreachable); a zram swap device does (80 pods Ready in 21 s,
-refault rate down ~15x). Shipping swap is an operator decision, so install.sh
-is unchanged and the gate gains an opt-in `--zram-mib` experiment knob.
+NotReady or API-unreachable); a zram swap device does (80 pods Ready in 15-17 s
+in the gate runs, refault rate down ~15x). Operator decision 2026-10-16: u7s
+does not configure swap; docs will suggest zram for memory-starved hosts. The
+gate keeps an opt-in `--zram-mib` knob.
 
 ## Why protection cannot work here
 
@@ -64,7 +65,7 @@ froze), but the margin is thin.
 ## What works: zram swap
 
 Screening (same VM, harness loops running, no systemd protection, 512 MiB
-zstd zram, page-cluster 0): 80/80 Ready in 21 s, node Ready throughout,
+zstd zram, page-cluster 0): 80/80 Ready in 21 s (screening run, not a gate run), node Ready throughout,
 refault 61k/s (vs 0.9-1.1M/s), MemAvailable min 322 MB (vs 91-143). See the gate-run
 table below. kubelet already runs with `failSwapOn: false`, and its
 default NoSwap behaviour keeps pod cgroups at swap.max=0, so only host daemons
@@ -90,11 +91,12 @@ PSI/refault are over the whole burst80 phase window (so the failing runs
 include the 600 s hard-kill and cleanup). Run 1's `burst-gate.sh` ran while the
 host was at loadavg 25 from the preceding cross-build.
 
-Run 4-6 (e) failures: `webhook-smoke.sh` stopped retrying on the first
+Run 4-5 (e) failures (run 6 passed (e)): `webhook-smoke.sh` stopped retrying on the first
 non-deny error ("failed to respond", i.e. kube-proxy had not programmed the
 smoke Service yet) because it `break`s on any create failure. A healthy node
 reaches that step faster than a thrashing one, which is why it only showed
-up now. The loop now only stops on "denied the request"; run 7 passes (e).
+up now. The loop now only stops on "denied the request". Run 7 passes (e) but is a single quiet-start pass with
+the fix, not 3/3.
 
 ## Upstream comparison
 
@@ -107,8 +109,7 @@ supported route to swap on a node.
 
 ## Decisions for the operator
 
-1. Allow install.sh to provision zram swap (e.g. systemd-zram-generator)? The
-   gate template currently states "no swap unless the operator's lever decision
-   adds one".
+1. Decided 2026-10-16: install.sh does not provision swap; docs will suggest
+   zram for memory-starved hosts.
 2. Reduce harness polling (vm-capture NODE kubectl every 2 s is the heaviest
    loop) so the gate measures the node, not itself.

@@ -73,11 +73,18 @@ burst_cleanup() {
 }
 
 if [ "$ZRAM_MIB" -gt 0 ]; then
-  modprobe zram num_devices=1
-  [ -e /sys/block/zram0 ] || cat /sys/class/zram-control/hot_add > /dev/null
-  echo zstd > /sys/block/zram0/comp_algorithm
-  echo "${ZRAM_MIB}M" > /sys/block/zram0/disksize
-  mkswap /dev/zram0 > /dev/null && swapon -p 100 /dev/zram0 && sysctl -q vm.page-cluster=0
+  zram_fail() {
+    log "zram_setup=failed:$1"; res zram_setup "failed:$1"; res install_ok 0
+    exit 1
+  }
+  modprobe zram num_devices=1 || zram_fail modprobe
+  [ -e /sys/block/zram0 ] || cat /sys/class/zram-control/hot_add > /dev/null || zram_fail hot_add
+  echo zstd > /sys/block/zram0/comp_algorithm || zram_fail comp_algorithm
+  echo "${ZRAM_MIB}M" > /sys/block/zram0/disksize || zram_fail disksize
+  mkswap /dev/zram0 > /dev/null || zram_fail mkswap
+  swapon -p 100 /dev/zram0 || zram_fail swapon
+  sysctl -q vm.page-cluster=0 || zram_fail page-cluster
+  res zram_setup ok
   echo "zram swap ${ZRAM_MIB} MiB: $(swapon --show --noheadings | tr -s ' ')" | tee -a "$OUT/run.log"
 fi
 
