@@ -209,6 +209,13 @@ ensure_jq() {
   fi
 }
 
+# Scratch dir for the release payload (tarball + extracted tree). /var/tmp is
+# disk-backed; the default mktemp location is /tmp, which is tmpfs (RAM) on recent
+# Ubuntu and OOMs the 1 GiB hosts u7s targets.
+mktemp_disk_dir() {
+  mktemp -d /var/tmp/u7s-install.XXXXXX
+}
+
 # Download the release tarball and its .sha256 sidecar, verify the sidecar's
 # hash against the downloaded bytes, and point $TARBALL at it. The caller
 # sets the EXIT trap that removes $DOWNLOAD_DIR. A sidecar fetch failure
@@ -217,7 +224,7 @@ ensure_jq() {
 # as root, so a URL-based fetch always requires a passing checksum.
 fetch_tarball() {
   local url="$1"
-  DOWNLOAD_DIR="$(mktemp -d)"
+  DOWNLOAD_DIR="$(mktemp_disk_dir)"
   TARBALL="$DOWNLOAD_DIR/$(basename "$url")"
   local checksum_url="$url.sha256"
   local checksum_file="$TARBALL.sha256"
@@ -714,12 +721,15 @@ systemctl restart crio
 # (docs/decisions/upstream-component-shipping-shape.md). Binaries are located
 # by name anywhere in the extracted tree rather than at a fixed path, so the
 # tarball's internal layout is not load-bearing. --join needs only kubelet.
-STAGE_DIR="$(mktemp -d)"
+STAGE_DIR="$(mktemp_disk_dir)"
 # Replaces the download-only trap above, so it must still cover $DOWNLOAD_DIR.
 # ${DOWNLOAD_DIR:+...} expands to nothing when --tarball gave a local path.
 trap 'rm -rf "$STAGE_DIR" ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}' EXIT
 
-tar -xzf "$TARBALL" -C "$STAGE_DIR"
+if ! tar -xzf "$TARBALL" -C "$STAGE_DIR"; then
+  echo "error: failed to extract $TARBALL into $STAGE_DIR -- check free disk space on /var/tmp (df -h /var/tmp)" >&2
+  exit 1
+fi
 
 install -d -m 0755 "$BIN_DIR"
 if [ "$WORKER_MODE" -eq 1 ]; then

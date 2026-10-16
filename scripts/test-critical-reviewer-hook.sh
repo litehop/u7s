@@ -216,6 +216,34 @@ else
   fail "raw input log dir missing"
 fi
 
+# Case 7b: a read-only agent whose answer cites an existing ai/findings doc
+# must NOT be queued -- a misattributed entry never auto-drains and costs the
+# mayor a manual investigation. A worker citing the same doc still queues.
+for RO_TYPE in Explore researcher bead-triager diff-summarizer dashboard-differ claude-code-guide statusline-setup; do
+  clear_sandbox
+  RO_WT="$SANDBOX/wt/ro-$RO_TYPE"
+  mkdir -p "$RO_WT/ai/findings"
+  RO_DOC="$RO_WT/ai/findings/already-committed.md"
+  printf 'doc\n' > "$RO_DOC"
+  INPUT_RO=$(jq -n --arg msg "The audit is in $RO_DOC — see section 2." --arg t "$RO_TYPE" \
+    '{agent_id:"agent-ro", agent_type:$t, cwd:"/tmp/wt", session_id:"sessro", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+  run_hook "$INPUT_RO"
+  if [ "$(count_queue_files)" = "0" ] && grep -q $'agent-ro\tskip\tread-only-agent' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+    pass "$RO_TYPE citing an existing findings doc → not queued (would never auto-drain)"
+  else
+    fail "$RO_TYPE citing a findings doc: expected 0 queue files + read-only-agent skip, got $(count_queue_files)"
+  fi
+done
+clear_sandbox
+INPUT_WORKER_CITE=$(jq -n --arg msg "Wrote findings to $RO_DOC" \
+  '{agent_id:"agent-wcite", agent_type:"worker", cwd:"/tmp/wt", session_id:"sesswc", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+run_hook "$INPUT_WORKER_CITE"
+if [ "$(count_queue_files)" = "1" ]; then
+  pass "worker citing a findings doc still queues (read-only skip must not swallow workers)"
+else
+  fail "worker findings: expected 1 queue file, got $(count_queue_files)"
+fi
+
 # Case 8: agent_type is a literal empty string (not missing) -- the
 # upstream #27755 spurious SubagentStop harness event. Must exit before
 # touching the log at all: a log write here would misrepresent "the hook
