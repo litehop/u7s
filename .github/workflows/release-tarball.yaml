@@ -41,7 +41,7 @@ jobs:
             V="${GITHUB_REF_NAME}"
           fi
           if ! printf '%s' "$V" | grep -Eq '^[0-9A-Za-z.-]+$'; then
-            echo "error: version must match [0-9A-Za-z.-] (semver build metadata; got: '$V')" >&2
+            echo "error: version must match [0-9A-Za-z.-] (letters, digits, '.' and '-' only; '+' is rejected; got: '$V')" >&2
             exit 1
           fi
           case "$V" in
