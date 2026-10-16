@@ -328,9 +328,20 @@ pub(crate) async fn create_pod<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let body = extract_body(&body, ct)?;
-    let mut obj =
+    let obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    create_pod_from_object(&state, &ns, &user, create_query.is_dry_run(), obj).await
+}
 
+/// Admission, defaulting, quota and persistence of a new pod, shared by the POST create
+/// path and the server-side-apply create-on-missing branch of `patch_pod`.
+async fn create_pod_from_object<S: Store>(
+    state: &AppState<S>,
+    ns: &Namespace,
+    user: &UserInfo,
+    dry_run: bool,
+    mut obj: Object,
+) -> Result<Response, crate::status::StatusError> {
     // NodeRestriction-equivalent enforcement: `authorize_pod`'s coarse (pre-body) check lets
     // a `system:node:*` identity's pod CREATE through unconditionally (matching upstream, which
     // authorizes pod-create via RBAC and defers the actual restriction to admission) — so this
@@ -363,7 +374,7 @@ pub(crate) async fn create_pod<S: Store>(
     apply_pod_create_defaults(&mut obj.body);
     apply_default_toleration_seconds(&mut obj.body);
     initialize_pod_generation(&mut obj.body);
-    apply_automount_sa_token_default(&state, &mut obj.body, ns.as_str()).await;
+    apply_automount_sa_token_default(state, &mut obj.body, ns.as_str()).await;
     inject_sa_token_volume(&mut obj.body, &name);
 
     if let Some(rc_name) = obj.body["spec"]["runtimeClassName"]
@@ -458,9 +469,9 @@ pub(crate) async fn create_pod<S: Store>(
             "groups": user.groups,
             "extra": user.extra,
         })),
-        dry_run: create_query.is_dry_run(),
+        dry_run,
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
     // Re-clear status after mutating webhooks: a webhook's JSON patch can reinject a
     // forged/scalar status the earlier clear_create_status already stripped — matches
     // upstream ordering (mutating admission runs BEFORE PrepareForCreate's unconditional
@@ -482,24 +493,23 @@ pub(crate) async fn create_pod<S: Store>(
     validate_pod_sysctls(&obj.body).map_err(Status::unprocessable_entity)?;
     super::defaults::validate_pod_certificate_projections(&obj.body)
         .map_err(Status::unprocessable_entity)?;
-    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(state, &obj.body, None, &admission_ctx).await?;
 
     // LimitRange: inject defaults then validate min/max bounds.
-    obj.body =
-        crate::limit_range::apply_limit_ranges(&state, obj.body, ns.as_str(), "pods").await?;
+    obj.body = crate::limit_range::apply_limit_ranges(state, obj.body, ns.as_str(), "pods").await?;
 
     // ResourceQuota: ensure pod count does not exceed hard limits, respecting scope selectors.
     // Held across check-then-write: without this, concurrent pod creates in the same
     // namespace (e.g. a ReplicationController's burst replica creation) can each observe
     // pre-write usage, all pass the check, and collectively exceed the quota.
     let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
-    crate::quota::check_resource_quota(&state, ns.as_str(), "", "pods", Some(&obj.body)).await?;
+    crate::quota::check_resource_quota(state, ns.as_str(), "", "pods", Some(&obj.body)).await?;
 
     obj.body["status"]["qosClass"] =
         serde_json::Value::String(compute_qos_class(&obj.body).to_owned());
 
     // Dry-run: validation passed; return the would-be created object without persisting.
-    if create_query.is_dry_run() {
+    if dry_run {
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
@@ -565,7 +575,7 @@ pub(crate) async fn create_pod<S: Store>(
                     })),
                     dry_run: false,
                 };
-                run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
+                run_validating_webhooks(state, &obj.body, None, &retry_ctx).await?;
             }
             Err(CreateNamespacedError::Store(e)) => return Err(store_err_to_status(e, &name)),
         }
@@ -577,7 +587,7 @@ pub(crate) async fn create_pod<S: Store>(
     // set (a static/pre-scheduled pod) — most pods get their nodeName later, via bind_pod.
     state.node_graph.apply_pod(ns.as_str(), &name, &obj.body);
 
-    crate::quota::record_pod_created(&state, ns.as_str(), &obj.body).await;
+    crate::quota::record_pod_created(state, ns.as_str(), &obj.body).await;
 
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
@@ -1481,8 +1491,20 @@ pub(crate) async fn patch_pod<S: Store>(
             .store
             .get(&key)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("", "pods", &name))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let Some(stored) = stored else {
+            if !is_ssa {
+                return Err(Status::not_found("", "pods", &name));
+            }
+            // Server-side apply on a missing pod creates it, through the same admission,
+            // defaulting and quota path as POST.
+            let mut obj = Object { body: patch };
+            super::json_patch::strip_managed_fields(&mut obj.body);
+            super::json_patch::enforce_patch_identity(&mut obj.body, &name, Some(ns.as_str()))?;
+            let resp =
+                create_pod_from_object(&state, &ns, &user, patch_query.is_dry_run(), obj).await?;
+            return Ok(resp);
+        };
 
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -1600,7 +1622,7 @@ pub(crate) async fn patch_pod<S: Store>(
         // or hard-deleting — checked BEFORE the hard-delete branch below, since a patch that
         // drains the last finalizer must not actually delete the pod under dryRun=All.
         if patch_query.is_dry_run() {
-            return Ok(Json(current_obj.body));
+            return Ok(Json(current_obj.body).into_response());
         }
 
         if deletion_ts_set && finalizers_empty {
@@ -1617,7 +1639,7 @@ pub(crate) async fn patch_pod<S: Store>(
             // lose an update.
             let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
             crate::quota::record_pod_removed(&state, ns.as_str(), &current_obj.body).await;
-            return Ok(Json(current_obj.body));
+            return Ok(Json(current_obj.body).into_response());
         }
 
         let expected_revision = parse_resource_version(current_obj.resource_version())?;
@@ -1640,7 +1662,7 @@ pub(crate) async fn patch_pod<S: Store>(
                     &current_obj.body,
                 )
                 .await;
-                return Ok(Json(current_obj.body));
+                return Ok(Json(current_obj.body).into_response());
             }
             Err(StoreError::RevisionMismatch { .. }) => {
                 // A concurrent write advanced the stored revision between our read and write.
@@ -18308,6 +18330,85 @@ mod handler_tests {
             StatusCode::OK,
             "apply-patch+yaml with a genuine YAML body must succeed, not 400 'invalid patch JSON'"
         );
+    }
+
+    fn ssa_pod_yaml(name: &str) -> String {
+        format!(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\nspec:\n  containers:\n  - name: c\n    image: img\n"
+        )
+    }
+
+    async fn ssa_patch_pod(
+        state: crate::state::AppState<SqliteStore>,
+        uri: &str,
+        ct: &str,
+        body: String,
+    ) -> axum::response::Response {
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(auth_layer())
+            .with_state(state);
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, ct)
+            .body(Body::from(body))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
+    }
+
+    /// `kubectl apply --server-side -f pod.yaml` on a Pod that does not exist yet must
+    /// create it (201) with create defaulting applied, not 404.
+    #[tokio::test]
+    async fn ssa_apply_of_missing_pod_creates_it_instead_of_404() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let resp = ssa_patch_pod(
+            state,
+            "/api/v1/namespaces/default/pods/new-pod",
+            "application/apply-patch+yaml",
+            ssa_pod_yaml("new-pod"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "SSA on a missing Pod must create it; 404 breaks `kubectl apply --server-side` of any new Pod"
+        );
+        let stored = store
+            .get("/registry/pods/default/new-pod")
+            .await
+            .unwrap()
+            .expect("apply-created pod must be persisted");
+        let pod: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(pod["metadata"]["namespace"], "default");
+        assert_eq!(
+            pod["status"]["phase"], "Pending",
+            "apply-create must run create defaulting like POST, or the scheduler never sees a Pending pod"
+        );
+        assert!(
+            pod["metadata"]["uid"]
+                .as_str()
+                .is_some_and(|u| !u.is_empty()),
+            "apply-create must stamp a uid like POST"
+        );
+    }
+
+    /// A non-apply PATCH on a missing Pod stays 404: only server-side apply has
+    /// create-on-missing semantics.
+    #[tokio::test]
+    async fn merge_patch_of_missing_pod_stays_404() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let resp = ssa_patch_pod(
+            state,
+            "/api/v1/namespaces/default/pods/ghost",
+            "application/merge-patch+json",
+            "{\"metadata\":{\"labels\":{\"a\":\"b\"}}}".into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // -----------------------------------------------------------------------
