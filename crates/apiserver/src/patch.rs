@@ -35,6 +35,8 @@ pub enum PatchError {
     NotAnObject,
     #[error("invalid $patch directive: {0}")]
     InvalidDirective(String),
+    #[error("invalid patch format of retainKeys")]
+    BadRetainKeys,
     #[error("strategic merge patch exceeds the work budget of {0} list-element operations")]
     TooComplex(usize),
 }
@@ -165,7 +167,13 @@ fn strategic_merge_patch_at(
     }
     let target_obj = target.as_object_mut().unwrap();
 
+    apply_retain_keys(target_obj, patch_obj)?;
+
     for (key, value) in patch_obj {
+        if key == RETAIN_KEYS {
+            continue;
+        }
+
         // `$deleteFromPrimitiveList/<field>` removes listed elements from a primitive
         // (non-object) array such as metadata.finalizers, which has no merge key to match
         // elements by. KCM's Job controller removes the batch.kubernetes.io/job-tracking
@@ -280,6 +288,40 @@ fn strategic_merge_patch_at(
         }
     }
 
+    Ok(())
+}
+
+const RETAIN_KEYS: &str = "$retainKeys";
+
+/// `$retainKeys: [k...]` marks a struct whose patchStrategy includes `retainKeys` (Deployment
+/// `spec.strategy`, PodSpec `volumes[*]` sources, ...): keys of `target` not listed are dropped
+/// before the patch merges, so a client switching a union member (RollingUpdate -> Recreate,
+/// emptyDir -> configMap) does not leave the old member behind. The directive is self-describing,
+/// so the server needs no per-type table; every non-null patch key must be listed.
+fn apply_retain_keys(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), PatchError> {
+    let Some(directive) = patch.get(RETAIN_KEYS) else {
+        return Ok(());
+    };
+    let list = directive.as_array().ok_or(PatchError::BadRetainKeys)?;
+    charge(list.len() + patch.len() + target.len())?;
+    let retained: HashSet<&str> = list.iter().filter_map(|v| v.as_str()).collect();
+    // Upstream compares interface{} values, so a non-string entry can never match a key.
+    for (k, v) in patch {
+        if k == RETAIN_KEYS
+            || v.is_null()
+            || k.starts_with("$deleteFromPrimitiveList/")
+            || k.starts_with("$setElementOrder/")
+        {
+            continue;
+        }
+        if !retained.contains(k.as_str()) {
+            return Err(PatchError::BadRetainKeys);
+        }
+    }
+    target.retain(|k, _| retained.contains(k.as_str()));
     Ok(())
 }
 
@@ -4105,5 +4147,68 @@ mod tests {
             matches!(err, PatchError::TooComplex(_)),
             "an unbudgeted merge must be refused, not run unbounded: {err:?}"
         );
+    }
+
+    #[test]
+    fn retain_keys_lets_kubectl_apply_switch_deployment_strategy_to_recreate() {
+        // Without it rollingUpdate survives next to type=Recreate and validation rejects the
+        // Deployment, so a client-side apply can never change strategy.
+        let mut target = json!({"spec": {"strategy": {
+            "type": "RollingUpdate", "rollingUpdate": {"maxSurge": 1}}}});
+        let patch = json!({"spec": {"strategy": {
+            "$retainKeys": ["type"], "type": "Recreate"}}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(target["spec"]["strategy"], json!({"type": "Recreate"}));
+    }
+
+    #[test]
+    fn retain_keys_drops_the_old_volume_source_when_switching_it() {
+        // A volume with two sources is invalid; apply switching emptyDir -> configMap must
+        // leave only the new one, while sibling volumes are untouched.
+        let mut target = json!({"spec": {"volumes": [
+            {"name": "a", "emptyDir": {}},
+            {"name": "b", "emptyDir": {}},
+        ]}});
+        let patch = json!({"spec": {"volumes": [{
+            "$retainKeys": ["name", "configMap"], "name": "a", "configMap": {"name": "cm"}}]}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        let vols = target["spec"]["volumes"].as_array().unwrap();
+        assert_eq!(vols[0], json!({"name": "a", "configMap": {"name": "cm"}}));
+        assert_eq!(vols[1], json!({"name": "b", "emptyDir": {}}));
+    }
+
+    #[test]
+    fn retain_keys_missing_a_patched_key_is_rejected_like_upstream() {
+        let mut target = json!({"spec": {"strategy": {"type": "RollingUpdate"}}});
+        let patch = json!({"spec": {"strategy": {
+            "$retainKeys": ["type"], "type": "Recreate", "rollingUpdate": {}}}});
+        let err = strategic_merge_patch(&mut target, &patch).unwrap_err();
+        assert_eq!(err.to_string(), "invalid patch format of retainKeys");
+        let patch = json!({"spec": {"strategy": {"$retainKeys": "type", "type": "Recreate"}}});
+        let err = strategic_merge_patch(&mut target, &patch).unwrap_err();
+        assert!(
+            matches!(err, PatchError::BadRetainKeys),
+            "non-list: {err:?}"
+        );
+    }
+
+    #[test]
+    fn patch_without_retain_keys_keeps_unlisted_fields() {
+        let mut target = json!({"spec": {"strategy": {
+            "type": "RollingUpdate", "rollingUpdate": {"maxSurge": 1}}}});
+        let patch = json!({"spec": {"strategy": {"type": "Recreate"}}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(
+            target["spec"]["strategy"]["rollingUpdate"],
+            json!({"maxSurge": 1})
+        );
+    }
+
+    #[test]
+    fn retain_keys_is_charged_against_the_work_budget() {
+        let mut target = json!({"a": {"x": 1}});
+        let patch = json!({"a": {"$retainKeys": ["x"], "x": 2}});
+        let err = run_strategic_merge(&mut target, &patch, None, false, 1).unwrap_err();
+        assert!(matches!(err, PatchError::TooComplex(_)), "{err:?}");
     }
 }
