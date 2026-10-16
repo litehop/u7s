@@ -10,7 +10,7 @@
 # Covers the three failure modes the bead exists to prevent:
 #
 #   1. start/reap happy path — a real listener stands in for the apiserver so
-#      resolve_apiserver_pid's real lsof-based lookup is exercised, not mocked.
+#      resolve_apiserver_pid's real u7s_owned_pids lookup is exercised, not mocked.
 #   2. missing-process robustness — the sampler must survive an interval with
 #      NO apiserver, NO scheduler, NO konnectivity-server, NO VM, and a dead
 #      /metrics endpoint without the background loop dying, AND `stop` must be
@@ -187,12 +187,16 @@ NC_STDIN_FIFO="$TMPDIR_TEST/nc-stdin-fifo"
 mkfifo "$NC_STDIN_FIFO"
 sleep 300 > "$NC_STDIN_FIFO" &
 LEFTOVER_PIDS+=("$!")
-nc -l "$PORT1" < "$NC_STDIN_FIFO" &
+WORKDIR1="$TMPDIR_TEST/work1"
+mkdir -p "$WORKDIR1"
+WORKDIR1="$(cd "$WORKDIR1" && pwd)"
+# argv shaped like a real u7s-apiserver of this workdir: the sampler selects
+# its apiserver by workdir ownership, not by who holds the port.
+( exec -a "u7s-apiserver --kubeconfig $WORKDIR1/kubeconfig" nc -l "$PORT1" < "$NC_STDIN_FIFO" ) &
 STANDIN_PID=$!
 LEFTOVER_PIDS+=("$STANDIN_PID")
 sleep 0.3
 
-WORKDIR1="$TMPDIR_TEST/work1"
 bash "$SCRIPT" start --workdir "$WORKDIR1" --interval 1 --port "$PORT1" --vm no-such-vm-1
 sleep 2.2
 
