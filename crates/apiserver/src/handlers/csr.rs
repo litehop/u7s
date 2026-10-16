@@ -341,6 +341,13 @@ pub async fn create_csr<S: Store>(
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     finalize_csr_create(&mut obj.body, &user)?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+    crate::field_manager::WriteIdentity::new(None, &headers).record(
+        &serde_json::Value::Null,
+        &mut obj.body,
+        "certificates.k8s.io/v1",
+        None,
+        None,
+    );
 
     // Dry-run: validation and admission passed; return the would-be created object without
     // persisting — mirrors create_resource's dry-run early-return in resource.rs.

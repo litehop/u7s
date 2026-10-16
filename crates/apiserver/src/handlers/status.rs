@@ -114,7 +114,7 @@ pub(crate) fn reject_patch_identity_mismatch(
 }
 
 /// Record the writer of a status-subresource PUT/PATCH as owner of the fields it changed.
-fn record_status_write(
+pub(super) fn record_status_write(
     headers: &HeaderMap,
     before: &serde_json::Value,
     after: &mut serde_json::Value,

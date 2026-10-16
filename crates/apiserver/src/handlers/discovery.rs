@@ -3062,6 +3062,7 @@ mod tests {
                 generation: 0,
                 finalizers: vec![],
                 deletion_timestamp: None,
+                managed_fields: None,
             },
             spec: CustomResourceDefinitionSpec {
                 group: "apps".to_string(),

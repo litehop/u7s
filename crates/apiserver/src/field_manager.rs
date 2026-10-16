@@ -737,6 +737,41 @@ impl Conflict {
     }
 }
 
+/// Resolves `?fieldManager=` once for every kind's write route: rejects an apply patch
+/// without it (as upstream's `ValidatePatchOptions` does before any handler runs) and
+/// forwards it as the internal header [`WriteIdentity`] reads, so handlers without a query
+/// extractor still record the caller-chosen manager. A client-supplied copy of the header is
+/// always discarded.
+pub(crate) async fn resolve_field_manager(
+    mut req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    req.headers_mut().remove(FIELD_MANAGER_HEADER);
+    let manager = axum::extract::Query::<BTreeMap<String, String>>::try_from_uri(req.uri())
+        .ok()
+        .and_then(|q| q.0.get("fieldManager").cloned())
+        .filter(|m| !m.is_empty());
+    let is_apply = req.method() == axum::http::Method::PATCH
+        && req
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("apply-patch+yaml"));
+    match manager {
+        Some(m) => {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&m) {
+                req.headers_mut().insert(FIELD_MANAGER_HEADER, v);
+            }
+        }
+        None if is_apply => {
+            return crate::status::Status::apply_field_manager_required().into_response();
+        }
+        None => {}
+    }
+    next.run(req).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1108,5 +1143,114 @@ mod tests {
             "e2e.test"
         );
         assert_eq!(request_manager(Some(""), None), "unknown");
+    }
+
+    mod routed {
+        use super::*;
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt as _;
+
+        async fn patch(
+            content_type: &str,
+            uri: &str,
+            forged_header: bool,
+        ) -> (axum::http::StatusCode, Value, Option<String>) {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let seen2 = seen.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/x",
+                    axum::routing::patch(move |h: axum::http::HeaderMap| async move {
+                        *seen2.lock().unwrap() = h
+                            .get(FIELD_MANAGER_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from);
+                        "ok"
+                    }),
+                )
+                .layer(axum::middleware::from_fn(resolve_field_manager));
+            let mut b = Request::builder()
+                .method("PATCH")
+                .uri(uri)
+                .header("content-type", content_type);
+            if forged_header {
+                b = b.header(FIELD_MANAGER_HEADER, "forged");
+            }
+            let resp = app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let seen = seen.lock().unwrap().clone();
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or_default(),
+                seen,
+            )
+        }
+
+        const APPLY: &str = "application/apply-patch+yaml";
+
+        /// A controller that forgets `?fieldManager=` on an apply must be told so, with
+        /// upstream's exact status, instead of silently becoming the "unknown" manager.
+        #[tokio::test]
+        async fn apply_without_field_manager_is_rejected_like_upstream() {
+            for uri in ["/x", "/x?fieldManager=", "/x?force=true"] {
+                let (status, body, _) = patch(APPLY, uri, false).await;
+                assert_eq!(status, 422, "{uri}: {body}");
+                assert_eq!(body["reason"], "Invalid", "{uri}");
+                assert_eq!(
+                    body["message"],
+                    "PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: Required value: \
+                     is required for apply patch",
+                    "{uri}"
+                );
+                assert_eq!(body["details"]["causes"][0]["field"], "fieldManager");
+                assert_eq!(body["details"]["causes"][0]["reason"], "FieldValueRequired");
+            }
+        }
+
+        /// Only apply requires it: merge patches fall back to the user agent, as upstream.
+        #[tokio::test]
+        async fn non_apply_patch_and_named_apply_pass_through_with_the_manager_forwarded() {
+            let (status, _, seen) = patch(APPLY, "/x?fieldManager=gitops", false).await;
+            assert_eq!(status, 200);
+            assert_eq!(seen.as_deref(), Some("gitops"));
+            let (status, _, seen) = patch("application/merge-patch+json", "/x", false).await;
+            assert_eq!(status, 200);
+            assert_eq!(seen, None);
+        }
+
+        /// The forwarding header is internal: a client-sent copy would let it name any
+        /// manager regardless of `?fieldManager=`.
+        #[tokio::test]
+        async fn client_supplied_forwarding_header_is_discarded() {
+            let (_, _, seen) = patch("application/merge-patch+json", "/x", true).await;
+            assert_eq!(seen, None);
+            let (_, _, seen) = patch(APPLY, "/x?fieldManager=real", true).await;
+            assert_eq!(seen.as_deref(), Some("real"));
+        }
+
+        /// The layer is installed on the real router, so every kind's apply route is covered.
+        #[tokio::test]
+        async fn real_router_rejects_apply_without_field_manager() {
+            let state = crate::handlers::test_support::make_state();
+            let app = crate::build_router(state).layer(axum::Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                ..Default::default()
+            }));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri("/api/v1/namespaces/default")
+                        .header("content-type", APPLY)
+                        .body(Body::from("metadata: {}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 422);
+        }
     }
 }
