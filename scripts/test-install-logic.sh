@@ -344,6 +344,9 @@ assert "the tarball is downloaded before apt installs anything, so an unreachabl
 assert_false "(regression guard) node-ipam-controller is not in u7s-kcm.service's --controllers disable-list -- disabling it (with no --cluster-cidr) is exactly what left Node.spec.podCIDR unallocated and broke cross-node Service routing" \
   grep -qF -- '-node-ipam-controller' "$INSTALL"
 
+assert_true "u7s-kcm.service enables the off-by-default bootstrap-signer and token-cleaner controllers -- without them expired join tokens are never deleted and cluster-info is never signed" \
+  grep -qF -- '--controllers=*,bootstrap-signer-controller,token-cleaner-controller,' "$INSTALL"
+
 assert_true "u7s-kcm.service's ExecStart allocates per-node pod CIDRs (--allocate-node-cidrs=true --cluster-cidr=...), which node-ipam-controller needs to stamp Node.spec.podCIDR at all" \
   grep -qF -- '--allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR' "$INSTALL"
 

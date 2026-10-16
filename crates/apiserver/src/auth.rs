@@ -308,7 +308,11 @@ pub(crate) async fn authenticate<S: Store>(
             return AuthnResult::Identified(user);
         }
     }
-    // 3. Token not recognized — reject.
+    // 3. Bootstrap token Secret (upstream order: after static file and SA tokens).
+    if let Some(user) = bootstrap_token_identity(token, store).await {
+        return AuthnResult::Identified(user);
+    }
+    // 4. Token not recognized — reject.
     AuthnResult::BadToken
 }
 
@@ -421,7 +425,13 @@ pub async fn authenticate_token_with_audiences<S: Store>(
             return Some(user);
         }
     }
-    None
+    bootstrap_token_identity(token, store).await
+}
+
+async fn bootstrap_token_identity<S: Store>(token: &str, store: &S) -> Option<UserInfo> {
+    let mut user = crate::bootstrap_token::authenticate(token, store).await?;
+    user.groups.push("system:authenticated".to_owned());
+    Some(user)
 }
 
 /// Return the current Unix time in seconds. Used by the bound-object liveness check's
@@ -1829,6 +1839,99 @@ mod tests {
             AuthnResult::BadToken => {}
             AuthnResult::Identified(_) => panic!("unknown token must not succeed"),
         }
+    }
+
+    async fn put_bootstrap_secret(store: &SqliteStore, id: &str, extra: &[(&str, &str)]) {
+        let b64 = |s: &str| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s);
+        let mut data = serde_json::Map::new();
+        for (k, v) in [
+            ("token-id", id),
+            ("token-secret", "0123456789abcdef"),
+            ("usage-bootstrap-authentication", "true"),
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        {
+            data.insert(k.into(), serde_json::json!(b64(v)));
+        }
+        let name = format!("bootstrap-token-{id}");
+        let val = serde_json::json!({
+            "kind": "Secret",
+            "metadata": {"name": name, "namespace": "kube-system"},
+            "type": "bootstrap.kubernetes.io/token",
+            "data": data,
+        });
+        store
+            .put(
+                &object_key("secrets", "kube-system", &name),
+                bytes::Bytes::from(serde_json::to_vec(&val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed bootstrap secret");
+    }
+
+    async fn bearer(store: &SqliteStore, token: &str) -> Option<UserInfo> {
+        let header = format!("Bearer {token}");
+        match authenticate(
+            Some(&header),
+            &HashMap::new(),
+            None,
+            None,
+            store,
+            &make_test_sig_cache(),
+        )
+        .await
+        {
+            AuthnResult::Identified(u) => Some(u),
+            AuthnResult::BadToken => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_token_secret_authenticates_without_restart_and_stops_when_deleted() {
+        let store = make_test_store();
+        assert!(
+            bearer(&store, "abcdef.0123456789abcdef").await.is_none(),
+            "no Secret yet: token must be rejected"
+        );
+        put_bootstrap_secret(&store, "abcdef", &[]).await;
+        let user = bearer(&store, "abcdef.0123456789abcdef")
+            .await
+            .expect("a freshly minted token Secret must authenticate with no restart");
+        assert_eq!(user.username, "system:bootstrap:abcdef");
+        assert_eq!(
+            user.groups,
+            vec!["system:bootstrappers", "system:authenticated"]
+        );
+        store
+            .delete(
+                &object_key("secrets", "kube-system", "bootstrap-token-abcdef"),
+                None,
+            )
+            .await
+            .expect("delete");
+        assert!(
+            bearer(&store, "abcdef.0123456789abcdef").await.is_none(),
+            "a deleted (consumed) token must stop working immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_bootstrap_token_secret_is_rejected_with_bad_token() {
+        let store = make_test_store();
+        put_bootstrap_secret(&store, "abcdef", &[("expiration", "2000-01-01T00:00:00Z")]).await;
+        assert!(
+            bearer(&store, "abcdef.0123456789abcdef").await.is_none(),
+            "an expired join token must 401 or a leaked token keeps joining nodes"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_token_with_wrong_secret_is_rejected_with_bad_token() {
+        let store = make_test_store();
+        put_bootstrap_secret(&store, "abcdef", &[]).await;
+        assert!(bearer(&store, "abcdef.aaaaaaaaaaaaaaaa").await.is_none());
     }
 
     // --- ct_token_lookup ---
