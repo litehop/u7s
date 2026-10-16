@@ -1095,11 +1095,22 @@ fn validate_issued_pcr_status(
 /// the `sign` verb on `signers/<signerName>` (or `signers/<domain>/*`), so holding
 /// `podcertificaterequests/status` alone does not let a caller issue under any signer name.
 fn user_may_sign<S: Store>(state: &AppState<S>, user: &UserInfo, signer_name: &str) -> bool {
+    user_may_for_signer(state, user, "sign", signer_name)
+}
+
+/// Upstream `certauthorization.IsAuthorizedForSignerName`: `verb` on
+/// `certificates.k8s.io/signers` named `<signerName>` or `<domain>/*`.
+pub(crate) fn user_may_for_signer<S: Store>(
+    state: &AppState<S>,
+    user: &UserInfo,
+    verb: &str,
+    signer_name: &str,
+) -> bool {
     let allowed = |name: &str| {
         state.rbac_index.is_allowed(&crate::rbac::AuthzRequest {
             username: &user.username,
             groups: &user.groups,
-            verb: "sign",
+            verb,
             api_group: GROUP,
             resource: "signers",
             subresource: "",

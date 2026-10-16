@@ -15,7 +15,7 @@
 //!   - Honours `resourceVersion` in incoming body for OCC (returns 409 on conflict).
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::HeaderMap,
     response::IntoResponse,
     Json,
@@ -24,6 +24,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::{
+    auth::UserInfo,
     handlers::generic::{store_err, validate_path_segment},
     handlers::json_patch::{
         apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
@@ -47,6 +48,7 @@ const KIND: &str = "CertificateSigningRequest";
 /// incoming body into the stored object. Never modifies `spec` or `status.certificate`.
 pub async fn put_approval<S: Store>(
     State(state): State<AppState<S>>,
+    Extension(user): Extension<UserInfo>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -66,6 +68,7 @@ pub async fn put_approval<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    super::csr::authorize_csr_approval(&state, &user, &current.body)?;
 
     // OCC: if incoming has a resourceVersion, it must match the stored one.
     let expected_rv = parse_resource_version(incoming.resource_version())?;
@@ -100,6 +103,7 @@ pub async fn put_approval<S: Store>(
 /// metadata.annotations are rejected outright (see `validate_approval_json_patch_paths`).
 pub async fn patch_approval<S: Store>(
     State(state): State<AppState<S>>,
+    Extension(user): Extension<UserInfo>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -118,6 +122,7 @@ pub async fn patch_approval<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    super::csr::authorize_csr_approval(&state, &user, &current.body)?;
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
@@ -293,6 +298,19 @@ mod tests {
         h
     }
 
+    fn approver(state: &crate::state::AppState) -> Extension<UserInfo> {
+        crate::handlers::test_support::grant_signer_verb(
+            state,
+            "approver",
+            "approve",
+            "kubernetes.io/kube-apiserver-client",
+        );
+        Extension(UserInfo {
+            username: "approver".into(),
+            ..Default::default()
+        })
+    }
+
     async fn current_rv(store: &Arc<SqliteStore>, name: &str) -> String {
         let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
         store.get(&key).await.unwrap().unwrap().revision.to_string()
@@ -356,6 +374,7 @@ mod tests {
 
         let result = put_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
@@ -411,6 +430,7 @@ mod tests {
 
         let result = put_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
@@ -468,6 +488,7 @@ mod tests {
 
         let result = put_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
@@ -526,7 +547,8 @@ mod tests {
         });
 
         let result = put_approval(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
@@ -557,7 +579,8 @@ mod tests {
         });
 
         let result = put_approval(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path("nonexistent".to_owned()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
@@ -608,6 +631,7 @@ mod tests {
 
         let result = put_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             dry_run_headers,
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
@@ -677,6 +701,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -745,6 +770,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             dry_run_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -809,6 +835,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from_static(patch_body.as_bytes()),
@@ -868,6 +895,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -939,6 +967,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -1011,6 +1040,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -1084,6 +1114,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -1154,6 +1185,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -1216,6 +1248,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -1294,7 +1327,8 @@ mod tests {
         );
 
         let result = patch_approval(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -1346,7 +1380,8 @@ mod tests {
         );
 
         let result = patch_approval(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -1376,7 +1411,8 @@ mod tests {
         );
 
         let result = patch_approval(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path("nonexistent-csr".to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
@@ -1408,7 +1444,8 @@ mod tests {
         );
 
         let result = patch_approval(
-            axum::extract::State(state),
+            axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path("any-csr".to_owned()),
             headers,
             bytes::Bytes::from(r#"{"status":{}}"#),
@@ -1465,6 +1502,7 @@ mod tests {
 
         let result = patch_approval(
             axum::extract::State(state.clone()),
+            approver(&state),
             axum::extract::Path(name.to_owned()),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
