@@ -65,6 +65,24 @@ rg_wait_ready() {
   return 1
 }
 
+# Turns `kubectl get node -w` output ("<status> <lastTransitionTime>" per line) into
+# node-ready.log lines ("<epoch> <status>"). The watch replays condition history on
+# (re)connect, so the epoch is the condition's own lastTransitionTime (the read time only
+# when that is missing/unparseable); rg_notready_since then drops replayed pre-burst flaps.
+# Consecutive identical lines are collapsed.
+rg_node_watch_stamp() {
+  local s tt t last=""
+  while read -r s tt; do
+    t=""
+    if [ -n "$tt" ]; then
+      t="$(date -d "$tt" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ "$tt" +%s 2>/dev/null)" || t=""
+    fi
+    [ -n "$t" ] || t="$(date +%s)"
+    [ "$t $s" = "$last" ] || printf '%s %s\n' "$t" "${s:-Unknown}"
+    last="$t $s"
+  done
+}
+
 # Counts Ready!=True observations with epoch >= $2 in a node-ready.log ("<epoch> <status>").
 # "unreachable" is not counted, matching criterion (b) of the full gate.
 rg_notready_since() {
@@ -113,17 +131,27 @@ rg_ramp_step() {
 # per-size table and the candidate N (largest size before the first failure). Returns 0
 # iff install succeeded and at least one size passed.
 rg_ramp_verdict() {
-  local f="$1" sizes="$2" samples="$3" n cand="" stopped="" row secs ok
+  local f="$1" sizes="$2" samples="$3" n cand="" stopped="" row secs ok failed="" unreach="" skipped=""
   printf '%-6s %-5s %-5s %-5s %-5s %-9s %s\n' size '(a)' '(b)' '(c)' '(d)' burst_s memavail_min_MiB
   for n in $sizes; do
     row="$(rg_ramp_step "$f" "$n")" && ok=1 || ok=0
     if [ "$row" = notrun ]; then
-      printf '%-6s not run\n' "$n"; continue
+      printf '%-6s not run\n' "$n"; skipped="$skipped $n"; continue
     fi
     secs="$(rg_get "$f" "ramp_${n}_secs")"
     printf '%-6s %-5s %-5s %-5s %-5s %-9s %s\n' "$n" $row "$secs" "$(rg_phase_memmin "$samples" "burst$n")"
     if [ "$ok" = 1 ] && [ -z "$stopped" ]; then cand="$n"; else stopped=1; fi
+    [ "$ok" = 1 ] || failed="${failed:-$n}"
+    [ -n "$(rg_get "$f" "ramp_${n}_ready_final")" ] || unreach="${unreach:-$n}"
   done
+  echo "RAMP: criterion (e) webhook-smoke is NOT evaluated per size; it runs only in the full-gate confirmation runs"
+  if [ -n "$unreach" ]; then
+    echo "RAMP: API unreachable at the end of the $unreach-pod step (VM or control plane died); later sizes were not tested"
+  elif [ -n "$failed" ]; then
+    echo "RAMP: stopped at the first criterion failure ($failed-pod burst)"
+  elif [ -n "$skipped" ]; then
+    echo "RAMP: ended early with no criterion failure; sizes not run:$skipped (VM died or run hit its wall-clock cap)"
+  fi
   if [ "$(rg_get "$f" install_ok)" != 1 ]; then
     echo "RAMP: install failed (install_ok=$(rg_get "$f" install_ok))"; return 1
   fi

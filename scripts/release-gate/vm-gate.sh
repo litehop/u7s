@@ -92,9 +92,11 @@ burst_cleanup() {
   k scale deployment/rg-burst --replicas=1 >/dev/null 2>&1
   local i
   for i in $(seq 1 60); do
-    [ "$(k get pods -l app=rg-burst --no-headers 2>/dev/null | wc -l)" -le 1 ] && break
+    [ "$(k get pods -l app=rg-burst --no-headers 2>/dev/null | wc -l)" -le 1 ] && return 0
     sleep 5
   done
+  log "WARNING: burst pods not scaled down within 300s; continuing with leftover pods"
+  res "burst_cleanup_timeout_$(cat "$OUT/phase")" 1
 }
 
 wait_node_ready() {
@@ -150,12 +152,7 @@ WATCH_T0="$(date +%s)"
 ( while :; do
     kubectl --kubeconfig "$KCFG" get node "$NODE" -w \
       -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}' 2>/dev/null \
-      | while read -r s tt; do
-          [ -n "$tt" ] && t="$(date -d "$tt" +%s 2>/dev/null)" || t=""
-          [ -n "$t" ] || printf -v t '%(%s)T' -1
-          [ "$t $s" = "${last:-}" ] || printf '%s %s\n' "$t" "${s:-Unknown}" >> "$OUT/node-ready.log"
-          last="$t $s"
-        done
+      | rg_node_watch_stamp >> "$OUT/node-ready.log"
     [ -e "$OUT/watch-stop" ] && break
     printf '%(%s)T unreachable\n' -1 >> "$OUT/node-ready.log"
     sleep 5

@@ -143,6 +143,27 @@ printf '100 True\n200 False\n300 Unknown\n400 unreachable\n500 True\n' > "$TMP/n
 assert "rg_notready_since counts only observations at/after the burst start" "$([ "$(rg_notready_since "$TMP/nr.log" 300)" = 1 ] && echo 1 || echo 0)"
 assert "rg_notready_since counts False and Unknown but not unreachable" "$([ "$(rg_notready_since "$TMP/nr.log" 0)" = 2 ] && echo 1 || echo 0)"
 
+# Node-watch stamping: the watch replays install-time flaps on (re)connect.
+T0=$(( $(date +%s) - 3600 ))
+iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ; }
+PRE="$(iso $((T0 - 600)))"; POST="$(iso $((T0 + 60)))"
+printf 'False %s\nTrue %s\n' "$PRE" "$(iso $((T0 - 500)))" | rg_node_watch_stamp > "$TMP/w1.log"
+assert "replayed pre-burst False (lastTransitionTime < burst start) is not counted: install flaps must not fail (b)" \
+  "$([ "$(rg_notready_since "$TMP/w1.log" "$T0")" = 0 ] && echo 1 || echo 0)"
+printf 'True %s\nFalse %s\n' "$PRE" "$POST" | rg_node_watch_stamp > "$TMP/w2.log"
+assert "False transition after burst start is counted: a real flap during the burst must fail (b)" \
+  "$([ "$(rg_notready_since "$TMP/w2.log" "$T0")" = 1 ] && echo 1 || echo 0)"
+printf 'False %s\nFalse %s\nFalse %s\n' "$POST" "$POST" "$POST" | rg_node_watch_stamp > "$TMP/w3.log"
+assert "duplicate watch lines are deduped: one flap is one observation" \
+  "$([ "$(wc -l < "$TMP/w3.log" | tr -d ' ')" = 1 ] && [ "$(rg_notready_since "$TMP/w3.log" "$T0")" = 1 ] && echo 1 || echo 0)"
+printf 'False %s\n' "$PRE" | rg_node_watch_stamp > "$TMP/w4.log"
+ramp_env_stuck="$(printf 'ramp_30_secs=20\nramp_30_oom_host=0\nramp_30_oom_kubesystem=0\nramp_30_notready=%s\nramp_30_ready_final=False\nramp_30_wp_ok=1\n' "$(rg_notready_since "$TMP/w4.log" "$T0")")"
+printf '%s\n' "$ramp_env_stuck" > "$TMP/stuck.env"
+assert "node still False from before the burst is not counted as a flap but fails (b) via the final-Ready check" \
+  "$([ "$(rg_ramp_step "$TMP/stuck.env" 30)" = "PASS FAIL PASS PASS" ] && echo 1 || echo 0)"
+printf 'True %s\n' "$PRE" | rg_node_watch_stamp > "$TMP/w5.log"
+assert "a lastTransitionTime is stamped as its own epoch, not the read time" "$([ "$(cut -d' ' -f1 "$TMP/w5.log")" = "$((T0 - 600))" ] && echo 1 || echo 0)"
+
 printf '1\tburst30\tMEM\t204800\n2\tburst30\tMEM\t102400\n3\tburst30\tkubelet\t1\t1\n4\tburst40\tMEM\t51200\n' > "$TMP/s.tsv"
 assert "rg_phase_memmin takes the per-phase minimum in MiB" "$([ "$(rg_phase_memmin "$TMP/s.tsv" burst30)" = 100 ] && echo 1 || echo 0)"
 assert "rg_phase_memmin reports - for a phase that never ran" "$([ "$(rg_phase_memmin "$TMP/s.tsv" burst70)" = - ] && echo 1 || echo 0)"
@@ -168,6 +189,18 @@ assert "ramp candidate is the largest size before the first failure, labelled ap
   "$(echo "$out" | grep -q '^RAMP: candidate N=40 -- approximate (single VM, state carryover)' && [ "$rrc" = 0 ] && echo 1 || echo 0)"
 assert "ramp table shows the failed size and the size never run" \
   "$(echo "$out" | grep -E '^50 +PASS +FAIL +FAIL +FAIL' >/dev/null && echo "$out" | grep -q '^60 .*not run' && echo 1 || echo 0)"
+assert "ramp summary states webhook-smoke (e) is not evaluated per size" \
+  "$(echo "$out" | grep -q '^RAMP: criterion (e) webhook-smoke is NOT evaluated per size' && echo 1 || echo 0)"
+assert "ramp summary says stopped at the first criterion failure (50), not VM death" \
+  "$(echo "$out" | grep -q '^RAMP: stopped at the first criterion failure (50-pod burst)' && echo 1 || echo 0)"
+ramp_env 30 40 > "$TMP/rampd.env"
+out="$(rg_ramp_verdict "$TMP/rampd.env" "30 40 50 60" "$TMP/s.tsv")" || true
+assert "ramp that ends with sizes unrun and no failure is reported as VM death / cap, not as a criterion failure" \
+  "$(echo "$out" | grep -q '^RAMP: ended early with no criterion failure; sizes not run: 50 60' && echo 1 || echo 0)"
+ramp_env 30 40 | grep -v '^ramp_40_ready_final=' > "$TMP/rampu.env"
+out="$(rg_ramp_verdict "$TMP/rampu.env" "30 40" "$TMP/s.tsv")" || true
+assert "ramp step with no node status (API unreachable) is reported as unreachable" \
+  "$(echo "$out" | grep -q '^RAMP: API unreachable at the end of the 40-pod step' && echo 1 || echo 0)"
 ramp_env 30:bad > "$TMP/ramp0.env"
 out="$(rg_ramp_verdict "$TMP/ramp0.env" "30 40" "$TMP/s.tsv")" && rrc=0 || rrc=$?
 assert "ramp with a failing first size has no candidate and exits non-zero" "$([ "$rrc" != 0 ] && echo "$out" | grep -q 'no size passed' && echo 1 || echo 0)"

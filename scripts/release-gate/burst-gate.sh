@@ -27,7 +27,8 @@
 #                     scaling down and settling between sizes, stopping at the first failure.
 #                     Prints the largest passing size as an approximate candidate N (single VM,
 #                     state carryover). Criteria (a)-(d) per size; implies --runs 1.
-#   --probe-kill SECS ramp-mode hard-kill per burst (default 180)
+#   --probe-kill SECS ramp-mode hard-kill per burst (default 180; deliberately
+#                     tighter than the 300 s criterion (c) cap so probes fail fast)
 #   --burst-cap SECS  criterion (c) cap (default 300)
 #   --tarball-dir DIR reuse the output of build-arm64-tarball.sh instead of rebuilding
 #   --out DIR         results directory (default: ./temp/release-gate/<timestamp>)
