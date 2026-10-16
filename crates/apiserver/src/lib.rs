@@ -5455,10 +5455,10 @@ mod tests {
         let rules = old["rules"].as_array_mut().unwrap();
         let before = rules.len();
         rules.retain(|r| r["resources"] != serde_json::json!(["signers"]));
+        let stripped = before - rules.len();
         assert_eq!(
-            rules.len(),
-            before - 1,
-            "test setup must strip the signers rule"
+            stripped, 3,
+            "the bootstrap KCM role defines attest, approve and sign rules on signers; the old-shaped role must lack all of them"
         );
         store
             .put(
@@ -5469,17 +5469,23 @@ mod tests {
             .await
             .unwrap();
 
-        let attest = rbac::AuthzRequest {
+        let grant = |verb: &'static str, signer: &'static str| rbac::AuthzRequest {
             username: "system:kube-controller-manager",
             groups: &[],
-            verb: "attest",
+            verb,
             api_group: "certificates.k8s.io",
             resource: "signers",
             subresource: "",
             namespace: None,
-            name: Some("kubernetes.io/kube-apiserver-serving"),
+            name: Some(signer),
             non_resource_url: None,
         };
+        let needed = [
+            grant("attest", "kubernetes.io/kube-apiserver-serving"),
+            grant("approve", "kubernetes.io/kube-apiserver-client-kubelet"),
+            grant("sign", "kubernetes.io/kube-apiserver-client"),
+            grant("sign", "kubernetes.io/kubelet-serving"),
+        ];
         let new_state = || {
             state::AppState::new(
                 std::sync::Arc::clone(&store),
@@ -5491,20 +5497,28 @@ mod tests {
         };
         let state = new_state();
         state.init().await;
-        assert!(
-            !state.rbac_index.is_allowed(&attest),
-            "setup: stale role must lack the grant"
-        );
+        for req in &needed {
+            assert!(
+                !state.rbac_index.is_allowed(req),
+                "setup: stale role must lack {} on {:?}",
+                req.verb,
+                req.name
+            );
+        }
 
         seed_rbac(&store).await.expect("restart seed must not fail");
 
         let state = new_state();
         state.init().await;
-        assert!(
-            state.rbac_index.is_allowed(&attest),
-            "after restart KCM must hold the rule added to the bootstrap role, else upgraded \
-             clusters never receive bootstrap-policy fixes"
-        );
+        for req in &needed {
+            assert!(
+                state.rbac_index.is_allowed(req),
+                "after restart KCM must be allowed {} on signer {:?}; otherwise on an existing \
+                 cluster CSRs are approved but never signed and kubelet certs stop rotating",
+                req.verb,
+                req.name
+            );
+        }
     }
 
     #[tokio::test]
