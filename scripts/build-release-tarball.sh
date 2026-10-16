@@ -44,7 +44,12 @@ mkdir -p "$STAGE_DIR" "$OUT_DIR"
 
 echo "==> Building u7s-apiserver + u7s-scheduler for $TARGET" >&2
 rustup target add "$TARGET" >&2
-cargo build --release --target "$TARGET" --manifest-path "$ROOT_DIR/Cargo.toml" -p u7s-apiserver -p u7s-scheduler
+# Stamped into --version and /version (crates/version); the tag's leading 'v'
+# is dropped so gitVersion reads v<k8s>+u7s-<release>.
+U7S_RELEASE="${VERSION#v}" \
+U7S_GIT_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)" \
+U7S_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  cargo build --release --target "$TARGET" --manifest-path "$ROOT_DIR/Cargo.toml" -p u7s-apiserver -p u7s-scheduler
 
 cp "$ROOT_DIR/target/$TARGET/release/u7s-apiserver" "$STAGE_DIR/"
 cp "$ROOT_DIR/target/$TARGET/release/u7s-scheduler" "$STAGE_DIR/"

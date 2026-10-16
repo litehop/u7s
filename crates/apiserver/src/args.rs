@@ -5,6 +5,7 @@
 use clap::Parser;
 
 #[derive(Parser)]
+#[command(version = u7s_version::version_string())]
 pub struct Args {
     #[arg(long, default_value = "./state.db")]
     pub(crate) db: String,
