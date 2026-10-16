@@ -750,7 +750,7 @@ fn check_alias_budget(s: &str) -> Result<(), String> {
     let mut budget = AliasBudget::default();
     let _ = yaml_rust2::parser::Parser::new_from_str(s).load(&mut budget, true);
     if budget.excessive {
-        return Err("error decoding patch: yaml: document contains excessive aliasing".into());
+        return Err("error decoding YAML: yaml: document contains excessive aliasing".into());
     }
     Ok(())
 }
@@ -1629,6 +1629,22 @@ mod tests {
         s
     }
 
+    /// Runs on a spawned thread so a regression fails the test instead of hanging or
+    /// OOMing CI.
+    fn parse_within_2s(body: String) -> Result<serde_json::Value, crate::status::StatusError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ssa_body_to_json(body.as_bytes()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "alias bomb not rejected within 2s: it must be rejected quickly or one PATCH \
+                 exhausts apiserver memory"
+                )
+            })
+    }
+
     /// yaml-rust2 deep-clones per alias, so a few hundred bytes of nested aliases would
     /// take seconds and then exhaust memory for any user able to PATCH. The pre-parse
     /// budget must reject it as 400 without expanding anything.
@@ -1636,13 +1652,7 @@ mod tests {
     fn ssa_body_to_json_rejects_alias_expansion_bomb_quickly() {
         let bomb = alias_bomb(10);
         assert!(bomb.len() < 600, "bomb must stay tiny: {}", bomb.len());
-        let start = std::time::Instant::now();
-        let err = ssa_body_to_json(bomb.as_bytes()).expect_err("bomb must be rejected");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "rejection must not expand aliases: {:?}",
-            start.elapsed()
-        );
+        let err = parse_within_2s(bomb).expect_err("bomb must be rejected");
         assert_eq!(err.0.as_u16(), 400);
         assert!(
             format!("{err:?}").contains("excessive aliasing"),
@@ -1653,7 +1663,7 @@ mod tests {
     /// A deeper bomb must cost the same: the budget check is linear in input size.
     #[test]
     fn ssa_body_to_json_rejects_deep_alias_bomb() {
-        assert!(ssa_body_to_json(alias_bomb(40).as_bytes()).is_err());
+        assert!(parse_within_2s(alias_bomb(40)).is_err());
     }
 
     /// Valid documents may reuse anchors (e.g. shared labels); the budget must not break
