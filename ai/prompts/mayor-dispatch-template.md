@@ -478,9 +478,12 @@ block), your LAST action before ending the session — after quality gates pass
 and your PR is open — must be:
 
 ```bash
-scripts/conformance/reset.sh --host-only --workdir "$PWD/temp/u7s" --port <YOUR_ASSIGNED_PORT>
+scripts/conformance/reset.sh --host-only --workdir ./temp/u7s --port <YOUR_ASSIGNED_PORT>
 limactl stop <VM_NAME>
 ```
+
+Run it from your worktree root with the relative `./temp/u7s` (the auto-mode
+classifier denies the `"$PWD/temp/u7s"` form); reset.sh canonicalises it.
 
 Stop the VM (idle u7s VMs share the host with other repos' VMs; operator rule 2026-10-14)
 unless the mayor's brief explicitly says to leave it up for an immediate continuation round.
