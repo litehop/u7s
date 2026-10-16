@@ -90,6 +90,12 @@ Usage:
   --mint-join-token     Run on an existing control-plane node: create a 24h
                          single-use join token and print the join command.
   --join <url>          Join an existing cluster at <url> (e.g. https://1.2.3.4:6443).
+                         Topology limit: an apiserver that reaches this node's
+                         kubelet through a 127.0.0.1 port forward (a Mac host
+                         in front of Lima VMs) cannot verify its serving cert,
+                         because the serving-CSR approver refuses 127.0.0.1
+                         SANs by design; kubectl logs/exec to such a worker
+                         fail. Real installs dial the node InternalIP.
   --token <token>       Join token from --mint-join-token (--join only). "-" or
                          absent prompts with echo off on a terminal, or reads
                          piped stdin; both keep it out of ps and history.
@@ -119,6 +125,8 @@ MINT_JOIN_TOKEN=0
 JOIN_SERVER=""
 JOIN_TOKEN=""
 CA_CERT_HASH=""
+# Set by join_cluster to the server-side creationTimestamp of this join's client CSR.
+JOIN_STARTED_AT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -525,11 +533,19 @@ join_cluster() {
   sleep 2
 
   echo "Submitting join CSR '$csr_name' to $JOIN_SERVER..."
-  curl -fsSL --cacert "$STATE_DIR/ca.pem" \
+  # The apiserver-stamped creationTimestamp of this join's client CSR is the
+  # lower bound for the serving CSR wait_for_joined_node accepts: a serving CSR
+  # issued to an earlier incarnation of the same node name is older than it.
+  # It is the server's clock on both sides, so node clock skew cannot matter.
+  JOIN_STARTED_AT="$(curl -fsSL --cacert "$STATE_DIR/ca.pem" \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$bootstrap_token") \
     -H "Content-Type: application/json" \
     -X POST "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" \
-    -d "$csr_body" >/dev/null
+    -d "$csr_body" | jq -r '.metadata.creationTimestamp // empty')"
+  if [ -z "$JOIN_STARTED_AT" ]; then
+    echo "error: the apiserver's reply to the join CSR carried no creationTimestamp" >&2
+    exit 1
+  fi
 
   # KCM's csrapproving/csrsigning controllers react to the create event; this
   # loop only waits on them, it approves nothing itself.
@@ -594,7 +610,8 @@ wait_for_joined_node() {
     fi
     if [ -z "$serving" ]; then
       resp="$(curl -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" 2>/dev/null || true)"
-      serving="$(printf '%s' "$resp" | jq -r --arg u "system:node:$NODE_NAME" '[.items[]? | select(.spec.signerName == "kubernetes.io/kubelet-serving" and .spec.username == $u and ((.status.certificate // "") != "") and any(.status.conditions[]?; .type == "Approved"))] | length' 2>/dev/null || true)"
+      # RFC3339 UTC timestamps compare correctly as strings.
+      serving="$(printf '%s' "$resp" | jq -r --arg u "system:node:$NODE_NAME" --arg since "$JOIN_STARTED_AT" '[.items[]? | select(.spec.signerName == "kubernetes.io/kubelet-serving" and .spec.username == $u and .metadata.creationTimestamp >= $since and ((.status.certificate // "") != "") and any(.status.conditions[]?; .type == "Approved"))] | length' 2>/dev/null || true)"
       [ "${serving:-0}" -ge 1 ] 2>/dev/null || serving=""
     fi
     if [ -n "$ready" ] && [ -n "$serving" ]; then

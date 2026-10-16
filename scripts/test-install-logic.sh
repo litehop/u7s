@@ -1250,7 +1250,7 @@ assert_true "the control-plane kubelet still disables RotateKubeletServerCertifi
 # CSR is approved and issued.
 WAIT_RUNNER="$JOIN_WORK/wait.sh"
 write_join_runner "$WAIT_RUNNER" '
-NODE_NAME=n1
+NODE_NAME=n1; JOIN_STARTED_AT=2026-10-16T10:00:00Z
 sleep() { :; }
 curl() {
   case "$*" in
@@ -1261,9 +1261,9 @@ curl() {
 wait_for_joined_node'
 READY_NODE='{"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
 NOTREADY_NODE='{"status":{"conditions":[{"type":"Ready","status":"False"}]}}'
-ISSUED_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
-PENDING_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"status":{}}]}'
-CLIENT_ONLY_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kube-apiserver-client-kubelet","username":"system:node:n1"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
+ISSUED_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
+PENDING_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{}}]}'
+CLIENT_ONLY_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kube-apiserver-client-kubelet","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
 run_wait() { NODE_JSON="$1" CSR_JSON="$2" bash "$WAIT_RUNNER" "$JOIN_WORK" 2>&1; }
 ok_status=0; run_wait "$READY_NODE" "$ISSUED_CSR" >/dev/null || ok_status=$?
 assert "join succeeds when the Node is Ready and its kubelet-serving CSR is approved and issued" \
@@ -1277,6 +1277,16 @@ assert "join fails when the Node never becomes Ready even though the serving cer
 cl_status=0; run_wait "$READY_NODE" "$CLIENT_ONLY_CSR" >/dev/null || cl_status=$?
 assert "the issued client-cert CSR does not count as the serving certificate" \
   "$([ "$cl_status" -ne 0 ] && echo 1 || echo 0)"
+STALE_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-15T09:00:00Z"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
+stale_status=0; run_wait "$READY_NODE" "$STALE_CSR" >/dev/null || stale_status=$?
+assert "a serving CSR issued to an earlier join of the same node name does not satisfy this join (a stale CSR would report a join as successful before the new kubelet's own serving cert exists)" \
+  "$([ "$stale_status" -ne 0 ] && echo 1 || echo 0)"
+MIXED_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-15T09:00:00Z"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}},{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
+mixed_status=0; run_wait "$READY_NODE" "$MIXED_CSR" >/dev/null || mixed_status=$?
+assert "a stale serving CSR beside this join's own issued one does not block the join (a re-joined node name keeps its old CSR objects)" \
+  "$([ "$mixed_status" -eq 0 ] && echo 1 || echo 0)"
+assert_true "join_cluster records the apiserver's creationTimestamp of its client CSR as the lower bound for the serving CSR wait" \
+  grep -qF 'JOIN_STARTED_AT="$(curl' "$INSTALL"
 
 # Token input: flag, "-" and absent all work; stdin keeps the secret off argv.
 TOKEN_RUNNER="$JOIN_WORK/token.sh"
