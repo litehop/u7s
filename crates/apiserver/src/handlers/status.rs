@@ -113,6 +113,28 @@ pub(crate) fn reject_patch_identity_mismatch(
     super::json_patch::enforce_patch_identity(&mut probe, name, ns)
 }
 
+/// Record the writer of a status-subresource PUT/PATCH as owner of the fields it changed.
+fn record_status_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    after: &mut serde_json::Value,
+    group: &str,
+    version: &str,
+) {
+    let api_version = if group.is_empty() {
+        version.to_string()
+    } else {
+        format!("{group}/{version}")
+    };
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        after,
+        &api_version,
+        Some("status"),
+        None,
+    );
+}
+
 // -- cluster-scoped --
 
 fn is_storage_version_migration(group: &str, plural: &str) -> bool {
@@ -157,6 +179,7 @@ pub async fn put_resource_status<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let before_write = current.body.clone();
     // node_authz's own doc comment on restrict_node_self_write: upstream's NodeRestriction
     // admission plugin runs on every subresource, not just the main resource — a
     // `system:node:<name>` identity holding only `nodes/status` RBAC (which is all kubelet
@@ -212,6 +235,7 @@ pub async fn put_resource_status<S: Store>(
     // Dry-run: validation and node-restriction checks passed; return the would-be
     // status object without persisting — mirrors replace_pod/replace_namespace's
     // dry-run early-return.
+    record_status_write(&headers, &before_write, &mut current.body, &group, &version);
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &meta.kind);
         return Ok(Json(current.body));
@@ -251,6 +275,7 @@ pub async fn patch_resource_status<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let before_write = current.body.clone();
     // See put_resource_status's node_before comment: same gap applies to PATCH /status.
     let node_before = if group.is_empty() && plural == "nodes" {
         Some(current.body.clone())
@@ -346,6 +371,7 @@ pub async fn patch_resource_status<S: Store>(
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
+    record_status_write(&headers, &before_write, &mut current.body, &group, &version);
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &meta.kind);
         return Ok(Json(current.body));
@@ -468,6 +494,7 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
             super::cr::convert_cr_to_request_version(&state, ctx, &group, &version, current.body)
                 .await?;
     }
+    let before_write = current.body.clone();
 
     let kind = StatusEnvelope::deserialize(&current.body)
         .map(|e| e.kind)
@@ -501,6 +528,7 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return above.
+    record_status_write(&headers, &before_write, &mut current.body, &group, &version);
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &kind);
         return Ok(Json(current.body).into_response());
@@ -573,6 +601,7 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
             super::cr::convert_cr_to_request_version(&state, ctx, &group, &version, current.body)
                 .await?;
     }
+    let before_write = current.body.clone();
 
     let kind = StatusEnvelope::deserialize(&current.body)
         .map(|e| e.kind)
@@ -651,6 +680,7 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
+    record_status_write(&headers, &before_write, &mut current.body, &group, &version);
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &kind);
         return Ok(Json(current.body).into_response());

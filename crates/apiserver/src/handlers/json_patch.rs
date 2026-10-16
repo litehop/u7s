@@ -46,7 +46,7 @@ pub(crate) fn user_agent(headers: &HeaderMap) -> Option<&str> {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct CreateQuery {
     #[serde(rename = "fieldManager")]
-    pub _field_manager: Option<String>,
+    pub field_manager: Option<String>,
     #[serde(rename = "fieldValidation")]
     pub field_validation: Option<String>,
     /// When set to "All", validate but do NOT persist the object.
@@ -65,7 +65,7 @@ impl CreateQuery {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ReplaceQuery {
     #[serde(rename = "fieldManager")]
-    pub _field_manager: Option<String>,
+    pub field_manager: Option<String>,
     /// When set to "All", validate but do NOT persist the replacement object.
     #[serde(rename = "dryRun")]
     pub dry_run: Option<String>,

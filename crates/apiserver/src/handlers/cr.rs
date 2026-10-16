@@ -2888,6 +2888,14 @@ pub async fn create_cr<S: Store>(
     prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    record_cr_write(
+        &headers,
+        &serde_json::Value::Null,
+        &mut obj,
+        &group,
+        &version,
+        ctx.schema.as_deref(),
+    );
 
     // Dry-run: validation and admission passed; return the would-be created object without
     // persisting — mirrors create_resource's dry-run early-return in resource.rs.
@@ -3115,6 +3123,15 @@ pub async fn replace_cr<S: Store>(
         &mut obj,
     )
     .await?;
+
+    record_cr_write(
+        &headers,
+        &existing,
+        &mut obj,
+        &group,
+        &version,
+        ctx.schema.as_deref(),
+    );
 
     // Dry-run: validation and admission passed; return the would-be replaced object without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -3887,6 +3904,14 @@ pub async fn create_cr_namespaced<S: Store>(
     prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    record_cr_write(
+        &headers,
+        &serde_json::Value::Null,
+        &mut obj,
+        &group,
+        &version,
+        ctx.schema.as_deref(),
+    );
 
     // ResourceQuota: ensure object count does not exceed hard limits (e.g. `count/<crd>.<group>`).
     // Custom resources went through admission webhooks above but were never checked against
@@ -4144,6 +4169,14 @@ pub async fn replace_cr_namespaced<S: Store>(
     );
     run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
+    record_cr_write(
+        &headers,
+        &existing,
+        &mut obj,
+        &group,
+        &version,
+        ctx.schema.as_deref(),
+    );
     prepare_cr_generation_for_update(
         &state,
         &ctx,
@@ -4467,6 +4500,58 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
         "code": 200
     }))
     .into_response())
+}
+
+/// Record the writer of a non-apply custom-resource write as owner of the fields it changed
+/// (`before` is `Value::Null` for a create).
+fn record_cr_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    obj: &mut serde_json::Value,
+    group: &str,
+    version: &str,
+    schema: Option<&serde_json::Value>,
+) {
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        obj,
+        &format!("{group}/{version}"),
+        None,
+        schema,
+    );
+}
+
+fn record_cr_status_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    obj: &mut serde_json::Value,
+    group: &str,
+    version: &str,
+) {
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        obj,
+        &format!("{group}/{version}"),
+        Some("status"),
+        None,
+    );
+}
+
+fn record_cr_scale_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    obj: &mut serde_json::Value,
+    group: &str,
+    version: &str,
+    ctx: &CrContext,
+) {
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        obj,
+        &format!("{group}/{version}"),
+        Some("scale"),
+        ctx.schema.as_deref(),
+    );
 }
 
 fn cr_field_request<'a>(
@@ -5217,6 +5302,7 @@ pub async fn put_cr_status<S: Store>(
     }
 
     let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
+    let before_write = current.clone();
 
     // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
     // Typed dispatch first: a registry-hit built-in kind with a registered status codec
@@ -5255,6 +5341,7 @@ pub async fn put_cr_status<S: Store>(
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
+    record_cr_status_write(&headers, &before_write, &mut current, &group, &version);
     if is_dry_run_header(&headers) {
         return Ok(Json(current));
     }
@@ -5410,6 +5497,7 @@ pub async fn patch_cr_status<S: Store>(
     }
 
     let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
+    let before_write = current.clone();
 
     // apply-patch+yaml bodies are genuine YAML; every other patch type here is JSON.
     let patch: serde_json::Value = if is_ssa {
@@ -5478,6 +5566,7 @@ pub async fn patch_cr_status<S: Store>(
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
+    record_cr_status_write(&headers, &before_write, &mut current, &group, &version);
     if is_dry_run_header(&headers) {
         return Ok(Json(current));
     }
@@ -5659,6 +5748,14 @@ async fn cr_scale_put_impl<S: Store>(
     let before = obj.clone();
     scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas as i64);
     apply_cr_generation_on_update(&before, &mut obj);
+    record_cr_scale_write(
+        headers,
+        &before,
+        &mut obj,
+        target.group,
+        target.version,
+        ctx,
+    );
 
     let old_rv = obj["metadata"]["resourceVersion"]
         .as_str()
@@ -5739,6 +5836,14 @@ async fn cr_scale_patch_impl<S: Store>(
         None => scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
     };
     apply_cr_generation_on_update(&before, &mut obj);
+    record_cr_scale_write(
+        headers,
+        &before,
+        &mut obj,
+        target.group,
+        target.version,
+        ctx,
+    );
 
     let old_rv = obj["metadata"]["resourceVersion"]
         .as_str()
@@ -14878,6 +14983,7 @@ mod tests {
             axum::http::header::CONTENT_TYPE,
             "application/apply-patch+yaml".parse().unwrap(),
         );
+        crate::field_manager::forward_query(&mut headers, None, true);
 
         let result = patch_cr(
             State(state.clone()),

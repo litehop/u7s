@@ -330,7 +330,17 @@ pub(crate) async fn create_pod<S: Store>(
     let body = extract_body(&body, ct)?;
     let obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
-    create_pod_from_object(&state, &ns, &user, create_query.is_dry_run(), obj).await
+    let writer =
+        crate::field_manager::WriteIdentity::new(create_query.field_manager.as_deref(), &headers);
+    create_pod_from_object(
+        &state,
+        &ns,
+        &user,
+        create_query.is_dry_run(),
+        Some(&writer),
+        obj,
+    )
+    .await
 }
 
 /// Admission, defaulting, quota and persistence of a new pod, shared by the POST create
@@ -340,6 +350,7 @@ async fn create_pod_from_object<S: Store>(
     ns: &Namespace,
     user: &UserInfo,
     dry_run: bool,
+    writer: Option<&crate::field_manager::WriteIdentity>,
     mut obj: Object,
 ) -> Result<Response, crate::status::StatusError> {
     // NodeRestriction-equivalent enforcement: `authorize_pod`'s coarse (pre-body) check lets
@@ -508,6 +519,9 @@ async fn create_pod_from_object<S: Store>(
     obj.body["status"]["qosClass"] =
         serde_json::Value::String(compute_qos_class(&obj.body).to_owned());
 
+    if let Some(writer) = writer {
+        writer.record(&serde_json::Value::Null, &mut obj.body, "v1", None, None);
+    }
     // Dry-run: validation passed; return the would-be created object without persisting.
     if dry_run {
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
@@ -836,6 +850,8 @@ pub(crate) async fn replace_pod<S: Store>(
     // status the client's PUT body carried (see stored_status comment above) is
     // discarded in favor of the server's own record.
     obj.body["status"] = stored_status;
+    crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
+        .record(&stored_obj.body, &mut obj.body, "v1", None, None);
 
     // Dry-run: validation and admission passed; return the would-be replaced object without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -1524,7 +1540,8 @@ pub(crate) async fn patch_pod<S: Store>(
             .map_err(crate::field_manager::Conflict::into_status)?
             .record(&mut obj.body);
             let resp =
-                create_pod_from_object(&state, &ns, &user, patch_query.is_dry_run(), obj).await?;
+                create_pod_from_object(&state, &ns, &user, patch_query.is_dry_run(), None, obj)
+                    .await?;
             return Ok(resp);
         };
 
@@ -1569,8 +1586,12 @@ pub(crate) async fn patch_pod<S: Store>(
 
         match patch_type {
             super::json_patch::PatchType::StrategicMerge => {
-                crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
-                    .map_err(|e| Status::bad_request(e.to_string()))?;
+                let merged = if is_ssa {
+                    crate::patch::strategic_merge_patch_ssa(&mut current_obj.body, &patch)
+                } else {
+                    crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
+                };
+                merged.map_err(|e| Status::bad_request(e.to_string()))?;
             }
             super::json_patch::PatchType::Merge => {
                 crate::patch::merge_patch(&mut current_obj.body, &patch);
@@ -2632,6 +2653,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
 
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let before_write = current_obj.body.clone();
 
     // Typed dispatch: Pod is always registered in status_dispatch (mirrors
     // put_namespace_status's identical null/typed-decode split), so a scalar or
@@ -2647,6 +2669,13 @@ pub(crate) async fn replace_pod_status<S: Store>(
     }
 
     crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, "Pod");
+    crate::field_manager::WriteIdentity::new(None, &headers).record(
+        &before_write,
+        &mut current_obj.body,
+        "v1",
+        Some("status"),
+        None,
+    );
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
@@ -2934,7 +2963,15 @@ pub(crate) async fn patch_pod_status<S: Store>(
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+        let before_write = current_obj.body.clone();
         current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
+        crate::field_manager::WriteIdentity::new(None, &headers).record(
+            &before_write,
+            &mut current_obj.body,
+            "v1",
+            Some("status"),
+            None,
+        );
 
         // Dry-run: validation passed; return the would-be patched status without
         // persisting — mirrors replace_pod_status's dry-run early-return.

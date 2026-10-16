@@ -51,6 +51,54 @@ pub fn strategic_merge_patch(
     strategic_merge_patch_at(target, patch, "", None)
 }
 
+thread_local! {
+    static SSA_KEYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Strategic-merge a server-side-apply body: lists use apply's list-map keys, which are
+/// composite for two built-in lists where strategic-merge-patch keys on one field.
+pub fn strategic_merge_patch_ssa(
+    target: &mut serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<(), PatchError> {
+    SSA_KEYS.with(|f| f.set(true));
+    let r = strategic_merge_patch_at(target, patch, "", None);
+    SSA_KEYS.with(|f| f.set(false));
+    r
+}
+
+pub(crate) fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKeyKind {
+    if SSA_KEYS.with(|f| f.get()) {
+        ssa_merge_key_for_path(path, schema)
+    } else {
+        base_merge_key_for_path(path, schema)
+    }
+}
+
+/// Apply's list-map keys (`x-kubernetes-list-map-keys`): container ports key on
+/// (containerPort, protocol) so a pod serving 53/TCP and 53/UDP has two items, and
+/// topologySpreadConstraints on (topologyKey, whenUnsatisfiable).
+pub(crate) fn ssa_merge_key_for_path(
+    path: &str,
+    schema: Option<&serde_json::Value>,
+) -> MergeKeyKind {
+    let kind = base_merge_key_for_path(path, schema);
+    if schema.is_some() {
+        return kind;
+    }
+    match kind {
+        MergeKeyKind::Key(mut keys) if keys == ["containerPort"] => {
+            keys.push("protocol".into());
+            MergeKeyKind::Key(keys)
+        }
+        MergeKeyKind::Key(mut keys) if keys == ["topologyKey"] => {
+            keys.push("whenUnsatisfiable".into());
+            MergeKeyKind::Key(keys)
+        }
+        other => other,
+    }
+}
+
 /// Strategic-merge-patch a custom-resource instance, resolving merge keys from the CRD's own
 /// OpenAPI schema (`x-kubernetes-list-type: map` + `x-kubernetes-list-map-keys`) instead of the
 /// hardcoded built-in-type table `strategic_merge_patch` uses — a CRD's kind has no relationship
@@ -233,7 +281,14 @@ fn matches_key_fields(
     existing: &serde_json::Value,
     fields: &[(String, serde_json::Value)],
 ) -> bool {
-    !fields.is_empty() && fields.iter().all(|(k, v)| existing.get(k) == Some(v))
+    let tcp = serde_json::Value::String("TCP".into());
+    !fields.is_empty()
+        && fields.iter().all(|(k, v)| {
+            existing
+                .get(k)
+                .or_else(|| (k == "protocol").then_some(&tcp))
+                == Some(v)
+        })
 }
 
 /// Reorder `target_arr` (an already-merged array) to match the ordering `order_arr`
@@ -539,7 +594,7 @@ pub(crate) enum MergeKeyKind {
 /// nothing to do with the Pod/Service shapes this table encodes, so a coincidental path
 /// collision (e.g. a CRD that happens to have its own unrelated `spec.containers` field) must
 /// not silently inherit Pod's merge-by-name semantics.
-pub(crate) fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKeyKind {
+fn base_merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKeyKind {
     if let Some(schema) = schema {
         return crd_merge_key_for_path(schema, path);
     }

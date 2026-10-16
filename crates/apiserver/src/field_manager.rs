@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
-use crate::patch::{merge_key_for_path, MergeKeyKind};
+use crate::patch::{ssa_merge_key_for_path, MergeKeyKind};
 
 /// One structured-merge-diff path: `["f:spec", "f:containers", "k:{\"name\":\"c\"}", "f:image"]`.
 pub(crate) type Path = Vec<String>;
@@ -147,7 +147,7 @@ fn walk_list(
     schema: Option<&Value>,
     out: &mut Extracted,
 ) {
-    match merge_key_for_path(dotted, schema) {
+    match ssa_merge_key_for_path(dotted, schema) {
         MergeKeyKind::Key(keys) => {
             if let Some(ids) = item_ids(items, &keys) {
                 for (item, id) in items.iter().zip(ids) {
@@ -181,6 +181,16 @@ fn walk_list(
     out.values.insert(path.clone(), list.clone());
 }
 
+/// A port's `protocol` is part of its identity and defaults to TCP, so an item that omits it
+/// is the same item as one that spells it out.
+fn key_value(v: Option<&Value>, key: &str) -> Option<Value> {
+    match v {
+        Some(v) => Some(v.clone()),
+        None if key == "protocol" => Some(Value::String("TCP".into())),
+        None => None,
+    }
+}
+
 /// `k:{...}` identity per item, or `None` when any item lacks every key field or two items
 /// collide — the list is then treated as atomic, as upstream does for an unkeyable list.
 fn item_ids(items: &[Value], keys: &[String]) -> Option<Vec<String>> {
@@ -190,11 +200,11 @@ fn item_ids(items: &[Value], keys: &[String]) -> Option<Vec<String>> {
         let obj = item.as_object()?;
         let mut key = Map::new();
         for k in keys {
-            if let Some(v) = obj.get(k) {
-                key.insert(k.clone(), v.clone());
+            if let Some(v) = key_value(obj.get(k), k) {
+                key.insert(k.clone(), v);
             }
         }
-        if key.is_empty() {
+        if !keys.iter().any(|k| k != "protocol" && obj.contains_key(k)) {
             return None;
         }
         let id = format!("k:{}", Value::Object(key));
@@ -317,7 +327,8 @@ fn elem_matches(item: &Value, elem: &str) -> bool {
         let Ok(Value::Object(key)) = serde_json::from_str::<Value>(k) else {
             return false;
         };
-        key.iter().all(|(kk, vv)| item.get(kk) == Some(vv))
+        key.iter()
+            .all(|(kk, vv)| key_value(item.get(kk), kk).as_ref() == Some(vv))
     } else if let Some(v) = elem.strip_prefix("v:") {
         serde_json::from_str::<Value>(v).is_ok_and(|v| *item == v)
     } else {
@@ -419,6 +430,49 @@ pub(crate) fn forwarded_query(headers: &axum::http::HeaderMap) -> (String, bool)
     )
 }
 
+/// Who is writing, for handlers that record ownership of a non-apply write.
+pub(crate) struct WriteIdentity {
+    manager: String,
+    now: String,
+}
+
+impl WriteIdentity {
+    pub(crate) fn new(query_manager: Option<&str>, headers: &axum::http::HeaderMap) -> Self {
+        let forwarded = headers
+            .get(FIELD_MANAGER_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let user_agent = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok());
+        Self {
+            manager: request_manager(query_manager.or(forwarded), user_agent),
+            now: crate::util::utc_now_rfc3339(),
+        }
+    }
+
+    /// Record `after` as an Update by this writer of `before` (`Value::Null` for a create).
+    pub(crate) fn record(
+        &self,
+        before: &Value,
+        after: &mut Value,
+        api_version: &str,
+        subresource: Option<&str>,
+        schema: Option<&Value>,
+    ) {
+        record_update(
+            before,
+            after,
+            &Request {
+                manager: &self.manager,
+                api_version,
+                subresource,
+                schema,
+                now: &self.now,
+            },
+        );
+    }
+}
+
 /// The manager name upstream records for a request without `?fieldManager=`: the user agent's
 /// product token.
 pub(crate) fn request_manager(query: Option<&str>, user_agent: Option<&str>) -> String {
@@ -479,6 +533,17 @@ pub(crate) fn plan_apply(
 
     let mut removals: Vec<Path> = previous
         .difference(&ext.set)
+        .filter(|p| {
+            // Still applied, just with a different shape (atomic list <-> keyed items): the
+            // field is not dropped, so neither it nor its items may be deleted.
+            let covered_by_atomic = ext.values.keys().any(|q| p.starts_with(q));
+            let still_applied_below = ext
+                .set
+                .range((*p).clone()..)
+                .next()
+                .is_some_and(|q| q.starts_with(p));
+            !covered_by_atomic && !still_applied_below
+        })
         .filter(|p| {
             !managers
                 .iter()
@@ -572,12 +637,34 @@ fn remove_member(obj: &mut Value, path: &Path) {
     }
 }
 
-/// Record on `after` that `manager` changed every field that differs from `before`, taking
-/// those fields (and dropping fields that disappeared) from every other manager.
-pub(crate) fn record_update(before: &Value, after: &mut Value, req: &Request<'_>) {
-    if before["metadata"]["managedFields"] != after["metadata"]["managedFields"] {
-        return;
+/// Upstream's rule for the managedFields a non-apply write carries (fieldmanager.go
+/// `decodeLiveOrNew`): `[]` or `[{}]` resets ownership, a decodable non-empty list is the
+/// base the write's changes are layered on, anything else falls back to the live object's.
+/// A subresource write never takes ownership from the request object.
+fn base_managers(live: &[Manager], after: &Value, subresource: bool) -> Vec<Manager> {
+    if subresource {
+        return live.to_vec();
     }
+    if let Some(entries) = after["metadata"]["managedFields"].as_array() {
+        let reset = entries.is_empty()
+            || (entries.len() == 1 && entries[0].as_object().is_some_and(|o| o.is_empty()));
+        if reset {
+            return Vec::new();
+        }
+    }
+    let supplied = read_managers(after);
+    if supplied.is_empty() {
+        live.to_vec()
+    } else {
+        supplied
+    }
+}
+
+/// Record on `after` that `manager` changed every field that differs from `before`, taking
+/// those fields (and dropping fields that disappeared) from every other manager. Runs for
+/// every non-apply write, including ones whose body carries no managedFields (PUT, POST),
+/// so ownership is never lost by a write that did not mention it.
+pub(crate) fn record_update(before: &Value, after: &mut Value, req: &Request<'_>) {
     let old = extract(before, req.schema);
     let new = extract(after, req.schema);
     let mut changed: PathSet = new.set.difference(&old.set).cloned().collect();
@@ -587,11 +674,9 @@ pub(crate) fn record_update(before: &Value, after: &mut Value, req: &Request<'_>
         }
     }
     let removed: PathSet = old.set.difference(&new.set).cloned().collect();
-    if changed.is_empty() && removed.is_empty() {
-        return;
-    }
 
-    let mut managers = read_managers(before);
+    let live = read_managers(before);
+    let mut managers = base_managers(&live, after, req.subresource.is_some());
     for m in &mut managers {
         m.set
             .retain(|p| !changed.contains(p) && !removed.contains(p));
@@ -691,7 +776,7 @@ mod tests {
     ) -> Result<(), Vec<Conflict>> {
         let plan = plan_apply(live, applied, force, &req(manager))?;
         let mut merged = live.clone();
-        crate::patch::strategic_merge_patch(&mut merged, applied).unwrap();
+        crate::patch::strategic_merge_patch_ssa(&mut merged, applied).unwrap();
         plan.remove_dropped_fields(&mut merged);
         plan.record(&mut merged);
         *live = merged;
@@ -820,6 +905,199 @@ mod tests {
         .unwrap();
         plan.record(&mut live);
         assert_eq!(live["metadata"]["managedFields"], first);
+    }
+
+    fn with_ports(ports: Value) -> Value {
+        let mut d = deployment(Some(1), false);
+        d["spec"]["template"]["spec"]["containers"][0]["ports"] = ports;
+        d
+    }
+
+    fn ports_of(live: &Value) -> Value {
+        live["spec"]["template"]["spec"]["containers"][0]["ports"].clone()
+    }
+
+    fn dns_ports() -> Value {
+        json!([
+            {"containerPort": 53, "protocol": "TCP"},
+            {"containerPort": 53, "protocol": "UDP"}
+        ])
+    }
+
+    /// A DNS pod serves 53/TCP and 53/UDP. Keying ports on containerPort alone collapsed them
+    /// into one item and a re-apply deleted the whole list; both protocols must be items.
+    #[test]
+    fn same_port_number_on_two_protocols_is_two_items_and_survives_reapply() {
+        let mut live = json!({});
+        apply(&mut live, &with_ports(dns_ports()), "a", false).unwrap();
+        assert_eq!(ports_of(&live), dns_ports());
+        apply(&mut live, &with_ports(dns_ports()), "a", false).unwrap();
+        assert_eq!(ports_of(&live), dns_ports(), "DNS shape must round-trip");
+    }
+
+    /// Dropping one of two ports removes that item only; it must never delete the list.
+    #[test]
+    fn dropping_one_port_removes_only_that_item_in_both_orders() {
+        let tcp = json!([{"containerPort": 53, "protocol": "TCP"}]);
+        let mut live = json!({});
+        apply(&mut live, &with_ports(dns_ports()), "a", false).unwrap();
+        apply(&mut live, &with_ports(tcp.clone()), "a", false).unwrap();
+        assert_eq!(ports_of(&live), tcp, "only the UDP item may be removed");
+
+        let mut live = json!({});
+        apply(&mut live, &with_ports(tcp.clone()), "a", false).unwrap();
+        apply(&mut live, &with_ports(dns_ports()), "a", false).unwrap();
+        assert_eq!(ports_of(&live), dns_ports());
+    }
+
+    /// A port without `protocol` is the TCP port: spelling the default out must not look like
+    /// a different item (which would delete and re-add it).
+    #[test]
+    fn omitted_protocol_is_the_same_item_as_tcp() {
+        let implicit = json!([{"containerPort": 80}]);
+        let explicit = json!([{"containerPort": 80, "protocol": "TCP"}]);
+        let mut live = json!({});
+        apply(&mut live, &with_ports(implicit), "a", false).unwrap();
+        apply(&mut live, &with_ports(explicit.clone()), "a", false).unwrap();
+        assert_eq!(ports_of(&live).as_array().unwrap().len(), 1);
+    }
+
+    /// A list recorded as one atomic field (older ownership) that is now applied as keyed
+    /// items is still applied: the transition must not delete it.
+    #[test]
+    fn atomic_to_keyed_ownership_transition_does_not_delete_the_list() {
+        let mut live = json!({});
+        apply(&mut live, &with_ports(dns_ports()), "a", false).unwrap();
+        let mut managers = read_managers(&live);
+        let ports_field: Path = ["f:spec", "f:template", "f:spec", "f:containers"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain([r#"k:{"name":"nginx"}"#.to_string(), "f:ports".to_string()])
+            .collect();
+        managers[0].set.retain(|p| !p.starts_with(&ports_field));
+        managers[0].set.insert(ports_field);
+        write_managers(&mut live, &managers);
+
+        apply(&mut live, &with_ports(dns_ports()), "a", false).unwrap();
+        assert_eq!(ports_of(&live), dns_ports());
+    }
+
+    /// The reverse: items previously owned individually, the list now applied as one atomic
+    /// field (a CRD that changed its list type). The new list is the applied state; pruning
+    /// the old items out of it would wipe the list.
+    #[test]
+    fn keyed_to_atomic_ownership_transition_does_not_delete_the_list() {
+        let schema = |list_type: &str| {
+            json!({"properties": {"spec": {"properties": {"items": {
+                "type": "array",
+                "x-kubernetes-list-type": list_type,
+                "x-kubernetes-list-map-keys": ["name"]
+            }}}}})
+        };
+        let body = json!({"apiVersion": "x/v1", "kind": "X", "metadata": {"name": "o"},
+            "spec": {"items": [{"name": "a"}, {"name": "b"}]}});
+        let keyed = schema("map");
+        let atomic = schema("atomic");
+        let request = |s: &'static Value| Request {
+            schema: Some(s),
+            ..req("a")
+        };
+        let keyed: &'static Value = Box::leak(Box::new(keyed));
+        let atomic: &'static Value = Box::leak(Box::new(atomic));
+
+        let mut live = body.clone();
+        plan_apply(&Value::Null, &body, false, &request(keyed))
+            .unwrap()
+            .record(&mut live);
+        let plan = plan_apply(&live, &body, false, &request(atomic)).unwrap();
+        assert!(
+            plan.removals.is_empty(),
+            "nothing is dropped: {:?}",
+            plan.removals
+        );
+    }
+
+    /// A scale-subresource (or any subresource) write is attributed to its writer, so an
+    /// applier that later drops the field does not delete a value another actor set.
+    #[test]
+    fn subresource_write_co_owns_so_a_later_apply_that_drops_the_field_keeps_it() {
+        let mut live = json!({});
+        apply(&mut live, &deployment(Some(3), false), "applier", false).unwrap();
+        let before = live.clone();
+        live["spec"]["replicas"] = json!(5);
+        let scale = Request {
+            subresource: Some("scale"),
+            ..req("hpa")
+        };
+        record_update(&before, &mut live, &scale);
+
+        apply(&mut live, &deployment(None, false), "applier", false).unwrap();
+        assert_eq!(live["spec"]["replicas"], 5);
+    }
+
+    /// A PUT body carries no managedFields; recording it must keep existing ownership rather
+    /// than wiping it, and attribute only what the PUT changed.
+    #[test]
+    fn put_without_managed_fields_keeps_ownership_and_attributes_its_changes() {
+        let mut live = json!({});
+        apply(&mut live, &deployment(Some(3), false), "applier", false).unwrap();
+        let before = live.clone();
+        let mut put = before.clone();
+        put["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("managedFields");
+        put["spec"]["replicas"] = json!(7);
+        record_update(&before, &mut put, &req("kubectl-edit"));
+
+        let managers = read_managers(&put);
+        assert!(
+            managers.iter().any(|m| m.name == "applier"),
+            "applier ownership kept"
+        );
+        let editor = managers.iter().find(|m| m.name == "kubectl-edit").unwrap();
+        assert!(editor
+            .set
+            .contains(&vec!["f:spec".to_string(), "f:replicas".to_string()]));
+    }
+
+    /// Client-supplied managedFields: `[{}]` resets ownership (upstream's documented way to
+    /// clear it), and a patch that carries managedFields is still attributed to its manager.
+    #[test]
+    fn managed_fields_reset_clears_other_managers_and_changes_are_still_recorded() {
+        let mut live = json!({});
+        apply(&mut live, &deployment(Some(3), false), "applier", false).unwrap();
+        let before = live.clone();
+        live["metadata"]["managedFields"] = json!([{}]);
+        live["spec"]["replicas"] = json!(9);
+        record_update(&before, &mut live, &req("resetter"));
+
+        let managers = read_managers(&live);
+        assert_eq!(
+            managers.len(),
+            1,
+            "reset drops every previous manager: {managers:?}"
+        );
+        assert_eq!(managers[0].name, "resetter");
+    }
+
+    /// A subresource write must ignore managedFields in its body (upstream decodeLiveOrNew):
+    /// otherwise a status/scale writer could forge ownership of arbitrary fields.
+    #[test]
+    fn subresource_write_ignores_client_supplied_managed_fields() {
+        let mut live = json!({});
+        apply(&mut live, &deployment(Some(3), false), "applier", false).unwrap();
+        let before = live.clone();
+        live["metadata"]["managedFields"] = json!([]);
+        record_update(
+            &before,
+            &mut live,
+            &Request {
+                subresource: Some("status"),
+                ..req("kubelet")
+            },
+        );
+        assert!(read_managers(&live).iter().any(|m| m.name == "applier"));
     }
 
     #[test]

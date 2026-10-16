@@ -142,7 +142,10 @@ async fn patch(
         patch_namespaced_resource(
             State(st.clone()),
             path(name),
-            Query(PatchQuery::default()),
+            Query(PatchQuery {
+                force: Some(true),
+                ..Default::default()
+            }),
             user(),
             headers(content_type),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),

@@ -464,6 +464,11 @@ pub(crate) async fn create_resource<S: Store>(
             // extractor of its own; forward the already-parsed ?fieldValidation= value via a
             // header rather than adding a parameter to its ~60 existing call sites.
             let mut headers = headers;
+            crate::field_manager::forward_query(
+                &mut headers,
+                create_query.field_manager.as_deref(),
+                false,
+            );
             if let Some(fv) = create_query.field_validation.as_deref() {
                 if let Ok(hv) = axum::http::HeaderValue::from_str(fv) {
                     headers.insert(
@@ -576,6 +581,14 @@ pub(crate) async fn create_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::force_generation_on_create(&group, &plural, &mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+    crate::field_manager::WriteIdentity::new(create_query.field_manager.as_deref(), &headers)
+        .record(
+            &serde_json::Value::Null,
+            &mut obj.body,
+            &api_version,
+            None,
+            None,
+        );
 
     // Dry-run: validation and admission passed; return the would-be created object without persisting.
     if create_query.is_dry_run() {
@@ -757,6 +770,12 @@ pub(crate) async fn replace_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
+            let mut headers = headers;
+            crate::field_manager::forward_query(
+                &mut headers,
+                replace_query.field_manager.as_deref(),
+                false,
+            );
             return super::cr::replace_cr(
                 State(state),
                 Path((group, version, plural, name)),
@@ -1044,6 +1063,14 @@ pub(crate) async fn replace_resource<S: Store>(
     // Restore the stored status: controllers write status via /status; a full PUT on
     // the main endpoint must preserve whatever the controller last wrote.
     restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
+    crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
+        .record(
+            old_object.as_ref().unwrap_or(&serde_json::Value::Null),
+            &mut obj.body,
+            &group_version(&group, &version),
+            None,
+            None,
+        );
 
     // Dry-run: validation and admission passed; return the would-be result without persisting.
     if replace_query.is_dry_run() {
@@ -1417,6 +1444,14 @@ pub(crate) struct PatchConfig<'a> {
 
 use crate::field_manager::applied_fields;
 
+fn group_version(group: &str, version: &str) -> String {
+    if group.is_empty() {
+        version.to_string()
+    } else {
+        format!("{group}/{version}")
+    }
+}
+
 fn field_request<'a>(
     manager: &'a str,
     api_version: &'a str,
@@ -1705,7 +1740,7 @@ pub(crate) async fn do_patch<S: Store>(
                 } else {
                     None
                 };
-                crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                crate::patch::strategic_merge_patch_ssa(&mut current.body, &patch)
                     .map_err(|e| Status::bad_request(e.to_string()))?;
                 race_plan.remove_dropped_fields(&mut current.body);
                 super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
@@ -2070,8 +2105,12 @@ pub(crate) async fn do_patch<S: Store>(
         match patch_type {
             PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
             PatchType::StrategicMerge => {
-                crate::patch::strategic_merge_patch(&mut current.body, &patch)
-                    .map_err(|e| Status::bad_request(e.to_string()))?;
+                let merged = if is_ssa {
+                    crate::patch::strategic_merge_patch_ssa(&mut current.body, &patch)
+                } else {
+                    crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                };
+                merged.map_err(|e| Status::bad_request(e.to_string()))?;
             }
             PatchType::Json => {
                 apply_json_patch(&mut current.body, &patch)?;
@@ -3299,6 +3338,11 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             // See create_resource: cr::create_cr_namespaced has no Query extractor of its
             // own, so forward ?fieldValidation= via a header instead of a new parameter.
             let mut headers = headers;
+            crate::field_manager::forward_query(
+                &mut headers,
+                create_query.field_manager.as_deref(),
+                false,
+            );
             if let Some(fv) = create_query.field_validation.as_deref() {
                 if let Ok(hv) = axum::http::HeaderValue::from_str(fv) {
                     headers.insert(
@@ -3425,6 +3469,15 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::force_generation_on_create(&group, &plural, &mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+
+    crate::field_manager::WriteIdentity::new(create_query.field_manager.as_deref(), &headers)
+        .record(
+            &serde_json::Value::Null,
+            &mut obj.body,
+            &api_version,
+            None,
+            None,
+        );
 
     // LimitRange: inject defaults then validate min/max bounds (pods only).
     obj.body = limit_range::apply_limit_ranges(&state, obj.body, &ns, &plural).await?;
@@ -3804,6 +3857,12 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
+            let mut headers = headers;
+            crate::field_manager::forward_query(
+                &mut headers,
+                replace_query.field_manager.as_deref(),
+                false,
+            );
             return super::cr::replace_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
@@ -4187,6 +4246,14 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // Restore the stored status: controllers write status via /status; a full PUT on
     // the main endpoint must preserve whatever the controller last wrote.
     restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
+    crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
+        .record(
+            old_object.as_ref().unwrap_or(&serde_json::Value::Null),
+            &mut obj.body,
+            &group_version(&group, &version),
+            None,
+            None,
+        );
 
     // A user PUT on an Endpoints object signals that the endpoints are now user-managed,
     // not service-controller-managed.  Clear the annotation the KCM endpoints-controller
@@ -6375,6 +6442,204 @@ mod tests {
         assert!(err.1.message.contains("kubectl-scale"), "{}", err.1.message);
     }
 
+    /// A DNS workload serves 53/TCP and 53/UDP. Re-applying between that shape and a
+    /// single-port shape (either order) must add/remove only the UDP item, never wipe the
+    /// container's ports.
+    #[tokio::test]
+    async fn apply_never_wipes_container_ports_when_same_port_number_has_two_protocols() {
+        let ports = |list: serde_json::Value| {
+            let mut d = ssa_deployment(Some(1), false);
+            d["spec"]["template"]["spec"]["containers"][0]["ports"] = list;
+            d
+        };
+        let both = serde_json::json!([
+            {"containerPort": 53, "protocol": "TCP"},
+            {"containerPort": 53, "protocol": "UDP"}
+        ]);
+        let tcp = serde_json::json!([{"containerPort": 53, "protocol": "TCP"}]);
+        let got =
+            |v: &serde_json::Value| v["spec"]["template"]["spec"]["containers"][0]["ports"].clone();
+
+        let state = make_state();
+        let a = apply_as("tool-a", false);
+        let r = patch_deployment(&state, APPLY, a, ports(both.clone()))
+            .await
+            .unwrap();
+        assert_eq!(got(&r), both);
+        let r = patch_deployment(&state, APPLY, apply_as("tool-a", false), ports(tcp.clone()))
+            .await
+            .unwrap();
+        assert_eq!(got(&r), tcp, "dropping UDP removes only that item");
+        let r = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ports(both.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got(&r), both, "adding UDP back keeps TCP");
+    }
+
+    /// An HPA (or `kubectl scale`) writing spec.replicas through the scale subresource owns
+    /// that value: a later apply that no longer names replicas must keep it, not reset the
+    /// workload to the default and undo the autoscaler.
+    #[tokio::test]
+    async fn scale_subresource_write_is_co_owned_so_apply_without_replicas_keeps_it() {
+        let state = make_state();
+        patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_static("hpa-controller/v1.37"),
+        );
+        crate::handlers::scale::put_scale(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".into(), "deployments".into(), "web".into())),
+            headers,
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "autoscaling/v1",
+                    "kind": "Scale",
+                    "metadata": {"name": "web", "namespace": "default"},
+                    "spec": {"replicas": 5}
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("scale put must succeed: {e:?}"));
+
+        let after = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(None, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            after["spec"]["replicas"], 5,
+            "the scale writer co-owns replicas, so dropping it from the manifest must not delete it"
+        );
+    }
+
+    /// A whole-object PUT body carries no managedFields; it must not wipe ownership, and the
+    /// fields it changed belong to its writer so a later apply that drops them keeps them.
+    #[tokio::test]
+    async fn put_keeps_ownership_and_co_owns_what_it_changed() {
+        let state = make_state();
+        let created = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+        let mut put = created.clone();
+        put["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("managedFields");
+        put["spec"]["replicas"] = serde_json::json!(8);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_static("kubectl-edit/v1.37"),
+        );
+        use axum::response::IntoResponse;
+        let resp = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "web".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&put).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("PUT must succeed: {e:?}"))
+        .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let replaced: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let managers: Vec<_> = replaced["metadata"]["managedFields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["manager"].as_str().unwrap().to_string())
+            .collect();
+        assert!(managers.contains(&"tool-a".to_string()), "{managers:?}");
+        assert!(
+            managers.contains(&"kubectl-edit".to_string()),
+            "{managers:?}"
+        );
+
+        let after = patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(None, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after["spec"]["replicas"], 8);
+    }
+
+    /// A patch that carries `metadata.managedFields: [{}]` resets ownership (upstream's
+    /// documented reset); the patch's own changes are still attributed to its manager rather
+    /// than the whole write being skipped.
+    #[tokio::test]
+    async fn patch_with_managed_fields_reset_is_recorded_not_skipped() {
+        let state = make_state();
+        patch_deployment(
+            &state,
+            APPLY,
+            apply_as("tool-a", false),
+            ssa_deployment(Some(3), false),
+        )
+        .await
+        .unwrap();
+        let reset = patch_deployment(
+            &state,
+            "application/merge-patch+json",
+            PatchQuery {
+                field_manager: Some("resetter".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"metadata": {"managedFields": [{}]}, "spec": {"replicas": 9}}),
+        )
+        .await
+        .unwrap();
+        let managers = reset["metadata"]["managedFields"].as_array().unwrap();
+        assert_eq!(managers.len(), 1, "{managers:?}");
+        assert_eq!(managers[0]["manager"], "resetter");
+        assert_eq!(managers[0]["operation"], "Update");
+    }
+
     /// Dropping a field from the manifest must delete the field the applier owned, or
     /// `kubectl apply` can never remove configuration (a removed port keeps being served).
     #[tokio::test]
@@ -7573,7 +7838,7 @@ mod tests {
                 "cm-2".to_string(),
             )),
             axum::extract::Query(ReplaceQuery {
-                _field_manager: None,
+                field_manager: None,
                 dry_run: Some("All".to_string()),
             }),
             test_user(),
@@ -8298,7 +8563,10 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
-            axum::extract::Query(PatchQuery::default()),
+            axum::extract::Query(PatchQuery {
+                force: Some(true),
+                ..Default::default()
+            }),
             test_user(),
             ssa_headers,
             patch_bytes,
@@ -8366,7 +8634,10 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
-            axum::extract::Query(PatchQuery::default()),
+            axum::extract::Query(PatchQuery {
+                force: Some(true),
+                ..Default::default()
+            }),
             test_user(),
             ssa_headers,
             yaml_patch,
@@ -20126,7 +20397,7 @@ mod tests {
 
         // PUT with dryRun=All: change holderIdentity to "new-holder".
         let dry_run_query = ReplaceQuery {
-            _field_manager: None,
+            field_manager: None,
             dry_run: Some("All".to_string()),
         };
         let put_resp = replace_namespaced_resource(
@@ -20197,7 +20468,7 @@ mod tests {
             "spec": { "holderIdentity": "new-node", "leaseDurationSeconds": 40 }
         });
         let dry_run_query = CreateQuery {
-            _field_manager: None,
+            field_manager: None,
             field_validation: None,
             dry_run: Some("All".to_string()),
         };
@@ -20316,7 +20587,7 @@ mod tests {
             "data": { "k": "v" }
         });
         let dry_run_query = CreateQuery {
-            _field_manager: None,
+            field_manager: None,
             field_validation: None,
             dry_run: Some("All".to_string()),
         };

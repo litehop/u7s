@@ -439,6 +439,28 @@ fn write_scale_replicas(
     Ok(())
 }
 
+/// A scale write owns `spec.replicas` as the `scale` subresource manager, so an applier that
+/// later drops the field does not delete a count an HPA set.
+fn record_scale_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    after: &mut serde_json::Value,
+    group: &str,
+) {
+    let api_version = if group.is_empty() {
+        "v1".to_string()
+    } else {
+        format!("{group}/v1")
+    };
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        after,
+        &api_version,
+        Some("scale"),
+        None,
+    );
+}
+
 async fn scale_put_impl<S: Store>(
     state: AppState<S>,
     group: &str,
@@ -472,12 +494,14 @@ async fn scale_put_impl<S: Store>(
     // reflects reality.
     let status_replicas = extract_status_replicas(&obj.body);
     let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
+    let before_write = obj.body.clone();
 
     write_scale_replicas(&mut obj, new_replicas)?;
 
     // Dry-run: spec.replicas was computed above; return the would-be Scale object
     // without persisting — this is the shared impl behind both apps/v1 and
     // ReplicationController scale PUT routes, so guarding here covers both.
+    record_scale_write(headers, &before_write, &mut obj.body, group);
     if is_dry_run_header(headers) {
         return Ok(Json(build_scale(
             name,
@@ -553,6 +577,7 @@ async fn scale_patch_impl<S: Store>(
     // reflects reality.
     let status_replicas = extract_status_replicas(&obj.body);
     let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
+    let before_write = obj.body.clone();
 
     // Extract replicas from patch if present; otherwise keep current value (no write).
     let new_replicas = match patch_scale_spec.replicas {
@@ -565,6 +590,7 @@ async fn scale_patch_impl<S: Store>(
 
     // Dry-run: same shared-impl reasoning as scale_put_impl above — covers both
     // apps/v1 and ReplicationController scale PATCH routes.
+    record_scale_write(headers, &before_write, &mut obj.body, group);
     if is_dry_run_header(headers) {
         return Ok(Json(build_scale(
             name,
