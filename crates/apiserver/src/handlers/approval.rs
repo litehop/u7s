@@ -76,7 +76,13 @@ pub async fn put_approval<S: Store>(
     // Merge status.conditions and metadata (labels/annotations) — never touch spec or
     // status.certificate. kubectl certificate approve/deny sends the whole object back,
     // and clients (e.g. this conformance test) also PATCH/PUT annotations via /approval.
+    let old_body = current.body.clone();
     merge_approval_conditions(&mut current, &incoming);
+    super::csr::populate_condition_timestamps(
+        &mut current.body,
+        &old_body,
+        &crate::util::utc_now_rfc3339(),
+    );
     merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
 
     // Dry-run: return the would-be approval object without persisting — mirrors
@@ -138,6 +144,7 @@ pub async fn patch_approval<S: Store>(
     // defense in depth alongside the PatchType::Json path check just below, so a
     // bug in (or future change to) that check can never let a JSON Patch smuggle a
     // different spec.request/spec.signerName past approval.
+    let old_body = current.body.clone();
     let spec_before = current.body["spec"].clone();
     let status_before: CertificateSigningRequestStatus =
         CertificateSigningRequestStatus::deserialize(&current.body["status"]).unwrap_or_else(
@@ -174,6 +181,12 @@ pub async fn patch_approval<S: Store>(
             merge_incoming_metadata(&mut current.body, &patch, KIND);
         }
     }
+
+    super::csr::populate_condition_timestamps(
+        &mut current.body,
+        &old_body,
+        &crate::util::utc_now_rfc3339(),
+    );
 
     // Restore protected fields — spec and status.certificate must never change via
     // /approval, for every patch type (not just PatchType::Json).
@@ -1565,5 +1578,119 @@ mod tests {
         );
         let conds = current.body["status"]["conditions"].as_array().unwrap();
         assert_eq!(conds[0]["type"], "Approved");
+    }
+
+    async fn put_conditions(
+        state: &crate::state::AppState,
+        name: &str,
+        conditions: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": name, "resourceVersion": current_rv(&state.store, name).await},
+            "status": {"conditions": conditions}
+        });
+        put_approval(
+            axum::extract::State(state.clone()),
+            approver(state),
+            axum::extract::Path(name.to_owned()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .expect("PUT /approval must succeed");
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        serde_json::from_slice(&stored.value).unwrap()
+    }
+
+    /// kubectl certificate approve sends no timestamps; without server defaulting
+    /// `kubectl get csr -o yaml` and audit tooling show a null lastTransitionTime.
+    #[tokio::test]
+    async fn put_approval_without_timestamps_defaults_both_so_approval_time_is_visible() {
+        let state = make_state();
+        seed_csr(&state.store, "ts-default", None).await;
+        let v = put_conditions(
+            &state,
+            "ts-default",
+            json!([{"type": "Approved", "status": "True", "reason": "r"}]),
+        )
+        .await;
+        let c = &v["status"]["conditions"][0];
+        assert!(c["lastUpdateTime"]
+            .as_str()
+            .is_some_and(|s| s.ends_with('Z')));
+        assert!(c["lastTransitionTime"]
+            .as_str()
+            .is_some_and(|s| s.ends_with('Z')));
+    }
+
+    /// Re-sending an unchanged approved CSR must not move the approval time forward.
+    #[tokio::test]
+    async fn put_approval_resend_unchanged_keeps_timestamps_so_approval_time_is_stable() {
+        let state = make_state();
+        seed_csr(&state.store, "ts-stable", None).await;
+        let first = put_conditions(
+            &state,
+            "ts-stable",
+            json!([{"type": "Approved", "status": "True",
+                    "lastUpdateTime": "2020-01-01T00:00:00Z",
+                    "lastTransitionTime": "2020-01-01T00:00:00Z"}]),
+        )
+        .await;
+        let again =
+            put_conditions(&state, "ts-stable", first["status"]["conditions"].clone()).await;
+        assert_eq!(first["status"]["conditions"], again["status"]["conditions"]);
+        assert_eq!(
+            again["status"]["conditions"][0]["lastTransitionTime"],
+            "2020-01-01T00:00:00Z"
+        );
+    }
+
+    /// A client-supplied timestamp is authoritative; overwriting it would falsify the audit trail.
+    #[tokio::test]
+    async fn put_approval_keeps_client_supplied_timestamps() {
+        let state = make_state();
+        seed_csr(&state.store, "ts-client", None).await;
+        let v = put_conditions(
+            &state,
+            "ts-client",
+            json!([{"type": "Approved", "status": "True",
+                    "lastUpdateTime": "2021-02-03T04:05:06Z",
+                    "lastTransitionTime": "2021-02-03T04:05:06Z"}]),
+        )
+        .await;
+        let c = &v["status"]["conditions"][0];
+        assert_eq!(c["lastUpdateTime"], "2021-02-03T04:05:06Z");
+        assert_eq!(c["lastTransitionTime"], "2021-02-03T04:05:06Z");
+    }
+
+    /// PATCH /approval (what `kubectl patch` and controllers use) must default timestamps too.
+    #[tokio::test]
+    async fn patch_approval_without_timestamps_defaults_both() {
+        let state = make_state();
+        seed_csr(&state.store, "ts-patch", None).await;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = json!({"status": {"conditions": [{"type": "Approved", "status": "True"}]}});
+        patch_approval(
+            axum::extract::State(state.clone()),
+            approver(&state),
+            axum::extract::Path("ts-patch".to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .expect("PATCH /approval must succeed");
+        let key = "/registry/certificates.k8s.io/certificatesigningrequests/ts-patch";
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let c = &v["status"]["conditions"][0];
+        assert!(c["lastUpdateTime"].is_string());
+        assert!(c["lastTransitionTime"].is_string());
     }
 }

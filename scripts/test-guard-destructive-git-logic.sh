@@ -469,6 +469,111 @@ for cmd in "git checkout pr-ref" "git switch pr-ref" "git merge pr-ref" "git res
 done
 
 # ---------------------------------------------------------------------------
+# 18. Parser gaps: wrappers and global options must not launder a HEAD-moving
+#     or destructive git command past the guard.
+# ---------------------------------------------------------------------------
+declare -a WRAPPED_BLOCKED=(
+  "command git checkout pr-ref"
+  "builtin command git checkout pr-ref"
+  "git --no-pager checkout pr-ref"
+  "git -P checkout pr-ref"
+  "git --git-dir=$MAIN/.git --work-tree=$MAIN checkout pr-ref"
+  "git --git-dir $MAIN/.git --work-tree $MAIN checkout pr-ref"
+  "git --work-tree=$MAIN checkout pr-ref"
+  "git --git-dir=$MAIN/.git checkout pr-ref"
+  "bash -c 'git checkout pr-ref'"
+  "sh -c \"git checkout pr-ref\""
+  "bash -lc 'git checkout pr-ref'"
+  "bash -c 'cd $MAIN && git reset --hard HEAD'"
+  "command git reset --hard HEAD"
+  "git --no-pager reset --hard HEAD"
+  "bash -c 'git reset --hard HEAD'"
+)
+for cmd in "${WRAPPED_BLOCKED[@]}"; do
+  assert "'$cmd' in the mayor checkout is refused -- the mayor checkout must not be reachable through a wrapper or global option" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "$cmd" "$MAIN")"
+done
+assert "'git --work-tree=<mayor> checkout pr-ref' from a worker cwd is refused -- --work-tree repoints the target at the mayor checkout" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir=$MAIN/.git --work-tree=$MAIN checkout pr-ref" "$WORKER")"
+assert "'bash -c \"cd <mayor> && git checkout pr-ref\"' from a worker cwd is refused -- the payload's cd must retarget its git" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "bash -c 'cd $MAIN && git checkout pr-ref'" "$WORKER")"
+
+declare -a WRAPPED_ALLOWED=(
+  "command git status"
+  "command git pull --ff-only"
+  "git --no-pager log --oneline -3"
+  "git -P diff main..pr-ref"
+  "git --no-pager show HEAD:a.txt"
+  "git --git-dir=$MAIN/.git --work-tree=$MAIN status"
+  "git --git-dir=$MAIN/.git --work-tree=$MAIN fetch origin"
+  "bash -c 'git status'"
+  "bash -c 'git pull --ff-only'"
+  "bash -c 'git log --oneline -3 && git fetch origin'"
+  "git branch -d pr-ref-gone"
+  "git worktree remove $SANDBOX_ROOT/scratch-wt"
+  "git worktree add $SANDBOX_ROOT/scratch-wt2 pr-ref"
+  "git remote prune origin"
+  "git checkout main"
+  "command git checkout main"
+  "git --no-pager checkout main"
+  "bash -c 'git checkout main'"
+)
+for cmd in "${WRAPPED_ALLOWED[@]}"; do
+  assert "'$cmd' in the mayor checkout is allowed -- legitimate mayor commands must keep working through wrappers" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$MAIN")"
+done
+for cmd in "command git checkout pr-ref" "git --no-pager checkout pr-ref" "bash -c 'git checkout pr-ref'" "git --git-dir=$WORKER/.git --work-tree=$WORKER checkout pr-ref"; do
+  assert "'$cmd' inside a worker worktree is allowed -- workers move their own HEAD constantly" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$WORKER")"
+done
+
+# ---------------------------------------------------------------------------
+# 19. --git-dir does not replace the cwd work tree but adds its own repo as a
+#     second target (HEAD lives there); unwrap `command -p`, `bash --norc -c`, `env [VAR=..] bash -c`.
+# ---------------------------------------------------------------------------
+assert "'git --git-dir=<worker>/.git checkout pr-ref' from the mayor cwd is refused -- git mutates the cwd (mayor) tree, so a worker --git-dir must not launder it" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir=$WORKER/.git checkout pr-ref" "$MAIN")"
+assert "'git --git-dir <worker>/.git reset --hard' from the mayor cwd is refused -- same laundering via the space form" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir $WORKER/.git reset --hard" "$MAIN")"
+assert "'git --git-dir=<mayor>/.git checkout pr-ref' from a worker cwd is refused -- HEAD lives in the git-dir, so it moves the mayor repo's HEAD" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir=$MAIN/.git checkout pr-ref" "$WORKER")"
+assert "'git --git-dir=<worker>/.git status' from the mayor cwd is allowed -- read-only" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "git --git-dir=$WORKER/.git status" "$MAIN")"
+assert "'git --git-dir=<worker>/.git --work-tree=<mayor> checkout pr-ref' is refused -- the work tree is the mayor's" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir=$WORKER/.git --work-tree=$MAIN checkout pr-ref" "$WORKER")"
+assert "'git --git-dir=<mayor>/.git --work-tree=<worker> checkout pr-ref' is refused -- the paired git-dir is the mayor's repo" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir=$MAIN/.git --work-tree=$WORKER checkout pr-ref" "$WORKER")"
+
+declare -a WRAPPER2_BLOCKED=(
+  "command -p git checkout pr-ref"
+  "command -p git reset --hard HEAD"
+  "bash --norc -c 'git checkout pr-ref'"
+  "bash --norc --noprofile -c 'git reset --hard HEAD'"
+  "env bash -c 'git checkout pr-ref'"
+  "env FOO=1 bash -c 'git checkout pr-ref'"
+  "env -u X FOO=1 bash --norc -c 'git reset --hard HEAD'"
+)
+for cmd in "${WRAPPER2_BLOCKED[@]}"; do
+  assert "'$cmd' in the mayor checkout is refused -- the wrapper must not hide git" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "$cmd" "$MAIN")"
+done
+declare -a WRAPPER2_ALLOWED=(
+  "command -p git status"
+  "command -p git pull --ff-only"
+  "bash --norc -c 'git log --oneline -3'"
+  "env FOO=1 bash -c 'git fetch origin'"
+  "env bash -c 'git checkout main'"
+)
+for cmd in "${WRAPPER2_ALLOWED[@]}"; do
+  assert "'$cmd' in the mayor checkout is allowed -- legitimate mayor commands must keep working through wrappers" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$MAIN")"
+done
+for cmd in "command -p git checkout pr-ref" "bash --norc -c 'git checkout pr-ref'" "env FOO=1 bash -c 'git checkout pr-ref'"; do
+  assert "'$cmd' inside a worker worktree is allowed -- workers move their own HEAD constantly" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$WORKER")"
+done
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

@@ -141,6 +141,7 @@ pub async fn list_csr<S: Store>(
     State(state): State<AppState<S>>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     // Lookup is infallible for the built-in CSR resource type.
     let meta = lookup(&state, GROUP, VERSION, PLURAL)?;
@@ -217,6 +218,21 @@ pub async fn list_csr<S: Store>(
         items
     };
 
+    let accept = accept_header(&headers);
+    if super::table::wants_table(accept) {
+        let continue_token = resp.continue_key.map(|key| {
+            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
+        });
+        let built = super::table::build_table(GROUP, PLURAL, items);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &super::table::table_api_version(accept),
+            Some(&list_revision.to_string()),
+            continue_token,
+        ))
+        .into_response());
+    }
+
     let body = build_list_response(
         &kind,
         GROUP,
@@ -230,6 +246,13 @@ pub async fn list_csr<S: Store>(
     Ok(Json(body).into_response())
 }
 
+fn accept_header(headers: &HeaderMap) -> &str {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 /// GET /apis/certificates.k8s.io/v1/certificatesigningrequests/{name}
 /// (also used for the /approval subresource GET)
 ///
@@ -240,6 +263,7 @@ pub async fn list_csr<S: Store>(
 pub async fn get_csr<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let key = group_object_key(GROUP, PLURAL, None, &name);
@@ -249,6 +273,20 @@ pub async fn get_csr<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
+
+    let accept = accept_header(&headers);
+    if super::table::wants_table(accept) {
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        let built = super::table::build_table(GROUP, PLURAL, vec![obj]);
+        return Ok(Json(super::table::finalize_table(
+            built,
+            &super::table::table_api_version(accept),
+            Some(&stored.revision.to_string()),
+            None,
+        ))
+        .into_response());
+    }
 
     Ok((
         StatusCode::OK,
@@ -472,6 +510,55 @@ pub(crate) fn authorize_csr_approval<S: Store>(
     )))
 }
 
+fn is_unset(v: &serde_json::Value) -> bool {
+    v.is_null() || v.as_str() == Some("")
+}
+
+/// Upstream `populateConditionTimestamps`: defaults an unset `lastUpdateTime` to `now`, and an
+/// unset `lastTransitionTime` to the old condition's value for the same type+status, else `now`.
+pub(crate) fn populate_condition_timestamps(
+    new: &mut serde_json::Value,
+    old: &serde_json::Value,
+    now: &str,
+) {
+    let old_conditions = csr_conditions(old);
+    let Some(conditions) = new["status"]["conditions"].as_array_mut() else {
+        return;
+    };
+    for c in conditions {
+        if is_unset(&c["lastUpdateTime"]) {
+            c["lastUpdateTime"] = now.into();
+        }
+        if is_unset(&c["lastTransitionTime"]) {
+            let carried = old_conditions
+                .iter()
+                .find(|o| {
+                    o["type"] == c["type"]
+                        && o["status"] == c["status"]
+                        && !is_unset(&o["lastTransitionTime"])
+                })
+                .map(|o| o["lastTransitionTime"].clone());
+            c["lastTransitionTime"] = carried.unwrap_or_else(|| now.into());
+        }
+    }
+}
+
+/// Server-defaulted timestamps are not a client-intended change, so a client that omits them
+/// when echoing the stored conditions is not "changing" anything.
+fn without_timestamps(conditions: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    conditions
+        .iter()
+        .cloned()
+        .map(|mut c| {
+            if let Some(m) = c.as_object_mut() {
+                m.remove("lastUpdateTime");
+                m.remove("lastTransitionTime");
+            }
+            c
+        })
+        .collect()
+}
+
 fn csr_conditions(body: &serde_json::Value) -> Vec<serde_json::Value> {
     body["status"]["conditions"]
         .as_array()
@@ -502,8 +589,15 @@ pub(crate) fn guard_csr_status_write<S: Store>(
 ) -> Result<(), crate::status::StatusError> {
     let old_conditions = csr_conditions(old);
     let mut new_conditions = csr_conditions(new);
-    let changed = csr_certificate(old) != csr_certificate(new) || old_conditions != new_conditions;
+    let changed = csr_certificate(old) != csr_certificate(new)
+        || without_timestamps(&old_conditions) != without_timestamps(&new_conditions);
     if !changed {
+        // Equal modulo timestamps: restore the stored conditions so a caller without `sign`
+        // cannot rewrite timestamps of existing Approved/Denied/Failed conditions.
+        if new["status"]["conditions"].is_array() {
+            new["status"]["conditions"] = serde_json::Value::Array(old_conditions);
+        }
+        populate_condition_timestamps(new, old, &crate::util::utc_now_rfc3339());
         return Ok(());
     }
     let signer = old["spec"]["signerName"].as_str().unwrap_or("");
@@ -547,6 +641,7 @@ pub(crate) fn guard_csr_status_write<S: Store>(
     if new["status"]["conditions"].is_array() {
         new["status"]["conditions"] = serde_json::Value::Array(new_conditions);
     }
+    populate_condition_timestamps(new, old, &crate::util::utc_now_rfc3339());
     Ok(())
 }
 
@@ -818,6 +913,7 @@ mod tests {
         let result = get_csr(
             axum::extract::State(state),
             axum::extract::Path("existing-csr".to_string()),
+            HeaderMap::new(),
         )
         .await;
 
@@ -838,6 +934,7 @@ mod tests {
         let result = get_csr(
             axum::extract::State(state),
             axum::extract::Path("no-such-csr".to_string()),
+            HeaderMap::new(),
         )
         .await;
 
@@ -1312,6 +1409,7 @@ mod tests {
                 timeout_seconds: None,
             }),
             axum::Extension(user),
+            HeaderMap::new(),
         )
         .await;
 
@@ -2642,5 +2740,128 @@ mod tests {
         )
         .await
         .expect("an expired or already-cleaned token must not fail certificate issuance");
+    }
+
+    /// Dropping the carried-over transition time would make a CSR look freshly approved
+    /// every time a signer or controller rewrites its conditions.
+    #[test]
+    fn populate_timestamps_keeps_transition_for_unchanged_type_and_status_but_resets_on_flip() {
+        let old = serde_json::json!({"status": {"conditions": [
+            {"type": "Failed", "status": "True", "lastTransitionTime": "2020-01-01T00:00:00Z"}
+        ]}});
+        let mut new = serde_json::json!({"status": {"conditions": [
+            {"type": "Failed", "status": "True", "lastUpdateTime": "2021-01-01T00:00:00Z"},
+            {"type": "Failed", "status": "False"}
+        ]}});
+        populate_condition_timestamps(&mut new, &old, "2030-01-01T00:00:00Z");
+        let c = &new["status"]["conditions"];
+        assert_eq!(c[0]["lastTransitionTime"], "2020-01-01T00:00:00Z");
+        assert_eq!(c[0]["lastUpdateTime"], "2021-01-01T00:00:00Z");
+        assert_eq!(c[1]["lastTransitionTime"], "2030-01-01T00:00:00Z");
+        assert_eq!(c[1]["lastUpdateTime"], "2030-01-01T00:00:00Z");
+    }
+
+    /// `kubectl get csr [name]` asks for a Table; the dedicated CSR GET/LIST handlers must honour
+    /// it or kubectl falls back to NAME/AGE only.
+    #[tokio::test]
+    async fn get_and_list_csr_return_table_when_kubectl_asks_for_one() {
+        let state = make_state();
+        seed_csr_for_get(&state, "tbl").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v1"),
+        );
+        let body = |resp: Response| async move {
+            let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+        };
+
+        let resp = get_csr(State(state.clone()), Path("tbl".into()), headers.clone())
+            .await
+            .unwrap();
+        let t = body(resp).await;
+        assert_eq!(t["kind"], "Table");
+        assert_eq!(t["columnDefinitions"][5]["name"], "Condition");
+        assert_eq!(t["rows"][0]["cells"][5], "Pending");
+
+        let resp = list_csr(
+            State(state),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            Extension(user("x")),
+            headers,
+        )
+        .await
+        .unwrap();
+        let t = body(resp).await;
+        assert_eq!(t["kind"], "Table");
+        assert_eq!(t["rows"][0]["cells"][0], "tbl");
+    }
+
+    /// Upstream silently preserves existing Approved/Denied conditions on /status; a caller
+    /// without `sign` must not be able to rewrite the recorded approval time.
+    #[tokio::test]
+    async fn status_write_without_sign_cannot_alter_existing_condition_timestamps() {
+        let state = make_state();
+        let ts = "2020-01-01T00:00:00Z";
+        let mk = |ty: &str, t: &str| {
+            serde_json::json!({"type": ty, "status": "True",
+                "lastUpdateTime": t, "lastTransitionTime": t})
+        };
+        seed_csr_with(
+            &state,
+            "ts2",
+            CLIENT_SIGNER,
+            serde_json::json!({"conditions": [mk("Approved", ts), mk("Failed", ts)]}),
+        )
+        .await;
+        let nobody = user("nobody");
+        let forged = "2030-01-01T00:00:00Z";
+        status_put(
+            &state,
+            &nobody,
+            "ts2",
+            serde_json::json!({"conditions": [mk("Approved", forged), mk("Failed", forged)]}),
+        )
+        .await
+        .expect("timestamp-only write is a no-op, not an error, as upstream");
+        let c = &stored_csr(&state, "ts2").await["status"]["conditions"];
+        for i in 0..2 {
+            assert_eq!(c[i]["lastTransitionTime"], ts, "{c}");
+            assert_eq!(c[i]["lastUpdateTime"], ts, "{c}");
+        }
+    }
+
+    /// A signer adding a Failed condition through /status must get timestamps, like /approval.
+    #[tokio::test]
+    async fn status_write_adding_failed_condition_defaults_timestamps() {
+        let state = make_state();
+        let who = user("signer");
+        crate::handlers::test_support::grant_signer_verb(&state, "signer", "sign", CLIENT_SIGNER);
+        seed_csr_with(&state, "ts1", CLIENT_SIGNER, serde_json::json!({})).await;
+        status_put(
+            &state,
+            &who,
+            "ts1",
+            serde_json::json!({"conditions": [{"type": "Failed", "status": "True"}]}),
+        )
+        .await
+        .expect("status write");
+        let s = stored_csr(&state, "ts1").await;
+        let c = &s["status"]["conditions"][0];
+        assert!(c["lastUpdateTime"].is_string(), "{c}");
+        assert!(c["lastTransitionTime"].is_string(), "{c}");
     }
 }
