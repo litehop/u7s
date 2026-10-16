@@ -4878,6 +4878,100 @@ mod tests {
         );
     }
 
+    async fn install_widget_crd(state: &AppState<u7s_store::SqliteStore>, group: &str) -> String {
+        let name = format!("widgets.{group}");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(&name, group, "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+        name
+    }
+
+    async fn delete_crd_ok(state: &AppState<u7s_store::SqliteStore>, name: &str) {
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
+    }
+
+    /// A deleted CRD's served versions can never be requested again, so conversion-cache
+    /// entries targeting them leak for the life of the process if not swept.
+    ///
+    /// Fails on revert: without `invalidate_by_target_api_versions` in `purge_crd` the entry
+    /// stays cached.
+    #[tokio::test]
+    async fn delete_crd_evicts_cr_conversion_cache_entries_for_its_target_api_versions() {
+        let state = make_state();
+        let group = "conv.example.com";
+        let name = install_widget_crd(&state, group).await;
+        let cache_key = ("42".to_string(), format!("{group}/v1"));
+        state.cr_conversion_cache.insert(
+            cache_key.clone(),
+            &serde_json::json!({ "apiVersion": format!("{group}/v1"), "kind": "Widget" }),
+        );
+        assert!(
+            state.cr_conversion_cache.contains(&cache_key),
+            "precondition: the converted body must be cached before the CRD delete"
+        );
+
+        delete_crd_ok(&state, &name).await;
+
+        assert!(
+            !state.cr_conversion_cache.contains(&cache_key),
+            "CRD delete must evict conversion-cache entries targeting its served versions"
+        );
+    }
+
+    /// Aggregated /apis discovery is served from a cache with no TTL, refreshed only by an
+    /// explicit call. A stale entry keeps advertising the deleted group, so KCM's namespace
+    /// controller keeps rediscovering it and the namespace drain never finishes.
+    ///
+    /// Fails on revert: without `refresh_discovery_cache` in `purge_crd` the group stays listed.
+    #[tokio::test]
+    async fn delete_crd_refreshes_discovery_so_the_deleted_group_is_no_longer_listed() {
+        let state = make_state();
+        let group = "disc.example.com";
+        let name = install_widget_crd(&state, group).await;
+        let list_groups = || async {
+            crate::handlers::discovery::build_aggregated_discovery(
+                &state,
+                "v2beta1",
+                false,
+                &crate::auth::UserInfo::default(),
+                "/apis",
+            )
+            .await
+        };
+        assert!(
+            list_groups()
+                .await
+                .items
+                .iter()
+                .any(|g| g.metadata.name == group),
+            "precondition: the CRD's group must be in discovery right after creation"
+        );
+
+        delete_crd_ok(&state, &name).await;
+
+        assert!(
+            !list_groups()
+                .await
+                .items
+                .iter()
+                .any(|g| g.metadata.name == group),
+            "the deleted CRD's group must disappear from discovery immediately"
+        );
+    }
+
     /// A connected CR watcher must see its objects DELETED when the CRD goes away, and the
     /// CRD's CR watch-ring shard must be reclaimed while that watcher is still attached —
     /// otherwise every deleted CRD leaks ring memory for as long as any client stays connected.
@@ -5479,6 +5573,41 @@ mod ratchet_tests {
             stored_json(&state, &store_key(FIN_CRD)).await.is_none(),
             "CRD must complete deletion once no instances remain"
         );
+    }
+
+    /// `find_crd` caches a Terminating CRD's context too, so a CR request during the window
+    /// between soft-delete and purge re-warms the key that soft-delete already evicted; a
+    /// missed eviction at purge then keeps serving the deleted CRD's schema instead of 410.
+    ///
+    /// Fails on revert: without `evict_cr_context_cache` in `purge_crd`, the final `find_crd`
+    /// returns the re-cached context instead of 410 Gone.
+    #[tokio::test]
+    async fn purge_evicts_context_recached_while_crd_was_terminating() {
+        let state = make_state();
+        create_fin_crd(&state).await;
+        let held = put_widget(&state, "held", &["example.com/hold"]).await;
+        delete_fin_crd(&state).await;
+
+        let ctx = crate::handlers::cr::find_crd(&state, "fin.io", "v1", "widgets")
+            .await
+            .expect("a Terminating CRD is still found, re-warming cr_context_cache");
+        assert!(
+            ctx.terminating,
+            "precondition: the cached CRD is Terminating"
+        );
+
+        state.store.delete(&held, None).await.unwrap();
+        finalize_crd(&state, FIN_CRD).await;
+        assert!(
+            stored_json(&state, &store_key(FIN_CRD)).await.is_none(),
+            "precondition: the CRD must be purged"
+        );
+
+        let err = match crate::handlers::cr::find_crd(&state, "fin.io", "v1", "widgets").await {
+            Ok(_) => panic!("find_crd must not serve a stale CrContext for a purged CRD"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::GONE);
     }
 
     #[tokio::test]
