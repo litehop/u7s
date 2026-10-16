@@ -26,10 +26,11 @@ pub(crate) struct ServeLimits {
     /// 1024 connections at an unmeasured 50-100 KiB each (rustls + hyper buffers) is
     /// ~50-100 MiB on a 1 GiB host, and stays under the raised RLIMIT_NOFILE.
     pub max_connections: usize,
-    /// Connections one non-loopback source IP may hold, so a single client or
-    /// slowloris burst cannot take every slot. Loopback is exempt: the control-plane
-    /// components and the VM port-forward all arrive from 127.0.0.1. Nodes behind one
-    /// NAT address share this budget.
+    /// Connections one non-loopback source may hold (per IPv4 address, per IPv6 /64),
+    /// so a single client or slowloris burst cannot take every slot. Loopback is
+    /// exempt: the control-plane components and the VM port-forward all arrive from
+    /// 127.0.0.1. Trade-off: nodes behind one NAT address (or in one IPv6 /64) share
+    /// this budget; there is no override.
     pub max_connections_per_ip: usize,
     /// Upper bound on the TLS handshake (Go's net/http has no default; 10 s is
     /// generous for the slowest legitimate client).
@@ -92,6 +93,11 @@ impl PerIpLimiter {
         if ip.is_loopback() {
             return Ok(None);
         }
+        // A single IPv6 host controls a whole /64, so per-address counting is no limit.
+        let ip = match ip {
+            IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
+            v4 => v4,
+        };
         let mut counts = self.counts.lock().unwrap();
         let n = counts.entry(ip).or_insert(0);
         if *n >= self.max {
@@ -132,6 +138,21 @@ impl InFlight {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         (self.0).0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// Waits for a connection that was sent GOAWAY to finish. Streams that raced the idle
+/// deadline run to completion (as in Go's http2); only a connection that has had
+/// nothing in flight for `window` is abandoned, so an unresponsive peer cannot hold
+/// the slot.
+async fn drain_after_goaway(
+    conn: impl Future + Unpin,
+    in_flight: tokio::sync::watch::Receiver<usize>,
+    window: Duration,
+) {
+    tokio::select! {
+        _ = conn => {}
+        () = idle_for(in_flight, window) => {}
     }
 }
 
@@ -306,6 +327,7 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
                     std::future::pending::<()>().await;
                 }
             };
+            let drain_rx = in_flight_rx.clone();
             // HTTP/1 idleness is already bounded by header_read_timeout.
             let idle_deadline = async {
                 if is_h2 {
@@ -326,7 +348,7 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
                 () = idle_deadline => {
                     tracing::debug!("closing idle HTTP/2 connection");
                     conn.as_mut().graceful_shutdown();
-                    let _ = tokio::time::timeout(limits.header_read_timeout, &mut conn).await;
+                    drain_after_goaway(&mut conn, drain_rx, limits.header_read_timeout).await;
                 }
             }
         });
@@ -788,6 +810,61 @@ mod tests {
             served,
             "closing a connection must free its per-IP slot or the client is locked out for good"
         );
+    }
+
+    #[test]
+    fn ipv6_hosts_in_one_slash_64_share_a_cap_so_address_rotation_cannot_evade_it() {
+        let limiter = PerIpLimiter::new(2);
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let other_prefix: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        let _s1 = limiter.acquire(a).unwrap();
+        let _s2 = limiter.acquire(b).unwrap();
+        assert!(
+            limiter
+                .acquire("2001:db8:1:2::77".parse().unwrap())
+                .is_err(),
+            "a client with a /64 can rotate addresses; the cap must count the whole prefix"
+        );
+        assert!(
+            limiter.acquire(other_prefix).is_ok(),
+            "a different /64 is a different client"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_that_raced_the_idle_deadline_survives_goaway_drain() {
+        let window = Duration::from_secs(10);
+        let (tx, rx) = tokio::sync::watch::channel(1usize);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut drain = tokio::spawn(drain_after_goaway(done_rx, rx, window));
+
+        tokio::time::sleep(window * 5).await;
+        assert!(
+            !drain.is_finished(),
+            "a watch that raced the idle deadline must not be cut once GOAWAY is sent"
+        );
+
+        tx.send_modify(|n| *n = 0);
+        tokio::time::sleep(window + Duration::from_millis(1)).await;
+        assert!(
+            drain.is_finished(),
+            "once nothing is in flight an unresponsive peer must not hold the slot past the window"
+        );
+        let _ = (&mut drain).await;
+        drop(done_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_closing_ends_the_drain_immediately() {
+        let (_tx, rx) = tokio::sync::watch::channel(1usize);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let drain = tokio::spawn(drain_after_goaway(done_rx, rx, Duration::from_secs(10)));
+        done_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(1), drain)
+            .await
+            .expect("drain must end as soon as the connection does")
+            .unwrap();
     }
 
     #[test]
