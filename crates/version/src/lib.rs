@@ -61,7 +61,11 @@ pub fn platform() -> String {
         "aarch64" => "arm64",
         other => other,
     };
-    format!("{}/{arch}", std::env::consts::OS)
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    format!("{os}/{arch}")
 }
 
 #[cfg(test)]
@@ -124,7 +128,7 @@ mod tests {
     fn platform_uses_go_arch_names_because_kubectl_prints_it_verbatim() {
         let p = platform();
         let (os, arch) = p.split_once('/').unwrap();
-        assert_eq!(os, std::env::consts::OS);
+        assert_ne!(os, "macos", "Go calls it darwin");
         assert!(!arch.contains("x86_64") && !arch.contains("aarch64"), "{p}");
     }
 }
