@@ -1158,7 +1158,7 @@ write_join_runner() {
     echo 'sleep() { :; }'
     echo 'ensure_jq() { :; }'
     grep '^JOIN_TOKEN_TTL_SECONDS=' "$INSTALL"
-    for fn in b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
+    for fn in wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1213,8 +1213,70 @@ assert_false "install.sh no longer passes --token-auth-file to the apiserver uni
   grep -q -- '--token-auth-file \$STATE_DIR' "$INSTALL"
 assert_false "no join artifact exists any more: nothing in install.sh packs a serving private key into a base64(JSON) blob passed on a command line" \
   grep -qE 'servingKey|artifact' "$INSTALL"
-assert_true "the joiner generates its own kubelet serving key locally and asks the CA for a cert via a kubelet-serving CSR (the private key never leaves the node)" \
-  bash -c 'awk "/^request_serving_cert\(\) \{/,/^\}/" "$1" | grep -q "ecparam -name prime256v1 -genkey -noout -out \"\$STATE_DIR/kubelet-serving.key\"" && awk "/^request_serving_cert\(\) \{/,/^\}/" "$1" | grep -q "kubernetes.io/kubelet-serving"' _ "$INSTALL"
+assert_false "the join script no longer generates a serving key/CSR or asks an operator to approve one: the approver checks SANs against the Node, which only exists after the kubelet starts, so a pre-start CSR deadlocks the join" \
+  grep -qE 'request_serving_cert|join-serving|certificate approve' "$INSTALL"
+
+# Worker kubelet config: serverTLSBootstrap and no static serving cert; the
+# control-plane kubelet keeps its minted cert.
+WORKER_CFG_RUNNER="$JOIN_WORK/cfg.sh"
+{
+  echo 'STATE_DIR="$1"'
+  echo 'systemctl() { return 3; }'
+  awk '/^write_kubelet_config_yaml\(\) \{$/,/^}$/' "$INSTALL"
+  echo 'write_kubelet_config_yaml "$2"'
+} > "$WORKER_CFG_RUNNER"
+mkdir -p "$JOIN_WORK/cfg-worker" "$JOIN_WORK/cfg-cp"
+bash "$WORKER_CFG_RUNNER" "$JOIN_WORK/cfg-worker" 1
+bash "$WORKER_CFG_RUNNER" "$JOIN_WORK/cfg-cp" 0
+assert_true "a worker's kubelet sets serverTLSBootstrap so it files its own serving CSR once registered (the join cannot request one before the Node exists)" \
+  grep -qxF 'serverTLSBootstrap: true' "$JOIN_WORK/cfg-worker/kubelet-config.yaml"
+assert_false "a worker's kubelet config has no tlsCertFile/tlsPrivateKeyFile (a missing file stops the kubelet from starting, and a stale one would be served instead of the issued cert)" \
+  grep -qE '^tls(Cert|PrivateKey)File:' "$JOIN_WORK/cfg-worker/kubelet-config.yaml"
+assert_true "the control-plane kubelet keeps its minted CA-signed serving cert" \
+  grep -qxF "tlsCertFile: $JOIN_WORK/cfg-cp/kubelet-serving.crt" "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
+assert_false "the control-plane kubelet does not enable serverTLSBootstrap (its CSR would sit beside the minted cert)" \
+  grep -q '^serverTLSBootstrap' "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
+FLAGS_RUNNER="$JOIN_WORK/flags.sh"
+{
+  awk '/^kubelet_round2_flags\(\) \{$/,/^}$/' "$INSTALL"
+  echo 'kubelet_round2_flags "$@"'
+} > "$FLAGS_RUNNER"
+assert_false "a worker must not disable RotateKubeletServerCertificate, which serverTLSBootstrap needs" \
+  bash -c 'bash "$1" 1.37 worker | grep -q RotateKubeletServerCertificate' _ "$FLAGS_RUNNER"
+assert_true "the control-plane kubelet still disables RotateKubeletServerCertificate (unchanged)" \
+  bash -c 'bash "$1" 1.37 | grep -q RotateKubeletServerCertificate=false' _ "$FLAGS_RUNNER"
+
+# The join succeeds only when the Node is Ready AND the kubelet-filed serving
+# CSR is approved and issued.
+WAIT_RUNNER="$JOIN_WORK/wait.sh"
+write_join_runner "$WAIT_RUNNER" '
+NODE_NAME=n1
+sleep() { :; }
+curl() {
+  case "$*" in
+    *"/api/v1/nodes/n1"*) printf "%s" "$NODE_JSON" ;;
+    *certificatesigningrequests*) printf "%s" "$CSR_JSON" ;;
+  esac
+}
+wait_for_joined_node'
+READY_NODE='{"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+NOTREADY_NODE='{"status":{"conditions":[{"type":"Ready","status":"False"}]}}'
+ISSUED_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
+PENDING_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"status":{}}]}'
+CLIENT_ONLY_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kube-apiserver-client-kubelet","username":"system:node:n1"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
+run_wait() { NODE_JSON="$1" CSR_JSON="$2" bash "$WAIT_RUNNER" "$JOIN_WORK" 2>&1; }
+ok_status=0; run_wait "$READY_NODE" "$ISSUED_CSR" >/dev/null || ok_status=$?
+assert "join succeeds when the Node is Ready and its kubelet-serving CSR is approved and issued" \
+  "$([ "$ok_status" -eq 0 ] && echo 1 || echo 0)"
+pend_status=0; pend_out="$(run_wait "$READY_NODE" "$PENDING_CSR")" || pend_status=$?
+assert "join fails loud with recovery text when the serving CSR stays Pending (logs/exec would be broken on a node reported as joined)" \
+  "$([ "$pend_status" -ne 0 ] && printf '%s' "$pend_out" | grep -q 'mint a new token' && echo 1 || echo 0)"
+nr_status=0; run_wait "$NOTREADY_NODE" "$ISSUED_CSR" >/dev/null || nr_status=$?
+assert "join fails when the Node never becomes Ready even though the serving cert was issued" \
+  "$([ "$nr_status" -ne 0 ] && echo 1 || echo 0)"
+cl_status=0; run_wait "$READY_NODE" "$CLIENT_ONLY_CSR" >/dev/null || cl_status=$?
+assert "the issued client-cert CSR does not count as the serving certificate" \
+  "$([ "$cl_status" -ne 0 ] && echo 1 || echo 0)"
 
 # Token input: flag, "-" and absent all work; stdin keeps the secret off argv.
 TOKEN_RUNNER="$JOIN_WORK/token.sh"

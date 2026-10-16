@@ -278,10 +278,12 @@ stage_binaries() {
 # otherwise /etc/resolv.conf. "" is wrong: dnsPolicy Default pods (CoreDNS)
 # then get nameserver 127.0.0.1 and CoreDNS forwards to itself.
 #
-# tlsCertFile/tlsPrivateKeyFile -- a serving cert signed by the cluster CA,
-# minted by kubelet.service's ExecStartPre or issued by the join's serving CSR.
-# Without it kubelet self-signs and the apiserver's kubelet-client rejects it,
-# breaking kubectl logs/exec.
+# tlsCertFile/tlsPrivateKeyFile (control plane) -- a serving cert signed by the
+# cluster CA, minted by kubelet.service's ExecStartPre. Without it kubelet
+# self-signs and the apiserver's kubelet-client rejects it, breaking kubectl
+# logs/exec. A worker (argument 1) sets serverTLSBootstrap instead: the kubelet
+# files its own kubelet-serving CSR once its Node exists, and the apiserver's
+# approver checks the SANs against that Node.
 #
 # clientCAFile -- lets kubelet authenticate the apiserver's own client cert
 # rather than treating proxied requests as anonymous, which its container-log
@@ -295,9 +297,16 @@ stage_binaries() {
 # --cert-dir CLI flag on kubelet.service's ExecStart -- see the flag there
 # for why it must live under $STATE_DIR.
 write_kubelet_config_yaml() {
-  local resolv_conf=/etc/resolv.conf
+  local worker="${1:-0}" resolv_conf=/etc/resolv.conf
   if systemctl is-active --quiet systemd-resolved; then
     resolv_conf=/run/systemd/resolve/resolv.conf
+  fi
+  # A worker's kubelet files its own kubelet-serving CSR once its Node exists
+  # (serverTLSBootstrap); the control-plane kubelet keeps the minted cert file.
+  local serving="tlsCertFile: $STATE_DIR/kubelet-serving.crt
+tlsPrivateKeyFile: $STATE_DIR/kubelet-serving.key"
+  if [ "$worker" -eq 1 ]; then
+    serving="serverTLSBootstrap: true"
   fi
   cat > "$STATE_DIR/kubelet-config.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -310,8 +319,7 @@ staticPodPath: /etc/u7s/static-pods
 clusterDNS:
   - 10.96.0.10
 clusterDomain: cluster.local
-tlsCertFile: $STATE_DIR/kubelet-serving.crt
-tlsPrivateKeyFile: $STATE_DIR/kubelet-serving.key
+$serving
 authentication:
   x509:
     clientCAFile: $STATE_DIR/ca.pem
@@ -362,8 +370,6 @@ mint_join_token() {
   echo "history; install.sh prompts for the token with echo off (or reads it from piped stdin):"
   echo "  install.sh --join $server \\"
   echo "    --ca-cert-hash sha256:$ca_hash --tarball <path> --node-name <name> [--iface <iface>]"
-  echo "Then approve the node's kubelet serving certificate (no auto-approver yet):"
-  echo "  kubectl certificate approve join-serving-<name>"
 }
 
 # base64url without padding, from stdin.
@@ -469,9 +475,9 @@ read_join_token() {
 # usages digital signature/key encipherment/client auth) and submits it under
 # the bootstrap token. KCM auto-approves and signs it -- no manual step -- and
 # the result becomes kubelet's own x509 identity, not a shared admin one. All
-# private keys are generated here and never leave this node. The kubelet
-# serving cert follows via a kubernetes.io/kubelet-serving CSR submitted with
-# that new identity; no KCM controller approves those, so the operator does.
+# private keys are generated here and never leave this node. The kubelet's
+# serving cert is requested by the kubelet itself (serverTLSBootstrap) once its
+# Node exists; wait_for_joined_node checks it was approved and issued.
 join_cluster() {
   if [ -z "$CA_CERT_HASH" ]; then
     echo "error: --join requires --ca-cert-hash sha256:<hash> (printed by --mint-join-token)" >&2
@@ -570,49 +576,35 @@ users:
 EOF
   chmod 600 "$STATE_DIR/kubeconfig"
   echo "Join CSR approved and signed -- kubelet's dedicated x509 kubeconfig written to $STATE_DIR/kubeconfig"
-
-  request_serving_cert
 }
 
-# The kubelet serving cert must chain to the cluster CA or the apiserver's
-# kubelet-client rejects it (kubectl logs/exec -> BadGateway). Own key, own
-# CSR, submitted as the freshly issued node identity.
-request_serving_cert() {
-  openssl ecparam -name prime256v1 -genkey -noout -out "$STATE_DIR/kubelet-serving.key"
-  chmod 600 "$STATE_DIR/kubelet-serving.key"
-  openssl req -new -key "$STATE_DIR/kubelet-serving.key" \
-    -subj "/O=system:nodes/CN=system:node:$NODE_NAME" \
-    -addext "subjectAltName=IP:$IFACE_IP,DNS:$NODE_NAME" \
-    -out "$STATE_DIR/kubelet-serving.csr"
-
-  local csr_name="join-serving-$NODE_NAME" csr_body
-  csr_body="$(jq -n -c \
-    --arg name "$csr_name" \
-    --arg request "$(base64 -w0 "$STATE_DIR/kubelet-serving.csr")" \
-    '{apiVersion: "certificates.k8s.io/v1", kind: "CertificateSigningRequest",
-      metadata: {name: $name},
-      spec: {request: $request,
-             signerName: "kubernetes.io/kubelet-serving",
-             usages: ["digital signature", "key encipherment", "server auth"]}}')"
+# Success condition of a join, checked as the new node identity after kubelet
+# started: the Node is Ready and the kubelet's own kubelet-serving CSR
+# (serverTLSBootstrap) is Approved and Issued. The apiserver's approver only
+# approves once the Node's addresses exist, so this can only be waited for
+# after the kubelet registered -- never requested up front.
+wait_for_joined_node() {
   local node_auth=(--cacert "$STATE_DIR/ca.pem" --cert "$STATE_DIR/kubelet-client.crt" --key "$STATE_DIR/kubelet-client.key")
-
-  echo "Submitting kubelet serving CSR '$csr_name'..."
-  curl -fsSL "${node_auth[@]}" -H "Content-Type: application/json" \
-    -X POST "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" \
-    -d "$csr_body" >/dev/null
-  echo "Waiting up to 5 min for an operator to approve it: kubectl certificate approve $csr_name"
-  local resp cert_b64=""
+  local ready="" serving="" resp
+  echo "Waiting up to 5 min for node $NODE_NAME to be Ready with an issued kubelet serving certificate..."
   for _ in $(seq 1 150); do
-    resp="$(curl -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests/$csr_name" 2>/dev/null || true)"
-    cert_b64="$(printf '%s' "$resp" | jq -r '.status.certificate // empty' 2>/dev/null || true)"
-    [ -n "$cert_b64" ] && break
+    if [ -z "$ready" ]; then
+      resp="$(curl -fsSL "${node_auth[@]}" "$JOIN_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
+      ready="$(printf '%s' "$resp" | jq -r '.status.conditions[]? | select(.type == "Ready" and .status == "True") | .type' 2>/dev/null || true)"
+    fi
+    if [ -z "$serving" ]; then
+      resp="$(curl -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" 2>/dev/null || true)"
+      serving="$(printf '%s' "$resp" | jq -r --arg u "system:node:$NODE_NAME" '[.items[]? | select(.spec.signerName == "kubernetes.io/kubelet-serving" and .spec.username == $u and ((.status.certificate // "") != "") and any(.status.conditions[]?; .type == "Approved"))] | length' 2>/dev/null || true)"
+      [ "${serving:-0}" -ge 1 ] 2>/dev/null || serving=""
+    fi
+    if [ -n "$ready" ] && [ -n "$serving" ]; then
+      echo "Node $NODE_NAME is Ready and its kubelet serving certificate was approved and issued."
+      return 0
+    fi
     sleep 2
   done
-  if [ -z "$cert_b64" ]; then
-    echo "error: kubelet serving CSR '$csr_name' was not approved within 5 min. The join token is already consumed and this node holds a partial join. To retry: on the control plane run 'kubectl delete csr $csr_name' and mint a new token (install.sh --mint-join-token); here run 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
-    exit 1
-  fi
-  printf '%s' "$cert_b64" | base64 -d > "$STATE_DIR/kubelet-serving.crt"
+  echo "error: after 5 min node $NODE_NAME Ready=$([ -n "$ready" ] && echo yes || echo no) and its kubelet serving CSR approved+issued=$([ -n "$serving" ] && echo yes || echo no). The join token is already consumed and this node holds a valid client identity; kubelet keeps retrying. Check 'journalctl -u kubelet' here and 'kubectl get csr' on the control plane (a Pending kubelet-serving CSR means the approver rejected its SANs against the Node's addresses; 'kubectl certificate describe' it, or approve it by hand). To start over: on the control plane 'kubectl delete node $NODE_NAME' and mint a new token (install.sh --mint-join-token); here 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
+  return 1
 }
 
 if [ "$MINT_JOIN_TOKEN" -eq 1 ]; then
@@ -915,7 +907,7 @@ NODE_NAME="$NODE_NAME"
 IFACE="$IFACE"
 EOF
 
-write_kubelet_config_yaml
+write_kubelet_config_yaml "$WORKER_MODE"
 
 # Round-2 kubelet tuning, shared by both kubelet.service blocks
 # below. --max-pods and ConfigMapAndSecretChangeDetectionStrategy are
@@ -963,7 +955,13 @@ write_kubelet_config_yaml
 # Takes the kubelet minor (e.g. "v1.37" or "1.37") and prints the flag string.
 kubelet_round2_flags() {
   local minor="${1#*.}"
-  local flags="--feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false"
+  local flags="--feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false"
+  # A worker's kubelet requests its own serving cert (serverTLSBootstrap), which
+  # needs RotateKubeletServerCertificate on; the control-plane kubelet still
+  # uses the CA-signed cert minted at start.
+  if [ "${2:-}" != worker ]; then
+    flags="$flags,RotateKubeletServerCertificate=false"
+  fi
   # The two gates below only exist from 1.37; an older kubelet rejects them as
   # unrecognized, so they are appended only when the staged kubelet is >= 1.37.
   if [ "$minor" -ge 37 ]; then
@@ -971,7 +969,11 @@ kubelet_round2_flags() {
   fi
   printf '%s' "$flags"
 }
-KUBELET_ROUND2_FLAGS="$(kubelet_round2_flags "$KUBE_MINOR")"
+if [ "$WORKER_MODE" -eq 1 ]; then
+  KUBELET_ROUND2_FLAGS="$(kubelet_round2_flags "$KUBE_MINOR" worker)"
+else
+  KUBELET_ROUND2_FLAGS="$(kubelet_round2_flags "$KUBE_MINOR")"
+fi
 
 if [ "$WORKER_MODE" -eq 1 ]; then
   # --- Join an existing cluster via the CSR API, or upgrade an
@@ -1021,6 +1023,10 @@ EOF
   systemctl daemon-reload
   systemctl enable kubelet.service
   systemctl restart kubelet.service
+
+  if [ "$JOIN_MODE" -eq 1 ]; then
+    wait_for_joined_node
+  fi
 
   echo ""
   if [ "$JOIN_MODE" -eq 1 ]; then
