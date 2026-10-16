@@ -33,6 +33,7 @@ mod rbac;
 mod rbac_gen_adapter;
 mod resource_gen_adapter;
 mod sa_sig_cache;
+mod serve;
 mod service_alloc;
 mod service_resolver;
 mod state;
@@ -54,13 +55,11 @@ use axum::{
 };
 use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
-use tower_service::Service;
 use u7s_store::SqliteStore;
 
 pub use admission::{build_review, AdmissionContext, AdmissionReview};
 pub use args::Args;
-use auth::{AuthLayer, PeerCertificate};
+use auth::AuthLayer;
 use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
 pub use metrics::record_request_total;
@@ -4472,6 +4471,14 @@ fn configure_accepted_socket(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::warn!("failed to set TCP_NODELAY on accepted connection: {e}");
     }
+    // Reap half-open peers (vanished clients, dropped NAT mappings) that would
+    // otherwise hold a connection slot and descriptor forever.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(15));
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!("failed to set TCP keepalive on accepted connection: {e}");
+    }
 }
 
 async fn serve_tls(
@@ -4479,71 +4486,8 @@ async fn serve_tls(
     app: Router,
     server_config: Arc<rustls::ServerConfig>,
 ) -> anyhow::Result<()> {
-    let acceptor = TlsAcceptor::from(server_config);
-    // Auto-negotiating builder: dispatches each connection to HTTP/1.1 or HTTP/2 by
-    // peeking at the first bytes for the HTTP/2 connection preface. Clients that
-    // saw h2 win ALPN (rustls ServerConfig.alpn_protocols in tls.rs) send that
-    // preface immediately, so in practice ALPN is what steers this — but the
-    // dispatch itself works from the wire, independent of the ALPN result.
-    let conn_builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     tracing::info!("listening on {}", listener.local_addr()?);
-
-    loop {
-        let (tcp_stream, _peer) = listener.accept().await?;
-        configure_accepted_socket(&tcp_stream);
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        let conn_builder = conn_builder.clone();
-
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(tcp_stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("TLS accept error: {e}");
-                    return;
-                }
-            };
-
-            // Extract the peer certificate once per connection, then share it
-            // across all requests on this connection via an Arc.
-            let peer_cert: Arc<Option<PeerCertificate>> = Arc::new(
-                tls_stream
-                    .get_ref()
-                    .1
-                    .peer_certificates()
-                    .and_then(|certs| certs.first())
-                    .map(|c| PeerCertificate(c.as_ref().to_vec())),
-            );
-
-            let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let service = hyper::service::service_fn(move |mut req: axum::http::Request<_>| {
-                let peer_cert = Arc::clone(&peer_cert);
-                let mut app = app.clone();
-                async move {
-                    if let Some(cert) = peer_cert.as_ref().as_ref() {
-                        req.extensions_mut().insert(cert.clone());
-                    }
-                    Ok::<_, std::convert::Infallible>(app.call(req).await.unwrap())
-                }
-            });
-            // serve_connection_with_upgrades() preserves WebSocket-upgrade support for
-            // connections that negotiate HTTP/1.1 (exec/attach/portforward use
-            // `Connection: Upgrade`, which has no HTTP/2 equivalent wired up here).
-            // Without it, hyper sends the 101 Switching Protocols response but never
-            // hands the connection off to the upgrade handler — the on_upgrade callback
-            // never runs, the splice never starts, and kubectl times out with
-            // "unexpected output from server". Connections that negotiate HTTP/2
-            // (kubelet's watch reflectors) skip this path entirely and get hyper's
-            // native h2 stream multiplexing instead of one TCP connection per watch.
-            if let Err(e) = conn_builder
-                .serve_connection_with_upgrades(io, service)
-                .await
-            {
-                tracing::debug!("connection error: {e}");
-            }
-        });
-    }
+    serve::serve_tls_with(listener, app, server_config, serve::ServeLimits::default()).await
 }
 
 #[cfg(test)]
