@@ -1391,16 +1391,18 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
 /// binding already exists from a previous version of this apiserver that bound it to the
 /// whole `system:nodes` group.
 ///
-/// Every other seeded RBAC object is create-only (see `seed_rbac`'s `put!` macro doc) so an
-/// operator's own edits survive a restart — but `subjects` on THIS binding is the actual
+/// Every other seeded RBAC object is only reconciled additively (see `seed_rbac`'s `put!` macro
+/// doc), which never removes subjects — but `subjects` on THIS binding is the actual
 /// security boundary the Node-authorization-mode fix depends on. `put!` alone only seeds an
 /// empty-subjects binding on a FRESH store; an apiserver upgraded against an EXISTING store
 /// would otherwise keep the old subject-full binding forever, silently reopening the P0 this
 /// fix closes (any node reads every secret in the cluster) on every upgraded deployment.
 /// Matches upstream bootstrappolicy's own "tightening reconciliation" comment for this exact
-/// binding. Deliberately narrow: only `subjects` is touched, and only when non-empty —
-/// `roleRef`/`metadata` and every other seeded object are left to `put!`'s normal
-/// create-only semantics.
+/// binding. Deliberately narrow: only `subjects` is touched, and only when non-empty.
+///
+/// Unlike upstream, this runs even when the binding carries `autoupdate: "false"`: nodes are
+/// authorized by the Node authorizer, not this binding, so no legitimate operator opt-out
+/// needs subjects here, and honoring the opt-out would reopen the all-nodes-read-all-secrets hole.
 async fn reconcile_system_node_binding_subjects(
     store: &SqliteStore,
     key: &str,
@@ -5086,6 +5088,40 @@ mod tests {
         // roleRef must be untouched by the reconciliation — only subjects is a security
         // boundary here; clobbering roleRef would be a different, unrelated bug.
         assert_eq!(crb["roleRef"]["name"].as_str(), Some("system:node"));
+    }
+
+    #[tokio::test]
+    async fn system_node_binding_subjects_are_cleared_even_with_autoupdate_false_to_keep_all_nodes_from_reading_all_secrets(
+    ) {
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = make_store();
+        let key = keys::group_object_key(GROUP, "clusterrolebindings", None, "system:node");
+        let opted_out = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {
+                "name": "system:node",
+                "uid": "00000000-0000-0000-0000-000000000011",
+                "annotations": { "rbac.authorization.kubernetes.io/autoupdate": "false" }
+            },
+            "subjects": [{ "kind": "Group", "apiGroup": GROUP, "name": "system:nodes" }],
+            "roleRef": { "apiGroup": GROUP, "kind": "ClusterRole", "name": "system:node" }
+        });
+        store
+            .put(&key, bytes::Bytes::from(opted_out.to_string()), None)
+            .await
+            .unwrap();
+
+        seed_rbac(&store).await.unwrap();
+
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let crb: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            crb["subjects"],
+            serde_json::json!([]),
+            "autoupdate=false must not preserve a system:nodes grant on system:node: it would \
+             let every node read every secret, and nodes are authorized by the Node authorizer"
+        );
     }
 
     #[tokio::test]
