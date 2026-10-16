@@ -19,6 +19,7 @@ mod coord_gen_adapter;
 mod core_gen_adapter;
 mod csr_approver;
 mod field_manager;
+mod go_unicode;
 pub mod handlers;
 mod inflight;
 mod keys;

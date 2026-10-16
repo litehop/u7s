@@ -197,18 +197,21 @@ impl Status {
         )
     }
 
-    /// Upstream's 422 for failed `ValidatePatchOptions`: one `(field, reason, body)` per
-    /// error, aggregated as `[a, b]` when there are several.
-    pub fn invalid_patch_options(errs: &[(String, &'static str, String)]) -> StatusError {
+    /// Upstream's 422 for failed `Validate{Create,Update,Patch}Options` (`kind` is e.g.
+    /// `CreateOptions`): one `(field, reason, body)` per error, aggregated as `[a, b]` when
+    /// there are several.
+    pub fn invalid_options(
+        kind: &'static str,
+        errs: &[(String, &'static str, String)],
+    ) -> StatusError {
         let lines: Vec<String> = errs.iter().map(|(f, _, b)| format!("{f}: {b}")).collect();
         let agg = if lines.len() == 1 {
             lines[0].clone()
         } else {
             format!("[{}]", lines.join(", "))
         };
-        let mut e = Status::unprocessable_entity(format!(
-            "PatchOptions.meta.k8s.io \"\" is invalid: {agg}"
-        ));
+        let mut e =
+            Status::unprocessable_entity(format!("{kind}.meta.k8s.io \"\" is invalid: {agg}"));
         let causes: Vec<_> = errs
             .iter()
             .map(|(field, reason, body)| {
@@ -217,7 +220,7 @@ impl Status {
             .collect();
         e.1.details = Some(Box::new(serde_json::json!({
             "group": "meta.k8s.io",
-            "kind": "PatchOptions",
+            "kind": kind,
             "causes": causes
         })));
         e
