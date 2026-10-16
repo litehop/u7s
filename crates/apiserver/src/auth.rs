@@ -748,7 +748,7 @@ fn is_exempt(path: &str) -> bool {
 
 /// HTTP method → RBAC verb.
 ///
-/// For GET requests the caller must call `get_verb` instead, because Kubernetes
+/// For GET and HEAD resource requests the caller must call `get_verb` instead, because Kubernetes
 /// distinguishes between "get" (named resource), "list" (collection), and
 /// "watch" (streaming watch).
 fn method_to_verb(method: &axum::http::Method) -> &'static str {
@@ -765,30 +765,52 @@ fn method_to_verb(method: &axum::http::Method) -> &'static str {
     }
 }
 
-/// Resolve the RBAC verb for a GET request.
+/// Resolve the RBAC verb for a GET or HEAD request, mirroring `NewRequestInfo`.
 ///
-/// Kubernetes differentiates three GET-related verbs:
-///   "watch"  — query param `watch=true` or `watch=1` is present
+///   "watch"  — collection request whose decoded `watch` param is not `false`/`0`
 ///   "list"   — collection endpoint (no resource name in path)
 ///   "get"    — named resource endpoint
 ///
-/// This prevents the authorization bypass where a user with only the `get`
-/// verb could enumerate all resources by hitting the collection endpoint.
+/// A named request is "get" even with `watch=true`, as upstream: a single-object watch is a
+/// `fieldSelector=metadata.name=` list/watch, not a named GET.
 fn get_verb(name: Option<&str>, query: Option<&str>) -> &'static str {
-    // Watch takes priority: a client streaming watch events needs "watch", not "list".
-    if let Some(q) = query {
-        for pair in q.split('&') {
-            if let Some(val) = pair.strip_prefix("watch=") {
-                if val == "true" || val == "1" {
-                    return "watch";
-                }
-            }
-        }
+    if name.is_some() {
+        return "get";
     }
-    match name {
-        Some(_) => "get",
-        None => "list",
+    if query_requests_watch(query) {
+        "watch"
+    } else {
+        "list"
     }
+}
+
+/// Whether the query asks for a watch, decided on the decoded query as the list handlers'
+/// deserializer sees it. A value the handler would reject (400) counts as a watch too, as
+/// upstream does when parsing fails: anything but `false`/`0`.
+fn query_requests_watch(query: Option<&str>) -> bool {
+    let Some(raw) = query.and_then(|q| query_param(q, "watch")) else {
+        return false;
+    };
+    match decode_query_component(raw) {
+        Some(v) => crate::util::parse_watch_value(&v)
+            .unwrap_or_else(|| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0")),
+        None => true,
+    }
+}
+
+/// First raw value of `key` in a query string, matching keys after the decoding the
+/// handlers' query deserializer applies. Matching raw bytes lets `wat%63h=true` slip past
+/// an authorizer while the handler still obeys it.
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        (decode_query_component(k).as_deref() == Some(key)).then_some(v)
+    })
+}
+
+/// Form-urlencoded decoding of one query component: `+` is a space, then `%XX`.
+fn decode_query_component(s: &str) -> Option<String> {
+    percent_decode(&s.replace('+', " "))
 }
 
 /// Decode RFC 3986 `%XX` percent-escapes in a URL query-string component.
@@ -836,10 +858,7 @@ pub(crate) fn percent_decode(s: &str) -> Option<String> {
 /// using `!=`, does not uniquely identify one resource name.
 fn field_selector_name(query: Option<&str>) -> Option<String> {
     let query = query?;
-    let raw = query
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("fieldSelector="))?;
-    let decoded = percent_decode(raw)?;
+    let decoded = decode_query_component(query_param(query, "fieldSelector")?)?;
     if decoded.contains(',') {
         return None;
     }
@@ -1503,7 +1522,9 @@ where
             // get_verb's list/get/watch distinction only applies to resource requests.
             let verb = if non_resource_url.is_some() {
                 method_to_verb(req.method())
-            } else if req.method() == axum::http::Method::GET {
+            } else if req.method() == axum::http::Method::GET
+                || req.method() == axum::http::Method::HEAD
+            {
                 get_verb(parsed.name.as_deref(), req.uri().query())
             } else if req.method() == axum::http::Method::DELETE && parsed.name.is_none() {
                 "deletecollection"
@@ -2134,12 +2155,71 @@ mod tests {
         assert_eq!(get_verb(Some("nginx"), Some("resourceVersion=42")), "get");
     }
 
-    /// GET with watch=true must map to "watch", regardless of whether a name
-    /// is present. "watch" is a separate RBAC verb in Kubernetes.
+    /// A named GET stays "get" even with watch=true (requestinfo.go only reinterprets
+    /// requests with no name); a named request has no watch handler, so authorizing it
+    /// as "watch" would deny users upstream allows.
+    #[test]
+    fn test_get_verb_named_request_ignores_watch_param() {
+        assert_eq!(get_verb(Some("nginx"), Some("watch=true")), "get");
+    }
+
+    /// A user allowed to list but not watch must not be able to open a watch by
+    /// percent-encoding the parameter: the handler decodes the query, so the verb RBAC
+    /// checks must come from the decoded query too.
+    #[test]
+    fn test_get_verb_encoded_watch_forms_are_watch_not_list() {
+        for q in [
+            "watch=%74rue",
+            "wat%63h=true",
+            "%77atch=true",
+            "watch=tru%65",
+            "limit=1&%77atch=%31",
+            "w%61tch=1&x=y",
+            "watch=%54RUE",
+            "watch=yes",
+            "watch=",
+            "watch",
+        ] {
+            assert_eq!(get_verb(None, Some(q)), "watch", "query {q:?}");
+        }
+        for q in ["watch=%66alse", "wat%63h=0", "watch=FALSE", "xwatch=true"] {
+            assert_eq!(get_verb(None, Some(q)), "list", "query {q:?}");
+        }
+    }
+
+    /// An invalid UTF-8 watch value must not silently authorize as list.
+    #[test]
+    fn test_get_verb_undecodable_watch_value_is_watch() {
+        assert_eq!(get_verb(None, Some("watch=%ff")), "watch");
+    }
+
+    /// The authorizer and the list handler's `?watch=` deserializer share one value
+    /// parser, so a value the handler treats as a watch can never be authorized as list.
+    #[test]
+    fn test_get_verb_agrees_with_handler_watch_deserializer() {
+        for v in ["true", "1", "false", "0", "True", "yes", ""] {
+            let handler_watch = crate::util::parse_watch_value(v) == Some(true);
+            let authz_watch = get_verb(None, Some(&format!("watch={v}"))) == "watch";
+            if handler_watch {
+                assert!(authz_watch, "handler watches on {v:?} but authz said list");
+            }
+        }
+    }
+
+    /// An encoded `fieldSelector` key must still pin the resourceName: otherwise a
+    /// resourceNames-restricted informer request is denied depending on how the client
+    /// encoded the key.
+    #[test]
+    fn test_field_selector_name_matches_encoded_key() {
+        assert_eq!(
+            field_selector_name(Some("field%53elector=metadata.name%3Dfoo")).as_deref(),
+            Some("foo")
+        );
+    }
+
     #[test]
     fn test_get_verb_watch_param_is_watch() {
         assert_eq!(get_verb(None, Some("watch=true")), "watch");
-        assert_eq!(get_verb(Some("nginx"), Some("watch=true")), "watch");
         // watch=1 is also accepted
         assert_eq!(get_verb(None, Some("watch=1")), "watch");
         // watch takes priority even with other params
@@ -5610,6 +5690,90 @@ mod tests {
                  apiserver_request_total{{code=\"410\"}} — otherwise the ring-capacity \
                  sizing signal (410 rate + the re-LIST load it drives) is blind to every \
                  410 that doesn't come from the watch handler"
+            );
+        }
+    }
+
+    /// Full-layer check that the verb RBAC enforces matches the verb the handler runs: a
+    /// user allowed to `list` but not `watch` or `get` must not reach the handler via a
+    /// percent-encoded watch flag or via HEAD (which axum routes to the GET handler), and a
+    /// `get`-only user must not run a HEAD collection list (a Content-Length size oracle).
+    #[tokio::test]
+    async fn head_and_encoded_watch_are_authorized_with_the_verb_the_handler_runs() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let idx = Arc::new(RbacIndex::new());
+        for (role, verb, user) in [("lister", "list", "lister"), ("getter", "get", "getter")] {
+            idx.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{role}"),
+                &serde_json::json!({
+                    "rules": [{ "apiGroups": [""], "resources": ["configmaps"], "verbs": [verb] }]
+                }),
+            );
+            idx.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{role}"),
+                &serde_json::json!({
+                    "subjects": [{ "kind": "User", "name": user }],
+                    "roleRef": {
+                        "apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "ClusterRole",
+                        "name": role
+                    }
+                }),
+            );
+        }
+        let mut token_map = HashMap::new();
+        for user in ["lister", "getter"] {
+            token_map.insert(
+                format!("{user}-token"),
+                UserInfo {
+                    username: user.to_owned(),
+                    uid: "1".to_owned(),
+                    groups: vec![],
+                    extra: Default::default(),
+                },
+            );
+        }
+        let app = Router::new()
+            .route("/api/v1/configmaps", get(|| async { "ok" }))
+            .route("/api/v1/configmaps/{name}", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
+            ));
+
+        let cases = [
+            ("lister", "GET", "/api/v1/configmaps", 200),
+            ("lister", "HEAD", "/api/v1/configmaps", 200),
+            ("lister", "GET", "/api/v1/configmaps?watch=true", 403),
+            ("lister", "GET", "/api/v1/configmaps?watch=%74rue", 403),
+            ("lister", "GET", "/api/v1/configmaps?wat%63h=1", 403),
+            ("lister", "HEAD", "/api/v1/configmaps?%77atch=true", 403),
+            ("lister", "HEAD", "/api/v1/configmaps/x", 403),
+            ("getter", "HEAD", "/api/v1/configmaps/x", 200),
+            ("getter", "HEAD", "/api/v1/configmaps", 403),
+            ("getter", "GET", "/api/v1/configmaps", 403),
+        ];
+        for (user, method, uri, want) in cases {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {user}-token"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                want,
+                "{user} {method} {uri}: RBAC must authorize the verb the handler will run"
             );
         }
     }

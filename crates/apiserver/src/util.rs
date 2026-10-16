@@ -303,15 +303,23 @@ where
         where
             E: serde::de::Error,
         {
-            match v {
-                "true" | "1" => Ok(Some(true)),
-                "false" | "0" => Ok(Some(false)),
-                other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
-            }
+            parse_watch_value(v)
+                .map(Some)
+                .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Str(v), &self))
         }
     }
 
     deserializer.deserialize_str(WatchBoolVisitor)
+}
+
+/// The values the list/watch handlers accept for `?watch=`. The single definition shared
+/// with the authorizer, so the verb RBAC checks is the verb the handler runs.
+pub(crate) fn parse_watch_value(v: &str) -> Option<bool> {
+    match v {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Returns the current UTC time formatted as RFC3339 (`YYYY-MM-DDThh:mm:ssZ`).
