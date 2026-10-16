@@ -11,6 +11,7 @@ mod auth;
 mod autoscaling_gen_adapter;
 mod batch_gen_adapter;
 mod bootstrap_apply;
+mod bootstrap_rbac;
 mod certificates_v1beta1_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
@@ -34,6 +35,7 @@ mod rbac;
 mod rbac_gen_adapter;
 mod resource_gen_adapter;
 mod sa_sig_cache;
+mod serve;
 mod service_alloc;
 mod service_resolver;
 mod state;
@@ -55,13 +57,11 @@ use axum::{
 };
 use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
-use tower_service::Service;
 use u7s_store::SqliteStore;
 
 pub use admission::{build_review, AdmissionContext, AdmissionReview};
 pub use args::Args;
-use auth::{AuthLayer, PeerCertificate};
+use auth::AuthLayer;
 use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
 pub use metrics::record_request_total;
@@ -1406,9 +1406,6 @@ async fn reconcile_system_node_binding_subjects(
 }
 
 async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
-    use bytes::Bytes;
-    use u7s_store::Store;
-
     const GROUP: &str = "rbac.authorization.k8s.io";
     // Never actually written to the store — the `put!` macro below overwrites
     // `metadata.creationTimestamp` on every body with `boot_timestamp()` before serializing
@@ -1417,27 +1414,15 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     // silently reintroducing the old "2024-01-01" lie.
     const TS: &str = "TIMESTAMP-OVERWRITTEN-BY-PUT-MACRO";
 
-    // Helper: create-only put for a single seeded RBAC object. Like upstream kube-apiserver,
-    // bootstrap RBAC is stamped once per cluster lifetime: on first boot this creates the
-    // object with `boot_timestamp()`; on every later boot the object already exists, so the
-    // write is rejected (AlreadyExists) and swallowed, leaving whatever an operator has since
-    // changed on it untouched. uid_suffix must be unique across all seeded objects.
+    // Helper: create-or-reconcile a single seeded RBAC object, as upstream's ensureRBACPolicy
+    // does: created when missing, otherwise only missing rules/subjects/labels/annotations are
+    // added (operator additions survive, autoupdate=false opts out, no write when up to date).
+    // uid must be unique across all seeded objects.
     macro_rules! put {
         ($key:expr, $body:expr, $name:expr, $kind:expr) => {{
             let mut body = $body;
             body["metadata"]["creationTimestamp"] = serde_json::Value::from(boot_timestamp());
-            match store
-                .put(&$key, Bytes::from(body.to_string()), Some(0))
-                .await
-            {
-                Ok(_) => tracing::info!("seeded {}: {}", $kind, $name),
-                Err(u7s_store::StoreError::AlreadyExists { .. }) => {
-                    // Already exists — idempotent, and intentionally not re-applied so an
-                    // operator's edit to a seeded Role/ClusterRole/ClusterRoleBinding survives
-                    // a restart instead of being silently reverted.
-                }
-                Err(e) => return Err(anyhow::anyhow!("seed {} {}: {}", $kind, $name, e)),
-            }
+            bootstrap_rbac::reconcile_object(store, &$key, body).await?;
         }};
     }
 
@@ -1715,6 +1700,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // rules live here. `create` is not covered by the generic wildcard rule below.
             { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "verbs": ["attest"] },
             { "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create","update","delete","list","watch"] },
+            // csrapproving/csrsigning controllers: upstream's
+            // system:controller:certificate-controller grants. The CSR /approval and /status
+            // writes themselves are covered by the wildcard update/patch rule below, but
+            // the apiserver additionally requires approve/sign on the signer.
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-client-kubelet"], "verbs": ["approve"] },
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kubelet-serving","kubernetes.io/kube-apiserver-client-kubelet","kubernetes.io/kube-apiserver-client","kubernetes.io/legacy-unknown"], "verbs": ["sign"] },
             // namespace-controller needs these two subresources specifically (the base
             // "namespaces" rule above doesn't cover them) to record deletion-progress
             // conditions and clear the "kubernetes" finalizer once a namespace's contents
@@ -2396,6 +2387,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "rules": [
             { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests"], "verbs": ["get","list","watch","delete"] },
             { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests/status","certificatesigningrequests/approval"], "verbs": ["update","patch"] },
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-client-kubelet"], "verbs": ["approve"] },
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kubelet-serving","kubernetes.io/kube-apiserver-client-kubelet","kubernetes.io/kube-apiserver-client","kubernetes.io/legacy-unknown"], "verbs": ["sign"] },
             { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
         ]
     });
@@ -3247,25 +3240,9 @@ fn parse_node_kubelet_ports(
 
 /// Parse "https://HOST:PORT" into (host, port). Returns ("127.0.0.1", 6443) on any parse error.
 fn parse_advertise_address(addr: &str) -> (String, u16) {
-    let without_scheme = addr
-        .strip_prefix("https://")
-        .or_else(|| addr.strip_prefix("http://"))
-        .unwrap_or(addr);
-    // Handle IPv6 bracketed addresses like [::1]:6443.
-    if let Some(bracket_end) = without_scheme.find(']') {
-        let host = without_scheme[1..bracket_end].to_owned();
-        let port = without_scheme
-            .get(bracket_end + 2..)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(6443);
-        return (host, port);
-    }
-    match without_scheme.rsplit_once(':') {
-        Some((host, port_str)) => {
-            let port = port_str.parse().unwrap_or(6443);
-            (host.to_owned(), port)
-        }
-        None => ("127.0.0.1".to_owned(), 6443),
+    match tls::parse_advertise(addr) {
+        Ok(Some((host, port))) => (host, port.unwrap_or(6443)),
+        _ => ("127.0.0.1".to_owned(), 6443),
     }
 }
 
@@ -4474,6 +4451,14 @@ fn configure_accepted_socket(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::warn!("failed to set TCP_NODELAY on accepted connection: {e}");
     }
+    // Reap half-open peers (vanished clients, dropped NAT mappings) that would
+    // otherwise hold a connection slot and descriptor forever.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(15));
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!("failed to set TCP keepalive on accepted connection: {e}");
+    }
 }
 
 async fn serve_tls(
@@ -4481,71 +4466,8 @@ async fn serve_tls(
     app: Router,
     server_config: Arc<rustls::ServerConfig>,
 ) -> anyhow::Result<()> {
-    let acceptor = TlsAcceptor::from(server_config);
-    // Auto-negotiating builder: dispatches each connection to HTTP/1.1 or HTTP/2 by
-    // peeking at the first bytes for the HTTP/2 connection preface. Clients that
-    // saw h2 win ALPN (rustls ServerConfig.alpn_protocols in tls.rs) send that
-    // preface immediately, so in practice ALPN is what steers this — but the
-    // dispatch itself works from the wire, independent of the ALPN result.
-    let conn_builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     tracing::info!("listening on {}", listener.local_addr()?);
-
-    loop {
-        let (tcp_stream, _peer) = listener.accept().await?;
-        configure_accepted_socket(&tcp_stream);
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        let conn_builder = conn_builder.clone();
-
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(tcp_stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("TLS accept error: {e}");
-                    return;
-                }
-            };
-
-            // Extract the peer certificate once per connection, then share it
-            // across all requests on this connection via an Arc.
-            let peer_cert: Arc<Option<PeerCertificate>> = Arc::new(
-                tls_stream
-                    .get_ref()
-                    .1
-                    .peer_certificates()
-                    .and_then(|certs| certs.first())
-                    .map(|c| PeerCertificate(c.as_ref().to_vec())),
-            );
-
-            let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let service = hyper::service::service_fn(move |mut req: axum::http::Request<_>| {
-                let peer_cert = Arc::clone(&peer_cert);
-                let mut app = app.clone();
-                async move {
-                    if let Some(cert) = peer_cert.as_ref().as_ref() {
-                        req.extensions_mut().insert(cert.clone());
-                    }
-                    Ok::<_, std::convert::Infallible>(app.call(req).await.unwrap())
-                }
-            });
-            // serve_connection_with_upgrades() preserves WebSocket-upgrade support for
-            // connections that negotiate HTTP/1.1 (exec/attach/portforward use
-            // `Connection: Upgrade`, which has no HTTP/2 equivalent wired up here).
-            // Without it, hyper sends the 101 Switching Protocols response but never
-            // hands the connection off to the upgrade handler — the on_upgrade callback
-            // never runs, the splice never starts, and kubectl times out with
-            // "unexpected output from server". Connections that negotiate HTTP/2
-            // (kubelet's watch reflectors) skip this path entirely and get hyper's
-            // native h2 stream multiplexing instead of one TCP connection per watch.
-            if let Err(e) = conn_builder
-                .serve_connection_with_upgrades(io, service)
-                .await
-            {
-                tracing::debug!("connection error: {e}");
-            }
-        });
-    }
+    serve::serve_tls_with(listener, app, server_config, serve::ServeLimits::default()).await
 }
 
 #[cfg(test)]
@@ -5496,6 +5418,91 @@ mod tests {
         let store = make_store();
         seed_rbac(&store).await.expect("first seed must not fail");
         seed_rbac(&store).await.expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn restart_on_a_store_with_an_old_kcm_role_grants_kcm_the_new_signers_rule() {
+        // Bootstrap-role fixes (e.g. new certificates.k8s.io/signers grants for KCM) only
+        // reach existing clusters if startup reconciles stale roles, not just creates.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("first seed must not fail");
+
+        let key = keys::group_object_key(
+            GROUP,
+            "clusterroles",
+            None,
+            "system:kube-controller-manager",
+        );
+        let existing = store.get(&key).await.unwrap().expect("kcm role seeded");
+        let mut old: serde_json::Value = serde_json::from_slice(&existing.value).unwrap();
+        let rules = old["rules"].as_array_mut().unwrap();
+        let before = rules.len();
+        rules.retain(|r| r["resources"] != serde_json::json!(["signers"]));
+        let stripped = before - rules.len();
+        assert_eq!(
+            stripped, 3,
+            "the bootstrap KCM role defines attest, approve and sign rules on signers; the old-shaped role must lack all of them"
+        );
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(old.to_string()),
+                Some(existing.revision),
+            )
+            .await
+            .unwrap();
+
+        let grant = |verb: &'static str, signer: &'static str| rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &[],
+            verb,
+            api_group: "certificates.k8s.io",
+            resource: "signers",
+            subresource: "",
+            namespace: None,
+            name: Some(signer),
+            non_resource_url: None,
+        };
+        let needed = [
+            grant("attest", "kubernetes.io/kube-apiserver-serving"),
+            grant("approve", "kubernetes.io/kube-apiserver-client-kubelet"),
+            grant("sign", "kubernetes.io/kube-apiserver-client"),
+            grant("sign", "kubernetes.io/kubelet-serving"),
+        ];
+        let new_state = || {
+            state::AppState::new(
+                std::sync::Arc::clone(&store),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            )
+        };
+        let state = new_state();
+        state.init().await;
+        for req in &needed {
+            assert!(
+                !state.rbac_index.is_allowed(req),
+                "setup: stale role must lack {} on {:?}",
+                req.verb,
+                req.name
+            );
+        }
+
+        seed_rbac(&store).await.expect("restart seed must not fail");
+
+        let state = new_state();
+        state.init().await;
+        for req in &needed {
+            assert!(
+                state.rbac_index.is_allowed(req),
+                "after restart KCM must be allowed {} on signer {:?}; otherwise on an existing \
+                 cluster CSRs are approved but never signed and kubelet certs stop rotating",
+                req.verb,
+                req.name
+            );
+        }
     }
 
     #[tokio::test]
@@ -7476,6 +7483,30 @@ mod tests {
         assert!(
             !allowed(kcm, &groups, "create", "certificatesigningrequests", None),
             "KCM must not gain CSR create from the CTB publisher grant"
+        );
+
+        for (verb, signer) in [
+            ("approve", "kubernetes.io/kube-apiserver-client-kubelet"),
+            ("sign", "kubernetes.io/kube-apiserver-client-kubelet"),
+            ("sign", "kubernetes.io/kube-apiserver-client"),
+            ("sign", "kubernetes.io/kubelet-serving"),
+        ] {
+            assert!(
+                allowed(kcm, &groups, verb, "signers", Some(signer)),
+                "KCM csrapproving/csrsigning must hold {verb} on {signer}, or node join and \
+                 CSR rotation stall once the apiserver enforces signer authorization"
+            );
+        }
+        assert!(
+            !allowed(
+                kcm,
+                &groups,
+                "approve",
+                "signers",
+                Some("kubernetes.io/kube-apiserver-client")
+            ),
+            "KCM must not auto-approve arbitrary client CSRs (upstream grants approve on the \
+             kubelet client signer only)"
         );
 
         let sa = vec![
@@ -9541,6 +9572,19 @@ mod tests {
             extra: Default::default(),
         };
 
+        handlers::test_support::grant_signer_verb(
+            &state,
+            "test-user",
+            "approve",
+            "kubernetes.io/kube-apiserver-client",
+        );
+        handlers::test_support::grant_signer_verb(
+            &state,
+            "test-user",
+            "sign",
+            "kubernetes.io/kube-apiserver-client",
+        );
+
         // --- Step 1: POST — create the CSR ---
         // spec.username/uid/groups/extra are deliberately spoofed here — KCM's real
         // csrapproving controller authorizes auto-approval directly from these stored
@@ -9666,6 +9710,7 @@ mod tests {
         });
         let approval_result = handlers::approval::put_approval(
             axum::extract::State(state.clone()),
+            axum::Extension(user.clone()),
             axum::extract::Path("lifecycle-csr".to_owned()),
             json_headers.clone(),
             bytes::Bytes::from(approval_body.to_string()),
@@ -11404,7 +11449,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(cr_body.to_string()))
             .expect("CR POST request must build");
-        create_req.extensions_mut().insert(admin);
+        create_req.extensions_mut().insert(admin.clone());
         let create_resp = router
             .call(create_req)
             .await
@@ -11418,12 +11463,13 @@ mod tests {
 
         // The csi-snapshotter sidecar's actual write shape: merge-patch PATCH to /status.
         let status_patch = serde_json::json!({ "status": { "readyToUse": true } });
-        let patch_req = Request::builder()
+        let mut patch_req = Request::builder()
             .method(Method::PATCH)
             .uri("/apis/example.io/v1/widgets/snap-content-1/status")
             .header("content-type", "application/merge-patch+json")
             .body(axum::body::Body::from(status_patch.to_string()))
             .expect("status PATCH request must build");
+        patch_req.extensions_mut().insert(admin);
         let patch_resp = router
             .call(patch_req)
             .await

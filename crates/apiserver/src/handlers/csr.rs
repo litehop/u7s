@@ -301,15 +301,8 @@ pub async fn create_csr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    finalize_csr_create(&mut obj.body, &user)?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
-
-    // Re-stamp spec identity from the authenticated caller and strip status — neither may
-    // survive a client, OR a mutating webhook, attempting to set them. spec is immutable
-    // after create; status is the signer's exclusive write.
-    stamp_csr_identity(&mut obj.body, &user);
-    if let Some(map) = obj.body.as_object_mut() {
-        map.remove("status");
-    }
 
     // Dry-run: validation and admission passed; return the would-be created object without
     // persisting — mirrors create_resource's dry-run early-return in resource.rs.
@@ -394,6 +387,167 @@ pub async fn delete_collection_csr<S: Store>(
         body,
     )
     .await
+}
+
+pub(crate) fn is_csr(group: &str, plural: &str) -> bool {
+    group == GROUP && plural == PLURAL
+}
+
+/// Upstream `csrStrategy.PrepareForUpdate`: spec is immutable after create. Without this a
+/// requester could get a benign request approved, then swap in a different request/signer.
+pub(crate) fn preserve_csr_spec(old: &serde_json::Value, new: &mut serde_json::Value) {
+    new["spec"] = old["spec"].clone();
+}
+
+/// Create-time admission shared by POST and SSA apply-create, run after mutating webhooks:
+/// subject restriction, then identity re-stamped from the authenticated caller and status
+/// stripped — neither may survive a client, or a mutating webhook, setting them. Spec is
+/// immutable after create; status is the signer's exclusive write.
+pub(crate) fn finalize_csr_create(
+    body: &mut serde_json::Value,
+    user: &UserInfo,
+) -> Result<(), crate::status::StatusError> {
+    reject_system_masters_client_csr(body)?;
+    stamp_csr_identity(body, user);
+    if let Some(map) = body.as_object_mut() {
+        map.remove("status");
+    }
+    Ok(())
+}
+
+const KUBE_APISERVER_CLIENT_SIGNER: &str = "kubernetes.io/kube-apiserver-client";
+const OID_ORGANIZATION: &str = "2.5.4.10";
+
+/// Upstream CertificateSubjectRestriction: the `kube-apiserver-client` signer must never be
+/// asked for a `system:masters` identity. The cluster CA is trusted for client auth, so a
+/// signed `O=system:masters` certificate is cluster-admin. An unreadable `O` value fails
+/// closed because the signer may decode it where this parser cannot.
+pub(crate) fn reject_system_masters_client_csr(
+    body: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let spec = &body["spec"];
+    if spec["signerName"].as_str() != Some(KUBE_APISERVER_CLIENT_SIGNER) {
+        return Ok(());
+    }
+    let forbidden = |why: String| Err(Status::forbidden(why));
+    let pem = base64::engine::general_purpose::STANDARD
+        .decode(spec["request"].as_str().unwrap_or(""))
+        .map_err(|e| Status::forbidden(format!("failed to parse CSR: {e}")))?;
+    let req = CertReq::from_pem(&pem)
+        .map_err(|e| Status::forbidden(format!("failed to parse CSR: {e}")))?;
+    for atv in req.info.subject.iter() {
+        if atv.oid.to_string() != OID_ORGANIZATION {
+            continue;
+        }
+        match crate::auth::atv_string(&atv.value) {
+            Some(org) if org == "system:masters" => {
+                return forbidden(format!(
+                    "use of {KUBE_APISERVER_CLIENT_SIGNER} signer with system:masters group is not allowed"
+                ))
+            }
+            None => {
+                return forbidden(format!(
+                    "use of {KUBE_APISERVER_CLIENT_SIGNER} signer with an undecodable organization is not allowed"
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Upstream CertificateApproval admission: `/approval` writes need `approve` on the signer
+/// of the stored (not the submitted) CSR.
+pub(crate) fn authorize_csr_approval<S: Store>(
+    state: &AppState<S>,
+    user: &UserInfo,
+    stored: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let signer = stored["spec"]["signerName"].as_str().unwrap_or("");
+    if super::certificates::user_may_for_signer(state, user, "approve", signer) {
+        return Ok(());
+    }
+    Err(Status::forbidden(format!(
+        "user not permitted to approve requests with signerName {signer:?}"
+    )))
+}
+
+fn csr_conditions(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    body["status"]["conditions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn csr_certificate(body: &serde_json::Value) -> &str {
+    body["status"]["certificate"].as_str().unwrap_or("")
+}
+
+fn condition_indices(conditions: &[serde_json::Value], ty: &str) -> Vec<usize> {
+    (0..conditions.len())
+        .filter(|&i| conditions[i]["type"].as_str() == Some(ty))
+        .collect()
+}
+
+/// Upstream CertificateSigning admission plus the `/status` strategy: a `/status` write
+/// that changes `status.certificate` or `status.conditions` needs `sign` on the signer;
+/// Approved/Denied conditions belong to `/approval` and cannot be added or removed here
+/// (existing ones are restored, as upstream's `preserveConditionInstances` does);
+/// Failed conditions cannot be removed; an issued certificate cannot be replaced.
+pub(crate) fn guard_csr_status_write<S: Store>(
+    state: &AppState<S>,
+    user: &UserInfo,
+    old: &serde_json::Value,
+    new: &mut serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let old_conditions = csr_conditions(old);
+    let mut new_conditions = csr_conditions(new);
+    let changed = csr_certificate(old) != csr_certificate(new) || old_conditions != new_conditions;
+    if !changed {
+        return Ok(());
+    }
+    let signer = old["spec"]["signerName"].as_str().unwrap_or("");
+    if !super::certificates::user_may_for_signer(state, user, "sign", signer) {
+        return Err(Status::forbidden(format!(
+            "user not permitted to sign requests with signerName {signer:?}"
+        )));
+    }
+
+    for ty in ["Approved", "Denied"] {
+        let old_idx = condition_indices(&old_conditions, ty);
+        let new_idx = condition_indices(&new_conditions, ty);
+        if new_idx.len() != old_idx.len() {
+            let verb = if new_idx.len() > old_idx.len() {
+                "add"
+            } else {
+                "remove"
+            };
+            return Err(Status::unprocessable_entity(format!(
+                "status.conditions: Forbidden: updates may not {verb} a condition of type {ty:?}"
+            )));
+        }
+        for (o, n) in old_idx.into_iter().zip(new_idx) {
+            new_conditions[n] = old_conditions[o].clone();
+        }
+    }
+    if condition_indices(&new_conditions, "Failed").len()
+        < condition_indices(&old_conditions, "Failed").len()
+    {
+        return Err(Status::unprocessable_entity(
+            "status.conditions: Forbidden: updates may not remove a condition of type \"Failed\""
+                .into(),
+        ));
+    }
+    if !csr_certificate(old).is_empty() && csr_certificate(old) != csr_certificate(new) {
+        return Err(Status::unprocessable_entity(
+            "status.certificate: Forbidden: updates may not modify existing certificate content"
+                .into(),
+        ));
+    }
+    if new["status"]["conditions"].is_array() {
+        new["status"]["conditions"] = serde_json::Value::Array(new_conditions);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1638,6 +1792,627 @@ mod tests {
                 .as_str()
                 .is_some_and(|n| n.starts_with("repro-csr-")),
             "created CSR must still carry the generateName prefix after the retry"
+        );
+    }
+
+    const CLIENT_SIGNER: &str = "kubernetes.io/kube-apiserver-client";
+
+    fn csr_b64_with_org(org: Option<&str>) -> String {
+        use rcgen::{CertificateParams, DnType, KeyPair};
+        let key_pair = KeyPair::generate().expect("key generation must succeed");
+        let mut params = CertificateParams::default();
+        if let Some(org) = org {
+            params
+                .distinguished_name
+                .push(DnType::OrganizationName, org);
+        }
+        let pem = params
+            .serialize_request(&key_pair)
+            .expect("CSR generation must succeed")
+            .pem()
+            .expect("CSR PEM serialization must succeed");
+        base64::engine::general_purpose::STANDARD.encode(pem)
+    }
+
+    fn user(name: &str) -> UserInfo {
+        UserInfo {
+            username: name.into(),
+            ..Default::default()
+        }
+    }
+
+    async fn seed_csr_with(state: &AppState, name: &str, signer: &str, status: serde_json::Value) {
+        let csr = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": name},
+            "spec": {"request": csr_b64_with_org(None), "signerName": signer},
+            "status": status
+        });
+        let key = group_object_key(GROUP, PLURAL, None, name);
+        state
+            .store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&csr).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed CSR");
+    }
+
+    async fn stored_csr(state: &AppState, name: &str) -> serde_json::Value {
+        let key = group_object_key(GROUP, PLURAL, None, name);
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        serde_json::from_slice(&stored.value).unwrap()
+    }
+
+    fn json_headers(content_type: &'static str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static(content_type),
+        );
+        h
+    }
+
+    fn approved() -> serde_json::Value {
+        serde_json::json!({"type": "Approved", "status": "True", "reason": "r", "message": "m"})
+    }
+
+    async fn status_put(
+        state: &AppState,
+        who: &UserInfo,
+        name: &str,
+        status: serde_json::Value,
+    ) -> Result<(), crate::status::StatusError> {
+        let body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+            "metadata": {"name": name}, "status": status
+        });
+        crate::handlers::cr::put_cr_status(
+            State(state.clone()),
+            Extension(who.clone()),
+            Path((GROUP.into(), VERSION.into(), PLURAL.into(), name.into())),
+            json_headers("application/json"),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn status_patch(
+        state: &AppState,
+        who: &UserInfo,
+        name: &str,
+        status: serde_json::Value,
+    ) -> Result<(), crate::status::StatusError> {
+        crate::handlers::cr::patch_cr_status(
+            State(state.clone()),
+            Extension(who.clone()),
+            Path((GROUP.into(), VERSION.into(), PLURAL.into(), name.into())),
+            json_headers("application/merge-patch+json"),
+            Bytes::from(serde_json::json!({"status": status}).to_string()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn approval_put(
+        state: &AppState,
+        who: &UserInfo,
+        name: &str,
+    ) -> Result<(), crate::status::StatusError> {
+        let body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+            "metadata": {"name": name}, "status": {"conditions": [approved()]}
+        });
+        crate::handlers::approval::put_approval(
+            State(state.clone()),
+            Extension(who.clone()),
+            Path(name.to_owned()),
+            json_headers("application/json"),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn approval_patch(
+        state: &AppState,
+        who: &UserInfo,
+        name: &str,
+    ) -> Result<(), crate::status::StatusError> {
+        crate::handlers::approval::patch_approval(
+            State(state.clone()),
+            Extension(who.clone()),
+            Path(name.to_owned()),
+            json_headers("application/merge-patch+json"),
+            Bytes::from(serde_json::json!({"status": {"conditions": [approved()]}}).to_string()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    fn assert_status(r: Result<(), crate::status::StatusError>, code: StatusCode, why: &str) {
+        match r {
+            Err(e) => assert_eq!(e.0, code, "{why}: {}", serde_json::to_value(&e.1).unwrap()),
+            Ok(()) => panic!("{why}: write unexpectedly succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_without_approve_on_signer_is_forbidden_so_scoped_roles_cannot_self_approve() {
+        let state = make_state();
+        seed_csr_with(&state, "c1", CLIENT_SIGNER, serde_json::json!({})).await;
+        let mallory = user("mallory");
+
+        assert_status(
+            approval_put(&state, &mallory, "c1").await,
+            StatusCode::FORBIDDEN,
+            "PUT /approval without approve on the signer",
+        );
+        assert_status(
+            approval_patch(&state, &mallory, "c1").await,
+            StatusCode::FORBIDDEN,
+            "PATCH /approval without approve on the signer",
+        );
+        assert!(
+            stored_csr(&state, "c1").await["status"]["conditions"].is_null(),
+            "a refused approval must not have been persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_is_scoped_to_the_csr_signer_not_any_signer() {
+        let state = make_state();
+        seed_csr_with(&state, "c1", CLIENT_SIGNER, serde_json::json!({})).await;
+        let ca = user("other-approver");
+        crate::handlers::test_support::grant_signer_verb(
+            &state,
+            "other-approver",
+            "approve",
+            "example.com/other",
+        );
+        assert_status(
+            approval_put(&state, &ca, "c1").await,
+            StatusCode::FORBIDDEN,
+            "approve on a different signer must not authorize this CSR",
+        );
+
+        let dom = user("domain-approver");
+        crate::handlers::test_support::grant_signer_verb(
+            &state,
+            "domain-approver",
+            "approve",
+            "kubernetes.io/*",
+        );
+        approval_put(&state, &dom, "c1")
+            .await
+            .expect("approve on <domain>/* authorizes every signer in the domain");
+    }
+
+    #[tokio::test]
+    async fn status_cannot_set_approved_so_sign_does_not_imply_approve() {
+        let state = make_state();
+        seed_csr_with(&state, "c1", CLIENT_SIGNER, serde_json::json!({})).await;
+        let signer = user("signer");
+        crate::handlers::test_support::grant_signer_verb(&state, "signer", "sign", CLIENT_SIGNER);
+
+        assert_status(
+            status_put(
+                &state,
+                &signer,
+                "c1",
+                serde_json::json!({"conditions": [approved()]}),
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "PUT /status adding Approved",
+        );
+        assert_status(
+            status_patch(
+                &state,
+                &signer,
+                "c1",
+                serde_json::json!({"conditions": [approved()]}),
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "PATCH /status adding Approved",
+        );
+        assert!(
+            stored_csr(&state, "c1").await["status"]["conditions"].is_null(),
+            "/status must never leave an Approved condition behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_certificate_requires_sign_on_the_signer() {
+        let state = make_state();
+        seed_csr_with(&state, "c1", CLIENT_SIGNER, serde_json::json!({})).await;
+        let mallory = user("mallory");
+        let forged = serde_json::json!({"certificate": "Zm9yZ2Vk"});
+
+        assert_status(
+            status_put(&state, &mallory, "c1", forged.clone()).await,
+            StatusCode::FORBIDDEN,
+            "PUT /status certificate without sign",
+        );
+        assert_status(
+            status_patch(&state, &mallory, "c1", forged.clone()).await,
+            StatusCode::FORBIDDEN,
+            "PATCH /status certificate without sign",
+        );
+        assert!(
+            stored_csr(&state, "c1").await["status"]["certificate"].is_null(),
+            "a forged certificate must not be persisted"
+        );
+
+        let signer = user("signer");
+        crate::handlers::test_support::grant_signer_verb(&state, "signer", "sign", CLIENT_SIGNER);
+        status_put(&state, &signer, "c1", forged)
+            .await
+            .expect("a holder of sign on the signer may set the certificate");
+        assert_status(
+            status_put(
+                &state,
+                &signer,
+                "c1",
+                serde_json::json!({"certificate": "b3RoZXI="}),
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "replacing an issued certificate",
+        );
+    }
+
+    #[tokio::test]
+    async fn status_write_preserves_existing_approval_and_needs_no_sign_when_nothing_changes() {
+        let state = make_state();
+        seed_csr_with(
+            &state,
+            "c1",
+            CLIENT_SIGNER,
+            serde_json::json!({"conditions": [approved()]}),
+        )
+        .await;
+        let signer = user("signer");
+        crate::handlers::test_support::grant_signer_verb(&state, "signer", "sign", CLIENT_SIGNER);
+        let denied = serde_json::json!({"type": "Denied", "status": "True"});
+        assert_status(
+            status_patch(
+                &state,
+                &signer,
+                "c1",
+                serde_json::json!({"conditions": [denied]}),
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "swapping Approved for Denied through /status",
+        );
+        let mut tampered = approved();
+        tampered["reason"] = "rewritten".into();
+        status_put(
+            &state,
+            &signer,
+            "c1",
+            serde_json::json!({"conditions": [tampered]}),
+        )
+        .await
+        .expect("editing an Approved condition is silently reverted, as upstream does");
+        assert_eq!(
+            stored_csr(&state, "c1").await["status"]["conditions"][0]["reason"],
+            "r",
+            "/status must not rewrite the approver's condition"
+        );
+
+        let unchanged = user("nobody");
+        status_put(
+            &state,
+            &unchanged,
+            "c1",
+            serde_json::json!({"conditions": [approved()]}),
+        )
+        .await
+        .expect("a /status write that changes neither certificate nor conditions needs no sign");
+    }
+
+    #[tokio::test]
+    async fn kcm_style_approve_then_sign_still_works() {
+        let state = make_state();
+        seed_csr_with(&state, "c1", CLIENT_SIGNER, serde_json::json!({})).await;
+        let kcm = user("kcm");
+        crate::handlers::test_support::grant_signer_verb(&state, "kcm", "approve", CLIENT_SIGNER);
+        crate::handlers::test_support::grant_signer_verb(&state, "kcm", "sign", CLIENT_SIGNER);
+
+        approval_put(&state, &kcm, "c1").await.expect("approve");
+        status_put(
+            &state,
+            &kcm,
+            "c1",
+            serde_json::json!({"conditions": [approved()], "certificate": "Y2VydA=="}),
+        )
+        .await
+        .expect("sign");
+        let s = stored_csr(&state, "c1").await;
+        assert_eq!(s["status"]["certificate"], "Y2VydA==");
+        assert_eq!(s["status"]["conditions"][0]["type"], "Approved");
+    }
+
+    async fn create_as(
+        state: &AppState,
+        signer: &str,
+        org: Option<&str>,
+    ) -> Result<(), crate::status::StatusError> {
+        let body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+            "metadata": {"generateName": "csr-"},
+            "spec": {"request": csr_b64_with_org(org), "signerName": signer,
+                     "usages": ["client auth"]}
+        });
+        create_csr(
+            State(state.clone()),
+            Extension(user("alice")),
+            json_headers("application/json"),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn client_signer_refuses_system_masters_organization_because_ca_is_trusted_for_admin() {
+        let state = make_state();
+        assert_status(
+            create_as(&state, CLIENT_SIGNER, Some("system:masters")).await,
+            StatusCode::FORBIDDEN,
+            "kube-apiserver-client with O=system:masters",
+        );
+        create_as(&state, CLIENT_SIGNER, Some("developers"))
+            .await
+            .expect("other organizations stay allowed");
+        create_as(&state, CLIENT_SIGNER, None)
+            .await
+            .expect("no organization stays allowed");
+        create_as(&state, "example.com/custom", Some("system:masters"))
+            .await
+            .expect("the restriction is specific to the kube-apiserver-client signer");
+    }
+
+    #[test]
+    fn client_signer_fails_closed_on_undecodable_request_because_signer_may_decode_it() {
+        let junk = |pem: &str| {
+            serde_json::json!({"spec": {
+                "signerName": CLIENT_SIGNER,
+                "request": base64::engine::general_purpose::STANDARD.encode(pem),
+            }})
+        };
+        for body in [
+            junk("not a pem"),
+            junk("-----BEGIN CERTIFICATE REQUEST-----\nAAAA\n-----END CERTIFICATE REQUEST-----\n"),
+            serde_json::json!({"spec": {"signerName": CLIENT_SIGNER, "request": "!!!"}}),
+        ] {
+            assert_status(
+                reject_system_masters_client_csr(&body),
+                StatusCode::FORBIDDEN,
+                "undecodable PKCS#10 on the client signer",
+            );
+        }
+    }
+
+    #[test]
+    fn client_signer_fails_closed_on_non_utf8_organization_because_it_could_hide_system_masters() {
+        use rcgen::{CertificateParams, DnType, DnValue, KeyPair};
+        let mut params = CertificateParams::default();
+        params.distinguished_name.push(
+            DnType::OrganizationName,
+            DnValue::TeletexString("system:masters".try_into().unwrap()),
+        );
+        let pem = params
+            .serialize_request(&KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
+            .unwrap();
+        let body = serde_json::json!({"spec": {
+            "signerName": CLIENT_SIGNER,
+            "request": base64::engine::general_purpose::STANDARD.encode(pem),
+        }});
+        assert_status(
+            reject_system_masters_client_csr(&body),
+            StatusCode::FORBIDDEN,
+            "O encoded as TeletexString",
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_authorizes_the_stored_signer_not_the_one_in_the_body() {
+        let state = make_state();
+        seed_csr_with(&state, "c1", CLIENT_SIGNER, serde_json::json!({})).await;
+        crate::handlers::test_support::grant_signer_verb(
+            &state,
+            "mallory",
+            "approve",
+            "example.com/harmless",
+        );
+        let body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+            "metadata": {"name": "c1"},
+            "spec": {"signerName": "example.com/harmless"},
+            "status": {"conditions": [approved()]}
+        });
+        let r = crate::handlers::approval::put_approval(
+            State(state.clone()),
+            Extension(user("mallory")),
+            Path("c1".to_owned()),
+            json_headers("application/json"),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .map(|_| ());
+        assert_status(
+            r,
+            StatusCode::FORBIDDEN,
+            "approve rights on a body-supplied signer must not approve a CSR stored under another",
+        );
+    }
+
+    fn csr_body(name: &str, signer: &str, org: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+            "metadata": {"name": name},
+            "spec": {"request": csr_b64_with_org(org), "signerName": signer,
+                     "usages": ["client auth"]}
+        })
+    }
+
+    fn admin() -> UserInfo {
+        UserInfo {
+            username: "admin".into(),
+            groups: vec!["system:masters".into()],
+            ..Default::default()
+        }
+    }
+
+    async fn generic_put(state: &AppState, name: &str, body: &serde_json::Value) -> StatusCode {
+        crate::handlers::resource::replace_resource(
+            State(state.clone()),
+            Path((GROUP.into(), VERSION.into(), PLURAL.into(), name.into())),
+            axum::extract::Query(Default::default()),
+            Extension(admin()),
+            json_headers("application/json"),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .map(|r| r.into_response().status())
+        .unwrap_or_else(|e| e.0)
+    }
+
+    async fn generic_patch(
+        state: &AppState,
+        name: &str,
+        content_type: &'static str,
+        body: String,
+    ) -> StatusCode {
+        crate::handlers::resource::patch_resource(
+            State(state.clone()),
+            Path((GROUP.into(), VERSION.into(), PLURAL.into(), name.into())),
+            axum::extract::Query(Default::default()),
+            Extension(admin()),
+            json_headers(content_type),
+            Bytes::from(body),
+        )
+        .await
+        .map(|r| r.into_response().status())
+        .unwrap_or_else(|e| e.0)
+    }
+
+    #[tokio::test]
+    async fn put_cannot_create_a_missing_csr_because_it_would_skip_the_subject_restriction() {
+        let state = make_state();
+        let body = csr_body("evil", CLIENT_SIGNER, Some("system:masters"));
+        assert_eq!(
+            generic_put(&state, "evil", &body).await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(state
+            .store
+            .get(&group_object_key(GROUP, PLURAL, None, "evil"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn server_side_apply_create_runs_the_subject_restriction_like_post() {
+        let state = make_state();
+        let body = csr_body("evil", CLIENT_SIGNER, Some("system:masters")).to_string();
+        assert_eq!(
+            generic_patch(&state, "evil", "application/apply-patch+yaml", body).await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(state
+            .store
+            .get(&group_object_key(GROUP, PLURAL, None, "evil"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn server_side_apply_creates_a_normal_csr_with_status_stripped_and_identity_stamped() {
+        let state = make_state();
+        let mut body = csr_body("ok", CLIENT_SIGNER, Some("developers"));
+        body["status"] = serde_json::json!({"conditions": [approved()]});
+        body["spec"]["username"] = "spoofed".into();
+        let code = generic_patch(
+            &state,
+            "ok",
+            "application/apply-patch+yaml",
+            body.to_string(),
+        )
+        .await;
+        assert!(code.is_success(), "apply-create of a CSR must work: {code}");
+        let s = stored_csr(&state, "ok").await;
+        assert!(
+            s["status"]["conditions"].is_null(),
+            "apply must not pre-approve"
+        );
+        assert_eq!(s["spec"]["username"], "admin", "identity is server-stamped");
+    }
+
+    #[tokio::test]
+    async fn plain_put_and_patch_leave_the_stored_spec_intact() {
+        let state = make_state();
+        seed_csr_with(&state, "c1", "example.com/custom", serde_json::json!({})).await;
+        let before = stored_csr(&state, "c1").await["spec"].clone();
+
+        let swapped = csr_body("c1", CLIENT_SIGNER, Some("system:masters"));
+        assert_eq!(generic_put(&state, "c1", &swapped).await, StatusCode::OK);
+        assert_eq!(stored_csr(&state, "c1").await["spec"], before, "PUT");
+
+        let patch = serde_json::json!({"spec": swapped["spec"]}).to_string();
+        generic_patch(&state, "c1", "application/merge-patch+json", patch.clone()).await;
+        assert_eq!(
+            stored_csr(&state, "c1").await["spec"],
+            before,
+            "merge patch"
+        );
+
+        generic_patch(
+            &state,
+            "c1",
+            "application/apply-patch+yaml",
+            swapped.to_string(),
+        )
+        .await;
+        assert_eq!(stored_csr(&state, "c1").await["spec"], before, "apply");
+    }
+
+    #[tokio::test]
+    async fn approve_then_swap_spec_cannot_yield_an_approved_system_masters_client_csr() {
+        let state = make_state();
+        let signer = "example.com/custom";
+        seed_csr_with(&state, "c1", signer, serde_json::json!({})).await;
+        crate::handlers::test_support::grant_signer_verb(&state, "approver", "approve", signer);
+        approval_put(&state, &user("approver"), "c1")
+            .await
+            .expect("approval on the benign signer");
+
+        let swapped = csr_body("c1", CLIENT_SIGNER, Some("system:masters"));
+        generic_put(&state, "c1", &swapped).await;
+        let patch = serde_json::json!({"spec": swapped["spec"]}).to_string();
+        generic_patch(&state, "c1", "application/merge-patch+json", patch).await;
+
+        let s = stored_csr(&state, "c1").await;
+        assert_eq!(s["status"]["conditions"][0]["type"], "Approved");
+        assert_eq!(
+            s["spec"]["signerName"], signer,
+            "the approved CSR must not become a kube-apiserver-client request"
+        );
+        assert!(
+            s["spec"]["request"] != swapped["spec"]["request"],
+            "the approved request must not be swappable for an O=system:masters one"
         );
     }
 }

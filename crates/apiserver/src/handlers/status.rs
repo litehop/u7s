@@ -146,6 +146,7 @@ pub async fn put_resource_status<S: Store>(
         None
     };
     let svm_before = is_storage_version_migration(&group, &plural).then(|| current.body.clone());
+    let csr_before = super::csr::is_csr(&group, &plural).then(|| current.body.clone());
 
     // Replace status and merge metadata; leave spec and identity fields untouched.
     // Typed dispatch first: a registered built-in kind (see status_dispatch.rs's table for
@@ -177,6 +178,9 @@ pub async fn put_resource_status<S: Store>(
             &current.body,
         )
         .map_err(Status::forbidden)?;
+    }
+    if let Some(ref old) = csr_before {
+        super::csr::guard_csr_status_write(&state, &user, old, &mut current.body)?;
     }
     if let Some(ref old) = svm_before {
         super::storagemigration::validate_status_update(old, &current.body)
@@ -232,6 +236,7 @@ pub async fn patch_resource_status<S: Store>(
         None
     };
     let svm_before = is_storage_version_migration(&group, &plural).then(|| current.body.clone());
+    let csr_before = super::csr::is_csr(&group, &plural).then(|| current.body.clone());
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
     // every other patch type here is JSON.
@@ -307,6 +312,9 @@ pub async fn patch_resource_status<S: Store>(
             &current.body,
         )
         .map_err(Status::forbidden)?;
+    }
+    if let Some(ref old) = csr_before {
+        super::csr::guard_csr_status_write(&state, &user, old, &mut current.body)?;
     }
     if let Some(ref old) = svm_before {
         super::storagemigration::validate_status_update(old, &current.body)

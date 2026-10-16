@@ -5054,6 +5054,7 @@ pub async fn patch_cr_namespaced<S: Store>(
 /// including `.spec` are left unchanged.
 pub async fn put_cr_status<S: Store>(
     State(state): State<AppState<S>>,
+    Extension(user): Extension<UserInfo>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -5108,6 +5109,8 @@ pub async fn put_cr_status<S: Store>(
         current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
     }
 
+    let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
+
     // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
     // Typed dispatch first: a registry-hit built-in kind with a registered status codec
     // (Namespace/CertificateSigningRequest/APIService today) fails a scalar status at
@@ -5138,6 +5141,10 @@ pub async fn put_cr_status<S: Store>(
     }
 
     crate::handlers::status::merge_incoming_metadata(&mut current, &incoming, &kind);
+
+    if let Some(old) = &csr_before {
+        crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
+    }
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
@@ -5242,6 +5249,7 @@ pub async fn get_cr_status<S: Store>(
 /// CRD-backed controller's PATCH to its own `/status` subresource never landed.
 pub async fn patch_cr_status<S: Store>(
     State(state): State<AppState<S>>,
+    Extension(user): Extension<UserInfo>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -5293,6 +5301,8 @@ pub async fn patch_cr_status<S: Store>(
     if let Some(ctx) = &cr_ctx {
         current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
     }
+
+    let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
 
     // apply-patch+yaml bodies are genuine YAML; every other patch type here is JSON.
     let patch: serde_json::Value = if is_ssa {
@@ -5352,6 +5362,10 @@ pub async fn patch_cr_status<S: Store>(
             }
             None => crate::handlers::status::reject_non_object_status(&current["status"])?,
         }
+    }
+
+    if let Some(old) = &csr_before {
+        crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
     }
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
@@ -9048,6 +9062,7 @@ mod tests {
         });
         put_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             Path((
                 HOSTPORT_CRD_GROUP.into(),
                 "v2".into(),
@@ -10732,6 +10747,7 @@ mod tests {
         assert!(
             put_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone(),)),
                 axum::http::HeaderMap::new(),
                 status_body,
@@ -14467,6 +14483,7 @@ mod tests {
         assert!(
             put_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
                 axum::http::HeaderMap::new(),
                 status_put_body,
@@ -14992,6 +15009,7 @@ mod tests {
         assert!(
             put_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
                 axum::http::HeaderMap::new(),
                 Bytes::from(serde_json::json!({ "status": { "ready": false } }).to_string()),
@@ -15182,6 +15200,7 @@ mod tests {
 
         let resp = match patch_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             Path((group.clone(), version.clone(), plural.clone(), name.clone())),
             headers,
             patch_body,
@@ -15246,6 +15265,7 @@ mod tests {
 
         let resp = patch_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             Path((group.clone(), version.clone(), plural.clone(), name.clone())),
             headers,
             patch_body,
@@ -15320,6 +15340,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
                 headers,
                 patch_body,
@@ -15391,6 +15412,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
                 headers,
                 patch_body,
@@ -15438,6 +15460,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "example.io".to_string(),
                     "v1".to_string(),
@@ -15472,6 +15495,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "argoproj.io".to_string(),
                     "v1alpha1".to_string(),
@@ -20677,6 +20701,7 @@ mod tests {
         assert!(
             put_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "example.io".into(),
                     "v1".into(),
@@ -21766,6 +21791,7 @@ mod tests {
         );
         let result = put_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             Path((
                 "example.io".into(),
                 "v1".into(),
@@ -21834,6 +21860,7 @@ mod tests {
         );
         let result = put_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             Path((
                 "example.io".into(),
                 "v1".into(),
@@ -21893,6 +21920,7 @@ mod tests {
         );
         let resp = put_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             Path((
                 "example.io".into(),
                 "v1".into(),
@@ -21979,6 +22007,7 @@ mod tests {
             );
             let result = put_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "example.io".into(),
                     "v1".into(),
@@ -22058,6 +22087,7 @@ mod tests {
         );
         let result = put_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             Path((
                 "example.io".into(),
                 "v1".into(),
@@ -22125,6 +22155,7 @@ mod tests {
         );
         let result = put_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             Path((
                 "certificates.k8s.io".into(),
                 "v1".into(),
@@ -22212,6 +22243,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "certificates.k8s.io".into(),
                     "v1".into(),
@@ -22252,6 +22284,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "certificates.k8s.io".into(),
                     "v1".into(),
@@ -22292,6 +22325,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "certificates.k8s.io".into(),
                     "v1".into(),
@@ -22357,6 +22391,7 @@ mod tests {
         let err = expect_err_status(
             put_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "apiregistration.k8s.io".into(),
                     "v1".into(),
@@ -22399,6 +22434,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "apiregistration.k8s.io".into(),
                     "v1".into(),
@@ -22437,6 +22473,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "apiregistration.k8s.io".into(),
                     "v1".into(),
@@ -22482,6 +22519,7 @@ mod tests {
         let err = expect_err_status(
             patch_cr_status(
                 State(state.clone()),
+                axum::Extension(crate::auth::UserInfo::default()),
                 Path((
                     "apiregistration.k8s.io".into(),
                     "v1".into(),
@@ -22526,6 +22564,7 @@ mod tests {
         );
         let result = put_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             Path((
                 "apiregistration.k8s.io".into(),
                 "v1".into(),
@@ -24383,6 +24422,7 @@ mod tests {
 
         put_cr_status(
             State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
             path(),
             axum::http::HeaderMap::new(),
             body(

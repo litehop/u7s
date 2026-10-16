@@ -195,3 +195,34 @@ pub(crate) async fn install_namespaced_crd(
     .await
     .expect("install CRD");
 }
+
+/// Grant `username` `verb` on `certificates.k8s.io/signers` named `signer_resource_name`
+/// (a signer name, or `<domain>/*`) through the same RBAC index the real authorizer reads.
+pub(crate) fn grant_signer_verb(
+    state: &AppState,
+    username: &str,
+    verb: &str,
+    signer_resource_name: &str,
+) {
+    let id = format!("{username}-{verb}");
+    state.rbac_index.apply_object(
+        &format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{id}"),
+        &serde_json::json!({"rules": [{
+            "apiGroups": ["certificates.k8s.io"],
+            "resources": ["signers"],
+            "resourceNames": [signer_resource_name],
+            "verbs": [verb]
+        }]}),
+    );
+    state.rbac_index.apply_object(
+        &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{id}"),
+        &serde_json::json!({
+            "subjects": [{"kind": "User", "name": username}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": id
+            }
+        }),
+    );
+}

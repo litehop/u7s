@@ -957,12 +957,18 @@ pub(crate) async fn replace_resource<S: Store>(
         }
     }
 
+    if old_object.is_none() && super::csr::is_csr(&group, &plural) {
+        return Err(Status::not_found(&group, &plural, &name));
+    }
     if old_object.is_none() {
         resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
     }
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
+    if let (true, Some(old)) = (super::csr::is_csr(&group, &plural), old_object.as_ref()) {
+        super::csr::preserve_csr_spec(old, &mut obj.body);
+    }
     if let (true, Some(old)) = (
         group == "certificates.k8s.io" && plural == "clustertrustbundles",
         old_object.as_ref(),
@@ -1493,6 +1499,10 @@ pub(crate) async fn do_patch<S: Store>(
         }
         super::defaults::validate_resource(group, plural, &obj.body)
             .map_err(Status::unprocessable_entity)?;
+        let is_csr = super::csr::is_csr(group, plural);
+        if is_csr {
+            super::csr::validate_csr_spec(&obj.body)?;
+        }
         // Escalation prevention: SSA-create is a create just like create_resource /
         // create_namespaced_resource, so it must run the same checks before persisting
         // a ClusterRoleBinding/ClusterRole/RoleBinding — otherwise `kubectl apply
@@ -1568,6 +1578,9 @@ pub(crate) async fn do_patch<S: Store>(
             dry_run,
         };
         obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
+        if is_csr {
+            super::csr::finalize_csr_create(&mut obj.body, user)?;
+        }
         // Re-clear status after mutating webhooks — see create_resource's identical call
         // for why: a webhook can reinject a forged/scalar status the earlier
         // clear_create_status already stripped, and this is the last point before
@@ -2159,8 +2172,8 @@ pub(crate) async fn do_patch<S: Store>(
                 "clustertrustbundles" | "podcertificaterequests"
             ) | ("storagemigration.k8s.io", "storageversionmigrations")
                 | ("resource.k8s.io", "devicetaintrules")
-        ) || super::defaults::generation_tracked_field(group, plural)
-            .is_some();
+        ) || super::csr::is_csr(group, plural)
+            || super::defaults::generation_tracked_field(group, plural).is_some();
         let old_object = if kind_reads_old_object {
             Some(
                 Object::from_bytes(&stored.value)
@@ -2199,6 +2212,9 @@ pub(crate) async fn do_patch<S: Store>(
                 old_or_null,
                 &mut current.body,
             );
+        }
+        if super::csr::is_csr(group, plural) {
+            super::csr::preserve_csr_spec(old_or_null, &mut current.body);
         }
 
         // Escalation prevention: this PATCH merges into an existing Role/ClusterRole/

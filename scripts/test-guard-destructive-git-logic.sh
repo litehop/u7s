@@ -410,6 +410,65 @@ assert "'jq \"(.a | .b)\" f.json' on main is allowed" \
   "$(allowed 'jq "(.a | .b)" f.json' "$MAIN")"
 
 # ---------------------------------------------------------------------------
+# 17. HEAD-moving git in the mayor checkout (CLAUDE_PROJECT_DIR=$MAIN makes
+#     $MAIN the mayor). A reviewer's `git checkout <pr-commit>` there left the
+#     mayor on a worker branch; reviewers must read via fetch/show/diff or a
+#     scratch worktree. The mayor's own ff-only sync and `checkout main` stay.
+# ---------------------------------------------------------------------------
+git -C "$MAIN" branch pr-ref main
+declare -a HEAD_BLOCKED=(
+  "git checkout pr-ref"
+  "git checkout $(git -C "$MAIN" rev-parse HEAD)"
+  "git checkout --detach main"
+  "git checkout -b review main"
+  "git switch pr-ref"
+  "git switch -c review"
+  "git merge pr-ref"
+  "git pull"
+  "git reset --soft HEAD~1"
+  "git reset HEAD"
+  "git rebase main"
+  "git cherry-pick pr-ref"
+  "git revert HEAD"
+  "git am x.patch"
+  "git -C $MAIN checkout pr-ref"
+)
+for cmd in "${HEAD_BLOCKED[@]}"; do
+  assert "'$cmd' in the mayor checkout is refused -- it moves the mayor off main, which silently misdirects every later mayor command" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "$cmd" "$MAIN")"
+done
+assert "'git -C <mayor> checkout pr-ref' from a worker cwd is refused -- -C must not launder the target" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git -C $MAIN checkout pr-ref" "$WORKER")"
+assert "'git checkout pr-ref' on a main-branch repo that is NOT the mayor checkout stays allowed -- the new clause applies to the mayor checkout only" \
+  "$(CLAUDE_PROJECT_DIR="$FRESH_STANDALONE" allowed "git checkout pr-ref" "$MAIN")"
+
+declare -a HEAD_ALLOWED=(
+  "git fetch origin main"
+  "git show HEAD:a.txt"
+  "git diff main..pr-ref"
+  "git log --oneline -3"
+  "git status"
+  "git branch --list"
+  "git rev-parse HEAD"
+  "git worktree list"
+  "git worktree add $SANDBOX_ROOT/scratch-wt pr-ref"
+  "git pull --ff-only"
+  "git merge --ff-only origin/main"
+  "git checkout main"
+  "git switch main"
+  "git restore --staged a.txt"
+  "git -C $WORKER checkout pr-ref"
+)
+for cmd in "${HEAD_ALLOWED[@]}"; do
+  assert "'$cmd' in the mayor checkout is allowed -- read-only inspection and the mayor's own ff-only sync must keep working" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$MAIN")"
+done
+for cmd in "git checkout pr-ref" "git switch pr-ref" "git merge pr-ref" "git reset --soft HEAD~1" "git rebase main" "git cherry-pick pr-ref"; do
+  assert "'$cmd' inside a worker worktree is allowed -- workers move their own HEAD constantly" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$WORKER")"
+done
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

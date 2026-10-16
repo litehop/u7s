@@ -5,7 +5,9 @@
 # list/show/apply/branch (including a bare `git stash -u` with no
 # subcommand word at all), clean -f*, switch -f/--discard-changes) when
 # the target repo is on branch `main` or is the mayor checkout. This is a
-# string-match guardrail, not a sandbox.
+# string-match guardrail, not a sandbox. It also refuses HEAD-moving git
+# (checkout/switch to a ref other than main, reset, rebase, cherry-pick,
+# revert, am, non-ff merge/pull) in the mayor checkout itself.
 #
 # Hook input arrives as JSON on stdin: {cwd, tool_input: {command, ...}}.
 # Missing/unparseable input fails OPEN (exit 0) so a hook bug can never
@@ -173,12 +175,62 @@ is_destructive_git_args() {
   esac
 }
 
+is_mayor_checkout() {
+  # is_mayor_checkout <dir> -- true if <dir>'s worktree root is exactly the
+  # mayor checkout (MAIN_ROOT), whatever branch it is on.
+  local toplevel
+  toplevel=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null || true)
+  [ -n "${MAIN_ROOT:-}" ] && [ -n "$toplevel" ] && [ "$toplevel" = "$MAIN_ROOT" ]
+}
+
+is_head_moving_args() {
+  # is_head_moving_args <args> -- true for git commands that move HEAD or
+  # rewrite the index/worktree of the mayor checkout and that the mayor never
+  # needs: checkout/switch to anything but `main`, reset in any mode, rebase,
+  # cherry-pick, revert, am, and merge/pull that are not --ff-only. Hook input
+  # does not reliably tell a subagent's Bash call from the mayor's own, so
+  # the mayor's `pull --ff-only` / `merge --ff-only` / `checkout main` stay
+  # allowed for everyone.
+  local args="$1" first tok npos=0
+  first=$(printf '%s\n' "$args" | awk '{print $1}')
+  is_bead_export_discard "$args" && return 1
+  case "$first" in
+    reset|rebase|cherry-pick|revert|am) return 0 ;;
+    merge|pull)
+      printf '%s' "$args" | grep -qE '(^|[[:space:]])--ff-only([[:space:]]|$)' && return 1
+      return 0
+      ;;
+    checkout|switch)
+      for tok in ${args#"$first"}; do
+        case "$tok" in
+          --) return 1 ;;
+          -*) return 0 ;;
+        esac
+        [ "$tok" = main ] || return 0
+        npos=$(( npos + 1 ))
+      done
+      [ "$npos" = 1 ] && return 1
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 BLOCK_MSG_TEMPLATE='BLOCKED: destructive git command against a protected branch/checkout.
   command: %s
   target : %s
 Use a scratch worktree instead:
   git worktree add temp/review-scratch/<name> <ref>
   git -C temp/review-scratch/<name> <command>
+'
+
+HEAD_MSG_TEMPLATE='BLOCKED: HEAD/index-changing git command in the mayor checkout.
+  command: %s
+  target : %s
+Read PR code without moving the mayor checkout:
+  gh pr diff <n>
+  git fetch origin <branch>; git show <ref>:<path>; git diff <a>..<b>
+  git worktree add temp/review-scratch/<name> <ref>; git -C temp/review-scratch/<name> <command>
 '
 
 check_command() {
@@ -247,6 +299,11 @@ check_command() {
     if { [ "$has_alias" = 1 ] || is_destructive_git_args "$rest" "$target_dir"; } && is_target_protected "$target_dir"; then
       # shellcheck disable=SC2059
       printf "$BLOCK_MSG_TEMPLATE" "$seg" "$target_dir" >&2
+      return 2
+    fi
+    if is_head_moving_args "$rest" && is_mayor_checkout "$target_dir"; then
+      # shellcheck disable=SC2059
+      printf "$HEAD_MSG_TEMPLATE" "$seg" "$target_dir" >&2
       return 2
     fi
   done <<< "$(printf '%s' "$cmd" | sed -E "s/(\\\$\\(|\`)[[:space:]]*(git[[:space:]]+(rev-parse|rev-list|describe|merge-base))/\\
