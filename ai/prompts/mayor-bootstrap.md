@@ -65,7 +65,11 @@ other in-flight workers and their write surfaces so the receiver pattern-matches
 for collisions; explicit "do not edit the mayor checkout" and "do not merge PRs";
 require tests + final report (changed files, commands run, branch/PR, risks).
 Workers never close their bead: they leave it in_progress with a
-`bd note <id> "PR #N opened: <url>"`.
+`bd note <id> "PR #N opened: <url>"` (or `"PR #N opened (partial: <what's
+left>): <url>"` when the PR does only part of the bead). mayor-tick closes a
+bead on merge only for a complete-form note matching that PR number; epics,
+beads with open children, partial PRs and beads without the note are never
+auto-closed, so close those by hand when needed.
 Before dispatching, run `scripts/bead-premise-check.sh <bead-id>`. Exit 0
 (still-broken) — proceed with dispatch. Exit 1 (no-longer-broken) — the
 alleged broken symbol/missing file/stale convention already landed; close

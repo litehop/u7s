@@ -130,7 +130,10 @@ gh pr create --title "..." --body "..."
 # Use --squash only for branches with many noisy debug/CI-fixup commits. Never --rebase.
 
 # 8. Leave the bead in_progress and note the PR. Never `bd close`: the
-# mayor closes beads when the PR merges.
+# The tick script closes the bead on merge only if this note says the PR completes
+# it. If the PR does only part of the bead, write the partial form instead and
+# the bead is never auto-closed:
+#   bd note <id> "PR #N opened (partial: <what's left>): <url>"
 bd note <id> "PR #N opened: <url>"
 ```
 

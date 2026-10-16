@@ -1562,7 +1562,9 @@ B="mayo""r-"
 # $1=case name, $2=JSON array of merged PRs the fake gh returns for the merged
 # search, rest = "<bead-id>=<status>" pairs the fake bd reports. Builds the
 # stubs once; BEAD_BIN/BEAD_DB/BEAD_CLOSE_LOG are then reused across ticks.
-# A `$BEAD_DB/FAIL` file makes the fake `bd close` fail.
+# A `$BEAD_DB/FAIL` file makes the fake `bd close` fail. Extra pairs
+# "<id>.notes=<text>", "<id>.type=<type>" and "<id>.children=<open count>"
+# feed the fake `bd show` / `bd children`.
 setup_bead_stubs() {
   local name="$1" prs="$2" pair; shift 2
   BEAD_BIN="$WORKDIR/stub-bead-$name"; BEAD_DB="$WORKDIR/bead-db-$name"
@@ -1583,7 +1585,13 @@ EOF
   cat > "$BEAD_BIN/bd" <<EOF
 #!/usr/bin/env bash
 case "\$1" in
-  show) [ -f "$BEAD_DB/\$2" ] || exit 1; printf '[{"id":"%s","status":"%s"}]' "\$2" "\$(cat "$BEAD_DB/\$2")" ;;
+  show) [ -f "$BEAD_DB/\$2" ] || exit 1
+        jq -nc --arg id "\$2" --arg st "\$(cat "$BEAD_DB/\$2")" \\
+          --arg notes "\$(cat "$BEAD_DB/\$2.notes" 2>/dev/null)" \\
+          --arg type "\$(cat "$BEAD_DB/\$2.type" 2>/dev/null || echo task)" \\
+          '[{id:\$id,status:\$st,notes:\$notes,issue_type:\$type}]' ;;
+  children) n=\$(cat "$BEAD_DB/\$2.children" 2>/dev/null || echo 0)
+            jq -nc --argjson n "\$n" '[range(\$n) | {status:"open"}] + [{status:"closed"}]' ;;
   close) [ -f "$BEAD_DB/FAIL" ] && exit 1
          printf '%s\n' "\$*" >> "$BEAD_CLOSE_LOG"; printf closed > "$BEAD_DB/\$2" ;;
   *) exit 1 ;;
@@ -1601,7 +1609,8 @@ bead_tick() {
 # on a worker/agent-* worktree (e.g. a PR from a hand-named branch).
 setup_bead_stubs merged \
   "[{\"number\":4242,\"title\":\"feat(x): thing (${B}aaa1, ${B}bbb2.3)\",\"mergeCommit\":{\"oid\":\"abcdef0123456789\"}}]" \
-  ${B}aaa1=in_progress ${B}bbb2.3=open
+  ${B}aaa1=in_progress ${B}bbb2.3=open \
+  "${B}aaa1.notes=PR #4242 opened: https://x/4242" "${B}bbb2.3.notes=PR #4242 opened: https://x/4242"
 bead_tick
 assert "a merged PR with no worker worktree closes every bead ID in its title, dotted child IDs included, citing PR and merge sha" \
   "$([ "$(sort "$BEAD_CLOSE_LOG")" = "$(printf 'close %saaa1 --reason merged in #4242 (abcdef0123)\nclose %sbbb2.3 --reason merged in #4242 (abcdef0123)' "$B" "$B")" ] && echo 1 || echo 0)"
@@ -1614,14 +1623,15 @@ assert "the scan asks gh only for MERGED PRs since the 3-day lookback, with a li
 
 setup_bead_stubs skip \
   "[{\"number\":11,\"title\":\"fix: y (${B}ccc3, ${B}ddd4)\",\"mergeCommit\":{\"oid\":\"1111111111\"}},{\"number\":12,\"title\":\"chore(deps): update renovate\",\"mergeCommit\":{\"oid\":\"2222222222\"}},{\"number\":13,\"title\":\"feat: z x${B}eee5\",\"mergeCommit\":{\"oid\":\"3333333333\"}}]" \
-  ${B}ccc3=closed ${B}ddd4=in_progress ${B}eee5=in_progress
+  ${B}ccc3=closed ${B}ddd4=in_progress ${B}eee5=in_progress \
+  "${B}ddd4.notes=PR #11 opened: u" "${B}eee5.notes=PR #13 opened: u"
 bead_tick
 assert "an already-closed bead is skipped while its open sibling closes; a no-bead-ID PR is a no-op; an ID glued to a word (x<id>) is not matched" \
   "$([ "$(cat "$BEAD_CLOSE_LOG")" = "close ${B}ddd4 --reason merged in #11 (1111111111)" ] && echo 1 || echo 0)"
 
 setup_bead_stubs fail \
   "[{\"number\":21,\"title\":\"feat: w (${B}fff6)\",\"mergeCommit\":{\"oid\":\"4444444444\"}}]" \
-  ${B}fff6=in_progress
+  ${B}fff6=in_progress "${B}fff6.notes=PR #21 opened: u"
 touch "$BEAD_DB/FAIL"
 bead_tick
 assert "a failed bd close exits 20 so the mayor sees it" \
@@ -1640,6 +1650,25 @@ setup_bead_stubs missing \
 bead_tick
 assert "a bead ID unknown to bd is logged and neither closed nor treated as a failure" \
   "$([ ! -s "$BEAD_CLOSE_LOG" ] && [ "$TICK_RC" -eq 0 ] && echo 1 || echo 0)"
+
+# A PR title cannot tell a completing PR from a partial one, so only a worker
+# note for THIS PR number authorises the close. Wrongly closing a bead with
+# remaining work hides it from `bd ready` and the dashboard.
+setup_bead_stubs gate \
+  "[{\"number\":51,\"title\":\"feat: a (${B}ok01, ${B}oth02, ${B}par03, ${B}pre04, ${B}epi05, ${B}kid06, ${B}pre12)\",\"mergeCommit\":{\"oid\":\"6666666666\"}}]" \
+  ${B}ok01=in_progress ${B}oth02=in_progress ${B}par03=in_progress ${B}pre04=in_progress \
+  ${B}epi05=open ${B}kid06=in_progress ${B}pre12=in_progress \
+  "${B}ok01.notes=PR #51 opened: https://x/51" \
+  "${B}oth02.notes=PR #5 opened: https://x/5" \
+  "${B}par03.notes=PR #51 opened (partial: item 2 left): https://x/51" \
+  "${B}epi05.notes=PR #51 opened: https://x/51" "${B}epi05.type=epic" \
+  "${B}kid06.notes=PR #51 opened: https://x/51" "${B}kid06.children=2" \
+  "${B}pre12.notes=PR #512 opened: https://x/512"
+bead_tick
+assert "only the bead whose note says this PR completed it closes; other-PR-number, partial, no-note (pre-convention), epic, open-children and PR-number-prefix (#512 vs #51) beads stay open" \
+  "$([ "$(cat "$BEAD_CLOSE_LOG")" = "close ${B}ok01 --reason merged in #51 (6666666666)" ] && echo 1 || echo 0)"
+assert "...and skipping them is quiet: exit 0 with no gate exception (an epic close attempt used to raise bead-close-failed)" \
+  "$([ "$TICK_RC" -eq 0 ] && [ "$(jq '.gate_exceptions | length' "$TICK_STATE")" = "0" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

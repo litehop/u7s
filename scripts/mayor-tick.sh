@@ -718,17 +718,36 @@ extract_bead_ids() {
     | sed -E 's/^[^m]*//' | sort -u
 }
 
-# Beads close when their PR merges. IDs come from the PR title only (bodies
-# carry no reliable bead line). A close failure is recorded as a gate
+# Beads close when their PR merges, but only if the worker declared the PR
+# complete for the bead: a note line "PR #N opened" for THIS PR without
+# "(partial". A PR title alone cannot tell a completing PR from a partial one,
+# so beads without the note (including all pre-convention PRs), epics and beads
+# with open children are never closed here; the mayor closes those by hand.
+# IDs come from the PR title only. A close failure is recorded as a gate
 # exception (exit 20); the scan repeats every tick, so it retries naturally.
 close_merged_pr_beads() {
-  local num="$1" title="$2" sha="$3" id status
+  local num="$1" title="$2" sha="$3" id show status type notes
   for id in $(extract_bead_ids "$title"); do
-    status=$(bd show "$id" --json 2>/dev/null | jq -r '.[0].status // empty' 2>/dev/null || true)
+    show=$(bd show "$id" --json 2>/dev/null || true)
+    status=$(printf '%s' "$show" | jq -r '.[0].status // empty' 2>/dev/null || true)
     case "$status" in
       closed) continue ;;
       "") echo "mayor-tick: bead $id not found, not closing (PR #$num)"; continue ;;
     esac
+    type=$(printf '%s' "$show" | jq -r '.[0].issue_type // empty' 2>/dev/null || true)
+    if [ "$type" = "epic" ]; then
+      echo "mayor-tick: bead $id is an epic, not auto-closing (PR #$num)"; continue
+    fi
+    if [ "$(bd children "$id" --json 2>/dev/null | jq '[.[]? | select(.status != "closed")] | length' 2>/dev/null || echo 0)" != "0" ]; then
+      echo "mayor-tick: bead $id has open children, not auto-closing (PR #$num)"; continue
+    fi
+    notes=$(printf '%s' "$show" | jq -r '.[0].notes // ""' 2>/dev/null | { grep -E "PR #${num} opened([^0-9]|\$)" || true; })
+    if [ -z "$notes" ]; then
+      echo "mayor-tick: bead $id has no 'PR #$num opened' note, not auto-closing"; continue
+    fi
+    if printf '%s' "$notes" | grep -q '(partial'; then
+      echo "mayor-tick: bead $id marked partial by PR #$num, not auto-closing"; continue
+    fi
     if run_cmd bd close "$id" --reason "merged in #$num ($sha)" >/dev/null 2>&1; then
       echo "mayor-tick: closed bead $id (merged in #$num, $sha)"
     else
