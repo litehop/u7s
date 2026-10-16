@@ -1945,7 +1945,10 @@ pub(crate) async fn do_patch<S: Store>(
                 let rbac_key = rbac_namespaced_key(group, version, namespace, plural, name);
                 state.rbac_index.apply_object(&rbac_key, &obj.body);
             }
-            Some(_) => {}
+            Some(namespace) => {
+                let info = rs_revision_info(group, plural, &obj.body);
+                propagate_rs_revision_to_deployment(state, &info, namespace).await;
+            }
         }
         // ResourceQuota: refresh status.used so a count/* quota's usage reflects this
         // SSA-create, matching create_namespaced_resource's own update_quota_status call.
@@ -3445,17 +3448,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     // Capture RS revision propagation info BEFORE ns_meta processing drops ownerReferences.
     // ObjectMeta serde drops unknown fields (including ownerReferences), so we must extract
     // what we need from obj.body before it's overwritten.
-    let rs_revision_info: Option<(String, serde_json::Value)> =
-        if group == "apps" && plural == "replicasets" {
-            let revision = obj.body["metadata"]["annotations"]["deployment.kubernetes.io/revision"]
-                .as_str()
-                .filter(|r| !r.is_empty())
-                .map(|r| r.to_string());
-            let owner_refs = obj.body["metadata"]["ownerReferences"].clone();
-            revision.map(|r| (r, owner_refs))
-        } else {
-            None
-        };
+    let rs_revision_info = rs_revision_info(&group, &plural, &obj.body);
 
     let mut ns_meta: ObjectMeta =
         ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
@@ -3719,6 +3712,23 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         resp.headers_mut().insert(axum::http::header::WARNING, hv);
     }
     Ok(resp)
+}
+
+/// The `(revision, ownerReferences)` of a ReplicaSet being created with the
+/// `deployment.kubernetes.io/revision` annotation, for [`propagate_rs_revision_to_deployment`].
+fn rs_revision_info(
+    group: &str,
+    plural: &str,
+    body: &serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
+    if group != "apps" || plural != "replicasets" {
+        return None;
+    }
+    let revision = body["metadata"]["annotations"]["deployment.kubernetes.io/revision"]
+        .as_str()
+        .filter(|r| !r.is_empty())?
+        .to_string();
+    Some((revision, body["metadata"]["ownerReferences"].clone()))
 }
 
 /// When KCM creates a ReplicaSet with `deployment.kubernetes.io/revision` annotation
@@ -18840,6 +18850,118 @@ mod tests {
              KCM 1.36 sets the annotation on the RS body before POST but never subsequently \
              PATCHes the Deployment; without our propagation the annotation stays null and \
              the AdmissionWebhook conformance test BeforeEach times out"
+        );
+    }
+
+    /// A ReplicaSet created by `kubectl apply --server-side` must propagate the revision
+    /// annotation to its owning Deployment exactly as a POST does; otherwise the Deployment
+    /// never gets `deployment.kubernetes.io/revision` and clients waiting on it hang.
+    #[tokio::test]
+    async fn rs_ssa_create_propagates_revision_annotation_to_owning_deployment() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let ns = "default";
+        let template = serde_json::json!({
+            "metadata": {"labels": {"app": "myapp"}},
+            "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+        });
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": ns},
+            "spec": {
+                "selector": {"matchLabels": {"app": "myapp"}},
+                "template": template
+            }
+        });
+        let mut json_hdrs = axum::http::HeaderMap::new();
+        json_hdrs.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let _ = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "deployments".to_string(),
+            )),
+            axum::extract::Query(super::super::json_patch::CreateQuery::default()),
+            test_user(),
+            json_hdrs,
+            bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Deployment create must succeed: {e:?}"))
+        .into_response();
+        let deploy_key = format!("/registry/apps/deployments/{ns}/web");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&store.get(&deploy_key).await.unwrap().expect("stored").value)
+                .unwrap();
+        let deploy_uid = stored["metadata"]["uid"].as_str().unwrap().to_string();
+
+        let rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "web-79d557df97",
+                "namespace": ns,
+                "annotations": {"deployment.kubernetes.io/revision": "1"},
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1", "kind": "Deployment", "name": "web",
+                    "uid": deploy_uid, "controller": true, "blockOwnerDeletion": true
+                }]
+            },
+            "spec": {
+                "selector": {"matchLabels": {"app": "myapp"}},
+                "template": template
+            }
+        });
+        let mut apply_hdrs = axum::http::HeaderMap::new();
+        apply_hdrs.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        let resp = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "replicasets".to_string(),
+                "web-79d557df97".to_string(),
+            )),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("kcm".into()),
+                ..Default::default()
+            }),
+            test_user(),
+            apply_hdrs,
+            bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ReplicaSet SSA create must succeed: {e:?}"))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let after: serde_json::Value =
+            serde_json::from_slice(&store.get(&deploy_key).await.unwrap().expect("stored").value)
+                .unwrap();
+        assert_eq!(
+            after["metadata"]["annotations"]["deployment.kubernetes.io/revision"], "1",
+            "an SSA-created ReplicaSet must propagate its revision to the owning Deployment \
+             like a POST does, else the Deployment never reports its revision"
         );
     }
 
