@@ -62,20 +62,23 @@ fn url_matches(have: &[&str], want: &str) -> bool {
         .any(|h| *h == want || h.strip_suffix('*').is_some_and(|p| want.starts_with(p)))
 }
 
-/// True when every (group, resource, verb[, name]) / (url, verb) tuple granted by `rule` is
-/// granted by some single rule in `have`.
+/// True when every (group, resource, verb[, name]) and every (url, verb) tuple granted by `rule`
+/// is granted by some single rule in `have`. Like upstream's `Covers`, a rule carrying both
+/// resources and nonResourceURLs is split into both kinds of tuples and all must be covered.
 fn rules_cover(have: &[Value], rule: &Value) -> bool {
     let verbs = strs(rule, "verbs");
     let urls = strs(rule, "nonResourceURLs");
-    if !urls.is_empty() {
-        return urls.iter().all(|url| {
-            verbs.iter().all(|verb| {
-                have.iter().any(|h| {
-                    url_matches(&strs(h, "nonResourceURLs"), url)
-                        && wildcard_or_eq(&strs(h, "verbs"), verb)
-                })
+    let urls_covered = urls.iter().all(|url| {
+        verbs.iter().all(|verb| {
+            have.iter().any(|h| {
+                url_matches(&strs(h, "nonResourceURLs"), url)
+                    && wildcard_or_eq(&strs(h, "verbs"), verb)
+                    && strs(h, "resourceNames").is_empty()
             })
-        });
+        })
+    });
+    if !urls_covered {
+        return false;
     }
     let groups = strs(rule, "apiGroups");
     let resources = strs(rule, "resources");
@@ -440,6 +443,39 @@ mod tests {
             reconcile(&existing, &expected),
             Reconciled::Update(..)
         ));
+    }
+
+    #[test]
+    fn mixed_resource_and_url_rule_is_not_covered_by_url_grant_alone() {
+        let url_only = json!({ "nonResourceURLs": ["/healthz"], "verbs": ["get"] });
+        let mixed = json!({
+            "apiGroups": [""], "resources": ["pods"], "nonResourceURLs": ["/healthz"], "verbs": ["get"]
+        });
+        let existing = stamped(role(json!([url_only])));
+        let expected = stamped(role(json!([mixed])));
+        let Reconciled::Update(obj, _) = reconcile(&existing, &expected) else {
+            panic!("pods/get is ungranted, so the role must be updated");
+        };
+        assert!(
+            obj["rules"].as_array().unwrap().contains(&mixed),
+            "checking only the URL half would silently skip adding a bootstrap role's resource grant on upgrade"
+        );
+    }
+
+    #[test]
+    fn mixed_rule_is_covered_when_each_half_is_granted() {
+        let mixed = json!({
+            "apiGroups": [""], "resources": ["pods"], "nonResourceURLs": ["/healthz"], "verbs": ["get"]
+        });
+        let existing = stamped(role(json!([
+            pods_get(),
+            { "nonResourceURLs": ["/healthz*"], "verbs": ["*"] }
+        ])));
+        assert_eq!(
+            reconcile(&existing, &stamped(role(json!([mixed])))),
+            Reconciled::Unchanged,
+            "fully granted halves must not append a duplicate rule on every restart"
+        );
     }
 
     #[test]
