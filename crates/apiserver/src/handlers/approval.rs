@@ -42,6 +42,20 @@ const GROUP: &str = "certificates.k8s.io";
 const PLURAL: &str = "certificatesigningrequests";
 const KIND: &str = "CertificateSigningRequest";
 
+fn record_approval_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    after: &mut serde_json::Value,
+) {
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        after,
+        "certificates.k8s.io/v1",
+        Some("approval"),
+        None,
+    );
+}
+
 /// PUT /apis/certificates.k8s.io/v1/certificatesigningrequests/{name}/approval
 ///
 /// Merges `status.conditions` and `metadata` (labels/annotations) from the
@@ -84,6 +98,7 @@ pub async fn put_approval<S: Store>(
         &crate::util::utc_now_rfc3339(),
     );
     merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+    record_approval_write(&headers, &old_body, &mut current.body);
 
     // Dry-run: return the would-be approval object without persisting — mirrors
     // put_resource_status's dry-run early-return.
@@ -211,6 +226,8 @@ pub async fn patch_approval<S: Store>(
             }
         }
     }
+
+    record_approval_write(&headers, &old_body, &mut current.body);
 
     // Dry-run: return the would-be patched approval object without persisting —
     // mirrors put_approval's dry-run early-return above.
@@ -1692,5 +1709,107 @@ mod tests {
         let c = &v["status"]["conditions"][0];
         assert!(c["lastUpdateTime"].is_string());
         assert!(c["lastTransitionTime"].is_string());
+    }
+
+    /// A created CSR names its creator in managedFields, so a later apply by another tool
+    /// sees who owns the spec fields it would overwrite.
+    #[tokio::test]
+    async fn csr_create_records_the_creator_as_an_update_manager() {
+        use base64::Engine;
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let pem = rcgen::CertificateParams::default()
+            .serialize_request(&key_pair)
+            .unwrap()
+            .pem()
+            .unwrap();
+        let body = json!({
+            "apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+            "metadata": {"name": "created-csr"},
+            "spec": {"request": base64::engine::general_purpose::STANDARD.encode(pem),
+                     "signerName": "kubernetes.io/kube-apiserver-client",
+                     "usages": ["client auth"]}
+        });
+        let state = make_state();
+        let mut headers = json_headers();
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_static("csr-creator/1.0"),
+        );
+        let resp = super::super::csr::create_csr(
+            axum::extract::State(state.clone()),
+            Extension(UserInfo {
+                username: "admin".into(),
+                ..Default::default()
+            }),
+            headers,
+            bytes::Bytes::from(body.to_string()),
+        )
+        .await
+        .map_err(|_| ())
+        .expect("create_csr must succeed")
+        .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let m = &v["metadata"]["managedFields"][0];
+        assert_eq!(m["manager"], "csr-creator", "{v}");
+        assert_eq!(m["operation"], "Update");
+        assert!(m["fieldsV1"]["f:spec"]["f:signerName"].is_object(), "{v}");
+    }
+
+    /// An approver's PUT and PATCH on /approval must each be recorded as an `approval`
+    /// subresource Update, so an apply by another tool is not blind to who set the conditions.
+    #[tokio::test]
+    async fn approval_put_and_patch_record_their_writer_under_the_approval_subresource() {
+        let state = make_state();
+        seed_csr(&state.store, "own-csr", None).await;
+        let key = "/registry/certificates.k8s.io/certificatesigningrequests/own-csr";
+        let managers = |v: &serde_json::Value, name: &str| {
+            v["metadata"]["managedFields"]
+                .as_array()
+                .and_then(|a| a.iter().find(|m| m["manager"] == name).cloned())
+        };
+        let ua_headers = |ct: &'static str, ua: &'static str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(ct),
+            );
+            h.insert(
+                axum::http::header::USER_AGENT,
+                axum::http::HeaderValue::from_static(ua),
+            );
+            h
+        };
+
+        let put_body = json!({"metadata": {"name": "own-csr", "annotations": {"by": "put"}},
+            "status": {"conditions": [{"type": "Approved", "status": "True"}]}});
+        put_approval(
+            axum::extract::State(state.clone()),
+            approver(&state),
+            axum::extract::Path("own-csr".to_owned()),
+            ua_headers("application/json", "put-approver/1.0"),
+            bytes::Bytes::from(put_body.to_string()),
+        )
+        .await
+        .expect("PUT /approval must succeed");
+        patch_approval(
+            axum::extract::State(state.clone()),
+            approver(&state),
+            axum::extract::Path("own-csr".to_owned()),
+            ua_headers("application/merge-patch+json", "patch-approver/1.0"),
+            bytes::Bytes::from(r#"{"metadata":{"annotations":{"by":"patch"}}}"#),
+        )
+        .await
+        .expect("PATCH /approval must succeed");
+
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        for who in ["put-approver", "patch-approver"] {
+            let m = managers(&v, who).unwrap_or_else(|| panic!("{who} not recorded: {v}"));
+            assert_eq!(m["operation"], "Update");
+            assert_eq!(m["subresource"], "approval");
+        }
     }
 }

@@ -122,6 +122,8 @@ pub struct CrdMetadata {
     pub finalizers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_fields: Option<serde_json::Value>,
 }
 
 fn is_zero(n: &i64) -> bool {
@@ -385,6 +387,25 @@ fn new_uid() -> String {
     // would collide, and the value was predictable (no entropy). Kubernetes
     // expects UIDs in UUID string format (RFC 4122).
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Record the writer of a non-apply write as owner of every field it changed from `before`
+/// (`Value::Null` for a create).
+fn record_crd_write(
+    headers: &HeaderMap,
+    before: &serde_json::Value,
+    crd: &mut CustomResourceDefinition,
+) -> Result<(), crate::status::StatusError> {
+    let mut after = serde_json::to_value(&*crd).map_err(|e| Status::internal(e.to_string()))?;
+    crate::field_manager::WriteIdentity::new(None, headers).record(
+        before,
+        &mut after,
+        API_VERSION,
+        None,
+        None,
+    );
+    crd.metadata.managed_fields = after["metadata"].get("managedFields").cloned();
+    Ok(())
 }
 
 fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::StatusError> {
@@ -664,6 +685,7 @@ pub async fn create_crd<S: Store>(
     let crd = parse_crd(&body)?;
     let name = crd.metadata.name.clone();
     let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
+    record_crd_write(&headers, &serde_json::Value::Null, &mut crd)?;
 
     // Dry-run: validation and admission passed; return the would-be created CRD without
     // persisting — mirrors create_resource's dry-run early-return in resource.rs.
@@ -824,6 +846,7 @@ pub async fn replace_crd<S: Store>(
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
     prepare_crd_generation_for_update(&existing, &mut crd);
+    record_crd_write(&headers, &existing, &mut crd)?;
 
     // Dry-run: validation and admission passed; return the would-be replaced CRD without
     // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
@@ -1451,6 +1474,7 @@ pub async fn patch_crd<S: Store>(
     // matching upstream: those patch types have no create-on-missing semantics.
     if is_ssa && stored_opt.is_none() {
         let mut body_json = ssa_body_to_json(&body)?;
+        crate::handlers::json_patch::strip_managed_fields(&mut body_json);
         // The URL name is authoritative for what gets created, regardless of what (if anything)
         // the apply body's metadata.name says — mirrors do_patch's obj_meta.name override.
         body_json["metadata"]["name"] = serde_json::Value::String(name.clone());
@@ -1501,12 +1525,15 @@ pub async fn patch_crd<S: Store>(
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
-    let patch: serde_json::Value = if is_ssa {
+    let mut patch: serde_json::Value = if is_ssa {
         ssa_body_to_json(&body)?
     } else {
         serde_json::from_slice(&body)
             .map_err(|e| Status::unprocessable_entity(format!("invalid patch: {e}")))?
     };
+    if is_ssa {
+        crate::handlers::json_patch::strip_managed_fields(&mut patch);
+    }
 
     match patch_type {
         PatchType::Merge | PatchType::StrategicMerge => {
@@ -1581,6 +1608,9 @@ pub async fn patch_crd<S: Store>(
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
     prepare_crd_generation_for_update(&existing, &mut crd);
+    if !is_ssa {
+        record_crd_write(&headers, &existing, &mut crd)?;
+    }
 
     // Dry-run: validation and admission passed; return the would-be patched CRD without
     // persisting — mirrors do_patch's dry-run early-return in resource.rs.
@@ -1648,6 +1678,7 @@ pub async fn put_crd_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    let before_write = current.body.clone();
     // `_dynamic`, not the built-in `replace_status_field`: a scalar status here is caught
     // by structural-schema validation (422), not a typed decode failure (400) — see
     // replace_status_field_dynamic's doc comment.
@@ -1657,6 +1688,13 @@ pub async fn put_crd_status<S: Store>(
     )?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+    crate::handlers::status::record_status_write(
+        &headers,
+        &before_write,
+        &mut current.body,
+        GROUP,
+        "v1",
+    );
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
@@ -1698,6 +1736,8 @@ pub async fn patch_crd_status<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let before_write = current.body.clone();
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
     // every other patch type here is JSON.
@@ -1743,6 +1783,13 @@ pub async fn patch_crd_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     crate::handlers::status::reject_non_object_status(&current.body["status"])?;
+    crate::handlers::status::record_status_write(
+        &headers,
+        &before_write,
+        &mut current.body,
+        GROUP,
+        "v1",
+    );
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
@@ -6209,5 +6256,160 @@ mod ratchet_tests {
             "releasing the last instance finalizer must wake the finalizer without waiting \
              for a poll, or `kubectl delete crd` hangs"
         );
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::tests::minimal_crd_bytes_with_group;
+    use super::*;
+    use crate::handlers::test_support::make_state;
+    use axum::http::{header, HeaderValue};
+
+    const NAME: &str = "widgets.example.com";
+
+    fn user() -> axum::Extension<UserInfo> {
+        axum::Extension(UserInfo {
+            username: "admin".into(),
+            ..Default::default()
+        })
+    }
+
+    fn headers(content_type: &'static str, user_agent: &'static str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        h.insert(header::USER_AGENT, HeaderValue::from_static(user_agent));
+        h
+    }
+
+    async fn stored(state: &AppState<u7s_store::SqliteStore>) -> serde_json::Value {
+        let s = state.store.get(&store_key(NAME)).await.unwrap().unwrap();
+        serde_json::from_slice(&s.value).unwrap()
+    }
+
+    fn owner<'a>(
+        obj: &'a serde_json::Value,
+        manager: &str,
+        subresource: Option<&str>,
+    ) -> Option<&'a serde_json::Value> {
+        obj["metadata"]["managedFields"]
+            .as_array()?
+            .iter()
+            .find(|m| m["manager"] == manager && m["subresource"].as_str() == subresource)
+    }
+
+    async fn seed(state: &AppState<u7s_store::SqliteStore>) {
+        create_crd(
+            axum::extract::State(state.clone()),
+            user(),
+            headers("application/json", "creator/1.0"),
+            minimal_crd_bytes_with_group(NAME, "example.com", "widgets"),
+        )
+        .await
+        .map_err(|_| ())
+        .expect("create");
+    }
+
+    /// Every non-apply CRD write must name its writer in managedFields, or a later apply by
+    /// another tool sees no owner for the field and overwrites or deletes it unchallenged.
+    #[tokio::test]
+    async fn crd_create_replace_patch_and_status_writes_record_their_writer() {
+        let state = make_state();
+        seed(&state).await;
+        let created = stored(&state).await;
+        let m = owner(&created, "creator", None).expect("create recorded");
+        assert_eq!(m["operation"], "Update");
+
+        let mut put = created.clone();
+        put["metadata"]["labels"] = serde_json::json!({"via": "put"});
+        replace_crd(
+            axum::extract::State(state.clone()),
+            Path(NAME.to_string()),
+            user(),
+            headers("application/json", "put-tool/1.0"),
+            Bytes::from(put.to_string()),
+        )
+        .await
+        .map_err(|_| ())
+        .expect("replace");
+        let after_put = stored(&state).await;
+        assert!(
+            owner(&after_put, "put-tool", None)
+                .is_some_and(|m| m["fieldsV1"]["f:metadata"]["f:labels"].is_object()),
+            "PUT must own the label it set: {after_put}"
+        );
+
+        patch_crd(
+            axum::extract::State(state.clone()),
+            Path(NAME.to_string()),
+            user(),
+            headers("application/merge-patch+json", "patch-tool/1.0"),
+            Bytes::from(r#"{"metadata":{"annotations":{"a":"b"}}}"#),
+        )
+        .await
+        .map_err(|_| ())
+        .expect("patch");
+        let after_patch = stored(&state).await;
+        assert!(
+            owner(&after_patch, "patch-tool", None)
+                .is_some_and(|m| m["fieldsV1"]["f:metadata"]["f:annotations"].is_object()),
+            "merge patch must own the annotation it set: {after_patch}"
+        );
+        assert!(
+            owner(&after_patch, "put-tool", None).is_some(),
+            "a later write must not wipe earlier owners"
+        );
+
+        let mut status = after_patch.clone();
+        status["status"] = serde_json::json!({"conditions": [
+            {"type": "Established", "status": "False", "reason": "Test"}]});
+        put_crd_status(
+            axum::extract::State(state.clone()),
+            Path(NAME.to_string()),
+            headers("application/json", "crd-controller/1.0"),
+            Bytes::from(status.to_string()),
+        )
+        .await
+        .map_err(|_| ())
+        .expect("status put");
+        assert!(owner(&stored(&state).await, "crd-controller", Some("status")).is_some());
+
+        patch_crd_status(
+            axum::extract::State(state.clone()),
+            Path(NAME.to_string()),
+            headers("application/merge-patch+json", "status-patcher/1.0"),
+            Bytes::from(r#"{"status":{"storedVersions":["v1alpha1"]}}"#),
+        )
+        .await
+        .map_err(|_| ())
+        .expect("status patch");
+        assert!(owner(&stored(&state).await, "status-patcher", Some("status")).is_some());
+    }
+
+    /// A client-supplied managedFields on an apply must not overwrite the server's record.
+    #[tokio::test]
+    async fn crd_apply_ignores_client_supplied_managed_fields() {
+        let state = make_state();
+        seed(&state).await;
+        let body = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": NAME, "managedFields": [
+                {"manager": "forged", "operation": "Update", "apiVersion": "v1",
+                 "fieldsType": "FieldsV1", "fieldsV1": {"f:metadata": {"f:labels": {}}}}]}
+        });
+        patch_crd(
+            axum::extract::State(state.clone()),
+            Path(NAME.to_string()),
+            user(),
+            headers("application/apply-patch+yaml", "applier/1.0"),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .map_err(|_| ())
+        .expect("apply");
+        let after = stored(&state).await;
+        assert!(owner(&after, "forged", None).is_none(), "{after}");
+        assert!(owner(&after, "creator", None).is_some(), "{after}");
     }
 }

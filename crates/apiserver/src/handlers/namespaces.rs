@@ -220,6 +220,13 @@ pub(crate) async fn create_namespace<S: Store>(
     crate::handlers::generic::clear_create_status(true, "v1", "Namespace", &mut obj.body)?;
     crate::handlers::defaults::apply_defaults("", "namespaces", &mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
+    crate::field_manager::WriteIdentity::new(None, &headers).record(
+        &serde_json::Value::Null,
+        &mut obj.body,
+        "v1",
+        None,
+        None,
+    );
 
     // Dry-run: validation and admission passed; return the would-be created namespace
     // without persisting — mirrors create_resource's dry-run early-return in resource.rs.
@@ -435,6 +442,13 @@ pub(crate) async fn replace_namespace<S: Store>(
         }
 
         run_validating_webhooks(&state, &obj.body, stored_obj.as_ref(), &admission_ctx).await?;
+        crate::field_manager::WriteIdentity::new(None, &headers).record(
+            stored_obj.as_ref().unwrap_or(&serde_json::Value::Null),
+            &mut obj.body,
+            "v1",
+            None,
+            None,
+        );
 
         // Dry-run: return the would-be replaced object without persisting — mirrors
         // create_namespace's dry-run early-return (is_dry_run_header is the router-wide
@@ -615,6 +629,13 @@ pub(crate) async fn patch_namespace<S: Store>(
     }
 
     run_validating_webhooks(&state, &current.body, Some(&pre_patch_obj), &admission_ctx).await?;
+    crate::field_manager::WriteIdentity::new(None, &headers).record(
+        &pre_patch_obj,
+        &mut current.body,
+        "v1",
+        None,
+        None,
+    );
 
     // Post-patch: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let current_meta: ObjectMeta =
@@ -701,8 +722,16 @@ pub(crate) async fn finalize_namespace<S: Store>(
     let mut spec: NamespaceSpec =
         NamespaceSpec::deserialize(&current.body["spec"]).unwrap_or_default();
     spec.finalizers = new_finalizers;
+    let before_write = current.body.clone();
     current.body["spec"] = serde_json::to_value(&spec)
         .map_err(|e| Status::internal(format!("failed to serialize NamespaceSpec: {e}")))?;
+    crate::field_manager::WriteIdentity::new(None, &headers).record(
+        &before_write,
+        &mut current.body,
+        "v1",
+        Some("finalize"),
+        None,
+    );
 
     // Check: if deletionTimestamp is set and spec.finalizers are now empty → hard-delete.
     let current_meta: ObjectMeta =
@@ -782,6 +811,7 @@ pub(crate) async fn put_namespace_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    let before_write = current.body.clone();
     match &incoming.body["status"] {
         serde_json::Value::Null => {
             current.body.as_object_mut().map(|m| m.remove("status"));
@@ -798,6 +828,8 @@ pub(crate) async fn put_namespace_status<S: Store>(
         &incoming.body,
         "Namespace",
     );
+
+    super::status::record_status_write(&headers, &before_write, &mut current.body, "", "v1");
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
@@ -839,6 +871,8 @@ pub(crate) async fn patch_namespace_status<S: Store>(
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let before_write = current.body.clone();
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
     // every other patch type here is JSON.
@@ -904,6 +938,8 @@ pub(crate) async fn patch_namespace_status<S: Store>(
             None => crate::handlers::status::reject_non_object_status(&current.body["status"])?,
         }
     }
+
+    super::status::record_status_write(&headers, &before_write, &mut current.body, "", "v1");
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
@@ -5823,13 +5859,15 @@ mod tests {
              Without managedFields the test fails with \
              'patched object should have the applied annotation'"
         );
+        let applied = mf
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["manager"] == "kubectl-apply")
+            .expect("managedFields must name the ?fieldManager query parameter as a manager");
         assert_eq!(
-            mf[0]["manager"], "kubectl-apply",
-            "managedFields[0].manager must equal the ?fieldManager query parameter"
-        );
-        assert_eq!(
-            mf[0]["operation"], "Apply",
-            "managedFields[0].operation must be 'Apply' for SSA requests"
+            applied["operation"], "Apply",
+            "the ?fieldManager entry's operation must be 'Apply' for SSA requests"
         );
     }
 
@@ -6929,5 +6967,193 @@ mod namespace_status_cas_tests {
             "absent resourceVersion in PUT /namespaces/status body must succeed (unconditional) — \
              single-writer clients that omit rv must not be broken by the stale-RV CAS fix"
         );
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::handlers::test_support::make_state;
+    use axum::http::{header, HeaderValue};
+
+    type TestState = crate::state::AppState;
+
+    fn user() -> Extension<UserInfo> {
+        Extension(UserInfo {
+            username: "admin".into(),
+            ..Default::default()
+        })
+    }
+
+    fn headers(content_type: &'static str, user_agent: &'static str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        h.insert(header::USER_AGENT, HeaderValue::from_static(user_agent));
+        h
+    }
+
+    async fn create(state: &TestState, name: &str) {
+        create_namespace(
+            State(state.clone()),
+            user(),
+            headers("application/json", "creator/1.0"),
+            Bytes::from(
+                serde_json::json!({"apiVersion": "v1", "kind": "Namespace",
+                                   "metadata": {"name": name}})
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create: {e:?}"));
+    }
+
+    async fn apply(state: &TestState, name: &str, manager: &str, labels: serde_json::Value) {
+        patch_namespace(
+            State(state.clone()),
+            Path(name.into()),
+            Query(PatchQuery {
+                field_manager: Some(manager.into()),
+                force: Some(false),
+                ..Default::default()
+            }),
+            user(),
+            headers("application/apply-patch+yaml", "applier/1.0"),
+            Bytes::from({
+                let mut ns = serde_json::json!({"apiVersion": "v1", "kind": "Namespace",
+                                                "metadata": {"name": name}});
+                if !labels.is_null() {
+                    ns["metadata"]["labels"] = labels;
+                }
+                ns.to_string()
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("apply: {e:?}"));
+    }
+
+    async fn stored(state: &TestState, name: &str) -> serde_json::Value {
+        let s = state
+            .store
+            .get(&cluster_object_key("namespaces", name))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_slice(&s.value).unwrap()
+    }
+
+    fn manager<'a>(
+        obj: &'a serde_json::Value,
+        name: &str,
+        subresource: Option<&str>,
+    ) -> Option<&'a serde_json::Value> {
+        obj["metadata"]["managedFields"]
+            .as_array()?
+            .iter()
+            .find(|m| m["manager"] == name && m["subresource"].as_str() == subresource)
+    }
+
+    /// An applier owns `team`; another tool PUTs a new value; the applier then stops
+    /// naming the label. Without recording the PUT, the applier still owns the label and
+    /// the apply silently deletes the other tool's change.
+    #[tokio::test]
+    async fn apply_dropping_a_label_keeps_the_value_another_manager_put() {
+        let state = make_state();
+        create(&state, "ns-put").await;
+        apply(&state, "ns-put", "tool-a", serde_json::json!({"team": "a"})).await;
+
+        let mut ns = stored(&state, "ns-put").await;
+        ns["metadata"]["labels"]["team"] = serde_json::json!("b");
+        replace_namespace(
+            State(state.clone()),
+            Path("ns-put".into()),
+            user(),
+            headers("application/json", "other-tool/2.0"),
+            Bytes::from(ns.to_string()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("put: {e:?}"));
+
+        apply(&state, "ns-put", "tool-a", serde_json::Value::Null).await;
+        let after = stored(&state, "ns-put").await;
+        assert_eq!(
+            after["metadata"]["labels"]["team"], "b",
+            "apply deleted a label another manager changed via PUT"
+        );
+        assert!(manager(&after, "other-tool", None).is_some());
+    }
+
+    /// Same data loss through merge-patch, the verb `kubectl label` uses.
+    #[tokio::test]
+    async fn apply_dropping_a_label_keeps_the_value_another_manager_merge_patched() {
+        let state = make_state();
+        create(&state, "ns-merge").await;
+        apply(
+            &state,
+            "ns-merge",
+            "tool-a",
+            serde_json::json!({"team": "a"}),
+        )
+        .await;
+
+        patch_namespace(
+            State(state.clone()),
+            Path("ns-merge".into()),
+            Query(PatchQuery::default()),
+            user(),
+            headers("application/merge-patch+json", "kubectl-label/1.0"),
+            Bytes::from(r#"{"metadata":{"labels":{"team":"b"}}}"#),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("merge patch: {e:?}"));
+
+        apply(&state, "ns-merge", "tool-a", serde_json::Value::Null).await;
+        let after = stored(&state, "ns-merge").await;
+        assert_eq!(
+            after["metadata"]["labels"]["team"], "b",
+            "apply deleted a label another manager changed via merge-patch"
+        );
+    }
+
+    /// A created Namespace is owned by its creator, so a later apply that drops a field
+    /// the creator set does not delete it.
+    #[tokio::test]
+    async fn namespace_create_records_the_creator_as_an_update_manager() {
+        let state = make_state();
+        create(&state, "ns-create").await;
+        let ns = stored(&state, "ns-create").await;
+        let m = manager(&ns, "creator", None).expect("creator recorded");
+        assert_eq!(m["operation"], "Update");
+        assert!(m["fieldsV1"]["f:metadata"]["f:labels"].is_object());
+    }
+
+    /// The namespace controller's /status and /finalize writes are recorded under their
+    /// own subresource so they do not take ownership of main-resource fields.
+    #[tokio::test]
+    async fn namespace_status_and_finalize_writes_are_recorded_per_subresource() {
+        let state = make_state();
+        create(&state, "ns-sub").await;
+        let mut ns = stored(&state, "ns-sub").await;
+        ns["status"] = serde_json::json!({"phase": "Active",
+            "conditions": [{"type": "NamespaceFinalizersRemaining", "status": "True"}]});
+        put_namespace_status(
+            State(state.clone()),
+            Path("ns-sub".into()),
+            headers("application/json", "ns-controller/1.0"),
+            Bytes::from(ns.to_string()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("status put: {e:?}"));
+        finalize_namespace(
+            State(state.clone()),
+            Path("ns-sub".into()),
+            headers("application/json", "ns-finalizer/1.0"),
+            Bytes::from(r#"{"spec":{"finalizers":["kubernetes","example.com/x"]}}"#),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("finalize: {e:?}"));
+
+        let after = stored(&state, "ns-sub").await;
+        assert!(manager(&after, "ns-controller", Some("status")).is_some());
+        assert!(manager(&after, "ns-finalizer", Some("finalize")).is_some());
     }
 }

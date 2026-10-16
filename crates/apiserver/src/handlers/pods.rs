@@ -3452,8 +3452,16 @@ pub(crate) async fn patch_pod_resize<S: Store>(
     validate_resize_patch(&current_obj.body, &incoming).map_err(Status::unprocessable_entity)?;
 
     let spec_before = current_obj.body["spec"].clone();
+    let before_write = current_obj.body.clone();
     current_obj.body = apply_resize_patch(&current_obj.body, &incoming);
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
+    crate::field_manager::WriteIdentity::new(None, &headers).record(
+        &before_write,
+        &mut current_obj.body,
+        "v1",
+        Some("resize"),
+        None,
+    );
 
     // Dry-run: validation passed; return the would-be resized pod without persisting —
     // mirrors replace_pod's dry-run early-return.
@@ -3611,8 +3619,16 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     let spec_before = current_obj.body["spec"].clone();
+    let before_write = current_obj.body.clone();
     current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &patch);
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
+    crate::field_manager::WriteIdentity::new(None, &headers).record(
+        &before_write,
+        &mut current_obj.body,
+        "v1",
+        Some("ephemeralcontainers"),
+        None,
+    );
 
     // Dry-run: validation passed; return the would-be patched pod without persisting —
     // mirrors replace_pod's dry-run early-return.
@@ -3660,8 +3676,16 @@ pub(crate) async fn put_ephemeral_containers<S: Store>(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     let spec_before = current_obj.body["spec"].clone();
+    let before_write = current_obj.body.clone();
     current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &incoming);
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
+    crate::field_manager::WriteIdentity::new(None, &headers).record(
+        &before_write,
+        &mut current_obj.body,
+        "v1",
+        Some("ephemeralcontainers"),
+        None,
+    );
 
     // Dry-run: validation passed; return the would-be replaced pod without persisting —
     // mirrors replace_pod's dry-run early-return.
@@ -21529,6 +21553,119 @@ mod ephemeral_containers_route_tests {
             1,
             "dryRun=All must not persist the second ephemeral container"
         );
+    }
+
+    async fn seed_running_pod(store: &Arc<SqliteStore>, name: &str) -> String {
+        seed_namespace(store, "default").await;
+        let key = format!("/registry/pods/default/{name}");
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx", "resources": {
+                "limits": {"cpu": "100m", "memory": "128Mi"},
+                "requests": {"cpu": "100m", "memory": "128Mi"}}}]},
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        key
+    }
+
+    async fn send(
+        app: Router,
+        method: &str,
+        uri: &str,
+        user_agent: &str,
+        body: &serde_json::Value,
+    ) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::USER_AGENT, user_agent)
+                    .body(json_body(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{method} {uri}");
+    }
+
+    fn owner(pod: &serde_json::Value, manager: &str, subresource: &str) -> bool {
+        pod["metadata"]["managedFields"]
+            .as_array()
+            .is_some_and(|a| {
+                a.iter().any(|m| {
+                    m["manager"] == manager
+                        && m["operation"] == "Update"
+                        && m["subresource"] == subresource
+                })
+            })
+    }
+
+    /// Both verbs on /ephemeralcontainers and /resize must name their writer under the
+    /// subresource, or an apply that later drops the debugger container or resource limit
+    /// would delete what another tool added.
+    #[tokio::test]
+    async fn ephemeralcontainers_and_resize_writes_record_their_writer_per_subresource() {
+        let (state, store) = make_state();
+        let key = seed_running_pod(&store, "owned").await;
+        let app = || {
+            Router::new()
+                .route(
+                    "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
+                    patch(patch_ephemeral_containers).put(put_ephemeral_containers),
+                )
+                .route(
+                    "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                    patch(patch_pod_resize),
+                )
+                .with_state(state.clone())
+        };
+        let base = "/api/v1/namespaces/default/pods/owned";
+        let ec = |n: &str| {
+            serde_json::json!({"spec": {"ephemeralContainers": [
+            {"name": n, "image": "busybox"}]}})
+        };
+        send(
+            app(),
+            "PATCH",
+            &format!("{base}/ephemeralcontainers"),
+            "patch-debugger/1.0",
+            &ec("dbg1"),
+        )
+        .await;
+        send(
+            app(),
+            "PUT",
+            &format!("{base}/ephemeralcontainers"),
+            "put-debugger/1.0",
+            &ec("dbg2"),
+        )
+        .await;
+        send(
+            app(),
+            "PATCH",
+            &format!("{base}/resize"),
+            "resizer/1.0",
+            &serde_json::json!({"spec": {"containers": [{"name": "app", "resources": {
+                "limits": {"cpu": "200m", "memory": "256Mi"},
+                "requests": {"cpu": "200m", "memory": "256Mi"}}}]}}),
+        )
+        .await;
+
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let pod: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            owner(&pod, "patch-debugger", "ephemeralcontainers"),
+            "{pod}"
+        );
+        assert!(owner(&pod, "put-debugger", "ephemeralcontainers"), "{pod}");
+        assert!(owner(&pod, "resizer", "resize"), "{pod}");
     }
 }
 
