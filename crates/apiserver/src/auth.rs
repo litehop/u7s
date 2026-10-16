@@ -263,7 +263,14 @@ pub(crate) fn begin_token_verification<'a>(
     sig_cache: &'a SigCache,
 ) -> Result<Option<tokio::sync::SemaphorePermit<'a>>, ()> {
     match bearer_token(auth_header) {
-        Some(token) if ct_token_lookup(token_map, token).is_none() => {
+        // A signature-cache hit proves this exact token was fully verified before; what is
+        // left (claims, memoised liveness) is cheap and must keep serving ordinary
+        // ServiceAccount traffic while bogus tokens occupy the slots.
+        Some(token)
+            if ct_token_lookup(token_map, token).is_none()
+                && sig_cache.get(&sa_sig_cache::token_hash(token), std::time::Instant::now())
+                    != Some(true) =>
+        {
             sig_cache.try_begin_verification().map(Some).ok_or(())
         }
         _ => Ok(None),
@@ -531,6 +538,26 @@ async fn object_is_live<S: Store>(store: &S, key: &str, expected_uid: &str) -> b
     true
 }
 
+/// `object_is_live`, skipping the store read when the same object/uid was seen live within
+/// `sa_sig_cache::LIVENESS_TTL`. Only live results are remembered, so deleting the object
+/// revokes its tokens within the TTL.
+async fn object_is_live_cached<S: Store>(
+    store: &S,
+    sig_cache: &SigCache,
+    key: &str,
+    expected_uid: &str,
+) -> bool {
+    let memo_key = format!("{key}\0{expected_uid}");
+    if sig_cache.recently_live(&memo_key, std::time::Instant::now()) {
+        return true;
+    }
+    let live = object_is_live(store, key, expected_uid).await;
+    if live {
+        sig_cache.record_live(memo_key, std::time::Instant::now());
+    }
+    live
+}
+
 /// Attempt to decode and verify a bearer token as an RS256 SA JWT.
 /// Returns `Some(UserInfo)` on success, `None` if the token is invalid, expired, or bound to
 /// a ServiceAccount/Pod that is no longer live.
@@ -631,8 +658,9 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
     // to invalidate a u7s SA token before its JWT `exp`; there is no JTI-based revocation
     // list (upstream Kubernetes doesn't have one either — see module-level notes).
     let kio = &claims.kubernetes_io;
-    if !object_is_live(
+    if !object_is_live_cached(
         store,
+        sig_cache,
         &object_key("serviceaccounts", &kio.namespace, &kio.serviceaccount.name),
         &kio.serviceaccount.uid,
     )
@@ -646,8 +674,9 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
         return None;
     }
     if let Some(pod) = &kio.pod {
-        if !object_is_live(
+        if !object_is_live_cached(
             store,
+            sig_cache,
             &object_key("pods", &kio.namespace, &pod.name),
             &pod.uid,
         )
@@ -2731,6 +2760,89 @@ mod tests {
             }
             AuthnResult::BadToken => panic!("valid SA JWT must not be rejected"),
         }
+    }
+
+    async fn authn_sa(
+        store: &SqliteStore,
+        dec: &DecodingKey,
+        sig_cache: &SigCache,
+        token: &str,
+    ) -> bool {
+        let header = format!("Bearer {token}");
+        matches!(
+            authenticate(
+                Some(&header),
+                &HashMap::new(),
+                Some(dec),
+                None,
+                store,
+                sig_cache
+            )
+            .await,
+            AuthnResult::Identified(_)
+        )
+    }
+
+    /// Ordinary ServiceAccount traffic (tokens verified before) must not compete with a
+    /// bogus-token flood for verification slots, or any 33 concurrent pod requests - or one
+    /// attacker - would 429 every workload in the cluster.
+    #[tokio::test]
+    async fn verified_sa_tokens_are_not_shed_while_bogus_tokens_hold_every_slot() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let sig_cache = make_test_sig_cache();
+        assert!(authn_sa(&store, &dec, &sig_cache, &token).await, "warm-up");
+
+        let _flood: Vec<_> = (0..sa_sig_cache::MAX_PRE_AUTH_VERIFICATIONS)
+            .map(|_| sig_cache.try_begin_verification().expect("free slot"))
+            .collect();
+        let header = format!("Bearer {token}");
+        let admitted: Vec<_> = (0..sa_sig_cache::MAX_PRE_AUTH_VERIFICATIONS * 2)
+            .map(|_| begin_token_verification(Some(&header), &HashMap::new(), &sig_cache))
+            .collect();
+        assert!(
+            admitted.iter().all(|r| matches!(r, Ok(None))),
+            "a token already verified (signature-cache hit) must need no slot"
+        );
+        assert!(
+            begin_token_verification(
+                Some("Bearer abcdef.0123456789abcdef"),
+                &HashMap::new(),
+                &sig_cache
+            )
+            .is_err(),
+            "setup: an unverified token must be shed when every slot is busy"
+        );
+    }
+
+    /// A hot token must not cost a store read per request, yet deleting its ServiceAccount
+    /// must still revoke it within the liveness TTL.
+    #[tokio::test]
+    async fn deleted_service_account_token_stops_working_within_the_liveness_ttl() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let sig_cache = make_test_sig_cache();
+        assert!(authn_sa(&store, &dec, &sig_cache, &token).await);
+
+        store
+            .delete(&object_key("serviceaccounts", "default", "my-sa"), None)
+            .await
+            .unwrap();
+        assert!(
+            authn_sa(&store, &dec, &sig_cache, &token).await,
+            "within the TTL the memoised liveness is trusted (no store read per request)"
+        );
+
+        tokio::time::sleep(sa_sig_cache::LIVENESS_TTL + std::time::Duration::from_millis(200))
+            .await;
+        assert!(
+            !authn_sa(&store, &dec, &sig_cache, &token).await,
+            "a token of a deleted ServiceAccount must be rejected once the TTL lapses"
+        );
     }
 
     #[tokio::test]
