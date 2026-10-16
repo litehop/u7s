@@ -808,8 +808,9 @@ fn method_to_verb(method: &axum::http::Method) -> &'static str {
         "PUT" => "update",
         "PATCH" => "patch",
         "DELETE" => "delete",
-        // HEAD is not a distinct RBAC verb in Kubernetes — it maps to "get".
-        "HEAD" => "get",
+        // requestinfo.go: non-resource requests carry the lowercased HTTP method, so HEAD is
+        // "head" there. Resource-path HEAD is get/list via `get_verb`, never this arm.
+        "HEAD" => "head",
         // Unknown/future methods: fall back to "get" (least-privilege intent).
         _ => "get",
     }
@@ -2303,6 +2304,8 @@ mod tests {
         );
     }
 
+    /// A collection GET with watch=true must map to "watch", which is a separate RBAC verb
+    /// in Kubernetes.
     #[test]
     fn test_get_verb_watch_param_is_watch() {
         assert_eq!(get_verb(None, Some("watch=true")), "watch");
@@ -2409,6 +2412,16 @@ mod tests {
              system:discovery only grants \"get\" on /openapi/*, so \"list\" \
              causes 403 and the type-check CRD conformance test hangs forever"
         );
+    }
+
+    /// Non-resource HEAD is verb "head", as upstream's requestinfo.go. The seeded
+    /// system:public-info-viewer and system:discovery rules grant only "get" (upstream's
+    /// bootstrap policy does too), so mapping HEAD to "get" would let anonymous clients
+    /// HEAD /version, which upstream denies.
+    #[test]
+    fn non_resource_head_is_head_not_get() {
+        assert_eq!(method_to_verb(&Method::HEAD), "head");
+        assert_eq!(method_to_verb(&Method::GET), "get");
     }
 
     // --- load_token_file() ---
@@ -6622,6 +6635,72 @@ mod tests {
             axum::http::StatusCode::OK,
             "an anonymous caller must still get /version via the system:unauthenticated \
              grant — removing is_exempt's bypass must not require a credential"
+        );
+    }
+
+    /// Upstream's system:public-info-viewer grants only `get` on /version, and
+    /// non-resource HEAD is verb `head` there, so an anonymous HEAD /version is Forbidden
+    /// while GET is allowed; a role that also lists `head` allows it. If HEAD were folded
+    /// back into `get`, anonymous callers would gain a read upstream denies.
+    #[tokio::test]
+    async fn anonymous_head_version_needs_head_verb_grant_as_upstream() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        async fn status_for(verbs: serde_json::Value, method: &str) -> axum::http::StatusCode {
+            let idx = Arc::new(RbacIndex::new());
+            idx.apply_object(
+                "/apis/rbac.authorization.k8s.io/v1/clusterroles/system:public-info-viewer",
+                &serde_json::json!({
+                    "rules": [{ "nonResourceURLs": ["/version"], "verbs": verbs }]
+                }),
+            );
+            idx.apply_object(
+                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system:public-info-viewer",
+                &serde_json::json!({
+                    "subjects": [{ "kind": "Group", "name": "system:unauthenticated" }],
+                    "roleRef": {
+                        "apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "ClusterRole",
+                        "name": "system:public-info-viewer"
+                    }
+                }),
+            );
+            let app = Router::new()
+                .route("/version", get(|| async { "ok" }))
+                .layer(AuthLayer::new(
+                    idx,
+                    HashMap::new(),
+                    None,
+                    Arc::new(make_test_store()),
+                    Arc::new(make_test_sig_cache()),
+                    Arc::new(FlowControlCache::new()),
+                    Arc::new(NodeGraph::new()),
+                    Arc::new(HashMap::new()),
+                    Arc::new(DiscoveryCache::new()),
+                ));
+            let req = Request::builder()
+                .method(method)
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        }
+
+        use axum::http::StatusCode;
+        assert_eq!(
+            status_for(serde_json::json!(["get"]), "GET").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_for(serde_json::json!(["get"]), "HEAD").await,
+            StatusCode::FORBIDDEN,
+            "a get-only rule must not authorize HEAD on a non-resource URL (verb is head)"
+        );
+        assert_eq!(
+            status_for(serde_json::json!(["get", "head"]), "HEAD").await,
+            StatusCode::OK,
+            "a rule listing head must authorize non-resource HEAD"
         );
     }
 }
