@@ -4903,33 +4903,6 @@ mod tests {
         .expect("delete must succeed");
     }
 
-    /// `find_crd` checks its context cache before any tombstone/404 fallback, so a missed
-    /// eviction keeps validating CR writes against the schema of a CRD that no longer exists.
-    ///
-    /// Fails on revert: without `evict_cr_context_cache` in `purge_crd`, `find_crd` returns
-    /// the stale cached context instead of 410 Gone.
-    #[tokio::test]
-    async fn delete_crd_evicts_cr_context_cache_so_find_crd_does_not_serve_a_deleted_crd() {
-        let state = make_state();
-        let group = "ctx.example.com";
-        let name = install_widget_crd(&state, group).await;
-        crate::handlers::cr::find_crd(&state, group, "v1", "widgets")
-            .await
-            .expect("CRD must be found right after install, warming cr_context_cache");
-
-        delete_crd_ok(&state, &name).await;
-
-        let err = match crate::handlers::cr::find_crd(&state, group, "v1", "widgets").await {
-            Ok(_) => panic!("find_crd must not serve a stale CrContext for a deleted CRD"),
-            Err(e) => e,
-        };
-        assert_eq!(
-            err.0,
-            axum::http::StatusCode::GONE,
-            "must be 410 Gone (group tombstone), not a stale Ok(ctx) or an uncached 404"
-        );
-    }
-
     /// A deleted CRD's served versions can never be requested again, so conversion-cache
     /// entries targeting them leak for the life of the process if not swept.
     ///
@@ -5600,6 +5573,41 @@ mod ratchet_tests {
             stored_json(&state, &store_key(FIN_CRD)).await.is_none(),
             "CRD must complete deletion once no instances remain"
         );
+    }
+
+    /// `find_crd` caches a Terminating CRD's context too, so a CR request during the window
+    /// between soft-delete and purge re-warms the key that soft-delete already evicted; a
+    /// missed eviction at purge then keeps serving the deleted CRD's schema instead of 410.
+    ///
+    /// Fails on revert: without `evict_cr_context_cache` in `purge_crd`, the final `find_crd`
+    /// returns the re-cached context instead of 410 Gone.
+    #[tokio::test]
+    async fn purge_evicts_context_recached_while_crd_was_terminating() {
+        let state = make_state();
+        create_fin_crd(&state).await;
+        let held = put_widget(&state, "held", &["example.com/hold"]).await;
+        delete_fin_crd(&state).await;
+
+        let ctx = crate::handlers::cr::find_crd(&state, "fin.io", "v1", "widgets")
+            .await
+            .expect("a Terminating CRD is still found, re-warming cr_context_cache");
+        assert!(
+            ctx.terminating,
+            "precondition: the cached CRD is Terminating"
+        );
+
+        state.store.delete(&held, None).await.unwrap();
+        finalize_crd(&state, FIN_CRD).await;
+        assert!(
+            stored_json(&state, &store_key(FIN_CRD)).await.is_none(),
+            "precondition: the CRD must be purged"
+        );
+
+        let err = match crate::handlers::cr::find_crd(&state, "fin.io", "v1", "widgets").await {
+            Ok(_) => panic!("find_crd must not serve a stale CrContext for a purged CRD"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, StatusCode::GONE);
     }
 
     #[tokio::test]
