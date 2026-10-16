@@ -34,7 +34,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{header, Method, Request, Response, StatusCode};
+use axum::http::{header, Method, Request, Response};
+use axum::response::IntoResponse as _;
 use futures_util::StreamExt as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Layer;
@@ -345,22 +346,8 @@ fn too_many_requests_response(req: &Request<Body>, limit_kind: &str) -> Response
         user_agent,
         "inflight limit reached, returning 429",
     );
-    let status = Status {
-        kind: "Status",
-        api_version: "v1",
-        status: "Failure",
-        message: "Too many requests".to_owned(),
-        reason: "TooManyRequests",
-        code: 429,
-        metadata: None,
-        details: None,
-    };
-    let body = serde_json::to_vec(&status).unwrap_or_default();
-    Response::builder()
-        .status(StatusCode::TOO_MANY_REQUESTS)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap()
+    // Retry-After/retryAfterSeconds make client-go back off instead of retrying hot.
+    Status::too_many_requests_retry_after("Too many requests".to_owned(), 1).into_response()
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -808,12 +795,18 @@ mod tests {
         let req = make_request(Method::GET);
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            "1",
+            "without Retry-After client-go retries immediately and keeps the pool saturated"
+        );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value =
             serde_json::from_slice(&body).expect("body must be valid JSON");
+        assert_eq!(json["details"]["retryAfterSeconds"], 1);
 
         assert_eq!(json["apiVersion"], "v1");
         assert_eq!(json["kind"], "Status");

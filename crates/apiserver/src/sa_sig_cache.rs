@@ -98,12 +98,23 @@ struct CacheState {
     order: VecDeque<[u8; 32]>,
 }
 
+/// Most concurrent pre-auth verifications. Authentication runs before the in-flight pools
+/// admit a request, so this is what bounds the `spawn_blocking` store reads an
+/// unauthenticated token flood can start (see `MAX_BLOCKING_THREADS`). 32 is far above the
+/// concurrent bearer-token verifications legitimate traffic needs (a verification takes
+/// well under a millisecond on a warm cache) yet a small fraction of the blocking pool.
+pub const MAX_PRE_AUTH_VERIFICATIONS: usize = 32;
+
 /// Cache of SA-JWT signature-verification outcomes. See the module doc for the full design
 /// rationale (cache key, TTL invariant, eviction policy, why audience is re-checked on every
 /// call regardless of hit/miss).
 pub struct SigCache {
     capacity: usize,
     state: RwLock<CacheState>,
+    /// Bounds concurrent pre-auth credential verification (store reads and RSA verifies for
+    /// bearer tokens the static map doesn't know). It lives here because this is the one
+    /// handle every `authenticate` call already receives.
+    pre_auth: tokio::sync::Semaphore,
     /// Test-only: counts every invocation of the real (expensive) `jsonwebtoken::decode`
     /// RSA-verify path, success or failure. Compiles to nothing in release builds — see
     /// `record_verify_attempt`. Mirrors `state::CrSchemaCache::compile_count`'s idiom for
@@ -123,9 +134,16 @@ impl SigCache {
                 map: HashMap::new(),
                 order: VecDeque::new(),
             }),
+            pre_auth: tokio::sync::Semaphore::new(MAX_PRE_AUTH_VERIFICATIONS),
             #[cfg(test)]
             verify_count: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// A slot for one pre-auth verification, or `None` when all are busy. Never waits: a
+    /// queue of unauthenticated callers is exactly the unbounded work this exists to refuse.
+    pub fn try_begin_verification(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.pre_auth.try_acquire().ok()
     }
 
     /// Returns `Some(true)` if a live (not yet expired as of `now`) entry exists for `key`.

@@ -241,6 +241,35 @@ pub(crate) enum AuthnResult {
     BadToken,
 }
 
+fn bearer_token(auth_header: Option<&str>) -> Option<&str> {
+    const BEARER_PREFIX: &str = "Bearer ";
+    auth_header.and_then(|value| {
+        let scheme = value.get(..BEARER_PREFIX.len())?;
+        scheme
+            .eq_ignore_ascii_case(BEARER_PREFIX)
+            .then(|| &value[BEARER_PREFIX.len()..])
+    })
+}
+
+/// Reserve a slot for the store reads and signature checks `authenticate` runs for a
+/// bearer token the static map doesn't know. `Ok(None)` means the request needs no slot
+/// (no bearer token, or a static one); `Err(())` means every slot is busy and the caller
+/// must answer 429 rather than wait. Authentication runs before the in-flight pools admit a
+/// request, so without this a flood of well-formed bogus tokens drives unbounded blocking
+/// store reads.
+pub(crate) fn begin_token_verification<'a>(
+    auth_header: Option<&str>,
+    token_map: &HashMap<String, UserInfo>,
+    sig_cache: &'a SigCache,
+) -> Result<Option<tokio::sync::SemaphorePermit<'a>>, ()> {
+    match bearer_token(auth_header) {
+        Some(token) if ct_token_lookup(token_map, token).is_none() => {
+            sig_cache.try_begin_verification().map(Some).ok_or(())
+        }
+        _ => Ok(None),
+    }
+}
+
 // `auth_header` is passed as an already-extracted `Option<&str>` rather than `&Request<Body>`:
 // holding a borrow of `Request<Body>` (which wraps a `!Sync` boxed body) across this
 // function's internal `.await` (the store-backed liveness check) would make the generated
@@ -262,15 +291,7 @@ pub(crate) async fn authenticate<S: Store>(
     // whose verified cert alone would have identified it under real kube-apiserver,
     // since the union authenticator lets a still-available cert authenticate when the
     // bearer-token authenticator declines instead of erroring.
-    const BEARER_PREFIX: &str = "Bearer ";
-    let bearer_token = auth_header.and_then(|value| {
-        let scheme = value.get(..BEARER_PREFIX.len())?;
-        scheme
-            .eq_ignore_ascii_case(BEARER_PREFIX)
-            .then(|| &value[BEARER_PREFIX.len()..])
-    });
-
-    let Some(token) = bearer_token else {
+    let Some(token) = bearer_token(auth_header) else {
         // No usable bearer token — try x509 client cert before anonymous fallback.
         if let Some(cert) = peer_cert {
             // chain already verified by rustls WebPkiClientVerifier
@@ -1299,6 +1320,17 @@ where
                 .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok());
+            let Ok(verification) =
+                begin_token_verification(auth_header, &token_map, sig_cache.as_ref())
+            else {
+                record_request_total(method_to_verb(req.method()), "", "", "", "", "429");
+                return Ok(axum::response::IntoResponse::into_response(
+                    Status::too_many_requests_retry_after(
+                        "Too many requests, please try again later.".to_owned(),
+                        1,
+                    ),
+                ));
+            };
             let authenticated_user = match authenticate(
                 auth_header,
                 &token_map,
@@ -1309,8 +1341,12 @@ where
             )
             .await
             {
-                AuthnResult::Identified(u) => u,
+                AuthnResult::Identified(u) => {
+                    drop(verification);
+                    u
+                }
                 AuthnResult::BadToken => {
+                    drop(verification);
                     // Fires before parse_path runs, so group/version/resource/scope are
                     // unknown — recorded empty rather than guessed, matching a non-resource
                     // request's shape rather than a specific one.
@@ -2462,6 +2498,105 @@ mod tests {
              blank token-auth-file line would let this literal 'Authorization: Bearer ' \
              request authenticate as system:masters"
         );
+    }
+
+    fn pre_auth_app(sig_cache: Arc<SigCache>) -> axum::Router {
+        use axum::{routing::any, Router};
+
+        let token_map = HashMap::from([(
+            "static-tok".to_owned(),
+            UserInfo {
+                username: "admin".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:masters".to_owned()],
+                extra: HashMap::new(),
+            },
+        )]);
+        Router::new()
+            .route("/api/v1/namespaces/default/pods", any(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                Arc::new(RbacIndex::new()),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                sig_cache,
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
+            ))
+    }
+
+    fn pre_auth_request(token: &str) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A flood of well-formed bootstrap-shaped bogus tokens reaches the store only through
+    /// the verification slots. With every slot busy, none of the flood may get past the
+    /// guard (a request that reached `authenticate` would come back 401, not 429), and a
+    /// client with a static token — which needs no store read — is still served.
+    #[tokio::test]
+    async fn bogus_token_flood_is_refused_before_any_store_read_and_static_clients_still_served() {
+        use tower::ServiceExt;
+
+        let sig_cache = Arc::new(make_test_sig_cache());
+        let app = pre_auth_app(Arc::clone(&sig_cache));
+        let _busy: Vec<_> = (0..crate::sa_sig_cache::MAX_PRE_AUTH_VERIFICATIONS)
+            .map(|_| sig_cache.try_begin_verification().expect("free slot"))
+            .collect();
+
+        for _ in 0..100 {
+            let resp = app
+                .clone()
+                .oneshot(pre_auth_request("abcdef.0123456789abcdef"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "a bogus token must be refused without touching the store while every \
+                 verification slot is busy"
+            );
+            assert_eq!(
+                resp.headers().get("retry-after").unwrap(),
+                "1",
+                "clients must be told to back off"
+            );
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(pre_auth_request("static-tok"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a static-token client needs no store read, so it must reach authorization (403 here, \
+             the test RBAC index is empty) instead of being shed with 429/401"
+        );
+    }
+
+    /// The slot must be released once `authenticate` returns, or every rejected token
+    /// would leak one and 32 bad tokens would lock out all bearer-token clients.
+    #[tokio::test]
+    async fn verification_slot_is_released_after_each_rejected_token() {
+        use tower::ServiceExt;
+
+        let app = pre_auth_app(Arc::new(make_test_sig_cache()));
+        for _ in 0..crate::sa_sig_cache::MAX_PRE_AUTH_VERIFICATIONS * 2 {
+            let resp = app
+                .clone()
+                .oneshot(pre_auth_request("abcdef.0123456789abcdef"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
     }
 
     // --- SA JWT authentication ---

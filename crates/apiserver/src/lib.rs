@@ -658,7 +658,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
     //     auth processing — this prevents OOM via large unauthenticated request bodies.
     //     Inflight sits inside auth because its reserved seats and per-user share are keyed
-    //     on the authenticated identity.
+    //     on the authenticated identity. That leaves authentication itself outside the
+    //     pools, so its store reads and signature checks are bounded by a separate
+    //     try-acquire guard (`MAX_PRE_AUTH_VERIFICATIONS`, 429 + Retry-After when busy).
     //     4 MiB matches etcd's practical limit (~1.5 MiB) with headroom for kubectl manifests.
     let app = build_router(state.clone())
         .layer(ContentTypeLayer)
