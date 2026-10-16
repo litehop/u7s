@@ -1346,6 +1346,162 @@ TOKEN_SECRET=0123456789abcdef CA_CERT_HASH="sha256:$(printf '0%.0s' $(seq 1 64))
 assert "discovery refuses a CA that does not match --ca-cert-hash even when the signature verifies (a stolen token must not be enough to substitute the CA)" \
   "$([ "$wrong_hash_status" -ne 0 ] && [ ! -e "$wrong_hash_state/ca.pem" ] && echo 1 || echo 0)"
 
+# ---------------------------------------------------------------------------
+# Upgrade in place: a joined worker re-runs install.sh with no token, and the
+# control plane re-runs it without re-minting its CA / service-account keys.
+# ---------------------------------------------------------------------------
+UPG_WORK="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK" "$WORKER_MODE_WORK" "$JOIN_WORK" "$UPG_WORK"' EXIT
+
+write_upgrade_runner() {
+  local runner="$1" body="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'STATE_DIR="$1"; NODE_NAME=n1'
+    echo 'sleep() { :; }'
+    for fn in current_client_cert verify_worker_identity worker_api_get worker_ready_heartbeat client_cert_fingerprint wait_for_upgraded_worker cp_identity_fingerprint verify_cp_identity_preserved; do
+      awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
+    done
+    echo "$body"
+  } > "$runner"
+}
+
+# A cert whose notAfter is in the past, and a valid one, sharing one key.
+UPG_KEY="$UPG_WORK/client.key"
+openssl ecparam -name prime256v1 -genkey -noout -out "$UPG_KEY"
+openssl req -new -key "$UPG_KEY" -subj "/O=system:nodes/CN=system:node:n1" -out "$UPG_WORK/client.csr"
+openssl req -x509 -new -key "$UPG_KEY" -subj "/CN=valid" -days 30 -out "$UPG_WORK/valid.crt" 2>/dev/null
+mkdir -p "$UPG_WORK/ca"
+: > "$UPG_WORK/ca/index.txt"
+echo 01 > "$UPG_WORK/ca/serial"
+cat > "$UPG_WORK/ca.cnf" <<EOF
+[ca]
+default_ca = d
+[d]
+database = $UPG_WORK/ca/index.txt
+new_certs_dir = $UPG_WORK/ca
+serial = $UPG_WORK/ca/serial
+default_md = sha256
+policy = p
+unique_subject = no
+[p]
+commonName = supplied
+EOF
+openssl ca -config "$UPG_WORK/ca.cnf" -selfsign -keyfile "$UPG_KEY" -in "$UPG_WORK/client.csr" \
+  -startdate 20200101000000Z -enddate 20200102000000Z -batch -notext -out "$UPG_WORK/expired.crt" >/dev/null 2>&1
+assert "test setup: the fixture client cert really is expired (otherwise the expiry tests below prove nothing)" \
+  "$(openssl x509 -in "$UPG_WORK/expired.crt" -noout -checkend 0 >/dev/null 2>&1 && echo 0 || echo 1)"
+
+new_worker_state() {
+  local d="$UPG_WORK/$1" cert="$2"
+  mkdir -p "$d/kubelet/pki"
+  echo 'server: https://cp.example:6443' > "$d/kubeconfig"
+  cp "$JOIN_CA_DIR/ca.pem" "$d/ca.pem"
+  cp "$UPG_KEY" "$d/kubelet-client.key"
+  cp "$cert" "$d/kubelet-client.crt"
+  printf '%s' "$d"
+}
+VERIFY_RUNNER="$UPG_WORK/verify.sh"
+write_upgrade_runner "$VERIFY_RUNNER" 'verify_worker_identity'
+
+ok_dir="$(new_worker_state valid "$UPG_WORK/valid.crt")"
+ok_status=0; bash "$VERIFY_RUNNER" "$ok_dir" >/dev/null 2>&1 || ok_status=$?
+assert "a joined worker with a valid client identity passes the pre-upgrade check (no token is asked for)" \
+  "$([ "$ok_status" -eq 0 ] && echo 1 || echo 0)"
+
+exp_dir="$(new_worker_state expired "$UPG_WORK/expired.crt")"
+exp_status=0; exp_out="$(bash "$VERIFY_RUNNER" "$exp_dir" 2>&1)" || exp_status=$?
+assert "an expired client identity fails the upgrade with a re-join-with-a-fresh-token message naming the state to clear (a silently restarted kubelet would crash-loop on 401 with no hint)" \
+  "$([ "$exp_status" -ne 0 ] && printf '%s' "$exp_out" | grep -q 'expired' && printf '%s' "$exp_out" | grep -qF "rm -rf $exp_dir" && printf '%s' "$exp_out" | grep -q 'fresh token' && echo 1 || echo 0)"
+
+rot_dir="$(new_worker_state rotated "$UPG_WORK/expired.crt")"
+cp "$UPG_WORK/valid.crt" "$rot_dir/kubelet/pki/kubelet-client-current.pem"
+rot_status=0; bash "$VERIFY_RUNNER" "$rot_dir" >/dev/null 2>&1 || rot_status=$?
+assert "a node whose join-time cert expired but whose kubelet rotated a valid one still upgrades (rotation keeps long-lived nodes alive; demanding a re-join would force a fresh token on every node after a year)" \
+  "$([ "$rot_status" -eq 0 ] && echo 1 || echo 0)"
+
+miss_dir="$UPG_WORK/missing"
+mkdir -p "$miss_dir"
+echo 'server: https://cp.example:6443' > "$miss_dir/kubeconfig"
+miss_status=0; miss_out="$(bash "$VERIFY_RUNNER" "$miss_dir" 2>&1)" || miss_status=$?
+assert "a worker kubeconfig without its client cert/key/CA means a join is required, said plainly (upgrading it would start a kubelet that can never authenticate)" \
+  "$([ "$miss_status" -ne 0 ] && printf '%s' "$miss_out" | grep -q 'a join is required' && printf '%s' "$miss_out" | grep -qF "$miss_dir/kubelet-client.crt" && echo 1 || echo 0)"
+
+# The install.sh worker branch, extracted: with an existing identity it must
+# skip the join, never read a token, and restart kubelet.
+write_worker_branch_runner() {
+  local runner="$1" unit_dir="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'STATE_DIR="$1"; JOIN_MODE="$2"; BIN_DIR=/opt/u7s/bin; NODE_NAME=n1; IFACE_IP=10.0.0.2; KUBELET_ROUND2_FLAGS=""'
+    echo 'join_cluster() { echo join_cluster >> "$STATE_DIR/calls"; }'
+    echo 'read_join_token() { echo read_join_token >> "$STATE_DIR/calls"; return 1; }'
+    echo 'ensure_jq() { :; }'
+    echo 'worker_ready_heartbeat() { echo HB1; }'
+    echo 'client_cert_fingerprint() { echo FP1; }'
+    echo 'wait_for_joined_node() { echo wait_for_joined_node >> "$STATE_DIR/calls"; }'
+    echo 'wait_for_upgraded_worker() { echo "wait_for_upgraded_worker $*" >> "$STATE_DIR/calls"; }'
+    echo 'systemctl() { echo "systemctl $*" >> "$STATE_DIR/calls"; }'
+    echo 'if true; then'
+    awk '/^  # --- Join an existing cluster via the CSR API/,/^  exit 0$/' "$INSTALL" \
+      | sed "s#/etc/systemd/system/#$unit_dir/#"
+    echo 'fi'
+  } > "$runner"
+}
+BRANCH_UNITS="$UPG_WORK/units"; mkdir -p "$BRANCH_UNITS"
+BRANCH_RUNNER="$UPG_WORK/branch.sh"
+write_worker_branch_runner "$BRANCH_RUNNER" "$BRANCH_UNITS"
+
+up_dir="$UPG_WORK/upgrade-branch"; mkdir -p "$up_dir"
+up_status=0; bash "$BRANCH_RUNNER" "$up_dir" 0 >/dev/null 2>&1 || up_status=$?
+assert "re-running install.sh on a joined worker with no token skips the join and restarts kubelet (an upgrade must not force minting a token for every node)" \
+  "$([ "$up_status" -eq 0 ] && ! grep -qE '^(join_cluster|read_join_token)$' "$up_dir/calls" && grep -qx 'systemctl restart kubelet.service' "$up_dir/calls" && echo 1 || echo 0)"
+assert "the upgrade waits for the Node to report Ready after the restart, passing the pre-restart heartbeat and cert fingerprint (otherwise a stale Ready or a lost identity is reported as a successful upgrade)" \
+  "$(grep -qx 'wait_for_upgraded_worker HB1 FP1' "$up_dir/calls" && echo 1 || echo 0)"
+
+jn_dir="$UPG_WORK/join-branch"; mkdir -p "$jn_dir"
+jn_status=0; bash "$BRANCH_RUNNER" "$jn_dir" 1 >/dev/null 2>&1 || jn_status=$?
+assert "a fresh --join still runs join_cluster and the join wait (the tokenless path must not swallow real joins)" \
+  "$([ "$jn_status" -eq 0 ] && grep -qx join_cluster "$jn_dir/calls" && grep -qx wait_for_joined_node "$jn_dir/calls" && ! grep -q '^wait_for_upgraded_worker' "$jn_dir/calls" && echo 1 || echo 0)"
+
+# Post-restart verification.
+HB_RUNNER="$UPG_WORK/hb.sh"
+write_upgrade_runner "$HB_RUNNER" '
+worker_ready_heartbeat() { echo "$HEARTBEAT"; }
+wait_for_upgraded_worker "$BEFORE" "$FP_BEFORE"'
+valid_fp="$(openssl x509 -in "$UPG_WORK/valid.crt" -noout -fingerprint -sha256 | cut -d= -f2)"
+stale_status=0; HEARTBEAT=T1 BEFORE=T1 FP_BEFORE="$valid_fp" bash "$HB_RUNNER" "$ok_dir" >/dev/null 2>&1 || stale_status=$?
+assert "a Node whose Ready heartbeat predates the kubelet restart is not reported as upgraded (the old Ready condition lingers until the lifecycle controller notices)" \
+  "$([ "$stale_status" -ne 0 ] && echo 1 || echo 0)"
+fresh_out="$(HEARTBEAT=T2 BEFORE=T1 FP_BEFORE="$valid_fp" bash "$HB_RUNNER" "$ok_dir" 2>&1)" && fresh_status=0 || fresh_status=$?
+assert "a Node that reports Ready with a newer heartbeat and an unchanged client cert is a successful upgrade, reported as such" \
+  "$([ "$fresh_status" -eq 0 ] && printf '%s' "$fresh_out" | grep -q 'client certificate unchanged' && echo 1 || echo 0)"
+rotd_out="$(HEARTBEAT=T2 BEFORE=T1 FP_BEFORE="AA:BB" bash "$HB_RUNNER" "$ok_dir" 2>&1)" && rotd_status=0 || rotd_status=$?
+assert "a client cert that changed across the restart is reported as rotated by the kubelet, not as a re-bootstrap" \
+  "$([ "$rotd_status" -eq 0 ] && printf '%s' "$rotd_out" | grep -q 'rotated its client certificate' && echo 1 || echo 0)"
+exp_after_status=0; HEARTBEAT=T2 BEFORE=T1 FP_BEFORE=x bash "$HB_RUNNER" "$exp_dir" >/dev/null 2>&1 || exp_after_status=$?
+assert "an upgrade whose client cert is no longer valid afterwards fails loud even if the Node looks Ready" \
+  "$([ "$exp_after_status" -ne 0 ] && echo 1 || echo 0)"
+
+# Control plane: CA / SA keys survive the re-run untouched, or the run fails.
+CP_RUNNER="$UPG_WORK/cp.sh"
+write_upgrade_runner "$CP_RUNNER" 'before="$(cp_identity_fingerprint)"; if [ -n "${MUTATE:-}" ]; then echo regenerated > "$STATE_DIR/$MUTATE"; fi; verify_cp_identity_preserved "$before"'
+cp_state="$UPG_WORK/cp-state"; mkdir -p "$cp_state"
+for f in ca.key ca.crt sa.key sa.pub; do echo "original $f" > "$cp_state/$f"; done
+cp_ok_out="$(bash "$CP_RUNNER" "$cp_state" 2>&1)" && cp_ok_status=0 || cp_ok_status=$?
+assert "a control-plane re-run that leaves ca.*/sa.* alone succeeds and says no CA or tokens were re-minted" \
+  "$([ "$cp_ok_status" -eq 0 ] && printf '%s' "$cp_ok_out" | grep -q 'no CA or tokens re-minted' && echo 1 || echo 0)"
+for f in ca.key sa.key; do
+  cp_bad_status=0; MUTATE="$f" bash "$CP_RUNNER" "$cp_state" >/dev/null 2>&1 || cp_bad_status=$?
+  assert "a control-plane upgrade that re-mints $f fails loud (every node's identity and every issued token would silently die)" \
+    "$([ "$cp_bad_status" -ne 0 ] && echo 1 || echo 0)"
+  echo "original $f" > "$cp_state/$f"
+done
+assert_true "the control-plane path records the CA/SA fingerprint before restarting the apiserver and verifies it after (an upgrade must not re-mint cluster identity)" \
+  grep -qF 'verify_cp_identity_preserved "$CP_IDENTITY_BEFORE"' "$INSTALL"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
