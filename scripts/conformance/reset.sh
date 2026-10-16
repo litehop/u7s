@@ -162,6 +162,32 @@ teardown_vm() {
   fi
 }
 
+# Pure: prints why <workdir> must never be wiped and returns 0, or returns 1
+# when it is safe. Compares physical paths so symlinked spellings (macOS
+# /var -> /private/var) cannot slip past.
+workdir_protected_reason() {
+  local wd="$1" p top
+  p="$(cd "$wd" 2>/dev/null && pwd -P)" || p="$wd"
+  if [ "$p" = "/" ]; then
+    echo "the filesystem root"; return 0
+  fi
+  if [ -n "${HOME:-}" ] && [ "$p" = "$(cd "$HOME" 2>/dev/null && pwd -P)" ]; then
+    echo "\$HOME"; return 0
+  fi
+  local cwd
+  cwd="$(pwd -P)"
+  if [ "$p" = "$cwd" ] || [[ "$cwd/" == "$p/"* ]]; then
+    echo "the current directory or one of its ancestors"; return 0
+  fi
+  if top="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    top="$(cd "$top" && pwd -P)"
+    if [[ "$top/" == "$p/"* ]]; then
+      echo "the git repo/worktree root or one of its ancestors"; return 0
+    fi
+  fi
+  return 1
+}
+
 main() {
   local WORKDIR="$PWD/temp/u7s"
   local VM_NAME="${U7S_VM_NAME:-lima-node}"
@@ -199,6 +225,17 @@ main() {
       /*) ;;
       *) WORKDIR="$PWD/${WORKDIR#./}" ;;
     esac
+  fi
+
+  # Full mode runs `rm -rf "$WORKDIR"`: refuse anything that is, or contains,
+  # the caller's cwd or repo/worktree root, plus $HOME and /. Deny-list only:
+  # a "temp/u7s" naming rule would reject the other dedicated state dirs
+  # callers pass to run-all.sh --workdir. Runs before any kill so a refusal
+  # has no side effects in either mode.
+  local protected_reason
+  if protected_reason="$(workdir_protected_reason "$WORKDIR")"; then
+    echo "[reset] ERROR: refusing --workdir $WORKDIR: it is $protected_reason" >&2
+    exit 1
   fi
 
   echo "=== [reset] Conformance teardown ==="
