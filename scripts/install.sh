@@ -651,9 +651,9 @@ apt-get update -qq
 apt-get install -y apt-transport-https ca-certificates curl gpg
 
 install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/Release.key \
+curl -fsSL https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/Release.key \
   | gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/ /' \
+echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/ /' \
   > /etc/apt/sources.list.d/cri-o.list
 apt-get update -qq
 apt-get install -y cri-o crun conmon
@@ -784,7 +784,7 @@ write_kubelet_config_yaml
 # deliberately NOT touched here -- operator scope narrowing keeps
 # behavior-changing knobs off the table until other levers are exhausted.
 #
-# Feature gates: kubelet-consulted Beta gates, default-on in v1.36.4's
+# Feature gates: kubelet-consulted Beta gates, default-on in v1.37.1's
 # pkg/features/kube_features.go, that no u7s workload or manifest exercises
 # (verified per-gate against crates/ + manifests/ for a consumer of the
 # capability's wire field). PodReadyToStartContainersCondition was left
