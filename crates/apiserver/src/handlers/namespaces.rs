@@ -586,6 +586,7 @@ pub(crate) async fn patch_namespace<S: Store>(
     crate::patch::merge_patch(&mut current.body, &patch);
 
     current.body["metadata"]["uid"] = stored_uid;
+    super::json_patch::enforce_patch_identity(&mut current.body, &name, None)?;
 
     if stored_status.is_null() {
         current.body.as_object_mut().map(|m| m.remove("status"));
@@ -2137,6 +2138,51 @@ mod tests {
             body["metadata"]["labels"]["patched"], "yes",
             "patch must apply the merge patch to the stored namespace"
         );
+    }
+
+    /// A Namespace patch (merge, strategic-merge, apply) that renames the object must be
+    /// refused with upstream's 400 and leave the stored namespace untouched: cascade deletion
+    /// selects objects by body namespace, so a renamed body would orphan or destroy the wrong
+    /// namespace's contents.
+    #[tokio::test]
+    async fn patch_namespace_rejects_rename_for_every_patch_type() {
+        use crate::handlers::test_support::{
+            assert_identity_mismatch, content_type_headers, identity_rewrite_patches,
+        };
+        let state = make_state();
+        assert!(create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            namespace_body("ns1"),
+        )
+        .await
+        .is_ok());
+        let key = crate::keys::cluster_object_key("namespaces", "ns1");
+        let before = state.store.get(&key).await.unwrap().unwrap().value;
+
+        for (label, ct, body) in identity_rewrite_patches("name", "kube-system", "v1", "Namespace")
+            .into_iter()
+            .filter(|(label, _, _)| *label != "json-patch")
+        {
+            let err = patch_namespace(
+                State(state.clone()),
+                Path("ns1".to_string()),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                content_type_headers(ct),
+                body,
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{label} rename must be rejected"));
+            assert_identity_mismatch(&err, label, "name");
+            assert_eq!(
+                state.store.get(&key).await.unwrap().unwrap().value,
+                before,
+                "{label} rename must not change the stored namespace"
+            );
+        }
     }
 
     /// `kubectl patch namespace --dry-run=server` (merge-patch branch) must NOT persist the

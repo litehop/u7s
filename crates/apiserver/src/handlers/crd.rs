@@ -1517,6 +1517,8 @@ pub async fn patch_crd<S: Store>(
         }
     }
 
+    crate::handlers::json_patch::enforce_patch_identity(&mut current, &name, None)?;
+
     if stored_status.is_null() {
         current.as_object_mut().map(|m| m.remove("status"));
     } else {
@@ -2032,6 +2034,52 @@ mod tests {
         .await
         .is_ok());
         assert_eq!(stored_crd_generation(&state, name).await, 3);
+    }
+
+    /// A CRD patch (any type) that renames the object must be refused with upstream's 400 and
+    /// leave the stored CRD untouched: the store key is URL-derived, but discovery and the CR
+    /// router resolve CRDs by body, so a renamed body would shadow another CRD's resources.
+    #[tokio::test]
+    async fn patch_crd_rejects_rename_for_every_patch_type() {
+        use crate::handlers::test_support::{
+            assert_identity_mismatch, content_type_headers, identity_rewrite_patches,
+        };
+        let state = make_state();
+        let name = "applications.argoproj.io";
+        assert!(create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes(name)
+        )
+        .await
+        .is_ok());
+        let key = crate::keys::group_object_key(GROUP, PLURAL, None, name);
+        let before = state.store.get(&key).await.unwrap().unwrap().value;
+
+        for (label, ct, body) in identity_rewrite_patches(
+            "name",
+            "widgets.example.io",
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+        ) {
+            let err = patch_crd(
+                State(state.clone()),
+                Path(name.to_string()),
+                test_user(),
+                content_type_headers(ct),
+                body,
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{label} rename must be rejected"));
+            assert_identity_mismatch(&err, label, "name");
+            assert_eq!(
+                state.store.get(&key).await.unwrap().unwrap().value,
+                before,
+                "{label} rename must not change the stored CRD"
+            );
+        }
     }
 
     // create_crd → 201; get_crd → 200 with stored object.
