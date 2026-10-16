@@ -57,7 +57,22 @@ small app (WordPress + MariaDB) running. Large pod bursts on top of that
 push the host into page-cache thrash. `install.sh` deliberately does not
 touch the host OS, so these node-level mitigations are yours to apply:
 
-- Add a swapfile (kubelet is configured with `failSwapOn: false`):
+- Recommended for bursty or dense workloads: enable zram swap. `install.sh`
+  does not configure swap. On 1 GiB / 1 vCPU with no swap, an 80-pod burst
+  never reached all-Ready within 600 s and the node went NotReady; with
+  512 MiB zram, 80 pods were Ready in 15-17 s and the node stayed Ready.
+  With `systemd-zram-generator` installed:
+
+  ```bash
+  printf '[zram0]\nzram-size = 512\ncompression-algorithm = zstd\n' |
+    sudo tee /etc/systemd/zram-generator.conf
+  sudo systemctl daemon-reload && sudo systemctl start /dev/zram0
+  ```
+
+  Kubelet runs with `failSwapOn: false` and its default `NoSwap` behaviour,
+  so pods do not swap; system processes and the kernel do.
+
+- Or add a swapfile instead:
 
   ```bash
   sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile
