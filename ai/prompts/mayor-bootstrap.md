@@ -112,7 +112,7 @@ as needed.
 
 **Mayor tick loop body — GitHub Merge Queue is active on this repo.** The
 main-branch ruleset (18156794) requires these status checks, enforced: lint,
-test-coverage, fmt, e2e-focus 1.36.4, sensitive-e2e-guard 1.36.4, script-tests.
+test-coverage, fmt, e2e-focus 1.37.1, sensitive-e2e-guard 1.37.1, script-tests.
 Queue config: MERGE method, all-green grouping, min 1 / max 5,
 `allow_auto_merge=true`. `strict_required_status_checks_policy` is deliberately
 `false`: the queue builds a synthetic merge commit against the latest base and
