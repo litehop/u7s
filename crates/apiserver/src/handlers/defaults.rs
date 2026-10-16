@@ -554,7 +554,22 @@ fn default_storageclass(obj: &mut serde_json::Value) {
 /// `namespaceStrategy.PrepareForCreate`. It must not live in `apply_defaults` (which also runs
 /// on reads) because the finalizer is removed over the object's life. Without it, DELETE on a
 /// finalizer-less namespace hard-deletes and orphans its content.
+///
+/// Also stamps `kubernetes.io/metadata.name` (upstream does so in the same PrepareForCreate):
+/// namespaceSelectors in webhooks and policies match on it, so a namespace created without it
+/// (e.g. by `kubectl apply --server-side`) falls outside every such selector.
 pub fn prepare_namespace_for_create(obj: &mut serde_json::Value) -> Result<(), String> {
+    if let Some(name) = obj["metadata"]["name"].as_str().map(str::to_owned) {
+        let mut labels = match obj["metadata"]["labels"].take() {
+            serde_json::Value::Object(m) => m,
+            _ => serde_json::Map::new(),
+        };
+        labels.insert(
+            "kubernetes.io/metadata.name".to_owned(),
+            serde_json::Value::String(name),
+        );
+        obj["metadata"]["labels"] = serde_json::Value::Object(labels);
+    }
     let mut spec: crate::types::NamespaceSpec =
         crate::types::NamespaceSpec::deserialize(&obj["spec"]).unwrap_or_default();
     let has_k8s = spec
