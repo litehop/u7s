@@ -24,6 +24,7 @@ assert_true() {
 # still fails unless it also matches.
 ALLOW=(
   'conformance/reset.sh::pgrep -f "\$pattern"::pattern is workdir_kill_pattern output (assigned on the previous line)'
+  '_kill-pattern.sh::pgrep -f "\$pattern"::pattern is workdir_kill_pattern output (assigned on the previous line)'
   'conformance/reset.sh::sudo pkill -f (kubelet|kube-controller-manager|sonobuoy)::fixed process names inside the guest VM, no path'
   'conformance/04-start-kcm.sh::kube-controller-manager-\[0-9\]::fixed binary-name pattern inside the guest VM, no path'
   'worktree-hygiene.sh::pkill -f "\$\(kill_pattern_for ::kill_pattern_for is a thin wrapper over workdir_kill_pattern'

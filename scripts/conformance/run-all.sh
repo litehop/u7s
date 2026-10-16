@@ -557,7 +557,7 @@ if [ "$STACK_ONLY" -eq 1 ]; then
     echo "Allocation profile: apiserver is running under dhat. --stack-only leaves"
     echo "it running on purpose (for kubectl exploration), so dhat's Drop-based"
     echo "flush ($DHAT_HEAP_FILE) hasn't fired yet — stop it yourself when done:"
-    echo "  kill -TERM \$(lsof -ti tcp:${PORT:-6443} -sTCP:LISTEN)"
+    echo "  pkill -TERM -f '$(workdir_kill_pattern apiserver "$(cd "$WORKDIR" && pwd)")'"
   fi
 else
   banner "Step 6/6: Run sonobuoy"
@@ -610,8 +610,12 @@ else
     bash "$DIR/sample-run-metrics.sh" snapshot --workdir "$WORKDIR" --label pre-teardown --vm "${U7S_VM_NAME:-lima-node}"
     bash "$DIR/sample-run-metrics.sh" stop --workdir "$WORKDIR"
 
-    # shellcheck disable=SC2207 # word-split intentionally: lsof -ti can return multiple PIDs, one per line.
-    API_PIDS=($(lsof -ti tcp:"${PORT:-6443}" -sTCP:LISTEN 2>/dev/null || true))
+    # Select by binary + this workdir, never by port: Lima auto-forwards other
+    # projects' guest ports onto the same host port, so the port's holder may
+    # not be ours.
+    WORKDIR_ABS="$(cd "$WORKDIR" && pwd)"
+    # shellcheck disable=SC2207 # word-split intentionally: pgrep returns one PID per line.
+    API_PIDS=($(u7s_owned_pids apiserver "$WORKDIR_ABS"))
     if [ "${#API_PIDS[@]}" -gt 0 ]; then
       echo "Sending SIGTERM to apiserver (PID(s): ${API_PIDS[*]}) ..."
       kill "${API_PIDS[@]}" 2>/dev/null || true
@@ -644,12 +648,11 @@ else
         echo "warning: apiserver (PID(s): ${API_PIDS[*]}) still running 5 minutes after SIGTERM — dhat heap may not have flushed" >&2
       fi
     else
-      echo "warning: no apiserver found listening on port ${PORT:-6443} — dhat heap may already be stale" >&2
+      echo "warning: no u7s-apiserver of workdir $WORKDIR_ABS found — dhat heap may already be stale" >&2
     fi
     # scheduler + konnectivity-server aren't dhat-instrumented, but leaving
     # them running after the apiserver they talk to is gone just leaves
     # orphans — same full-cleanup scope as reset.sh.
-    WORKDIR_ABS="$(cd "$WORKDIR" && pwd)"
     pkill -f "$(workdir_kill_pattern scheduler "$WORKDIR_ABS")" 2>/dev/null || true
     pkill -f "$(workdir_kill_pattern konnectivity-server "$WORKDIR_ABS")" 2>/dev/null || true
 

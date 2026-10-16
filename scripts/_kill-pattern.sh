@@ -23,3 +23,13 @@ workdir_kill_pattern() {
     *) echo "workdir_kill_pattern: unknown process type '$proc_type'" >&2; return 1 ;;
   esac
 }
+
+# u7s_owned_pids <type> <canonical-workdir>: PIDs (one per line) of the u7s
+# processes of that type belonging to that workdir. Signal only these, never a
+# port's holder: Lima auto-forwards other projects' guest ports onto the same
+# host port, so the holder may be someone else's VM agent.
+u7s_owned_pids() {
+  local pattern
+  pattern=$(workdir_kill_pattern "$1" "$2") || return 1
+  pgrep -f "$pattern" 2>/dev/null || true
+}
