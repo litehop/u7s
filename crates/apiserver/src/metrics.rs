@@ -58,7 +58,7 @@ pub static WATCH_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 /// Counter of apiserver requests, broken out by verb, group, version, resource, scope and
 /// HTTP status code — matches upstream `apiserver_request_total`. Instrumented at two sites:
-/// `auth::AuthService::call` records every non-exempt, non-watch request once the inner
+/// `auth::AuthService::call` records every non-watch request once the inner
 /// handler responds, covering every verb and status code — including handler-encoded outcomes
 /// such as a CRD-tombstone or expired-continue-token 410, not just RBAC's own 401/403. Watch
 /// is recorded separately by `handlers::watch` (200 open, 410 expired resourceVersion, 429
@@ -245,11 +245,7 @@ pub static SA_SIG_CACHE_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
 /// Counter of aggregated-discovery documents built by `build_aggregated_discovery`, broken out
 /// by which discovery route triggered the build (`/api`, `/apis`, `/discovery/v2`), whether the
 /// core `/api/v1` group was included, and whether any `APIService` was registered at build time.
-/// `/api`, `/apis` and `/discovery/v2` are all on `auth::is_exempt`'s exempt list, so
-/// `AuthService::call` returns before `record_request_total` ever runs for them --
-/// `apiserver_request_total` has zero series for these routes. This counter is the only
-/// per-request signal available for measuring discovery request volume; `has_apiservice`
-/// specifically exists so a future discovery cache's design can be checked against the baseline
+/// `has_apiservice` exists so a future discovery cache's design can be checked against the baseline
 /// rate of calls that involve a live APIService backend -- see the caller-token-forwarding
 /// cache-safety doc on `build_aggregated_discovery` itself for why that case cannot be served
 /// from a naive shared cache.

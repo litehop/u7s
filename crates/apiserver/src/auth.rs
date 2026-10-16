@@ -229,11 +229,6 @@ fn ct_token_lookup<'a>(
 
 /// Outcome of authenticating a single request.
 ///
-/// `pub(crate)`: also called directly by `handlers::discovery`'s auth-exempt routes (`/api`,
-/// `/apis`, `/discovery/v2` — see `is_exempt`'s doc), which need to resolve the caller's
-/// identity for asserting front-proxy headers to an aggregated APIService backend
-/// (`aggregation::discovery_resources_for_apiservice`) even though `AuthLayer` itself never
-/// runs `authenticate` for them.
 pub(crate) enum AuthnResult {
     /// Authenticated — carry UserInfo forward.
     Identified(UserInfo),
@@ -767,35 +762,6 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
 // Path parsing → AuthzRequest fields
 // ---------------------------------------------------------------------------
 
-/// Paths that skip auth entirely.
-///
-/// `/version` is deliberately NOT here (unlike real kube-apiserver's few truly
-/// unauthenticated paths, `/version` still goes through authn/authz there too — see
-/// `WithAuthentication`/`WithAuthorization` wrapping the full handler chain upstream).
-/// Skipping auth for it meant `AuthService::call`'s classification hook (and
-/// Impersonate-* header handling) never ran for `/version` at all, which is exactly
-/// the endpoint the upstream APF conformance test polls to check for
-/// `X-Kubernetes-PF-*` response headers. Anonymous callers still reach it: `authenticate`
-/// falls back to `system:anonymous`/`system:unauthenticated`, and the seeded
-/// `system:public-info-viewer` ClusterRoleBinding grants that group `get` on `/version`
-/// — so removing this exemption changes nothing about who can call it, only that the
-/// full pipeline (classification, impersonation, `apiserver_request_total`) now runs.
-fn is_exempt(path: &str) -> bool {
-    matches!(
-        path,
-        "/healthz"
-            | "/readyz"
-            | "/livez"
-            | "/api"
-            | "/api/"
-            | "/apis"
-            | "/apis/"
-            | "/discovery/v2"
-            | "/openapi/v2"
-            | "/openapi/v3"
-    )
-}
-
 /// HTTP method → RBAC verb.
 ///
 /// For GET and HEAD resource requests the caller must call `get_verb` instead, because Kubernetes
@@ -832,6 +798,25 @@ fn get_verb(name: Option<&str>, query: Option<&str>) -> &'static str {
         "watch"
     } else {
         "list"
+    }
+}
+
+/// The RBAC verb authorization checks for a request. Non-resource URLs carry the HTTP method
+/// itself (get_verb's list/watch only applies to resources).
+fn request_verb(
+    method: &axum::http::Method,
+    parsed: &ParsedPath,
+    non_resource: bool,
+    query: Option<&str>,
+) -> &'static str {
+    if non_resource {
+        method_to_verb(method)
+    } else if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
+        get_verb(parsed.name.as_deref(), query)
+    } else if method == axum::http::Method::DELETE && parsed.name.is_none() {
+        "deletecollection"
+    } else {
+        method_to_verb(method)
     }
 }
 
@@ -1308,19 +1293,15 @@ where
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let path = req.uri().path();
 
-        // Exempt paths skip auth.
-        if is_exempt(path) {
-            return Box::pin(self.inner.call(req));
-        }
-
         // parse_path and the non-resource-URL check are pure functions of the borrowed
         // path — run them here, on the borrow, before `req` (and the borrow) moves into
         // the async block below. Only non-resource URLs (health checks, /openapi,
-        // /version, ...) need the raw path downstream, so only that minority pays for an
-        // owned-String clone; the common resource-URL case captures just `parsed`, which
-        // already owns its own group/version/resource/subresource/namespace/name fields.
+        // /version, discovery documents, ...) need the raw path downstream, so only that
+        // minority pays for an owned-String clone; the common resource-URL case captures
+        // just `parsed`, which already owns its own
+        // group/version/resource/subresource/namespace/name fields.
         let parsed = parse_path(path);
-        let non_resource_path = if parsed.resource.is_empty() && !path.starts_with("/api") {
+        let non_resource_path = if parsed.resource.is_empty() {
             Some(path.to_owned())
         } else {
             None
@@ -1377,10 +1358,15 @@ where
                 }
                 AuthnResult::BadToken => {
                     drop(verification);
-                    // Fires before parse_path runs, so group/version/resource/scope are
-                    // unknown — recorded empty rather than guessed, matching a non-resource
-                    // request's shape rather than a specific one.
-                    record_request_total(method_to_verb(req.method()), "", "", "", "", "401");
+                    // Group/version/resource/scope stay empty rather than guessed; the verb
+                    // is derived exactly as authorization derives it.
+                    let verb = request_verb(
+                        req.method(),
+                        &parsed,
+                        non_resource_path.is_some(),
+                        req.uri().query(),
+                    );
+                    record_request_total(verb, "", "", "", "", "401");
                     return Ok(unauthorized_response());
                 }
             };
@@ -1607,17 +1593,12 @@ where
 
             // Non-resource URL verbs map directly from the HTTP method ("get", "post", ...).
             // get_verb's list/get/watch distinction only applies to resource requests.
-            let verb = if non_resource_url.is_some() {
-                method_to_verb(req.method())
-            } else if req.method() == axum::http::Method::GET
-                || req.method() == axum::http::Method::HEAD
-            {
-                get_verb(parsed.name.as_deref(), req.uri().query())
-            } else if req.method() == axum::http::Method::DELETE && parsed.name.is_none() {
-                "deletecollection"
-            } else {
-                method_to_verb(req.method())
-            };
+            let verb = request_verb(
+                req.method(),
+                &parsed,
+                non_resource_url.is_some(),
+                req.uri().query(),
+            );
 
             // RBAC `resourceNames` restrictions must also recognize the LIST/WATCH-with-
             // `fieldSelector=metadata.name=<name>` pattern used by every client-go informer
@@ -2326,91 +2307,46 @@ mod tests {
         assert_eq!(get_verb(None, Some("watch=0")), "list");
     }
 
-    // --- is_exempt() ---
-
-    #[test]
-    fn test_exempt_paths() {
-        // Discovery and health paths must not require auth.
-        for path in &["/healthz", "/readyz", "/livez", "/api", "/apis"] {
-            assert!(is_exempt(path), "{path} must be exempt");
-        }
-        // Non-exempt paths must not be skipped.
-        assert!(!is_exempt("/api/v1/pods"));
-        assert!(!is_exempt("/apis/apps/v1/deployments"));
-        // /version must NOT be exempt — see is_exempt's doc for why it needs to run
-        // through the full authn/authz/classification pipeline like upstream.
-        assert!(!is_exempt("/version"));
-    }
-
-    /// Upstream e2e clients (Discovery, kubectl proxy) call AbsPath('/api/') and
-    /// AbsPath('/apis/') with a literal trailing slash. Without exempting these
-    /// variants, such clients get a 401/403 instead of the discovery doc.
-    #[test]
-    fn test_exempt_paths_trailing_slash() {
-        for path in &["/api/", "/apis/"] {
-            assert!(
-                is_exempt(path),
-                "{path} must be exempt — clients appending a trailing slash to a \
-                 discovery root must not be treated differently from the no-slash form"
-            );
-        }
-    }
-
-    /// /openapi/v2 and /openapi/v3 must be exempt from auth.
-    ///
-    /// Conformance tests poll these endpoints after creating a CRD to wait for
-    /// the CRD schema to appear. The test client sends requests without credentials,
-    /// so any auth requirement causes 403 Forbidden and the test times out waiting
-    /// for a schema that the client can never see. kube-apiserver serves these
-    /// endpoints without requiring auth.
-    #[test]
-    fn openapi_endpoints_are_exempt_from_auth() {
-        assert!(
-            is_exempt("/openapi/v2"),
-            "/openapi/v2 must be auth-exempt — conformance tests poll it without credentials \
-             to detect when a CRD schema is published; a 403 causes the test to time out"
-        );
-        assert!(
-            is_exempt("/openapi/v3"),
-            "/openapi/v3 must be auth-exempt — conformance tests poll it without credentials \
-             to detect when a CRD schema is published; a 403 causes the test to time out"
-        );
-    }
-
-    /// GET /openapi/v3/apis/<group>/<version> must use verb "get", not "list".
-    ///
-    /// parse_path() returns name=None for this path (it's not a resource path), so
-    /// get_verb(None, _) would return "list". The system:discovery ClusterRole only
-    /// grants verb "get" on /openapi/*, so a "list" check always fails with 403,
-    /// causing the e2e test "should type check a CRD" to hang while polling the
-    /// per-group schema endpoint.
-    #[test]
-    fn non_resource_url_get_uses_method_verb_not_list() {
-        let path = "/openapi/v3/apis/stable.example.com/v1";
+    /// Verb exactly as authorization derives it for `method path`, used by both the 401
+    /// metric label and the RBAC check.
+    fn verb_for(method: Method, path: &str, query: Option<&str>) -> &'static str {
         let parsed = parse_path(path);
-        // parse_path returns unknown_path() for non-api/apis paths
-        assert!(
-            parsed.resource.is_empty(),
-            "openapi path must not parse as a resource"
-        );
-        // non_resource_url detection
-        let is_non_resource = parsed.resource.is_empty() && !path.starts_with("/api");
-        assert!(
-            is_non_resource,
-            "/openapi/... must be detected as non-resource"
-        );
-        // verb for non-resource GET must be "get", not "list"
-        // (get_verb(None, None) returns "list" — must NOT be called for non-resource paths)
-        let verb = if is_non_resource {
-            method_to_verb(&Method::GET)
-        } else {
-            get_verb(parsed.name.as_deref(), None)
-        };
+        request_verb(&method, &parsed, parsed.resource.is_empty(), query)
+    }
+
+    /// Discovery documents (`/api/v1`, `/apis/<group>/<version>`) and OpenAPI paths have no
+    /// resource segment, so they are non-resource URLs authorized with verb "get". Treating
+    /// them as a resource "list" never matches system:discovery's nonResourceURLs, so every
+    /// non-admin client would 403 on discovery and the type-check-a-CRD conformance test hangs.
+    #[test]
+    fn discovery_and_openapi_paths_use_get_not_list() {
+        for path in [
+            "/api",
+            "/api/v1",
+            "/apis",
+            "/apis/apps",
+            "/apis/apps/v1",
+            "/openapi/v3/apis/stable.example.com/v1",
+            "/healthz",
+        ] {
+            assert_eq!(verb_for(Method::GET, path, None), "get", "{path}");
+        }
+    }
+
+    /// A resource-path HEAD is get/list, never "head": the 401 metric label for an
+    /// unauthenticated resource HEAD must match what authorization would have checked.
+    #[test]
+    fn resource_head_verb_is_list_or_get_and_non_resource_head_is_head() {
+        assert_eq!(verb_for(Method::HEAD, "/api/v1/pods", None), "list");
+        assert_eq!(verb_for(Method::HEAD, "/api/v1/pods/p", None), "get");
+        assert_eq!(verb_for(Method::HEAD, "/healthz", None), "head");
         assert_eq!(
-            verb, "get",
-            "GET /openapi/v3/apis/<group>/<version> must use verb \"get\" — \
-             system:discovery only grants \"get\" on /openapi/*, so \"list\" \
-             causes 403 and the type-check CRD conformance test hangs forever"
+            verb_for(Method::GET, "/api/v1/pods", Some("watch=true")),
+            "watch"
+        );
+        assert_eq!(
+            verb_for(Method::DELETE, "/api/v1/pods", None),
+            "deletecollection"
         );
     }
 
@@ -5633,7 +5569,7 @@ mod tests {
             StatusCode::FORBIDDEN,
             "a rule granting a DIFFERENT nonResourceURL must not match {PATH} — if the \
              preamble hoist ever captured the wrong string (stale, truncated, or the \
-             is_exempt-time borrow instead of the real path), this would wrongly allow"
+             borrow of something other than the real path), this would wrongly allow"
         );
     }
 
@@ -6093,7 +6029,7 @@ mod tests {
             ));
 
         let before_401 = REQUEST_TOTAL
-            .with_label_values(&["get", "", "", "", "", "401"])
+            .with_label_values(&["list", "", "", "", "", "401"])
             .get();
 
         let req_401 = Request::builder()
@@ -6111,7 +6047,7 @@ mod tests {
         );
 
         let after_401 = REQUEST_TOTAL
-            .with_label_values(&["get", "", "", "", "", "401"])
+            .with_label_values(&["list", "", "", "", "", "401"])
             .get();
         assert_eq!(
             after_401,
@@ -6578,14 +6514,13 @@ mod tests {
         );
     }
 
-    /// Regression guard for removing "/version" from `is_exempt`: a caller with NO
-    /// Authorization header at all must still reach `/version`, exactly as it could when
-    /// the path was fully auth-exempt. `authenticate`'s anonymous fallback plus the seeded
-    /// `system:public-info-viewer` grant (bound to `system:unauthenticated`) must combine
-    /// to make this work — if either piece regressed, load-balancer-style unauthenticated
-    /// version probes would start getting 401/403 instead of 200.
+    /// A caller with NO Authorization header must reach `/version`: `authenticate`'s
+    /// anonymous fallback plus the seeded `system:public-info-viewer` grant (bound to
+    /// `system:unauthenticated`) must combine to make this work — if either piece
+    /// regressed, load-balancer-style unauthenticated version probes would start getting
+    /// 401/403 instead of 200.
     #[tokio::test]
-    async fn anonymous_caller_still_reaches_version_after_removing_its_auth_exemption() {
+    async fn anonymous_caller_reaches_version_via_public_info_viewer() {
         use axum::{body::Body, http::Request, routing::get, Router};
         use tower::ServiceExt;
 
@@ -6634,7 +6569,7 @@ mod tests {
             resp.status(),
             axum::http::StatusCode::OK,
             "an anonymous caller must still get /version via the system:unauthenticated \
-             grant — removing is_exempt's bypass must not require a credential"
+             grant — /version must not require a credential"
         );
     }
 

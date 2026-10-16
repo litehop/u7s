@@ -14,7 +14,6 @@
 //
 // Both endpoints are RBAC-gated (non-resource URLs) via the seeded ClusterRole
 // `system:service-account-issuer-discovery` which grants `get` on these paths.
-// They are NOT in auth::is_exempt().
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use base64::Engine as _;

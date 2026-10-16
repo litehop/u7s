@@ -850,20 +850,19 @@ async fn healthz(
 
 fn build_router(state: AppState) -> Router {
     Router::new()
-        // Health endpoints — no auth required; kube-controller-manager polls these
-        // before declaring the apiserver ready. Listed in is_exempt() in auth.rs.
+        // Health endpoints — authorized through system:public-info-viewer like upstream.
         // /healthz alone gates on boot_ready (see healthz's doc) — /livez and /readyz stay
         // unconditional "ok" so a slow boot-time manifest apply can't trip a liveness-probe
         // restart loop.
         .route("/healthz", get(healthz))
         .route("/livez", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ok" }))
-        // Prometheus text-exposition metrics — RBAC-gated like every other route (NOT listed
-        // in auth::is_exempt), matching upstream kube-apiserver where /metrics requires the
-        // same bearer-token auth as any other endpoint. The bootstrap system:monitoring
+        // Prometheus text-exposition metrics — RBAC-gated like every other route, matching
+        // upstream kube-apiserver where /metrics requires the same bearer-token auth as any
+        // other endpoint. The bootstrap system:monitoring
         // ClusterRole already grants nonResourceURLs access to it.
         .route("/metrics", get(handlers::metrics::metrics))
-        // Server version — no auth required (sonobuoy, kubectl version)
+        // Server version — public via system:public-info-viewer (sonobuoy, kubectl version)
         .route("/version", get(handlers::discovery::version))
         // OIDC SA issuer discovery — RBAC-gated via system:service-account-issuer-discovery ClusterRole
         .route(
@@ -1639,7 +1638,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
 
     // -----------------------------------------------------------------------
     // ClusterRole: system:discovery — read access to API discovery endpoints.
-    // Grants get on /api, /apis, /openapi/v2, etc. so unauthenticated discovery works.
+    // Identical to upstream's rule; bound to system:authenticated only.
     // -----------------------------------------------------------------------
     let key = keys::group_object_key(GROUP, "clusterroles", None, "system:discovery");
     let body = serde_json::json!({
@@ -1647,7 +1646,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:discovery", "uid": "00000000-0000-0000-0000-000000000016", "creationTimestamp": TS },
         "rules": [
-            { "nonResourceURLs": ["/api","/api/*","/apis","/apis/*","/healthz","/readyz","/livez","/openapi","/openapi/*","/version"], "verbs": ["get"] }
+            { "nonResourceURLs": ["/livez","/readyz","/healthz","/version","/version/","/openapi","/openapi/*","/api","/api/*","/apis","/apis/*"], "verbs": ["get"] }
         ]
     });
     put!(key, body, "system:discovery", "ClusterRole");
@@ -9082,33 +9081,28 @@ mod tests {
         );
     }
 
-    /// GET /openapi/v2 and /openapi/v3 must return 200 (not 403) without credentials.
-    ///
-    /// Conformance tests poll these endpoints after creating a CRD to wait for the CRD
-    /// schema to appear. The test client sends unauthenticated requests (no Bearer token,
-    /// no client cert). If auth is required, anonymous users get 403 Forbidden and the
-    /// test times out with "failed to wait for OpenAPI spec validating condition: unexpected
-    /// response: 403". kube-apiserver serves these endpoints to unauthenticated callers.
-    ///
-    /// This test fails if the auth exemption for /openapi/v2 and /openapi/v3 is removed.
-    #[tokio::test]
-    async fn openapi_endpoints_return_200_without_credentials() {
-        use axum::http::{Request, StatusCode};
-        use tower::ServiceExt as _;
-
-        let store = std::sync::Arc::new(make_store());
+    /// Production-shaped stack (seeded RBAC loaded into the index, real `AuthLayer`) so the
+    /// status codes below are RBAC decisions, not handler behaviour.
+    async fn seeded_rbac_app(store: &std::sync::Arc<u7s_store::SqliteStore>) -> axum::Router {
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert(
+            "alice-token".to_owned(),
+            auth::UserInfo {
+                username: "alice".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+        );
         let state = state::AppState::new(
-            std::sync::Arc::clone(&store),
+            std::sync::Arc::clone(store),
             None,
             None,
-            std::collections::HashMap::new(),
+            tokens,
             "https://localhost:6443".into(),
         );
-
-        // Build router with AuthLayer — this is the same stack as production.
-        // Without the auth exemption for /openapi/v*, the anonymous request would
-        // produce 403 Forbidden because system:anonymous has no RBAC grants.
-        let app = build_router(state.clone()).layer(AuthLayer::new(
+        state.init().await;
+        build_router(state.clone()).layer(AuthLayer::new(
             std::sync::Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
@@ -9118,26 +9112,135 @@ mod tests {
             std::sync::Arc::clone(&state.node_graph),
             std::sync::Arc::clone(&state.resource_registry),
             std::sync::Arc::clone(&state.discovery_cache),
-        ));
+        ))
+    }
 
-        for path in ["/openapi/v2", "/openapi/v3"] {
-            // No Authorization header — anonymous request, like the conformance test client.
-            let req = Request::builder()
-                .uri(path)
-                .body(axum::body::Body::empty())
-                .expect("request build must not fail");
-            let resp = app
-                .clone()
-                .oneshot(req)
-                .await
-                .expect("router must not error");
+    async fn status_of(
+        app: &axum::Router,
+        path: &str,
+        token: Option<&str>,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt as _;
+        let mut req = axum::http::Request::builder().uri(path);
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        app.clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .expect("router must not error")
+            .status()
+    }
+
+    /// Anonymous callers get exactly what `system:public-info-viewer` grants (health and
+    /// version) and nothing else: discovery and OpenAPI document the CRDs and aggregated APIs
+    /// installed, so leaking them to `system:unauthenticated` hands an unauthenticated network
+    /// client an inventory of the cluster. Upstream binds `system:discovery` to
+    /// `system:authenticated` only.
+    #[tokio::test]
+    async fn anonymous_gets_health_and_version_but_not_discovery_or_openapi() {
+        use axum::http::StatusCode;
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let app = seeded_rbac_app(&store).await;
+
+        for path in ["/healthz", "/livez", "/readyz", "/version"] {
             assert_eq!(
-                resp.status(),
+                status_of(&app, path, None).await,
                 StatusCode::OK,
-                "{path} must return 200 OK for unauthenticated requests — \
-                 conformance tests poll this without credentials after CRD creation; \
-                 403 causes 'failed to wait for OpenAPI spec validating condition: \
-                 unexpected response: 403'"
+                "anonymous {path} must be allowed by system:public-info-viewer — load \
+                 balancers and probes carry no credential"
+            );
+        }
+        for path in [
+            "/api",
+            "/api/",
+            "/api/v1",
+            "/apis",
+            "/apis/",
+            "/openapi/v2",
+            "/openapi/v3",
+            "/discovery/v2",
+        ] {
+            assert_eq!(
+                status_of(&app, path, None).await,
+                StatusCode::FORBIDDEN,
+                "anonymous {path} must be 403 — upstream denies system:unauthenticated \
+                 discovery and OpenAPI, and an open path lets anyone enumerate CRDs and schemas"
+            );
+        }
+    }
+
+    /// kubectl and every e2e client authenticate before discovering; `system:discovery`
+    /// bound to `system:authenticated` must therefore cover the whole discovery surface once
+    /// the path exemptions are gone, including `/api/v1` and `/apis/<group>/<version>` which
+    /// have no resource segment and must be treated as non-resource URLs.
+    #[tokio::test]
+    async fn authenticated_user_discovers_api_and_openapi_via_system_discovery() {
+        use axum::http::StatusCode;
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let app = seeded_rbac_app(&store).await;
+
+        for path in [
+            "/api",
+            "/api/",
+            "/api/v1",
+            "/apis",
+            "/apis/",
+            "/apis/apps",
+            "/apis/apps/v1",
+            "/openapi/v2",
+            "/openapi/v3",
+            "/healthz",
+            "/version",
+        ] {
+            let status = status_of(&app, path, Some("alice-token")).await;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "an authenticated user must be authorized for {path} by system:discovery — a \
+                 403 breaks kubectl api-resources and every client-go discovery"
+            );
+            assert_ne!(status, StatusCode::UNAUTHORIZED, "{path}");
+        }
+        assert_eq!(
+            status_of(&app, "/api/v1/pods", Some("alice-token")).await,
+            StatusCode::FORBIDDEN,
+            "system:discovery must not leak resource access"
+        );
+    }
+
+    /// The seeded roles, not a hard-coded bypass, decide: deleting the seeded rule makes the
+    /// same request 403. An operator who tightens `system:public-info-viewer` or
+    /// `system:discovery` must actually take effect.
+    #[tokio::test]
+    async fn removing_seeded_public_info_and_discovery_roles_revokes_access() {
+        use axum::http::StatusCode;
+        use u7s_store::Store as _;
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        for role in ["system:public-info-viewer", "system:discovery"] {
+            let key =
+                keys::group_object_key("rbac.authorization.k8s.io", "clusterroles", None, role);
+            store.delete(key, None).await.expect("delete seeded role");
+        }
+        let app = seeded_rbac_app(&store).await;
+
+        for (path, token) in [
+            ("/healthz", None),
+            ("/livez", None),
+            ("/readyz", None),
+            ("/version", None),
+            ("/api", Some("alice-token")),
+            ("/apis", Some("alice-token")),
+            ("/openapi/v2", Some("alice-token")),
+        ] {
+            assert_eq!(
+                status_of(&app, path, token).await,
+                StatusCode::FORBIDDEN,
+                "{path} must be 403 once its seeded role is gone — otherwise a bypass, not \
+                 RBAC, is governing it"
             );
         }
     }

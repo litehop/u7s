@@ -10,8 +10,7 @@ use crate::state::AppState;
 
 /// Serve `GET /metrics` in the standard Prometheus text-exposition format, the same wire
 /// format real kube-apiserver's `/metrics` uses — any Prometheus-ecosystem scraper reads this
-/// identically to upstream. RBAC-gated like every other route (see `auth::is_exempt`), not
-/// auth-exempt like `/healthz`.
+/// identically to upstream. RBAC-gated like every other route.
 pub async fn metrics<S: Store>(State(state): State<AppState<S>>) -> Response {
     crate::metrics::WATCH_BROADCAST_RECEIVERS.set(state.store.watch_receiver_count() as i64);
     // u7s_watch_closed_total has a small, fixed `reason` domain — pre-populate it so the
