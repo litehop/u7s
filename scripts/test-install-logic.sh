@@ -1360,7 +1360,7 @@ write_upgrade_runner() {
     echo 'set -euo pipefail'
     echo 'STATE_DIR="$1"; NODE_NAME=n1'
     echo 'sleep() { :; }'
-    for fn in current_client_cert verify_worker_identity worker_api_get worker_api_epoch worker_ready_heartbeat client_cert_fingerprint wait_for_upgraded_worker cp_identity_fingerprint verify_cp_identity_preserved; do
+    for fn in current_client_cert verify_worker_identity worker_api_get worker_ready_heartbeat client_cert_fingerprint wait_for_upgraded_worker cp_identity_fingerprint verify_cp_identity_preserved; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1453,7 +1453,7 @@ write_worker_branch_runner() {
     echo 'join_cluster() { echo join_cluster >> "$STATE_DIR/calls"; }'
     echo 'read_join_token() { echo read_join_token >> "$STATE_DIR/calls"; return 1; }'
     echo 'ensure_jq() { :; }'
-    echo 'worker_api_epoch() { echo "${API_EPOCH-1000}"; }'
+    echo 'worker_ready_heartbeat() { echo "${HB_BEFORE-1000}"; }'
     echo 'client_cert_fingerprint() { echo FP1; }'
     echo 'wait_for_joined_node() { echo wait_for_joined_node >> "$STATE_DIR/calls"; }'
     echo 'wait_for_upgraded_worker() { echo "wait_for_upgraded_worker $*" >> "$STATE_DIR/calls"; }'
@@ -1472,11 +1472,11 @@ up_dir="$UPG_WORK/upgrade-branch"; mkdir -p "$up_dir"
 up_status=0; bash "$BRANCH_RUNNER" "$up_dir" 0 >/dev/null 2>&1 || up_status=$?
 assert "re-running install.sh on a joined worker with no token skips the join and restarts kubelet (an upgrade must not force minting a token for every node)" \
   "$([ "$up_status" -eq 0 ] && ! grep -qE '^(join_cluster|read_join_token)$' "$up_dir/calls" && grep -qx 'systemctl restart kubelet.service' "$up_dir/calls" && echo 1 || echo 0)"
-assert "the upgrade waits for the Node to report Ready after the restart, passing the API server's pre-restart time and cert fingerprint (otherwise a stale Ready or a lost identity is reported as a successful upgrade)" \
+assert "the upgrade waits for the Node to report Ready after the restart, passing the pre-restart Ready heartbeat and cert fingerprint (otherwise a stale Ready or a lost identity is reported as a successful upgrade)" \
   "$(grep -qx 'wait_for_upgraded_worker 1000 FP1' "$up_dir/calls" && echo 1 || echo 0)"
 
 noapi_dir="$UPG_WORK/upgrade-no-api"; mkdir -p "$noapi_dir"
-noapi_status=0; API_EPOCH= bash "$BRANCH_RUNNER" "$noapi_dir" 0 >/dev/null 2>&1 || noapi_status=$?
+noapi_status=0; HB_BEFORE= bash "$BRANCH_RUNNER" "$noapi_dir" 0 >/dev/null 2>&1 || noapi_status=$?
 assert "an unreachable API server before the restart aborts the upgrade untouched (an empty baseline would let any stale Ready heartbeat pass the post-restart wait)" \
   "$([ "$noapi_status" -ne 0 ] && ! grep -q 'systemctl restart' "$noapi_dir/calls" 2>/dev/null && echo 1 || echo 0)"
 
@@ -1507,20 +1507,28 @@ exp_after_status=0; HEARTBEAT=200 BEFORE=100 FP_BEFORE=x bash "$HB_RUNNER" "$exp
 assert "an upgrade whose client cert is no longer valid afterwards fails loud even if the Node looks Ready" \
   "$([ "$exp_after_status" -ne 0 ] && echo 1 || echo 0)"
 
-# The server-side time sources, parsed from real API shapes: Date header for
-# the restart baseline, RFC3339 heartbeat for the comparison.
+# The kubelet stamps the heartbeat with the worker's clock, so the wait must
+# compare it only with an earlier reading of the same field. The API server's
+# Date header (here 02:00:00, as if read before the restart) must not matter:
+# a worker clock 3h ahead (stale heartbeat 05:00:00 == baseline) must not pass,
+# and one 1h behind (fresh heartbeat 01:00:10 > baseline 01:00:00) must.
 TIME_RUNNER="$UPG_WORK/time.sh"
 write_upgrade_runner "$TIME_RUNNER" '
 worker_api_get() {
   case "$1" in
     /version) printf "HTTP/2 200\r\ndate: Sat, 17 Oct 2026 02:00:00 GMT\r\n\r\n" ;;
-    *) printf "{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"lastHeartbeatTime\":\"2026-10-17T02:00:05Z\"}]}}" ;;
+    *) printf "{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"lastHeartbeatTime\":\"%s\"}]}}" "$SERVED_HB" ;;
   esac
 }
-echo "$(worker_api_epoch) $(worker_ready_heartbeat)"'
-time_out="$(bash "$TIME_RUNNER" "$ok_dir" 2>&1)" || true
-assert "the restart baseline and the node heartbeat are both epoch seconds on the API server's clock, so a 5s-newer heartbeat compares as newer (no dependence on the worker's own clock)" \
-  "$([ "$time_out" = "1792202400 1792202405" ] && echo 1 || echo 0)"
+SERVED_HB="$BASE_HB"; before="$(worker_ready_heartbeat any)"
+SERVED_HB="$NOW_HB"
+wait_for_upgraded_worker "$before" "$FP_BEFORE"'
+ahead_status=0; BASE_HB=2026-10-17T05:00:00Z NOW_HB=2026-10-17T05:00:00Z FP_BEFORE="$valid_fp" bash "$TIME_RUNNER" "$ok_dir" >/dev/null 2>&1 || ahead_status=$?
+assert "with the worker clock ahead of the API server, an unchanged (stale) Ready heartbeat is not mistaken for a post-restart one" \
+  "$([ "$ahead_status" -ne 0 ] && echo 1 || echo 0)"
+behind_status=0; BASE_HB=2026-10-17T01:00:00Z NOW_HB=2026-10-17T01:00:10Z FP_BEFORE="$valid_fp" bash "$TIME_RUNNER" "$ok_dir" >/dev/null 2>&1 || behind_status=$?
+assert "with the worker clock behind the API server, a fresh Ready heartbeat is still accepted (a server-clock comparison would fail every upgrade on such a node)" \
+  "$([ "$behind_status" -eq 0 ] && echo 1 || echo 0)"
 
 # Control plane: CA / SA keys survive the re-run untouched, or the run fails.
 CP_RUNNER="$UPG_WORK/cp.sh"
