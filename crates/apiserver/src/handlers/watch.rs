@@ -1000,31 +1000,32 @@ async fn watch_generic_impl<S: Store>(
     };
     let watch_version = derive_watch_version(&api_version).to_string();
     let watch_scope = derive_watch_scope(&prefix, &plural);
-    // Enforce per-client watch concurrency limit. Try to acquire a permit from
-    // this user's semaphore. If the semaphore is exhausted (client already has
-    // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
-    let sem = state.watch_limit.semaphore_for(&username);
-    let client_permit = sem.try_acquire_owned().map_err(|_| {
-        crate::metrics::REQUEST_TOTAL
-            .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "429"])
-            .inc();
-        u7s_store::metrics::WATCH_CLOSED_TOTAL
-            .with_label_values(&["client_limit_exceeded"])
-            .inc();
-        crate::status::Status::too_many_requests_retry_after(
-            format!(
-                "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
-                crate::state::MAX_WATCHES_PER_CLIENT
-            ),
-            crate::state::WATCH_RETRY_AFTER_SECONDS,
-        )
-    })?;
-    // Server-wide cap on top of the per-client one: system identities bypass it so
-    // ordinary tenants exhausting the pool cannot starve kubelets or the control plane.
-    let global_permit = if crate::state::is_system_priority_username(&username) {
+    // System identities (kubelets, controller-manager, scheduler, admin) take no permits:
+    // they are few and trusted, and the controller-manager alone opens well over
+    // MAX_WATCHES_PER_CLIENT streams (one informer per type plus one GC watch per resource),
+    // so a per-client cap would break it, and an exhausted tenant pool must not starve it.
+    let _watch_permit = if crate::state::is_system_priority_username(&username) {
         None
     } else {
-        Some(state.watch_limit.try_acquire_global().ok_or_else(|| {
+        // Per-client cap first, then the server-wide pool: SAs are free to mint, so the
+        // per-client budget alone does not bound the aggregate.
+        let sem = state.watch_limit.semaphore_for(&username);
+        let client_permit = sem.try_acquire_owned().map_err(|_| {
+            crate::metrics::REQUEST_TOTAL
+                .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "429"])
+                .inc();
+            u7s_store::metrics::WATCH_CLOSED_TOTAL
+                .with_label_values(&["client_limit_exceeded"])
+                .inc();
+            crate::status::Status::too_many_requests_retry_after(
+                format!(
+                    "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
+                    crate::state::MAX_WATCHES_PER_CLIENT
+                ),
+                crate::state::WATCH_RETRY_AFTER_SECONDS,
+            )
+        })?;
+        let global_permit = state.watch_limit.try_acquire_global().ok_or_else(|| {
             crate::metrics::REQUEST_TOTAL
                 .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "429"])
                 .inc();
@@ -1038,9 +1039,9 @@ async fn watch_generic_impl<S: Store>(
                 ),
                 crate::state::WATCH_RETRY_AFTER_SECONDS,
             )
-        })?)
+        })?;
+        Some((client_permit, global_permit))
     };
-    let _watch_permit = (client_permit, global_permit);
     tracing::debug!(username = %username, "watch: permit acquired");
     // Moved into the stream below: a generator captures only the variables it names, so
     // without that the permit would drop when this function returns, not when the stream ends.
@@ -3083,6 +3084,24 @@ mod tests {
             .is_err(),
             "a kube-system ServiceAccount is a tenant-mintable name and must not be exempt"
         );
+    }
+
+    /// The controller-manager shares one identity across every informer and GC watch (100+
+    /// streams); a per-client cap on it leaves GC unsynced and the cluster unhealthy.
+    #[tokio::test]
+    async fn system_identity_is_not_bound_by_per_client_watch_limit() {
+        let state = global_cap_state(1);
+        let mut held = Vec::new();
+        for i in 0..crate::state::MAX_WATCHES_PER_CLIENT + 10 {
+            held.push(
+                watch_generic(
+                    state.clone(),
+                    global_cap_cfg("system:kube-controller-manager"),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("kcm watch {i} must not hit a per-client cap")),
+            );
+        }
     }
 
     /// Both rejections must tell clients when to retry (details.retryAfterSeconds and the

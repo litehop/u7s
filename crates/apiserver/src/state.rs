@@ -74,10 +74,10 @@ impl ServiceIpAllocator {
 /// Maximum number of concurrent watch streams allowed per authenticated user.
 /// A client that already has this many open watches gets HTTP 429 on the next attempt.
 ///
-/// The kube-controller-manager's garbage collector opens one watch per registered
-/// resource type (50+ watches for all core + apps/v1 + extension resources). The
-/// limit must be high enough for the GC to establish all its watches simultaneously.
-pub const MAX_WATCHES_PER_CLIENT: usize = 64;
+/// The e2e suite runs every parallel worker as one identity, and its "concurrent watches
+/// in same order" conformance spec alone opens 100 simultaneous watches, so the limit must
+/// clear that with headroom; the aggregate is bounded by `MAX_WATCHES_GLOBAL` instead.
+pub const MAX_WATCHES_PER_CLIENT: usize = 256;
 
 /// Server-wide cap on concurrent watch streams from ordinary identities. The per-client
 /// limit keys on username, so anyone who can mint ServiceAccounts gets a fresh
@@ -90,8 +90,9 @@ pub const MAX_WATCHES_GLOBAL: usize = 512;
 /// Seconds a rejected watch client is told to wait before retrying.
 pub const WATCH_RETRY_AFTER_SECONDS: u64 = 1;
 
-/// Identities whose watches bypass the global cap so a tenant exhausting it cannot lock
-/// out the control plane: the provisioned admin (CN=admin, O=system:masters), kubelets
+/// Identities whose watches bypass both the per-client and global caps, so a tenant
+/// exhausting the pool cannot lock out the control plane (and the controller-manager's
+/// 100+ watches fit): the provisioned admin (CN=admin, O=system:masters), kubelets
 /// (`system:node:<name>`, O=system:nodes), the controller-manager and the scheduler.
 /// Mirrors upstream APF's exempt (system:masters), system-nodes and system-leader-election
 /// flow schemas. Matched on username because tenants can only obtain
