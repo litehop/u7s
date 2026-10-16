@@ -52,6 +52,10 @@ export BURST_CAP_SECS
 case "$ZRAM_MIB" in
   ''|*[!0-9]*) echo "--zram-mib must be a non-negative integer (MiB), got '$ZRAM_MIB'" >&2; exit 2 ;;
 esac
+case "$RUNS" in
+  ''|*[!0-9]*) echo "--runs must be a positive integer, got '$RUNS'" >&2; exit 2 ;;
+esac
+[ "$RUNS" -ge 1 ] || { echo "--runs must be a positive integer, got '$RUNS'" >&2; exit 2; }
 
 # shellcheck source=lib.sh
 . "$HERE/lib.sh"
@@ -88,7 +92,9 @@ awk '
 grep -q 'name: data' "$STAGE/wordpress/mariadb-emptydir.yaml" || { echo "mariadb emptyDir rewrite failed" >&2; exit 2; }
 
 overall=0; passed=0
-for i in $(seq 1 "$RUNS"); do
+i=0
+while [ "$i" -lt "$RUNS" ]; do
+  i=$((i + 1))
   VM="u7s-rg-$STAMP-$i"; VMS="$VMS $VM"
   RUN_OUT="$OUT/run-$i"; mkdir -p "$RUN_OUT"
   echo "==== run $i/$RUNS: VM $VM ===="

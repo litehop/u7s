@@ -115,5 +115,21 @@ for bad in abc -5 1.5 ""; do
     "$([ "$rc" = 2 ] && echo "$err" | grep -q 'non-negative integer' && [ ! -e "$TMP/out-bad/stage" ] && echo 1 || echo 0)"
 done
 
+# --runs validation: BSD `seq 1 0` counts down, so --runs 0 once created a real VM.
+printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\nexit 1\n' > "$TMP/bin/limactl"
+export LIMA_CALLS="$TMP/lima-calls"
+for bad in 0 00 -1 abc 1.5 ""; do
+  : > "$LIMA_CALLS"; rm -rf "$TMP/out-runs"
+  rc=0; err="$("$HERE/burst-gate.sh" --runs "$bad" --tarball-dir "$TMP/tb" --out "$TMP/out-runs" 2>&1 >/dev/null)" || rc=$?
+  assert "--runs '$bad' rejected with exit 2 and zero limactl calls (a bad count must not spawn a VM)" \
+    "$([ "$rc" = 2 ] && echo "$err" | grep -q 'positive integer' && [ ! -s "$LIMA_CALLS" ] && echo 1 || echo 0)"
+done
+: > "$LIMA_CALLS"; rm -rf "$TMP/out-runs"
+"$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-runs" >/dev/null 2>&1 || true
+assert "--runs 1 creates exactly one VM" "$([ "$(grep -c '^create ' "$LIMA_CALLS")" = 1 ] && echo 1 || echo 0)"
+: > "$LIMA_CALLS"; rm -rf "$TMP/out-runs"
+"$HERE/burst-gate.sh" --runs 2 --tarball-dir "$TMP/tb" --out "$TMP/out-runs" >/dev/null 2>&1 || true
+assert "--runs 2 creates exactly two VMs" "$([ "$(grep -c '^create ' "$LIMA_CALLS")" = 2 ] && echo 1 || echo 0)"
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
