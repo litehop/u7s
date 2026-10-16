@@ -17,6 +17,7 @@ mod certificates_v1beta1_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
 mod core_gen_adapter;
+mod csr_approver;
 mod field_manager;
 pub mod handlers;
 mod inflight;
@@ -508,6 +509,36 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                     _ = apiservice_reconciler_shutdown_rx.changed() => break,
+                }
+            }
+        });
+    }
+
+    // 10e1. Auto-approve kubelet-serving CSRs that match the requesting node (see
+    // csr_approver for why this is a poll rather than an informer-driven controller).
+    let (_csr_approver_shutdown_tx, mut csr_approver_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+    {
+        let approver_state = state.clone();
+        let apiserver_ips: Vec<std::net::IpAddr> = [
+            tls::parse_advertise(&state.server_address)
+                .ok()
+                .flatten()
+                .and_then(|(h, _)| h.parse().ok()),
+            args.listen
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|a| a.ip()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        tokio::spawn(async move {
+            loop {
+                csr_approver::approve_kubelet_serving_csrs(&approver_state, &apiserver_ips).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(csr_approver::APPROVAL_INTERVAL) => {}
+                    _ = csr_approver_shutdown_rx.changed() => break,
                 }
             }
         });
