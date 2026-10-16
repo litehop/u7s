@@ -92,6 +92,11 @@ assert_true "run-all.sh selects the apiserver via u7s_owned_pids" \
 assert_true "u7s-start.sh selects the apiserver via u7s_owned_pids" \
   grep -q 'u7s_owned_pids apiserver' "$DIR/../u7s-start.sh"
 
+assert_true "sample-run-metrics.sh selects the apiserver via u7s_owned_pids, not the port holder" \
+  grep -q 'u7s_owned_pids apiserver' "$DIR/sample-run-metrics.sh"
+assert_true "sample-run-metrics.sh does not resolve the apiserver by lsof on the port" \
+  bash -c '! grep -A2 "^resolve_apiserver_pid" "$1" | grep -q lsof' _ "$DIR/sample-run-metrics.sh"
+
 set +e
 OUT=$(check_port_free "$PORT" "apiserver" 2>&1)
 RC=$?
@@ -100,6 +105,27 @@ assert_true "pre-flight refuses to start when a foreign process holds the port" 
 assert_true "pre-flight names the holder's pid" grep -q "pid $FOREIGN" <<< "$OUT"
 assert_true "pre-flight names the holder's command" grep -q "foreign-limactl-hostagent" <<< "$OUT"
 assert_true "pre-flight does not signal the holder" alive "$FOREIGN"
+
+# u7s-start.sh --background restart: kill u7s_owned_pids of this workdir, then
+# check_port_free. With no u7s process of the workdir, a foreign listener must
+# fail the restart and survive.
+PORT2=$(free_port)
+( exec -a "foreign-restart-listener" nc -l "$PORT2" </dev/null >/dev/null 2>&1 ) &
+FOREIGN2=$!
+disown "$FOREIGN2"
+PIDS+=("$FOREIGN2")
+sleep 0.5
+RESTART_WD="$T/wd/restart"
+mkdir -p "$RESTART_WD"
+OWNED_PIDS=$(u7s_owned_pids apiserver "$RESTART_WD")
+assert_true "restart: no u7s-apiserver of the workdir exists to kill" [ -z "$OWNED_PIDS" ]
+set +e
+OUT2=$(check_port_free "$PORT2" "apiserver" 2>&1)
+RC2=$?
+set -e
+assert_true "restart: refuses when a foreign process holds the port after the owned-pid kill" [ "$RC2" = 1 ]
+assert_true "restart: names the foreign holder" grep -q "foreign-restart-listener" <<< "$OUT2"
+assert_true "restart: foreign listener survives" alive "$FOREIGN2"
 
 echo ""
 echo "$PASS passed, $FAIL failed"
