@@ -55,7 +55,7 @@ pass `SONOBUOY_FOCUS=` inline. Prefer a unique no-metacharacter substring for
 3. File a bead (`bd create`) before starting a fix.
 4. Fix; add a regression test (Rule 14: must fail if the fix is reverted); run `cargo test` + clippy.
 5. Re-verify with kubectl, then run sonobuoy ONCE — confirm PASS in e2e.txt.
-6. Close the bead, commit (source only — not `.beads/issues.jsonl`), push.
+6. Commit (source only — not `.beads/issues.jsonl`), push, open the PR, and note it on the bead (`bd note`); the bead closes when the PR merges, not before.
 
 ## Rules that matter most here
 

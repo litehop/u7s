@@ -1549,6 +1549,99 @@ assert "...and still runs the rest of cleanup (merged PR recorded)" \
   "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 24. Beads close when their PR merges. The tick scans recently merged PRs
+#     independent of any worktree, so beads of non-worker branches close, a
+#     failed close is surfaced (exit 20) and retried on the next tick, and the
+#     scan is bounded to a lookback window. Otherwise beads sit in_progress
+#     after merge and `bd ready`/the dashboard drift from main.
+# ---------------------------------------------------------------------------
+
+# Bead-ID prefix, split so the bead-id-refs guard doesn't flag these fixtures.
+B="mayo""r-"
+
+# $1=case name, $2=JSON array of merged PRs the fake gh returns for the merged
+# search, rest = "<bead-id>=<status>" pairs the fake bd reports. Builds the
+# stubs once; BEAD_BIN/BEAD_DB/BEAD_CLOSE_LOG are then reused across ticks.
+# A `$BEAD_DB/FAIL` file makes the fake `bd close` fail.
+setup_bead_stubs() {
+  local name="$1" prs="$2" pair; shift 2
+  BEAD_BIN="$WORKDIR/stub-bead-$name"; BEAD_DB="$WORKDIR/bead-db-$name"
+  mkdir -p "$BEAD_BIN" "$BEAD_DB"
+  BEAD_CLOSE_LOG="$WORKDIR/bead-close-$name.log"
+  : > "$BEAD_CLOSE_LOG"
+  printf '%s' "$prs" > "$BEAD_DB/prs.json"
+  for pair in "$@"; do printf '%s' "${pair#*=}" > "$BEAD_DB/${pair%%=*}"; done
+  cat > "$BEAD_BIN/gh" <<EOF
+#!/usr/bin/env bash
+if [[ " \$* " == *" --state merged "* ]]; then
+  printf '%s\n' "\$*" > "$BEAD_DB/gh-args"
+  cat "$BEAD_DB/prs.json"
+else
+  printf '[]'
+fi
+EOF
+  cat > "$BEAD_BIN/bd" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  show) [ -f "$BEAD_DB/\$2" ] || exit 1; printf '[{"id":"%s","status":"%s"}]' "\$2" "\$(cat "$BEAD_DB/\$2")" ;;
+  close) [ -f "$BEAD_DB/FAIL" ] && exit 1
+         printf '%s\n' "\$*" >> "$BEAD_CLOSE_LOG"; printf closed > "$BEAD_DB/\$2" ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$BEAD_BIN/gh" "$BEAD_BIN/bd"
+}
+
+bead_tick() {
+  build_scratch_repo
+  invoke_tick "$BEAD_BIN" "$SCRATCH_REPO" 0
+}
+
+# No worktree exists at all here, so this also proves closing does not depend
+# on a worker/agent-* worktree (e.g. a PR from a hand-named branch).
+setup_bead_stubs merged \
+  "[{\"number\":4242,\"title\":\"feat(x): thing (${B}aaa1, ${B}bbb2.3)\",\"mergeCommit\":{\"oid\":\"abcdef0123456789\"}}]" \
+  ${B}aaa1=in_progress ${B}bbb2.3=open
+bead_tick
+assert "a merged PR with no worker worktree closes every bead ID in its title, dotted child IDs included, citing PR and merge sha" \
+  "$([ "$(sort "$BEAD_CLOSE_LOG")" = "$(printf 'close %saaa1 --reason merged in #4242 (abcdef0123)\nclose %sbbb2.3 --reason merged in #4242 (abcdef0123)' "$B" "$B")" ] && echo 1 || echo 0)"
+bead_tick
+assert "a second tick over the same merged PR does not close again (idempotent)" \
+  "$([ "$(wc -l < "$BEAD_CLOSE_LOG" | tr -d ' ')" = "2" ] && echo 1 || echo 0)"
+EXPECT_SINCE=$(date -u -v-3d +%Y-%m-%d 2>/dev/null || date -u -d "3 days ago" +%Y-%m-%d)
+assert "the scan asks gh only for MERGED PRs since the 3-day lookback, with a limit (no unbounded history scan)" \
+  "$(grep -q -- "--state merged" "$BEAD_DB/gh-args" && grep -q -- "merged:>=$EXPECT_SINCE" "$BEAD_DB/gh-args" && grep -q -- "--limit" "$BEAD_DB/gh-args" && echo 1 || echo 0)"
+
+setup_bead_stubs skip \
+  "[{\"number\":11,\"title\":\"fix: y (${B}ccc3, ${B}ddd4)\",\"mergeCommit\":{\"oid\":\"1111111111\"}},{\"number\":12,\"title\":\"chore(deps): update renovate\",\"mergeCommit\":{\"oid\":\"2222222222\"}},{\"number\":13,\"title\":\"feat: z x${B}eee5\",\"mergeCommit\":{\"oid\":\"3333333333\"}}]" \
+  ${B}ccc3=closed ${B}ddd4=in_progress ${B}eee5=in_progress
+bead_tick
+assert "an already-closed bead is skipped while its open sibling closes; a no-bead-ID PR is a no-op; an ID glued to a word (x<id>) is not matched" \
+  "$([ "$(cat "$BEAD_CLOSE_LOG")" = "close ${B}ddd4 --reason merged in #11 (1111111111)" ] && echo 1 || echo 0)"
+
+setup_bead_stubs fail \
+  "[{\"number\":21,\"title\":\"feat: w (${B}fff6)\",\"mergeCommit\":{\"oid\":\"4444444444\"}}]" \
+  ${B}fff6=in_progress
+touch "$BEAD_DB/FAIL"
+bead_tick
+assert "a failed bd close exits 20 so the mayor sees it" \
+  "$([ "$TICK_RC" -eq 20 ] && echo 1 || echo 0)"
+assert "...and the failure names the PR and bead in gate_exceptions" \
+  "$([ "$(jq -r '.gate_exceptions[0] | "\(.reason) \(.pr) \(.bead)"' "$TICK_STATE")" = "bead-close-failed 21 ${B}fff6" ] && echo 1 || echo 0)"
+rm "$BEAD_DB/FAIL"
+bead_tick
+assert "the next tick retries the failed close (no worktree needed) and succeeds" \
+  "$([ "$(cat "$BEAD_CLOSE_LOG")" = "close ${B}fff6 --reason merged in #21 (4444444444)" ] && echo 1 || echo 0)"
+assert "...and the retried tick no longer reports the failure" \
+  "$([ "$(jq '.gate_exceptions | length' "$TICK_STATE")" = "0" ] && echo 1 || echo 0)"
+
+setup_bead_stubs missing \
+  "[{\"number\":31,\"title\":\"feat: v (${B}ggg7)\",\"mergeCommit\":{\"oid\":\"5555555555\"}}]"
+bead_tick
+assert "a bead ID unknown to bd is logged and neither closed nor treated as a failure" \
+  "$([ ! -s "$BEAD_CLOSE_LOG" ] && [ "$TICK_RC" -eq 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

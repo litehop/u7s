@@ -129,8 +129,9 @@ gh pr create --title "..." --body "..."
 # Note for mayor: merge PRs with --merge (regular merge commit) by default.
 # Use --squash only for branches with many noisy debug/CI-fixup commits. Never --rebase.
 
-# 8. Close the bead
-bd close <id> --reason="PR #N opened"
+# 8. Leave the bead in_progress and note the PR. Never `bd close`: the
+# mayor closes beads when the PR merges.
+bd note <id> "PR #N opened: <url>"
 ```
 
 ## Session close
@@ -139,7 +140,7 @@ Work is NOT done until:
 - [ ] All code changes committed
 - [ ] Branch pushed to remote
 - [ ] PR opened
-- [ ] Bead closed with PR reference
+- [ ] Bead left in_progress with a "PR #N opened" note (never closed by the worker)
 - [ ] Evidence inline, worthwhile archives evacuated (below)
 
 Evidence: nothing may depend on a gitignored file being present. Put the PASS

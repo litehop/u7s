@@ -179,7 +179,8 @@ Before merging, the mayor checks:
 - tests or CI are green;
 - bead state will be updated after merge.
 
-After merge, the mayor pulls main, closes the bead with a concrete reason,
+After merge, the mayor pulls main, closes the PR's beads with a reason citing the PR and merge commit
+(workers leave beads in_progress; `scripts/mayor-tick.sh` closes on merge),
 and updates `/ai/dashboard.md`.
 
 This is the difference between "a lot of agents did things" and "the
