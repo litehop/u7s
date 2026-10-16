@@ -957,12 +957,18 @@ pub(crate) async fn replace_resource<S: Store>(
         }
     }
 
+    if old_object.is_none() && super::csr::is_csr(&group, &plural) {
+        return Err(Status::not_found(&group, &plural, &name));
+    }
     if old_object.is_none() {
         resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
     }
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
+    if let (true, Some(old)) = (super::csr::is_csr(&group, &plural), old_object.as_ref()) {
+        super::csr::preserve_csr_spec(old, &mut obj.body);
+    }
     if let (true, Some(old)) = (
         group == "certificates.k8s.io" && plural == "clustertrustbundles",
         old_object.as_ref(),
@@ -1438,6 +1444,12 @@ pub(crate) async fn do_patch<S: Store>(
         .get(key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+
+    // CSRs are created only through create_csr (upstream AllowCreateOnUpdate=false), which
+    // runs the subject restriction an apply-create would otherwise skip.
+    if stored_opt.is_none() && super::csr::is_csr(group, plural) {
+        return Err(Status::not_found(group, plural, name));
+    }
 
     // SSA upsert: apply-patch+yaml on a missing resource creates it.
     if is_ssa && stored_opt.is_none() {
@@ -2157,8 +2169,8 @@ pub(crate) async fn do_patch<S: Store>(
                 "clustertrustbundles" | "podcertificaterequests"
             ) | ("storagemigration.k8s.io", "storageversionmigrations")
                 | ("resource.k8s.io", "devicetaintrules")
-        ) || super::defaults::generation_tracked_field(group, plural)
-            .is_some();
+        ) || super::csr::is_csr(group, plural)
+            || super::defaults::generation_tracked_field(group, plural).is_some();
         let old_object = if kind_reads_old_object {
             Some(
                 Object::from_bytes(&stored.value)
@@ -2197,6 +2209,9 @@ pub(crate) async fn do_patch<S: Store>(
                 old_or_null,
                 &mut current.body,
             );
+        }
+        if super::csr::is_csr(group, plural) {
+            super::csr::preserve_csr_spec(old_or_null, &mut current.body);
         }
 
         // Escalation prevention: this PATCH merges into an existing Role/ClusterRole/
