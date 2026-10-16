@@ -19,6 +19,7 @@ case "${1:-}" in
 esac
 
 gcp_require_config
+gcp_print_target
 
 # The only path to a mutating gcloud call; dry-run prints instead of executing.
 mutate() {
@@ -30,8 +31,12 @@ mutate() {
   fi
 }
 
-# gcloud list ... -> true iff it printed something.
-exists() { [ -n "$(gcloud "$@")" ]; }
+# gcloud list ... -> true iff it printed something; a failed list aborts (not "absent").
+exists() {
+  local out
+  out="$(gcloud "$@")" || gcp_die "gcloud $* failed"
+  [ -n "$out" ]
+}
 
 enabled="$(gcloud services list --enabled --format='value(config.name)')"
 for api in compute.googleapis.com iap.googleapis.com; do

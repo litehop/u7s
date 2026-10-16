@@ -21,14 +21,17 @@ case "$cmd" in
   up)   [ $# -eq 1 ] || usage; gcp_vps_create "$1" ;;
   ssh)  [ $# -ge 1 ] || usage; gcp_vps_ssh "$@" ;;
   scp)  [ $# -ge 2 ] || usage; gcp_vps_scp "$@" ;;
-  down) [ $# -eq 1 ] || usage; gcp_vps_delete "$1" ;;
+  down) [ $# -eq 1 ] || usage; zone="$(gcp_zone)"; gcp_vps_delete "$1" "$zone" ;;
   list)
     gcloud compute instances list --filter="labels.u7s-test=1" \
       --format='table(name,status,creationTimestamp.date("%Y-%m-%dT%H:%MZ"):label=CREATED,zone.basename())'
     ;;
   gc)
     names="$(gcp_vps_names)"
-    for n in $names; do gcp_vps_delete "$n"; done
+    while IFS=$'\t' read -r n z; do
+      [ -n "$n" ] || continue
+      gcp_vps_delete "$n" "$z"
+    done <<<"$names"
     ;;
   *) usage ;;
 esac

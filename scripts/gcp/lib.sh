@@ -9,6 +9,8 @@ GCP_SUBNET_RANGE=10.80.0.0/24
 GCP_IAP_RANGE=35.235.240.0/20
 GCP_LABEL=u7s-test=1
 
+# A stray CLOUDSDK_* variable would silently override the named configuration.
+unset CLOUDSDK_CORE_PROJECT CLOUDSDK_CORE_ACCOUNT CLOUDSDK_COMPUTE_ZONE CLOUDSDK_COMPUTE_REGION
 export CLOUDSDK_ACTIVE_CONFIG_NAME="${U7S_GCP_CONFIG:-u7s-gcp}"
 
 gcp_die() { echo "error: $*" >&2; exit 1; }
@@ -43,14 +45,30 @@ gcp_vps_ssh() {
 # gcp_vps_scp scp-args... (remote side written NAME:path)
 gcp_vps_scp() { gcloud compute scp --tunnel-through-iap "$@"; }
 
-gcp_vps_ip() {
-  gcloud compute instances describe "$1" --format='value(networkInterfaces[0].networkIP)'
+# gcp_vps_delete NAME ZONE: refuses instances not labelled u7s-test=1.
+gcp_vps_delete() {
+  local label
+  label="$(gcloud compute instances describe "$1" --zone="$2" --format='value(labels.u7s-test)')" \
+    || gcp_die "cannot describe $1"
+  [ "$label" = 1 ] || gcp_die "$1 is not labelled u7s-test=1; refusing to delete"
+  gcloud compute instances delete "$1" --zone="$2" --quiet
 }
 
-gcp_vps_delete() { gcloud compute instances delete "$1" --quiet; }
-
+# Prints "NAME<TAB>ZONE" per u7s-test=1 instance.
 gcp_vps_names() {
-  gcloud compute instances list --filter="labels.u7s-test=1" --format='value(name)'
+  gcloud compute instances list --filter="labels.u7s-test=1" --format='value(name,zone.basename())'
+}
+
+# The configured compute zone; fails if unset.
+gcp_zone() {
+  local zone
+  zone="$(gcloud config get-value compute/zone 2>/dev/null)" || zone=
+  [ -n "$zone" ] || gcp_die "gcloud configuration '$CLOUDSDK_ACTIVE_CONFIG_NAME' has no compute/zone; see docs/dev-setup.md (GCP test VPSes)"
+  echo "$zone"
+}
+
+gcp_print_target() {
+  echo "target: project=$(gcloud config get-value project 2>/dev/null) account=$(gcloud config get-value account 2>/dev/null) config=$CLOUDSDK_ACTIVE_CONFIG_NAME"
 }
 
 # True iff Google reclaimed NAME (Spot preemption).
