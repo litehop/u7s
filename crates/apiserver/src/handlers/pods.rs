@@ -361,6 +361,7 @@ pub(crate) async fn create_pod<S: Store>(
     // same as it always has for the common (status-absent) case.
     super::generic::clear_create_status(true, "v1", "Pod", &mut obj.body)?;
     apply_pod_create_defaults(&mut obj.body);
+    apply_default_toleration_seconds(&mut obj.body);
     initialize_pod_generation(&mut obj.body);
     apply_automount_sa_token_default(&state, &mut obj.body, ns.as_str()).await;
     inject_sa_token_volume(&mut obj.body, &name);
@@ -4943,6 +4944,50 @@ pub(crate) fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     }
 }
 
+const DEFAULT_TOLERATION_SECONDS: i64 = 300;
+
+/// DefaultTolerationSeconds admission (CREATE only): add `not-ready` and `unreachable`
+/// NoExecute tolerations with tolerationSeconds=300 unless the pod already tolerates the
+/// taint. Mirrors upstream's match rule: a toleration counts when its key is the taint key
+/// or empty AND its effect is NoExecute or empty (operator is not consulted).
+pub(crate) fn apply_default_toleration_seconds(pod: &mut serde_json::Value) {
+    if !pod["spec"].is_object() {
+        return;
+    }
+    let existing = pod["spec"]["tolerations"].as_array();
+    let tolerates = |taint_key: &str| {
+        existing.is_some_and(|ts| {
+            ts.iter().any(|t| {
+                let key = t["key"].as_str().unwrap_or("");
+                let effect = t["effect"].as_str().unwrap_or("");
+                (key == taint_key || key.is_empty()) && (effect == "NoExecute" || effect.is_empty())
+            })
+        })
+    };
+    let missing: Vec<serde_json::Value> = [
+        "node.kubernetes.io/not-ready",
+        "node.kubernetes.io/unreachable",
+    ]
+    .into_iter()
+    .filter(|k| !tolerates(k))
+    .map(|k| {
+        serde_json::json!({
+            "key": k,
+            "operator": "Exists",
+            "effect": "NoExecute",
+            "tolerationSeconds": DEFAULT_TOLERATION_SECONDS,
+        })
+    })
+    .collect();
+    if missing.is_empty() {
+        return;
+    }
+    match pod["spec"]["tolerations"].as_array_mut() {
+        Some(arr) => arr.extend(missing),
+        None => pod["spec"]["tolerations"] = serde_json::Value::Array(missing),
+    }
+}
+
 /// Copy `overhead.podFixed` from a RuntimeClass into `pod.spec.overhead`.
 ///
 /// If the pod already carries `spec.overhead`, it is left unchanged (idempotent,
@@ -5828,6 +5873,79 @@ pub(crate) fn inject_sa_token_volume(pod: &mut serde_json::Value, pod_name: &str
 #[cfg(test)]
 mod create_defaults_tests {
     use super::*;
+
+    fn tolerations_of(pod: &serde_json::Value) -> Vec<serde_json::Value> {
+        pod["spec"]["tolerations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn default_toleration(key: &str) -> serde_json::Value {
+        serde_json::json!({"key": key, "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300})
+    }
+
+    /// Without the default tolerations a transient NotReady/Unknown node makes the taint
+    /// manager evict every pod instantly instead of after 300s.
+    #[test]
+    fn default_tolerations_added_when_pod_has_none() {
+        let mut pod = serde_json::json!({"spec": {"containers": []}});
+        apply_default_toleration_seconds(&mut pod);
+        assert_eq!(
+            tolerations_of(&pod),
+            vec![
+                default_toleration("node.kubernetes.io/not-ready"),
+                default_toleration("node.kubernetes.io/unreachable"),
+            ]
+        );
+    }
+
+    /// A user's own not-ready toleration (e.g. tolerationSeconds=10) must not be duplicated
+    /// or overridden; only the missing unreachable one is appended.
+    #[test]
+    fn existing_not_ready_toleration_is_kept_and_only_unreachable_added() {
+        let own = serde_json::json!({"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 10});
+        let mut pod = serde_json::json!({"spec": {"tolerations": [own.clone()]}});
+        apply_default_toleration_seconds(&mut pod);
+        assert_eq!(
+            tolerations_of(&pod),
+            vec![own, default_toleration("node.kubernetes.io/unreachable")]
+        );
+    }
+
+    /// An empty-key Exists toleration (tolerate everything, as DaemonSet/system pods carry)
+    /// already covers both taints; adding 300s limits would make them evictable.
+    #[test]
+    fn wildcard_toleration_suppresses_defaults() {
+        let wild = serde_json::json!({"operator": "Exists"});
+        let mut pod = serde_json::json!({"spec": {"tolerations": [wild.clone()]}});
+        apply_default_toleration_seconds(&mut pod);
+        assert_eq!(tolerations_of(&pod), vec![wild]);
+    }
+
+    /// A NoSchedule-only toleration for the same key does not tolerate NoExecute, so the
+    /// defaults must still be added.
+    #[test]
+    fn noschedule_toleration_does_not_suppress_noexecute_defaults() {
+        let ns = serde_json::json!({"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoSchedule"});
+        let mut pod = serde_json::json!({"spec": {"tolerations": [ns.clone()]}});
+        apply_default_toleration_seconds(&mut pod);
+        assert_eq!(tolerations_of(&pod).len(), 3);
+        assert_eq!(tolerations_of(&pod)[0], ns);
+    }
+
+    /// DaemonSet pods already carry not-ready/unreachable tolerations without
+    /// tolerationSeconds (tolerate forever); defaulting must leave them unchanged.
+    #[test]
+    fn daemonset_style_tolerations_are_unchanged() {
+        let tols = serde_json::json!([
+            {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute"},
+            {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute"},
+        ]);
+        let mut pod = serde_json::json!({"spec": {"tolerations": tols.clone()}});
+        apply_default_toleration_seconds(&mut pod);
+        assert_eq!(pod["spec"]["tolerations"], tols);
+    }
 
     /// create_pod must default spec.enableServiceLinks to true when absent.
     ///
@@ -11153,6 +11271,8 @@ mod handler_tests {
         assert_eq!(
             stored_v["spec"]["tolerations"],
             serde_json::json!([
+                {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+                {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
                 {"key": "foo", "operator": "Equal", "value": "bar", "effect": "NoSchedule"}
             ]),
             "the RuntimeClass's toleration must be copied onto the pod, or the pod \
