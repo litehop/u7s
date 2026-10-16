@@ -652,34 +652,44 @@ current_client_cert() {
 # Refuses an upgrade the node cannot authenticate: a missing identity needs a
 # join, an expired one (kubelet offline past its cert lifetime) needs a re-join.
 verify_worker_identity() {
-  local f missing=""
-  for f in kubeconfig ca.pem kubelet-client.crt kubelet-client.key; do
+  local f missing="" checked="$STATE_DIR/kubelet-client.crt"
+  for f in ca.pem kubelet-client.crt kubelet-client.key; do
     [ -s "$STATE_DIR/$f" ] || missing="$missing $STATE_DIR/$f"
   done
+  [ -s "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" ] && checked="$STATE_DIR/kubelet/pki/kubelet-client-current.pem"
   if [ -n "$missing" ]; then
     echo "error: this worker has no usable join identity (missing:$missing) -- a join is required. Mint a token on the control plane (install.sh --mint-join-token), then here: systemctl stop kubelet; rm -rf $STATE_DIR; re-run install.sh --join <url> --ca-cert-hash <hash> ..." >&2
     return 1
   fi
   if ! current_client_cert >/dev/null; then
-    echo "error: this worker's kubelet client certificate has expired (notAfter $(openssl x509 -in "$STATE_DIR/kubelet-client.crt" -noout -enddate | cut -d= -f2); rotated copy: $STATE_DIR/kubelet/pki/kubelet-client-current.pem) -- the node can no longer authenticate, so it must re-join with a fresh token. On the control plane: install.sh --mint-join-token (and 'kubectl delete node $NODE_NAME' if it is still registered). Here: systemctl stop kubelet; rm -rf $STATE_DIR (clears kubeconfig, kubelet-client.*, ca.pem and kubelet/pki); re-run install.sh --join <url> --ca-cert-hash <hash> ... with the new token." >&2
+    echo "error: this worker's kubelet client certificate has expired ($checked: notAfter $(openssl x509 -in "$checked" -noout -enddate | cut -d= -f2)) -- the node can no longer authenticate, so it must re-join with a fresh token. On the control plane: install.sh --mint-join-token (and 'kubectl delete node $NODE_NAME' if it is still registered). Here: systemctl stop kubelet; rm -rf $STATE_DIR (clears kubeconfig, kubelet-client.*, ca.pem and kubelet/pki); re-run install.sh --join <url> --ca-cert-hash <hash> ... with the new token." >&2
     return 1
   fi
 }
 
 # GET $1 on the API server named in the worker's kubeconfig, as the node.
 worker_api_get() {
-  local cert key server
+  local path="$1" cert key server
+  shift
   cert="$(current_client_cert)" || return 1
   key="$STATE_DIR/kubelet-client.key"
   [ "$cert" = "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" ] && key="$cert"
   server="$(sed -n 's/^ *server: *//p' "$STATE_DIR/kubeconfig" | head -n1)"
-  curl -fsSL --cacert "$STATE_DIR/ca.pem" --cert "$cert" --key "$key" "$server$1"
+  curl -fsSL --cacert "$STATE_DIR/ca.pem" --cert "$cert" --key "$key" "$@" "$server$path"
 }
 
-# lastHeartbeatTime of the Node's Ready=True condition; empty when it is not Ready.
+# The API server's current time (epoch seconds, from its Date header); empty when unreachable.
+# The worker's own clock may be skewed against the heartbeats the server stamps.
+worker_api_epoch() {
+  worker_api_get /version -D - -o /dev/null 2>/dev/null \
+    | tr -d '\r' | sed -n 's/^[Dd]ate: *//p' \
+    | jq -R 'strptime("%a, %d %b %Y %H:%M:%S GMT") | mktime' 2>/dev/null || true
+}
+
+# lastHeartbeatTime (epoch seconds) of the Node's Ready=True condition; empty when it is not Ready.
 worker_ready_heartbeat() {
   worker_api_get "/api/v1/nodes/$NODE_NAME" 2>/dev/null \
-    | jq -r '.status.conditions[]? | select(.type == "Ready" and .status == "True") | .lastHeartbeatTime' 2>/dev/null || true
+    | jq -r '.status.conditions[]? | select(.type == "Ready" and .status == "True") | .lastHeartbeatTime | fromdateiso8601' 2>/dev/null || true
 }
 
 client_cert_fingerprint() {
@@ -689,14 +699,15 @@ client_cert_fingerprint() {
 }
 
 # After the kubelet restart: the Node must report Ready with a heartbeat newer
-# than $1 (the pre-restart one, so a stale Ready cannot pass) and the client
-# cert must still be valid. $2 is the pre-restart cert fingerprint.
+# than $1 (the API server's epoch time just before the restart, so a stale
+# Ready cannot pass) and the client cert must still be valid. $2 is the
+# pre-restart cert fingerprint.
 wait_for_upgraded_worker() {
   local before="$1" fp_before="$2" hb="" fp_after
   echo "Waiting up to 5 min for node $NODE_NAME to report Ready again with its existing client identity..."
   for _ in $(seq 1 150); do
     hb="$(worker_ready_heartbeat)"
-    [ -n "$hb" ] && [ "$hb" != "$before" ] && break
+    [ -n "$hb" ] && [ "$hb" -gt "$before" ] && break
     hb=""
     sleep 2
   done
@@ -1122,7 +1133,11 @@ if [ "$WORKER_MODE" -eq 1 ]; then
   else
     echo "Existing worker node detected -- join skipped, no token needed; upgrading kubelet only, kubeconfig and kubelet-client.crt/.key are left untouched."
     ensure_jq
-    HEARTBEAT_BEFORE="$(worker_ready_heartbeat)"
+    RESTART_EPOCH="$(worker_api_epoch)"
+    if [ -z "$RESTART_EPOCH" ]; then
+      echo "error: cannot read the API server's clock (is the API server reachable with this node's client identity?) -- refusing to restart kubelet, since a post-restart Ready heartbeat could not be told from a stale one. Nothing was changed." >&2
+      exit 1
+    fi
     FINGERPRINT_BEFORE="$(client_cert_fingerprint)"
   fi
 
@@ -1168,7 +1183,7 @@ EOF
   if [ "$JOIN_MODE" -eq 1 ]; then
     wait_for_joined_node
   else
-    wait_for_upgraded_worker "$HEARTBEAT_BEFORE" "$FINGERPRINT_BEFORE" || exit 1
+    wait_for_upgraded_worker "$RESTART_EPOCH" "$FINGERPRINT_BEFORE" || exit 1
   fi
 
   echo ""

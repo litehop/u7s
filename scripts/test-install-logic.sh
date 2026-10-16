@@ -1360,7 +1360,7 @@ write_upgrade_runner() {
     echo 'set -euo pipefail'
     echo 'STATE_DIR="$1"; NODE_NAME=n1'
     echo 'sleep() { :; }'
-    for fn in current_client_cert verify_worker_identity worker_api_get worker_ready_heartbeat client_cert_fingerprint wait_for_upgraded_worker cp_identity_fingerprint verify_cp_identity_preserved; do
+    for fn in current_client_cert verify_worker_identity worker_api_get worker_api_epoch worker_ready_heartbeat client_cert_fingerprint wait_for_upgraded_worker cp_identity_fingerprint verify_cp_identity_preserved; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1390,6 +1390,8 @@ commonName = supplied
 EOF
 openssl ca -config "$UPG_WORK/ca.cnf" -selfsign -keyfile "$UPG_KEY" -in "$UPG_WORK/client.csr" \
   -startdate 20200101000000Z -enddate 20200102000000Z -batch -notext -out "$UPG_WORK/expired.crt" >/dev/null 2>&1
+openssl ca -config "$UPG_WORK/ca.cnf" -selfsign -keyfile "$UPG_KEY" -in "$UPG_WORK/client.csr" \
+  -startdate 20210101000000Z -enddate 20210102000000Z -batch -notext -out "$UPG_WORK/expired-rotated.crt" >/dev/null 2>&1
 assert "test setup: the fixture client cert really is expired (otherwise the expiry tests below prove nothing)" \
   "$(openssl x509 -in "$UPG_WORK/expired.crt" -noout -checkend 0 >/dev/null 2>&1 && echo 0 || echo 1)"
 
@@ -1415,6 +1417,14 @@ exp_status=0; exp_out="$(bash "$VERIFY_RUNNER" "$exp_dir" 2>&1)" || exp_status=$
 assert "an expired client identity fails the upgrade with a re-join-with-a-fresh-token message naming the state to clear (a silently restarted kubelet would crash-loop on 401 with no hint)" \
   "$([ "$exp_status" -ne 0 ] && printf '%s' "$exp_out" | grep -q 'expired' && printf '%s' "$exp_out" | grep -qF "rm -rf $exp_dir" && printf '%s' "$exp_out" | grep -q 'fresh token' && echo 1 || echo 0)"
 
+bothexp_dir="$(new_worker_state both-expired "$UPG_WORK/expired.crt")"
+cp "$UPG_WORK/expired-rotated.crt" "$bothexp_dir/kubelet/pki/kubelet-client-current.pem"
+bothexp_out="$(bash "$VERIFY_RUNNER" "$bothexp_dir" 2>&1)" || true
+assert "the expired-identity message reports the notAfter of the rotated cert the kubelet actually uses, not the stale join-time cert (an operator comparing dates would otherwise misdiagnose when the node lost access)" \
+  "$(printf '%s' "$bothexp_out" | grep -qF "$bothexp_dir/kubelet/pki/kubelet-client-current.pem: notAfter Jan  2 00:00:00 2021" && ! printf '%s' "$bothexp_out" | grep -q '2020' && echo 1 || echo 0)"
+assert "the expired-identity message names the join-time cert's notAfter when no rotated cert exists" \
+  "$(printf '%s' "$exp_out" | grep -qF "$exp_dir/kubelet-client.crt: notAfter Jan  2 00:00:00 2020" && echo 1 || echo 0)"
+
 rot_dir="$(new_worker_state rotated "$UPG_WORK/expired.crt")"
 cp "$UPG_WORK/valid.crt" "$rot_dir/kubelet/pki/kubelet-client-current.pem"
 rot_status=0; bash "$VERIFY_RUNNER" "$rot_dir" >/dev/null 2>&1 || rot_status=$?
@@ -1427,6 +1437,10 @@ echo 'server: https://cp.example:6443' > "$miss_dir/kubeconfig"
 miss_status=0; miss_out="$(bash "$VERIFY_RUNNER" "$miss_dir" 2>&1)" || miss_status=$?
 assert "a worker kubeconfig without its client cert/key/CA means a join is required, said plainly (upgrading it would start a kubelet that can never authenticate)" \
   "$([ "$miss_status" -ne 0 ] && printf '%s' "$miss_out" | grep -q 'a join is required' && printf '%s' "$miss_out" | grep -qF "$miss_dir/kubelet-client.crt" && echo 1 || echo 0)"
+nokc_dir="$UPG_WORK/missing-all"; mkdir -p "$nokc_dir"
+nokc_out="$(bash "$VERIFY_RUNNER" "$nokc_dir" 2>&1)" || true
+assert "kubeconfig is not listed as a missing join identity: without it the node is not detected as an existing worker, so the entry could never fire" \
+  "$(printf '%s' "$nokc_out" | grep -qF "$nokc_dir/kubelet-client.crt" && ! printf '%s' "$nokc_out" | grep -qF "$nokc_dir/kubeconfig" && echo 1 || echo 0)"
 
 # The install.sh worker branch, extracted: with an existing identity it must
 # skip the join, never read a token, and restart kubelet.
@@ -1439,7 +1453,7 @@ write_worker_branch_runner() {
     echo 'join_cluster() { echo join_cluster >> "$STATE_DIR/calls"; }'
     echo 'read_join_token() { echo read_join_token >> "$STATE_DIR/calls"; return 1; }'
     echo 'ensure_jq() { :; }'
-    echo 'worker_ready_heartbeat() { echo HB1; }'
+    echo 'worker_api_epoch() { echo "${API_EPOCH-1000}"; }'
     echo 'client_cert_fingerprint() { echo FP1; }'
     echo 'wait_for_joined_node() { echo wait_for_joined_node >> "$STATE_DIR/calls"; }'
     echo 'wait_for_upgraded_worker() { echo "wait_for_upgraded_worker $*" >> "$STATE_DIR/calls"; }'
@@ -1458,8 +1472,13 @@ up_dir="$UPG_WORK/upgrade-branch"; mkdir -p "$up_dir"
 up_status=0; bash "$BRANCH_RUNNER" "$up_dir" 0 >/dev/null 2>&1 || up_status=$?
 assert "re-running install.sh on a joined worker with no token skips the join and restarts kubelet (an upgrade must not force minting a token for every node)" \
   "$([ "$up_status" -eq 0 ] && ! grep -qE '^(join_cluster|read_join_token)$' "$up_dir/calls" && grep -qx 'systemctl restart kubelet.service' "$up_dir/calls" && echo 1 || echo 0)"
-assert "the upgrade waits for the Node to report Ready after the restart, passing the pre-restart heartbeat and cert fingerprint (otherwise a stale Ready or a lost identity is reported as a successful upgrade)" \
-  "$(grep -qx 'wait_for_upgraded_worker HB1 FP1' "$up_dir/calls" && echo 1 || echo 0)"
+assert "the upgrade waits for the Node to report Ready after the restart, passing the API server's pre-restart time and cert fingerprint (otherwise a stale Ready or a lost identity is reported as a successful upgrade)" \
+  "$(grep -qx 'wait_for_upgraded_worker 1000 FP1' "$up_dir/calls" && echo 1 || echo 0)"
+
+noapi_dir="$UPG_WORK/upgrade-no-api"; mkdir -p "$noapi_dir"
+noapi_status=0; API_EPOCH= bash "$BRANCH_RUNNER" "$noapi_dir" 0 >/dev/null 2>&1 || noapi_status=$?
+assert "an unreachable API server before the restart aborts the upgrade untouched (an empty baseline would let any stale Ready heartbeat pass the post-restart wait)" \
+  "$([ "$noapi_status" -ne 0 ] && ! grep -q 'systemctl restart' "$noapi_dir/calls" 2>/dev/null && echo 1 || echo 0)"
 
 jn_dir="$UPG_WORK/join-branch"; mkdir -p "$jn_dir"
 jn_status=0; bash "$BRANCH_RUNNER" "$jn_dir" 1 >/dev/null 2>&1 || jn_status=$?
@@ -1472,18 +1491,36 @@ write_upgrade_runner "$HB_RUNNER" '
 worker_ready_heartbeat() { echo "$HEARTBEAT"; }
 wait_for_upgraded_worker "$BEFORE" "$FP_BEFORE"'
 valid_fp="$(openssl x509 -in "$UPG_WORK/valid.crt" -noout -fingerprint -sha256 | cut -d= -f2)"
-stale_status=0; HEARTBEAT=T1 BEFORE=T1 FP_BEFORE="$valid_fp" bash "$HB_RUNNER" "$ok_dir" >/dev/null 2>&1 || stale_status=$?
-assert "a Node whose Ready heartbeat predates the kubelet restart is not reported as upgraded (the old Ready condition lingers until the lifecycle controller notices)" \
+stale_status=0; HEARTBEAT=100 BEFORE=100 FP_BEFORE="$valid_fp" bash "$HB_RUNNER" "$ok_dir" >/dev/null 2>&1 || stale_status=$?
+assert "a Node whose Ready heartbeat is not newer than the restart time is not reported as upgraded (the old Ready condition lingers until the lifecycle controller notices)" \
   "$([ "$stale_status" -ne 0 ] && echo 1 || echo 0)"
-fresh_out="$(HEARTBEAT=T2 BEFORE=T1 FP_BEFORE="$valid_fp" bash "$HB_RUNNER" "$ok_dir" 2>&1)" && fresh_status=0 || fresh_status=$?
+older_status=0; HEARTBEAT=50 BEFORE=100 FP_BEFORE="$valid_fp" bash "$HB_RUNNER" "$ok_dir" >/dev/null 2>&1 || older_status=$?
+assert "a Ready heartbeat older than the restart time is not reported as upgraded" \
+  "$([ "$older_status" -ne 0 ] && echo 1 || echo 0)"
+fresh_out="$(HEARTBEAT=200 BEFORE=100 FP_BEFORE="$valid_fp" bash "$HB_RUNNER" "$ok_dir" 2>&1)" && fresh_status=0 || fresh_status=$?
 assert "a Node that reports Ready with a newer heartbeat and an unchanged client cert is a successful upgrade, reported as such" \
   "$([ "$fresh_status" -eq 0 ] && printf '%s' "$fresh_out" | grep -q 'client certificate unchanged' && echo 1 || echo 0)"
-rotd_out="$(HEARTBEAT=T2 BEFORE=T1 FP_BEFORE="AA:BB" bash "$HB_RUNNER" "$ok_dir" 2>&1)" && rotd_status=0 || rotd_status=$?
+rotd_out="$(HEARTBEAT=200 BEFORE=100 FP_BEFORE="AA:BB" bash "$HB_RUNNER" "$ok_dir" 2>&1)" && rotd_status=0 || rotd_status=$?
 assert "a client cert that changed across the restart is reported as rotated by the kubelet, not as a re-bootstrap" \
   "$([ "$rotd_status" -eq 0 ] && printf '%s' "$rotd_out" | grep -q 'rotated its client certificate' && echo 1 || echo 0)"
-exp_after_status=0; HEARTBEAT=T2 BEFORE=T1 FP_BEFORE=x bash "$HB_RUNNER" "$exp_dir" >/dev/null 2>&1 || exp_after_status=$?
+exp_after_status=0; HEARTBEAT=200 BEFORE=100 FP_BEFORE=x bash "$HB_RUNNER" "$exp_dir" >/dev/null 2>&1 || exp_after_status=$?
 assert "an upgrade whose client cert is no longer valid afterwards fails loud even if the Node looks Ready" \
   "$([ "$exp_after_status" -ne 0 ] && echo 1 || echo 0)"
+
+# The server-side time sources, parsed from real API shapes: Date header for
+# the restart baseline, RFC3339 heartbeat for the comparison.
+TIME_RUNNER="$UPG_WORK/time.sh"
+write_upgrade_runner "$TIME_RUNNER" '
+worker_api_get() {
+  case "$1" in
+    /version) printf "HTTP/2 200\r\ndate: Sat, 17 Oct 2026 02:00:00 GMT\r\n\r\n" ;;
+    *) printf "{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"lastHeartbeatTime\":\"2026-10-17T02:00:05Z\"}]}}" ;;
+  esac
+}
+echo "$(worker_api_epoch) $(worker_ready_heartbeat)"'
+time_out="$(bash "$TIME_RUNNER" "$ok_dir" 2>&1)" || true
+assert "the restart baseline and the node heartbeat are both epoch seconds on the API server's clock, so a 5s-newer heartbeat compares as newer (no dependence on the worker's own clock)" \
+  "$([ "$time_out" = "1792202400 1792202405" ] && echo 1 || echo 0)"
 
 # Control plane: CA / SA keys survive the re-run untouched, or the run fails.
 CP_RUNNER="$UPG_WORK/cp.sh"
