@@ -439,21 +439,40 @@ pub struct TlsMaterial {
     pub server_config: Arc<ServerConfig>,
 }
 
-/// Extract the host from an advertise_address like "https://host.lima.internal:6443".
-/// Returns None if the string is absent or unparseable.
-fn advertise_host(advertise_address: Option<&str>) -> Option<String> {
-    let addr = advertise_address?;
-    // Strip scheme prefix.
-    let without_scheme = addr
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    // Strip port suffix — split on ':' and take the first segment.
-    let host = without_scheme.split(':').next()?;
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_owned())
+/// Split an advertise address ("https://host:6443", "[fd00::1]:6443", "myhost") into its
+/// unbracketed host and optional port. Ok(None) when there is no host (e.g. "https://").
+pub(crate) fn parse_advertise(addr: &str) -> anyhow::Result<Option<(String, Option<u16>)>> {
+    if addr.contains('%') {
+        anyhow::bail!("advertise address {addr:?}: IPv6 zone IDs ('%') are not supported");
     }
+    if addr.ends_with("://") {
+        return Ok(None);
+    }
+    let with_scheme = if addr.contains("://") {
+        addr.to_owned()
+    } else {
+        format!("https://{addr}")
+    };
+    let uri: hyper::http::Uri = with_scheme
+        .parse()
+        .map_err(|e| anyhow::anyhow!("advertise address {addr:?}: {e}"))?;
+    let Some(host) = uri.host().filter(|h| !h.is_empty()) else {
+        return Ok(None);
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    Ok(Some((host.to_owned(), uri.port_u16())))
+}
+
+/// Extract the host (IPv6 brackets stripped) from an advertise_address like
+/// "https://host.lima.internal:6443". Ok(None) if absent or hostless.
+fn advertise_host(advertise_address: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(addr) = advertise_address else {
+        return Ok(None);
+    };
+    Ok(parse_advertise(addr)?.map(|(host, _)| host))
 }
 
 /// Build the full SAN list for the server certificate.
@@ -510,7 +529,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // Always include localhost / 127.0.0.1 and the lima VM-to-host alias,
     // plus the advertise-address host if provided.
     let sans = build_server_sans(
-        advertise_host(args.advertise_address.as_deref()).as_deref(),
+        advertise_host(args.advertise_address.as_deref())?.as_deref(),
         &args.service_cluster_ip_range,
     )?;
     server_params.subject_alt_names = sans;
@@ -881,7 +900,7 @@ mod tests {
     #[test]
     fn advertise_host_extracts_dns_name() {
         assert_eq!(
-            advertise_host(Some("https://host.lima.internal:6443")),
+            advertise_host(Some("https://host.lima.internal:6443")).unwrap(),
             Some("host.lima.internal".into())
         );
     }
@@ -889,14 +908,14 @@ mod tests {
     #[test]
     fn advertise_host_extracts_ip() {
         assert_eq!(
-            advertise_host(Some("https://192.168.1.10:6443")),
+            advertise_host(Some("https://192.168.1.10:6443")).unwrap(),
             Some("192.168.1.10".into())
         );
     }
 
     #[test]
     fn advertise_host_none_on_absent() {
-        assert_eq!(advertise_host(None), None);
+        assert_eq!(advertise_host(None).unwrap(), None);
     }
 
     #[test]
@@ -905,7 +924,9 @@ mod tests {
         // generate_tls must succeed and produce a cert that includes the DNS SAN.
         let _tls = generate_tls(&args).expect("generate_tls failed");
         // Verify host parses as DNS (not IP).
-        let host = advertise_host(args.advertise_address.as_deref()).unwrap();
+        let host = advertise_host(args.advertise_address.as_deref())
+            .unwrap()
+            .unwrap();
         assert!(
             host.parse::<std::net::IpAddr>().is_err(),
             "expected DNS name, got IP"
@@ -917,7 +938,9 @@ mod tests {
     fn san_includes_advertise_ip() {
         let args = args_with(Some("https://192.168.1.10:6443"));
         let _tls = generate_tls(&args).expect("generate_tls failed");
-        let host = advertise_host(args.advertise_address.as_deref()).unwrap();
+        let host = advertise_host(args.advertise_address.as_deref())
+            .unwrap()
+            .unwrap();
         assert!(
             host.parse::<std::net::IpAddr>().is_ok(),
             "expected IP address"
@@ -931,7 +954,9 @@ mod tests {
         let args = args_with(Some("https://host.lima.internal:6443"));
         // generate_tls builds sans starting with localhost + 127.0.0.1.
         // We verify by inspecting the logic path: advertise_host does not return "localhost".
-        let host = advertise_host(args.advertise_address.as_deref()).unwrap();
+        let host = advertise_host(args.advertise_address.as_deref())
+            .unwrap()
+            .unwrap();
         assert_ne!(host, "localhost");
         // And generate_tls must not error.
         generate_tls(&args).expect("generate_tls failed");
@@ -1751,10 +1776,95 @@ mod tests {
         // scheme. Returning Some("") would silently insert an empty-string SAN into the
         // server certificate, which is invalid and would cause cert parsing errors.
         assert_eq!(
-            advertise_host(Some("https://")),
+            advertise_host(Some("https://")).unwrap(),
             None,
             "empty host segment must return None, not Some(\"\")"
         );
+    }
+
+    fn extra_sans(advertise: &str) -> Vec<SanType> {
+        let host = advertise_host(Some(advertise)).unwrap();
+        let sans = build_server_sans(host.as_deref(), "10.96.0.0/12").unwrap();
+        sans[8..].to_vec()
+    }
+
+    /// An IPv6-literal advertise URL must yield an IP SAN; the old ':' split produced
+    /// "[fd00", which failed SAN construction and made IPv6 control-plane endpoints unusable.
+    #[test]
+    fn ipv6_literal_advertise_yields_ip_san_so_ipv6_endpoints_work() {
+        let want = SanType::IpAddress("fd00::1".parse().unwrap());
+        assert_eq!(extra_sans("https://[fd00::1]:6443"), vec![want.clone()]);
+        assert_eq!(extra_sans("https://[fd00::1]"), vec![want.clone()]);
+        assert_eq!(extra_sans("[fd00::1]:6443"), vec![want]);
+    }
+
+    /// IPv4 literals must stay IP SANs (not DNS SANs), with and without a port.
+    #[test]
+    fn ipv4_literal_advertise_yields_ip_san_with_and_without_port() {
+        let want = SanType::IpAddress("192.168.1.10".parse().unwrap());
+        assert_eq!(extra_sans("https://192.168.1.10:6443"), vec![want.clone()]);
+        assert_eq!(extra_sans("https://192.168.1.10"), vec![want]);
+    }
+
+    /// DNS names must stay DNS SANs, with and without a port.
+    #[test]
+    fn dns_advertise_yields_dns_san_with_and_without_port() {
+        let want = SanType::DnsName("cp.example.com".try_into().unwrap());
+        assert_eq!(
+            extra_sans("https://cp.example.com:6443"),
+            vec![want.clone()]
+        );
+        assert_eq!(extra_sans("https://cp.example.com"), vec![want]);
+    }
+
+    /// A zone ID can't appear in a certificate SAN; it must be rejected loudly at startup
+    /// rather than producing a cert no client can validate.
+    #[test]
+    fn ipv6_zone_id_advertise_is_rejected_instead_of_minting_an_unusable_cert() {
+        let err = advertise_host(Some("https://[fe80::1%25eth0]:6443")).unwrap_err();
+        assert!(err.to_string().contains("zone"), "unclear error: {err}");
+        assert!(advertise_host(Some("https://[fe80::1%eth0]:6443")).is_err());
+    }
+
+    /// parse_advertise reports the port so seed_services advertises the right endpoint.
+    #[test]
+    fn parse_advertise_returns_unbracketed_host_and_port() {
+        assert_eq!(
+            parse_advertise("https://[fd00::1]:6444").unwrap(),
+            Some(("fd00::1".into(), Some(6444)))
+        );
+        assert_eq!(
+            parse_advertise("https://h.example").unwrap(),
+            Some(("h.example".into(), None))
+        );
+    }
+
+    /// End-to-end: a server cert minted from an IPv6 advertise URL must validate for an
+    /// IPv6 literal server name, otherwise IPv6 control-plane endpoints are unusable.
+    #[tokio::test]
+    async fn tls_handshake_succeeds_against_cert_from_ipv6_advertise_url() {
+        let args = args_with(Some("https://[fd00::1]:6443"));
+        let tls = generate_tls(&args).expect("generate_tls must accept an IPv6 advertise URL");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                tls.ca_cert_der.clone(),
+            ))
+            .unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config.clone());
+
+        let (c, s) = tokio::io::duplex(16 * 1024);
+        let name = rustls::pki_types::ServerName::IpAddress(
+            "fd00::1".parse::<std::net::Ipv6Addr>().unwrap().into(),
+        );
+        let (client, server) = tokio::join!(connector.connect(name, c), acceptor.accept(s));
+        server.expect("server handshake");
+        client.expect("client must validate the server cert for IPv6 literal fd00::1");
     }
 
     /// advertise_host must strip a bare port suffix even when no scheme is present.
@@ -1762,7 +1872,7 @@ mod tests {
     #[test]
     fn advertise_host_no_scheme_strips_port() {
         assert_eq!(
-            advertise_host(Some("myhost:6443")),
+            advertise_host(Some("myhost:6443")).unwrap(),
             Some("myhost".into()),
             "advertise_host must strip the port even when no scheme is present"
         );
