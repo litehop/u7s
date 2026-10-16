@@ -32,6 +32,7 @@ check_port_free() {
   if [ -n "$holder" ]; then
     echo "error: host port 127.0.0.1:${port} (${label}) is already bound (a previous stack or another VM is using it)." >&2
     echo "  Assign this stack a different ${label} port — see ai/prompts/vm-operations.md for the per-worker port-assignment scheme." >&2
+    echo "  Holder: pid ${holder} ($(ps -o command= -p "$holder" 2>/dev/null | cut -c1-200 || true)) -- NOT signalled; it may belong to another project (Lima auto-forwards guest ports to the same host port)." >&2
     echo "  To see what's holding the port: lsof -n -i :${port}" >&2
     exit 1
   fi
