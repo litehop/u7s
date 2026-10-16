@@ -704,6 +704,9 @@ fn build_kubelet_tls_config(
         let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("parse kubelet client cert PEM: {e}"))?;
+        if certs.is_empty() {
+            anyhow::bail!("kubelet client identity PEM contains no certificates");
+        }
 
         let key = PrivateKeyDer::from_pem_slice(pem)
             .map_err(|e| anyhow::anyhow!("parse kubelet client key PEM: {e}"))?;
@@ -7851,11 +7854,6 @@ mod tests {
         );
     }
 
-    /// build_kubelet_tls_config without a CA must return Err to prevent MITM.
-    ///
-    /// When no CA is configured, connecting to the kubelet without certificate verification
-    /// opens an MITM vector. The function must refuse to build a config rather than
-    /// returning one that skips verification. Callers convert this Err to HTTP 503.
     #[test]
     fn build_kubelet_tls_config_accepts_multi_cert_identity_bundle() {
         let leaf = rcgen::generate_simple_self_signed(vec!["leaf".to_string()]).unwrap();
@@ -7891,6 +7889,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_kubelet_tls_config_key_only_identity_errors_with_no_certificates() {
+        let ca = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let leaf = rcgen::generate_simple_self_signed(vec!["leaf".to_string()]).unwrap();
+        let key_only = leaf.signing_key.serialize_pem();
+        let err = build_kubelet_tls_config(Some(ca.cert.der()), Some(key_only.as_bytes()))
+            .expect_err(
+                "a key-only identity must be rejected: the kubelet would see no client cert",
+            );
+        assert!(
+            err.to_string().contains("no certificates"),
+            "error must name the missing certificates, got: {err}"
+        );
+    }
+
+    /// build_kubelet_tls_config without a CA must return Err to prevent MITM.
+    ///
+    /// When no CA is configured, connecting to the kubelet without certificate verification
+    /// opens an MITM vector. The function must refuse to build a config rather than
+    /// returning one that skips verification. Callers convert this Err to HTTP 503.
     #[test]
     fn build_kubelet_tls_config_without_ca_returns_err() {
         let result = build_kubelet_tls_config(None, None);
