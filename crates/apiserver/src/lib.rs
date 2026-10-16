@@ -1283,6 +1283,9 @@ fn build_router(state: AppState) -> Router {
                 .patch(handlers::status::patch_namespaced_resource_status),
         )
         .fallback(fallback_handler)
+        .layer(axum::middleware::from_fn(
+            field_manager::resolve_field_manager,
+        ))
         .layer(axum::middleware::from_fn(namespace_guard::guard))
         // API aggregation: for any /apis/{group}/{version}/* request whose group+version
         // matches a registered APIService with a live backend, proxy it there instead of
