@@ -196,24 +196,6 @@ pub(crate) async fn create_namespace<S: Store>(
         }
     }
 
-    // Inject the kubernetes.io/metadata.name label required for namespaceSelector evaluation.
-    // Kubernetes stamps this label automatically on every namespace at creation time so that
-    // admission webhook namespaceSelectors using matchExpressions on this label work correctly
-    // (e.g. to exempt specific namespaces from a webhook). Without it, selectors like
-    // `key: kubernetes.io/metadata.name, operator: NotIn, values: [kube-system]` would have
-    // no label to match against and every namespace would appear to be in scope.
-    {
-        let labels = obj.body["metadata"]["labels"].clone();
-        let mut labels_map = match labels {
-            serde_json::Value::Object(m) => m,
-            _ => serde_json::Map::new(),
-        };
-        labels_map
-            .entry("kubernetes.io/metadata.name")
-            .or_insert_with(|| serde_json::Value::String(name.clone()));
-        obj.body["metadata"]["labels"] = serde_json::Value::Object(labels_map);
-    }
-
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
         group: "",
@@ -255,22 +237,28 @@ pub(crate) async fn create_namespace<S: Store>(
 
     obj.set_resource_version(new_rv);
 
-    // Seed kube-root-ca.crt synchronously so a pod admitted into this namespace
-    // immediately after creation never races KCM's root-ca-cert-publisher for it.
-    // Upstream, the publisher creates this ConfigMap asynchronously on its own
-    // reconcile loop; a pod can be created (and its SA token volume admitted)
-    // before that reconcile fires, and the kubelet then fails to mount the
-    // projected volume with "configmap kube-root-ca.crt not found", hanging the
-    // pod forever. KCM's publisher still POSTs its own copy later — that becomes
-    // a 409 which the generic create-conflict path already handles.
+    seed_root_ca_configmap(&state, &name).await;
+
+    Ok((StatusCode::CREATED, Json(obj.body)))
+}
+
+/// Seed kube-root-ca.crt synchronously so a pod admitted into a new namespace
+/// immediately after creation never races KCM's root-ca-cert-publisher for it.
+/// Upstream, the publisher creates this ConfigMap asynchronously on its own
+/// reconcile loop; a pod can be created (and its SA token volume admitted)
+/// before that reconcile fires, and the kubelet then fails to mount the
+/// projected volume with "configmap kube-root-ca.crt not found", hanging the
+/// pod forever. KCM's publisher still POSTs its own copy later — that becomes
+/// a 409 which the generic create-conflict path already handles.
+pub(crate) async fn seed_root_ca_configmap<S: Store>(state: &AppState<S>, name: &str) {
     if let Some(ca_der) = state.cluster_ca_der.as_deref() {
-        let cm_key = crate::keys::object_key("configmaps", &name, "kube-root-ca.crt");
+        let cm_key = crate::keys::object_key("configmaps", name, "kube-root-ca.crt");
         let ca_pem =
             String::from_utf8_lossy(&crate::tls::pem_encode("CERTIFICATE", ca_der)).into_owned();
         let cm_body = serde_json::json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
-            "metadata": { "name": "kube-root-ca.crt", "namespace": &name },
+            "metadata": { "name": "kube-root-ca.crt", "namespace": name },
             "data": { "ca.crt": ca_pem }
         });
         match state
@@ -287,8 +275,6 @@ pub(crate) async fn create_namespace<S: Store>(
             ),
         }
     }
-
-    Ok((StatusCode::CREATED, Json(obj.body)))
 }
 
 pub(crate) async fn get_namespace<S: Store>(
