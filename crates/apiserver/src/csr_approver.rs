@@ -22,7 +22,7 @@ use x509_cert::ext::pkix::SubjectAltName;
 use x509_cert::ext::Extension;
 use x509_cert::request::{CertReq, ExtensionReq};
 
-use crate::keys::{cluster_object_key, group_list_prefix};
+use crate::keys::{cluster_list_prefix, group_list_prefix};
 use crate::state::AppState;
 
 const GROUP: &str = "certificates.k8s.io";
@@ -44,6 +44,7 @@ pub(crate) const APPROVAL_INTERVAL: std::time::Duration = std::time::Duration::f
 pub(crate) fn evaluate(
     csr: &serde_json::Value,
     node: Option<&serde_json::Value>,
+    ctx: &IpContext,
 ) -> Result<(), String> {
     let spec = &csr["spec"];
     let username = spec["username"].as_str().unwrap_or("");
@@ -110,7 +111,7 @@ pub(crate) fn evaluate(
                 ))
             }
             GeneralName::IpAddress(raw) => match ip_from_octets(raw.as_bytes()) {
-                Some(ip) if node_ips.contains(&ip) => {}
+                Some(ip) if node_ips.contains(&ip) => ctx.check_ip(ip, node_name)?,
                 Some(ip) => {
                     return Err(format!(
                         "IP SAN {ip} is not in Node {node_name:?} status.addresses"
@@ -122,6 +123,55 @@ pub(crate) fn evaluate(
         }
     }
     Ok(())
+}
+
+/// What an IP SAN must additionally avoid. A node may write any `status.addresses` on its
+/// own Node object, so membership there proves nothing about who owns the address.
+#[derive(Default)]
+pub(crate) struct IpContext {
+    /// Every IP any OTHER Node reports in any address field.
+    pub other_node_ips: BTreeSet<IpAddr>,
+    /// Service CIDR base and size (IPv4 only, as the allocator is).
+    pub service_cidr: Option<(std::net::Ipv4Addr, u32)>,
+    /// The apiserver's own advertise and listen addresses.
+    pub apiserver_ips: Vec<IpAddr>,
+}
+
+impl IpContext {
+    fn check_ip(&self, ip: IpAddr, node_name: &str) -> Result<(), String> {
+        let ip = ip.to_canonical();
+        let special = match ip {
+            IpAddr::V4(v) => {
+                v.is_loopback() || v.is_unspecified() || v.is_link_local() || v.is_multicast()
+            }
+            IpAddr::V6(v) => {
+                v.is_loopback()
+                    || v.is_unspecified()
+                    || v.is_unicast_link_local()
+                    || v.is_multicast()
+            }
+        };
+        if special {
+            return Err(format!(
+                "IP SAN {ip} is loopback, unspecified, link-local or multicast"
+            ));
+        }
+        if let (IpAddr::V4(v4), Some((base, size))) = (ip, self.service_cidr) {
+            let off = u32::from(v4).wrapping_sub(u32::from(base));
+            if u32::from(v4) >= u32::from(base) && off < size {
+                return Err(format!("IP SAN {ip} is inside the service CIDR"));
+            }
+        }
+        if self.apiserver_ips.iter().any(|a| a.to_canonical() == ip) {
+            return Err(format!("IP SAN {ip} is the apiserver's own address"));
+        }
+        if self.other_node_ips.contains(&ip) {
+            return Err(format!(
+                "IP SAN {ip} is also reported by another Node, not only {node_name:?}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Every GeneralName from every SAN extension in the CSR's extensionRequest attributes.
@@ -192,7 +242,10 @@ fn is_undecided(csr: &serde_json::Value) -> bool {
 }
 
 /// One sweep: approve every undecided kubelet-serving CSR that passes [`evaluate`].
-pub(crate) async fn approve_kubelet_serving_csrs<S: Store>(state: &AppState<S>) {
+pub(crate) async fn approve_kubelet_serving_csrs<S: Store>(
+    state: &AppState<S>,
+    apiserver_ips: &[IpAddr],
+) {
     let prefix = group_list_prefix(GROUP, PLURAL, None);
     let Ok(resp) = state.store.list(&prefix, ListOptions::default()).await else {
         return;
@@ -209,15 +262,37 @@ pub(crate) async fn approve_kubelet_serving_csrs<S: Store>(state: &AppState<S>) 
             .as_str()
             .and_then(|u| u.strip_prefix(NODE_USER_PREFIX))
             .unwrap_or("");
-        let node = match state
+        let Ok(nodes) = state
             .store
-            .get(&cluster_object_key("nodes", node_name))
+            .list(&cluster_list_prefix("nodes"), ListOptions::default())
             .await
-        {
-            Ok(Some(n)) => serde_json::from_slice::<serde_json::Value>(&n.value).ok(),
-            _ => None,
+        else {
+            return;
         };
-        if let Err(reason) = evaluate(&csr, node.as_ref()) {
+        let mut node = None;
+        let mut ctx = IpContext {
+            service_cidr: state
+                .service_ip_allocator
+                .as_ref()
+                .map(|a| (a.base, a.size)),
+            apiserver_ips: apiserver_ips.to_vec(),
+            ..Default::default()
+        };
+        for n in &nodes.items {
+            let Ok(n) = serde_json::from_slice::<serde_json::Value>(&n.value) else {
+                continue;
+            };
+            if n["metadata"]["name"].as_str() == Some(node_name) {
+                node = Some(n);
+                continue;
+            }
+            for a in n["status"]["addresses"].as_array().into_iter().flatten() {
+                if let Some(ip) = a["address"].as_str().and_then(|s| s.parse::<IpAddr>().ok()) {
+                    ctx.other_node_ips.insert(ip.to_canonical());
+                }
+            }
+        }
+        if let Err(reason) = evaluate(&csr, node.as_ref(), &ctx) {
             tracing::debug!("kubelet-serving CSR {name} left pending: {reason}");
             continue;
         }
@@ -255,6 +330,7 @@ pub(crate) async fn approve_kubelet_serving_csrs<S: Store>(state: &AppState<S>) 
 mod tests {
     use super::*;
     use crate::handlers::test_support::make_state;
+    use crate::keys::cluster_object_key;
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 
     const NODE_IP: &str = "192.168.5.15";
@@ -302,7 +378,8 @@ mod tests {
     }
 
     fn refused(csr: &serde_json::Value, needle: &str) {
-        let why = evaluate(csr, Some(&node())).expect_err("CSR must stay pending");
+        let why =
+            evaluate(csr, Some(&node()), &IpContext::default()).expect_err("CSR must stay pending");
         assert!(why.contains(needle), "refused for the wrong reason: {why}");
     }
 
@@ -331,12 +408,13 @@ mod tests {
 
     #[test]
     fn approves_a_csr_whose_identity_and_sans_all_belong_to_the_requesting_node() {
-        evaluate(&good_csr(), Some(&node()))
+        evaluate(&good_csr(), Some(&node()), &IpContext::default())
             .expect("a node's own serving CSR must be auto-approved");
         let mut csr = good_csr();
         csr["spec"]["usages"] =
             serde_json::json!(["digital signature", "key encipherment", "server auth"]);
-        evaluate(&csr, Some(&node())).expect("RSA usage set must be accepted");
+        evaluate(&csr, Some(&node()), &IpContext::default())
+            .expect("RSA usage set must be accepted");
         let mut csr = good_csr();
         csr["spec"]["request"] = request(
             "system:node:n1",
@@ -344,7 +422,8 @@ mod tests {
             vec![dns("n1.internal")],
         )
         .into();
-        evaluate(&csr, Some(&node())).expect("a hostname the Node reports is the node's own");
+        evaluate(&csr, Some(&node()), &IpContext::default())
+            .expect("a hostname the Node reports is the node's own");
     }
 
     #[test]
@@ -435,7 +514,7 @@ mod tests {
 
     #[test]
     fn missing_node_leaves_the_csr_pending_so_the_kubelet_retries_after_registering() {
-        let why = evaluate(&good_csr(), None).unwrap_err();
+        let why = evaluate(&good_csr(), None, &IpContext::default()).unwrap_err();
         assert!(why.contains("does not exist"), "{why}");
     }
 
@@ -477,17 +556,123 @@ mod tests {
             )
             .await;
         }
-        approve_kubelet_serving_csrs(&state).await;
+        approve_kubelet_serving_csrs(&state, &[]).await;
         assert_eq!(conditions(&state, "ok").await[0]["type"], "Approved");
         assert!(
             conditions(&state, "bad").await.is_null(),
             "a CSR with a foreign IP SAN must never be approved or denied"
         );
-        approve_kubelet_serving_csrs(&state).await;
+        approve_kubelet_serving_csrs(&state, &[]).await;
         assert_eq!(
             conditions(&state, "ok").await.as_array().unwrap().len(),
             1,
             "an already-approved CSR must not collect duplicate conditions"
         );
+    }
+
+    fn node_named(name: &str, ips: &[&str]) -> serde_json::Value {
+        let addrs: Vec<_> = ips
+            .iter()
+            .map(|a| serde_json::json!({"type": "InternalIP", "address": a}))
+            .collect();
+        serde_json::json!({"metadata": {"name": name}, "status": {"addresses": addrs}})
+    }
+
+    fn serving_csr_for(node: &str, ips: &[&str]) -> serde_json::Value {
+        let mut sans = vec![dns(node)];
+        sans.extend(ips.iter().map(|a| ip(a)));
+        let mut csr = csr_json(
+            &format!("system:node:{node}"),
+            &["system:nodes"],
+            &["digital signature", "server auth"],
+            request(&format!("system:node:{node}"), &["system:nodes"], sans),
+        );
+        csr["metadata"]["name"] = format!("csr-{node}").into();
+        csr
+    }
+
+    #[tokio::test]
+    async fn node_that_writes_another_nodes_ip_into_its_own_status_cannot_get_a_serving_cert_for_it(
+    ) {
+        // Nodes may write their own status.addresses, so a compromised n2 can claim n1's IP
+        // and would otherwise be issued a cert that impersonates n1 for logs/exec.
+        let state = make_state();
+        seed(
+            &state,
+            &cluster_object_key("nodes", "n1"),
+            &node_named("n1", &["192.168.5.15"]),
+        )
+        .await;
+        seed(
+            &state,
+            &cluster_object_key("nodes", "n2"),
+            &node_named("n2", &["192.168.5.16", "192.168.5.15"]),
+        )
+        .await;
+        let attack = serving_csr_for("n2", &["192.168.5.15"]);
+        seed(
+            &state,
+            &crate::keys::group_object_key(GROUP, PLURAL, None, "csr-n2"),
+            &attack,
+        )
+        .await;
+        approve_kubelet_serving_csrs(&state, &[]).await;
+        assert!(
+            conditions(&state, "csr-n2").await.is_null(),
+            "an IP reported by two Nodes must not be approved for either"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_with_a_unique_ip_is_approved_alongside_other_nodes() {
+        let state = make_state();
+        seed(
+            &state,
+            &cluster_object_key("nodes", "n1"),
+            &node_named("n1", &["192.168.5.15"]),
+        )
+        .await;
+        seed(
+            &state,
+            &cluster_object_key("nodes", "n2"),
+            &node_named("n2", &["192.168.5.16"]),
+        )
+        .await;
+        let csr = serving_csr_for("n2", &["192.168.5.16"]);
+        seed(
+            &state,
+            &crate::keys::group_object_key(GROUP, PLURAL, None, "csr-n2"),
+            &csr,
+        )
+        .await;
+        approve_kubelet_serving_csrs(&state, &[]).await;
+        assert_eq!(conditions(&state, "csr-n2").await[0]["type"], "Approved");
+    }
+
+    #[test]
+    fn ips_that_name_the_cluster_rather_than_a_node_are_refused_even_when_the_node_claims_them() {
+        let ctx = IpContext {
+            service_cidr: Some(("10.96.0.0".parse().unwrap(), 1 << 20)),
+            apiserver_ips: vec!["192.168.5.1".parse().unwrap()],
+            ..Default::default()
+        };
+        for (addr, needle) in [
+            ("10.96.0.1", "service CIDR"),
+            ("10.100.3.4", "service CIDR"),
+            ("192.168.5.1", "apiserver"),
+            ("127.0.0.1", "loopback"),
+            ("169.254.1.2", "link-local"),
+            ("224.0.0.1", "multicast"),
+            ("0.0.0.0", "unspecified"),
+            ("fe80::1", "link-local"),
+        ] {
+            let node = node_named("n1", &[addr]);
+            let csr = serving_csr_for("n1", &[addr]);
+            let why = evaluate(&csr, Some(&node), &ctx).expect_err(addr);
+            assert!(why.contains(needle), "{addr}: {why}");
+        }
+        let node = node_named("n1", &["10.112.0.0"]);
+        let csr = serving_csr_for("n1", &["10.112.0.0"]);
+        evaluate(&csr, Some(&node), &ctx).expect("an IP just outside the service CIDR is fine");
     }
 }
