@@ -157,6 +157,65 @@ fn is_websocket_upgrade_request(req: &axum::http::Request<Body>) -> bool {
     has_upgrade_connection && has_websocket_upgrade
 }
 
+/// Container names are DNS-1123 labels upstream; anything else (notably `..`, `/`, `%`)
+/// would let the caller steer the kubelet path.
+fn validate_container_name(container: &str) -> Result<(), crate::status::StatusError> {
+    let ok = !container.is_empty()
+        && container.len() <= 63
+        && container
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !container.starts_with('-')
+        && !container.ends_with('-');
+    if ok {
+        Ok(())
+    } else {
+        Err(Status::bad_request(format!(
+            "invalid container name '{container}': must be a DNS-1123 label"
+        )))
+    }
+}
+
+/// Builds `<scheme>://<host>:<port>/<segments...>[?query]` with every segment
+/// percent-encoded (including `/`), so user-derived values can never add, drop or
+/// collapse path components. `.` and `..` are rejected because the URL parser would
+/// normalise them away.
+fn kubelet_endpoint_url(
+    scheme: &str,
+    host: &str,
+    port: u16,
+    segments: &[&str],
+    query: Option<&str>,
+) -> Result<String, crate::status::StatusError> {
+    if let Some(s) = segments.iter().find(|s| **s == "." || **s == "..") {
+        return Err(Status::bad_request(format!(
+            "invalid path segment '{s}': may not be '.' or '..'"
+        )));
+    }
+    let mut url = reqwest::Url::parse(&format!("{scheme}://{host}:{port}/"))
+        .map_err(|e| Status::internal(format!("invalid kubelet address '{host}': {e}")))?;
+    url.path_segments_mut()
+        .map_err(|()| Status::internal("kubelet URL cannot carry a path".into()))?
+        .extend(segments);
+    url.set_query(query.filter(|q| !q.is_empty()));
+    Ok(url.into())
+}
+
+/// Percent-encodes a user-supplied proxy path tail (already decoded by the router)
+/// segment by segment, preserving `/` structure. `?`, `#`, `%` and `\` in a segment stay
+/// data, and `.`/`..` segments are rejected.
+fn encode_proxy_tail(tail: &str) -> Result<String, crate::status::StatusError> {
+    let segments: Vec<&str> = tail.split('/').collect();
+    let url = kubelet_endpoint_url("http", "proxy.invalid", 80, &segments, None)?;
+    let encoded = reqwest::Url::parse(&url)
+        .map_err(|e| Status::internal(e.to_string()))?
+        .path()
+        .strip_prefix('/')
+        .unwrap_or_default()
+        .to_owned();
+    Ok(encoded)
+}
+
 /// Pure lookup: pod → node → node_ip → kubelet containerLogs URL.
 ///
 /// Extracted from `pod_log` so the plain-HTTP and WebSocket branches share the same
@@ -232,8 +291,7 @@ async fn resolve_log_target<S: Store>(
     // 5. Build the kubelet URL.
     //    Kubelet log endpoint: https://<node-ip>:<port>/containerLogs/<ns>/<pod>/<container>
     let kp = kubelet_port_for_node(node_name, &state.node_kubelet_ports, state.kubelet_port);
-    let mut kubelet_url =
-        format!("https://{node_ip}:{kp}/containerLogs/{raw_ns}/{pod_name}/{container}");
+    validate_container_name(&container)?;
 
     // Forward query parameters.
     let mut params: Vec<(&str, String)> = Vec::new();
@@ -256,16 +314,19 @@ async fn resolve_log_target<S: Store>(
         params.push(("limitBytes", n.to_string()));
     }
 
-    if !params.is_empty() {
-        let qs: String = params
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        kubelet_url = format!("{kubelet_url}?{qs}");
-    }
+    let qs: String = params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
 
-    Ok(kubelet_url)
+    kubelet_endpoint_url(
+        "https",
+        &node_ip,
+        kp,
+        &["containerLogs", raw_ns, pod_name, &container],
+        Some(&qs),
+    )
 }
 
 /// Fetch the kubelet log stream and forward each chunk as a WebSocket binary message.
@@ -482,8 +543,14 @@ pub async fn resolve_attach_target<S: Store>(
         .collect::<Vec<_>>()
         .join("&");
     let kp = kubelet_port_for_node(node_name, &state.node_kubelet_ports, state.kubelet_port);
-    let kubelet_ws_url =
-        format!("wss://{node_ip}:{kp}/attach/{raw_ns}/{pod_name}/{container}?{qs}");
+    validate_container_name(&container)?;
+    let kubelet_ws_url = kubelet_endpoint_url(
+        "wss",
+        &node_ip,
+        kp,
+        &["attach", raw_ns, pod_name, &container],
+        Some(&qs),
+    )?;
 
     let admission_ctx = AdmissionContext {
         group: "",
@@ -1002,11 +1069,14 @@ pub async fn resolve_exec_target<S: Store>(
     }
     let qs = params.join("&");
     let kp = kubelet_port_for_node(node_name, &state.node_kubelet_ports, state.kubelet_port);
-    let kubelet_ws_url = if qs.is_empty() {
-        format!("wss://{node_ip}:{kp}/exec/{raw_ns}/{pod_name}/{container}")
-    } else {
-        format!("wss://{node_ip}:{kp}/exec/{raw_ns}/{pod_name}/{container}?{qs}")
-    };
+    validate_container_name(&container)?;
+    let kubelet_ws_url = kubelet_endpoint_url(
+        "wss",
+        &node_ip,
+        kp,
+        &["exec", raw_ns, pod_name, &container],
+        Some(&qs),
+    )?;
 
     let admission_ctx = AdmissionContext {
         group: "",
@@ -1472,8 +1542,14 @@ pub(crate) async fn validate_portforward<S: Store>(
     // 5. Build the kubelet portForward URL.
     //    https://<node-ip>:<port>/portForward/<ns>/<pod>[?ports=<port>]
     let kp = kubelet_port_for_node(&node_name, &state.node_kubelet_ports, state.kubelet_port);
-    let ports_qs = ports.map(|p| format!("?ports={p}")).unwrap_or_default();
-    let kubelet_url = format!("https://{node_ip}:{kp}/portForward/{ns}/{pod_name}{ports_qs}");
+    let ports_qs = ports.map(|p| format!("ports={p}"));
+    let kubelet_url = kubelet_endpoint_url(
+        "https",
+        &node_ip,
+        kp,
+        &["portForward", ns, pod_name],
+        ports_qs.as_deref(),
+    )?;
 
     Ok(PortforwardParams {
         kubelet_url,
@@ -2012,7 +2088,7 @@ pub async fn resolve_node_proxy_target<S: Store>(
     })?;
 
     let kp = kubelet_port_for_node(bare_name, &state.node_kubelet_ports, state.kubelet_port);
-    let kubelet_url = format!("https://{node_ip}:{kp}/{path_suffix}");
+    let kubelet_url = format!("https://{node_ip}:{kp}/{}", encode_proxy_tail(path_suffix)?);
     Ok((kubelet_url, client))
 }
 
@@ -2709,7 +2785,7 @@ async fn pod_proxy_dispatch<S: Store>(
     let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
         .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
-    let path_with_query = append_query(path_suffix, query.as_deref());
+    let path_with_query = append_query(&encode_proxy_tail(path_suffix)?, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
         // Route through konnectivity via an explicit CONNECT tunnel.
@@ -3048,7 +3124,7 @@ async fn service_proxy_dispatch<S: Store>(
     let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
         .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
-    let path_with_query = append_query(path_suffix, query.as_deref());
+    let path_with_query = append_query(&encode_proxy_tail(path_suffix)?, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
         let (status, mut headers, body) = pod_proxy_via_connect_tunnel(
@@ -11435,5 +11511,162 @@ mod tests {
             upgrade_sites,
             "an inbound WebSocketUpgrade bypasses capped_upgrade()"
         );
+    }
+
+    async fn seed_kubelet_pod(state: &AppState) {
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns1", "resourceVersion": "1"},
+            "spec": {"nodeName": "node-1", "containers": [{"name": "app", "image": "x"}]}
+        });
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "ns1", "p"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn make_state_with_ca() -> AppState {
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let mut state = make_state();
+        state.cluster_ca_der = Some(Arc::new(cert.cert.der().to_vec()));
+        seed_kubelet_pod(&state).await;
+        state
+    }
+
+    fn log_query(container: &str) -> LogQuery {
+        LogQuery {
+            container: Some(container.into()),
+            follow: Some(true),
+            tail_lines: Some(10),
+            since_seconds: None,
+            timestamps: None,
+            previous: None,
+            limit_bytes: None,
+        }
+    }
+
+    /// A pods/log grant must not become a read of arbitrary kubelet endpoints:
+    /// `container=../../../pods` used to normalise to kubelet `/pods`, returning every pod
+    /// spec on the node under the apiserver's kubelet client identity.
+    #[tokio::test]
+    async fn traversal_container_is_rejected_for_log_exec_and_attach() {
+        let state = make_state_with_ca().await;
+        for bad in [
+            "../../../pods",
+            "..",
+            "..%2F..%2Fpods",
+            "%2e%2e%2f",
+            "a/b",
+            "app?x=1",
+            "app&command=id",
+            "App",
+            "-app",
+        ] {
+            let err = resolve_log_target(&state, "ns1", "p", &log_query(bad))
+                .await
+                .expect_err(&format!("log container {bad:?} must be rejected"));
+            assert_eq!(err.0.as_u16(), 400, "log {bad:?}");
+
+            let err = resolve_exec_target(&state, "ns1", "p", Some(bad), "command=ls")
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("exec container {bad:?} must be rejected"));
+            assert_eq!(err.0.as_u16(), 400, "exec {bad:?}");
+
+            let attach = AttachQuery {
+                container: Some(bad.into()),
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                tty: None,
+            };
+            let err = resolve_attach_target(&state, "ns1", "p", &attach)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("attach container {bad:?} must be rejected"));
+            assert_eq!(err.0.as_u16(), 400, "attach {bad:?}");
+        }
+    }
+
+    /// Rejecting traversal must not break real container names.
+    #[tokio::test]
+    async fn valid_container_names_still_resolve_for_log() {
+        let state = make_state_with_ca().await;
+        for ok in ["app", "a", "my-app-2", "0abc"] {
+            let url = resolve_log_target(&state, "ns1", "p", &log_query(ok))
+                .await
+                .unwrap_or_else(|e| panic!("valid container {ok:?} rejected: {}", e.0));
+            assert_eq!(
+                url,
+                format!("https://10.0.0.1:10250/containerLogs/ns1/p/{ok}?follow=true&tailLines=10")
+            );
+        }
+    }
+
+    /// Exec arguments are user data: a `/` or `..` in `command=` must stay a query value
+    /// and never reach the path, or `command=../../pods` could retarget the kubelet URL.
+    #[tokio::test]
+    async fn exec_command_with_slashes_stays_in_query() {
+        let state = make_state_with_ca().await;
+        let target = resolve_exec_target(
+            &state,
+            "ns1",
+            "p",
+            Some("app"),
+            "container=app&command=cat&command=..%2F..%2Fetc%2Fpasswd&command=/etc/x&command=..",
+        )
+        .await
+        .expect("valid exec must resolve");
+        let url = reqwest::Url::parse(&target.kubelet_ws_url).unwrap();
+        assert_eq!(url.path(), "/exec/ns1/p/app", "{url}");
+        let commands: Vec<_> = url
+            .query_pairs()
+            .filter(|(k, _)| k == "command")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(commands, ["cat", "../../etc/passwd", "/etc/x", ".."]);
+    }
+
+    /// Proxy tails are forwarded but each segment is re-encoded so `?`/`#`/`%`/`\` stay
+    /// path data and dot-segments cannot be normalised out of the intended prefix.
+    #[test]
+    fn proxy_tail_is_encoded_and_dot_segments_rejected() {
+        assert_eq!(encode_proxy_tail("").unwrap(), "");
+        assert_eq!(encode_proxy_tail("logs/").unwrap(), "logs/");
+        assert_eq!(encode_proxy_tail("a/b/c").unwrap(), "a/b/c");
+        assert_eq!(encode_proxy_tail("a?x=1#f").unwrap(), "a%3Fx=1%23f");
+        assert_eq!(encode_proxy_tail("100%").unwrap(), "100%25");
+        assert_eq!(encode_proxy_tail("a//b").unwrap(), "a//b");
+        for bad in ["..", "../pods", "a/../b", "a/./b", "."] {
+            assert!(encode_proxy_tail(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(!encode_proxy_tail("a\\b").unwrap().contains('\\'));
+    }
+
+    #[test]
+    fn kubelet_endpoint_url_encodes_segments() {
+        let u =
+            kubelet_endpoint_url("https", "10.0.0.1", 10250, &["x", "a/b", "c?d"], None).unwrap();
+        assert_eq!(u, "https://10.0.0.1:10250/x/a%2Fb/c%3Fd");
+        assert!(kubelet_endpoint_url("https", "10.0.0.1", 1, &["x", ".."], None).is_err());
     }
 }
