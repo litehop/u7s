@@ -38,7 +38,9 @@ write_fetch_tarball_runner() {
   {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
+    awk '/^mktemp_disk_dir\(\) \{/,/^\}/' "$install_script"
     awk '/^fetch_tarball\(\) \{/,/^\}/' "$install_script"
+    echo 'DOWNLOAD_DIR=""; trap '"'"'rm -rf ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}'"'"' EXIT'
     echo 'fetch_tarball "$1"'
     echo 'echo "TARBALL_PATH=$TARBALL"'
   } > "$runner"
