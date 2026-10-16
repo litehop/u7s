@@ -21,6 +21,7 @@ mod keys;
 mod limit_range;
 mod metrics;
 pub mod migrate_tables;
+mod namespace_guard;
 mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
 mod node_authz;
@@ -1279,6 +1280,7 @@ fn build_router(state: AppState) -> Router {
                 .patch(handlers::status::patch_namespaced_resource_status),
         )
         .fallback(fallback_handler)
+        .layer(axum::middleware::from_fn(namespace_guard::guard))
         // API aggregation: for any /apis/{group}/{version}/* request whose group+version
         // matches a registered APIService with a live backend, proxy it there instead of
         // the routes above. Runs as a layer (not a route) so it covers every verb/subpath

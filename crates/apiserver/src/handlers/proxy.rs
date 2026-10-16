@@ -613,7 +613,8 @@ fn build_kubelet_tls_config(
     ca_der: Option<&[u8]>,
     client_identity_pem: Option<&[u8]>,
 ) -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
-    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::RootCertStore;
 
     let der = ca_der.ok_or_else(|| {
@@ -633,17 +634,12 @@ fn build_kubelet_tls_config(
     let builder = rustls::ClientConfig::builder().with_webpki_verifier(verifier);
 
     let config = if let Some(pem) = client_identity_pem {
-        let mut cursor = std::io::Cursor::new(pem);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cursor)
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("parse kubelet client cert PEM: {e}"))?;
 
-        let mut key_cursor = std::io::Cursor::new(pem);
-        let key = rustls_pemfile::private_key(&mut key_cursor)
-            .map_err(|e| anyhow::anyhow!("parse kubelet client key PEM: {e}"))?
-            .ok_or_else(|| {
-                anyhow::anyhow!("no private key found in kubelet client identity PEM")
-            })?;
+        let key = PrivateKeyDer::from_pem_slice(pem)
+            .map_err(|e| anyhow::anyhow!("parse kubelet client key PEM: {e}"))?;
 
         builder
             .with_client_auth_cert(certs, key)
@@ -7784,6 +7780,41 @@ mod tests {
     /// When no CA is configured, connecting to the kubelet without certificate verification
     /// opens an MITM vector. The function must refuse to build a config rather than
     /// returning one that skips verification. Callers convert this Err to HTTP 503.
+    #[test]
+    fn build_kubelet_tls_config_accepts_multi_cert_identity_bundle() {
+        let leaf = rcgen::generate_simple_self_signed(vec!["leaf".to_string()]).unwrap();
+        let inter = rcgen::generate_simple_self_signed(vec!["inter".to_string()]).unwrap();
+        let ca = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let pem = format!(
+            "{}{}{}",
+            leaf.cert.pem(),
+            inter.cert.pem(),
+            leaf.signing_key.serialize_pem()
+        );
+
+        let result = build_kubelet_tls_config(Some(ca.cert.der()), Some(pem.as_bytes()));
+        assert!(
+            result.is_ok(),
+            "a cert chain followed by a key must parse — otherwise mTLS to the kubelet \
+             breaks for chained client identities: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn build_kubelet_tls_config_malformed_identity_pem_errors_not_panics() {
+        let ca = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let bad = b"-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n-----END CERTIFICATE-----\n";
+        assert!(
+            build_kubelet_tls_config(Some(ca.cert.der()), Some(bad)).is_err(),
+            "malformed identity PEM must surface a clear error, not a panic or silent no-auth"
+        );
+        assert!(
+            build_kubelet_tls_config(Some(ca.cert.der()), Some(b"")).is_err(),
+            "an identity PEM with no key must be rejected"
+        );
+    }
+
     #[test]
     fn build_kubelet_tls_config_without_ca_returns_err() {
         let result = build_kubelet_tls_config(None, None);
