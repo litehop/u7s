@@ -9,8 +9,10 @@ GCP_SUBNET_RANGE=10.80.0.0/24
 GCP_IAP_RANGE=35.235.240.0/20
 GCP_LABEL=u7s-test=1
 
-# A stray CLOUDSDK_* variable would silently override the named configuration.
-unset CLOUDSDK_CORE_PROJECT CLOUDSDK_CORE_ACCOUNT CLOUDSDK_COMPUTE_ZONE CLOUDSDK_COMPUTE_REGION
+# A stray CLOUDSDK_* variable (project, zone, config dir, impersonation...) would silently
+# override the named configuration.
+for _v in $(compgen -v CLOUDSDK_); do unset "$_v"; done
+unset _v
 export CLOUDSDK_ACTIVE_CONFIG_NAME="${U7S_GCP_CONFIG:-u7s-gcp}"
 
 gcp_die() { echo "error: $*" >&2; exit 1; }
@@ -26,7 +28,7 @@ gcp_require_config() {
 }
 
 gcp_vps_create() {
-  gcloud compute instances create "$1" \
+  gcloud compute instances create "$1" --zone="$2" \
     --machine-type=e2-micro \
     --image-family=ubuntu-2604-lts-amd64 --image-project=ubuntu-os-cloud \
     --boot-disk-size=10GB --boot-disk-type=pd-standard \

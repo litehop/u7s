@@ -96,7 +96,7 @@ The scripts select it with `CLOUDSDK_ACTIVE_CONFIG_NAME` (`U7S_GCP_CONFIG` overr
 
 **One-time project setup**: `scripts/gcp/setup.sh --dry-run` runs only read-only gcloud calls and prints every mutating command it would run (enable the IAP API, VPC `u7s-test` in custom mode, subnet `10.80.0.0/24` in `us-west1`, firewall: tcp:22 from the IAP range `35.235.240.0/20` plus all traffic inside the subnet; no internet ingress). Review it, then run `scripts/gcp/setup.sh`; it skips what exists, so re-running is a no-op. If the org policy ever forbids external IPs, VPSes need Cloud Router + Cloud NAT and `--no-address` (not scripted).
 
-**VPS lifecycle** (`scripts/gcp/vps.sh up NAME | ssh NAME [-- cmd] | scp SRC NAME:DST | down NAME | list | gc`). SSH/scp tunnel through IAP. VPSes are Spot, label `u7s-test=1`, termination action STOP and `--max-run-duration=16h`. Google reclaims Spot capacity on its own demand (30 s notice), not on idleness; preemption and the 16h cap STOP the VPS rather than delete it, so the disk and logs survive for post-mortem. A stopped VPS still bills its 10 GB disk (about $0.40/month); only `down`/`gc` removes it, so check `vps.sh list` (shows state and creation time) after a session. `gc` deletes every `u7s-test=1` instance, stopped included. Create and delete only the VPSes you were assigned.
+**VPS lifecycle** (`scripts/gcp/vps.sh up NAME | ssh NAME [-- cmd] | scp SRC NAME:DST | down NAME | list | gc`). SSH/scp tunnel through IAP. VPSes are Spot, label `u7s-test=1`, termination action STOP and `--max-run-duration=16h`. Google reclaims Spot capacity on its own demand (30 s notice), not on idleness; preemption and the 16h cap STOP the VPS rather than delete it, so the disk and logs survive for post-mortem. A stopped VPS still bills its 10 GB disk (about $0.40/month); only `down`/`gc` removes it, so check `vps.sh list` (shows state and creation time) after a session. `gc` deletes every `u7s-test=1` instance, stopped included, so it is mayor/operator-only; workers `down` only the VPSes (name prefix) they were assigned.
 
 **Cutting a snapshot release** (mayor/operator only; publishes a GitHub prerelease, so confirm with the operator first): `gh workflow run release-tarball.yaml -f version=v0.3.0-snapshot.N`.
 
@@ -107,7 +107,7 @@ The scripts select it with `CLOUDSDK_ACTIVE_CONFIG_NAME` (`U7S_GCP_CONFIG` overr
 ```sh
 scripts/gcp/vps.sh up t1
 scripts/gcp/vps.sh ssh t1 -- 'curl -fsSL https://u7s.dekiru.tech/<tag>/install.sh | sudo bash'
-scripts/gcp/vps.sh scp -r <manifest-dir> t1:/tmp/wp
+scripts/gcp/vps.sh scp --recurse <manifest-dir> t1:/tmp/wp
 scripts/gcp/vps.sh ssh t1 -- sudo kubectl --kubeconfig /var/lib/u7s/kubeconfig apply -f /tmp/wp
 scripts/gcp/vps.sh down t1
 ```
