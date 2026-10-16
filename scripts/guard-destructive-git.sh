@@ -234,7 +234,7 @@ Read PR code without moving the mayor checkout:
 '
 
 strip_wrappers() {
-  # strip_wrappers <segment> -- drops leading `command`/`builtin` words and
+  # strip_wrappers <segment> -- drops leading `command [-p]`/`builtin` words and
   # `bash|sh|zsh|dash [opts] -c '` shell-payload openers so the git inside is
   # parsed as a plain segment. The payload's own `;`/`&&` were already split
   # into segments, so only its first fragment carries the opener; a trailing
@@ -243,8 +243,8 @@ strip_wrappers() {
   shell_re='^(bash|sh|zsh|dash)([[:space:]]+-[^c[:space:]][^[:space:]]*)*[[:space:]]+-[a-zA-Z]*c[[:space:]]+(.*)$'
   quote_re='^["'"'"']?(.*)$'
   while :; do
-    if [[ "$seg" =~ ^(command|builtin)[[:space:]]+(.*)$ ]]; then
-      seg="${BASH_REMATCH[2]}"
+    if [[ "$seg" =~ ^(command|builtin)([[:space:]]+-p)*[[:space:]]+(.*)$ ]]; then
+      seg="${BASH_REMATCH[3]}"
     elif [[ "$seg" =~ $shell_re ]]; then
       seg="${BASH_REMATCH[3]}"
       [[ "$seg" =~ $quote_re ]] && seg="${BASH_REMATCH[1]}"
@@ -303,17 +303,16 @@ check_command() {
     rest="${seg#git }"
     target_dir="$current_dir"
     has_alias=0
-    local gitdir_arg="" wt_set=0
+    local gitdir_arg=""
     while :; do
       if [[ "$rest" =~ ^-C[[:space:]]+([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
         target_dir=$(resolve_dir "$target_dir" "${BASH_REMATCH[1]}")
         rest="${BASH_REMATCH[2]}"
       elif [[ "$rest" =~ ^--work-tree(=|[[:space:]]+)([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
         target_dir=$(resolve_dir "$target_dir" "$(printf '%s' "${BASH_REMATCH[2]}" | sed -E "s/^[\"']//; s/[\"']\$//")")
-        wt_set=1
         rest="${BASH_REMATCH[3]}"
       elif [[ "$rest" =~ ^--git-dir(=|[[:space:]]+)([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
-        gitdir_arg=$(printf '%s' "${BASH_REMATCH[2]}" | sed -E "s/^[\"']//; s/[\"']\$//")
+        gitdir_arg=$(resolve_dir "$target_dir" "$(printf '%s' "${BASH_REMATCH[2]}" | sed -E "s/^[\"']//; s/[\"']\$//")")
         rest="${BASH_REMATCH[3]}"
       elif [[ "$rest" =~ ^(--no-pager|-P|--paginate|-p|--no-optional-locks|--no-replace-objects|--literal-pathspecs)[[:space:]]+(.*)$ ]]; then
         rest="${BASH_REMATCH[2]}"
@@ -329,22 +328,27 @@ check_command() {
         break
       fi
     done
-    if [ -n "$gitdir_arg" ] && [ "$wt_set" = 0 ]; then
-      gitdir_arg=$(resolve_dir "$target_dir" "$gitdir_arg")
-      [ "${gitdir_arg##*/}" = .git ] && target_dir="${gitdir_arg%/.git}"
+    # git mutates the work tree (the cwd unless --work-tree) AND moves HEAD/refs in
+    # the --git-dir repo, so both are targets.
+    local -a targets=("$target_dir")
+    if [ -n "$gitdir_arg" ] && [ "${gitdir_arg##*/}" = .git ]; then
+      targets+=("${gitdir_arg%/.git}")
     fi
 
-    # An alias can expand to any destructive command, so refuse them outright.
-    if { [ "$has_alias" = 1 ] || is_destructive_git_args "$rest" "$target_dir"; } && is_target_protected "$target_dir"; then
-      # shellcheck disable=SC2059
-      printf "$BLOCK_MSG_TEMPLATE" "$seg" "$target_dir" >&2
-      return 2
-    fi
-    if is_head_moving_args "$rest" && is_mayor_checkout "$target_dir"; then
-      # shellcheck disable=SC2059
-      printf "$HEAD_MSG_TEMPLATE" "$seg" "$target_dir" >&2
-      return 2
-    fi
+    local t
+    for t in "${targets[@]}"; do
+      # An alias can expand to any destructive command, so refuse them outright.
+      if { [ "$has_alias" = 1 ] || is_destructive_git_args "$rest" "$t"; } && is_target_protected "$t"; then
+        # shellcheck disable=SC2059
+        printf "$BLOCK_MSG_TEMPLATE" "$seg" "$t" >&2
+        return 2
+      fi
+      if is_head_moving_args "$rest" && is_mayor_checkout "$t"; then
+        # shellcheck disable=SC2059
+        printf "$HEAD_MSG_TEMPLATE" "$seg" "$t" >&2
+        return 2
+      fi
+    done
   done <<< "$(printf '%s' "$cmd" | sed -E "s/(\\\$\\(|\`)[[:space:]]*(git[[:space:]]+(rev-parse|rev-list|describe|merge-base))/\\
 \\2/g; s/(\\\$\\(|\`)/ $SUBST_MARK\\
 /g; s/(&&|\\|\\||;|\\||\\(|\\))/\\
