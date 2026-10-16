@@ -3846,6 +3846,7 @@ dependencies = [
  "u7s-scheduler",
  "u7s-sentinel",
  "u7s-store",
+ "u7s-version",
  "uuid",
  "x509-cert",
  "yaml-rust2",
@@ -3883,6 +3884,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "u7s-version",
 ]
 
 [[package]]
@@ -3917,6 +3919,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "u7s-version"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

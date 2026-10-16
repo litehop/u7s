@@ -21,6 +21,9 @@ check() {
 tarball="$(sed -n 's/^K8S_VERSION="\([0-9.]*\)"$/\1/p' "$REPO/scripts/build-release-tarball.sh")"
 minor="${tarball%.*}"
 
+version_crate="$(sed -n 's/^pub const K8S_VERSION: &str = "\([0-9.]*\)";$/\1/p' "$REPO/crates/version/src/lib.rs")"
+check "crates/version K8S_VERSION (reported by /version)" "$tarball" "$version_crate"
+
 matrix_newest="$(grep -E '^\s*k8s: \[' "$REPO/.github/workflows/e2e-focus.yaml" \
   | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)"
 check "e2e-focus matrix newest entry" "$tarball" "$matrix_newest"
