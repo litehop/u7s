@@ -210,7 +210,10 @@ mod tests {
             super::super::resource::patch_resource(
                 State(state.clone()),
                 name_path(),
-                Query(PatchQuery::default()),
+                Query(PatchQuery {
+                    force: Some(true),
+                    ..Default::default()
+                }),
                 Extension(admin()),
                 headers(content_type),
                 Bytes::from(match mode {

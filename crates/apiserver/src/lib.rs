@@ -18,6 +18,7 @@ mod content_type;
 mod coord_gen_adapter;
 mod core_gen_adapter;
 mod csr_approver;
+mod field_manager;
 pub mod handlers;
 mod inflight;
 mod keys;
@@ -1843,9 +1844,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // ClusterRole (e.g. CoreDNS's system:coredns) whose rules it doesn't hold
             // itself — without it, RBAC escalation-prevention on the SSA-create path
             // makes every real cluster boot fail to install CoreDNS's RBAC. This is
-            // distinct from "escalate", which only bypasses the check when authoring a
-            // Role/ClusterRole's own rules, not when creating a binding to one.
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update","bind"] },
+            // distinct from "escalate", which bypasses the check when authoring a
+            // Role/ClusterRole's own rules (needed to apply system:coredns itself).
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update","bind","escalate"] },
             { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services","namespaces"], "verbs": ["get","create","patch","update"] },
             { "apiGroups": ["apps"], "resources": ["deployments","daemonsets"], "verbs": ["get","create","patch","update"] }
         ]
