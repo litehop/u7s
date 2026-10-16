@@ -48,6 +48,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
+use crate::handlers::field_selector::FieldSelector;
 use crate::rbac::{self, AuthzRequest, RbacIndex};
 
 const NODE_USERNAME_PREFIX: &str = "system:node:";
@@ -259,26 +260,33 @@ pub(crate) fn node_identity<'a>(username: &'a str, groups: &[String]) -> Option<
     Some(name)
 }
 
-/// True if the request's `fieldSelector` query param contains an exact-match
-/// `spec.nodeName=<node_name>` term (possibly combined with other terms via `,`, as kubelet's
-/// real pod-list/watch query does: `spec.nodeName=<node>,status.phase!=Succeeded,...`).
-/// Mirrors upstream's `attrs.GetFieldSelector()` scoped-list check, needed because a bare
-/// LIST/WATCH pods request has no `name` for the graph to key off.
+/// True if the request's `fieldSelector` requires `spec.nodeName=<node_name>` (possibly
+/// combined with other terms, as kubelet's pod-list/watch query does:
+/// `spec.nodeName=<node>,status.phase!=Succeeded,...`). Mirrors upstream's
+/// `attrs.GetFieldSelector()` scoped-list check, needed because a bare LIST/WATCH pods request
+/// has no `name` for the graph to key off.
+///
+/// Decided on the same query decoding (`Query`) and parse (`FieldSelector::parse`) the pod
+/// list/watch handlers use, so authorizer and handler cannot read a selector differently (an
+/// escaped comma once did). A selector the handler would reject is not authorized.
 fn field_selector_selects_node(query: Option<&str>, node_name: &str) -> bool {
     let Some(query) = query else {
         return false;
     };
-    let Some(raw) = query
-        .split('&')
-        .find_map(|p| p.strip_prefix("fieldSelector="))
+    let Ok(uri) = format!("/?{query}").parse::<axum::http::Uri>() else {
+        return false;
+    };
+    let Ok(axum::extract::Query(params)) =
+        axum::extract::Query::<Vec<(String, String)>>::try_from_uri(&uri)
     else {
         return false;
     };
-    let decoded = crate::auth::percent_decode(raw);
-    decoded.split(',').any(|term| {
-        let parsed = term.split_once("==").or_else(|| term.split_once('='));
-        matches!(parsed, Some(("spec.nodeName", v)) if v == node_name)
-    })
+    let mut selectors = params.iter().filter(|(k, _)| k == "fieldSelector");
+    let (Some((_, raw)), None) = (selectors.next(), selectors.next()) else {
+        return false;
+    };
+    FieldSelector::parse(Some(raw), "", "pods")
+        .is_ok_and(|s| s.requires_equal("spec.nodeName", node_name))
 }
 
 fn authorize_referenced_object(
@@ -1101,6 +1109,73 @@ mod tests {
             "node-a must not be able to list node-b's pods by simply spoofing the \
              fieldSelector — the selector's node must match the caller's own identity"
         );
+    }
+
+    fn node_a_may_list_pods_with(query: &str) -> bool {
+        let groups = vec![NODES_GROUP.to_owned()];
+        let req = node_req(
+            "system:node:node-a",
+            &groups,
+            "list",
+            "",
+            "pods",
+            "",
+            None,
+            None,
+        );
+        authorize(&req, Some(query), &seeded_graph(), &RbacIndex::new())
+    }
+
+    #[test]
+    fn escaped_comma_cannot_smuggle_the_node_term_past_the_parser() {
+        // `\,` is a literal comma inside ONE term (value of status.phase), so the list handler
+        // sees no spec.nodeName term and returns every pod, secrets-bearing env included. The
+        // authorizer must read the selector exactly as the handler does.
+        for q in [
+            r"fieldSelector=status.phase!%3DFoo%5C%2Cspec.nodeName%3Dnode-a",
+            r"fieldSelector=status.phase!=Foo\,spec.nodeName=node-a",
+            r"fieldSelector=spec.nodeName%3Dnode-a%5C%2Cstatus.phase%3Dx",
+            r"fieldSelector=spec.nodeName%5C%3Dnode-a",
+        ] {
+            assert!(
+                !node_a_may_list_pods_with(q),
+                "{q}: node-a must not list pods when the parsed selector has no unescaped \
+                 spec.nodeName=node-a term"
+            );
+        }
+    }
+
+    #[test]
+    fn unescaped_and_escaped_value_forms_authorize_like_the_parser_reads_them() {
+        assert!(node_a_may_list_pods_with(
+            "fieldSelector=spec.nodeName%3Dnode-a"
+        ));
+        assert!(node_a_may_list_pods_with(
+            "fieldSelector=spec.nodeName%3D%3Dnode-a%2Cstatus.phase!%3DSucceeded"
+        ));
+        assert!(node_a_may_list_pods_with(
+            "fieldSelector=status.phase!%3DFoo%2Cspec.nodeName%3Dnode-a&watch=true"
+        ));
+        // `\\` is a literal backslash, not an escape of the following comma.
+        assert!(node_a_may_list_pods_with(
+            r"fieldSelector=status.phase!%3DFoo%5C%5C%2Cspec.nodeName%3Dnode-a"
+        ));
+        assert!(
+            !node_a_may_list_pods_with("fieldSelector=spec.nodeName!%3Dnode-a"),
+            "a negated term does not scope the list to the node"
+        );
+    }
+
+    #[test]
+    fn malformed_or_duplicated_selector_is_not_authorized() {
+        for q in [
+            "fieldSelector=spec.nodeName%3Dnode-a%2Cbogus.field%3D1",
+            "fieldSelector=spec.nodeName%3Dnode-a%2Cx",
+            "fieldSelector=spec.nodeName%3Dnode-a&fieldSelector=status.phase%3DRunning",
+            "fieldSelector=spec.nodeName%3Dnode-a%5Cx",
+        ] {
+            assert!(!node_a_may_list_pods_with(q), "{q}");
+        }
     }
 
     #[test]
