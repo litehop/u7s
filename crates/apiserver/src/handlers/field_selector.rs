@@ -459,6 +459,14 @@ impl FieldSelector {
         items.into_iter().filter(|i| self.matches(i)).collect()
     }
 
+    /// True if some term pins `label` to exactly `value` (`=`/`==`, not `!=`). Terms are ANDed,
+    /// so every match of this selector has `label == value`.
+    pub fn requires_equal(&self, label: &str, value: &str) -> bool {
+        self.terms
+            .iter()
+            .any(|t| !t.negated && t.label == label && t.value == value)
+    }
+
     pub fn labels(&self) -> impl Iterator<Item = &str> {
         self.terms.iter().map(|t| t.label.as_str())
     }
@@ -1046,6 +1054,20 @@ mod tests {
     fn escaped_comma_and_equals_in_values_survive_parsing() {
         let obj = json!({"metadata": {"name": "a,b=c"}});
         assert!(sel(r"metadata.name=a\,b\=c", "", "pods").matches(&obj));
+    }
+
+    #[test]
+    fn requires_equal_reads_escapes_like_upstream_so_authz_cannot_be_smuggled_past() {
+        let s = |raw| sel(raw, "", "pods");
+        assert!(s("spec.nodeName=a,status.phase!=x").requires_equal("spec.nodeName", "a"));
+        assert!(s("spec.nodeName==a").requires_equal("spec.nodeName", "a"));
+        assert!(!s("spec.nodeName!=a").requires_equal("spec.nodeName", "a"));
+        // `\,` stays inside the status.phase value: there is no spec.nodeName term at all.
+        assert!(!s(r"status.phase!=Foo\,spec.nodeName=a").requires_equal("spec.nodeName", "a"));
+        // `\=` is a literal `=` in the value; `\\` a literal backslash that does not escape `,`.
+        assert!(s(r"spec.nodeName=a\=b").requires_equal("spec.nodeName", "a=b"));
+        assert!(s(r"status.phase=x\\,spec.nodeName=a").requires_equal("spec.nodeName", "a"));
+        assert!(s(r"status.phase=x\\").requires_equal("status.phase", r"x\"));
     }
 
     #[test]
