@@ -197,20 +197,28 @@ impl Status {
         )
     }
 
-    /// Upstream's 422 for an apply patch without `?fieldManager=` (`ValidatePatchOptions`).
-    pub fn apply_field_manager_required() -> StatusError {
-        let detail = "Required value: is required for apply patch";
+    /// Upstream's 422 for failed `ValidatePatchOptions`: one `(field, reason, body)` per
+    /// error, aggregated as `[a, b]` when there are several.
+    pub fn invalid_patch_options(errs: &[(String, &'static str, String)]) -> StatusError {
+        let lines: Vec<String> = errs.iter().map(|(f, _, b)| format!("{f}: {b}")).collect();
+        let agg = if lines.len() == 1 {
+            lines[0].clone()
+        } else {
+            format!("[{}]", lines.join(", "))
+        };
         let mut e = Status::unprocessable_entity(format!(
-            "PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: {detail}"
+            "PatchOptions.meta.k8s.io \"\" is invalid: {agg}"
         ));
+        let causes: Vec<_> = errs
+            .iter()
+            .map(|(field, reason, body)| {
+                serde_json::json!({"reason": reason, "message": body, "field": field})
+            })
+            .collect();
         e.1.details = Some(Box::new(serde_json::json!({
             "group": "meta.k8s.io",
             "kind": "PatchOptions",
-            "causes": [{
-                "reason": "FieldValueRequired",
-                "message": detail,
-                "field": "fieldManager"
-            }]
+            "causes": causes
         })));
         e
     }

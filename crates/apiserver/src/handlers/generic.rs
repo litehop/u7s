@@ -853,18 +853,11 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
 /// client-chosen uid would let a caller forge object identity — e.g. matching a
 /// stale/foreign `ownerReference.uid` to manipulate GC's owner-liveness check, or
 /// defeating controllers' "same name, different uid means a different object"
-/// recreate-detection.
+/// recreate-detection. `creationTimestamp` is likewise always reset to now, so a client
+/// cannot backdate an object to dodge age-based GC, TTL or ordering logic.
 pub(crate) fn stamp_metadata(obj: &mut Object) {
-    let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
     obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
-    if meta
-        .creation_timestamp
-        .as_deref()
-        .map(|s| s.is_empty())
-        .unwrap_or(true)
-    {
-        obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-    }
+    obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
 }
 
 /// Clears a newly-created built-in's client-supplied `status` before it is persisted.
@@ -2266,6 +2259,25 @@ mod tests {
             .unwrap_or("");
         assert!(!ts.is_empty(), "creationTimestamp must be set");
         assert!(ts.contains('T'), "creationTimestamp must be RFC3339");
+    }
+
+    #[test]
+    fn stamp_metadata_replaces_backdated_creation_timestamp() {
+        // A client that picks creationTimestamp can backdate an object past age-based
+        // cleanup (TTL, GC ordering); upstream's FillObjectMetaSystemFields always resets it.
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
+                "metadata": { "name": "x", "creationTimestamp": "2001-01-01T00:00:00Z" }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        stamp_metadata(&mut obj);
+        let ts = obj.body["metadata"]["creationTimestamp"].as_str().unwrap();
+        assert!(
+            ts > "2024-",
+            "backdated creationTimestamp must be replaced with now, got {ts}"
+        );
     }
 
     // -- allowWatchBookmarks: CollectionQuery field and bookmark suppression --

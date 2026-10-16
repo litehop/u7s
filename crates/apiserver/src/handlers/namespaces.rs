@@ -188,13 +188,7 @@ pub(crate) async fn create_namespace<S: Store>(
         }
     }
 
-    {
-        let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
-        if meta.creation_timestamp.is_none() {
-            obj.body["metadata"]["creationTimestamp"] =
-                serde_json::Value::String(utc_now_rfc3339());
-        }
-    }
+    obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -1762,6 +1756,44 @@ mod tests {
         assert!(
             ts.contains('T'),
             "creationTimestamp must be RFC3339 (contains 'T'); got: {ts}"
+        );
+    }
+
+    // A client-supplied creationTimestamp must be replaced on create (upstream
+    // FillObjectMetaSystemFields); keeping it would let a namespace be backdated.
+    #[tokio::test]
+    async fn create_namespace_replaces_backdated_creation_timestamp() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "old-ns", "creationTimestamp": "2001-01-01T00:00:00Z" }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "old-ns"))
+            .await
+            .unwrap()
+            .expect("namespace must exist in store");
+        let stored: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let ts = stored["metadata"]["creationTimestamp"].as_str().unwrap();
+        assert!(
+            ts > "2024-",
+            "backdated creationTimestamp must be replaced, got {ts}"
         );
     }
 

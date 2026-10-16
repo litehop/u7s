@@ -737,9 +737,115 @@ impl Conflict {
     }
 }
 
-/// Resolves `?fieldManager=` once for every kind's write route: rejects an apply patch
-/// without it (as upstream's `ValidatePatchOptions` does before any handler runs) and
-/// forwards it as the internal header [`WriteIdentity`] reads, so handlers without a query
+const FIELD_MANAGER_MAX_LENGTH: usize = 128;
+
+fn go_printable(c: char) -> bool {
+    !c.is_control() && (c == ' ' || !c.is_whitespace())
+}
+
+/// Go's `strconv.Quote`, which upstream's error messages use for string values.
+fn go_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{b}' => out.push_str("\\v"),
+            c if go_printable(c) => out.push(c),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32))
+            }
+            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
+    out.push('"');
+    out
+}
+
+type FieldError = (String, &'static str, String);
+
+/// Upstream's `ValidatePatchOptions` over the raw query pairs of a patch request whose
+/// media type is already known to be supported.
+fn validate_patch_options(is_apply: bool, query: &[(String, String)]) -> Vec<FieldError> {
+    let first = |k: &str| query.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let manager = first("fieldManager").unwrap_or_default();
+    let mut errs: Vec<FieldError> = Vec::new();
+    if is_apply {
+        if manager.is_empty() {
+            errs.push((
+                "fieldManager".into(),
+                "FieldValueRequired",
+                "Required value: is required for apply patch".into(),
+            ));
+        }
+    } else if first("force").is_some() {
+        errs.push((
+            "force".into(),
+            "FieldValueForbidden",
+            "Forbidden: may not be specified for non-apply patch".into(),
+        ));
+    }
+    if manager.len() > FIELD_MANAGER_MAX_LENGTH {
+        errs.push((
+            "fieldManager".into(),
+            "FieldValueTooLong",
+            format!("Too long: may not be more than {FIELD_MANAGER_MAX_LENGTH} bytes"),
+        ));
+    }
+    for (i, c) in manager.char_indices() {
+        if !go_printable(c) {
+            errs.push((
+                "fieldManager".into(),
+                "FieldValueInvalid",
+                format!(
+                    "Invalid value: {}: invalid character U+{:04X} (at position {i})",
+                    go_quote(manager),
+                    c as u32
+                ),
+            ));
+        }
+    }
+    let dry_run: Vec<&str> = query
+        .iter()
+        .filter(|(n, _)| n == "dryRun")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    if dry_run.iter().any(|v| *v != "All") {
+        errs.push((
+            "dryRun".into(),
+            "FieldValueNotSupported",
+            format!(
+                "Unsupported value: {}: supported values: \"All\"",
+                serde_json::to_string(&dry_run).unwrap_or_default()
+            ),
+        ));
+    }
+    if let Some(fv) = first("fieldValidation") {
+        if !["", "Ignore", "Warn", "Strict"].contains(&fv) {
+            errs.push((
+                "fieldValidation".into(),
+                "FieldValueNotSupported",
+                format!(
+                    "Unsupported value: {}: supported values: \"\", \"Ignore\", \"Strict\", \"Warn\"",
+                    go_quote(fv)
+                ),
+            ));
+        }
+    }
+    errs
+}
+
+/// Resolves `?fieldManager=` once for every kind's write route: validates a patch's options
+/// as upstream's `ValidatePatchOptions` does before any handler runs (an unsupported media
+/// type is left for the handler's 415, as upstream rejects it first), and forwards the
+/// manager as the internal header [`WriteIdentity`] reads, so handlers without a query
 /// extractor still record the caller-chosen manager. A client-supplied copy of the header is
 /// always discarded.
 pub(crate) async fn resolve_field_manager(
@@ -748,26 +854,29 @@ pub(crate) async fn resolve_field_manager(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     req.headers_mut().remove(FIELD_MANAGER_HEADER);
-    let manager = axum::extract::Query::<BTreeMap<String, String>>::try_from_uri(req.uri())
-        .ok()
-        .and_then(|q| q.0.get("fieldManager").cloned())
-        .filter(|m| !m.is_empty());
-    let is_apply = req.method() == axum::http::Method::PATCH
-        && req
+    let query = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(req.uri())
+        .map(|q| q.0)
+        .unwrap_or_default();
+    if req.method() == axum::http::Method::PATCH
+        && crate::handlers::json_patch::detect_patch_type(req.headers()).is_ok()
+    {
+        let is_apply = req
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("apply-patch+yaml"));
-    match manager {
-        Some(m) => {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&m) {
-                req.headers_mut().insert(FIELD_MANAGER_HEADER, v);
-            }
+        let errs = validate_patch_options(is_apply, &query);
+        if !errs.is_empty() {
+            return crate::status::Status::invalid_patch_options(&errs).into_response();
         }
-        None if is_apply => {
-            return crate::status::Status::apply_field_manager_required().into_response();
-        }
-        None => {}
+    }
+    let manager = query
+        .iter()
+        .find(|(n, _)| n == "fieldManager")
+        .map(|(_, v)| v.as_str())
+        .filter(|m| !m.is_empty());
+    if let Some(Ok(v)) = manager.map(axum::http::HeaderValue::from_str) {
+        req.headers_mut().insert(FIELD_MANAGER_HEADER, v);
     }
     next.run(req).await
 }
@@ -1208,6 +1317,158 @@ mod tests {
                 assert_eq!(body["details"]["causes"][0]["field"], "fieldManager");
                 assert_eq!(body["details"]["causes"][0]["reason"], "FieldValueRequired");
             }
+        }
+
+        const MERGE: &str = "application/merge-patch+json";
+
+        /// `?force` on a merge patch is a client bug upstream refuses; accepting it hides
+        /// that a controller believes a non-apply patch can take field ownership.
+        #[tokio::test]
+        async fn force_on_non_apply_patch_is_rejected_like_upstream() {
+            for ct in [
+                MERGE,
+                "application/strategic-merge-patch+json",
+                "application/json-patch+json",
+            ] {
+                for q in ["force=true", "force=false"] {
+                    let (status, body, _) = patch(ct, &format!("/x?{q}"), false).await;
+                    assert_eq!(status, 422, "{ct} ?{q}: {body}");
+                    assert_eq!(
+                        body["message"],
+                        "PatchOptions.meta.k8s.io \"\" is invalid: force: Forbidden: may not \
+                         be specified for non-apply patch"
+                    );
+                    assert_eq!(body["details"]["group"], "meta.k8s.io");
+                    assert_eq!(body["details"]["kind"], "PatchOptions");
+                    assert!(body["details"].get("name").is_none());
+                    assert_eq!(
+                        body["details"]["causes"][0]["reason"],
+                        "FieldValueForbidden"
+                    );
+                    assert_eq!(body["details"]["causes"][0]["field"], "force");
+                }
+            }
+            let (status, _, _) = patch(APPLY, "/x?fieldManager=m&force=true", false).await;
+            assert_eq!(status, 200, "force is valid for apply");
+        }
+
+        /// u7s serves no CBOR apply; it must reach the handler's 415 rather than be
+        /// mistaken for apply or masked as a 422 by `force`.
+        #[tokio::test]
+        async fn unsupported_media_type_is_left_to_the_handler() {
+            let (status, _, _) =
+                patch("application/apply-patch+cbor", "/x?force=true", false).await;
+            assert_eq!(
+                status, 200,
+                "validation must not pre-empt the handler's 415"
+            );
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/apply-patch+cbor"),
+            );
+            assert_eq!(
+                crate::handlers::json_patch::detect_patch_type(&h)
+                    .unwrap_err()
+                    .0,
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
+        }
+
+        /// A manager over 128 bytes would bloat every managedFields entry it owns.
+        #[tokio::test]
+        async fn overlong_field_manager_is_rejected_like_upstream() {
+            let uri = format!("/x?fieldManager={}", "a".repeat(129));
+            let (status, body, _) = patch(MERGE, &uri, false).await;
+            assert_eq!(status, 422);
+            assert_eq!(
+                body["message"],
+                "PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: Too long: may not be \
+                 more than 128 bytes"
+            );
+            assert_eq!(body["details"]["causes"][0]["reason"], "FieldValueTooLong");
+            let uri = format!("/x?fieldManager={}", "a".repeat(128));
+            assert_eq!(patch(MERGE, &uri, false).await.0, 200);
+        }
+
+        /// A control character in the manager would corrupt logs and managedFields output.
+        #[tokio::test]
+        async fn unprintable_field_manager_is_rejected_like_upstream() {
+            let (status, body, _) = patch(MERGE, "/x?fieldManager=a%07b", false).await;
+            assert_eq!(status, 422);
+            assert_eq!(
+                body["message"],
+                "PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: Invalid value: \
+                 \"a\\ab\": invalid character U+0007 (at position 1)"
+            );
+            assert_eq!(body["details"]["causes"][0]["reason"], "FieldValueInvalid");
+            assert_eq!(body["details"]["causes"][0]["field"], "fieldManager");
+        }
+
+        /// Only `All` is a real dry run; any other value must not silently become a write.
+        #[tokio::test]
+        async fn unsupported_dry_run_value_is_rejected_like_upstream() {
+            let (status, body, _) = patch(MERGE, "/x?dryRun=All&dryRun=None", false).await;
+            assert_eq!(status, 422);
+            assert_eq!(
+                body["message"],
+                "PatchOptions.meta.k8s.io \"\" is invalid: dryRun: Unsupported value: \
+                 [\"All\",\"None\"]: supported values: \"All\""
+            );
+            assert_eq!(
+                body["details"]["causes"][0]["reason"],
+                "FieldValueNotSupported"
+            );
+            assert_eq!(patch(MERGE, "/x?dryRun=All", false).await.0, 200);
+        }
+
+        /// A typo such as `fieldValidation=strict` must fail loudly, not skip validation.
+        #[tokio::test]
+        async fn unsupported_field_validation_value_is_rejected_like_upstream() {
+            let (status, body, _) = patch(MERGE, "/x?fieldValidation=strict", false).await;
+            assert_eq!(status, 422);
+            assert_eq!(
+                body["message"],
+                "PatchOptions.meta.k8s.io \"\" is invalid: fieldValidation: Unsupported value: \
+                 \"strict\": supported values: \"\", \"Ignore\", \"Strict\", \"Warn\""
+            );
+            assert_eq!(body["details"]["causes"][0]["field"], "fieldValidation");
+            for ok in ["", "Ignore", "Warn", "Strict"] {
+                let uri = format!("/x?fieldValidation={ok}");
+                assert_eq!(patch(MERGE, &uri, false).await.0, 200, "{ok}");
+            }
+        }
+
+        /// Several bad options are reported together, as upstream's aggregate does.
+        #[tokio::test]
+        async fn several_bad_options_are_aggregated() {
+            let (status, body, _) = patch(MERGE, "/x?force=true&dryRun=x", false).await;
+            assert_eq!(status, 422);
+            assert_eq!(body["details"]["causes"].as_array().unwrap().len(), 2);
+            assert!(body["message"]
+                .as_str()
+                .unwrap()
+                .contains("is invalid: [force: Forbidden"));
+        }
+
+        /// Only PATCH carries PatchOptions.
+        #[tokio::test]
+        async fn non_patch_requests_are_not_validated() {
+            let app = axum::Router::new()
+                .route("/x", axum::routing::put(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(resolve_field_manager));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/x?force=true")
+                        .header("content-type", "application/json")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
         }
 
         /// Only apply requires it: merge patches fall back to the user agent, as upstream.
