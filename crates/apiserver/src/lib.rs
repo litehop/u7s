@@ -11,6 +11,7 @@ mod auth;
 mod autoscaling_gen_adapter;
 mod batch_gen_adapter;
 mod bootstrap_apply;
+mod bootstrap_rbac;
 mod certificates_v1beta1_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
@@ -1406,9 +1407,6 @@ async fn reconcile_system_node_binding_subjects(
 }
 
 async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
-    use bytes::Bytes;
-    use u7s_store::Store;
-
     const GROUP: &str = "rbac.authorization.k8s.io";
     // Never actually written to the store — the `put!` macro below overwrites
     // `metadata.creationTimestamp` on every body with `boot_timestamp()` before serializing
@@ -1417,27 +1415,15 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     // silently reintroducing the old "2024-01-01" lie.
     const TS: &str = "TIMESTAMP-OVERWRITTEN-BY-PUT-MACRO";
 
-    // Helper: create-only put for a single seeded RBAC object. Like upstream kube-apiserver,
-    // bootstrap RBAC is stamped once per cluster lifetime: on first boot this creates the
-    // object with `boot_timestamp()`; on every later boot the object already exists, so the
-    // write is rejected (AlreadyExists) and swallowed, leaving whatever an operator has since
-    // changed on it untouched. uid_suffix must be unique across all seeded objects.
+    // Helper: create-or-reconcile a single seeded RBAC object, as upstream's ensureRBACPolicy
+    // does: created when missing, otherwise only missing rules/subjects/labels/annotations are
+    // added (operator additions survive, autoupdate=false opts out, no write when up to date).
+    // uid must be unique across all seeded objects.
     macro_rules! put {
         ($key:expr, $body:expr, $name:expr, $kind:expr) => {{
             let mut body = $body;
             body["metadata"]["creationTimestamp"] = serde_json::Value::from(boot_timestamp());
-            match store
-                .put(&$key, Bytes::from(body.to_string()), Some(0))
-                .await
-            {
-                Ok(_) => tracing::info!("seeded {}: {}", $kind, $name),
-                Err(u7s_store::StoreError::AlreadyExists { .. }) => {
-                    // Already exists — idempotent, and intentionally not re-applied so an
-                    // operator's edit to a seeded Role/ClusterRole/ClusterRoleBinding survives
-                    // a restart instead of being silently reverted.
-                }
-                Err(e) => return Err(anyhow::anyhow!("seed {} {}: {}", $kind, $name, e)),
-            }
+            bootstrap_rbac::reconcile_object(store, &$key, body).await?;
         }};
     }
 
@@ -5496,6 +5482,77 @@ mod tests {
         let store = make_store();
         seed_rbac(&store).await.expect("first seed must not fail");
         seed_rbac(&store).await.expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn restart_on_a_store_with_an_old_kcm_role_grants_kcm_the_new_signers_rule() {
+        // Bootstrap-role fixes (e.g. new certificates.k8s.io/signers grants for KCM) only
+        // reach existing clusters if startup reconciles stale roles, not just creates.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("first seed must not fail");
+
+        let key = keys::group_object_key(
+            GROUP,
+            "clusterroles",
+            None,
+            "system:kube-controller-manager",
+        );
+        let existing = store.get(&key).await.unwrap().expect("kcm role seeded");
+        let mut old: serde_json::Value = serde_json::from_slice(&existing.value).unwrap();
+        let rules = old["rules"].as_array_mut().unwrap();
+        let before = rules.len();
+        rules.retain(|r| r["resources"] != serde_json::json!(["signers"]));
+        assert_eq!(
+            rules.len(),
+            before - 1,
+            "test setup must strip the signers rule"
+        );
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(old.to_string()),
+                Some(existing.revision),
+            )
+            .await
+            .unwrap();
+
+        let attest = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &[],
+            verb: "attest",
+            api_group: "certificates.k8s.io",
+            resource: "signers",
+            subresource: "",
+            namespace: None,
+            name: Some("kubernetes.io/kube-apiserver-serving"),
+            non_resource_url: None,
+        };
+        let new_state = || {
+            state::AppState::new(
+                std::sync::Arc::clone(&store),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            )
+        };
+        let state = new_state();
+        state.init().await;
+        assert!(
+            !state.rbac_index.is_allowed(&attest),
+            "setup: stale role must lack the grant"
+        );
+
+        seed_rbac(&store).await.expect("restart seed must not fail");
+
+        let state = new_state();
+        state.init().await;
+        assert!(
+            state.rbac_index.is_allowed(&attest),
+            "after restart KCM must hold the rule added to the bootstrap role, else upgraded \
+             clusters never receive bootstrap-policy fixes"
+        );
     }
 
     #[tokio::test]
