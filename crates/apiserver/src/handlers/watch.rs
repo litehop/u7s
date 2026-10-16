@@ -1017,8 +1017,8 @@ async fn watch_generic_impl<S: Store>(
         ))
     })?;
     tracing::debug!(username = %username, "watch: permit acquired");
-    // _watch_permit is held for the duration of the watch stream and released when
-    // this function returns (RAII drop).
+    // Moved into the stream below: a generator captures only the variables it names, so
+    // without that the permit would drop when this function returns, not when the stream ends.
 
     // Check compaction horizon BEFORE committing headers so clients get a synchronous HTTP 410.
     // If from_rv > 0 and below the horizon, the revision is expired — return 410 immediately.
@@ -1102,6 +1102,7 @@ async fn watch_generic_impl<S: Store>(
         use tokio::time::{Duration, interval, sleep};
 
         let state_for_conversion = state_for_conversion;
+        let _watch_permit = _watch_permit;
         // Brackets apiserver_longrunning_requests{verb="watch",...} for the stream's real
         // lifetime — see LongRunningWatchGuard's doc for why it must be constructed here,
         // inside the generator, rather than in the enclosing function.
@@ -2893,6 +2894,73 @@ mod tests {
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "watch_generic must map store watch() errors to HTTP 500 via Status::internal"
         );
+    }
+
+    /// One user holding MAX_WATCHES_PER_CLIENT open watch streams must exhaust their own
+    /// permits, get a 429 TooManyRequests on the next, and regain a slot when a stream ends.
+    /// If the permit is dropped when the handler returns rather than when the stream ends, a
+    /// single user can open unbounded watches (tasks, fds, broadcast receivers) and exhaust a
+    /// 1 GiB host.
+    #[tokio::test]
+    async fn open_watch_streams_hold_per_client_permits_until_dropped() {
+        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let cfg = || WatchConfig {
+            prefix: "/registry/test/".into(),
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            from_revision: 0,
+            initial_items: None,
+            label_selector: None,
+            field_selector: None,
+            allow_watch_bookmarks: false,
+            username: "mallory".into(),
+            as_partial_object_metadata: false,
+            group: "".into(),
+            plural: "".into(),
+            timeout_seconds: None,
+        };
+
+        let mut held = Vec::new();
+        for i in 0..MAX_WATCHES_PER_CLIENT {
+            let resp = watch_generic(state.clone(), cfg())
+                .await
+                .unwrap_or_else(|_| panic!("watch {i} is within the per-client limit"));
+            held.push(resp);
+        }
+        let sem = state.watch_limit.semaphore_for("mallory");
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "open watch streams must each hold a permit; releasing at handler return lets one \
+             user open unbounded watches"
+        );
+
+        let over = watch_generic(state.clone(), cfg())
+            .await
+            .expect_err("watch beyond the per-client limit must be rejected");
+        assert_eq!(over.0, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(over.1.reason, "TooManyRequests");
+
+        drop(held.pop());
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "ending one stream must free exactly one permit so the client can reconnect"
+        );
+        watch_generic(state.clone(), cfg())
+            .await
+            .unwrap_or_else(|_| panic!("a freed slot must admit a new watch"));
     }
 
     /// A different user's watch succeeds even when another user has exhausted their quota.
