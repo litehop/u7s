@@ -91,6 +91,28 @@ pub(crate) fn merge_incoming_metadata(
     }
 }
 
+/// Reject a status merge/strategic patch whose `metadata.name`/`metadata.namespace` names a
+/// different object than the URL (400, as upstream applies `checkName` to the patched object
+/// of every subresource). `merge_incoming_metadata` would otherwise silently restore them,
+/// hiding a client bug that upstream surfaces. Keys the patch omits are not checked.
+pub(crate) fn reject_patch_identity_mismatch(
+    patch: &serde_json::Value,
+    name: &str,
+    ns: Option<&str>,
+) -> Result<(), crate::status::StatusError> {
+    let Some(meta) = patch.get("metadata").and_then(|m| m.as_object()) else {
+        return Ok(());
+    };
+    let mut probe = serde_json::json!({ "metadata": { "name": name } });
+    if let Some(v) = meta.get("name") {
+        probe["metadata"]["name"] = v.clone();
+    }
+    if let (Some(v), Some(_)) = (meta.get("namespace"), ns) {
+        probe["metadata"]["namespace"] = v.clone();
+    }
+    super::json_patch::enforce_patch_identity(&mut probe, name, ns)
+}
+
 // -- cluster-scoped --
 
 fn is_storage_version_migration(group: &str, plural: &str) -> bool {
@@ -246,6 +268,7 @@ pub async fn patch_resource_status<S: Store>(
         serde_json::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
+    reject_patch_identity_mismatch(&patch, &name, None)?;
 
     match patch_type {
         PatchType::Json => {
@@ -564,6 +587,7 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
         serde_json::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
+    reject_patch_identity_mismatch(&patch, &name, Some(&ns))?;
 
     match patch_type {
         PatchType::Json => {
@@ -1958,6 +1982,81 @@ mod tests {
             result.is_ok(),
             "strategic-merge-patch on namespaced status must succeed"
         );
+    }
+
+    /// A status patch naming a different object must be a 400, like upstream's `checkName`
+    /// on every subresource; silently restoring the name hides a client that is patching the
+    /// wrong object (and fails the conformance expectation that the write is refused).
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_rejects_mismatched_name_and_namespace() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "id-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "id-lease" },
+            "status": {}
+        });
+        store
+            .put(
+                "/registry/coordination.k8s.io/leases/kube-node-lease/id-lease",
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        for (patch, what) in [
+            (
+                serde_json::json!({"metadata": {"name": "other"}, "status": {}}),
+                "name",
+            ),
+            (
+                serde_json::json!({"metadata": {"namespace": "other"}, "status": {}}),
+                "namespace",
+            ),
+            (
+                serde_json::json!({"metadata": {"name": "id-lease", "namespace": "kube-node-lease"}, "status": {}}),
+                "matching identity",
+            ),
+        ] {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/merge-patch+json"),
+            );
+            let result = patch_namespaced_resource_status(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "kube-node-lease".into(),
+                    "leases".into(),
+                    "id-lease".into(),
+                )),
+                headers,
+                bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+            )
+            .await;
+            if what == "matching identity" {
+                assert!(
+                    result.is_ok(),
+                    "a patch repeating the URL identity is legal"
+                );
+            } else {
+                let err = result.err().unwrap_or_else(|| {
+                    panic!("a status patch with a mismatched {what} must be rejected")
+                });
+                assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{what}");
+            }
+        }
     }
 
     /// patch_namespaced_resource_status must accept a genuine multi-line YAML

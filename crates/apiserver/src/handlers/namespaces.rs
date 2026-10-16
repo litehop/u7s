@@ -860,6 +860,7 @@ pub(crate) async fn patch_namespace_status<S: Store>(
         serde_json::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
+    crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, Some(&name))?;
 
     match patch_type {
         PatchType::Json => {

@@ -2862,6 +2862,7 @@ pub(crate) async fn patch_pod_status<S: Store>(
 
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    super::status::reject_patch_identity_mismatch(&patch, &name, Some(ns.as_str()))?;
 
     // Retry on RevisionMismatch: PATCH is not a conditional operation — re-read and
     // re-apply when a concurrent write advances the stored rv between our read and write.

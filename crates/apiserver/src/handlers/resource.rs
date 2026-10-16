@@ -1454,14 +1454,7 @@ pub(crate) async fn do_patch<S: Store>(
         };
         // Strip any managedFields the client sent — we don't track field ownership.
         strip_managed_fields(&mut obj.body);
-        let mut obj_meta: ObjectMeta =
-            ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
-        obj_meta.name = Some(name.to_string());
-        if let Some(namespace) = ns {
-            obj_meta.namespace = Some(namespace.to_string());
-        }
-        obj.body["metadata"] =
-            serde_json::to_value(obj_meta).map_err(|e| Status::internal(e.to_string()))?;
+        super::json_patch::enforce_patch_identity(&mut obj.body, name, ns)?;
         resolve_valid_name(&mut obj, group, plural, &meta.kind)?;
         stamp_metadata(&mut obj);
         // An SSA apply-create is a create just like create_resource/create_namespaced_resource
@@ -6132,6 +6125,66 @@ mod tests {
 
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/lima-node";
         assert!(store.get(key).await.unwrap().is_some());
+    }
+
+    /// An apply that would create an object under a different name or namespace than the URL
+    /// must be a 400 (upstream `checkName`); silently creating it under the URL name hides a
+    /// client that applied the wrong manifest to the wrong endpoint, and nothing is persisted.
+    #[tokio::test]
+    async fn apply_create_with_mismatched_name_or_namespace_is_rejected_and_persists_nothing() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        for (body_name, body_ns) in [("other", "kube-node-lease"), ("lima-node", "other-ns")] {
+            let patch = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": body_name, "namespace": body_ns },
+                "spec": { "holderIdentity": "x" }
+            });
+            let mut ssa_headers = axum::http::HeaderMap::new();
+            ssa_headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+            );
+            let err = patch_namespaced_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "coordination.k8s.io".to_string(),
+                    "v1".to_string(),
+                    "kube-node-lease".to_string(),
+                    "leases".to_string(),
+                    "lima-node".to_string(),
+                )),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                ssa_headers,
+                bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("apply of {body_name}/{body_ns} onto lima-node must fail"));
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        }
+        assert!(store
+            .get("/registry/coordination.k8s.io/leases/kube-node-lease/lima-node")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get("/registry/coordination.k8s.io/leases/kube-node-lease/other")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// apply-patch+yaml SSA-create-on-missing is a third CREATE surface (alongside plain POST
