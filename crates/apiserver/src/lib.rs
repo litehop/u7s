@@ -653,12 +653,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     // 11. Build axum router and attach tower layers.
-    //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
+    //     Order (outermost first): body_limit → auth → inflight → content_type → handler.
     //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
     //     auth processing — this prevents OOM via large unauthenticated request bodies.
+    //     Inflight sits inside auth because its reserved seats and per-user share are keyed
+    //     on the authenticated identity.
     //     4 MiB matches etcd's practical limit (~1.5 MiB) with headroom for kubectl manifests.
     let app = build_router(state.clone())
         .layer(ContentTypeLayer)
+        .layer(InflightLayer::new())
         .layer(AuthLayer::new(
             Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
@@ -670,7 +673,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Arc::clone(&state.resource_registry),
             Arc::clone(&state.discovery_cache),
         ))
-        .layer(InflightLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
 
     // 12. Bind TLS listener and serve. Uses bind_listener (socket2) rather than

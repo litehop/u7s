@@ -813,6 +813,27 @@ fn decode_query_component(s: &str) -> Option<String> {
     percent_decode(&s.replace('+', " "))
 }
 
+/// Whether a request is long-running, i.e. exempt from the max-in-flight pools and the
+/// body deadline. Mirrors kube-apiserver's `LongRunningFunc`: verb `watch` (collection GET
+/// asking for a watch) or one of the subresources `proxy`, `attach`, `exec`, `log`,
+/// `portforward`.
+pub(crate) fn is_long_running_request(
+    method: &axum::http::Method,
+    path: &str,
+    query: Option<&str>,
+) -> bool {
+    let parsed = parse_path(path);
+    if parsed.resource.is_empty() {
+        return false;
+    }
+    matches!(
+        parsed.subresource.as_str(),
+        "proxy" | "attach" | "exec" | "log" | "portforward"
+    ) || (matches!(*method, axum::http::Method::GET)
+        && parsed.name.is_none()
+        && query_requests_watch(query))
+}
+
 /// Decode RFC 3986 `%XX` percent-escapes in a URL query-string component.
 ///
 /// Kubernetes clients (client-go) percent-encode `fieldSelector` values, e.g.
