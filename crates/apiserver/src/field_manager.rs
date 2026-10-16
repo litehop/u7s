@@ -879,22 +879,56 @@ fn delete_options_body(opts: &DeleteOptions) -> Vec<u8> {
     body.to_string().into_bytes()
 }
 
+/// The pod, service and node proxy routes: their DELETE body and query belong to the
+/// backend, not to `DeleteOptions`.
+fn is_proxy_path(path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    matches!(
+        segs.as_slice(),
+        [
+            "api",
+            "v1",
+            "namespaces",
+            _,
+            "pods" | "services",
+            _,
+            "proxy",
+            ..
+        ] | ["api", "v1", "nodes", _, "proxy", ..]
+    )
+}
+
 /// Resolves a DELETE's effective `DeleteOptions` as upstream's delete handler does: a
 /// non-empty body is the options (the query is ignored), an empty body takes them from the
 /// query. The result is validated (422 `DeleteOptions`) before any handler runs; options
 /// that came from the query are handed on as a JSON body, the one place every delete and
 /// deletecollection handler reads them from. An undecodable body is left to the handlers'
-/// lenient parse.
+/// lenient parse. A non-empty body also makes its `dryRun` authoritative: the query-derived
+/// dry-run header is dropped, as upstream never reads the query then.
 async fn resolve_delete_options(
     req: axum::http::Request<axum::body::Body>,
     query: &[(String, String)],
-) -> Result<axum::http::Request<axum::body::Body>, axum::response::Response> {
+) -> Result<axum::http::Request<axum::body::Body>, Box<axum::response::Response>> {
     use axum::response::IntoResponse;
     let (mut parts, body) = req.into_parts();
     let raw = axum::body::to_bytes(body, crate::MAX_BODY_BYTES)
         .await
-        .map_err(|_| axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
+        .map_err(|e| {
+            let over_cap = std::error::Error::source(&e)
+                .is_some_and(|s| s.is::<http_body_util::LengthLimitError>());
+            Box::new(if over_cap {
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response()
+            } else {
+                crate::status::Status::bad_request(format!("unable to read the request body: {e}"))
+                    .into_response()
+            })
+        })?;
     let from_query = raw.is_empty();
+    if !from_query {
+        parts
+            .headers
+            .remove(crate::handlers::json_patch::DRY_RUN_HEADER);
+    }
     let opts = if from_query {
         Some(delete_options_from_query(query))
     } else {
@@ -906,9 +940,9 @@ async fn resolve_delete_options(
     if let Some(opts) = opts {
         let errs = validate_delete_options(&opts);
         if !errs.is_empty() {
-            return Err(
+            return Err(Box::new(
                 crate::status::Status::invalid_options("DeleteOptions", &errs).into_response(),
-            );
+            ));
         }
         if from_query
             && (opts.propagation_policy.is_some()
@@ -986,10 +1020,10 @@ pub(crate) async fn resolve_field_manager(
     let query = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(req.uri())
         .map(|q| q.0)
         .unwrap_or_default();
-    if *req.method() == axum::http::Method::DELETE {
+    if *req.method() == axum::http::Method::DELETE && !is_proxy_path(req.uri().path()) {
         req = match resolve_delete_options(req, &query).await {
             Ok(req) => req,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
     }
     let validated = match *req.method() {
@@ -1978,6 +2012,148 @@ mod tests {
                 assert_eq!(status, 200, "{uri}");
                 assert_eq!(echoed, Value::Null, "{uri}: body must stay empty");
                 assert_eq!(ct, None, "{uri}");
+            }
+        }
+
+        /// Mirrors the delete handlers' dry-run decision (`body.is_dry_run() || header`)
+        /// behind the same layer order as the real router.
+        async fn handler_dry_runs(uri: &str, body: &str) -> bool {
+            let app = axum::Router::new()
+                .route(
+                    "/x",
+                    axum::routing::delete(
+                        |h: axum::http::HeaderMap, b: axum::body::Bytes| async move {
+                            let opts: DeleteOptions =
+                                serde_json::from_slice(&b).unwrap_or_default();
+                            let dry = opts.is_dry_run()
+                                || crate::handlers::json_patch::is_dry_run_header(&h);
+                            dry.to_string()
+                        },
+                    ),
+                )
+                .layer(axum::middleware::from_fn(resolve_field_manager))
+                .layer(axum::middleware::from_fn(
+                    crate::handlers::json_patch::inject_dry_run_header,
+                ));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            bytes.as_ref() == b"true"
+        }
+
+        /// Upstream ignores the query once a body is present, so a body that says "really
+        /// delete" must not be turned into a dry run by `?dryRun=All` (the caller would
+        /// believe the object is gone), and a body dryRun must still dry-run.
+        #[tokio::test]
+        async fn body_dry_run_is_authoritative_over_query_dry_run() {
+            assert!(
+                !handler_dry_runs("/x?dryRun=All", r#"{"dryRun":[]}"#).await,
+                "body without dryRun must really delete despite ?dryRun=All"
+            );
+            assert!(handler_dry_runs("/x", r#"{"dryRun":["All"]}"#).await);
+            assert!(
+                handler_dry_runs("/x?dryRun=All", "").await,
+                "a bodyless ?dryRun=All must still dry-run"
+            );
+        }
+
+        /// Proxied DELETEs carry the backend's own body and query: decoding them as
+        /// DeleteOptions would 422 a valid backend request or inject a JSON body into it.
+        #[tokio::test]
+        async fn proxied_delete_reaches_the_backend_unchanged() {
+            let app =
+                axum::Router::new()
+                    .route(
+                        "/api/v1/namespaces/{ns}/services/{name}/proxy/{*p}",
+                        axum::routing::delete(
+                            |h: axum::http::HeaderMap,
+                             uri: axum::http::Uri,
+                             b: axum::body::Bytes| async move {
+                                format!(
+                                    "{}|{}|{}",
+                                    uri.query().unwrap_or_default(),
+                                    h.get("content-type")
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or(""),
+                                    String::from_utf8_lossy(&b)
+                                )
+                            },
+                        ),
+                    )
+                    .layer(axum::middleware::from_fn(resolve_field_manager));
+            for (uri, ct, body) in [
+                (
+                    "/api/v1/namespaces/d/services/s/proxy/a?propagationPolicy=Bogus&dryRun=None",
+                    "text/plain",
+                    r#"{"dryRun":["None"]}"#,
+                ),
+                (
+                    "/api/v1/namespaces/d/services/s/proxy/a?propagationPolicy=Orphan",
+                    "",
+                    "",
+                ),
+            ] {
+                let mut b = Request::builder().method("DELETE").uri(uri);
+                if !ct.is_empty() {
+                    b = b.header("content-type", ct);
+                }
+                let resp = app
+                    .clone()
+                    .oneshot(b.body(Body::from(body)).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200, "{uri}");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let query = uri.split_once('?').unwrap().1;
+                assert_eq!(
+                    String::from_utf8_lossy(&bytes),
+                    format!("{query}|{ct}|{body}")
+                );
+            }
+        }
+
+        /// An oversized DELETE body is the client's size error (413), distinct from a
+        /// failed read (400), so callers know whether to shrink the body or retry.
+        #[tokio::test]
+        async fn oversized_delete_body_is_413() {
+            let (status, _, _) = delete_echo(
+                "/x",
+                Some("application/json"),
+                vec![b' '; crate::MAX_BODY_BYTES + 1],
+            )
+            .await;
+            assert_eq!(status, 413);
+        }
+
+        #[test]
+        fn proxy_paths_are_recognised_exactly() {
+            for p in [
+                "/api/v1/namespaces/d/pods/p/proxy",
+                "/api/v1/namespaces/d/pods/p/proxy/x/y",
+                "/api/v1/namespaces/d/services/s/proxy/",
+                "/api/v1/nodes/n/proxy/metrics",
+            ] {
+                assert!(is_proxy_path(p), "{p}");
+            }
+            for p in [
+                "/api/v1/namespaces/d/configmaps/proxy",
+                "/api/v1/namespaces/d/pods/proxy",
+                "/api/v1/namespaces/d/pods",
+            ] {
+                assert!(!is_proxy_path(p), "{p}");
             }
         }
 
