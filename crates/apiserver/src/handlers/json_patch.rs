@@ -2472,7 +2472,6 @@ mod tests {
         "soft_delete_crd",
         "purge_crd",
         "delete_finalized_namespace",
-        "delete_namespace_scoped_crds",
         "update_quota_status",
         "write_vap_status",
         "write_flowcontrol_status",
