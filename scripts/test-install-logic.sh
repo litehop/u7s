@@ -29,6 +29,9 @@
 # shellcheck disable=SC2016 # file-wide: single-quoted grep patterns below
 # intentionally match install.sh's literal, unexpanded source text.
 set -euo pipefail
+# A command dying under set -e must say so: a silent exit before the Results
+# line reads as "no output" in CI instead of a failure.
+trap 'echo "FAIL: test script aborted at line $LINENO before reaching Results" >&2' ERR
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL="$DIR/install.sh"
@@ -1150,8 +1153,8 @@ write_join_runner() {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
     echo 'STATE_DIR="$1"; JOIN_SERVER="https://cp.example:6443"; CA_CERT_HASH="${CA_CERT_HASH:-}"; JOIN_TOKEN="${JOIN_TOKEN:-}"'
-    echo 'base64() { local a=() x; for x in "$@"; do [ "$x" = -w0 ] || a+=("$x"); done; command base64 ${a[@]+"${a[@]}"}; }'
-    echo 'date() { if [ "$1" = -u ] && [ "$2" = -d ]; then command date -u -r "${3#@}" "${@:4}"; else command date "$@"; fi; }'
+    echo 'base64() { local a=() x; if ! command base64 -w0 </dev/null >/dev/null 2>&1; then for x in "$@"; do [ "$x" = -w0 ] || a+=("$x"); done; set -- ${a[@]+"${a[@]}"}; fi; command base64 "$@"; }'
+    echo 'date() { if [ "$1" = -u ] && [ "$2" = -d ] && ! command date -u -d @0 +%s >/dev/null 2>&1; then command date -u -r "${3#@}" "${@:4}"; else command date "$@"; fi; }'
     echo 'sleep() { :; }'
     echo 'ensure_jq() { :; }'
     grep '^JOIN_TOKEN_TTL_SECONDS=' "$INSTALL"
@@ -1180,7 +1183,10 @@ kubectl() {
 }
 systemctl() { echo "$*" >> "$STATE_DIR/systemctl-calls"; }
 mint_join_token'
-mint_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR" 2>&1)"
+mint_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR" 2>&1)" || {
+  echo "FAIL: mint runner crashed, so no mint assertion can run: $mint_out"
+  exit 1
+}
 SECRET_JSON="$JOIN_CA_DIR/created-secret.json"
 mint_field() { jq -r ".stringData[\"$1\"]" "$SECRET_JSON"; }
 
@@ -1198,8 +1204,11 @@ assert "mint writes no static token-auth-file (a file entry never expires and is
   "$([ ! -e "$JOIN_CA_DIR/token-auth-file" ] && echo 1 || echo 0)"
 assert "mint passes the Secret to kubectl on stdin, never argv (token secret visible to every local user via ps otherwise)" \
   "$(grep -qF "$(mint_field token-secret)" "$JOIN_CA_DIR/kubectl-argv" && echo 0 || echo 1)"
-assert "mint prints the complete join command: the token on stdin (--token -) and the CA pin matching the cluster CA's SPKI hash, so the operator never has to compute either" \
-  "$(printf '%s' "$mint_out" | grep -qF -- "--token -" && printf '%s' "$mint_out" | grep -qF -- "--ca-cert-hash $EXPECTED_CA_HASH" && printf '%s' "$mint_out" | grep -qF "$(mint_field token-id).$(mint_field token-secret)" && echo 1 || echo 0)"
+mint_token="$(mint_field token-id).$(mint_field token-secret)"
+assert "mint prints the CA pin matching the cluster CA's SPKI hash in the join command, so the operator never has to compute it" \
+  "$(printf '%s' "$mint_out" | grep -qF -- "--ca-cert-hash $EXPECTED_CA_HASH" && echo 1 || echo 0)"
+assert "the printed join command carries no token (a token in the command line lands in shell history and ps); the token is printed once, separately" \
+  "$(printf '%s\n' "$mint_out" | grep -F 'install.sh --join' | grep -qF "$mint_token" && echo 0 || { printf '%s' "$mint_out" | grep -qF "$mint_token" && echo 1 || echo 0; })"
 assert_false "install.sh no longer passes --token-auth-file to the apiserver unit (static tokens survive restarts forever and cannot be revoked without editing a file)" \
   grep -q -- '--token-auth-file \$STATE_DIR' "$INSTALL"
 assert_false "no join artifact exists any more: nothing in install.sh packs a serving private key into a base64(JSON) blob passed on a command line" \
@@ -1221,6 +1230,10 @@ bad_status=0
 printf 'not-a-token\n' | bash "$TOKEN_RUNNER" "$JOIN_WORK" >/dev/null 2>&1 || bad_status=$?
 assert "a malformed token is rejected before any network call" \
   "$([ "$bad_status" -ne 0 ] && echo 1 || echo 0)"
+empty_status=0
+empty_out="$(bash "$TOKEN_RUNNER" "$JOIN_WORK" </dev/null 2>&1)" || empty_status=$?
+assert "empty non-TTY stdin fails with a clear 'no join token' message instead of a silent set -e exit (an unattended join otherwise dies with no explanation)" \
+  "$([ "$empty_status" -ne 0 ] && printf '%s' "$empty_out" | grep -q 'no join token on stdin' && echo 1 || echo 0)"
 
 # Discovery: the cluster-info JWS must verify under the token and the CA must
 # match the pinned hash -- either failing means trusting an impostor endpoint.

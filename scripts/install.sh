@@ -46,7 +46,7 @@ fi
 # Usage:
 #   sudo scripts/install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>]
 #   sudo scripts/install.sh --mint-join-token
-#   echo <token> | sudo scripts/install.sh --join <url> --token - --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
+#   sudo scripts/install.sh --join <url> --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 #
 # Knobs on the zero-argument path are env-settable
 # (docs/decisions/install-script-ux.md):
@@ -91,7 +91,8 @@ Usage:
                          single-use join token and print the join command.
   --join <url>          Join an existing cluster at <url> (e.g. https://1.2.3.4:6443).
   --token <token>       Join token from --mint-join-token (--join only). "-" or
-                         absent reads it from stdin, which keeps it out of ps.
+                         absent prompts with echo off on a terminal, or reads
+                         piped stdin; both keep it out of ps and history.
   --ca-cert-hash sha256:<hash>
                          Pin for the cluster CA (--join only), printed by
                          --mint-join-token.
@@ -356,9 +357,10 @@ mint_join_token() {
   ca_hash="$(openssl x509 -in "$STATE_DIR/ca.pem" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 | sed 's/^.* //')"
   server="$(kubectl --kubeconfig="$STATE_DIR/kubeconfig" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 
-  echo "Join token ${token_id}.<secret> created in kube-system, expires $expiration (single-use)."
-  echo "On the joining node, run as root (the token on stdin keeps it out of ps and shell history):"
-  echo "  echo '${token_id}.${token_secret}' | install.sh --join $server --token - \\"
+  echo "Join token created in kube-system, expires $expiration (single-use): ${token_id}.${token_secret}"
+  echo "On the joining node, run as root. The command carries no token, so it stays out of shell"
+  echo "history; install.sh prompts for the token with echo off (or reads it from piped stdin):"
+  echo "  install.sh --join $server \\"
   echo "    --ca-cert-hash sha256:$ca_hash --tarball <path> --node-name <name> [--iface <iface>]"
   echo "Then approve the node's kubelet serving certificate (no auto-approver yet):"
   echo "  kubectl certificate approve join-serving-<name>"
@@ -446,7 +448,11 @@ read_join_token() {
       read -rsp "Join token: " token
       echo >&2
     else
-      read -r token
+      read -r token || true
+    fi
+    if [ -z "$token" ]; then
+      echo "error: no join token on stdin -- pipe it in (echo <token> | install.sh --join ...) or run on a terminal to be prompted" >&2
+      exit 1
     fi
   fi
   if ! printf '%s' "$token" | grep -Eq '^[a-z0-9]{6}\.[a-z0-9]{16}$'; then
@@ -603,7 +609,7 @@ request_serving_cert() {
     sleep 2
   done
   if [ -z "$cert_b64" ]; then
-    echo "error: kubelet serving CSR '$csr_name' was not approved within 5 min (kubectl certificate approve $csr_name, then delete it and re-run the join if it expired)" >&2
+    echo "error: kubelet serving CSR '$csr_name' was not approved within 5 min. The join token is already consumed and this node holds a partial join. To retry: on the control plane run 'kubectl delete csr $csr_name' and mint a new token (install.sh --mint-join-token); here run 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
     exit 1
   fi
   printf '%s' "$cert_b64" | base64 -d > "$STATE_DIR/kubelet-serving.crt"

@@ -2742,6 +2742,39 @@ mod tests {
         .expect("an expired or already-cleaned token must not fail certificate issuance");
     }
 
+    #[tokio::test]
+    async fn namespaced_status_path_cannot_write_a_cluster_scoped_csr_around_the_token_consumption_hook(
+    ) {
+        let state = make_state();
+        seed_join_token_and_csr(&state, BOOTSTRAP_USER).await;
+        let body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+            "metadata": {"name": "c1"},
+            "status": {"conditions": [approved()], "certificate": "Q0VSVA=="}
+        });
+        let res = crate::handlers::status::put_namespaced_resource_status(
+            State(state.clone()),
+            Path((
+                GROUP.into(),
+                VERSION.into(),
+                "x".into(),
+                PLURAL.into(),
+                "c1".into(),
+            )),
+            json_headers("application/json"),
+            Bytes::from(body.to_string()),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a namespaced /status path must not reach a cluster-scoped CSR"
+        );
+        assert!(
+            stored_csr(&state, "c1").await["status"]["certificate"].is_null(),
+            "the CSR must be untouched, or a certificate could be issued without consuming the token"
+        );
+    }
+
     /// Dropping the carried-over transition time would make a CSR look freshly approved
     /// every time a signer or controller rewrites its conditions.
     #[test]
