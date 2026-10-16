@@ -528,6 +528,52 @@ for cmd in "command git checkout pr-ref" "git --no-pager checkout pr-ref" "bash 
 done
 
 # ---------------------------------------------------------------------------
+# 19. --git-dir does not replace the cwd work tree but adds its own repo as a
+#     second target (HEAD lives there); unwrap `command -p`, `bash --norc -c`, `env [VAR=..] bash -c`.
+# ---------------------------------------------------------------------------
+assert "'git --git-dir=<worker>/.git checkout pr-ref' from the mayor cwd is refused -- git mutates the cwd (mayor) tree, so a worker --git-dir must not launder it" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir=$WORKER/.git checkout pr-ref" "$MAIN")"
+assert "'git --git-dir <worker>/.git reset --hard' from the mayor cwd is refused -- same laundering via the space form" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir $WORKER/.git reset --hard" "$MAIN")"
+assert "'git --git-dir=<mayor>/.git checkout pr-ref' from a worker cwd is refused -- HEAD lives in the git-dir, so it moves the mayor repo's HEAD" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir=$MAIN/.git checkout pr-ref" "$WORKER")"
+assert "'git --git-dir=<worker>/.git status' from the mayor cwd is allowed -- read-only" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "git --git-dir=$WORKER/.git status" "$MAIN")"
+assert "'git --git-dir=<worker>/.git --work-tree=<mayor> checkout pr-ref' is refused -- the work tree is the mayor's" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir=$WORKER/.git --work-tree=$MAIN checkout pr-ref" "$WORKER")"
+assert "'git --git-dir=<mayor>/.git --work-tree=<worker> checkout pr-ref' is refused -- the paired git-dir is the mayor's repo" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "git --git-dir=$MAIN/.git --work-tree=$WORKER checkout pr-ref" "$WORKER")"
+
+declare -a WRAPPER2_BLOCKED=(
+  "command -p git checkout pr-ref"
+  "command -p git reset --hard HEAD"
+  "bash --norc -c 'git checkout pr-ref'"
+  "bash --norc --noprofile -c 'git reset --hard HEAD'"
+  "env bash -c 'git checkout pr-ref'"
+  "env FOO=1 bash -c 'git checkout pr-ref'"
+  "env -u X FOO=1 bash --norc -c 'git reset --hard HEAD'"
+)
+for cmd in "${WRAPPER2_BLOCKED[@]}"; do
+  assert "'$cmd' in the mayor checkout is refused -- the wrapper must not hide git" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "$cmd" "$MAIN")"
+done
+declare -a WRAPPER2_ALLOWED=(
+  "command -p git status"
+  "command -p git pull --ff-only"
+  "bash --norc -c 'git log --oneline -3'"
+  "env FOO=1 bash -c 'git fetch origin'"
+  "env bash -c 'git checkout main'"
+)
+for cmd in "${WRAPPER2_ALLOWED[@]}"; do
+  assert "'$cmd' in the mayor checkout is allowed -- legitimate mayor commands must keep working through wrappers" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$MAIN")"
+done
+for cmd in "command -p git checkout pr-ref" "bash --norc -c 'git checkout pr-ref'" "env FOO=1 bash -c 'git checkout pr-ref'"; do
+  assert "'$cmd' inside a worker worktree is allowed -- workers move their own HEAD constantly" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$WORKER")"
+done
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
