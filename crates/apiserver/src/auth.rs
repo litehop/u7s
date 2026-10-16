@@ -370,7 +370,7 @@ pub fn extract_client_cert_identity(der: &[u8]) -> Option<UserInfo> {
 
 /// Decode a DER `Any` value as a UTF-8 string by trying the common string
 /// types used in X.509 subject distinguished names.
-fn atv_string(value: &x509_cert::der::Any) -> Option<String> {
+pub(crate) fn atv_string(value: &x509_cert::der::Any) -> Option<String> {
     use x509_cert::der::{Tag, Tagged as _};
 
     match value.tag() {

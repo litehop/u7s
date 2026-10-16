@@ -1713,6 +1713,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // rules live here. `create` is not covered by the generic wildcard rule below.
             { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "verbs": ["attest"] },
             { "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create","update","delete","list","watch"] },
+            // csrapproving/csrsigning controllers: upstream's
+            // system:controller:certificate-controller grants. The CSR /approval and /status
+            // writes themselves are covered by the wildcard update/patch rule below, but
+            // the apiserver additionally requires approve/sign on the signer.
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-client-kubelet"], "verbs": ["approve"] },
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kubelet-serving","kubernetes.io/kube-apiserver-client-kubelet","kubernetes.io/kube-apiserver-client","kubernetes.io/legacy-unknown"], "verbs": ["sign"] },
             // namespace-controller needs these two subresources specifically (the base
             // "namespaces" rule above doesn't cover them) to record deletion-progress
             // conditions and clear the "kubernetes" finalizer once a namespace's contents
@@ -2394,6 +2400,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "rules": [
             { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests"], "verbs": ["get","list","watch","delete"] },
             { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests/status","certificatesigningrequests/approval"], "verbs": ["update","patch"] },
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-client-kubelet"], "verbs": ["approve"] },
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kubelet-serving","kubernetes.io/kube-apiserver-client-kubelet","kubernetes.io/kube-apiserver-client","kubernetes.io/legacy-unknown"], "verbs": ["sign"] },
             { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
         ]
     });
@@ -7476,6 +7484,30 @@ mod tests {
             "KCM must not gain CSR create from the CTB publisher grant"
         );
 
+        for (verb, signer) in [
+            ("approve", "kubernetes.io/kube-apiserver-client-kubelet"),
+            ("sign", "kubernetes.io/kube-apiserver-client-kubelet"),
+            ("sign", "kubernetes.io/kube-apiserver-client"),
+            ("sign", "kubernetes.io/kubelet-serving"),
+        ] {
+            assert!(
+                allowed(kcm, &groups, verb, "signers", Some(signer)),
+                "KCM csrapproving/csrsigning must hold {verb} on {signer}, or node join and \
+                 CSR rotation stall once the apiserver enforces signer authorization"
+            );
+        }
+        assert!(
+            !allowed(
+                kcm,
+                &groups,
+                "approve",
+                "signers",
+                Some("kubernetes.io/kube-apiserver-client")
+            ),
+            "KCM must not auto-approve arbitrary client CSRs (upstream grants approve on the \
+             kubelet client signer only)"
+        );
+
         let sa = vec![
             "system:serviceaccounts".to_owned(),
             "system:authenticated".to_owned(),
@@ -9539,6 +9571,19 @@ mod tests {
             extra: Default::default(),
         };
 
+        handlers::test_support::grant_signer_verb(
+            &state,
+            "test-user",
+            "approve",
+            "kubernetes.io/kube-apiserver-client",
+        );
+        handlers::test_support::grant_signer_verb(
+            &state,
+            "test-user",
+            "sign",
+            "kubernetes.io/kube-apiserver-client",
+        );
+
         // --- Step 1: POST — create the CSR ---
         // spec.username/uid/groups/extra are deliberately spoofed here — KCM's real
         // csrapproving controller authorizes auto-approval directly from these stored
@@ -9664,6 +9709,7 @@ mod tests {
         });
         let approval_result = handlers::approval::put_approval(
             axum::extract::State(state.clone()),
+            axum::Extension(user.clone()),
             axum::extract::Path("lifecycle-csr".to_owned()),
             json_headers.clone(),
             bytes::Bytes::from(approval_body.to_string()),
@@ -11402,7 +11448,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(cr_body.to_string()))
             .expect("CR POST request must build");
-        create_req.extensions_mut().insert(admin);
+        create_req.extensions_mut().insert(admin.clone());
         let create_resp = router
             .call(create_req)
             .await
@@ -11416,12 +11462,13 @@ mod tests {
 
         // The csi-snapshotter sidecar's actual write shape: merge-patch PATCH to /status.
         let status_patch = serde_json::json!({ "status": { "readyToUse": true } });
-        let patch_req = Request::builder()
+        let mut patch_req = Request::builder()
             .method(Method::PATCH)
             .uri("/apis/example.io/v1/widgets/snap-content-1/status")
             .header("content-type", "application/merge-patch+json")
             .body(axum::body::Body::from(status_patch.to_string()))
             .expect("status PATCH request must build");
+        patch_req.extensions_mut().insert(admin);
         let patch_resp = router
             .call(patch_req)
             .await
