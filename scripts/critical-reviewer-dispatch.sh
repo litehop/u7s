@@ -157,6 +157,18 @@ if [ "$AGENT_TYPE" = "critical-reviewer" ]; then
   exit 0
 fi
 
+# Read-only agents produce answers, not deliverables. Their messages routinely
+# cite already-committed ai/findings/ docs, which the findings detection below
+# would misattribute as a fresh deliverable; the resulting queue entry never
+# auto-drains.
+case "$AGENT_TYPE" in
+  Explore|researcher|bead-triager|diff-summarizer|dashboard-differ|claude-code-guide|statusline-setup)
+    log_decision "$(printf '%s\t%s\tskip\tread-only-agent\tagent_type=%s' \
+      "$TS" "$AGENT_ID" "$AGENT_TYPE")"
+    exit 0
+    ;;
+esac
+
 DELIVERABLE_TYPE=""
 DELIVERABLE_REF=""
 DECISION_LABEL="queued"
