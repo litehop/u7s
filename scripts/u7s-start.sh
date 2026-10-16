@@ -151,8 +151,9 @@ pkill -f "$(workdir_kill_pattern konnectivity-server "$WORKDIR")" 2>/dev/null ||
 if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
     echo "Port $HOST_IP:$PORT in use — killing existing apiserver before restart ..." >&2
-    API_PID=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
-    [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null || true
+    OWNED_PIDS=$(u7s_owned_pids apiserver "$WORKDIR")
+    # shellcheck disable=SC2086 # one PID per line
+    [ -z "$OWNED_PIDS" ] || kill $OWNED_PIDS 2>/dev/null || true
     for i in $(seq 1 10); do
       nc -z "$HOST_IP" "$PORT" 2>/dev/null || break
       sleep 1
