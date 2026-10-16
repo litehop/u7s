@@ -19,8 +19,9 @@
 set -euo pipefail
 
 # Same Kubernetes version pinned elsewhere in this project (e2e-focus.yaml's
-# matrix, scripts/conformance/04-start-kcm.sh, lima/kubelet.yaml's CRI-O repo).
-K8S_VERSION="1.36.4"
+# matrix, scripts/conformance/04-start-kcm.sh, lima/kubelet.yaml's CRI-O repo,
+# install.sh's CRI-O repo); scripts/test-k8s-version-pins-logic.sh enforces it.
+K8S_VERSION="1.37.1"
 TARGET="x86_64-unknown-linux-gnu"
 K8S_ARCH="amd64"
 
