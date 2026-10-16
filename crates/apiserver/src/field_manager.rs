@@ -795,6 +795,56 @@ fn validate_patch_options(is_apply: bool, query: &[(String, String)]) -> Vec<Fie
     errs
 }
 
+/// Upstream's `ValidateDryRun`.
+fn validate_dry_run(query: &[(String, String)]) -> Option<FieldError> {
+    let dry_run: Vec<&str> = query
+        .iter()
+        .filter(|(n, _)| n == "dryRun")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    dry_run.iter().any(|v| *v != "All").then(|| {
+        (
+            "dryRun".into(),
+            "FieldValueNotSupported",
+            format!(
+                "Unsupported value: {}: supported values: \"All\"",
+                serde_json::to_string(&dry_run).unwrap_or_default()
+            ),
+        )
+    })
+}
+
+/// Upstream's `ValidateDeleteOptions` over the query parameters of a DELETE.
+fn validate_delete_options(query: &[(String, String)]) -> Vec<FieldError> {
+    let first = |k: &str| query.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let mut errs: Vec<FieldError> = Vec::new();
+    let policy = first("propagationPolicy");
+    if let (Some(p), Some(_)) = (policy, first("orphanDependents")) {
+        errs.push((
+            "propagationPolicy".into(),
+            "FieldValueInvalid",
+            format!(
+                "Invalid value: {}: orphanDependents and deletionPropagation cannot be both set",
+                go_quote(p)
+            ),
+        ));
+    }
+    if let Some(p) = policy {
+        if !["Foreground", "Background", "Orphan"].contains(&p) {
+            errs.push((
+                "propagationPolicy".into(),
+                "FieldValueNotSupported",
+                format!(
+                    "Unsupported value: {}: supported values: \"Foreground\", \"Background\", \"Orphan\", \"nil\"",
+                    go_quote(p)
+                ),
+            ));
+        }
+    }
+    errs.extend(validate_dry_run(query));
+    errs
+}
+
 /// The fieldManager, dryRun and fieldValidation checks shared by upstream's
 /// `ValidateCreateOptions`, `ValidateUpdateOptions` and `ValidatePatchOptions`.
 fn validate_common_options(query: &[(String, String)]) -> Vec<FieldError> {
@@ -821,21 +871,7 @@ fn validate_common_options(query: &[(String, String)]) -> Vec<FieldError> {
             ));
         }
     }
-    let dry_run: Vec<&str> = query
-        .iter()
-        .filter(|(n, _)| n == "dryRun")
-        .map(|(_, v)| v.as_str())
-        .collect();
-    if dry_run.iter().any(|v| *v != "All") {
-        errs.push((
-            "dryRun".into(),
-            "FieldValueNotSupported",
-            format!(
-                "Unsupported value: {}: supported values: \"All\"",
-                serde_json::to_string(&dry_run).unwrap_or_default()
-            ),
-        ));
-    }
+    errs.extend(validate_dry_run(query));
     if let Some(fv) = first("fieldValidation") {
         if !["", "Ignore", "Warn", "Strict"].contains(&fv) {
             errs.push((
@@ -863,15 +899,9 @@ pub(crate) async fn resolve_field_manager(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     req.headers_mut().remove(FIELD_MANAGER_HEADER);
-    let query = match axum::extract::Query::<Vec<(String, String)>>::try_from_uri(req.uri()) {
-        Ok(q) => q.0,
-        Err(e) => {
-            return crate::status::Status::bad_request(format!(
-                "unable to decode query string: {e}"
-            ))
-            .into_response();
-        }
-    };
+    let query = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(req.uri())
+        .map(|q| q.0)
+        .unwrap_or_default();
     let validated = match *req.method() {
         axum::http::Method::PATCH
             if crate::handlers::json_patch::detect_patch_type(req.headers()).is_ok() =>
@@ -885,6 +915,7 @@ pub(crate) async fn resolve_field_manager(
         }
         axum::http::Method::POST => Some(("CreateOptions", validate_common_options(&query))),
         axum::http::Method::PUT => Some(("UpdateOptions", validate_common_options(&query))),
+        axum::http::Method::DELETE => Some(("DeleteOptions", validate_delete_options(&query))),
         _ => None,
     };
     if let Some((kind, errs)) = validated {
@@ -1497,7 +1528,9 @@ mod tests {
             let app = axum::Router::new()
                 .route(
                     "/x",
-                    axum::routing::post(|| async { "ok" }).put(|| async { "ok" }),
+                    axum::routing::post(|| async { "ok" })
+                        .put(|| async { "ok" })
+                        .delete(|| async { "ok" }),
                 )
                 .layer(axum::middleware::from_fn(resolve_field_manager));
             let resp = app
@@ -1638,6 +1671,52 @@ mod tests {
                 '\u{10FFFF}',
             ] {
                 assert!(!go_printable(c), "{c:?} is not printable in Go");
+            }
+        }
+
+        /// `kubectl delete --dry-run` typos and bogus propagation policies must fail loudly
+        /// on DELETE as they do on every other write, not silently become a real delete.
+        #[tokio::test]
+        async fn delete_options_are_validated_like_upstream() {
+            let (status, body) = send("DELETE", "/x?dryRun=None").await;
+            assert_eq!(status, 422, "{body}");
+            assert_eq!(
+                body["message"],
+                "DeleteOptions.meta.k8s.io \"\" is invalid: dryRun: Unsupported value: \
+                 [\"None\"]: supported values: \"All\""
+            );
+            assert_eq!(body["details"]["kind"], "DeleteOptions");
+
+            let (status, body) = send("DELETE", "/x?propagationPolicy=Bogus").await;
+            assert_eq!(status, 422, "{body}");
+            assert_eq!(
+                body["message"],
+                "DeleteOptions.meta.k8s.io \"\" is invalid: propagationPolicy: Unsupported \
+                 value: \"Bogus\": supported values: \"Foreground\", \"Background\", \
+                 \"Orphan\", \"nil\""
+            );
+
+            let (status, body) = send(
+                "DELETE",
+                "/x?propagationPolicy=Orphan&orphanDependents=true",
+            )
+            .await;
+            assert_eq!(status, 422, "{body}");
+            assert_eq!(
+                body["message"],
+                "DeleteOptions.meta.k8s.io \"\" is invalid: propagationPolicy: Invalid value: \
+                 \"Orphan\": orphanDependents and deletionPropagation cannot be both set"
+            );
+            assert_eq!(body["details"]["causes"][0]["reason"], "FieldValueInvalid");
+
+            for ok in [
+                "/x",
+                "/x?dryRun=All",
+                "/x?propagationPolicy=Foreground",
+                "/x?propagationPolicy=Background&gracePeriodSeconds=0",
+                "/x?orphanDependents=false",
+            ] {
+                assert_eq!(send("DELETE", ok).await.0, 200, "{ok}");
             }
         }
 
