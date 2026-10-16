@@ -2762,10 +2762,6 @@ mod tests {
         );
     }
 
-    /// Every protobuf-decoded field outside the vendored `generated.proto` schema is silently
-    /// dropped, and the descriptor-driven completeness oracles only know the vendored schema —
-    /// so a `/version` bump without re-vendoring leaves the whole suite green while new upstream
-    /// fields vanish on write. `UPSTREAM_VERSION` records the tag the protos were fetched from.
     #[tokio::test]
     async fn version_endpoint_reports_build_metadata_not_prerelease_so_helm_kube_version_checks_pass(
     ) {
@@ -2783,6 +2779,10 @@ mod tests {
         );
     }
 
+    /// Every protobuf-decoded field outside the vendored `generated.proto` schema is silently
+    /// dropped, and the descriptor-driven completeness oracles only know the vendored schema —
+    /// so a `/version` bump without re-vendoring leaves the whole suite green while new upstream
+    /// fields vanish on write. `UPSTREAM_VERSION` records the tag the protos were fetched from.
     #[test]
     fn vendored_protos_match_advertised_kubernetes_version() {
         let recorded = std::fs::read_to_string(
