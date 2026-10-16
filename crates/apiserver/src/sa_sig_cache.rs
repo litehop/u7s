@@ -98,12 +98,37 @@ struct CacheState {
     order: VecDeque<[u8; 32]>,
 }
 
+/// Most concurrent pre-auth verifications. Authentication runs before the in-flight pools
+/// admit a request, so this is what bounds the `spawn_blocking` store reads an
+/// unauthenticated token flood can start (see `MAX_BLOCKING_THREADS`). 32 is far above the
+/// concurrent bearer-token verifications legitimate traffic needs (a verification takes
+/// well under a millisecond on a warm cache) yet a small fraction of the blocking pool.
+pub const MAX_PRE_AUTH_VERIFICATIONS: usize = 32;
+
+/// How long a ServiceAccount/Pod found live is trusted without another store read. Upstream
+/// checks bound objects against informer caches, which lag the API by about this much, so
+/// 5s keeps revocation as prompt as upstream's while a hot token does one store read per
+/// object per 5s instead of one per request on a 2-connection sqlite pool.
+pub const LIVENESS_TTL: Duration = Duration::from_secs(5);
+
+/// Cap on remembered liveness results; 4096 entries is a few hundred KiB, far above the
+/// number of distinct ServiceAccounts and Pods a 1 GiB host serves.
+const MAX_LIVENESS_ENTRIES: usize = 4096;
+
 /// Cache of SA-JWT signature-verification outcomes. See the module doc for the full design
 /// rationale (cache key, TTL invariant, eviction policy, why audience is re-checked on every
 /// call regardless of hit/miss).
 pub struct SigCache {
     capacity: usize,
     state: RwLock<CacheState>,
+    /// Bounds concurrent pre-auth credential verification (store reads and RSA verifies for
+    /// bearer tokens the static map doesn't know). It lives here because this is the one
+    /// handle every `authenticate` call already receives.
+    pre_auth: tokio::sync::Semaphore,
+    /// Bound-object liveness results (`"<store key>\0<uid>"` -> time the object was last
+    /// seen live). Only positive results are kept, so a deletion takes effect within
+    /// `LIVENESS_TTL` and a missing object is always re-checked.
+    live: std::sync::Mutex<HashMap<String, Instant>>,
     /// Test-only: counts every invocation of the real (expensive) `jsonwebtoken::decode`
     /// RSA-verify path, success or failure. Compiles to nothing in release builds — see
     /// `record_verify_attempt`. Mirrors `state::CrSchemaCache::compile_count`'s idiom for
@@ -123,9 +148,40 @@ impl SigCache {
                 map: HashMap::new(),
                 order: VecDeque::new(),
             }),
+            pre_auth: tokio::sync::Semaphore::new(MAX_PRE_AUTH_VERIFICATIONS),
+            live: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             verify_count: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Whether `key` was seen live within `LIVENESS_TTL` of `now`.
+    pub fn recently_live(&self, key: &str, now: Instant) -> bool {
+        self.live
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|seen| now.saturating_duration_since(*seen) < LIVENESS_TTL)
+    }
+
+    /// Remember that `key` was live at `now`. Stops recording once the map holds
+    /// `MAX_LIVENESS_ENTRIES` unexpired entries, so unauthenticated-but-valid tokens for many
+    /// objects cannot grow it; the overflow just pays the store read.
+    pub fn record_live(&self, key: String, now: Instant) {
+        let mut live = self.live.lock().unwrap();
+        if live.len() >= MAX_LIVENESS_ENTRIES {
+            live.retain(|_, seen| now.saturating_duration_since(*seen) < LIVENESS_TTL);
+            if live.len() >= MAX_LIVENESS_ENTRIES {
+                return;
+            }
+        }
+        live.insert(key, now);
+    }
+
+    /// A slot for one pre-auth verification, or `None` when all are busy. Never waits: a
+    /// queue of unauthenticated callers is exactly the unbounded work this exists to refuse.
+    pub fn try_begin_verification(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.pre_auth.try_acquire().ok()
     }
 
     /// Returns `Some(true)` if a live (not yet expired as of `now`) entry exists for `key`.

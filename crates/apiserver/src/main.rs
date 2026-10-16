@@ -112,19 +112,24 @@ fn runtime_worker_threads() -> usize {
 /// this cap (`24`) accounted only for sqlite's 2 connections and starved
 /// exactly that case -- outbound webhook/proxy/kubelet calls queue behind a
 /// saturated blocking pool instead of running, and the resulting stall looks
-/// like a hung backend rather than a resource cap. `202` is `MAX_INFLIGHT`
-/// (200) plus sqlite's 2 connections -- the actual peak demand -- while
+/// like a hung backend rather than a resource cap. `202` was `MAX_INFLIGHT`
+/// (200) plus sqlite's 2 connections -- the peak demand before the pre-auth guard -- while
 /// staying far below tokio's 512 default, so the RSS/thread-count win from
 /// capping this at all is preserved without reintroducing DNS starvation.
-const MAX_BLOCKING_THREADS: usize = 202;
+///
+/// Authentication runs before the in-flight pools, so its store reads (bootstrap-token
+/// Secret lookup, SA-token liveness check) are bounded by their own guard instead: at most
+/// `MAX_PRE_AUTH_VERIFICATIONS` (32, sa_sig_cache.rs) run at once, the rest get 429. They
+/// add to the in-flight demand, hence `234` = 200 + 32 + sqlite's 2.
+const MAX_BLOCKING_THREADS: usize = 234;
 
 // Compile-time guards, not `#[test]`s: a wrong value here defeats the whole
 // point of the cap before any test even runs, so catch it at build time
 // instead of relying on someone remembering to run the test suite.
 const _: () = assert!(
-    MAX_BLOCKING_THREADS >= 202,
+    MAX_BLOCKING_THREADS >= 234,
     "MAX_BLOCKING_THREADS shrank back below MAX_INFLIGHT (200, inflight.rs) \
-     + sqlite's 2 connections -- reqwest's GaiResolver runs DNS lookups for \
+     + MAX_PRE_AUTH_VERIFICATIONS (32) + sqlite's 2 connections -- reqwest's GaiResolver runs DNS lookups for \
      every webhook/aggregation-proxy/kubelet-client call on this SAME \
      blocking pool, so a smaller cap starves outbound DNS under load even \
      though a DNS-free benchmark would show no regression"
@@ -339,7 +344,7 @@ mod tests {
     /// Guards against tokio's default `max_blocking_threads` of 512 coming
     /// back, and against `configure_runtime()` drifting from the
     /// `MAX_BLOCKING_THREADS` constant it's supposed to apply. See that
-    /// constant's doc comment for why `202` (not tokio's 512, and not an
+    /// constant's doc comment for why `234` (not tokio's 512, and not an
     /// arbitrarily small number) is the right peak: sqlite's 2 connections
     /// plus every one of `MAX_INFLIGHT`'s 200 in-flight requests potentially
     /// blocked resolving DNS for an outbound webhook/proxy/kubelet call.

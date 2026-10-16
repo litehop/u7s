@@ -1,6 +1,7 @@
 // inflight.rs — Tower middleware for concurrent request limiting.
 //
-// Enforces two limits:
+// Runs after authentication (the caller's identity decides which seats it may take) and
+// enforces two pools:
 //   - MAX_INFLIGHT (200): total concurrent requests across all methods.
 //     Rejected immediately (HTTP 429) when exhausted — reads must fail
 //     fast, not queue, so a mutating storm can't stall health checks/watches.
@@ -9,35 +10,62 @@
 //     MUTATING_WAIT_TIMEOUT before returning 429 — see that constant's
 //     doc comment for why queuing, not instant-reject, is correct here.
 //
-// The mutating queue is a DELIBERATE minimal subset of Kubernetes' API
-// Priority & Fairness (APF): it gives overflow a bounded wait instead of
-// an instant reject, but skips APF's FlowSchema/PriorityLevel request
-// classification and per-flow shuffle-sharded fairness entirely. u7s is
-// single-tenant at its current scale, so the fairness problem APF exists
-// to solve — one tenant's burst starving another's — doesn't apply yet.
-// Any future ask to add priority levels, multiple queues, or per-flow
-// fairness here must first cost-analyze extending this file vs adopting
-// upstream APF; skipping that analysis is how this accretes into a worse,
-// hand-rolled APF one feature at a time.
+// Each pool keeps a reserved fraction that only control-plane identities
+// (`state::is_system_priority_username`) may use, and caps any single other
+// user at a share of the pool, so one tenant can neither starve kubelets and
+// controllers nor take every seat. Long-running requests (watch, proxy,
+// exec/attach/portforward, log) and health probes bypass the pools entirely,
+// as upstream's LongRunningFunc and exempt priority level do.
+//
+// This is a DELIBERATE minimal subset of Kubernetes' API Priority & Fairness
+// (APF): two classes (system / everyone else), a per-user cap, and a bounded
+// wait for mutations, with no FlowSchema classification or shuffle-sharded
+// fair queuing. Any future ask to add priority levels, multiple queues, or
+// per-flow fairness here must first cost-analyze extending this file vs
+// adopting upstream APF; skipping that analysis is how this accretes into a
+// worse, hand-rolled APF one feature at a time.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{header, Method, Request, Response, StatusCode};
+use axum::http::{header, Method, Request, Response};
+use axum::response::IntoResponse as _;
 use futures_util::StreamExt as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Layer;
 use tower_service::Service;
 
+use crate::auth::{is_long_running_request, UserInfo};
+use crate::state::is_system_priority_username;
 use crate::status::Status;
 
 const MAX_INFLIGHT: usize = 200;
 const MAX_MUTATING: usize = 100;
+
+/// Seats only control-plane identities may take: 20% of each pool. Kubelet lease and
+/// status writes, controller updates and the scheduler's bindings are a few dozen
+/// concurrent requests on a single-node-to-small cluster, so 40 read / 20 mutating seats
+/// cover them with headroom while leaving 80% of the pool to everyone else.
+const RESERVED_INFLIGHT: usize = MAX_INFLIGHT / 5;
+const RESERVED_MUTATING: usize = MAX_MUTATING / 5;
+
+/// Most seats one non-system user may hold: 25% of each pool. Four distinct users are
+/// needed to fill the shared remainder, so a single runaway client or one leaked token is
+/// contained, while a legitimate tenant still gets 50 concurrent reads / 25 concurrent
+/// writes — well above what kubectl or a controller sustains.
+const USER_SHARE_INFLIGHT: usize = MAX_INFLIGHT / 4;
+const USER_SHARE_MUTATING: usize = MAX_MUTATING / 4;
+
+/// Per-user semaphore map size past which idle entries are dropped, bounding memory
+/// against minted ServiceAccount names. Live entries never exceed the pool size plus the
+/// queue depth, so pruning at this size only ever removes idle ones.
+const USER_MAP_PRUNE_AT: usize = 1024;
 
 /// Max time a mutating request waits for a free permit before 429ing.
 ///
@@ -52,13 +80,10 @@ const MAX_MUTATING: usize = 100;
 /// genuinely stuck or overloaded backend.
 const MUTATING_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Max time a mutating request may take to deliver its body once admitted.
-///
-/// Matches kube-apiserver's default 60s request timeout, which bounds every
-/// non-long-running request (and so releases its max-in-flight seat). Only the
-/// body read is bounded here, not the handler: u7s has no long-running
-/// classifier for mutating verbs (exec/attach/portforward/proxy upgrades), and
-/// those send no body past the handshake.
+/// Max time a non-long-running mutating request may take to deliver its body once
+/// admitted. Matches kube-apiserver's default 60s request timeout, which bounds every
+/// non-long-running request (and so releases its max-in-flight seat). Only the body read
+/// is bounded here, not the handler.
 const MUTATING_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Max number of mutating requests allowed to queue for a permit at once.
@@ -73,21 +98,132 @@ const MUTATING_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_MUTATING_QUEUE_DEPTH: usize = 512;
 
 // ---------------------------------------------------------------------------
+// Pool
+// ---------------------------------------------------------------------------
+
+enum Caller {
+    System,
+    Other(String),
+}
+
+impl Caller {
+    fn of(req: &Request<Body>) -> Self {
+        match req.extensions().get::<UserInfo>() {
+            Some(u) if is_system_priority_username(&u.username) => Caller::System,
+            Some(u) => Caller::Other(u.username.clone()),
+            None => Caller::Other(String::new()),
+        }
+    }
+}
+
+/// Held for the life of a request; dropping it returns every seat.
+struct Seat {
+    _user: Option<OwnedSemaphorePermit>,
+    _shared: Option<OwnedSemaphorePermit>,
+    _all: OwnedSemaphorePermit,
+}
+
+/// A seat pool: `all` is the hard capacity, `shared` is the part non-system callers may
+/// use (capacity minus the reserved seats), and each non-system user is further limited
+/// by its own semaphore. System callers take only from `all`, so while non-system holders
+/// are bounded by `shared` the reserved seats are always free for them.
+struct Pool {
+    all: Arc<Semaphore>,
+    shared: Arc<Semaphore>,
+    user_share: usize,
+    users: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl Pool {
+    fn new(capacity: usize, reserved: usize, user_share: usize) -> Arc<Self> {
+        Arc::new(Pool {
+            all: Arc::new(Semaphore::new(capacity)),
+            shared: Arc::new(Semaphore::new(capacity.saturating_sub(reserved))),
+            user_share,
+            users: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn user_semaphore(&self, user: &str) -> Arc<Semaphore> {
+        let mut users = self.users.lock().unwrap();
+        if users.len() >= USER_MAP_PRUNE_AT {
+            // An Arc held elsewhere is a live permit or a queued waiter.
+            users.retain(|_, s| Arc::strong_count(s) > 1);
+        }
+        Arc::clone(
+            users
+                .entry(user.to_owned())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.user_share))),
+        )
+    }
+
+    fn try_acquire(&self, caller: &Caller) -> Option<Seat> {
+        let (user, shared) = match caller {
+            Caller::System => (None, None),
+            Caller::Other(name) => (
+                Some(self.user_semaphore(name).try_acquire_owned().ok()?),
+                Some(Arc::clone(&self.shared).try_acquire_owned().ok()?),
+            ),
+        };
+        let all = Arc::clone(&self.all).try_acquire_owned().ok()?;
+        Some(Seat {
+            _user: user,
+            _shared: shared,
+            _all: all,
+        })
+    }
+
+    /// Like `try_acquire`, but a miss waits up to MUTATING_WAIT_TIMEOUT instead of
+    /// rejecting on the spot. Returns `None` if the queue-depth guard trips (fail fast, no
+    /// wait) or the wait times out.
+    async fn acquire_waiting(&self, caller: &Caller, waiters: &Arc<AtomicUsize>) -> Option<Seat> {
+        // Fast path: a seat is free right now, no need to join the queue.
+        if let Some(seat) = self.try_acquire(caller) {
+            return Some(seat);
+        }
+
+        // tokio's Semaphore waiter list is unbounded FIFO, so admission into the wait
+        // itself must be bounded (see MAX_MUTATING_QUEUE_DEPTH).
+        let _waiter = WaiterGuard::try_new(Arc::clone(waiters))?;
+
+        let wait = async {
+            let (user, shared) = match caller {
+                Caller::System => (None, None),
+                Caller::Other(name) => (
+                    Some(self.user_semaphore(name).acquire_owned().await.ok()?),
+                    Some(Arc::clone(&self.shared).acquire_owned().await.ok()?),
+                ),
+            };
+            let all = Arc::clone(&self.all).acquire_owned().await.ok()?;
+            Some(Seat {
+                _user: user,
+                _shared: shared,
+                _all: all,
+            })
+        };
+        tokio::time::timeout(MUTATING_WAIT_TIMEOUT, wait)
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // InflightLayer
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct InflightLayer {
-    inflight: Arc<Semaphore>,
-    mutating: Arc<Semaphore>,
+    inflight: Arc<Pool>,
+    mutating: Arc<Pool>,
     mutating_waiters: Arc<AtomicUsize>,
 }
 
 impl InflightLayer {
     pub fn new() -> Self {
         InflightLayer {
-            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT)),
-            mutating: Arc::new(Semaphore::new(MAX_MUTATING)),
+            inflight: Pool::new(MAX_INFLIGHT, RESERVED_INFLIGHT, USER_SHARE_INFLIGHT),
+            mutating: Pool::new(MAX_MUTATING, RESERVED_MUTATING, USER_SHARE_MUTATING),
             mutating_waiters: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -113,8 +249,8 @@ impl<S> Layer<S> for InflightLayer {
 #[derive(Clone)]
 pub struct InflightService<S> {
     inner: S,
-    inflight: Arc<Semaphore>,
-    mutating: Arc<Semaphore>,
+    inflight: Arc<Pool>,
+    mutating: Arc<Pool>,
     mutating_waiters: Arc<AtomicUsize>,
 }
 
@@ -125,7 +261,16 @@ fn is_mutating(method: &Method) -> bool {
     )
 }
 
-/// RAII counter for a request queued on the mutating semaphore.
+/// `/healthz`, `/livez`, `/readyz` and their sub-checks: probes must answer even when
+/// every seat is taken, or the kubelet restarts a merely busy apiserver.
+fn is_health_probe(path: &str) -> bool {
+    ["/healthz", "/livez", "/readyz"].iter().any(|probe| {
+        path.strip_prefix(probe)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
+/// RAII counter for a request queued on the mutating pool.
 ///
 /// Must decrement on every exit path — permit acquired, timeout elapsed,
 /// or the holding future dropped outright (client disconnects while
@@ -157,36 +302,6 @@ impl WaiterGuard {
 impl Drop for WaiterGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// Acquire a mutating permit, waiting up to MUTATING_WAIT_TIMEOUT if the
-/// semaphore is momentarily exhausted rather than rejecting on the spot.
-/// Returns `Err` if the queue-depth guard trips (fail fast, no wait) or
-/// the wait times out (permits stayed exhausted the whole time).
-async fn acquire_mutating_permit(
-    semaphore: Arc<Semaphore>,
-    waiters: Arc<AtomicUsize>,
-) -> Result<OwnedSemaphorePermit, ()> {
-    // Fast path: a permit is free right now, no need to join the queue.
-    if let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() {
-        return Ok(permit);
-    }
-
-    // Queue-depth guard: tokio's Semaphore waiter list is unbounded FIFO,
-    // so admission into the wait itself must be bounded rather than
-    // trusting the timeout alone to cap memory (see MAX_MUTATING_QUEUE_DEPTH
-    // doc comment). WaiterGuard::try_new reserves the slot atomically — see
-    // its doc comment for why a separate load-then-increment can transiently
-    // exceed the cap under concurrent callers.
-    let _waiter_guard = match WaiterGuard::try_new(Arc::clone(&waiters)) {
-        Some(guard) => guard,
-        None => return Err(()),
-    };
-
-    match tokio::time::timeout(MUTATING_WAIT_TIMEOUT, semaphore.acquire_owned()).await {
-        Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) | Err(_) => Err(()),
     }
 }
 
@@ -231,22 +346,8 @@ fn too_many_requests_response(req: &Request<Body>, limit_kind: &str) -> Response
         user_agent,
         "inflight limit reached, returning 429",
     );
-    let status = Status {
-        kind: "Status",
-        api_version: "v1",
-        status: "Failure",
-        message: "Too many requests".to_owned(),
-        reason: "TooManyRequests",
-        code: 429,
-        metadata: None,
-        details: None,
-    };
-    let body = serde_json::to_vec(&status).unwrap_or_default();
-    Response::builder()
-        .status(StatusCode::TOO_MANY_REQUESTS)
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap()
+    // Retry-After/retryAfterSeconds make client-go back off instead of retrying hot.
+    Status::too_many_requests_retry_after("Too many requests".to_owned(), 1).into_response()
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -268,61 +369,57 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let mut inner = self.inner.clone();
 
+        if is_health_probe(req.uri().path())
+            || is_long_running_request(req.method(), req.uri().path(), req.uri().query())
+        {
+            return Box::pin(async move { inner.call(req).await });
+        }
+
+        let caller = Caller::of(&req);
+
         if !is_mutating(req.method()) {
             // Reads: single instant-reject check against the total inflight
-            // cap, unchanged — see the module doc comment for why.
-            let inflight_permit = match Arc::clone(&self.inflight).try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
+            // cap — see the module doc comment for why.
+            let seat = match self.inflight.try_acquire(&caller) {
+                Some(seat) => seat,
+                None => {
                     let resp = too_many_requests_response(&req, "inflight");
                     return Box::pin(async move { Ok(resp) });
                 }
             };
             return Box::pin(async move {
-                let _inflight = inflight_permit;
+                let _seat = seat;
                 inner.call(req).await
             });
         }
 
-        // Mutating: acquire the (possibly-waited) mutating permit FIRST,
-        // then the inflight permit. A queued-but-not-yet-admitted mutating
-        // request must NOT hold an inflight permit while it waits — inflight
-        // permits are held for up to MUTATING_WAIT_TIMEOUT once acquired
+        // Mutating: acquire the (possibly-waited) mutating seat FIRST,
+        // then the inflight seat. A queued-but-not-yet-admitted mutating
+        // request must NOT hold an inflight seat while it waits — inflight
+        // seats are held for up to MUTATING_WAIT_TIMEOUT once acquired
         // this way, and grabbing one before the mutating wait resolves would
         // let a 300-request mutating burst alone exhaust MAX_INFLIGHT (200)
         // purely from requests parked in the mutating queue, instant-429ing
-        // read traffic (and any mutation past #200) on a cap this fix
-        // deliberately does not touch. Acquiring in mutating-then-inflight
-        // order means only requests actually admitted through the 100-permit
-        // mutating gate ever compete for inflight capacity, exactly as if
-        // they were ordinary reads.
-        let mutating_sem = Arc::clone(&self.mutating);
-        let mutating_waiters = Arc::clone(&self.mutating_waiters);
-        let inflight_sem = Arc::clone(&self.inflight);
+        // read traffic (and any mutation past #200). Acquiring in
+        // mutating-then-inflight order means only requests actually admitted
+        // through the 100-seat mutating gate ever compete for inflight
+        // capacity, exactly as if they were ordinary reads.
+        let mutating = Arc::clone(&self.mutating);
+        let inflight = Arc::clone(&self.inflight);
+        let waiters = Arc::clone(&self.mutating_waiters);
 
         Box::pin(async move {
-            let mutating_permit =
-                match acquire_mutating_permit(mutating_sem, mutating_waiters).await {
-                    Ok(p) => p,
-                    Err(()) => {
-                        let resp = too_many_requests_response(&req, "mutating");
-                        return Ok(resp);
-                    }
-                };
-
-            let inflight_permit = match inflight_sem.try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    drop(mutating_permit);
-                    let resp = too_many_requests_response(&req, "inflight");
-                    return Ok(resp);
-                }
+            let Some(mutating_seat) = mutating.acquire_waiting(&caller, &waiters).await else {
+                return Ok(too_many_requests_response(&req, "mutating"));
+            };
+            let Some(inflight_seat) = inflight.try_acquire(&caller) else {
+                return Ok(too_many_requests_response(&req, "inflight"));
             };
 
-            // Permits are held for the duration of the inner call and dropped
-            // when this future completes, automatically releasing the semaphore.
-            let _mutating = mutating_permit;
-            let _inflight = inflight_permit;
+            // Seats are held for the duration of the inner call and dropped
+            // when this future completes, automatically releasing the semaphores.
+            let _mutating = mutating_seat;
+            let _inflight = inflight_seat;
             inner.call(with_body_deadline(req)).await
         })
     }
@@ -368,24 +465,32 @@ mod tests {
             .unwrap()
     }
 
+    fn request_as(method: Method, uri: &str, username: &str) -> Request<Body> {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(UserInfo {
+            username: username.to_owned(),
+            ..Default::default()
+        });
+        req
+    }
+
+    /// Take every seat in the pool, as a stuck workload would.
+    fn exhaust(pool: &Pool) -> OwnedSemaphorePermit {
+        let n = pool.all.available_permits() as u32;
+        Arc::clone(&pool.all).try_acquire_many_owned(n).unwrap()
+    }
+
     #[tokio::test]
     async fn test_inflight_limit_returns_429() {
         // When all 200 inflight slots are consumed, the 201st request must get 429.
         // This validates that the total concurrency cap is enforced — without it,
         // an unbounded server could OOM under load.
-        let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
-        let mutating = Arc::new(Semaphore::new(MAX_MUTATING));
-
-        // Exhaust all inflight permits.
-        let _permits: Vec<OwnedSemaphorePermit> = (0..MAX_INFLIGHT)
-            .map(|_| Arc::clone(&inflight).try_acquire_owned().unwrap())
-            .collect();
-
-        let layer = InflightLayer {
-            inflight: Arc::clone(&inflight),
-            mutating: Arc::clone(&mutating),
-            mutating_waiters: Arc::new(AtomicUsize::new(0)),
-        };
+        let layer = InflightLayer::new();
+        let _permits = exhaust(&layer.inflight);
         let mut svc = layer.layer(OkService);
 
         let req = make_request(Method::GET);
@@ -408,20 +513,10 @@ mod tests {
         // WAIT for a permit, and only 429 once MUTATING_WAIT_TIMEOUT elapses
         // with no permit freed. Time is paused so this proves the wait
         // happened (virtual time) without the test taking 30 real seconds.
-        let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
-        let mutating = Arc::new(Semaphore::new(MAX_MUTATING));
-
         // Exhaust all mutating permits and never release them — nothing will
         // free up, so the request under test must ride out the full deadline.
-        let _permits: Vec<OwnedSemaphorePermit> = (0..MAX_MUTATING)
-            .map(|_| Arc::clone(&mutating).try_acquire_owned().unwrap())
-            .collect();
-
-        let layer = InflightLayer {
-            inflight: Arc::clone(&inflight),
-            mutating: Arc::clone(&mutating),
-            mutating_waiters: Arc::new(AtomicUsize::new(0)),
-        };
+        let layer = InflightLayer::new();
+        let _permits = exhaust(&layer.mutating);
         let mut svc = layer.layer(OkService);
 
         let req = make_request(Method::POST);
@@ -490,22 +585,13 @@ mod tests {
         // is the guard that bounds that: once the waiter count already hits
         // MAX_MUTATING_QUEUE_DEPTH, the next request must reject INSTANTLY,
         // not join the queue and wait out the deadline.
-        let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
-        let mutating = Arc::new(Semaphore::new(MAX_MUTATING));
-        let mutating_waiters = Arc::new(AtomicUsize::new(0));
-
+        let layer = InflightLayer::new();
         // Saturate the permits...
-        let _permits: Vec<OwnedSemaphorePermit> = (0..MAX_MUTATING)
-            .map(|_| Arc::clone(&mutating).try_acquire_owned().unwrap())
-            .collect();
+        let _permits = exhaust(&layer.mutating);
         // ...and simulate the waiter queue already being at capacity.
-        mutating_waiters.store(MAX_MUTATING_QUEUE_DEPTH, Ordering::SeqCst);
-
-        let layer = InflightLayer {
-            inflight: Arc::clone(&inflight),
-            mutating: Arc::clone(&mutating),
-            mutating_waiters: Arc::clone(&mutating_waiters),
-        };
+        layer
+            .mutating_waiters
+            .store(MAX_MUTATING_QUEUE_DEPTH, Ordering::SeqCst);
         let mut svc = layer.layer(OkService);
 
         let req = make_request(Method::POST);
@@ -665,19 +751,8 @@ mod tests {
     async fn test_read_bypasses_mutating_limit() {
         // GET requests must not consume mutating permits.  A full mutating pool
         // must not block read traffic — reads are never write-limited.
-        let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
-        let mutating = Arc::new(Semaphore::new(MAX_MUTATING));
-
-        // Exhaust mutating permits.
-        let _permits: Vec<OwnedSemaphorePermit> = (0..MAX_MUTATING)
-            .map(|_| Arc::clone(&mutating).try_acquire_owned().unwrap())
-            .collect();
-
-        let layer = InflightLayer {
-            inflight: Arc::clone(&inflight),
-            mutating: Arc::clone(&mutating),
-            mutating_waiters: Arc::new(AtomicUsize::new(0)),
-        };
+        let layer = InflightLayer::new();
+        let _permits = exhaust(&layer.mutating);
         let mut svc = layer.layer(OkService);
 
         let req = make_request(Method::GET);
@@ -713,25 +788,25 @@ mod tests {
     async fn test_429_response_is_kubernetes_status_json() {
         // The 429 body must be a valid Kubernetes Status object.
         // kubectl and controllers parse this body — wrong format breaks tooling.
-        let inflight = Arc::new(Semaphore::new(0)); // immediately exhausted
-        let mutating = Arc::new(Semaphore::new(MAX_MUTATING));
-
-        let layer = InflightLayer {
-            inflight: Arc::clone(&inflight),
-            mutating: Arc::clone(&mutating),
-            mutating_waiters: Arc::new(AtomicUsize::new(0)),
-        };
+        let layer = InflightLayer::new();
+        let _permits = exhaust(&layer.inflight);
         let mut svc = layer.layer(OkService);
 
         let req = make_request(Method::GET);
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            "1",
+            "without Retry-After client-go retries immediately and keeps the pool saturated"
+        );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value =
             serde_json::from_slice(&body).expect("body must be valid JSON");
+        assert_eq!(json["details"]["retryAfterSeconds"], 1);
 
         assert_eq!(json["apiVersion"], "v1");
         assert_eq!(json["kind"], "Status");
@@ -752,14 +827,8 @@ mod tests {
         let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
         let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
 
-        let inflight = Arc::new(Semaphore::new(0)); // immediately exhausted
-        let mutating = Arc::new(Semaphore::new(MAX_MUTATING));
-
-        let layer = InflightLayer {
-            inflight: Arc::clone(&inflight),
-            mutating: Arc::clone(&mutating),
-            mutating_waiters: Arc::new(AtomicUsize::new(0)),
-        };
+        let layer = InflightLayer::new();
+        let _permits = exhaust(&layer.inflight);
         let mut svc = layer.layer(OkService);
 
         let req = Request::builder()
@@ -841,23 +910,21 @@ mod tests {
 
         let mut senders = Vec::new();
         let mut tasks = tokio::task::JoinSet::new();
-        for _ in 0..MAX_MUTATING {
+        // Four tenants fill everything non-system callers may use.
+        for i in 0..MAX_MUTATING - RESERVED_MUTATING {
             let (tx, body) = channel_body();
             tx.send(b"{".to_vec()).await.unwrap();
             senders.push(tx);
             let mut svc = layer.layer(ReadBodyService);
-            let req = Request::builder()
-                .method(Method::POST)
-                .uri("/x")
-                .body(body)
-                .unwrap();
+            let mut req = request_as(Method::POST, "/x", &format!("tenant-{}", i % 4));
+            *req.body_mut() = body;
             tasks.spawn(async move { svc.call(req).await.unwrap().status() });
         }
 
         // Join late enough that its queue wait outlives the body deadline.
         tokio::time::sleep(Duration::from_secs(40)).await;
         assert_eq!(
-            mutating.available_permits(),
+            mutating.shared.available_permits(),
             0,
             "setup: pool must be pinned"
         );
@@ -896,12 +963,12 @@ mod tests {
             "other writes must get a permit once stuck bodies time out"
         );
         assert_eq!(
-            mutating.available_permits(),
+            mutating.all.available_permits(),
             MAX_MUTATING,
             "mutating permits leaked"
         );
         assert_eq!(
-            inflight.available_permits(),
+            inflight.all.available_permits(),
             MAX_INFLIGHT,
             "inflight permits leaked"
         );
@@ -929,5 +996,398 @@ mod tests {
         drop(tx);
 
         assert_eq!(call.await.unwrap(), StatusCode::OK);
+    }
+
+    // Inner service that holds its seat until the gate opens.
+    #[derive(Clone)]
+    struct GateService(tokio::sync::watch::Receiver<bool>);
+
+    impl Service<Request<Body>> for GateService {
+        type Response = Response<Body>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<Body>) -> Self::Future {
+            let mut rx = self.0.clone();
+            Box::pin(async move {
+                let _ = rx.wait_for(|open| *open).await;
+                Ok(Response::builder().status(200).body(Body::empty()).unwrap())
+            })
+        }
+    }
+
+    /// Start `n` requests from `user` that keep their seats until `gate` opens.
+    async fn hold_seats(
+        layer: &InflightLayer,
+        gate: &tokio::sync::watch::Receiver<bool>,
+        method: Method,
+        uri: &str,
+        user: &str,
+        n: usize,
+    ) -> tokio::task::JoinSet<StatusCode> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..n {
+            let mut svc = layer.layer(GateService(gate.clone()));
+            let req = request_as(method.clone(), uri, user);
+            tasks.spawn(async move { svc.call(req).await.unwrap().status() });
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tasks
+    }
+
+    async fn status_of(layer: &InflightLayer, req: Request<Body>) -> StatusCode {
+        layer.layer(OkService).call(req).await.unwrap().status()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_user_cannot_hold_every_read_seat_and_starve_other_users() {
+        // Without a per-user cap a single leaked token or runaway controller takes all
+        // 200 read seats and every other client gets 429.
+        let layer = InflightLayer::new();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let _held = hold_seats(
+            &layer,
+            &gate,
+            Method::GET,
+            "/api/v1/pods",
+            "tenant",
+            USER_SHARE_INFLIGHT,
+        )
+        .await;
+
+        assert_eq!(
+            status_of(&layer, request_as(Method::GET, "/api/v1/pods", "tenant")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a user past its share must be rejected"
+        );
+        assert_eq!(
+            status_of(&layer, request_as(Method::GET, "/api/v1/pods", "other")).await,
+            StatusCode::OK,
+            "another user must still get a seat while one user is at its cap"
+        );
+        open.send(true).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_user_cannot_hold_every_write_seat_and_starve_other_users() {
+        // Same starvation on the mutating pool, where overflow queues: the over-share
+        // request must wait out its deadline for the user's own seats, not be admitted,
+        // and must not block anyone else while it waits.
+        let layer = InflightLayer::new();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let _held = hold_seats(
+            &layer,
+            &gate,
+            Method::POST,
+            "/api/v1/namespaces",
+            "tenant",
+            USER_SHARE_MUTATING,
+        )
+        .await;
+
+        let over = {
+            let layer = layer.clone();
+            tokio::spawn(async move {
+                status_of(
+                    &layer,
+                    request_as(Method::POST, "/api/v1/namespaces", "tenant"),
+                )
+                .await
+            })
+        };
+        assert_eq!(
+            status_of(
+                &layer,
+                request_as(Method::POST, "/api/v1/namespaces", "other")
+            )
+            .await,
+            StatusCode::OK,
+            "another user's write must be admitted while one user is at its cap"
+        );
+        tokio::time::sleep(MUTATING_WAIT_TIMEOUT + Duration::from_secs(1)).await;
+        assert_eq!(
+            over.await.unwrap(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a user past its write share must not be admitted"
+        );
+        open.send(true).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kubelet_still_gets_a_seat_when_tenants_exhaust_the_read_pool() {
+        // Tenants filling the shared part of the pool must not lock out node heartbeats:
+        // a kubelet that cannot report status gets its node marked NotReady.
+        let layer = InflightLayer::new();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let shared = MAX_INFLIGHT - RESERVED_INFLIGHT;
+        let mut held = Vec::new();
+        for t in 0..shared.div_ceil(USER_SHARE_INFLIGHT) {
+            let n = USER_SHARE_INFLIGHT.min(shared - t * USER_SHARE_INFLIGHT);
+            held.push(
+                hold_seats(
+                    &layer,
+                    &gate,
+                    Method::GET,
+                    "/api/v1/pods",
+                    &format!("tenant-{t}"),
+                    n,
+                )
+                .await,
+            );
+        }
+
+        assert_eq!(
+            status_of(&layer, request_as(Method::GET, "/api/v1/pods", "late")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "setup: the shared part of the pool must be full"
+        );
+        for system in ["system:node:n1", "admin", "system:kube-scheduler"] {
+            assert_eq!(
+                status_of(&layer, request_as(Method::GET, "/api/v1/nodes", system)).await,
+                StatusCode::OK,
+                "{system} must use the reserved seats while tenants hold the pool"
+            );
+        }
+        open.send(true).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kubelet_still_gets_a_seat_when_tenants_exhaust_the_write_pool() {
+        let layer = InflightLayer::new();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let shared = MAX_MUTATING - RESERVED_MUTATING;
+        let mut held = Vec::new();
+        for t in 0..shared.div_ceil(USER_SHARE_MUTATING) {
+            let n = USER_SHARE_MUTATING.min(shared - t * USER_SHARE_MUTATING);
+            held.push(
+                hold_seats(
+                    &layer,
+                    &gate,
+                    Method::PUT,
+                    "/api/v1/namespaces/a/configmaps/c",
+                    &format!("tenant-{t}"),
+                    n,
+                )
+                .await,
+            );
+        }
+
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            status_of(
+                &layer,
+                request_as(
+                    Method::PUT,
+                    "/apis/coordination.k8s.io/v1/leases/n1",
+                    "system:node:n1"
+                )
+            )
+            .await,
+            StatusCode::OK,
+            "a kubelet lease write must be admitted while tenants hold the pool"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the reserved seat must be free immediately, not after queueing"
+        );
+        open.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_probes_pass_when_every_seat_is_taken() {
+        // A kubelet that gets 429 from /livez restarts a merely busy apiserver.
+        let layer = InflightLayer::new();
+        let _all = exhaust(&layer.inflight);
+        let _mut = exhaust(&layer.mutating);
+
+        assert_eq!(
+            status_of(&layer, make_request(Method::GET)).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "setup: ordinary requests must be rejected"
+        );
+        for path in [
+            "/healthz",
+            "/livez",
+            "/readyz",
+            "/readyz/etcd",
+            "/healthz/ping",
+        ] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            assert_eq!(
+                status_of(&layer, req).await,
+                StatusCode::OK,
+                "{path} must bypass the pools"
+            );
+        }
+        let req = Request::builder()
+            .uri("/healthzzz")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(&layer, req).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "only the probe paths are exempt, not any path sharing the prefix"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watches_do_not_consume_a_seat_and_pass_when_the_pool_is_full() {
+        // Long-lived watches pinning seats would drain the pool within minutes (hundreds of
+        // informers), 429ing every ordinary request; watches have their own caps.
+        let layer = InflightLayer::new();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let held = hold_seats(
+            &layer,
+            &gate,
+            Method::GET,
+            "/api/v1/pods?watch=true",
+            "tenant",
+            USER_SHARE_INFLIGHT * 2,
+        )
+        .await;
+        assert_eq!(
+            held.len(),
+            USER_SHARE_INFLIGHT * 2,
+            "setup: watches running"
+        );
+        assert_eq!(
+            layer.inflight.all.available_permits(),
+            MAX_INFLIGHT,
+            "open watches must not hold in-flight seats"
+        );
+
+        let _all = exhaust(&layer.inflight);
+        assert_eq!(
+            status_of(
+                &layer,
+                request_as(Method::GET, "/api/v1/pods?watch=true", "tenant")
+            )
+            .await,
+            StatusCode::OK,
+            "a watch must be admitted even when the pool is exhausted"
+        );
+        open.send(true).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxied_upload_longer_than_the_body_deadline_is_not_cut() {
+        // Proxy is long-running upstream: a pods/proxy POST whose body takes minutes (an
+        // upload through the apiserver) must not be failed by the 60s body deadline.
+        let layer = InflightLayer::new();
+        let (tx, body) = channel_body();
+        let mut svc = layer.layer(ReadBodyService);
+        let mut req = request_as(
+            Method::POST,
+            "/api/v1/namespaces/a/pods/p/proxy/upload",
+            "tenant",
+        );
+        *req.body_mut() = body;
+        let call = tokio::spawn(async move { svc.call(req).await.unwrap().status() });
+
+        tx.send(b"part1".to_vec()).await.unwrap();
+        tokio::time::sleep(MUTATING_BODY_TIMEOUT * 2).await;
+        tx.send(b"part2".to_vec()).await.unwrap();
+        drop(tx);
+
+        assert_eq!(
+            call.await.unwrap(),
+            StatusCode::OK,
+            "a proxy body taking longer than the deadline must still be delivered"
+        );
+        assert_eq!(
+            layer.mutating.all.available_permits(),
+            MAX_MUTATING,
+            "proxy must not hold a mutating seat"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_proxy_body_stalling_past_the_deadline_is_still_cut() {
+        // Guards the exemption's scope: only long-running requests escape the deadline,
+        // an ordinary POST that stalls must still free its seat.
+        let layer = InflightLayer::new();
+        let (tx, body) = channel_body();
+        let mut svc = layer.layer(ReadBodyService);
+        let mut req = request_as(Method::POST, "/api/v1/namespaces/a/configmaps", "tenant");
+        *req.body_mut() = body;
+        let call = tokio::spawn(async move { svc.call(req).await.unwrap().status() });
+
+        tx.send(b"part1".to_vec()).await.unwrap();
+        tokio::time::sleep(MUTATING_BODY_TIMEOUT * 2).await;
+
+        assert_eq!(call.await.unwrap(), StatusCode::REQUEST_TIMEOUT);
+        drop(tx);
+    }
+
+    #[test]
+    fn long_running_classifier_matches_upstream_exemptions() {
+        let cases = [
+            (Method::GET, "/api/v1/pods", Some("watch=true"), true),
+            (
+                Method::GET,
+                "/api/v1/namespaces/a/pods",
+                Some("watch=1"),
+                true,
+            ),
+            (Method::GET, "/api/v1/pods", Some("watch=false"), false),
+            (Method::GET, "/api/v1/pods", None, false),
+            (Method::GET, "/api/v1/namespaces/a/pods/p", None, false),
+            (Method::GET, "/api/v1/namespaces/a/pods/p/log", None, true),
+            (Method::POST, "/api/v1/namespaces/a/pods/p/exec", None, true),
+            (
+                Method::POST,
+                "/api/v1/namespaces/a/pods/p/attach",
+                None,
+                true,
+            ),
+            (
+                Method::POST,
+                "/api/v1/namespaces/a/pods/p/portforward",
+                None,
+                true,
+            ),
+            (
+                Method::POST,
+                "/api/v1/namespaces/a/services/s/proxy/x",
+                None,
+                true,
+            ),
+            (Method::PUT, "/api/v1/nodes/n/proxy/x", None, true),
+            (Method::POST, "/api/v1/namespaces/a/pods", None, false),
+            (
+                Method::PATCH,
+                "/api/v1/namespaces/a/pods/p/status",
+                None,
+                false,
+            ),
+            (Method::GET, "/version", None, false),
+            (Method::GET, "/healthz", Some("watch=true"), false),
+        ];
+        for (method, path, query, want) in cases {
+            assert_eq!(
+                is_long_running_request(&method, path, query),
+                want,
+                "{method} {path}?{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_user_semaphore_map_stays_bounded_under_minted_identities() {
+        // ServiceAccount names are attacker-mintable; an entry per name forever is a slow
+        // memory leak.
+        let pool = Pool::new(MAX_INFLIGHT, RESERVED_INFLIGHT, USER_SHARE_INFLIGHT);
+        for i in 0..USER_MAP_PRUNE_AT * 3 {
+            let seat = pool.try_acquire(&Caller::Other(format!("sa-{i}")));
+            assert!(seat.is_some());
+        }
+        assert!(
+            pool.users.lock().unwrap().len() <= USER_MAP_PRUNE_AT,
+            "idle per-user entries must be pruned"
+        );
     }
 }

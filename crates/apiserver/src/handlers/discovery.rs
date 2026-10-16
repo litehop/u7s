@@ -91,6 +91,20 @@ async fn resolve_caller_identity<S: Store>(
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
+    let anonymous = || UserInfo {
+        username: "system:anonymous".to_owned(),
+        uid: String::new(),
+        groups: vec!["system:unauthenticated".to_owned()],
+        extra: Default::default(),
+    };
+    // Busy verification slots degrade to the public view instead of queueing store reads.
+    let Ok(_verification) = crate::auth::begin_token_verification(
+        auth_header,
+        &state.token_map,
+        state.sa_sig_cache.as_ref(),
+    ) else {
+        return anonymous();
+    };
     match crate::auth::authenticate(
         auth_header,
         &state.token_map,
@@ -102,12 +116,7 @@ async fn resolve_caller_identity<S: Store>(
     .await
     {
         AuthnResult::Identified(user) => user,
-        AuthnResult::BadToken => UserInfo {
-            username: "system:anonymous".to_owned(),
-            uid: String::new(),
-            groups: vec!["system:unauthenticated".to_owned()],
-            extra: Default::default(),
-        },
+        AuthnResult::BadToken => anonymous(),
     }
 }
 

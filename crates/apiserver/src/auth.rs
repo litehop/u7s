@@ -241,6 +241,42 @@ pub(crate) enum AuthnResult {
     BadToken,
 }
 
+fn bearer_token(auth_header: Option<&str>) -> Option<&str> {
+    const BEARER_PREFIX: &str = "Bearer ";
+    auth_header.and_then(|value| {
+        let scheme = value.get(..BEARER_PREFIX.len())?;
+        scheme
+            .eq_ignore_ascii_case(BEARER_PREFIX)
+            .then(|| &value[BEARER_PREFIX.len()..])
+    })
+}
+
+/// Reserve a slot for the store reads and signature checks `authenticate` runs for a
+/// bearer token the static map doesn't know. `Ok(None)` means the request needs no slot
+/// (no bearer token, or a static one); `Err(())` means every slot is busy and the caller
+/// must answer 429 rather than wait. Authentication runs before the in-flight pools admit a
+/// request, so without this a flood of well-formed bogus tokens drives unbounded blocking
+/// store reads.
+pub(crate) fn begin_token_verification<'a>(
+    auth_header: Option<&str>,
+    token_map: &HashMap<String, UserInfo>,
+    sig_cache: &'a SigCache,
+) -> Result<Option<tokio::sync::SemaphorePermit<'a>>, ()> {
+    match bearer_token(auth_header) {
+        // A signature-cache hit proves this exact token was fully verified before; what is
+        // left (claims, memoised liveness) is cheap and must keep serving ordinary
+        // ServiceAccount traffic while bogus tokens occupy the slots.
+        Some(token)
+            if ct_token_lookup(token_map, token).is_none()
+                && sig_cache.get(&sa_sig_cache::token_hash(token), std::time::Instant::now())
+                    != Some(true) =>
+        {
+            sig_cache.try_begin_verification().map(Some).ok_or(())
+        }
+        _ => Ok(None),
+    }
+}
+
 // `auth_header` is passed as an already-extracted `Option<&str>` rather than `&Request<Body>`:
 // holding a borrow of `Request<Body>` (which wraps a `!Sync` boxed body) across this
 // function's internal `.await` (the store-backed liveness check) would make the generated
@@ -262,15 +298,7 @@ pub(crate) async fn authenticate<S: Store>(
     // whose verified cert alone would have identified it under real kube-apiserver,
     // since the union authenticator lets a still-available cert authenticate when the
     // bearer-token authenticator declines instead of erroring.
-    const BEARER_PREFIX: &str = "Bearer ";
-    let bearer_token = auth_header.and_then(|value| {
-        let scheme = value.get(..BEARER_PREFIX.len())?;
-        scheme
-            .eq_ignore_ascii_case(BEARER_PREFIX)
-            .then(|| &value[BEARER_PREFIX.len()..])
-    });
-
-    let Some(token) = bearer_token else {
+    let Some(token) = bearer_token(auth_header) else {
         // No usable bearer token — try x509 client cert before anonymous fallback.
         if let Some(cert) = peer_cert {
             // chain already verified by rustls WebPkiClientVerifier
@@ -510,6 +538,26 @@ async fn object_is_live<S: Store>(store: &S, key: &str, expected_uid: &str) -> b
     true
 }
 
+/// `object_is_live`, skipping the store read when the same object/uid was seen live within
+/// `sa_sig_cache::LIVENESS_TTL`. Only live results are remembered, so deleting the object
+/// revokes its tokens within the TTL.
+async fn object_is_live_cached<S: Store>(
+    store: &S,
+    sig_cache: &SigCache,
+    key: &str,
+    expected_uid: &str,
+) -> bool {
+    let memo_key = format!("{key}\0{expected_uid}");
+    if sig_cache.recently_live(&memo_key, std::time::Instant::now()) {
+        return true;
+    }
+    let live = object_is_live(store, key, expected_uid).await;
+    if live {
+        sig_cache.record_live(memo_key, std::time::Instant::now());
+    }
+    live
+}
+
 /// Attempt to decode and verify a bearer token as an RS256 SA JWT.
 /// Returns `Some(UserInfo)` on success, `None` if the token is invalid, expired, or bound to
 /// a ServiceAccount/Pod that is no longer live.
@@ -610,8 +658,9 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
     // to invalidate a u7s SA token before its JWT `exp`; there is no JTI-based revocation
     // list (upstream Kubernetes doesn't have one either — see module-level notes).
     let kio = &claims.kubernetes_io;
-    if !object_is_live(
+    if !object_is_live_cached(
         store,
+        sig_cache,
         &object_key("serviceaccounts", &kio.namespace, &kio.serviceaccount.name),
         &kio.serviceaccount.uid,
     )
@@ -625,8 +674,9 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
         return None;
     }
     if let Some(pod) = &kio.pod {
-        if !object_is_live(
+        if !object_is_live_cached(
             store,
+            sig_cache,
             &object_key("pods", &kio.namespace, &pod.name),
             &pod.uid,
         )
@@ -812,6 +862,27 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 /// Form-urlencoded decoding of one query component: `+` is a space, then `%XX`.
 fn decode_query_component(s: &str) -> Option<String> {
     percent_decode(&s.replace('+', " "))
+}
+
+/// Whether a request is long-running, i.e. exempt from the max-in-flight pools and the
+/// body deadline. Mirrors kube-apiserver's `LongRunningFunc`: verb `watch` (collection GET
+/// asking for a watch) or one of the subresources `proxy`, `attach`, `exec`, `log`,
+/// `portforward`.
+pub(crate) fn is_long_running_request(
+    method: &axum::http::Method,
+    path: &str,
+    query: Option<&str>,
+) -> bool {
+    let parsed = parse_path(path);
+    if parsed.resource.is_empty() {
+        return false;
+    }
+    matches!(
+        parsed.subresource.as_str(),
+        "proxy" | "attach" | "exec" | "log" | "portforward"
+    ) || (matches!(*method, axum::http::Method::GET)
+        && parsed.name.is_none()
+        && query_requests_watch(query))
 }
 
 /// Decode RFC 3986 `%XX` percent-escapes in a URL query-string component.
@@ -1279,6 +1350,17 @@ where
                 .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok());
+            let Ok(verification) =
+                begin_token_verification(auth_header, &token_map, sig_cache.as_ref())
+            else {
+                record_request_total(method_to_verb(req.method()), "", "", "", "", "429");
+                return Ok(axum::response::IntoResponse::into_response(
+                    Status::too_many_requests_retry_after(
+                        "Too many requests, please try again later.".to_owned(),
+                        1,
+                    ),
+                ));
+            };
             let authenticated_user = match authenticate(
                 auth_header,
                 &token_map,
@@ -1289,8 +1371,12 @@ where
             )
             .await
             {
-                AuthnResult::Identified(u) => u,
+                AuthnResult::Identified(u) => {
+                    drop(verification);
+                    u
+                }
                 AuthnResult::BadToken => {
+                    drop(verification);
                     // Fires before parse_path runs, so group/version/resource/scope are
                     // unknown — recorded empty rather than guessed, matching a non-resource
                     // request's shape rather than a specific one.
@@ -2456,6 +2542,105 @@ mod tests {
         );
     }
 
+    fn pre_auth_app(sig_cache: Arc<SigCache>) -> axum::Router {
+        use axum::{routing::any, Router};
+
+        let token_map = HashMap::from([(
+            "static-tok".to_owned(),
+            UserInfo {
+                username: "admin".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:masters".to_owned()],
+                extra: HashMap::new(),
+            },
+        )]);
+        Router::new()
+            .route("/api/v1/namespaces/default/pods", any(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                Arc::new(RbacIndex::new()),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                sig_cache,
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
+            ))
+    }
+
+    fn pre_auth_request(token: &str) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A flood of well-formed bootstrap-shaped bogus tokens reaches the store only through
+    /// the verification slots. With every slot busy, none of the flood may get past the
+    /// guard (a request that reached `authenticate` would come back 401, not 429), and a
+    /// client with a static token — which needs no store read — is still served.
+    #[tokio::test]
+    async fn bogus_token_flood_is_refused_before_any_store_read_and_static_clients_still_served() {
+        use tower::ServiceExt;
+
+        let sig_cache = Arc::new(make_test_sig_cache());
+        let app = pre_auth_app(Arc::clone(&sig_cache));
+        let _busy: Vec<_> = (0..crate::sa_sig_cache::MAX_PRE_AUTH_VERIFICATIONS)
+            .map(|_| sig_cache.try_begin_verification().expect("free slot"))
+            .collect();
+
+        for _ in 0..100 {
+            let resp = app
+                .clone()
+                .oneshot(pre_auth_request("abcdef.0123456789abcdef"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "a bogus token must be refused without touching the store while every \
+                 verification slot is busy"
+            );
+            assert_eq!(
+                resp.headers().get("retry-after").unwrap(),
+                "1",
+                "clients must be told to back off"
+            );
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(pre_auth_request("static-tok"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a static-token client needs no store read, so it must reach authorization (403 here, \
+             the test RBAC index is empty) instead of being shed with 429/401"
+        );
+    }
+
+    /// The slot must be released once `authenticate` returns, or every rejected token
+    /// would leak one and 32 bad tokens would lock out all bearer-token clients.
+    #[tokio::test]
+    async fn verification_slot_is_released_after_each_rejected_token() {
+        use tower::ServiceExt;
+
+        let app = pre_auth_app(Arc::new(make_test_sig_cache()));
+        for _ in 0..crate::sa_sig_cache::MAX_PRE_AUTH_VERIFICATIONS * 2 {
+            let resp = app
+                .clone()
+                .oneshot(pre_auth_request("abcdef.0123456789abcdef"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+    }
+
     // --- SA JWT authentication ---
 
     /// Generate a minimal in-memory RSA-2048 key pair for use in tests.
@@ -2588,6 +2773,89 @@ mod tests {
             }
             AuthnResult::BadToken => panic!("valid SA JWT must not be rejected"),
         }
+    }
+
+    async fn authn_sa(
+        store: &SqliteStore,
+        dec: &DecodingKey,
+        sig_cache: &SigCache,
+        token: &str,
+    ) -> bool {
+        let header = format!("Bearer {token}");
+        matches!(
+            authenticate(
+                Some(&header),
+                &HashMap::new(),
+                Some(dec),
+                None,
+                store,
+                sig_cache
+            )
+            .await,
+            AuthnResult::Identified(_)
+        )
+    }
+
+    /// Ordinary ServiceAccount traffic (tokens verified before) must not compete with a
+    /// bogus-token flood for verification slots, or any 33 concurrent pod requests - or one
+    /// attacker - would 429 every workload in the cluster.
+    #[tokio::test]
+    async fn verified_sa_tokens_are_not_shed_while_bogus_tokens_hold_every_slot() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let sig_cache = make_test_sig_cache();
+        assert!(authn_sa(&store, &dec, &sig_cache, &token).await, "warm-up");
+
+        let _flood: Vec<_> = (0..sa_sig_cache::MAX_PRE_AUTH_VERIFICATIONS)
+            .map(|_| sig_cache.try_begin_verification().expect("free slot"))
+            .collect();
+        let header = format!("Bearer {token}");
+        let admitted: Vec<_> = (0..sa_sig_cache::MAX_PRE_AUTH_VERIFICATIONS * 2)
+            .map(|_| begin_token_verification(Some(&header), &HashMap::new(), &sig_cache))
+            .collect();
+        assert!(
+            admitted.iter().all(|r| matches!(r, Ok(None))),
+            "a token already verified (signature-cache hit) must need no slot"
+        );
+        assert!(
+            begin_token_verification(
+                Some("Bearer abcdef.0123456789abcdef"),
+                &HashMap::new(),
+                &sig_cache
+            )
+            .is_err(),
+            "setup: an unverified token must be shed when every slot is busy"
+        );
+    }
+
+    /// A hot token must not cost a store read per request, yet deleting its ServiceAccount
+    /// must still revoke it within the liveness TTL.
+    #[tokio::test]
+    async fn deleted_service_account_token_stops_working_within_the_liveness_ttl() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let sig_cache = make_test_sig_cache();
+        assert!(authn_sa(&store, &dec, &sig_cache, &token).await);
+
+        store
+            .delete(&object_key("serviceaccounts", "default", "my-sa"), None)
+            .await
+            .unwrap();
+        assert!(
+            authn_sa(&store, &dec, &sig_cache, &token).await,
+            "within the TTL the memoised liveness is trusted (no store read per request)"
+        );
+
+        tokio::time::sleep(sa_sig_cache::LIVENESS_TTL + std::time::Duration::from_millis(200))
+            .await;
+        assert!(
+            !authn_sa(&store, &dec, &sig_cache, &token).await,
+            "a token of a deleted ServiceAccount must be rejected once the TTL lapses"
+        );
     }
 
     #[tokio::test]
