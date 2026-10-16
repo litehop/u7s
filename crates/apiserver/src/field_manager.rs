@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Map, Value};
 
 use crate::patch::{ssa_merge_key_for_path, MergeKeyKind};
+use crate::types::DeleteOptions;
 
 /// One structured-merge-diff path: `["f:spec", "f:containers", "k:{\"name\":\"c\"}", "f:image"]`.
 pub(crate) type Path = Vec<String>;
@@ -796,12 +797,7 @@ fn validate_patch_options(is_apply: bool, query: &[(String, String)]) -> Vec<Fie
 }
 
 /// Upstream's `ValidateDryRun`.
-fn validate_dry_run(query: &[(String, String)]) -> Option<FieldError> {
-    let dry_run: Vec<&str> = query
-        .iter()
-        .filter(|(n, _)| n == "dryRun")
-        .map(|(_, v)| v.as_str())
-        .collect();
+fn validate_dry_run(dry_run: &[&str]) -> Option<FieldError> {
     dry_run.iter().any(|v| *v != "All").then(|| {
         (
             "dryRun".into(),
@@ -814,12 +810,19 @@ fn validate_dry_run(query: &[(String, String)]) -> Option<FieldError> {
     })
 }
 
-/// Upstream's `ValidateDeleteOptions` over the query parameters of a DELETE.
-fn validate_delete_options(query: &[(String, String)]) -> Vec<FieldError> {
-    let first = |k: &str| query.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+fn query_dry_run(query: &[(String, String)]) -> Vec<&str> {
+    query
+        .iter()
+        .filter(|(n, _)| n == "dryRun")
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
+/// Upstream's `ValidateDeleteOptions` over the effective options of a DELETE.
+fn validate_delete_options(opts: &DeleteOptions) -> Vec<FieldError> {
     let mut errs: Vec<FieldError> = Vec::new();
-    let policy = first("propagationPolicy");
-    if let (Some(p), Some(_)) = (policy, first("orphanDependents")) {
+    let policy = opts.propagation_policy.as_deref();
+    if let (Some(p), Some(_)) = (policy, opts.orphan_dependents) {
         errs.push((
             "propagationPolicy".into(),
             "FieldValueInvalid",
@@ -841,8 +844,89 @@ fn validate_delete_options(query: &[(String, String)]) -> Vec<FieldError> {
             ));
         }
     }
-    errs.extend(validate_dry_run(query));
+    let dry_run: Vec<&str> = opts.dry_run.iter().flatten().map(String::as_str).collect();
+    errs.extend(validate_dry_run(&dry_run));
     errs
+}
+
+/// Upstream's `ParameterCodec.DecodeParameters` into `DeleteOptions`, used only when the
+/// request has no body. `orphanDependents` follows apimachinery's bool conversion: "0" and
+/// any case of "false" are false, every other value (including empty) is true.
+fn delete_options_from_query(query: &[(String, String)]) -> DeleteOptions {
+    let first = |k: &str| query.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let dry_run = query_dry_run(query);
+    DeleteOptions {
+        propagation_policy: first("propagationPolicy").map(String::from),
+        orphan_dependents: first("orphanDependents")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false"))),
+        grace_period_seconds: None,
+        dry_run: (!dry_run.is_empty()).then(|| dry_run.into_iter().map(String::from).collect()),
+    }
+}
+
+/// The JSON body handlers decode `DeleteOptions` from, carrying the query-supplied options.
+fn delete_options_body(opts: &DeleteOptions) -> Vec<u8> {
+    let mut body = json!({"apiVersion": "v1", "kind": "DeleteOptions"});
+    if let Some(p) = &opts.propagation_policy {
+        body["propagationPolicy"] = json!(p);
+    }
+    if let Some(o) = opts.orphan_dependents {
+        body["orphanDependents"] = json!(o);
+    }
+    if let Some(d) = &opts.dry_run {
+        body["dryRun"] = json!(d);
+    }
+    body.to_string().into_bytes()
+}
+
+/// Resolves a DELETE's effective `DeleteOptions` as upstream's delete handler does: a
+/// non-empty body is the options (the query is ignored), an empty body takes them from the
+/// query. The result is validated (422 `DeleteOptions`) before any handler runs; options
+/// that came from the query are handed on as a JSON body, the one place every delete and
+/// deletecollection handler reads them from. An undecodable body is left to the handlers'
+/// lenient parse.
+async fn resolve_delete_options(
+    req: axum::http::Request<axum::body::Body>,
+    query: &[(String, String)],
+) -> Result<axum::http::Request<axum::body::Body>, axum::response::Response> {
+    use axum::response::IntoResponse;
+    let (mut parts, body) = req.into_parts();
+    let raw = axum::body::to_bytes(body, crate::MAX_BODY_BYTES)
+        .await
+        .map_err(|_| axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
+    let from_query = raw.is_empty();
+    let opts = if from_query {
+        Some(delete_options_from_query(query))
+    } else {
+        crate::util::extract_body_quiet(&raw, crate::util::content_type(&parts.headers))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<DeleteOptions>(&b).ok())
+    };
+    let mut out = raw;
+    if let Some(opts) = opts {
+        let errs = validate_delete_options(&opts);
+        if !errs.is_empty() {
+            return Err(
+                crate::status::Status::invalid_options("DeleteOptions", &errs).into_response(),
+            );
+        }
+        if from_query
+            && (opts.propagation_policy.is_some()
+                || opts.orphan_dependents.is_some()
+                || opts.dry_run.is_some())
+        {
+            out = delete_options_body(&opts).into();
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            parts.headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+        }
+    }
+    Ok(axum::http::Request::from_parts(
+        parts,
+        axum::body::Body::from(out),
+    ))
 }
 
 /// The fieldManager, dryRun and fieldValidation checks shared by upstream's
@@ -871,7 +955,7 @@ fn validate_common_options(query: &[(String, String)]) -> Vec<FieldError> {
             ));
         }
     }
-    errs.extend(validate_dry_run(query));
+    errs.extend(validate_dry_run(&query_dry_run(query)));
     if let Some(fv) = first("fieldValidation") {
         if !["", "Ignore", "Warn", "Strict"].contains(&fv) {
             errs.push((
@@ -902,6 +986,12 @@ pub(crate) async fn resolve_field_manager(
     let query = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(req.uri())
         .map(|q| q.0)
         .unwrap_or_default();
+    if *req.method() == axum::http::Method::DELETE {
+        req = match resolve_delete_options(req, &query).await {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
+    }
     let validated = match *req.method() {
         axum::http::Method::PATCH
             if crate::handlers::json_patch::detect_patch_type(req.headers()).is_ok() =>
@@ -915,7 +1005,6 @@ pub(crate) async fn resolve_field_manager(
         }
         axum::http::Method::POST => Some(("CreateOptions", validate_common_options(&query))),
         axum::http::Method::PUT => Some(("UpdateOptions", validate_common_options(&query))),
-        axum::http::Method::DELETE => Some(("DeleteOptions", validate_delete_options(&query))),
         _ => None,
     };
     if let Some((kind, errs)) = validated {
@@ -1717,6 +1806,178 @@ mod tests {
                 "/x?orphanDependents=false",
             ] {
                 assert_eq!(send("DELETE", ok).await.0, 200, "{ok}");
+            }
+        }
+
+        /// Sends a DELETE through the middleware to a handler that echoes the body and
+        /// content type it receives, as every delete handler would see them.
+        async fn delete_echo(
+            uri: &str,
+            content_type: Option<&str>,
+            body: Vec<u8>,
+        ) -> (axum::http::StatusCode, Value, Option<String>) {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let seen2 = seen.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/x",
+                    axum::routing::delete(
+                        move |h: axum::http::HeaderMap, b: axum::body::Bytes| async move {
+                            *seen2.lock().unwrap() = h
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from);
+                            b
+                        },
+                    ),
+                )
+                .layer(axum::middleware::from_fn(resolve_field_manager));
+            let mut b = Request::builder().method("DELETE").uri(uri);
+            if let Some(ct) = content_type {
+                b = b.header("content-type", ct);
+            }
+            let resp = app
+                .oneshot(b.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let ct = seen.lock().unwrap().clone();
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or_default(),
+                ct,
+            )
+        }
+
+        /// An invalid DeleteOptions body must be refused like the query form: kubectl and
+        /// client-go send options in the body, so a bad dryRun or policy there would
+        /// otherwise run a real (or cascading) delete the caller did not ask for.
+        #[tokio::test]
+        async fn delete_options_body_is_validated_like_upstream() {
+            let cases = [
+                (
+                    json!({"dryRun": ["None"]}),
+                    "dryRun: Unsupported value: [\"None\"]: supported values: \"All\"",
+                ),
+                (
+                    json!({"propagationPolicy": "Bogus"}),
+                    "propagationPolicy: Unsupported value: \"Bogus\": supported values: \
+                     \"Foreground\", \"Background\", \"Orphan\", \"nil\"",
+                ),
+                (
+                    json!({"propagationPolicy": "Orphan", "orphanDependents": false}),
+                    "propagationPolicy: Invalid value: \"Orphan\": orphanDependents and \
+                     deletionPropagation cannot be both set",
+                ),
+            ];
+            for (opts, cause) in cases {
+                let (status, body, _) = delete_echo(
+                    "/x",
+                    Some("application/json"),
+                    opts.to_string().into_bytes(),
+                )
+                .await;
+                assert_eq!(status, 422, "{opts}: {body}");
+                assert_eq!(
+                    body["message"],
+                    format!("DeleteOptions.meta.k8s.io \"\" is invalid: {cause}"),
+                    "{opts}"
+                );
+                assert_eq!(body["details"]["kind"], "DeleteOptions");
+            }
+        }
+
+        /// Validation must also see protobuf bodies, which is what kubectl and client-go
+        /// actually send; a JSON-only check would pass every real client through.
+        #[tokio::test]
+        async fn protobuf_delete_options_body_is_validated() {
+            // Payloads here are all under 128 bytes, so every length is a one-byte varint.
+            fn ld(field: u8, payload: &[u8]) -> Vec<u8> {
+                let mut out = vec![(field << 3) | 2, payload.len() as u8];
+                out.extend_from_slice(payload);
+                out
+            }
+            let delete_options = ld(5, b"None"); // DeleteOptions.dryRun
+            let mut type_meta = ld(1, b"v1");
+            type_meta.extend(ld(2, b"DeleteOptions"));
+            let mut unknown = ld(1, &type_meta);
+            unknown.extend(ld(2, &delete_options));
+            let mut envelope = vec![0x6b, 0x38, 0x73, 0x00];
+            envelope.extend(unknown);
+            let (status, body, _) =
+                delete_echo("/x", Some("application/vnd.kubernetes.protobuf"), envelope).await;
+            assert_eq!(status, 422, "{body}");
+            assert_eq!(body["details"]["kind"], "DeleteOptions");
+        }
+
+        /// Upstream decodes the query only when the body is empty: a body (even `{}`) wins
+        /// outright, so a bad query beside it is ignored and a good query cannot override it.
+        #[tokio::test]
+        async fn delete_options_body_takes_precedence_over_query_like_upstream() {
+            let (status, _, ct) = delete_echo(
+                "/x?propagationPolicy=Bogus&dryRun=None",
+                Some("application/json"),
+                b"{}".to_vec(),
+            )
+            .await;
+            assert_eq!(status, 200, "a non-empty body makes the query irrelevant");
+            assert_eq!(ct.as_deref(), Some("application/json"));
+
+            let (status, echoed, _) = delete_echo(
+                "/x?propagationPolicy=Orphan",
+                Some("application/json"),
+                br#"{"propagationPolicy":"Background"}"#.to_vec(),
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                echoed,
+                json!({"propagationPolicy": "Background"}),
+                "the body must reach the handler untouched, not merged with the query"
+            );
+        }
+
+        /// A `?propagationPolicy=` / `?orphanDependents=` / `?dryRun=All` on a bodyless
+        /// DELETE must reach the handlers (which only read the body), or `kubectl delete
+        /// --cascade=orphan`-style raw requests silently cascade or really delete.
+        #[tokio::test]
+        async fn delete_query_options_reach_handlers_as_a_json_body() {
+            let (status, echoed, ct) =
+                delete_echo("/x?propagationPolicy=Orphan&dryRun=All", None, Vec::new()).await;
+            assert_eq!(status, 200);
+            assert_eq!(ct.as_deref(), Some("application/json"));
+            assert_eq!(echoed["propagationPolicy"], "Orphan");
+            assert_eq!(echoed["dryRun"], json!(["All"]));
+            assert!(echoed.get("orphanDependents").is_none());
+
+            for (value, want) in [
+                ("false", false),
+                ("0", false),
+                ("FALSE", false),
+                ("true", true),
+                ("", true),
+            ] {
+                let (_, echoed, _) =
+                    delete_echo(&format!("/x?orphanDependents={value}"), None, Vec::new()).await;
+                assert_eq!(
+                    echoed["orphanDependents"], want,
+                    "orphanDependents={value:?}"
+                );
+            }
+        }
+
+        /// A plain delete without options must not grow a synthetic body, or handlers that
+        /// treat "no body" as "no explicit propagation intent" would see one.
+        #[tokio::test]
+        async fn delete_without_options_is_passed_through_unchanged() {
+            for uri in ["/x", "/x?gracePeriodSeconds=0", "/x?unrelated=1"] {
+                let (status, echoed, ct) = delete_echo(uri, None, Vec::new()).await;
+                assert_eq!(status, 200, "{uri}");
+                assert_eq!(echoed, Value::Null, "{uri}: body must stay empty");
+                assert_eq!(ct, None, "{uri}");
             }
         }
 
