@@ -74,9 +74,10 @@ impl ServiceIpAllocator {
 /// Maximum number of concurrent watch streams allowed per authenticated user.
 /// A client that already has this many open watches gets HTTP 429 on the next attempt.
 ///
-/// The e2e suite runs every parallel worker as one identity, and its "concurrent watches
-/// in same order" conformance spec alone opens 100 simultaneous watches, so the limit must
-/// clear that with headroom; the aggregate is bounded by `MAX_WATCHES_GLOBAL` instead.
+/// Must stay above 100: sonobuoy runs the e2e suite as the non-exempt
+/// `system:serviceaccount:sonobuoy:sonobuoy-serviceaccount` (not the admin kubeconfig), and the
+/// "concurrent watches in same order" conformance spec opens 100 simultaneous watches as that one
+/// identity (64 fails it with 429s). The aggregate is bounded by `MAX_WATCHES_GLOBAL` instead.
 pub const MAX_WATCHES_PER_CLIENT: usize = 256;
 
 /// Server-wide cap on concurrent watch streams from ordinary identities. The per-client
@@ -95,8 +96,10 @@ pub const WATCH_RETRY_AFTER_SECONDS: u64 = 1;
 /// 100+ watches fit): the provisioned admin (CN=admin, O=system:masters), kubelets
 /// (`system:node:<name>`, O=system:nodes), the controller-manager and the scheduler.
 /// Mirrors upstream APF's exempt (system:masters), system-nodes and system-leader-election
-/// flow schemas. Matched on username because tenants can only obtain
-/// `system:serviceaccount:*` names, never these.
+/// flow schemas. Matched on username, which is only as trustworthy as the cluster CA's
+/// issuance: a principal allowed to approve and sign `kubernetes.io/kube-apiserver-client`
+/// CSRs can mint a certificate with any CN here (upstream's signer likewise forbids only
+/// O=system:masters), so that RBAC grant is effectively a control-plane grant.
 pub fn is_system_priority_username(username: &str) -> bool {
     matches!(
         username,
@@ -2162,6 +2165,10 @@ mod tests {
     // the per-client limit entirely, since semaphore_for would hand out a fresh
     // MAX_WATCHES_PER_CLIENT-permit semaphore instead of the shared one the live watch is
     // enforcing against).
+    // sonobuoy's non-exempt service account opens 100 simultaneous watches in the
+    // "concurrent watches in same order" conformance spec; a cap of 64 fails it with 429s.
+    const _: () = assert!(MAX_WATCHES_PER_CLIENT > 100);
+
     #[test]
     fn watch_limit_sweep_idle_evicts_only_entries_with_no_live_permit() {
         let limiter = WatchLimitState::new();
