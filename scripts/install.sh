@@ -174,6 +174,18 @@ if [ ! -d /run/systemd/system ]; then
   exit 1
 fi
 
+# beep, the DaemonSet that serves type=LoadBalancer Services, runs on every
+# node and needs kernel >= 6.6 (its eBPF dataplane's support floor).
+kernel_supports_beep() {
+  local major minor
+  IFS=. read -r major minor _ <<< "${1%%-*}"
+  [ "$major" -gt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -ge 6 ]; }
+}
+if ! kernel_supports_beep "$(uname -r)"; then
+  echo "error: kernel $(uname -r) is older than 6.6 -- u7s's default LoadBalancer provider (beep) requires kernel >= 6.6" >&2
+  exit 1
+fi
+
 BIN_DIR=/opt/u7s/bin
 STATE_DIR=/var/lib/u7s
 # Flat sibling of state.db/ca.*/kubeconfig, not a subdirectory -- deleting it
@@ -1252,7 +1264,7 @@ POD_NODE_CIDR_MASK_SIZE=24
 # (the release-pipeline vendoring step lands separately); that is equivalent
 # to an empty set, not an error. Placed here (after $POD_CLUSTER_CIDR is
 # resolved, before the systemd units below start anything) because
-# flannel.yaml and kube-proxy.yaml each carry install-time placeholders a
+# flannel.yaml, kube-proxy.yaml and beep.yaml each carry install-time placeholders a
 # byte-for-byte copy would ship unresolved -- see each file's own header for
 # what it substitutes to. Every other manifest copies verbatim.
 if [ "$WORKER_MODE" -eq 0 ]; then
@@ -1271,6 +1283,11 @@ if [ "$WORKER_MODE" -eq 0 ]; then
       sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#__IFACE_IP__#$IFACE_IP#g" \
         "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml" > "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml.tmp"
       mv "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml.tmp" "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml"
+    fi
+    if [ -f "$MANIFEST_OUTPUT_DIR/beep.yaml" ]; then
+      sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+        "$MANIFEST_OUTPUT_DIR/beep.yaml" > "$MANIFEST_OUTPUT_DIR/beep.yaml.tmp"
+      mv "$MANIFEST_OUTPUT_DIR/beep.yaml.tmp" "$MANIFEST_OUTPUT_DIR/beep.yaml"
     fi
   fi
 fi

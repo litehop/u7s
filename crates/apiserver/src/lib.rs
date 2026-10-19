@@ -1855,7 +1855,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // makes every real cluster boot fail to install CoreDNS's RBAC. This is
             // distinct from "escalate", which bypasses the check when authoring a
             // Role/ClusterRole's own rules (needed to apply system:coredns itself).
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update","bind","escalate"] },
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings","roles","rolebindings"], "verbs": ["get","create","patch","update","bind","escalate"] },
             { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services","namespaces"], "verbs": ["get","create","patch","update"] },
             { "apiGroups": ["apps"], "resources": ["deployments","daemonsets"], "verbs": ["get","create","patch","update"] }
         ]
