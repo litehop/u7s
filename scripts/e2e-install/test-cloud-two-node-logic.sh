@@ -53,6 +53,7 @@ case "$*" in
         echo "Join token created in kube-system, expires 2026-10-20T00:00:00Z (single-use): $STUB_TOKEN"
         echo "  install.sh --join https://127.0.0.1:6443 \\"
         echo "    --ca-cert-hash $STUB_HASH --tarball <path> --node-name <name>" ;;
+      *"get nodes -o wide"*) echo "u7s-e2e-t-cp.zone.internal Ready <none> 1m v1.37.1 10.80.0.2 <none> Ubuntu" ;;
       *"get ds -o name"*)
         echo daemonset.apps/kube-proxy
         case "${STUB_BEEP:-0}" in
@@ -101,6 +102,8 @@ assert "installs come from the mirror, never a local build" \
   "$(has 'https://u7s.dekiru.tech/v0.4.0-snapshot.1/install.sh' "$LOG")"
 assert "w1 joins the control plane's internal IP, not a public one" \
   "$(has '--join https://10.80.0.2:6443' "$LOG")$(has '--ca-cert-hash '"$HASH" "$LOG")"
+assert "the cp node is addressed by its registered FQDN, not the VPS name (a nodeName that matches no node gets the pod garbage-collected)" \
+  "$(has 'node/u7s-e2e-t-cp.zone.internal' "$LOG")$(has 'nodeName: u7s-e2e-t-cp.zone.internal' "$STDIN")"
 assert "the join token reaches w1 on stdin (--token -)" "$(has "$TOKEN" "$STDIN")$(has '--token -' "$LOG")"
 assert "the join token never appears in any gcloud argv (process lists and shell history would leak it)" \
   "$(hasnt "$TOKEN" "$LOG")"

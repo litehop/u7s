@@ -128,7 +128,7 @@ YAML
 
 # The join token only ever travels on stdin: never in argv, a log or the results directory.
 join_w1() { printf '%s\n' "$1" | vps ssh "$W1" -- sudo bash /tmp/install.sh --join "https://$CP_IP:6443" --token - --ca-cert-hash "$2" --node-name "$W1"; }
-apply_pods() { { pod_yaml pin "$W1"; echo ---; pod_yaml peer "$CP"; } | on_cp "$KC apply -f -"; }
+apply_pods() { { pod_yaml pin "$W1"; echo ---; pod_yaml peer "$CP_NODE"; } | on_cp "$KC apply -f -"; }
 webhook_smoke() {
   vps scp "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$CP:/tmp/webhook-smoke.sh" &&
     on_cp sudo bash /tmp/webhook-smoke.sh --kubeconfig /var/lib/u7s/kubeconfig
@@ -158,7 +158,12 @@ step fetch-w1 vps ssh "$W1" -- "curl -fsSL $INSTALL_URL -o /tmp/install.sh"
 step join-w1 join_w1 "$token" "$ca_hash"
 unset token
 
-step nodes-ready on_cp "$KC wait --for=condition=Ready node/$CP node/$W1 --timeout=300s"
+# The control plane registers under its hostname, which GCP makes an FQDN, so look the node up
+# by the internal IP rather than assuming it is named like the VPS.
+CP_NODE="$(on_cp "$KC get nodes -o wide --no-headers" | awk -v ip="$CP_IP" '$6 == ip {print $1}')"
+[ -n "$CP_NODE" ] || fail "no node with InternalIP $CP_IP registered on $CP"
+
+step nodes-ready on_cp "$KC wait --for=condition=Ready node/$CP_NODE node/$W1 --timeout=300s"
 step apply-pods apply_pods
 step pinned-pod-running on_cp "$KC wait --for=condition=Ready pod/pin pod/peer --timeout=300s"
 step logs-exec on_cp "$KC logs pin | grep -q . && $KC exec pin -- /agnhost hostname"
