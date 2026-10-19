@@ -62,16 +62,17 @@ const REASON_FAILED_DISCOVERY_CHECK: &str = "FailedDiscoveryCheck";
 // Path parsing
 // ---------------------------------------------------------------------------
 
-/// False when the raw (still percent-encoded) path tail has a segment that, once decoded,
-/// is `.`/`..` or contains `/` or `\`. The backend decodes and may clean the path, so such a
-/// segment could land the request outside `/apis/{group}/{version}` with the caller's
-/// asserted identity. Upstream never reaches this state because its mux rejects/redirects
-/// unclean paths before the proxy handler runs.
+/// False when the raw (still percent-encoded) path tail, once fully decoded and split on `/`,
+/// has a `.` or `..` segment. Encoded slashes (`%2F`, `%5C`) are ordinary bytes: upstream
+/// forwards the decoded path unchanged, so `%2F` becomes a real separator there. Splitting
+/// after decoding keeps `a%2f..%2fb` caught while `a%5c..%5cb` (one segment containing
+/// backslashes) passes, as upstream does. Upstream also forwards dot segments untouched;
+/// refusing them here is a deliberate retained defence, since the backend may clean the
+/// path and land outside `/apis/{group}/{version}` under the caller's asserted identity.
 fn tail_stays_under_prefix(tail: &str) -> bool {
-    tail.split('/').all(|seg| {
-        let decoded = percent_decode(seg);
-        decoded != b"." && decoded != b".." && !decoded.iter().any(|b| matches!(b, b'/' | b'\\'))
-    })
+    percent_decode(tail)
+        .split(|b| *b == b'/')
+        .all(|seg| seg != b"." && seg != b"..")
 }
 
 fn percent_decode(s: &str) -> Vec<u8> {
@@ -433,7 +434,7 @@ pub async fn proxy_to_backend<S: Store>(
 
     if !tail_stays_under_prefix(tail) {
         return Status::bad_request(format!(
-            "invalid path \"{tail}\": dot segments and encoded separators are not allowed"
+            "invalid path \"{tail}\": dot segments are not allowed"
         ))
         .into_response();
     }
@@ -2163,12 +2164,33 @@ mod tests {
             "a/%2e/b",
             "a%2f..%2fb",
             "a%2F%2e%2e%2Fb",
-            "a%5c..%5cb",
+            "a%2f%2e%2e",
+            "a//../b",
         ] {
             assert!(
                 !tail_stays_under_prefix(tail),
                 "{tail:?} would let the backend resolve a path outside the APIService prefix \
                  under the caller's asserted identity"
+            );
+        }
+    }
+
+    #[test]
+    fn tail_guard_allows_encoded_slashes_as_upstream_does() {
+        for tail in [
+            "flunders/a%2Fb",
+            "flunders/a%2fb",
+            "flunders/a%5Cb",
+            "flunders/a%5cb",
+            "flunders/a\\b",
+            "flunders//b",
+            "a%5c..%5cb",
+            "a\\..\\b",
+        ] {
+            assert!(
+                tail_stays_under_prefix(tail),
+                "{tail:?} is proxied by upstream kube-aggregator; refusing it breaks clients \
+                 that name resources with encoded separators"
             );
         }
     }
@@ -2250,6 +2272,16 @@ mod tests {
         let resp = call("namespaces/default/flunders").await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert_eq!(backend.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let resp = call("flunders/a%2Fb").await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "an encoded slash must reach the backend as upstream's aggregator does"
+        );
+        let resp = call("flunders/a%5Cb").await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(backend.hits.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     /// An aggregated API backed by a Service must be reached through the Service's ClusterIP
