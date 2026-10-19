@@ -167,7 +167,7 @@ CP_NODE="$(on_cp "$KC get nodes -o wide --no-headers" | awk -v ip="$CP_IP" '$6 =
 step nodes-ready on_cp "$KC wait --for=condition=Ready node/$CP_NODE node/$W1 --timeout=300s"
 step apply-pods apply_pods
 step pinned-pod-running on_cp "$KC wait --for=condition=Ready pod/pin pod/peer --timeout=300s"
-step logs-exec on_cp "$KC logs pin | grep -q . && $KC exec pin -- /agnhost hostname"
+step logs-exec on_cp "$KC logs pin | grep -q . && $KC exec pin -- /agnhost etc-hosts"
 step cross-node-pod-to-pod on_cp "$KC exec peer -- /agnhost connect \$($KC get pod pin -o jsonpath='{.status.podIP}'):8080 --timeout=10s"
 step webhook-smoke webhook_smoke
 
