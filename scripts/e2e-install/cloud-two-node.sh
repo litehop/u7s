@@ -162,6 +162,7 @@ unset token
 # by the internal IP rather than assuming it is named like the VPS.
 CP_NODE="$(on_cp "$KC get nodes -o wide --no-headers" | awk -v ip="$CP_IP" '$6 == ip {print $1}')"
 [ -n "$CP_NODE" ] || fail "no node with InternalIP $CP_IP registered on $CP"
+[ "$(wc -l <<<"$CP_NODE")" -eq 1 ] || fail "multiple nodes with InternalIP $CP_IP registered on $CP: $(tr '\n' ' ' <<<"$CP_NODE")"
 
 step nodes-ready on_cp "$KC wait --for=condition=Ready node/$CP_NODE node/$W1 --timeout=300s"
 step apply-pods apply_pods

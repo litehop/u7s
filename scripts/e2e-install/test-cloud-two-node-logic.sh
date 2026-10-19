@@ -53,7 +53,12 @@ case "$*" in
         echo "Join token created in kube-system, expires 2026-10-20T00:00:00Z (single-use): $STUB_TOKEN"
         echo "  install.sh --join https://127.0.0.1:6443 \\"
         echo "    --ca-cert-hash $STUB_HASH --tarball <path> --node-name <name>" ;;
-      *"get nodes -o wide"*) echo "u7s-e2e-t-cp.zone.internal Ready <none> 1m v1.37.1 10.80.0.2 <none> Ubuntu" ;;
+      *"get nodes -o wide"*)
+        echo "u7s-e2e-t-w1.zone.internal Ready <none> 1m v1.37.1 10.80.0.3 <none> Ubuntu"
+        case "${STUB_NODES:-one}" in
+          one|dup) echo "u7s-e2e-t-cp.zone.internal Ready <none> 1m v1.37.1 10.80.0.2 <none> Ubuntu" ;;
+        esac
+        [ "${STUB_NODES:-one}" != dup ] || echo "u7s-e2e-t-cp2.zone.internal Ready <none> 1m v1.37.1 10.80.0.2 <none> Ubuntu" ;;
       *"get ds -o name"*)
         echo daemonset.apps/kube-proxy
         case "${STUB_BEEP:-0}" in
@@ -103,7 +108,7 @@ assert "installs come from the mirror, never a local build" \
 assert "w1 joins the control plane's internal IP, not a public one" \
   "$(has '--join https://10.80.0.2:6443' "$LOG")$(has '--ca-cert-hash '"$HASH" "$LOG")"
 assert "the cp node is addressed by its registered FQDN, not the VPS name (a nodeName that matches no node gets the pod garbage-collected)" \
-  "$(has 'node/u7s-e2e-t-cp.zone.internal' "$LOG")$(has 'nodeName: u7s-e2e-t-cp.zone.internal' "$STDIN")"
+  "$(has 'node/u7s-e2e-t-cp.zone.internal' "$LOG")$(has 'nodeName: u7s-e2e-t-cp.zone.internal' "$STDIN")$(hasnt 'node/u7s-e2e-t-w1.zone.internal' "$LOG")"
 assert "the join token reaches w1 on stdin (--token -)" "$(has "$TOKEN" "$STDIN")$(has '--token -' "$LOG")"
 assert "the join token never appears in any gcloud argv (process lists and shell history would leak it)" \
   "$(hasnt "$TOKEN" "$LOG")"
@@ -130,6 +135,13 @@ STUB_OPS=op-1 run --release v0.4.0-snapshot.1
 assert "a passing run is PASS even if an old preemption operation exists" "$(rc_is 0)$(has 'RESULT: PASS' "$OUT")"
 STUB_FAIL_MATCH="--mint-join-token" run --release v0.4.0-snapshot.1
 assert "a release without --mint-join-token fails loudly at the mint step" "$(rc_is 1)$(has 'mint-join-token' "$OUT")"
+
+STUB_NODES=none run --release v0.4.0-snapshot.1
+assert "no node with the cp InternalIP fails loudly instead of waiting on an empty node name" \
+  "$(rc_is 1)$(has 'no node with InternalIP 10.80.0.2' "$OUT")"
+STUB_NODES=dup run --release v0.4.0-snapshot.1
+assert "two nodes sharing the cp InternalIP fail rather than feeding both names to kubectl wait" \
+  "$(rc_is 1)$(has 'multiple nodes with InternalIP 10.80.0.2' "$OUT")"
 
 # --- --keep
 run --release v0.4.0-snapshot.1 --keep
