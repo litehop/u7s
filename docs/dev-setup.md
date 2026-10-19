@@ -1,5 +1,9 @@
 # Dev Setup
 
+## Rust toolchain
+
+The Rust toolchain is pinned by `rust-toolchain.toml` at the repo root; rustup installs it on the first `cargo` run and CI uses the same file.
+
 ## kubectl
 
 kubectl is pinned per-project via [aqua](https://aquaproj.github.io/) to avoid touching your system install.
