@@ -62,17 +62,29 @@ const REASON_FAILED_DISCOVERY_CHECK: &str = "FailedDiscoveryCheck";
 // Path parsing
 // ---------------------------------------------------------------------------
 
-/// False when the raw (still percent-encoded) path tail, once fully decoded and split on `/`,
-/// has a `.` or `..` segment. Encoded slashes (`%2F`, `%5C`) are ordinary bytes: upstream
-/// forwards the decoded path unchanged, so `%2F` becomes a real separator there. Splitting
-/// after decoding keeps `a%2f..%2fb` caught while `a%5c..%5cb` (one segment containing
-/// backslashes) passes, as upstream does. Upstream also forwards dot segments untouched;
-/// refusing them here is a deliberate retained defence, since the backend may clean the
-/// path and land outside `/apis/{group}/{version}` under the caller's asserted identity.
+/// False when the raw (still percent-encoded) path tail has a segment that, once decoded,
+/// is `.`/`..` or contains `/` or `\`. The backend decodes and may clean the path, so such a
+/// segment could land the request outside `/apis/{group}/{version}` with the caller's
+/// asserted identity. Upstream never reaches this state because its mux rejects/redirects
+/// unclean paths before the proxy handler runs.
 fn tail_stays_under_prefix(tail: &str) -> bool {
-    percent_decode(tail)
-        .split(|b| *b == b'/')
-        .all(|seg| seg != b"." && seg != b"..")
+    tail.split('/').all(|seg| {
+        let decoded = percent_decode(seg);
+        decoded != b"." && decoded != b".." && !decoded.iter().any(|b| matches!(b, b'/' | b'\\'))
+    })
+}
+
+fn outbound_url(base: &str, group: &str, version: &str, tail: &str, query: Option<&str>) -> String {
+    let mut url = format!("{base}/apis/{group}/{version}");
+    if !tail.is_empty() {
+        url.push('/');
+        url.push_str(tail);
+    }
+    if let Some(q) = query.filter(|q| !q.is_empty()) {
+        url.push('?');
+        url.push_str(q);
+    }
+    url
 }
 
 fn percent_decode(s: &str) -> Vec<u8> {
@@ -434,20 +446,12 @@ pub async fn proxy_to_backend<S: Store>(
 
     if !tail_stays_under_prefix(tail) {
         return Status::bad_request(format!(
-            "invalid path \"{tail}\": dot segments are not allowed"
+            "invalid path \"{tail}\": dot segments and encoded separators are not allowed"
         ))
         .into_response();
     }
 
-    let mut url = format!("{base}/apis/{group}/{version}");
-    if !tail.is_empty() {
-        url.push('/');
-        url.push_str(tail);
-    }
-    if let Some(q) = query.filter(|q| !q.is_empty()) {
-        url.push('?');
-        url.push_str(q);
-    }
+    let url = outbound_url(&base, group, version, tail, query);
 
     let client = match build_backend_client(state, apiservice).await {
         Ok(c) => c,
@@ -2164,8 +2168,11 @@ mod tests {
             "a/%2e/b",
             "a%2f..%2fb",
             "a%2F%2e%2e%2Fb",
-            "a%2f%2e%2e",
-            "a//../b",
+            "a%5c..%5cb",
+            "a\\..\\b",
+            "flunders/x\\..\\..\\..\\secret",
+            "flunders/n%2Fstatus",
+            "flunders/n%2fstatus",
         ] {
             assert!(
                 !tail_stays_under_prefix(tail),
@@ -2175,23 +2182,44 @@ mod tests {
         }
     }
 
+    /// The url crate treats a literal `\` as `/` for https and collapses dot segments, so
+    /// `x\..\..\..\secret` would resolve to `/apis/g/secret`. Guard-passing tails must yield an
+    /// outbound URL that stays under the APIService prefix; the escaping ones must be refused.
     #[test]
-    fn tail_guard_allows_encoded_slashes_as_upstream_does() {
+    fn outbound_url_never_escapes_apiservice_prefix_via_backslash_or_encoded_separators() {
+        let base = "https://h:443";
+        let prefix = "/apis/g/v";
+        let escapes = |tail: &str| {
+            let url = reqwest::Url::parse(&outbound_url(base, "g", "v", tail, None)).unwrap();
+            let path = url.path();
+            !(path == prefix || path.starts_with(&format!("{prefix}/")))
+        };
+
+        assert!(
+            escapes("flunders/x\\..\\..\\..\\secret"),
+            "precondition: the url crate collapses literal backslash dot segments"
+        );
+
         for tail in [
-            "flunders/a%2Fb",
-            "flunders/a%2fb",
-            "flunders/a%5Cb",
-            "flunders/a%5cb",
-            "flunders/a\\b",
-            "flunders//b",
-            "a%5c..%5cb",
+            "flunders/x\\..\\..\\..\\secret",
             "a\\..\\b",
+            "flunders/x%5c..%5c..%5c..%5csecret",
+            "flunders/x%5C..%5C..%5C..%5Csecret",
+            "flunders/x%2f..%2f..%2f..%2fsecret",
+            "flunders/x%2F%2e%2e%2F%2E%2E%2Fsecret",
+            "flunders/x/..\\..\\secret",
+            "flunders/x\\%2e%2e\\secret",
+            "flunders/a%2Fb",
+            "flunders/a%5Cb",
         ] {
             assert!(
-                tail_stays_under_prefix(tail),
-                "{tail:?} is proxied by upstream kube-aggregator; refusing it breaks clients \
-                 that name resources with encoded separators"
+                !tail_stays_under_prefix(tail) || !escapes(tail),
+                "{tail:?} passes the guard yet the outbound URL leaves the APIService prefix"
             );
+        }
+
+        for tail in ["", "namespaces/default/flunders/a.b", "flunders/%252e%252e"] {
+            assert!(tail_stays_under_prefix(tail) && !escapes(tail), "{tail:?}");
         }
     }
 
@@ -2255,7 +2283,15 @@ mod tests {
             }
         };
 
-        for tail in ["../../api/v1/secrets", "%2e%2e/%2e%2e/x", "a%2f..%2f..%2fx"] {
+        // `n%2Fstatus` is authorized by RBAC as a get on flunders/`n%2Fstatus` but the backend
+        // would decode it to flunders/n/status; it must never reach the backend.
+        for tail in [
+            "../../api/v1/secrets",
+            "%2e%2e/%2e%2e/x",
+            "a%2f..%2f..%2fx",
+            "flunders/n%2Fstatus",
+            "flunders/x\\..\\..\\secret",
+        ] {
             let resp = call(tail).await;
             assert_eq!(
                 resp.status(),
@@ -2272,16 +2308,6 @@ mod tests {
         let resp = call("namespaces/default/flunders").await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert_eq!(backend.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-        let resp = call("flunders/a%2Fb").await;
-        assert_eq!(
-            resp.status(),
-            axum::http::StatusCode::OK,
-            "an encoded slash must reach the backend as upstream's aggregator does"
-        );
-        let resp = call("flunders/a%5Cb").await;
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        assert_eq!(backend.hits.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     /// An aggregated API backed by a Service must be reached through the Service's ClusterIP
