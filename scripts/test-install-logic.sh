@@ -1547,6 +1547,46 @@ done
 assert_true "the control-plane path records the CA/SA fingerprint before restarting the apiserver and verifies it after (an upgrade must not re-mint cluster identity)" \
   grep -qF 'verify_cp_identity_preserved "$CP_IDENTITY_BEFORE"' "$INSTALL"
 
+# First-boot race: the apiserver writes its CA/keys/kubeconfigs some time after
+# `systemctl restart u7s-apiserver` returns. The wait runs against a stub whose
+# sleep() writes the files only after N polls (kubeconfig last, as the real
+# apiserver does), so removing the wait or dropping a file from its list fails.
+WAITFILES_WORK="$(mktemp -d)"
+WAITFILES_RUNNER="$WAITFILES_WORK/run.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'dir="$1"; polls=0'
+  echo 'sleep() { polls=$((polls+1)); if [ "$polls" -ge "${APPEAR_AFTER:-999999}" ]; then for f in ca.crt ca.key sa.key kubeconfig kcm-kubeconfig; do [ "$f" = "${NEVER:-}" ] || echo x > "$dir/$f"; done; fi; }'
+  awk '/^wait_for_apiserver_files\(\) \{/,/^\}/' "$INSTALL"
+  echo 'wait_for_apiserver_files "$dir"; echo "polls=$polls"'
+} > "$WAITFILES_RUNNER"
+
+wf_dir="$WAITFILES_WORK/late"; mkdir -p "$wf_dir"
+wf_out="$(APPEAR_AFTER=5 bash "$WAITFILES_RUNNER" "$wf_dir" 2>&1)" && wf_status=0 || wf_status=$?
+assert "install waits for files the apiserver writes after its restart returns instead of racing them (a slow first boot otherwise fails the KCM restart)" \
+  "$([ "$wf_status" -eq 0 ] && printf '%s' "$wf_out" | grep -q 'polls=5' && echo 1 || echo 0)"
+
+wf_dir="$WAITFILES_WORK/present"; mkdir -p "$wf_dir"
+for f in ca.crt ca.key sa.key kubeconfig kcm-kubeconfig; do echo x > "$wf_dir/$f"; done
+wf_out="$(bash "$WAITFILES_RUNNER" "$wf_dir" 2>&1)" && wf_status=0 || wf_status=$?
+assert "a re-run with the identity already on disk does not wait (upgrades must not pay the first-boot delay)" \
+  "$([ "$wf_status" -eq 0 ] && printf '%s' "$wf_out" | grep -q 'polls=0' && echo 1 || echo 0)"
+
+for missing in ca.crt kcm-kubeconfig; do
+  wf_dir="$WAITFILES_WORK/never-$missing"; mkdir -p "$wf_dir"
+  wf_out="$(APPEAR_AFTER=1 NEVER="$missing" bash "$WAITFILES_RUNNER" "$wf_dir" 2>&1)" && wf_status=0 || wf_status=$?
+  assert "a $missing that never appears fails the install naming that file (an operator must see which artefact is missing, not a later unit failure)" \
+    "$([ "$wf_status" -ne 0 ] && printf '%s' "$wf_out" | grep -qF "error: u7s-apiserver did not write $wf_dir/$missing" && echo 1 || echo 0)"
+done
+rm -rf "$WAITFILES_WORK"
+
+wf_apiserver_line="$(grep -n '^if ! systemctl restart u7s-apiserver.service' "$INSTALL" | cut -d: -f1)"
+wf_wait_line="$(grep -n '^wait_for_apiserver_files "\$STATE_DIR"' "$INSTALL" | cut -d: -f1)"
+wf_kcm_line="$(grep -n '^systemctl restart u7s-kcm.service' "$INSTALL" | cut -d: -f1)"
+assert "the file wait sits between the apiserver restart and the KCM/kubelet restarts (otherwise the wait guards nothing)" \
+  "$([ -n "$wf_apiserver_line" ] && [ -n "$wf_wait_line" ] && [ -n "$wf_kcm_line" ] && [ "$wf_apiserver_line" -lt "$wf_wait_line" ] && [ "$wf_wait_line" -lt "$wf_kcm_line" ] && echo 1 || echo 0)"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
