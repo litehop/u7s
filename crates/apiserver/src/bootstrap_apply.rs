@@ -334,6 +334,8 @@ fn kind_to_resource(kind: &str) -> anyhow::Result<(&'static str, bool)> {
         "DaemonSet" => ("daemonsets", true),
         "ClusterRole" => ("clusterroles", false),
         "ClusterRoleBinding" => ("clusterrolebindings", false),
+        "Role" => ("roles", true),
+        "RoleBinding" => ("rolebindings", true),
         "Namespace" => ("namespaces", false),
         other => anyhow::bail!(
             "bootstrap applier does not know the REST resource for kind {other:?} — it only \
@@ -563,6 +565,22 @@ mod tests {
             ("namespaces", false),
             "Namespace must resolve to the cluster-scoped 'namespaces' resource, matching \
              ClusterRole's non-namespaced shape"
+        );
+    }
+
+    /// `manifests/beep.yaml` scopes its Secret/Lease/Event grants to namespaces with Roles; a
+    /// ClusterRole substitute would widen them cluster-wide, so the applier must resolve
+    /// namespaced RBAC kinds rather than fatal-boot the apiserver on them.
+    #[test]
+    fn kind_to_resource_supports_role_and_rolebinding_as_namespaced_so_beeps_scoped_rbac_doesnt_fatal_boot(
+    ) {
+        assert_eq!(
+            kind_to_resource("Role").expect("Role must be a known kind"),
+            ("roles", true)
+        );
+        assert_eq!(
+            kind_to_resource("RoleBinding").expect("RoleBinding must be a known kind"),
+            ("rolebindings", true)
         );
     }
 
@@ -1230,6 +1248,56 @@ mod tests {
              Namespace document was applied before the ConfigMap that depends on it, matching \
              flannel.yaml's own document order",
             );
+    }
+
+    /// The real `manifests/beep.yaml` (placeholders substituted as install.sh does) must apply
+    /// cleanly: it ships namespaced Roles/RoleBindings whose `create` grants need the
+    /// bootstrap-installer's `escalate`/`bind`. A 403 here fatal-boots every install, since beep
+    /// is applied by default.
+    #[tokio::test]
+    async fn beep_manifest_applies_with_namespaced_rbac_through_the_bootstrap_installer() {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("beep");
+        let manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../manifests/beep.yaml"
+        ))
+        .expect("repo-root manifests/beep.yaml must exist and be readable")
+        .replace("__IFACE__", "eth0")
+        .replace("__POD_CLUSTER_CIDR__", "10.244.0.0/16");
+        std::fs::write(dir.join("beep.yaml"), manifest).expect("write beep.yaml");
+
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
+            .await
+            .expect("the vendored beep manifest must apply through the bootstrap installer");
+
+        for key in [
+            crate::keys::group_object_key(
+                "rbac.authorization.k8s.io",
+                "roles",
+                Some("kube-system"),
+                "servicelb-controller-flow-hash-seed",
+            ),
+            crate::keys::group_object_key(
+                "rbac.authorization.k8s.io",
+                "rolebindings",
+                Some("beep-leases"),
+                "servicelb-controller-node-lease",
+            ),
+            crate::keys::group_object_key(
+                "apps",
+                "daemonsets",
+                Some("kube-system"),
+                "servicelb-controller",
+            ),
+        ] {
+            server
+                .store
+                .get(&key)
+                .await
+                .expect("store get must not fail")
+                .unwrap_or_else(|| panic!("{key} must exist after applying beep.yaml"));
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -1,5 +1,9 @@
 # Dev Setup
 
+## Rust toolchain
+
+The Rust toolchain is pinned by `rust-toolchain.toml` at the repo root; rustup installs it on the first `cargo` run and CI uses the same file.
+
 ## kubectl
 
 kubectl is pinned per-project via [aqua](https://aquaproj.github.io/) to avoid touching your system install.
@@ -113,3 +117,5 @@ scripts/gcp/vps.sh down t1
 ```
 
 The apiserver listens on the internal IP only, so run kubectl on the VPS. MariaDB's PVC stays Pending without csi-hostpath; use `emptyDir` instead, as the gate's rewrite does (`scripts/release-gate/burst-gate.sh`, "emptyDir").
+
+**Two-node install + join check.** `scripts/e2e-install/cloud-two-node.sh --release <tag> [--keep]` creates VPSes `cp` and `w1` under a run-unique `u7s-e2e-` prefix, installs from the mirror, joins `w1` with a token passed on stdin, and asserts both nodes Ready, a pod pinned to `w1`, `kubectl logs/exec`, cross-node pod traffic and `webhook-smoke.sh`. If the release bundles beep it also creates a client VPS and checks that a `type=LoadBalancer` Service answers from it with the client's internal IP preserved (otherwise `SKIPPED`). A preempted VPS reports `PREEMPTED`, not `FAIL`. Without `--keep` it deletes only the VPSes it created. Results land in `temp/e2e-install/<timestamp>/`.

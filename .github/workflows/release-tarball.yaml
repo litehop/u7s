@@ -72,7 +72,8 @@ jobs:
 
       # No rust-cache: a cache restored from main-branch CI would feed
       # attacker-controlled build output into the release.
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
 
       - name: Build tarball
         env:

@@ -74,6 +74,19 @@ fn tail_stays_under_prefix(tail: &str) -> bool {
     })
 }
 
+fn outbound_url(base: &str, group: &str, version: &str, tail: &str, query: Option<&str>) -> String {
+    let mut url = format!("{base}/apis/{group}/{version}");
+    if !tail.is_empty() {
+        url.push('/');
+        url.push_str(tail);
+    }
+    if let Some(q) = query.filter(|q| !q.is_empty()) {
+        url.push('?');
+        url.push_str(q);
+    }
+    url
+}
+
 fn percent_decode(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -438,15 +451,7 @@ pub async fn proxy_to_backend<S: Store>(
         .into_response();
     }
 
-    let mut url = format!("{base}/apis/{group}/{version}");
-    if !tail.is_empty() {
-        url.push('/');
-        url.push_str(tail);
-    }
-    if let Some(q) = query.filter(|q| !q.is_empty()) {
-        url.push('?');
-        url.push_str(q);
-    }
+    let url = outbound_url(&base, group, version, tail, query);
 
     let client = match build_backend_client(state, apiservice).await {
         Ok(c) => c,
@@ -2164,12 +2169,57 @@ mod tests {
             "a%2f..%2fb",
             "a%2F%2e%2e%2Fb",
             "a%5c..%5cb",
+            "a\\..\\b",
+            "flunders/x\\..\\..\\..\\secret",
+            "flunders/n%2Fstatus",
+            "flunders/n%2fstatus",
         ] {
             assert!(
                 !tail_stays_under_prefix(tail),
                 "{tail:?} would let the backend resolve a path outside the APIService prefix \
                  under the caller's asserted identity"
             );
+        }
+    }
+
+    /// The url crate treats a literal `\` as `/` for https and collapses dot segments, so
+    /// `x\..\..\..\secret` would resolve to `/apis/g/secret`. Guard-passing tails must yield an
+    /// outbound URL that stays under the APIService prefix; the escaping ones must be refused.
+    #[test]
+    fn outbound_url_never_escapes_apiservice_prefix_via_backslash_or_encoded_separators() {
+        let base = "https://h:443";
+        let prefix = "/apis/g/v";
+        let escapes = |tail: &str| {
+            let url = reqwest::Url::parse(&outbound_url(base, "g", "v", tail, None)).unwrap();
+            let path = url.path();
+            !(path == prefix || path.starts_with(&format!("{prefix}/")))
+        };
+
+        assert!(
+            escapes("flunders/x\\..\\..\\..\\secret"),
+            "precondition: the url crate collapses literal backslash dot segments"
+        );
+
+        for tail in [
+            "flunders/x\\..\\..\\..\\secret",
+            "a\\..\\b",
+            "flunders/x%5c..%5c..%5c..%5csecret",
+            "flunders/x%5C..%5C..%5C..%5Csecret",
+            "flunders/x%2f..%2f..%2f..%2fsecret",
+            "flunders/x%2F%2e%2e%2F%2E%2E%2Fsecret",
+            "flunders/x/..\\..\\secret",
+            "flunders/x\\%2e%2e\\secret",
+            "flunders/a%2Fb",
+            "flunders/a%5Cb",
+        ] {
+            assert!(
+                !tail_stays_under_prefix(tail) || !escapes(tail),
+                "{tail:?} passes the guard yet the outbound URL leaves the APIService prefix"
+            );
+        }
+
+        for tail in ["", "namespaces/default/flunders/a.b", "flunders/%252e%252e"] {
+            assert!(tail_stays_under_prefix(tail) && !escapes(tail), "{tail:?}");
         }
     }
 
@@ -2233,7 +2283,15 @@ mod tests {
             }
         };
 
-        for tail in ["../../api/v1/secrets", "%2e%2e/%2e%2e/x", "a%2f..%2f..%2fx"] {
+        // `n%2Fstatus` is authorized by RBAC as a get on flunders/`n%2Fstatus` but the backend
+        // would decode it to flunders/n/status; it must never reach the backend.
+        for tail in [
+            "../../api/v1/secrets",
+            "%2e%2e/%2e%2e/x",
+            "a%2f..%2f..%2fx",
+            "flunders/n%2Fstatus",
+            "flunders/x\\..\\..\\secret",
+        ] {
             let resp = call(tail).await;
             assert_eq!(
                 resp.status(),
