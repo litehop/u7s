@@ -34,7 +34,7 @@ done
 [[ "$RELEASE" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || usage
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-RUN_ID="${U7S_E2E_RUN_ID:-$(date -u +%m%d%H%M%S)}"
+RUN_ID="${U7S_E2E_RUN_ID:-$(date -u +%m%d%H%M%S)-$$}"
 OUT="${U7S_E2E_RESULTS_DIR:-$ROOT/temp/e2e-install/$TS}"
 SLEEP="${U7S_E2E_POLL_SLEEP:-10}"
 CP="u7s-e2e-$RUN_ID-cp"
@@ -44,10 +44,13 @@ INSTALL_URL="https://u7s.dekiru.tech/$RELEASE/install.sh"
 KC="sudo kubectl --kubeconfig /var/lib/u7s/kubeconfig"
 AGNHOST=registry.k8s.io/e2e-test-images/agnhost:2.63.0
 
-mkdir -p "$OUT"
-exec > >(tee "$OUT/run.log") 2>&1
-
 gcp_require_config
+PROJECT="$(gcloud config get-value project 2>/dev/null)"
+redact() { sed "s|$PROJECT|<project>|g"; }
+
+mkdir -p "$OUT"
+exec > >(redact | tee "$OUT/run.log") 2>&1
+
 gcp_print_target | sed 's/^target: .*/target: <redacted>/'
 echo "results: $OUT"
 ZONE="$(gcp_zone)"
@@ -62,7 +65,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # step NAME cmd...: runs cmd (stdin passes through), keeping its output in $OUT/NAME.log.
 step() {
   local name="$1"; shift
-  if "$@" >"$OUT/$name.log" 2>&1; then
+  if "$@" 2>&1 | redact >"$OUT/$name.log"; then
     echo "PASS: $name"
   else
     tail -n 20 "$OUT/$name.log" >&2
@@ -93,11 +96,13 @@ finish() {
   exit "$rc"
 }
 trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 up() {
   local n="$1"
   CREATED+=("$n")
-  vps up "$n" >"$OUT/up-$n.log" 2>&1 || fail "creating $n (see $OUT/up-$n.log)"
+  vps up "$n" 2>&1 | redact >"$OUT/up-$n.log" || fail "creating $n (see $OUT/up-$n.log)"
   for _ in $(seq 1 30); do
     vps ssh "$n" -- true >/dev/null 2>&1 && return 0
     sleep "$SLEEP"
@@ -138,6 +143,7 @@ apply_lb() {
 up "$CP"
 up "$W1"
 CP_IP="$(internal_ip "$CP")"
+W1_IP="$(internal_ip "$W1")"
 echo "cp=$CP ($CP_IP) w1=$W1"
 
 step install-cp on_cp "curl -fsSL $INSTALL_URL -o /tmp/install.sh && sudo bash /tmp/install.sh"
@@ -159,7 +165,8 @@ step logs-exec on_cp "$KC logs pin | grep -q . && $KC exec pin -- /agnhost hostn
 step cross-node-pod-to-pod on_cp "$KC exec peer -- /agnhost connect \$($KC get pod pin -o jsonpath='{.status.podIP}'):8080 --timeout=10s"
 step webhook-smoke webhook_smoke
 
-if ! on_cp "$KC -n kube-system get ds -o name | grep -qi beep" >/dev/null 2>&1; then
+daemonsets="$(on_cp "$KC -n kube-system get ds -o name" 2>/dev/null)" || fail "listing kube-system DaemonSets on $CP"
+if ! grep -qx 'daemonset.apps/servicelb-controller' <<<"$daemonsets"; then
   echo "SKIPPED: loadbalancer (release $RELEASE does not bundle beep)"
   exit 0
 fi
@@ -176,6 +183,12 @@ for _ in $(seq 1 30); do
 done
 [ -n "$ingress" ] || fail "Service lb never got a LoadBalancer ingress IP"
 echo "ingress IPs: $ingress; client $CLIENT ($CLIENT_IP)"
+for node_ip in "$CP_IP" "$W1_IP"; do
+  case " $ingress " in
+    *" $node_ip "*) ;;
+    *) fail "LoadBalancer ingress ($ingress) lacks node IP $node_ip; the via-pod-less-node path is untested" ;;
+  esac
+done
 for ip in $ingress; do
   seen="$(vps ssh "$CLIENT" -- curl -fsS --max-time 15 "http://$ip/clientip")" || fail "curl http://$ip from $CLIENT"
   [ "${seen%:*}" = "$CLIENT_IP" ] || fail "backend saw client ${seen%:*} via $ip, expected $CLIENT_IP"

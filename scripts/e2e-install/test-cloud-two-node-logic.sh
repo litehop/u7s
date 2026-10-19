@@ -30,23 +30,36 @@ cat >"$TMP/bin/gcloud" <<'EOF'
 echo "$*" >>"$STUB_LOG"
 case "$*" in
   "config configurations describe "*) exit 0 ;;
-  "config get-value project") echo proj; exit 0 ;;
+  "config get-value project") echo fake-proj-123; exit 0 ;;
   "config get-value account") echo acct@example.com; exit 0 ;;
   "config get-value compute/zone") echo us-west1-b; exit 0 ;;
   "compute instances describe "*networkIP*)
     case "$*" in *-cp\ *) echo 10.80.0.2 ;; *-w1\ *) echo 10.80.0.3 ;; *) echo 10.80.0.4 ;; esac; exit 0 ;;
+  "compute instances create "*)
+    [ -z "${STUB_LEAK:-}" ] || echo "Created [https://compute.googleapis.com/projects/fake-proj-123/zones/z/instances/x]" >&2
+    exit 0 ;;
   "compute instances describe "*) echo 1; exit 0 ;;
   "compute operations list "*) echo "${STUB_OPS:-}"; exit 0 ;;
   "compute ssh "*)
     cat >>"$STUB_LOG.stdin"
-    [ -z "${STUB_FAIL_MATCH:-}" ] || case "$*" in *"$STUB_FAIL_MATCH"*) exit 1 ;; esac
+    [ -z "${STUB_TERM_MATCH:-}" ] || case "$*" in *"$STUB_TERM_MATCH"*) kill -TERM "$(ps -axo pid=,command= | grep -F "bash $STUB_SCRIPT" | sort -n | awk 'NR==1{print $1}')" ;; esac
+    [ -z "${STUB_FAIL_MATCH:-}" ] || case "$*" in
+      *"$STUB_FAIL_MATCH"*)
+        [ -z "${STUB_LEAK:-}" ] || echo "ERROR: https://compute.googleapis.com/projects/fake-proj-123/zones/z failed" >&2
+        exit 1 ;;
+    esac
     case "$*" in
       *--mint-join-token*)
         echo "Join token created in kube-system, expires 2026-10-20T00:00:00Z (single-use): $STUB_TOKEN"
         echo "  install.sh --join https://127.0.0.1:6443 \\"
         echo "    --ca-cert-hash $STUB_HASH --tarball <path> --node-name <name>" ;;
-      *"grep -qi beep"*) [ "${STUB_BEEP:-0}" = 1 ] || exit 1 ;;
-      *loadBalancer.ingress*) echo "${STUB_INGRESS-10.80.0.50 10.80.0.51}" ;;
+      *"get ds -o name"*)
+        echo daemonset.apps/kube-proxy
+        case "${STUB_BEEP:-0}" in
+          1) echo daemonset.apps/servicelb-controller ;;
+          decoy) echo daemonset.apps/beep-exporter ;;
+        esac ;;
+      *loadBalancer.ingress*) echo "${STUB_INGRESS-10.80.0.2 10.80.0.3}" ;;
       *"/clientip"*) echo "${STUB_SEEN-10.80.0.4}:41234" ;;
     esac
     exit 0 ;;
@@ -60,7 +73,7 @@ run() {
   : >"$TMP/log"; : >"$TMP/log.stdin"; rm -rf "$TMP/res"
   RC=0
   OUT="$(PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/log" STUB_TOKEN="$TOKEN" STUB_HASH="$HASH" \
-    U7S_E2E_RUN_ID=t U7S_E2E_RESULTS_DIR="$TMP/res" U7S_E2E_POLL_SLEEP=0 \
+    STUB_SCRIPT="$SCRIPT" U7S_E2E_RUN_ID=t U7S_E2E_RESULTS_DIR="$TMP/res" U7S_E2E_POLL_SLEEP=0 \
     "$SCRIPT" "$@" 2>&1 </dev/null)" || RC=$?
   LOG="$(cat "$TMP/log")"
   STDIN="$(cat "$TMP/log.stdin")"
@@ -101,7 +114,7 @@ assert "cleanup never uses gc (it sweeps every u7s-test=1 instance, including ot
   "$(hasnt 'instances list' "$LOG")"
 assert "the results directory records PASS" "$(has PASS "$(cat "$TMP/res/result.txt")")"
 assert "the target line is redacted (project/account must not reach logs)" \
-  "$(has 'target: <redacted>' "$OUT")$(hasnt 'acct@example.com' "$OUT")$(hasnt 'project=proj' "$OUT")"
+  "$(has 'target: <redacted>' "$OUT")$(hasnt 'acct@example.com' "$OUT")$(hasnt 'project=fake-proj-123' "$OUT")"
 
 # --- failure and preemption
 STUB_FAIL_MATCH="wait --for=condition=Ready node" run --release v0.4.0-snapshot.1
@@ -124,7 +137,7 @@ assert "--keep prints how to reach each VPS and the kubeconfig path" \
 # --- LoadBalancer check (beep bundled)
 STUB_BEEP=1 run --release v0.4.0-snapshot.1
 assert "with beep a client VPS is created in the subnet and every ingress IP is curled from it" \
-  "$(rc_is 0)$(has 'instances create u7s-e2e-t-client' "$LOG")$(has 'http://10.80.0.50/clientip' "$LOG")$(has 'http://10.80.0.51/clientip' "$LOG")"
+  "$(rc_is 0)$(has 'instances create u7s-e2e-t-client' "$LOG")$(has 'http://10.80.0.2/clientip' "$LOG")$(has 'http://10.80.0.3/clientip' "$LOG")"
 assert "the client VPS is cleaned up too" "$(has 'instances delete u7s-e2e-t-client ' "$LOG")"
 assert "SKIPPED is not printed when the LB check ran" "$(hasnt 'SKIPPED' "$OUT")"
 STUB_BEEP=1 STUB_SEEN=10.80.0.3 run --release v0.4.0-snapshot.1
@@ -134,5 +147,23 @@ STUB_BEEP=1 STUB_INGRESS="" run --release v0.4.0-snapshot.1
 assert "a Service that never gets an ingress IP fails instead of passing vacuously" \
   "$(rc_is 1)$(has 'never got a LoadBalancer ingress IP' "$OUT")"
 
-echo "$PASS passed, $FAIL failed"
+STUB_BEEP=1 STUB_INGRESS="10.80.0.2" run --release v0.4.0-snapshot.1
+assert "an ingress list missing a node IP fails: the via-pod-less-node path would go unchecked" \
+  "$(rc_is 1)$(has 'lacks node IP 10.80.0.3' "$OUT")"
+STUB_BEEP=decoy run --release v0.4.0-snapshot.1
+assert "only the real servicelb-controller DaemonSet counts as beep; a lookalike name is SKIPPED" \
+  "$(rc_is 0)$(has 'SKIPPED: loadbalancer' "$OUT")"
+STUB_BEEP=1 STUB_FAIL_MATCH="get ds -o name" run --release v0.4.0-snapshot.1
+assert "a failed DaemonSet listing is FAIL, not a silent SKIPPED pass" \
+  "$(rc_is 1)$(hasnt 'SKIPPED' "$OUT")$(has 'listing kube-system DaemonSets' "$OUT")"
+
+# --- redaction and interrupts
+STUB_LEAK=1 STUB_FAIL_MATCH="wait --for=condition=Ready node" run --release v0.4.0-snapshot.1
+assert "the project id never reaches the run log, step logs or up logs (they get copied around)" \
+  "$(hasnt 'fake-proj-123' "$OUT")$(hasnt 'fake-proj-123' "$RES")$(has 'projects/<project>/' "$RES")"
+STUB_TERM_MATCH="wait --for=condition=Ready node" run --release v0.4.0-snapshot.1
+assert "SIGTERM mid-run still deletes the VPSes (they bill otherwise)" \
+  "$(rc_is 143)$(has 'instances delete u7s-e2e-t-cp ' "$LOG")$(has 'instances delete u7s-e2e-t-w1 ' "$LOG")"
+
+echo "$PASS passed,$FAIL failed"
 [ "$FAIL" = 0 ]
