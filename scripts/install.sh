@@ -229,6 +229,24 @@ wait_for_apiserver() {
   fi
 }
 
+# Block until u7s-apiserver's first run has written every file the control-plane
+# units read at start. systemctl restart returns once the process is spawned,
+# and a first boot on a slow core can take well over a second to mint the CA.
+wait_for_apiserver_files() {
+  local dir="$1" f missing=""
+  echo "Waiting for u7s-apiserver to write its CA, keys and kubeconfigs..."
+  for _ in $(seq 1 60); do
+    missing=""
+    for f in ca.crt ca.key sa.key kubeconfig kcm-kubeconfig; do
+      [ -s "$dir/$f" ] || { missing="$dir/$f"; break; }
+    done
+    [ -z "$missing" ] && return 0
+    sleep 2
+  done
+  echo "error: u7s-apiserver did not write $missing within 120s (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)" >&2
+  exit 1
+}
+
 # Only --mint-join-token/--join need jq; not installed unconditionally so the
 # default path's apt footprint stays unchanged.
 ensure_jq() {
@@ -1239,8 +1257,8 @@ fi
 #
 # u7s-apiserver writes ca.key/ca.crt/sa.key/sa.pub/kubeconfig on its first run,
 # and Type=simple guarantees only that the process started, not that those
-# writes finished -- so each dependent unit's first ExecStart can legitimately
-# fail. Restart=always absorbs that race, so no wait-loop is needed.
+# writes finished -- so the dependent units are only restarted after
+# wait_for_apiserver_files. Restart=always remains for later crashes.
 
 # Pod CIDR for node-ipam-controller (below) and Flannel's net-conf.json
 # (applied further down) -- one variable so the two can never drift apart.
@@ -1425,6 +1443,7 @@ if ! systemctl restart u7s-apiserver.service; then
   echo "error: failed to restart u7s-apiserver.service (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)" >&2
   exit 1
 fi
+wait_for_apiserver_files "$STATE_DIR"
 systemctl enable u7s-kcm.service
 systemctl restart u7s-kcm.service
 systemctl enable kubelet.service
