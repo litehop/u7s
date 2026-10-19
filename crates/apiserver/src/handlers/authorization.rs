@@ -400,18 +400,26 @@ pub async fn subject_access_review<S: Store>(
     // The auth middleware already enforces this at the HTTP layer, but we also
     // check here so that the restriction is visible in the handler, and so it
     // remains in effect even if route ordering or middleware ever changes.
+    //
+    // Decided by `authorized` (Node authorizer + RBAC), like the middleware: a kubelet's
+    // `system:node:<name>` identity is granted this only by the Node authorizer, so an
+    // RBAC-only check would 403 every kubelet webhook-authz call (logs/exec/attach).
     let caller_allowed = caller.groups.iter().any(|g| g == "system:masters")
-        || state.rbac_index.is_allowed(&crate::rbac::AuthzRequest {
-            username: &caller.username,
-            groups: &caller.groups,
-            verb: "create",
-            api_group: "authorization.k8s.io",
-            resource: "subjectaccessreviews",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: None,
-        });
+        || authorized(
+            &crate::rbac::AuthzRequest {
+                username: &caller.username,
+                groups: &caller.groups,
+                verb: "create",
+                api_group: "authorization.k8s.io",
+                resource: "subjectaccessreviews",
+                subresource: "",
+                namespace: None,
+                name: None,
+                non_resource_url: None,
+            },
+            &state.node_graph,
+            &state.rbac_index,
+        );
 
     if !caller_allowed {
         return (
@@ -557,17 +565,21 @@ pub async fn local_subject_access_review<S: Store>(
     // Same privilege gate as SubjectAccessReview: only system:masters or
     // callers with `create localsubjectaccessreviews` may probe other subjects.
     let caller_allowed = caller.groups.iter().any(|g| g == "system:masters")
-        || state.rbac_index.is_allowed(&crate::rbac::AuthzRequest {
-            username: &caller.username,
-            groups: &caller.groups,
-            verb: "create",
-            api_group: "authorization.k8s.io",
-            resource: "localsubjectaccessreviews",
-            subresource: "",
-            namespace: Some(&namespace),
-            name: None,
-            non_resource_url: None,
-        });
+        || authorized(
+            &crate::rbac::AuthzRequest {
+                username: &caller.username,
+                groups: &caller.groups,
+                verb: "create",
+                api_group: "authorization.k8s.io",
+                resource: "localsubjectaccessreviews",
+                subresource: "",
+                namespace: Some(&namespace),
+                name: None,
+                non_resource_url: None,
+            },
+            &state.node_graph,
+            &state.rbac_index,
+        );
 
     if !caller_allowed {
         return (
@@ -1832,6 +1844,62 @@ mod handler_tests {
             StatusCode::FORBIDDEN,
             "unprivileged caller must get 403, not a result"
         );
+    }
+
+    /// A kubelet (`system:node:<name>`, group `system:nodes`) is granted SAR/LocalSAR create
+    /// only by the Node authorizer — the `system:node` ClusterRoleBinding has no subjects. The
+    /// handler must accept it: the kubelet's webhook authorizer sends one SAR per incoming
+    /// request, so a 403 here makes `kubectl logs/exec/attach` fail with "Authorization error"
+    /// on any cluster whose kubelet is not the system:masters admin (every install.sh cluster).
+    #[tokio::test]
+    async fn sar_and_local_sar_accept_a_kubelet_node_identity_so_logs_and_exec_authorize() {
+        let state = make_state();
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/system:node",
+            &serde_json::json!({ "rules": [
+                { "apiGroups": ["authorization.k8s.io"],
+                  "resources": ["subjectaccessreviews", "localsubjectaccessreviews"],
+                  "verbs": ["create"] }
+            ]}),
+        );
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                post(subject_access_review),
+            )
+            .route(
+                "/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews",
+                post(local_subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "user": "kube-apiserver-kubelet-client",
+                "groups": ["system:masters"],
+                "resourceAttributes": {
+                    "verb": "get", "group": "", "resource": "nodes",
+                    "subresource": "proxy", "name": "n1"
+                }
+            }
+        });
+        for uri in [
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews",
+        ] {
+            let req = json_req(
+                "POST",
+                uri,
+                body.clone(),
+                user("system:node:n1", &["system:nodes"]),
+            );
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::CREATED,
+                "a kubelet identity must be allowed to create reviews at {uri}"
+            );
+        }
     }
 
     /// A caller in system:masters must be able to use SAR — they can probe any
