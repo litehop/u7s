@@ -16,6 +16,9 @@ answer per component rather than resolving it ad hoc at install time.
   the same way u7s's own binaries ship.
 - **kube-proxy** — not vendored as a host binary. Ships as an in-cluster
   DaemonSet manifest; its pods pull the upstream image at runtime.
+- **litehop/beep** — in-cluster DaemonSet manifest (`manifests/beep.yaml`),
+  the default Service `type=LoadBalancer` provider (the k3s klipper-lb role).
+  Needs systemd and kernel >= 6.6; `install.sh` checks the kernel.
 - **CRI-O + crun** — host dependency, installed by the install script via
   `apt`. Ubuntu only for now.
 - **CoreDNS** — in-cluster manifest, applied through the existing
@@ -55,5 +58,8 @@ default-bloat failure mode the packaging philosophy exists to avoid.
 
 - CRI-O beyond Ubuntu is unaddressed until there is demand.
 - HPA requires a user-applied manifest.
+- beep deviates from upstream for `externalTrafficPolicy: Local` (a node with
+  no local endpoint forwards cross-node, client IP preserved, instead of
+  dropping) and honours `sessionAffinity: ClientIP` but not `timeoutSeconds`.
 - kube-proxy replacement is out of u7s scope (beep-side, post-v1.0); this
   ADR governs only the upstream-binary path.

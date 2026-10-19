@@ -913,6 +913,52 @@ else
     "$(grep -qF '__KUBE_VERSION__' "$mutated_dest6/kube-proxy.yaml" && echo 1 || echo 0)"
 fi
 
+# Case 7: the REAL manifests/beep.yaml run through install.sh's substitution
+# must leave no placeholder token behind. An unresolved --pod-cidr makes beep
+# reject every backend Pod, and an unresolved --uplink-iface leaves
+# LoadBalancer traffic unadmitted -- both ship silently as Pending/dead VIPs.
+BEEP_MANIFEST="$ROOT_DIR/manifests/beep.yaml"
+stage7="$MANIFEST_WORK/stage7"
+mkdir -p "$stage7/manifests"
+cp "$BEEP_MANIFEST" "$stage7/manifests/beep.yaml"
+dest7="$MANIFEST_WORK/dest7"
+bash "$MANIFEST_RUNNER" "$stage7" "$dest7" 0 "enp0s9" "10.99.0.0/16"
+assert_true "beep.yaml's --pod-cidr is substituted with install.sh's POD_CLUSTER_CIDR so it cannot drift from KCM's --cluster-cidr" \
+  grep -qF -- '--pod-cidr=10.99.0.0/16' "$dest7/beep.yaml"
+assert_true "beep.yaml's --uplink-iface is substituted with install.sh's resolved --iface so beep admits LoadBalancer traffic on the node's real NIC" \
+  grep -qF -- '--uplink-iface=enp0s9' "$dest7/beep.yaml"
+assert_false "beep.yaml carries no unresolved __IFACE__/__POD_CLUSTER_CIDR__ token once it reaches the well-known folder" \
+  grep -qE '__[A-Z_]+__' "$dest7/beep.yaml"
+assert "beep.yaml's images are all digest-pinned, not a floating tag (:latest would change the privileged node-prep image under a running cluster)" \
+  "$([ "$(grep -E '^[[:space:]]+image: ' "$BEEP_MANIFEST" | grep -vc '@sha256:[0-9a-f]\{64\}$' || true)" = 0 ] && echo 1 || echo 0)"
+MUTATED_BEEP_SUB_INSTALL="$MANIFEST_WORK/install-mutated-beep-sub.sh"
+sed 's/if \[ -f "\$MANIFEST_OUTPUT_DIR\/beep.yaml" \]; then/if false; then/' "$INSTALL" \
+  > "$MUTATED_BEEP_SUB_INSTALL"
+if diff -q "$INSTALL" "$MUTATED_BEEP_SUB_INSTALL" > /dev/null 2>&1; then
+  assert "mutation self-check: beep.yaml's substitution guard exists in install.sh to mutate" 0
+else
+  MUTATED_BEEP_SUB_RUNNER="$MANIFEST_WORK/manifest-copy-mutated-beep-sub.sh"
+  write_manifest_copy_runner "$MUTATED_BEEP_SUB_INSTALL" "$MUTATED_BEEP_SUB_RUNNER"
+  bash "$MUTATED_BEEP_SUB_RUNNER" "$stage7" "$MANIFEST_WORK/dest7-mutated" 0 "enp0s9" "10.99.0.0/16"
+  assert "mutation self-check: with beep.yaml's substitution bypassed, placeholders ship unresolved -- proving the assertions above fail if the substitution is reverted" \
+    "$(grep -qF '__POD_CLUSTER_CIDR__' "$MANIFEST_WORK/dest7-mutated/beep.yaml" && echo 1 || echo 0)"
+fi
+
+# beep's eBPF dataplane needs kernel >= 6.6; installing on an older kernel
+# would leave every LoadBalancer Service Pending with only a crash-looping
+# DaemonSet pod to show for it, so the installer must refuse up front.
+KERNEL_FN="$MANIFEST_WORK/kernel-fn.sh"
+awk '/^kernel_supports_beep\(\) \{$/,/^\}$/' "$INSTALL" > "$KERNEL_FN"
+assert_true "kernel_supports_beep is present in install.sh" test -s "$KERNEL_FN"
+kernel_ok() { bash -c '. "$1"; kernel_supports_beep "$2"' _ "$KERNEL_FN" "$1"; }
+assert_true "kernel 6.6.0 (the floor) is accepted" kernel_ok "6.6.0"
+assert_true "kernel 6.8.0-31-generic is accepted (suffix ignored)" kernel_ok "6.8.0-31-generic"
+assert_true "kernel 7.0.0-31 is accepted (a higher major beats a lower minor)" kernel_ok "7.0.0-31"
+assert_false "kernel 6.5.13 is rejected" kernel_ok "6.5.13"
+assert_false "kernel 5.15.0-100-generic is rejected (a high minor does not beat a lower major)" kernel_ok "5.15.0-100-generic"
+assert_true "install.sh refuses to proceed when the kernel check fails" \
+  grep -qF 'if ! kernel_supports_beep "$(uname -r)"; then' "$INSTALL"
+
 # ---------------------------------------------------------------------------
 # Regression guard: both migrations remove
 # install.sh's own kubectl-apply heredocs entirely -- CoreDNS never had one
