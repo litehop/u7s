@@ -586,8 +586,10 @@ fix** (so a failing P1 fix doesn't strand the small cleanups); commit format
 `<WORKTREE_ROOT>/<cluster-name>-<HEAD_BEAD_ID>`; pre-claim each bead BEFORE
 its commit (so bd state mirrors history one-to-one and a stalled cluster
 leaves a clean partial trail); quality gates after EACH commit + full
-regression after ALL; PR titled `<scope>(<artefact>): <cluster name> (N beads
-incl. <P1 highlights>)`; return PR URL + per-bead one-liner + cross-bead
+regression after ALL; PR titled `<scope>(<artefact>): <cluster name>
+(mayor-a, mayor-b, mayor-c)` listing EVERY bead as its full `mayor-<id>`
+(mayor-tick closes beads on merge from IDs in the title only; "N beads incl."
+closes none); return PR URL + per-bead one-liner + cross-bead
 unifications spotted. Disjoint-surface "small-misc" clusters are valid at
 the tail of a drain — the binding rule is hot-zone parallelism, not strict
 same-surface.
