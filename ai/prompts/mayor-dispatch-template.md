@@ -633,10 +633,13 @@ Critical learnings:
   progress survives a watchdog timeout.
 - **Name the recent landings** so the audit reads the current reality.
 - **Severity tags** (HIGH/MED/LOW/DEFER) make later cluster-formation trivial.
-- **Commit the doc, don't wrap it in a PR.** It's git-tracked under the bead
-  lifecycle (see README's "Findings lifecycle"), but audit output isn't code
-  needing review-before-merge — commit it directly and reference it from the
-  bead's notes.
+- **Commit the doc on the worker branch and push it; don't wrap it in a PR.**
+  Main is protected (merge queue), so the doc lives on the PR-less
+  `worker/agent-<id>` branch, not on main. worktree-hygiene archives such a
+  branch as tag `archive/<bead>-findings` before deleting it; the worker
+  records the pushed branch and commit SHA in the bead's notes, and the mayor
+  reads the doc via `git show archive/<bead>-findings:<path>`. If the doc must
+  land on main (durable reference), open a small docs PR instead.
 
 ---
 
