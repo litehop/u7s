@@ -9288,6 +9288,105 @@ mod tests {
             .status()
     }
 
+    /// A caller holding only `nonResourceURLs: [/api/*]` or a single `resourceNames` grant
+    /// must never get a 2xx on a resource path whose decoded form is invalid UTF-8 or
+    /// contains an empty segment: authz and the route must agree it is a resource request
+    /// for a name the grant does not cover.
+    #[tokio::test]
+    async fn undecodable_or_empty_name_segments_never_pass_narrow_grants() {
+        let store = std::sync::Arc::new(make_store());
+        let mut tokens = std::collections::HashMap::new();
+        for user in ["nonres", "named"] {
+            tokens.insert(
+                format!("{user}-token"),
+                auth::UserInfo {
+                    username: user.into(),
+                    uid: String::new(),
+                    groups: vec![],
+                    extra: Default::default(),
+                },
+            );
+        }
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            tokens,
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+        for (user, rule) in [
+            (
+                "nonres",
+                serde_json::json!({"nonResourceURLs": ["/api/*"], "verbs": ["*"]}),
+            ),
+            (
+                "named",
+                serde_json::json!({"apiGroups": [""], "resources": ["pods"], "resourceNames": ["n"], "verbs": ["get"]}),
+            ),
+        ] {
+            state.rbac_index.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{user}"),
+                &serde_json::json!({"rules": [rule]}),
+            );
+            state.rbac_index.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{user}"),
+                &serde_json::json!({
+                    "subjects": [{"kind": "User", "name": user}],
+                    "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": user}
+                }),
+            );
+        }
+        let app = build_router(state.clone()).layer(AuthLayer::new(
+            std::sync::Arc::clone(&state.rbac_index),
+            (*state.token_map).clone(),
+            state.sa_decoding_key.clone(),
+            std::sync::Arc::clone(&state.store),
+            std::sync::Arc::clone(&state.sa_sig_cache),
+            std::sync::Arc::clone(&state.flowcontrol_cache),
+            std::sync::Arc::clone(&state.node_graph),
+            std::sync::Arc::clone(&state.resource_registry),
+            std::sync::Arc::clone(&state.discovery_cache),
+        ));
+
+        assert_ne!(
+            status_of(&app, "/api/v1/namespaces/ns/pods/n", Some("named-token")).await,
+            axum::http::StatusCode::FORBIDDEN,
+            "control: the resourceNames grant covers pods/n"
+        );
+        for path in [
+            "/api/v1/namespaces/ns/pods/%FF",
+            "/api/v1/namespaces/ns/pods/%ff",
+            "/api/v1/namespaces/ns/pods/a%FFb",
+            "/api/v1/namespaces/ns/pods/%FF/log",
+            "/api/v1/pods/%FF",
+        ] {
+            let status = status_of(&app, path, Some("nonres-token")).await;
+            assert!(
+                !status.is_success(),
+                "{path}: a nonResourceURLs-only caller got {status} on a resource path"
+            );
+            assert_eq!(
+                status,
+                axum::http::StatusCode::FORBIDDEN,
+                "{path}: invalid UTF-8 must be authorized as a resource request, not as the \
+                 non-resource URL /api/*"
+            );
+        }
+        for path in [
+            "/api/v1/namespaces/ns/pods/%2Fn",
+            "/api/v1/namespaces/ns/pods/%2fn",
+            "/api/v1/namespaces/ns/pods//n",
+        ] {
+            let status = status_of(&app, path, Some("named-token")).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::FORBIDDEN,
+                "{path}: an empty name segment must not be authorized as resourceNames [n]"
+            );
+        }
+    }
+
     /// Anonymous callers get exactly what `system:public-info-viewer` grants (health and
     /// version) and nothing else: discovery and OpenAPI document the CRDs and aggregated APIs
     /// installed, so leaking them to `system:unauthenticated` hands an unauthenticated network

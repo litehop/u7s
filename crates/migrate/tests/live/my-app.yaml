@@ -1,0 +1,4 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: dropped-in, namespace: default}
+data: {from: manifest-file}

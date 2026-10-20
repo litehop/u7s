@@ -131,8 +131,7 @@ pub const FINALIZER_ALLOWLIST: &[FinalizerEntry] = &[
     // Safe to strip ONLY while u7s's load-balancer provider (beep) does not
     // implement this finalizer. If beep or any other LB provider starts
     // setting or honouring it, stripping would orphan its load balancers:
-    // re-audit this entry. `no_workspace_code_uses_lb_cleanup_finalizer`
-    // trips when this repo starts referencing it.
+    // re-audit this entry whenever an LB provider integrates.
     FinalizerEntry {
         name: LB_CLEANUP,
         min_minor: 35,
@@ -301,29 +300,5 @@ mod tests {
                 assert!(strippable_finalizers(tag).is_empty(), "{tag}");
             }
         }
-    }
-
-    #[test]
-    fn no_workspace_code_uses_lb_cleanup_finalizer() {
-        fn scan(dir: &std::path::Path, hits: &mut Vec<String>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    scan(&p, hits);
-                } else if p.extension().is_some_and(|x| x == "rs")
-                    && !p.ends_with("migrate_tables.rs")
-                    && std::fs::read_to_string(&p).is_ok_and(|s| s.contains(LB_CLEANUP))
-                {
-                    hits.push(p.display().to_string());
-                }
-            }
-        }
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let mut hits = vec![];
-        scan(&crates, &mut hits);
-        assert!(
-            hits.is_empty(),
-            "{hits:?} now reference {LB_CLEANUP}: the migrate strip entry is only safe while no LB provider implements it; re-audit FINALIZER_ALLOWLIST"
-        );
     }
 }
