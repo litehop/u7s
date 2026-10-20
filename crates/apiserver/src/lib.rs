@@ -31,6 +31,7 @@ mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
 mod node_authz;
 mod patch;
+mod pki;
 mod proto;
 #[cfg(test)]
 mod proto_descriptor;
