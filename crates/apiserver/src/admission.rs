@@ -838,6 +838,15 @@ struct RuleWithOperations {
 // Rule matching
 // ---------------------------------------------------------------------------
 
+/// Matches one `rules[].resources` entry against a request's `resource` or `resource/subresource`,
+/// as upstream's rules.Matcher does: `pods` matches only the main resource, `pods/*` any pods
+/// subresource, `*` only main resources, and `*/*` everything.
+fn resource_rule_matches(rule: &str, request: &str) -> bool {
+    let (rule_res, rule_sub) = rule.split_once('/').unwrap_or((rule, ""));
+    let (req_res, req_sub) = request.split_once('/').unwrap_or((request, ""));
+    (rule_res == "*" || rule_res == req_res) && (rule_sub == "*" || rule_sub == req_sub)
+}
+
 /// Returns true if the webhook rule matches the given resource/operation/group/version.
 ///
 /// Wildcard "*" matches anything. An empty rules list means no rules — does not match.
@@ -863,10 +872,9 @@ pub fn matches_rule(
         let s = v.as_str().unwrap_or("");
         s == "*" || s == version
     });
-    let resource_match = resources.iter().any(|r| {
-        let s = r.as_str().unwrap_or("");
-        s == "*" || s == resource
-    });
+    let resource_match = resources
+        .iter()
+        .any(|r| resource_rule_matches(r.as_str().unwrap_or(""), resource));
     let operation_match = operations.iter().any(|o| {
         let s = o.as_str().unwrap_or("");
         s == "*" || s == operation
@@ -906,7 +914,10 @@ fn matches_rule_typed(
 ) -> bool {
     let group_match = rule.api_groups.iter().any(|g| g == "*" || g == group);
     let version_match = rule.api_versions.iter().any(|v| v == "*" || v == version);
-    let resource_match = rule.resources.iter().any(|r| r == "*" || r == resource);
+    let resource_match = rule
+        .resources
+        .iter()
+        .any(|r| resource_rule_matches(r, resource));
     let operation_match = rule.operations.iter().any(|o| o == "*" || o == operation);
     let scope_match = match rule.scope.as_deref().unwrap_or("*") {
         "Namespaced" => namespace.is_some(),
@@ -4310,6 +4321,30 @@ pub async fn run_validating_webhooks<S: Store>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Webhook/VAP authors rely on upstream's resource/subresource rule grammar: a `pods` rule
+    /// must not start gating pods/exec, while `pods/*` and `*/*` must reach subresources.
+    #[test]
+    fn resource_rule_matches_follows_upstream_subresource_grammar() {
+        assert!(resource_rule_matches("pods", "pods"));
+        assert!(!resource_rule_matches("pods", "pods/ephemeralcontainers"));
+        assert!(resource_rule_matches(
+            "pods/ephemeralcontainers",
+            "pods/ephemeralcontainers"
+        ));
+        assert!(!resource_rule_matches(
+            "pods/status",
+            "pods/ephemeralcontainers"
+        ));
+        assert!(resource_rule_matches("pods/*", "pods/ephemeralcontainers"));
+        assert!(resource_rule_matches("*", "pods"));
+        assert!(!resource_rule_matches("*", "pods/ephemeralcontainers"));
+        assert!(resource_rule_matches("*/*", "pods/ephemeralcontainers"));
+        assert!(resource_rule_matches(
+            "*/ephemeralcontainers",
+            "pods/ephemeralcontainers"
+        ));
+    }
     use axum::routing::post;
     use axum::Router;
     use serde_json::json;
