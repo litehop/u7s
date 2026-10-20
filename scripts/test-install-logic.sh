@@ -105,6 +105,17 @@ assert_true "u7s-kcm.service delegates authentication to the apiserver via the f
   grep -qF -- '--authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig' <<<"$kcm_exec_line"
 assert_true "u7s-kcm.service delegates authorization to the apiserver (SubjectAccessReview), so /metrics honours system:monitoring RBAC" \
   grep -qF -- '--authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig' <<<"$kcm_exec_line"
+kcm_unit="$(awk '/^cat > \/etc\/systemd\/system\/u7s-kcm.service/,/^EOF$/' "$INSTALL")"
+assert_true "u7s-kcm.service sets StartLimitIntervalSec=0 -- KCM exits until the apiserver publishes extension-apiserver-authentication, and systemd's default 5 starts/10s would leave it failed for good" \
+  grep -qx 'StartLimitIntervalSec=0' <<<"$kcm_unit"
+assert_true "install waits for kube-system/extension-apiserver-authentication before restarting u7s-kcm.service, so KCM does not start into its fatal lookup failure" \
+  grep -qF 'wait_for_authentication_configmap "$STATE_DIR/kubeconfig"' "$INSTALL"
+cm_wait_line="$(grep -n '^wait_for_authentication_configmap "' "$INSTALL" | cut -d: -f1)"
+cm_kcm_line="$(grep -n '^systemctl restart u7s-kcm.service' "$INSTALL" | cut -d: -f1)"
+assert "the ConfigMap wait precedes the KCM restart (otherwise it guards nothing)" \
+  "$([ -n "$cm_wait_line" ] && [ -n "$cm_kcm_line" ] && [ "$cm_wait_line" -lt "$cm_kcm_line" ] && echo 1 || echo 0)"
+assert_false "u7s-kcm.service does not set --authentication-tolerate-lookup-failure: a KCM that silently skips delegated authn would serve /metrics unauthenticated-looking" \
+  grep -qF -- '--authentication-tolerate-lookup-failure' <<<"$kcm_exec_line"
 assert_false "u7s-kcm.service opens no extra anonymous paths: /metrics must stay RBAC-gated" \
   grep -qF -- '--authorization-always-allow-paths' <<<"$kcm_exec_line"
 
@@ -1659,6 +1670,23 @@ for missing in ca.crt kcm-kubeconfig; do
     "$([ "$wf_status" -ne 0 ] && printf '%s' "$wf_out" | grep -qF "error: u7s-apiserver did not write $wf_dir/$missing" && echo 1 || echo 0)"
 done
 rm -rf "$WAITFILES_WORK"
+
+CMWAIT_RUNNER="$(mktemp)"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'polls=0; sleep() { :; }'
+  echo 'kubectl() { polls=$((polls+1)); [ "$polls" -gt "${FAIL_FIRST:-0}" ]; }'
+  awk '/^wait_for_authentication_configmap\(\) \{/,/^\}/' "$INSTALL"
+  echo 'wait_for_authentication_configmap /dev/null; echo "polls=$polls"'
+} > "$CMWAIT_RUNNER"
+cm_out="$(FAIL_FIRST=3 bash "$CMWAIT_RUNNER" 2>&1)" && cm_status=0 || cm_status=$?
+assert "install keeps polling until the authentication ConfigMap appears (KCM must not start before it exists)" \
+  "$([ "$cm_status" -eq 0 ] && printf '%s' "$cm_out" | grep -q 'polls=4' && echo 1 || echo 0)"
+cm_out="$(FAIL_FIRST=9999 bash "$CMWAIT_RUNNER" 2>&1)" && cm_status=0 || cm_status=$?
+assert "a ConfigMap that never appears fails the install with a clear timeout message instead of hanging" \
+  "$([ "$cm_status" -ne 0 ] && printf '%s' "$cm_out" | grep -qF 'extension-apiserver-authentication was not published within 120s' && echo 1 || echo 0)"
+rm -f "$CMWAIT_RUNNER"
 
 wf_apiserver_line="$(grep -n '^if ! systemctl restart u7s-apiserver.service' "$INSTALL" | cut -d: -f1)"
 wf_wait_line="$(grep -n '^wait_for_apiserver_files "\$STATE_DIR"' "$INSTALL" | cut -d: -f1)"

@@ -252,6 +252,25 @@ wait_for_apiserver_files() {
   exit 1
 }
 
+# KCM's delegated authn/authz treats a missing
+# kube-system/extension-apiserver-authentication ConfigMap as fatal at start, and
+# the apiserver publishes it from a spawned reconciler after its files exist.
+wait_for_authentication_configmap() {
+  local kubeconfig_path="$1" ready=0
+  echo "Waiting for the apiserver to publish kube-system/extension-apiserver-authentication..."
+  for _ in $(seq 1 60); do
+    if kubectl --kubeconfig="$kubeconfig_path" -n kube-system get configmap extension-apiserver-authentication >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 2
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "error: kube-system/extension-apiserver-authentication was not published within 120s (check: journalctl -u u7s-apiserver); u7s-kcm needs it for delegated authn/authz" >&2
+    exit 1
+  fi
+}
+
 # Only --mint-join-token/--join need jq; not installed unconditionally so the
 # default path's apt footprint stays unchanged.
 ensure_jq() {
@@ -1381,6 +1400,7 @@ cat > /etc/systemd/system/u7s-kcm.service <<EOF
 Description=u7s kube-controller-manager
 After=u7s-apiserver.service
 Requires=u7s-apiserver.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -1514,6 +1534,7 @@ if ! systemctl restart u7s-apiserver.service; then
   exit 1
 fi
 wait_for_apiserver_files "$STATE_DIR"
+wait_for_authentication_configmap "$STATE_DIR/kubeconfig"
 systemctl enable u7s-kcm.service
 systemctl restart u7s-kcm.service
 systemctl enable u7s-kcm-restart.path

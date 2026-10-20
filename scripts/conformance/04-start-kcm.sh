@@ -140,6 +140,16 @@ if grep -qE "https://127\." "\$KUBECONFIG_FILE" && grep -q "host.lima.internal" 
   KUBECONFIG_FILE="\$TMPDIR_KCM/kubeconfig"
 fi
 
+# Delegated authn/authz is fatal at KCM start until the apiserver has published
+# kube-system/extension-apiserver-authentication; the supervisor's crash-burst
+# breaker (5 crashes) could give up on that race, so wait here instead.
+if command -v kubectl &>/dev/null; then
+  for _ in \$(seq 1 60); do
+    kubectl --kubeconfig="\$KUBECONFIG_FILE" -n kube-system get configmap extension-apiserver-authentication >/dev/null 2>&1 && break
+    sleep 2
+  done
+fi
+
 echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
 SUPERVISOR_LOG="/tmp/kcm-supervisor.log"
 chmod +x /tmp/kcm-supervisor.sh
