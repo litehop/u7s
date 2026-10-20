@@ -163,7 +163,7 @@ fn strategic_merge_patch_at(
 }
 
 /// `validate_retain` is false for content that does not exist yet: upstream never runs
-/// `$retainKeys` validation for an absent key, it only strips `$patch`.
+/// `$retainKeys` validation for an absent key; it drops any map carrying `$patch` instead.
 fn merge_patch_into(
     target: &mut serde_json::Value,
     patch: &serde_json::Value,
@@ -284,13 +284,9 @@ fn merge_patch_into(
                 }
             }
         } else if value.is_object() {
-            // On a map that does not exist yet, `$patch: delete` has nothing to delete and
-            // upstream drops the key for `$patch: replace` too (outside new content, which is stored stripped); neither leaves a map behind.
-            if !target_obj.contains_key(key)
-                && value
-                    .get(PATCH_DIRECTIVE)
-                    .is_some_and(|d| d == "delete" || (d == "replace" && validate_retain))
-            {
+            // Upstream removeDirectives drops the entire map carrying `$patch` (any value,
+            // any depth) when its key is absent from the target; no map is left behind.
+            if !target_obj.contains_key(key) && value.get(PATCH_DIRECTIVE).is_some() {
                 continue;
             }
             let validate_retain = target_obj.contains_key(key);
@@ -4337,7 +4333,10 @@ mod tests {
                     .pointer(ptr)
                     .unwrap_or_else(|| panic!("{ctx}: {ptr} missing in {target}"));
                 match kind {
-                    "$patch: replace" => assert_eq!(got["cfg"], json!({"keep": 1}), "{ctx}"),
+                    "$patch: replace" => assert!(
+                        got.get("cfg").is_none(),
+                        "{ctx}: upstream removeDirectives drops the whole map carrying $patch"
+                    ),
                     "$patch: delete" => {
                         assert!(got.get("gone").is_none(), "{ctx}: deleted map stored");
                         assert_eq!(got["keep"], 1, "{ctx}");
@@ -4378,7 +4377,11 @@ mod tests {
         let mut target = json!({"rules": []});
         let patch = json!({"rules": [{"verbs": ["get"], "sub": {"$patch": "replace", "a": 1}}]});
         strategic_merge_patch(&mut target, &patch).unwrap();
-        assert_eq!(target["rules"][0]["sub"], json!({"a": 1}));
+        assert!(
+            target["rules"][0].get("sub").is_none(),
+            "upstream removeDirectives drops the whole map carrying $patch"
+        );
+        assert_eq!(target["rules"][0]["verbs"], json!(["get"]));
     }
 
     #[test]
