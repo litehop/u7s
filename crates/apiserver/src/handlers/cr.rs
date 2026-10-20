@@ -2897,7 +2897,7 @@ pub async fn create_cr<S: Store>(
     if is_dry_run_header(&headers) {
         let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
         if let Some(hv) = warn_header {
-            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            resp.headers_mut().append(axum::http::header::WARNING, hv);
         }
         return Ok(resp);
     }
@@ -2963,7 +2963,7 @@ pub async fn create_cr<S: Store>(
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
     let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
     if let Some(hv) = warn_header {
-        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        resp.headers_mut().append(axum::http::header::WARNING, hv);
     }
     Ok(resp)
 }
@@ -3924,7 +3924,7 @@ pub async fn create_cr_namespaced<S: Store>(
     if is_dry_run_header(&headers) {
         let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
         if let Some(hv) = warn_header {
-            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            resp.headers_mut().append(axum::http::header::WARNING, hv);
         }
         return Ok(resp);
     }
@@ -4019,7 +4019,7 @@ pub async fn create_cr_namespaced<S: Store>(
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
     let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
     if let Some(hv) = warn_header {
-        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        resp.headers_mut().append(axum::http::header::WARNING, hv);
     }
     Ok(resp)
 }
@@ -4669,7 +4669,7 @@ pub async fn patch_cr<S: Store>(
         if is_dry_run_header(&headers) {
             let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
             if let Some(hv) = warn_header {
-                resp.headers_mut().insert(axum::http::header::WARNING, hv);
+                resp.headers_mut().append(axum::http::header::WARNING, hv);
             }
             return Ok(resp);
         }
@@ -4691,7 +4691,7 @@ pub async fn patch_cr<S: Store>(
         obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
         let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
         if let Some(hv) = warn_header {
-            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            resp.headers_mut().append(axum::http::header::WARNING, hv);
         }
         return Ok(resp);
     }
@@ -4857,7 +4857,7 @@ pub async fn patch_cr<S: Store>(
         obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
         let mut resp = Json(obj).into_response();
         if let Some(hv) = warn_header {
-            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            resp.headers_mut().append(axum::http::header::WARNING, hv);
         }
         return Ok(resp);
     }
@@ -4883,7 +4883,7 @@ pub async fn patch_cr<S: Store>(
     obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
     let mut resp = Json(obj).into_response();
     if let Some(hv) = warn_header {
-        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        resp.headers_mut().append(axum::http::header::WARNING, hv);
     }
     Ok(resp)
 }
@@ -4985,7 +4985,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         if is_dry_run_header(&headers) {
             let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
             if let Some(hv) = warn_header {
-                resp.headers_mut().insert(axum::http::header::WARNING, hv);
+                resp.headers_mut().append(axum::http::header::WARNING, hv);
             }
             return Ok(resp);
         }
@@ -5034,7 +5034,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
         let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
         if let Some(hv) = warn_header {
-            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            resp.headers_mut().append(axum::http::header::WARNING, hv);
         }
         return Ok(resp);
     }
@@ -5200,7 +5200,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
         let mut resp = Json(obj).into_response();
         if let Some(hv) = warn_header {
-            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            resp.headers_mut().append(axum::http::header::WARNING, hv);
         }
         return Ok(resp);
     }
@@ -5226,7 +5226,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
     let mut resp = Json(obj).into_response();
     if let Some(hv) = warn_header {
-        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        resp.headers_mut().append(axum::http::header::WARNING, hv);
     }
     Ok(resp)
 }

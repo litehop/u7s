@@ -392,3 +392,25 @@ fn seconds_scale_leaf_is_valid_when_issued_and_rotates_at_two_thirds() {
     assert_eq!(*rotated.lock().unwrap(), vec!["admin"]);
     assert_ne!(r.leaf("admin").cert_der, old.cert_der);
 }
+
+#[test]
+fn failed_rotation_is_recorded_for_operators_until_a_later_rotation_succeeds() {
+    let h = Harness::new("failure-visible");
+    let r = h.start(Duration::from_secs(60)).unwrap();
+    h.advance(50);
+    let moved = h.dir.with_extension("away");
+    std::fs::rename(&h.dir, &moved).unwrap(); // lgtm[rust/path-injection]
+    r.rotate_due(&|_, _| {}).unwrap_err();
+    let failures = h.pki.inventory.failures();
+    assert_eq!(
+        failures.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        vec!["admin"],
+        "an unwritable leaf must be visible to the expiry Events and metric, not only logged"
+    );
+    std::fs::rename(&moved, &h.dir).unwrap(); // lgtm[rust/path-injection]
+    r.rotate_due(&|_, _| {}).unwrap();
+    assert!(
+        h.pki.inventory.failures().is_empty(),
+        "a successful rotation must clear the failure so the Warning Event stops"
+    );
+}

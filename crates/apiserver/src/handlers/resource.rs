@@ -598,7 +598,7 @@ pub(crate) async fn create_resource<S: Store>(
         inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
         let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
         if let Some(hv) = warn_header {
-            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            resp.headers_mut().append(axum::http::header::WARNING, hv);
         }
         return Ok(resp);
     }
@@ -688,7 +688,7 @@ pub(crate) async fn create_resource<S: Store>(
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
     if let Some(hv) = warn_header {
-        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        resp.headers_mut().append(axum::http::header::WARNING, hv);
     }
     Ok(resp)
 }
@@ -3566,7 +3566,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
         let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
         if let Some(hv) = warn_header {
-            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+            resp.headers_mut().append(axum::http::header::WARNING, hv);
         }
         return Ok(resp);
     }
@@ -3715,7 +3715,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
 
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
     if let Some(hv) = warn_header {
-        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        resp.headers_mut().append(axum::http::header::WARNING, hv);
     }
     Ok(resp)
 }

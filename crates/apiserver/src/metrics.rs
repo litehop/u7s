@@ -310,6 +310,65 @@ pub static APF_NOMINAL_LIMIT_SEATS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+/// Remaining lifetime of the client certificate on each authenticated request that presented
+/// one. Same name, buckets and meaning as upstream's x509 authenticator histogram
+/// (staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go).
+pub static CLIENT_CERT_EXPIRATION_SECONDS: LazyLock<prometheus::Histogram> = LazyLock::new(|| {
+    let histogram = prometheus::Histogram::with_opts(
+        HistogramOpts::new(
+            "apiserver_client_certificate_expiration_seconds",
+            "Distribution of the remaining lifetime on the certificate used to authenticate a \
+             request.",
+        )
+        .buckets(vec![
+            0.0, 1800.0, 3600.0, 7200.0, 21600.0, 43200.0, 86400.0, 172800.0, 345600.0, 604800.0,
+            2592000.0, 7776000.0, 15552000.0, 31104000.0,
+        ]),
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(histogram.clone()))
+        .expect("apiserver_client_certificate_expiration_seconds is registered once per process");
+    histogram
+});
+
+/// Seconds until each cert in the inventory expires (negative once expired), one series per
+/// cert, covering every CA and apiserver-held leaf even when nobody calls (the histogram above
+/// only sees certs that arrive on requests). Name, labels and meaning match k3s's
+/// `k3s_certificate_expiration_seconds`.
+pub static CERT_EXPIRATION_SECONDS: LazyLock<prometheus::GaugeVec> = LazyLock::new(|| {
+    let gauge = prometheus::GaugeVec::new(
+        Opts::new(
+            "u7s_certificate_expiration_seconds",
+            "Seconds until each certificate in the PKI inventory expires.",
+        ),
+        &["cert", "subject", "usages"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .expect("u7s_certificate_expiration_seconds is registered exactly once per process");
+    gauge
+});
+
+/// Rotations (or publications of a rotated cert, e.g. rewriting its kubeconfig) that failed,
+/// by cert name. Non-zero means a component may still hold the old, expiring cert.
+pub static CERT_ROTATION_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "u7s_certificate_rotation_failures_total",
+            "Certificate rotations or publications of a rotated certificate that failed, by \
+             certificate name.",
+        ),
+        &["cert"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_certificate_rotation_failures_total is registered exactly once per process");
+    counter
+});
+
 #[cfg(test)]
 mod tests {
     use prometheus::core::Collector;

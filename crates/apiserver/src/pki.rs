@@ -3,6 +3,7 @@
 //! `CertificateParams` is built anywhere except `Pki::params`.
 
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -143,7 +144,6 @@ pub(crate) struct CertSpec<'a> {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct CertRecord {
     pub name: &'static str,
     pub subject: String,
@@ -154,18 +154,49 @@ pub(crate) struct CertRecord {
 }
 
 #[derive(Clone, Default)]
-pub struct CertInventory(Arc<RwLock<Vec<CertRecord>>>);
+pub struct CertInventory {
+    certs: Arc<RwLock<Vec<CertRecord>>>,
+    /// Cert name -> why its last rotation (or the publication of the rotated cert) failed.
+    failures: Arc<RwLock<BTreeMap<&'static str, String>>>,
+}
 
 impl CertInventory {
     fn record(&self, record: CertRecord) {
-        let mut all = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut all = self.certs.write().unwrap_or_else(|e| e.into_inner());
         all.retain(|r| r.name != record.name);
         all.push(record);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn snapshot(&self) -> Vec<CertRecord> {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.certs.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Remember that `name` could not be rotated or published and count it, so an operator
+    /// sees the stale cert instead of only a log line.
+    pub(crate) fn record_failure(&self, name: &'static str, error: impl std::fmt::Display) {
+        crate::metrics::CERT_ROTATION_FAILURES
+            .with_label_values(&[name])
+            .inc();
+        self.failures
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name, error.to_string());
+    }
+
+    pub(crate) fn clear_failure(&self, name: &'static str) {
+        self.failures
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+    }
+
+    pub(crate) fn failures(&self) -> Vec<(&'static str, String)> {
+        self.failures
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(n, e)| (*n, e.clone()))
+            .collect()
     }
 }
 
