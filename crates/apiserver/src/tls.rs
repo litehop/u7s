@@ -577,7 +577,6 @@ pub struct TlsMaterial {
     /// client-CA change; the accept loop loads it once per connection.
     pub server_config: Swap<Arc<ServerConfig>>,
     /// Every cert issued or loaded for this process, with its validity window.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub inventory: CertInventory,
     /// Re-issues every apiserver-owned leaf before it expires. The fields above are the
     /// leaves as of startup; consumers learn of later ones through the rotator.

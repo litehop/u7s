@@ -17,6 +17,7 @@ pub async fn metrics<S: Store>(State(state): State<AppState<S>>) -> Response {
     // metric is visible on the very first scrape rather than only after the first watch
     // happens to close for a given reason (see prime_watch_closed_total's doc for why).
     u7s_store::metrics::prime_watch_closed_total();
+    crate::cert_expiry::sync_metrics(&state.cert_watch.inventory, state.cert_watch.clock.now());
 
     let metric_families = prometheus::gather();
     let encoder = TextEncoder::new();

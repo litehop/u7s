@@ -260,6 +260,9 @@ impl Rotator {
                             ) {
                                 Ok(config) => self.server_config.set(config),
                                 Err(e) => {
+                                    self.pki
+                                        .inventory
+                                        .record_failure(plan.name, format!("{e:#}"));
                                     failures.push(format!("{}: {e:#}", plan.name));
                                     continue;
                                 }
@@ -268,9 +271,15 @@ impl Rotator {
                         state.leaves.insert(plan.name, leaf.clone());
                     }
                     tracing::info!("rotated {}: new notAfter {}", plan.name, leaf.not_after);
+                    self.pki.inventory.clear_failure(plan.name);
                     on_rotated(plan.name, &leaf);
                 }
-                Err(e) => failures.push(format!("{}: {e:#}", plan.name)),
+                Err(e) => {
+                    self.pki
+                        .inventory
+                        .record_failure(plan.name, format!("{e:#}"));
+                    failures.push(format!("{}: {e:#}", plan.name));
+                }
             }
         }
         if failures.is_empty() {

@@ -944,6 +944,9 @@ pub struct AppState<S = SqliteStore> {
     /// `false` until the task resolves; no test needs the gated behavior at construction time,
     /// same pattern as `node_kubelet_ports`/`sa_sig_cache`.
     pub boot_ready: Arc<AtomicBool>,
+    /// Cert inventory and clock feeding expiry Warning headers, Node Events and the expiry
+    /// gauge. Empty (nothing at risk) unless `run()` overwrites it with the live inventory.
+    pub cert_watch: crate::cert_expiry::CertWatch,
     /// PodSecurity admission defaults and exemptions. Not part of `AppStateConfig`: `run()`
     /// overwrites it from `--admission-control-config-file`; every test gets upstream's
     /// default (everything privileged, nothing exempt).
@@ -1021,6 +1024,7 @@ impl<S> Clone for AppState<S> {
             sa_sig_cache: self.sa_sig_cache.clone(),
             flowcontrol_cache: self.flowcontrol_cache.clone(),
             boot_ready: self.boot_ready.clone(),
+            cert_watch: self.cert_watch.clone(),
             pod_security: self.pod_security.clone(),
         }
     }
@@ -1296,6 +1300,7 @@ impl<S: Store> AppState<S> {
             // never boots that task) gets the ready default, matching node_kubelet_ports'
             // pattern.
             boot_ready: Arc::new(AtomicBool::new(true)),
+            cert_watch: Default::default(),
             pod_security: Arc::new(crate::pod_security::Config::default()),
         }
     }

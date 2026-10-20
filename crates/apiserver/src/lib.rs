@@ -13,6 +13,7 @@ mod batch_gen_adapter;
 mod bootstrap_apply;
 mod bootstrap_rbac;
 mod bootstrap_token;
+mod cert_expiry;
 mod certificates_v1beta1_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
@@ -424,12 +425,21 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // Re-issue each leaf before it expires and hand the new one to every in-memory holder of
     // the old one. Components that read their kubeconfig once (KCM, scheduler) pick the
     // rewritten file up on their next start.
+    state.cert_watch = cert_expiry::CertWatch {
+        inventory: tls_material.inventory.clone(),
+        clock: Default::default(),
+    };
+    let rotation_inventory = tls_material.inventory.clone();
     let rotation_state = state.clone();
     let rotation_ca_der = tls_material.ca_cert_der.clone();
     tokio::spawn(Arc::clone(&tls_material.rotator).run(Arc::new(
         move |name: &'static str, leaf: &rotation::Leaf| {
             if let Some((_, files)) = rotating_leaf_files.iter().find(|(n, _)| *n == name) {
                 if let Err(e) = tls::write_leaf_pem(files, &leaf.cert_der, &leaf.key_pem) {
+                    rotation_inventory.record_failure(
+                        name,
+                        format_args!("rewrite {}: {e:#}", files.pem().display()),
+                    );
                     tracing::error!(
                         "rewrite {} after rotating {name}: {e:#}",
                         files.pem().display()
@@ -446,6 +456,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                     },
                     "system:kube-scheduler",
                 ) {
+                    rotation_inventory.record_failure(
+                        name,
+                        format_args!("rewrite {scheduler_kubeconfig}: {e:#}"),
+                    );
                     tracing::error!("rewrite {scheduler_kubeconfig} after rotating {name}: {e:#}");
                 }
             }
@@ -454,6 +468,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             match name {
                 "admin" => {
                     if let Err(e) = rotation_state.set_webhook_identity(identity_pem) {
+                        rotation_inventory
+                            .record_failure(name, format_args!("webhook client: {e}"));
                         tracing::error!("webhook client after rotating {name}: {e}");
                     }
                 }
@@ -512,6 +528,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // seed_flowcontrol just wrote, so AuthLayer's APF classification has FlowSchemas/
     // PriorityLevelConfigurations to match against from the very first request.
     state.init_flowcontrol_cache().await;
+
+    // 10c-pre4. Node Events for certs nearing expiry or failing to rotate.
+    tokio::spawn(cert_expiry::run_monitor(
+        Arc::clone(&store),
+        state.cert_watch.clone(),
+    ));
 
     // 10c. Keep the kubernetes Endpoints in sync with the kubernetes EndpointSlice.
     // KCM's endpointslice-controller may update the EndpointSlice with the apiserver
@@ -1383,6 +1405,10 @@ fn build_router(state: AppState) -> Router {
         // AdmissionContext.dry_run otherwise stays hardcoded false on those paths.
         .layer(axum::middleware::from_fn(
             handlers::json_patch::inject_dry_run_header,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.cert_watch.clone(),
+            cert_expiry::warn_requests,
         ))
         // Outermost: admission plugins anywhere below push warnings into the request's sink,
         // rendered here as `Warning` response headers.
