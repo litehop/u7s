@@ -523,9 +523,29 @@ pub(crate) async fn fetch_initial_events<S: Store>(
     if !send_initial_events {
         return Ok(None);
     }
+    list_current_state(state, prefix, group, plural, None)
+        .await
+        .map(Some)
+}
+
+/// Current objects under `prefix` (defaults applied) with the list revision. `narrow` is a
+/// store-level superset narrowing (see `FieldSelector::store_selector`); callers still filter.
+async fn list_current_state<S: Store>(
+    state: &AppState<S>,
+    prefix: &str,
+    group: &str,
+    plural: &str,
+    narrow: Option<u7s_store::FieldSelector>,
+) -> Result<(Vec<serde_json::Value>, u64), crate::status::StatusError> {
     let resp = state
         .store
-        .list(prefix, ListOptions::default())
+        .list(
+            prefix,
+            ListOptions {
+                field_selector: narrow,
+                ..ListOptions::default()
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
     let items: Vec<serde_json::Value> = resp
@@ -537,7 +557,7 @@ pub(crate) async fn fetch_initial_events<S: Store>(
             v
         })
         .collect();
-    Ok(Some((items, resp.revision)))
+    Ok((items, resp.revision))
 }
 
 /// Split a label selector string into top-level comma-separated terms,
@@ -783,6 +803,10 @@ pub(crate) struct WatchConfig {
     pub kind: String,
     pub from_revision: u64,
     pub initial_items: Option<(Vec<serde_json::Value>, u64)>,
+    /// `sendInitialEvents=false` was requested explicitly: with resourceVersion unset/"0" the
+    /// watch starts from "now" with no synthetic ADDED of current state (only an omitted
+    /// sendInitialEvents gets that legacy replay).
+    pub explicit_no_initial_events: bool,
     pub label_selector: Option<String>,
     pub field_selector: Option<String>,
     pub allow_watch_bookmarks: bool,
@@ -979,6 +1003,7 @@ async fn watch_generic_impl<S: Store>(
         kind,
         from_revision,
         initial_items,
+        explicit_no_initial_events,
         label_selector,
         field_selector,
         allow_watch_bookmarks,
@@ -1072,8 +1097,41 @@ async fn watch_generic_impl<S: Store>(
     // as a synthetic ADDED in the initial phase — before the BOOKMARK — not after
     // it. Emitting an event after the BOOKMARK would violate the Kubernetes watch
     // protocol invariant: everything before BOOKMARK is "initial state".
+    //
+    // resourceVersion unset/"0" with sendInitialEvents omitted: upstream (cacher.go Watch ->
+    // watch_cache.go getAllEventsSinceLocked, release-1.37) serves the current state as
+    // synthetic ADDED events with no bookmark and never replays write history. Replaying the
+    // ring would hand clients (e.g. `kubectl get node X -w`) long-superseded states of every
+    // object as if they were live transitions. With sendInitialEvents=false explicit, upstream
+    // starts from the cache's current revision and sends no current state.
+    let initial_events_bookmark = initial_items.is_some();
+    let initial_items =
+        if from_revision == 0 && initial_items.is_none() && !explicit_no_initial_events {
+            let (mut items, list_rv) = list_current_state(
+                &state,
+                &prefix,
+                &group,
+                &plural,
+                field_selector.store_selector(),
+            )
+            .await?;
+            // Selectors run on the requested version's view, as for live events.
+            if let Some(ctx) = &cr_fields {
+                super::cr::convert_cr_list_items(
+                    &state,
+                    ctx.conversion_webhook_client_config.as_ref(),
+                    &mut items,
+                    &ctx.desired_api_version,
+                )
+                .await?;
+            }
+            Some((items, list_rv))
+        } else {
+            initial_items
+        };
     let watch_from_rv = match &initial_items {
         Some((_, list_rv)) => *list_rv,
+        None if from_revision == 0 && explicit_no_initial_events => state.store.current_revision(),
         None => from_revision,
     };
 
@@ -1203,8 +1261,10 @@ async fn watch_generic_impl<S: Store>(
                     yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &v));
                 }
             }
-            record_watch_event();
-            yield Ok::<Bytes, axum::BoxError>(ndjson_initial_events_bookmark(&api_version, &kind, last_rv));
+            if initial_events_bookmark {
+                record_watch_event();
+                yield Ok::<Bytes, axum::BoxError>(ndjson_initial_events_bookmark(&api_version, &kind, last_rv));
+            }
         }
 
         loop {
@@ -2502,6 +2562,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 10, // expired
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -2555,6 +2616,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0, // not expired
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -2608,6 +2670,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -2673,6 +2736,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: Some("app=frontend".into()),
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -2698,6 +2762,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -2772,6 +2837,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 10,                 // expired — below horizon of 50
                 initial_items: Some((vec![], 50)), // sendInitialEvents already fetched snapshot at rv=50
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -2851,6 +2917,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -2947,6 +3014,7 @@ mod tests {
             kind: "ConfigMap".into(),
             from_revision: 0,
             initial_items: None,
+            explicit_no_initial_events: false,
             label_selector: None,
             field_selector: None,
             allow_watch_bookmarks: false,
@@ -3010,6 +3078,7 @@ mod tests {
             kind: "ConfigMap".into(),
             from_revision: 0,
             initial_items: None,
+            explicit_no_initial_events: false,
             label_selector: None,
             field_selector: None,
             allow_watch_bookmarks: false,
@@ -3212,6 +3281,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -3321,6 +3391,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -3350,6 +3421,155 @@ mod tests {
              type) is exactly the class of bug that desyncs an informer's cache from the \
              server without a visible decode error"
         );
+    }
+
+    /// A watch opened without a resourceVersion must see each object once, in its current
+    /// state, and never the superseded writes still sitting in the ring buffer. Replaying
+    /// history made `kubectl get node X -w` report the node's registration-time NotReady/empty
+    /// status as live transitions right after it went Ready, failing the release gate's
+    /// "node stays Ready" criterion. Fails on revert: the stream would carry the stale ADDED
+    /// plus a MODIFIED per later write.
+    #[tokio::test]
+    async fn watch_generic_rv_zero_serves_current_state_not_write_history() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/configmaps/default/cm-hist";
+        // An earlier watcher (kubelet, KCM informers) is what makes the store keep write
+        // history for the prefix; a cold shard would be seeded from current state anyway.
+        let _earlier_watcher = store
+            .watch("/registry/configmaps/default/", 0)
+            .await
+            .unwrap();
+        let mut rev = 0;
+        for v in ["v1", "v2", "v3"] {
+            let obj = serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": { "name": "cm-hist", "namespace": "default" },
+                "data": { "k": v }
+            });
+            rev = store
+                .put(
+                    key,
+                    bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                    Some(rev),
+                )
+                .await
+                .unwrap();
+        }
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                explicit_no_initial_events: false,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must open"));
+
+        let events = read_watch_body_with_timeout(resp).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "rv=0 watch must emit one synthetic ADDED for the current state only (no history, \
+             no initial-events-end bookmark); got: {events:?}"
+        );
+        assert_eq!(events[0]["type"], "ADDED");
+        assert_eq!(
+            events[0]["object"]["data"]["k"], "v3",
+            "the synthetic ADDED must carry the latest state, not a superseded write"
+        );
+    }
+
+    /// Explicit sendInitialEvents=false with rv=0 means "start from now": upstream sends no
+    /// current state and no history, only later writes. Serving current state here would
+    /// make a client that already listed (and opted out of initial events) see every object
+    /// twice; replaying the ring would hand it superseded states.
+    #[tokio::test]
+    async fn watch_generic_rv_zero_explicit_no_initial_events_sends_only_later_writes() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let prefix = "/registry/configmaps/default/";
+        let _earlier_watcher = store.watch(prefix, 0).await.unwrap();
+        let cm = |k: &str| {
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": { "name": "cm-x", "namespace": "default" },
+                    "data": { "k": k }
+                }))
+                .unwrap(),
+            )
+        };
+        let rev = store
+            .put("/registry/configmaps/default/cm-x", cm("old"), Some(0))
+            .await
+            .unwrap();
+        let state = AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: prefix.into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                explicit_no_initial_events: true,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must open"));
+        store
+            .put("/registry/configmaps/default/cm-x", cm("new"), Some(rev))
+            .await
+            .unwrap();
+
+        let events = read_watch_body_with_timeout(resp).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "only the post-open write may be delivered; got: {events:?}"
+        );
+        assert_eq!(events[0]["type"], "MODIFIED");
+        assert_eq!(events[0]["object"]["data"]["k"], "new");
     }
 
     /// A watch with a matching label selector must emit the ADDED event for a matching object.
@@ -3400,6 +3620,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: Some("app=frontend".into()),
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -3480,6 +3701,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: Some("app=frontend".into()),
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -3571,6 +3793,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: Some("app=frontend".into()),
                 field_selector: Some("metadata.namespace=default".into()),
                 allow_watch_bookmarks: false,
@@ -3660,6 +3883,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: Some("app=frontend".into()),
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -3735,6 +3959,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: Some("app=frontend".into()),
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -3969,6 +4194,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: rv1,
                 initial_items: Some((vec![obj_v1], rv1)),
+                explicit_no_initial_events: false,
                 label_selector: Some("app=frontend".into()),
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -4096,6 +4322,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: Some("app=frontend".into()),
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -4729,6 +4956,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: Some("app=foo".into()),
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -4862,6 +5090,7 @@ mod tests {
                 kind: "GatewayClass".into(),
                 from_revision: 0,
                 initial_items,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: true,
@@ -4952,6 +5181,7 @@ mod tests {
                 kind: "Service".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -5084,6 +5314,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -5180,6 +5411,7 @@ mod tests {
                 kind: "ServiceAccount".into(),
                 from_revision: 0,
                 initial_items,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: Some("metadata.name=default".into()),
                 allow_watch_bookmarks: true,
@@ -5284,6 +5516,7 @@ mod tests {
                 kind: "ServiceAccount".into(),
                 from_revision: 0,
                 initial_items,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 // Selector for "default" — the stored SA is named "other-sa", so no match.
                 field_selector: Some("metadata.name=default".into()),
@@ -5379,6 +5612,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: create_rv,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -5535,6 +5769,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: rv,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: true,
@@ -5618,6 +5853,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: rv,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -5690,6 +5926,7 @@ mod tests {
                 kind: "ConfigMap".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -5956,6 +6193,7 @@ mod tests {
             kind: "ConfigMap".into(),
             from_revision: 0,
             initial_items: None,
+            explicit_no_initial_events: false,
             label_selector: None,
             field_selector: None,
             allow_watch_bookmarks: false,
@@ -6227,6 +6465,7 @@ mod tests {
                 kind: "Widget".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -6315,6 +6554,7 @@ mod tests {
                 kind: "Widget".into(),
                 from_revision: 0,
                 initial_items: None,
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,
@@ -6387,6 +6627,7 @@ mod tests {
                 kind: "Widget".into(),
                 from_revision: 0,
                 initial_items: Some((items, 5)),
+                explicit_no_initial_events: false,
                 label_selector: None,
                 field_selector: None,
                 allow_watch_bookmarks: false,

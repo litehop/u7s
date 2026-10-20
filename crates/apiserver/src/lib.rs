@@ -276,16 +276,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // scheduler correctly without needing their own changes.
     let scheduler_kubeconfig_path =
         std::path::Path::new(&args.kubeconfig).with_file_name("kubeconfig-scheduler");
-    // Embedded rather than file paths: the scheduler's kubeconfig reader only understands
-    // inline data and reads it once, so it still needs a restart after a rotation.
-    tls::write_identity_kubeconfig(
+    write_component_kubeconfig(
         &scheduler_kubeconfig_path.to_string_lossy(),
-        &tls::kubeconfig_server(&args),
-        &tls::KubeconfigCreds::Embedded {
-            ca_cert_der: &tls_material.ca_cert_der,
-            cert_der: &tls_material.scheduler_cert_der,
-            key_pem: &tls_material.scheduler_key_pem,
-        },
+        &args,
+        "scheduler",
         "system:kube-scheduler",
     )?;
     // No consumer yet: the in-process YAML applier that will use this identity to install
@@ -300,18 +294,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         "bootstrap-installer",
         "system:bootstrap-installer",
     )?;
-    let rotation_server_url = tls::kubeconfig_server(&args);
     // Leaves whose cert+key PEM (the file their kubeconfig references) is rewritten whenever
-    // the leaf is re-issued; the scheduler's embedded kubeconfig is rewritten whole.
+    // the leaf is re-issued.
     let rotating_leaf_files: Vec<(&'static str, tls::LeafFiles)> = vec![
         ("admin", tls::leaf_files(&args, "admin")),
         ("kcm-client", tls::leaf_files(&args, "kcm")),
+        ("scheduler-client", tls::leaf_files(&args, "scheduler")),
         (
             "bootstrap-installer-client",
             tls::leaf_files(&args, "bootstrap-installer"),
         ),
     ];
-    let scheduler_kubeconfig = scheduler_kubeconfig_path.to_string_lossy().into_owned();
 
     // 6. Load optional static token map.
     let token_map = match &args.token_auth_file {
@@ -423,15 +416,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .set(Some(Arc::new(proxy_client_identity_pem)));
 
     // Re-issue each leaf before it expires and hand the new one to every in-memory holder of
-    // the old one. Components that read their kubeconfig once (KCM, scheduler) pick the
-    // rewritten file up on their next start.
+    // the old one. KCM and the scheduler re-read the rewritten file without a restart.
     state.cert_watch = cert_expiry::CertWatch {
         inventory: tls_material.inventory.clone(),
         clock: Default::default(),
     };
     let rotation_inventory = tls_material.inventory.clone();
     let rotation_state = state.clone();
-    let rotation_ca_der = tls_material.ca_cert_der.clone();
     tokio::spawn(Arc::clone(&tls_material.rotator).run(Arc::new(
         move |name: &'static str, leaf: &rotation::Leaf| {
             if let Some((_, files)) = rotating_leaf_files.iter().find(|(n, _)| *n == name) {
@@ -444,23 +435,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                         "rewrite {} after rotating {name}: {e:#}",
                         files.pem().display()
                     );
-                }
-            } else if name == "scheduler-client" {
-                if let Err(e) = tls::write_identity_kubeconfig(
-                    &scheduler_kubeconfig,
-                    &rotation_server_url,
-                    &tls::KubeconfigCreds::Embedded {
-                        ca_cert_der: &rotation_ca_der,
-                        cert_der: &leaf.cert_der,
-                        key_pem: &leaf.key_pem,
-                    },
-                    "system:kube-scheduler",
-                ) {
-                    rotation_inventory.record_failure(
-                        name,
-                        format_args!("rewrite {scheduler_kubeconfig}: {e:#}"),
-                    );
-                    tracing::error!("rewrite {scheduler_kubeconfig} after rotating {name}: {e:#}");
                 }
             }
             let mut identity_pem = tls::pem_encode("CERTIFICATE", &leaf.cert_der);

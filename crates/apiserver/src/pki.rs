@@ -18,8 +18,9 @@ pub(crate) const SERVING_CERT_LIFETIME: Duration = Duration::from_secs(90 * 24 *
 /// born (nearly) expired.
 const BACKDATE: Duration = Duration::from_secs(5 * 60);
 
-/// Lifetime, in seconds, applied to the apiserver serving cert and the apiserver-held
-/// kubelet-client and proxy-client identities so rotation can be observed in real time.
+/// Lifetime, in seconds, applied to the apiserver serving cert, the apiserver-held
+/// kubelet-client and proxy-client identities, and the KCM and scheduler client certs so rotation can be observed in
+/// real time.
 /// Compiled only with the `pki-test-knobs` feature, which no shipped build enables, so a
 /// production binary neither reads the variable nor can be made to issue short-lived certs.
 #[cfg(feature = "pki-test-knobs")]
@@ -28,7 +29,7 @@ pub(crate) fn test_lifetime() -> Option<Duration> {
         .ok()?
         .parse()
         .expect("U7S_PKI_TEST_LIFETIME_SECS must be an integer number of seconds");
-    tracing::warn!("pki-test-knobs: serving, kubelet-client and proxy-client lifetime is {secs}s");
+    tracing::warn!("pki-test-knobs: serving, kubelet-client, proxy-client, kcm-client and scheduler-client lifetime is {secs}s");
     Some(Duration::from_secs(secs))
 }
 

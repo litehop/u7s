@@ -69,6 +69,7 @@ pub(crate) async fn list_namespaces<S: Store>(
                 kind: "Namespace".to_string(),
                 from_revision: query.resource_version.unwrap_or(0),
                 initial_items: initial,
+                explicit_no_initial_events: query.send_initial_events == Some(false),
                 label_selector: query.label_selector,
                 field_selector: query.field_selector,
                 allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
