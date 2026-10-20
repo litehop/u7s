@@ -166,7 +166,8 @@ scheduled() { [ -n "$(k -n "$NS" get pods -l "app=$NAME" -o jsonpath='{.items[0]
 
 proc_start() { ps -o lstart= -p "$1" 2>/dev/null | sed "s/^ *//"; }
 kcm_pid() { limactl shell "$VM" pgrep -x kube-controller 2>/dev/null | head -1; }
-kcm_start() { limactl shell "$VM" ps -o lstart= -p "$1" 2>/dev/null | sed "s/^ *//"; }
+# Kernel start tick (field 22 of /proc/PID/stat): ps lstart is derived from boot time and drifts by a second between calls.
+kcm_start() { limactl shell "$VM" cut -d" " -f22 "/proc/$1/stat" 2>/dev/null; }
 sched_pid() { pgrep -f "$(workdir_kill_pattern scheduler "$ABS_WORKDIR")" | head -1; }
 file_serial_differs() { [ "$(pem_file_serial "$1")" != "$2" ]; }
 
@@ -177,6 +178,7 @@ if [ -n "$VM" ]; then
   KCM_PID="$(kcm_pid)"
   [ -n "$KCM_PID" ] || fail "no kube-controller-manager process in $VM"
   KCM_START="$(kcm_start "$KCM_PID")"
+  RELOADS_BEFORE="$(grep -c "TLS material changed on disk" "$WORKDIR/scheduler.log" || true)"
   echo "scheduler pid $SCHED_PID started $SCHED_START; kcm pid $KCM_PID started $KCM_START"
 fi
 
@@ -236,7 +238,8 @@ for i in $(seq 1 "$ITERATIONS"); do
     [ "$(kcm_pid)" = "$KCM_PID" ] && [ "$(kcm_start "$KCM_PID")" = "$KCM_START" ] ||
       fail "iteration $i: KCM was restarted (pid $KCM_PID, started $KCM_START)"
     reloads="$(grep -c "TLS material changed on disk" "$WORKDIR/scheduler.log" || true)"
-    [ "$reloads" -ge "$i" ] || fail "iteration $i: scheduler.log shows $reloads TLS reloads, expected at least $i"
+    [ "$((reloads - RELOADS_BEFORE))" -ge "$i" ] ||
+      fail "iteration $i: scheduler.log shows $((reloads - RELOADS_BEFORE)) TLS reloads since the run began, expected at least $i"
     echo "PASS[$i]: scheduler and KCM kept their processes (no restart); scheduler reloaded TLS material $reloads time(s)"
   fi
 done
