@@ -730,6 +730,9 @@ fn generate_tls_with(
     serving_lifetime: std::time::Duration,
     renew_fraction: f64,
 ) -> anyhow::Result<TlsMaterial> {
+    let test_lifetime = crate::pki::test_lifetime();
+    let serving_lifetime = test_lifetime.unwrap_or(serving_lifetime);
+    let held_client_lifetime = test_lifetime.unwrap_or(CLIENT_CERT_LIFETIME);
     // Install the ML-KEM-768 hybrid post-quantum crypto provider.
     // `.ok()` makes this idempotent: a second call (e.g. in tests) is a no-op.
     rustls_post_quantum::provider().install_default().ok();
@@ -802,13 +805,16 @@ fn generate_tls_with(
         // Kubelet's --client-ca-file trusts our cluster CA, and kubelet accepts clients
         // from the system:masters organization as trusted. CN and O must match exactly
         // what real kube-apiserver uses so kubelet authorizes the proxy requests.
-        client_plan(
-            "kubelet-client",
-            "kube-apiserver-kubelet-client",
-            Some("system:masters"),
-            CaKind::Cluster,
-            None,
-        ),
+        LeafPlan {
+            lifetime: held_client_lifetime,
+            ..client_plan(
+                "kubelet-client",
+                "kube-apiserver-kubelet-client",
+                Some("system:masters"),
+                CaKind::Cluster,
+                None,
+            )
+        },
         // Real kubeadm gives kube-controller-manager a dedicated x509 identity, not a share
         // of admin/system:masters. No O= — the seeded ClusterRoleBinding
         // system:kube-controller-manager (see seed_rbac()) binds by username (kind: User),
@@ -841,13 +847,16 @@ fn generate_tls_with(
         // CN follows kubeadm's own "front-proxy-client" convention. Presented to aggregated
         // backends only (see doc); no O= is needed since the backend's own RBAC/authorization
         // config never sees this cert's Subject, only the X-Remote-User/-Group headers it vouches for.
-        client_plan(
-            "proxy-client",
-            "front-proxy-client",
-            None,
-            CaKind::FrontProxy,
-            None,
-        ),
+        LeafPlan {
+            lifetime: held_client_lifetime,
+            ..client_plan(
+                "proxy-client",
+                "front-proxy-client",
+                None,
+                CaKind::FrontProxy,
+                None,
+            )
+        },
     ];
     let rotator = Rotator::new(
         pki.clone(),
@@ -1481,6 +1490,27 @@ mod tests {
     }
 
     const DAY: std::time::Duration = std::time::Duration::from_secs(86400);
+
+    /// The production wiring (not just the rotator in isolation) must renew the 90-day
+    /// serving cert at day 60; a different fraction would renew too late (expiry outage)
+    /// or churn every connection.
+    #[test]
+    fn production_rotator_renews_the_serving_cert_at_two_thirds_of_ninety_days() {
+        let dir = test_temp_dir("serving-due");
+        let material = generate_tls(&args_in(&dir)).expect("boot");
+        let serving = material
+            .inventory
+            .snapshot()
+            .into_iter()
+            .find(|r| r.name == SERVING_LEAF)
+            .expect("serving cert is inventoried");
+        assert_eq!(
+            material.rotator.next_due(),
+            serving.not_before + time::Duration::days(60),
+            "serving cert renewal point"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
 
     /// A restart must not keep handing out an admin kubeconfig that is about to expire:
     /// past 2/3 of the year it is replaced, before that it is stable.
