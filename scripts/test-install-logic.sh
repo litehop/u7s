@@ -1633,6 +1633,90 @@ wf_kcm_line="$(grep -n '^systemctl restart u7s-kcm.service' "$INSTALL" | cut -d:
 assert "the file wait sits between the apiserver restart and the KCM/kubelet restarts (otherwise the wait guards nothing)" \
   "$([ -n "$wf_apiserver_line" ] && [ -n "$wf_wait_line" ] && [ -n "$wf_kcm_line" ] && [ "$wf_apiserver_line" -lt "$wf_wait_line" ] && [ "$wf_wait_line" -lt "$wf_kcm_line" ] && echo 1 || echo 0)"
 
+# ---------------------------------------------------------------------------
+# Supply chain: https-only curl, and a truncated download executes nothing.
+# ---------------------------------------------------------------------------
+
+# A curl without --proto '=https...' follows an https->http redirect, handing a
+# network attacker the bytes that become root-run binaries or apt keys.
+curl_lines="$(grep -nE '(^|[ (])curl ' "$INSTALL" | grep -vE '^[0-9]+:[[:space:]]*#|apt-get install' || true)"
+bad_curls="$(printf '%s\n' "$curl_lines" | grep -vE "curl --proto '=https(,file)?'( --proto-redir '=https')? --tlsv1\.2 " || true)"
+assert "every curl in install.sh is https-only with TLS >= 1.2, so a MITM cannot downgrade a fetch that feeds root-run code (offenders: ${bad_curls:-none})" \
+  "$([ -n "$curl_lines" ] && [ -z "$bad_curls" ] && echo 1 || echo 0)"
+
+# `curl | sudo bash` can be cut short anywhere. Bash parses a whole function
+# before running it, so cutting inside main() is a syntax error. A bogus flag
+# makes any executed prefix visible: main's arg parser would print "unknown
+# argument".
+main_line="$(grep -n '^main() {$' "$INSTALL" | cut -d: -f1)"
+total_lines="$(wc -l < "$INSTALL")"
+TRUNC_WORK="$(mktemp -d)"
+trunc_ok=1
+for cut_at in $(( main_line + 1 )) $(( (main_line + total_lines) / 2 )) $(( total_lines - 3 )); do
+  head -n "$cut_at" "$INSTALL" > "$TRUNC_WORK/install.sh"
+  trunc_status=0
+  trunc_out="$(bash "$TRUNC_WORK/install.sh" --bogus-flag 2>&1)" || trunc_status=$?
+  [ "$trunc_status" -ne 0 ] || trunc_ok=0
+  printf '%s' "$trunc_out" | grep -q 'unknown argument' && trunc_ok=0
+  printf '%s' "$trunc_out" | grep -qiE 'syntax error|unexpected end of file' || trunc_ok=0
+done
+rm -rf "$TRUNC_WORK"
+assert "a truncated install.sh fails to parse and executes nothing, instead of running a script prefix as root" \
+  "$trunc_ok"
+assert "install.sh invokes main on its last line" \
+  "$([ "$(tail -n 1 "$INSTALL")" = 'main "$@"' ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# Supply chain: apt signing keys are pinned by fingerprint.
+# ---------------------------------------------------------------------------
+
+# install_apt_key is extracted verbatim; curl is stubbed to copy a local
+# fixture key (the real function's fetch flags are covered by the curl test
+# above). Real gpg parses real throwaway keys.
+KEY_WORK="$(mktemp -d)"
+export GNUPGHOME="$KEY_WORK/gnupg"
+mkdir -m 700 "$GNUPGHOME"
+gpg --batch --quiet --pinentry-mode loopback --passphrase '' --quick-generate-key "pin-test <pin@test.invalid>" ed25519 sign never 2>/dev/null
+gpg --batch --quiet --pinentry-mode loopback --passphrase '' --quick-generate-key "other-test <other@test.invalid>" ed25519 sign never 2>/dev/null
+good_fpr="$(gpg --batch --with-colons --list-keys pin@test.invalid | awk -F: '/^fpr:/{print $10; exit}')"
+other_fpr="$(gpg --batch --with-colons --list-keys other@test.invalid | awk -F: '/^fpr:/{print $10; exit}')"
+gpg --batch --armor --export pin@test.invalid > "$KEY_WORK/good.asc"
+gpg --batch --armor --export other@test.invalid > "$KEY_WORK/other.asc"
+cat "$KEY_WORK/good.asc" "$KEY_WORK/other.asc" > "$KEY_WORK/both.asc"
+unset GNUPGHOME
+
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'curl() { local out=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done; cp "$FIXTURE_KEY" "$out"; }'
+  awk '/^install_apt_key\(\) \{/,/^\}/' "$INSTALL"
+  echo 'install_apt_key https://example.invalid/Release.key "$1" "$2"'
+} > "$KEY_WORK/runner.sh"
+
+run_key_install() {
+  KEY_STATUS=0
+  KEY_OUT="$(FIXTURE_KEY="$1" bash "$KEY_WORK/runner.sh" "$2" "$KEY_WORK/out.gpg" 2>&1)" || KEY_STATUS=$?
+}
+
+rm -f "$KEY_WORK/out.gpg"
+run_key_install "$KEY_WORK/good.asc" "$good_fpr"
+assert "a key matching the pinned fingerprint is installed into the apt keyring" \
+  "$([ "$KEY_STATUS" -eq 0 ] && [ -s "$KEY_WORK/out.gpg" ] && echo 1 || echo 0)"
+
+rm -f "$KEY_WORK/out.gpg"
+run_key_install "$KEY_WORK/other.asc" "$good_fpr"
+assert "a key with a different fingerprint than the pin is refused, naming expected and actual, and no keyring is written -- a compromised mirror cannot swap in its own key" \
+  "$([ "$KEY_STATUS" -ne 0 ] && [ ! -e "$KEY_WORK/out.gpg" ] && printf '%s' "$KEY_OUT" | grep -qF "expected: $good_fpr" && printf '%s' "$KEY_OUT" | grep -qF "actual:   $other_fpr" && echo 1 || echo 0)"
+
+rm -f "$KEY_WORK/out.gpg"
+run_key_install "$KEY_WORK/both.asc" "$good_fpr"
+assert "a key file carrying the pinned key plus an attacker key is refused, since signed-by would trust both" \
+  "$([ "$KEY_STATUS" -ne 0 ] && [ ! -e "$KEY_WORK/out.gpg" ] && echo 1 || echo 0)"
+
+assert "both apt keys are installed through the fingerprint-checking function, never piped straight into gpg --dearmor" \
+  "$([ "$(grep -c '^install_apt_key ' "$INSTALL")" -eq 2 ] && ! grep -qE 'curl .*\| *$|^ *\| gpg' "$INSTALL" && echo 1 || echo 0)"
+rm -rf "$KEY_WORK"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then

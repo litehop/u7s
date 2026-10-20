@@ -931,6 +931,16 @@ fn field_selector_name(query: Option<&str>) -> Option<String> {
     Some(value.to_owned())
 }
 
+/// Single percent-decode of a URL path (`+` stays literal). `None` when the result is not
+/// valid UTF-8.
+fn decode_path(path: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if path.contains('%') {
+        percent_decode(path).map(std::borrow::Cow::Owned)
+    } else {
+        Some(std::borrow::Cow::Borrowed(path))
+    }
+}
+
 /// Parsed path components needed for AuthzRequest construction.
 struct ParsedPath {
     api_group: String,
@@ -955,8 +965,16 @@ struct ParsedPath {
 ///   <resource>                            cluster-scoped collection
 ///   <resource>/<name>                     cluster-scoped named
 ///   <resource>/<name>/<sub>               cluster-scoped subresource
+///
+/// Splits the percent-decoded path (decoded once), like upstream's `RequestInfoFactory`
+/// splitting `URL.Path`: the router hands handlers decoded names, so an encoded `/` must
+/// be seen here as the segment boundary it becomes downstream. A path that does not
+/// decode to UTF-8 is treated as a non-resource URL.
 fn parse_path(path: &str) -> ParsedPath {
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(decoded) = decode_path(path) else {
+        return unknown_path();
+    };
+    let segs: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
 
     let (api_group, version, rest) = match segs.first().copied() {
         Some("api") => {
@@ -1302,7 +1320,7 @@ where
         // group/version/resource/subresource/namespace/name fields.
         let parsed = parse_path(path);
         let non_resource_path = if parsed.resource.is_empty() {
-            Some(path.to_owned())
+            Some(decode_path(path).unwrap_or(path.into()).into_owned())
         } else {
             None
         };
@@ -2140,6 +2158,143 @@ mod tests {
         assert_eq!(p.resource, "pods");
         assert_eq!(p.subresource, "status");
         assert_eq!(p.name.as_deref(), Some("mypod"));
+    }
+
+    /// An encoded `/` becomes a segment boundary for the router's decoded names, so authz
+    /// must split the decoded path or `n%2Fstatus` is authorized as a plain get on `n`
+    /// while the backend serves `n/status`.
+    #[test]
+    fn parse_path_splits_encoded_slash_like_decoded_url_path() {
+        for raw in [
+            "/apis/g/v/namespaces/ns/flunders/n%2Fstatus",
+            "/apis/g/v/namespaces/ns/flunders/n%2fstatus",
+            "/apis/g/v/namespaces/ns/flunders%2Fn%2Fstatus",
+            "/apis/g/v/namespaces%2Fns/flunders/n/status",
+            "/apis/g/v/namespaces/ns/flunders/%6E/%73tatus",
+        ] {
+            let p = parse_path(raw);
+            assert_eq!(p.resource, "flunders", "{raw}");
+            assert_eq!(p.namespace.as_deref(), Some("ns"), "{raw}");
+            assert_eq!(p.name.as_deref(), Some("n"), "{raw}");
+            assert_eq!(p.subresource, "status", "{raw}");
+        }
+    }
+
+    /// Double-encoding decodes exactly once (as upstream/axum do), so `%252F` is a literal
+    /// `%2F` name and never a boundary.
+    #[test]
+    fn parse_path_decodes_once_so_double_encoding_stays_in_one_segment() {
+        let p = parse_path("/api/v1/namespaces/ns/pods/n%252Fstatus");
+        assert_eq!(p.name.as_deref(), Some("n%2Fstatus"));
+        assert_eq!(p.subresource, "");
+    }
+
+    /// An encoded backslash is data, not a separator.
+    #[test]
+    fn parse_path_keeps_encoded_backslash_inside_segment() {
+        let p = parse_path("/api/v1/namespaces/ns/pods/n%5Cstatus");
+        assert_eq!(p.name.as_deref(), Some("n\\status"));
+        assert_eq!(p.subresource, "");
+    }
+
+    /// Encoded dot segments decode to `..`; authz sees the literal name the handler gets.
+    #[test]
+    fn parse_path_decodes_encoded_dot_segments() {
+        let p = parse_path("/api/v1/namespaces/ns/pods/%2e%2E");
+        assert_eq!(p.name.as_deref(), Some(".."));
+    }
+
+    #[test]
+    fn parse_path_treats_non_utf8_as_non_resource() {
+        assert!(parse_path("/api/v1/namespaces/ns/pods/%FF")
+            .resource
+            .is_empty());
+    }
+
+    /// User impact: a user granted `get flunders` but not `get flunders/status` must not
+    /// reach the status subresource by hiding the slash as `%2F`; the normal path stays
+    /// allowed, and non-resource rules see the decoded URL.
+    #[tokio::test]
+    async fn encoded_slash_cannot_smuggle_subresource_past_rbac() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let idx = Arc::new(RbacIndex::new());
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/flunder-getter",
+            &serde_json::json!({"rules": [
+                {"apiGroups": ["g"], "resources": ["flunders"], "verbs": ["get"]},
+                {"nonResourceURLs": ["/metrics"], "verbs": ["get"]}
+            ]}),
+        );
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/flunder-getter",
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "u"}],
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "flunder-getter"}
+            }),
+        );
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "tok".to_owned(),
+            UserInfo {
+                username: "u".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+        );
+        let app = Router::new()
+            .route(
+                "/apis/g/v/namespaces/ns/flunders/{name}",
+                get(|| async { "ok" }),
+            )
+            .fallback(|| async { "ok" })
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
+            ));
+        let status = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("authorization", "Bearer tok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        assert_eq!(
+            status("/apis/g/v/namespaces/ns/flunders/n").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status("/apis/g/v/namespaces/ns/flunders/n%2Fstatus").await,
+            StatusCode::FORBIDDEN,
+            "%2F must be authorized as flunders/status"
+        );
+        assert_eq!(
+            status("/apis/g/v/namespaces/ns/flunders/n%2fstatus").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(status("/metrics").await, StatusCode::OK);
+        assert_eq!(
+            status("/%6Detrics").await,
+            StatusCode::OK,
+            "non-resource rules must match the decoded path"
+        );
     }
 
     // Regression tests for parse_path misclassifying namespace paths.

@@ -21,8 +21,8 @@ and kube-controller-manager, and writes a systemd unit for each.
    returns 404 by design; pin a snapshot tag instead:
 
    ```bash
-   TAG=$(curl -sf "https://api.github.com/repos/litehop/u7s/releases?per_page=1" | grep -m1 '"tag_name"' | cut -d'"' -f4)
-   curl -fsSL "https://u7s.dekiru.tech/${TAG:?could not resolve the latest release tag - set TAG manually}/install.sh" | sudo bash
+   TAG=$(curl --proto '=https' --tlsv1.2 -sf "https://api.github.com/repos/litehop/u7s/releases?per_page=1" | grep -m1 '"tag_name"' | cut -d'"' -f4)
+   curl --proto '=https' --tlsv1.2 -fsSL "https://u7s.dekiru.tech/${TAG:?could not resolve the latest release tag - set TAG manually}/install.sh" | sudo bash
    ```
 
    The lookup uses `curl`, `grep` and `cut` (unauthenticated GitHub API
