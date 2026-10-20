@@ -101,6 +101,13 @@ assert_false "u7s-kcm.service passes no --service-account-private-key-file: lega
 assert_true "u7s-kcm.service reads --root-ca-file from the apiserver-published ca-bundle.pem, the file the restart hook watches" \
   grep -qF -- '--root-ca-file=$STATE_DIR/ca-bundle.pem' <<<"$kcm_exec_line"
 
+assert_true "u7s-kcm.service delegates authentication to the apiserver via the file-path kcm-kubeconfig -- without it :10257/metrics is 403 for every caller incl. cluster-admin" \
+  grep -qF -- '--authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig' <<<"$kcm_exec_line"
+assert_true "u7s-kcm.service delegates authorization to the apiserver (SubjectAccessReview), so /metrics honours system:monitoring RBAC" \
+  grep -qF -- '--authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig' <<<"$kcm_exec_line"
+assert_false "u7s-kcm.service opens no extra anonymous paths: /metrics must stay RBAC-gated" \
+  grep -qF -- '--authorization-always-allow-paths' <<<"$kcm_exec_line"
+
 assert_true "KCM restarts when ca-bundle.pem changes (--root-ca-file is read once, so root succession would otherwise leave KCM publishing a stale kube-root-ca.crt)" \
   grep -qF 'PathChanged=$STATE_DIR/ca-bundle.pem' "$INSTALL"
 assert_true "the CA-bundle path unit triggers a restart of u7s-kcm.service" \

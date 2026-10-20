@@ -1391,6 +1391,12 @@ WorkingDirectory=$STATE_DIR
 # service-account token Secrets, so KCM's token controller stays off.
 # kcm-kubeconfig references files, so KCM live-reloads a re-issued client cert and
 # CA; --root-ca-file is read once, hence the restart hook below.
+# --authentication-kubeconfig/--authorization-kubeconfig (same kubeconfig, as
+# kubeadm does) delegate authn/authz to the apiserver so :10257/metrics is
+# RBAC-gated (system:monitoring) instead of 403 for everyone; /healthz,
+# /readyz and /livez stay open by default. KCM treats a failed lookup of
+# kube-system/extension-apiserver-authentication as fatal and Restart=always
+# retries until the apiserver has published it.
 # ExecStartPre rather than a bash -c wrapper so --controllers=*,-... stays a
 # literal argv entry: systemd's own line-splitting never globs, but a real
 # shell would expand that "*" against WorkingDirectory's contents.
@@ -1425,7 +1431,7 @@ Environment=GOMAXPROCS=2
 # no longer knows about is a hard --controllers validation error ("is not
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 

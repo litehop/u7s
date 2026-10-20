@@ -148,11 +148,9 @@ chmod +x /tmp/kcm-supervisor.sh
 # node-route-controller / service-lb-controller from this exclusion list:
 # see scripts/install.sh's u7s-kcm.service for why -- mirrored here so the
 # conformance run exercises what ships.
-# --authorization-always-allow-paths below adds /metrics to the default
-# /healthz,/readyz,/livez allow-list. Without it, sample-run-metrics.sh's
-# unauthenticated curl to :10257/metrics gets a 403 -- confirmed: archived
-# kcm-metrics-*.prom snapshots hold a JSON Forbidden body, not Prometheus
-# text, so it's not just missing go_memstats, it's zero series of any kind.
+# --authentication-kubeconfig/--authorization-kubeconfig delegate authn/authz to the
+# apiserver (as install.sh does), so :10257/metrics needs a system:monitoring
+# token; /healthz,/readyz,/livez stay open by default.
 setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --kubeconfig="\$KUBECONFIG_FILE" \\
   --cluster-signing-cert-file="\$CA_CERT" \\
@@ -167,7 +165,8 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --leader-elect=false \\
   --bind-address=127.0.0.1 \\
   --kube-api-content-type=application/json \\
-  --authorization-always-allow-paths=/healthz,/readyz,/livez,/metrics \\
+  --authentication-kubeconfig="\$KUBECONFIG_FILE" \\
+  --authorization-kubeconfig="\$KUBECONFIG_FILE" \\
   \$KCM_V_FLAG \\
   > "\$SUPERVISOR_LOG" 2>&1 &
 
