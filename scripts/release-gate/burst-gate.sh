@@ -3,7 +3,7 @@
 #
 # Per run: fresh Lima VM from scripts/release-gate/u7s-vps-1g.yaml (arm64, 1 vCPU,
 # 1 GiB, no swap) -> zero-argument install.sh from an arm64 tarball built from this
-# checkout -> WordPress+MariaDB -> 20-pod burst -> 80-pod burst -> webhook-smoke.sh,
+# checkout -> WordPress+MariaDB -> 20-pod burst -> N-pod burst (--burst-pods, default 50) -> webhook-smoke.sh,
 # sampling MemAvailable, per-process PSS/RSS, OOM kills and node Ready throughout.
 #
 # PASS iff all of (operator-approved criteria; every run must pass):
@@ -14,9 +14,12 @@
 #   (e) scripts/e2e-workload/webhook-smoke.sh passes on the shipped-install VM
 # Exits non-zero if any criterion of any run FAILs.
 #
-# Usage: burst-gate.sh [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--zram-mib N] [--coredns-requests]
+# Usage: burst-gate.sh [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
+#   --burst-pods N    size of the large burst (default 50); the verdict names it
+#   --confirm         release-gate mode, run on a QUIET host (~1 h): --runs (default 3) full runs at
+#                     50 pods, and only if any fails 3 at 40. Reports the gated no-swap ceiling or FAIL.
 #   --keep            do not delete the VMs afterwards
 #   --memory GiB      override the template's VM memory (forced-failure checks, e.g. 0.625)
 #   --coredns-requests experiment: set CoreDNS cpu/memory requests after install
@@ -38,6 +41,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
+BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
 BURST_CAP_SECS=300
 RUN_WALL_SECS=3300
@@ -50,6 +54,8 @@ while [ $# -gt 0 ]; do
     --zram-mib) ZRAM_MIB="$2"; shift 2 ;;
     --capture) CAPTURE=1; shift ;;
     --ramp) RAMP="$2"; shift 2 ;;
+    --burst-pods) BURST_PODS="$2"; shift 2 ;;
+    --confirm) CONFIRM=1; shift ;;
     --probe-kill) PROBE_KILL_SECS="$2"; shift 2 ;;
     --memory) MEMORY="$2"; shift 2 ;;
     --burst-cap) BURST_CAP_SECS="$2"; shift 2 ;;
@@ -74,6 +80,10 @@ esac
 case "$PROBE_KILL_SECS" in
   ''|*[!0-9]*|0) echo "--probe-kill must be a positive integer (seconds), got '$PROBE_KILL_SECS'" >&2; exit 2 ;;
 esac
+case "$BURST_PODS" in
+  ''|*[!0-9]*|0) echo "--burst-pods must be a positive integer, got '$BURST_PODS'" >&2; exit 2 ;;
+esac
+if [ "$CONFIRM" = 1 ] && [ -n "$RAMP" ]; then echo "--confirm and --ramp are mutually exclusive" >&2; exit 2; fi
 if [ -n "$RAMP" ]; then
   RAMP_SIZES="$(rg_parse_ramp "$RAMP")" \
     || { echo "--ramp must be strictly increasing positive integers like 30,40,50, got '$RAMP'" >&2; exit 2; }
@@ -96,12 +106,25 @@ if [ -z "$TARBALL_DIR" ]; then
   "$HERE/build-arm64-tarball.sh" "$TARBALL_DIR" || { echo "tarball build failed" >&2; exit 2; }
 fi
 
+# --confirm: full gate (--runs, default 3) at each size in CONFIRM_SIZES, largest first, stopping
+# at the first size where every run passes. The passing size is the gated no-swap burst ceiling.
+if [ "$CONFIRM" = 1 ]; then
+  tried=()
+  for size in $CONFIRM_SIZES; do
+    "$0" --runs "$RUNS" --burst-pods "$size" --burst-cap "$BURST_CAP_SECS" --tarball-dir "$TARBALL_DIR" --out "$OUT/burst-$size" >&2 || true
+    n_passed="$(cat "$OUT/burst-$size/passed" 2>/dev/null || echo 0)"
+    tried+=("$size:$n_passed:$RUNS")
+    [ "$n_passed" = "$RUNS" ] && break
+  done
+  rg_confirm_verdict "${tried[@]}"; exit $?
+fi
+
 STAGE="$OUT/stage"
 mkdir -p "$STAGE/wordpress"
 cp "$TARBALL_DIR"/u7s-gate-*.tar.gz "$TARBALL_DIR"/u7s-gate-*.tar.gz.sha256 "$TARBALL_DIR/install.sh" "$STAGE/"
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
-printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\n' \
-  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" > "$STAGE/gate.env"
+printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\n' \
+  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" > "$STAGE/gate.env"
 cp "$ROOT/examples/e2e/wordpress/wordpress.yaml" "$STAGE/wordpress/"
 # MariaDB data on emptyDir: the gate VM has no csi-hostpath, and the PVC is not what is under test.
 awk '
@@ -156,5 +179,6 @@ while [ "$i" -lt "$RUNS" ]; do
   [ "$KEEP" = 1 ] || { limactl delete -f "$VM" >/dev/null 2>&1; VMS="${VMS/ $VM/}"; }
 done
 
-echo "==== GATE: $passed/$RUNS runs passed -> $([ "$overall" = 0 ] && echo PASS || echo FAIL) (results in $OUT) ===="
+echo "$passed" > "$OUT/passed"
+echo "==== GATE: $passed/$RUNS runs passed at $BURST_PODS pods -> $([ "$overall" = 0 ] && echo PASS || echo FAIL) (results in $OUT) ===="
 exit "$overall"

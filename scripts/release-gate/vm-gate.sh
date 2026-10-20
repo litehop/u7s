@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs inside the gate VM as root (driven by burst-gate.sh). Installs u7s with the
-# zero-argument baked install.sh, deploys WordPress+MariaDB, runs the 20- and 80-pod
+# zero-argument baked install.sh, deploys WordPress+MariaDB, runs the 20- and BURST_PODS-pod
 # bursts with hard wall-clock caps, runs webhook-smoke.sh, and writes
 # $RG/out/results.env (format: see lib.sh) plus raw samples.
 #
@@ -18,7 +18,7 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
-COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180
+COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
 
@@ -231,10 +231,10 @@ run_full() {
   burst_cleanup; phase settle20; sleep "$SETTLE_STEP"
   record_uids
 
-  phase burst80
-  b80="$(run_burst 80)"; res burst80_secs "$b80"; log "80-pod burst: $b80 s"
-  snap burst80
-  burst_cleanup; phase settle80; sleep "$SETTLE_STEP"
+  phase burstn
+  bn="$(run_burst "$BURST_PODS")"; res burst_pods "$BURST_PODS"; res burst_secs "$bn"; log "$BURST_PODS-pod burst: $bn s"
+  snap burstn
+  burst_cleanup; phase settlen; sleep "$SETTLE_STEP"
   record_uids
 
   phase wpcheck

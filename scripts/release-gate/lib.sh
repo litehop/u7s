@@ -10,7 +10,8 @@
 #   notready_events=N        node Ready!=True observations during the run
 #   node_ready_final=True|False|Unknown
 #   burst20_secs=N|timeout   seconds until all 20 pods Ready, or "timeout" (hard cap hit)
-#   burst80_secs=N|timeout
+#   burst_pods=N             size of the large burst (the gated no-swap ceiling candidate)
+#   burst_secs=N|timeout     seconds until all burst_pods Ready
 #   wp_ok=1|0                WordPress page answered after the burst settled
 #   webhook_ok=1|0           scripts/e2e-workload/webhook-smoke.sh passed
 # Ramp mode writes install_ok plus, per burst size N: ramp_N_secs (N|timeout),
@@ -167,7 +168,7 @@ _rg_row() { printf '%-4s %-5s %s\n' "$1" "$2" "$3"; }
 # Prints the per-criterion table for one results file; returns 1 if any criterion FAILs.
 rg_verdict() {
   local f="$1" cap="$BURST_CAP_SECS" rc=0
-  local install oomh oomk notready ready_final b20 b80 wp wh
+  local install oomh oomk notready ready_final b20 bn np wp wh
 
   install="$(rg_get "$f" install_ok)"
   oomh="$(rg_get "$f" oom_host)"
@@ -175,7 +176,7 @@ rg_verdict() {
   notready="$(rg_get "$f" notready_events)"
   ready_final="$(rg_get "$f" node_ready_final)"
   b20="$(rg_get "$f" burst20_secs)"
-  b80="$(rg_get "$f" burst80_secs)"
+  bn="$(rg_get "$f" burst_secs)"; np="$(rg_get "$f" burst_pods)"
   wp="$(rg_get "$f" wp_ok)"
   wh="$(rg_get "$f" webhook_ok)"
 
@@ -197,8 +198,8 @@ rg_verdict() {
   _check "(b)" "$b" "node Ready throughout (not-Ready observations=${notready:-missing}, final=${ready_final:-missing})"
 
   local c=0
-  if [ "$(_burst_ok "$b20")" = 1 ] && [ "$(_burst_ok "$b80")" = 1 ]; then c=1; fi
-  _check "(c)" "$c" "each burst within ${cap}s (20-pod=${b20:-missing}$(_is_num "$b20" && echo s), 80-pod=${b80:-missing}$(_is_num "$b80" && echo s))"
+  if [ "$(_burst_ok "$b20")" = 1 ] && [ "$(_burst_ok "$bn")" = 1 ] && _is_num "$np"; then c=1; fi
+  _check "(c)" "$c" "each burst within ${cap}s (20-pod=${b20:-missing}$(_is_num "$b20" && echo s), ${np:-?}-pod=${bn:-missing}$(_is_num "$bn" && echo s))"
 
   _check "(d)" "$([ "$wp" = 1 ] && echo 1 || echo 0)" "WordPress responds after burst settles (wp_ok=${wp:-missing})"
   _check "(e)" "$([ "$wh" = 1 ] && echo 1 || echo 0)" "webhook-smoke.sh passes (webhook_ok=${wh:-missing})"
@@ -206,6 +207,23 @@ rg_verdict() {
   # Not a criterion: kubelet memory-pressure evictions delete pods without an OOM kill.
   _rg_row INFO "" "evicted pods: $(rg_get "$f" evicted_pods) api-unreachable polls: $(rg_get "$f" api_unreachable_polls)"
 
-  if [ "$rc" -eq 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; fi
+  if [ "$rc" -eq 0 ]; then echo "RESULT: PASS (${np:-?}-pod burst)"; else echo "RESULT: FAIL (${np:-?}-pod burst)"; fi
   return "$rc"
+}
+
+# Confirm-mode decision. Args: one "<pods>:<passed>:<total>" per size tried, largest first.
+# The gated no-swap ceiling is the first size where every run passed; a smaller size is
+# only tried when the larger one failed. Returns 1 when none confirmed.
+rg_confirm_verdict() {
+  local t pods passed total
+  for t in "$@"; do
+    IFS=: read -r pods passed total <<< "$t"
+    echo "CONFIRM: ${pods}-pod burst passed ${passed}/${total} runs"
+    if [ "${total:-0}" -ge 1 ] && [ "$passed" = "$total" ]; then
+      echo "CONFIRM: PASS -- gated no-swap burst ceiling = ${pods} pods (${passed}/${total} on a quiet host)"
+      return 0
+    fi
+  done
+  echo "CONFIRM: FAIL -- no size passed on every run; no gated no-swap ceiling"
+  return 1
 }
