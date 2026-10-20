@@ -2911,6 +2911,31 @@ fn json_quantity_map_to_proto(
         .unwrap_or_default()
 }
 
+/// `metadata.managedFields` as protobuf. Without it a typed (protobuf) client reads an object
+/// with no managedFields while a JSON client reads them, so the two views of one object differ.
+pub(crate) fn json_to_managed_fields_proto(
+    meta: &serde_json::Value,
+) -> Vec<meta_v1::ManagedFieldsEntry> {
+    meta.get("managedFields")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|e| meta_v1::ManagedFieldsEntry {
+                    manager: jstr(e, "manager"),
+                    operation: jstr(e, "operation"),
+                    api_version: jstr(e, "apiVersion"),
+                    time: jtime(e, "time"),
+                    fields_type: jstr(e, "fieldsType"),
+                    fields_v1: e.get("fieldsV1").map(|f| meta_v1::FieldsV1 {
+                        raw: serde_json::to_vec(f).ok(),
+                    }),
+                    subresource: jstr(e, "subresource"),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
     let meta = obj
         .get("metadata")
@@ -2946,6 +2971,7 @@ fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
         annotations: jstrmap(&meta, "annotations"),
         owner_references,
         finalizers: jstrs(&meta, "finalizers"),
+        managed_fields: json_to_managed_fields_proto(&meta),
         ..Default::default()
     }
 }
@@ -3896,6 +3922,42 @@ pub fn encode_eventlist_proto_gen(v: &serde_json::Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typed (protobuf) client and a JSON client reading the same pod must see the same
+    /// managedFields; the pod `resize` subresource conformance spec compares exactly those two
+    /// reads and fails when the protobuf one drops them.
+    #[test]
+    fn pod_proto_encoding_carries_managed_fields() {
+        let fields = serde_json::json!({"f:spec": {"f:containers": {"k:{\"name\":\"c1\"}": {}}}});
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "managedFields": [{
+                "manager": "kubectl-patch", "operation": "Update", "apiVersion": "v1",
+                "time": "2026-10-20T06:45:10Z", "fieldsType": "FieldsV1",
+                "fieldsV1": fields, "subresource": "resize",
+            }]},
+            "spec": {"containers": [{"name": "c1"}]},
+        });
+        let decoded =
+            core_v1::Pod::decode(encode_pod_proto_gen(&pod).as_slice()).expect("decode pod");
+        let entry = &decoded.metadata.expect("metadata").managed_fields[0];
+        assert_eq!(entry.manager.as_deref(), Some("kubectl-patch"));
+        assert_eq!(entry.operation.as_deref(), Some("Update"));
+        assert_eq!(entry.subresource.as_deref(), Some("resize"));
+        assert_eq!(
+            entry.time.as_ref().and_then(|t| t.seconds),
+            Some(1_792_478_710)
+        );
+        let raw = entry
+            .fields_v1
+            .as_ref()
+            .and_then(|f| f.raw.clone())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+            fields
+        );
+    }
 
     /// Pod spec tolerations survive proto decode via the generated path.
     ///
