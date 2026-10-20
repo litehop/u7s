@@ -135,9 +135,33 @@ pub(crate) struct IpContext {
     pub service_cidr: Option<(std::net::Ipv4Addr, u32)>,
     /// The apiserver's own advertise and listen addresses.
     pub apiserver_ips: Vec<IpAddr>,
+    /// Every Node's `spec.podCIDRs`/`spec.podCIDR` as (node name, base, prefix length). The
+    /// apiserver has no cluster CIDR, so the union of per-node ranges is the pod range.
+    pub pod_cidrs: Vec<(String, IpAddr, u8)>,
 }
 
 impl IpContext {
+    fn add_pod_cidrs(&mut self, node: &serde_json::Value) {
+        let name = node["metadata"]["name"].as_str().unwrap_or("");
+        let spec = &node["spec"];
+        let cidrs = spec["podCIDRs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain([&spec["podCIDR"]]);
+        for c in cidrs.filter_map(|c| c.as_str()) {
+            let Some((base, len)) = c.split_once('/') else {
+                continue;
+            };
+            if let (Ok(base), Ok(len)) = (base.parse::<IpAddr>(), len.parse::<u8>()) {
+                let base = base.to_canonical();
+                if len <= if base.is_ipv4() { 32 } else { 128 } {
+                    self.pod_cidrs.push((name.to_string(), base, len));
+                }
+            }
+        }
+    }
+
     fn check_ip(&self, ip: IpAddr, node_name: &str) -> Result<(), String> {
         let ip = ip.to_canonical();
         let special = match ip {
@@ -162,6 +186,13 @@ impl IpContext {
                 return Err(format!("IP SAN {ip} is inside the service CIDR"));
             }
         }
+        for (owner, base, len) in &self.pod_cidrs {
+            if cidr_contains(*base, *len, ip) {
+                return Err(format!(
+                    "IP SAN {ip} is inside Node {owner}'s podCIDR {base}/{len}"
+                ));
+            }
+        }
         if self.apiserver_ips.iter().any(|a| a.to_canonical() == ip) {
             return Err(format!("IP SAN {ip} is the apiserver's own address"));
         }
@@ -172,6 +203,16 @@ impl IpContext {
         }
         Ok(())
     }
+}
+
+fn cidr_contains(base: IpAddr, len: u8, ip: IpAddr) -> bool {
+    let (b, i, bits) = match (base, ip) {
+        (IpAddr::V4(b), IpAddr::V4(i)) => (u128::from(u32::from(b)), u128::from(u32::from(i)), 32),
+        (IpAddr::V6(b), IpAddr::V6(i)) => (u128::from(b), u128::from(i), 128),
+        _ => return false,
+    };
+    let host_bits = u32::from(bits - len);
+    host_bits >= 128 || (b >> host_bits) == (i >> host_bits)
 }
 
 /// Every GeneralName from every SAN extension in the CSR's extensionRequest attributes.
@@ -282,6 +323,7 @@ pub(crate) async fn approve_kubelet_serving_csrs<S: Store>(
             let Ok(n) = serde_json::from_slice::<serde_json::Value>(&n.value) else {
                 continue;
             };
+            ctx.add_pod_cidrs(&n);
             if n["metadata"]["name"].as_str() == Some(node_name) {
                 node = Some(n);
                 continue;
@@ -647,6 +689,72 @@ mod tests {
         .await;
         approve_kubelet_serving_csrs(&state, &[]).await;
         assert_eq!(conditions(&state, "csr-n2").await[0]["type"], "Approved");
+    }
+
+    fn with_pod_cidrs(mut node: serde_json::Value, cidrs: &[&str]) -> serde_json::Value {
+        node["spec"] = serde_json::json!({"podCIDR": cidrs[0], "podCIDRs": cidrs});
+        node
+    }
+
+    async fn sweep_decision(nodes: &[serde_json::Value], csr_node: &str, ip: &str) -> bool {
+        let state = make_state();
+        for n in nodes {
+            let name = n["metadata"]["name"].as_str().unwrap();
+            seed(&state, &cluster_object_key("nodes", name), n).await;
+        }
+        let csr = serving_csr_for(csr_node, &[ip]);
+        let key = crate::keys::group_object_key(GROUP, PLURAL, None, &format!("csr-{csr_node}"));
+        seed(&state, &key, &csr).await;
+        approve_kubelet_serving_csrs(&state, &[]).await;
+        !conditions(&state, &format!("csr-{csr_node}"))
+            .await
+            .is_null()
+    }
+
+    #[tokio::test]
+    async fn serving_cert_for_an_ip_in_another_nodes_pod_range_stays_pending_so_a_pod_ip_cannot_be_impersonated(
+    ) {
+        let n1 = with_pod_cidrs(node_named("n1", &["192.168.5.15"]), &["10.244.1.0/24"]);
+        // n2 claims a pod IP of n1's range as its own address.
+        let n2 = with_pod_cidrs(node_named("n2", &["10.244.1.7"]), &["10.244.2.0/24"]);
+        assert!(!sweep_decision(&[n1, n2], "n2", "10.244.1.7").await);
+    }
+
+    #[tokio::test]
+    async fn serving_cert_for_an_ip_in_the_nodes_own_pod_range_stays_pending() {
+        let n1 = with_pod_cidrs(node_named("n1", &["10.244.1.9"]), &["10.244.1.0/24"]);
+        assert!(!sweep_decision(&[n1], "n1", "10.244.1.9").await);
+    }
+
+    #[tokio::test]
+    async fn ipv6_pod_range_is_excluded_too_including_the_legacy_single_podcidr_field() {
+        let mut n1 = node_named("n1", &["fd00:1::5"]);
+        n1["spec"] = serde_json::json!({"podCIDR": "fd00:1::/64"});
+        assert!(!sweep_decision(&[n1], "n1", "fd00:1::5").await);
+        let n2 = with_pod_cidrs(
+            node_named("n2", &["fd00:2::5"]),
+            &["10.244.2.0/24", "fd00:2::/64"],
+        );
+        assert!(!sweep_decision(&[n2], "n2", "fd00:2::5").await);
+    }
+
+    #[tokio::test]
+    async fn ip_just_outside_every_pod_range_is_still_approved() {
+        let n1 = with_pod_cidrs(
+            node_named("n1", &["10.244.3.0"]),
+            &["10.244.1.0/24", "fd00:1::/64"],
+        );
+        let n2 = with_pod_cidrs(node_named("n2", &["10.244.0.255"]), &["10.244.2.0/24"]);
+        assert!(sweep_decision(&[n1.clone(), n2.clone()], "n1", "10.244.3.0").await);
+        assert!(sweep_decision(&[n1, n2], "n2", "10.244.0.255").await);
+    }
+
+    #[tokio::test]
+    async fn node_without_a_pod_cidr_yet_neither_blocks_nor_breaks_approval() {
+        let n1 = node_named("n1", &["192.168.5.15"]);
+        let mut n2 = node_named("n2", &["192.168.5.16"]);
+        n2["spec"] = serde_json::json!({"podCIDRs": []});
+        assert!(sweep_decision(&[n1, n2], "n1", "192.168.5.15").await);
     }
 
     #[test]
