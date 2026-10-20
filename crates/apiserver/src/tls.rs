@@ -1,4 +1,8 @@
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+use crate::pki::{
+    cert_validity, CertInventory, CertRole, CertSpec, Pki, Signer, CLIENT_CERT_LIFETIME,
+    ROOT_CA_LIFETIME, SERVING_CERT_LIFETIME,
+};
+use rcgen::{CertificateParams, Issuer, KeyPair, SanType};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, UnixTime},
@@ -161,6 +165,8 @@ fn random_ca_suffix() -> String {
 /// Design: keeping the CA stable means kubelets (and any other component that
 /// trusts our CA via kubeconfig) do not see a cert validation failure after a restart.
 fn load_or_generate_ca(
+    pki: &Pki,
+    name: &'static str,
     ca_key_path: &str,
     ca_cert_path: &str,
 ) -> anyhow::Result<(KeyPair, CertificateParams, Vec<u8>)> {
@@ -229,11 +235,10 @@ fn load_or_generate_ca(
         let ca_cn = crate::auth::extract_client_cert_identity(&ca_cert_der)
             .map(|id| id.username)
             .unwrap_or_else(|| "u7s-ca".to_owned());
-        let mut ca_params = CertificateParams::default();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, ca_cn);
+        let spec = ca_spec(name, &ca_cn);
+        pki.record_loaded(&spec, &ca_cert_der)?;
+        let (not_before, not_after) = cert_validity(&ca_cert_der)?;
+        let ca_params = pki.params(&spec, not_before, not_after);
 
         tracing::info!("loaded CA key from {ca_key_path}; cert DER from {ca_cert_path}");
         return Ok((ca_key, ca_params, ca_cert_der));
@@ -245,18 +250,15 @@ fn load_or_generate_ca(
     // by the shared literal name and then failing cryptographic verification
     // against a leaf signed by a different key (rustls BadSignature — cryptic).
     tracing::info!("generating new CA key+cert → {ca_key_path} / {ca_cert_path}");
-    let ca_key = KeyPair::generate().map_err(|e| anyhow::anyhow!("generate CA key: {e}"))?;
     let ca_cn = format!("u7s-ca-{}", random_ca_suffix());
-    let mut ca_params = CertificateParams::default();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, ca_cn);
-    let ca_cert_der = ca_params
-        .self_signed(&ca_key)
-        .map_err(|e| anyhow::anyhow!("self-sign CA: {e}"))?
-        .der()
-        .to_vec();
+    let spec = ca_spec(name, &ca_cn);
+    let issued = pki
+        .issue(&spec, None)
+        .map_err(|e| anyhow::anyhow!("generate CA: {e}"))?;
+    let ca_key = issued.key;
+    let ca_cert_der = issued.cert.der().to_vec();
+    let (not_before, not_after) = cert_validity(&ca_cert_der)?;
+    let ca_params = pki.params(&spec, not_before, not_after);
 
     // Persist both files to temp names first, then rename cert and finally key. A crash
     // before the first rename leaves neither final file (next boot is a clean first
@@ -285,6 +287,18 @@ fn load_or_generate_ca(
         .map_err(|e| anyhow::anyhow!("fsync CA directory: {e}"))?;
 
     Ok((ca_key, ca_params, ca_cert_der))
+}
+
+fn ca_spec<'a>(name: &'static str, common_name: &'a str) -> CertSpec<'a> {
+    CertSpec {
+        name,
+        common_name,
+        organization: None,
+        role: CertRole::Root,
+        lifetime: ROOT_CA_LIFETIME,
+        usages: &["cert sign"],
+        sans: vec![],
+    }
 }
 
 /// Rename `key_tmp` to `key_path` iff it is a key matching the cert at `cert_path`.
@@ -376,39 +390,48 @@ fn leaf_cert_chain_validates(leaf_der: &[u8], ca_der: &[u8]) -> bool {
 /// unconditionally overwritten into the kubeconfig file), with no way to revoke the
 /// previous one.
 fn load_or_generate_admin_cert(
+    pki: &Pki,
     key_path: &std::path::Path,
     cert_path: &std::path::Path,
     ca_cert_der: &[u8],
-    ca_issuer: &Issuer<'_, KeyPair>,
+    signer: &Signer<'_>,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let key_exists = key_path.exists();
     let cert_exists = cert_path.exists();
+    let key_tmp = format!("{}.tmp", key_path.display());
+    let cert_tmp = format!("{}.tmp", cert_path.display());
 
-    // Same partial-state rationale as load_or_generate_ca: only one of the two files
-    // existing means a prior run crashed mid-write. Delete the stale half and regenerate
-    // rather than silently loading a key with no matching cert (or vice versa).
-    if key_exists ^ cert_exists {
-        if key_exists {
-            tracing::error!(
-                "partial admin cert state: {} exists but {} is missing; \
-                 deleting stale key and regenerating admin cert",
-                key_path.display(),
-                cert_path.display()
-            );
-            std::fs::remove_file(key_path).map_err(|e| {
-                anyhow::anyhow!("remove stale admin key {}: {e}", key_path.display())
-            })?;
+    // Same crash-recovery rules as the CA: an interrupted first write (cert renamed, key
+    // not yet) is resumed only when the tmp key provably matches the cert.
+    let key_exists = if cert_exists
+        && !key_exists
+        && roll_forward_key_tmp(
+            &cert_path.to_string_lossy(),
+            &key_tmp,
+            &key_path.to_string_lossy(),
+        )? {
+        tracing::warn!("rolled forward interrupted admin key write {key_tmp}");
+        true
+    } else {
+        key_exists
+    };
+
+    // One file alone is a crashed or tampered state; deleting it would silently mint a new
+    // system:masters credential, so refuse and leave both files untouched.
+    if key_exists != cert_exists {
+        let (present, missing) = if key_exists {
+            (key_path, cert_path)
         } else {
-            tracing::error!(
-                "partial admin cert state: {} exists but {} is missing; \
-                 deleting stale cert and regenerating admin cert",
-                cert_path.display(),
-                key_path.display()
-            );
-            std::fs::remove_file(cert_path).map_err(|e| {
-                anyhow::anyhow!("remove stale admin cert {}: {e}", cert_path.display())
-            })?;
-        }
+            (cert_path, key_path)
+        };
+        anyhow::bail!(
+            "partial admin cert state: {} exists but {} is missing; refusing to regenerate. \
+             Restore {}, or delete {} to deliberately mint a new admin credential",
+            present.display(),
+            missing.display(),
+            missing.display(),
+            present.display()
+        );
     }
 
     if key_path.exists() && cert_path.exists() {
@@ -421,6 +444,7 @@ fn load_or_generate_admin_cert(
             .map_err(|e| anyhow::anyhow!("read admin cert {}: {e}", cert_path.display()))?;
 
         if leaf_cert_chain_validates(&cert_der, ca_cert_der) {
+            pki.record_loaded(&admin_spec(), &cert_der)?;
             tracing::info!("loaded admin cert from {}", cert_path.display());
             return Ok((cert_der, key_pem.into_bytes()));
         }
@@ -441,26 +465,48 @@ fn load_or_generate_admin_cert(
             .map_err(|e| anyhow::anyhow!("remove stale admin cert {}: {e}", cert_path.display()))?;
     }
 
-    let admin_key = KeyPair::generate().map_err(|e| anyhow::anyhow!("generate admin key: {e}"))?;
-    let mut admin_params = CertificateParams::default();
-    admin_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "admin");
-    // O=system:masters bypasses RBAC (Phase 3+). Harmless in Phase 1 (no RBAC).
-    admin_params
-        .distinguished_name
-        .push(rcgen::DnType::OrganizationName, "system:masters");
-    let admin_cert = admin_params.signed_by(&admin_key, ca_issuer)?;
-    let admin_cert_der = admin_cert.der().to_vec();
-    let admin_key_pem = admin_key.serialize_pem().into_bytes();
+    let spec = admin_spec();
+    let issued = pki.issue(&spec, Some(signer))?;
+    let admin_cert_der = issued.cert.der().to_vec();
+    let admin_key_pem = issued.key.serialize_pem().into_bytes();
 
-    write_private_key(validate_cli_path(key_path)?, &admin_key_pem)
-        .map_err(|e| anyhow::anyhow!("write admin key {}: {e}", key_path.display()))?;
-    std::fs::write(validate_cli_path(cert_path)?, &admin_cert_der)
-        .map_err(|e| anyhow::anyhow!("write admin cert {}: {e}", cert_path.display()))?;
+    // Both files go to tmp names first, then cert, then key: a crash between the renames
+    // leaves cert + key.tmp, which the next boot resumes, or cert alone, which it refuses.
+    let io = |what: &str, p: &std::path::Path, e: std::io::Error| {
+        anyhow::anyhow!("{what} {}: {e}", p.display())
+    };
+    write_private_key(
+        validate_cli_path(std::path::Path::new(&key_tmp))?,
+        &admin_key_pem,
+    )
+    .map_err(|e| io("write admin key", key_path, e))?;
+    write_synced(
+        validate_cli_path(std::path::Path::new(&cert_tmp))?,
+        &admin_cert_der,
+    )
+    .map_err(|e| io("write admin cert", cert_path, e))?;
+    std::fs::rename(&cert_tmp, cert_path).map_err(|e| io("rename admin cert", cert_path, e))?;
+    sync_parent_dir(&cert_path.to_string_lossy())
+        .map_err(|e| io("fsync admin cert dir", cert_path, e))?;
+    std::fs::rename(&key_tmp, key_path).map_err(|e| io("rename admin key", key_path, e))?;
+    sync_parent_dir(&key_path.to_string_lossy())
+        .map_err(|e| io("fsync admin key dir", key_path, e))?;
     tracing::info!("generated new admin cert → {}", cert_path.display());
 
     Ok((admin_cert_der, admin_key_pem))
+}
+
+fn admin_spec() -> CertSpec<'static> {
+    CertSpec {
+        name: "admin",
+        common_name: "admin",
+        // O=system:masters bypasses RBAC.
+        organization: Some("system:masters"),
+        role: CertRole::Leaf,
+        lifetime: CLIENT_CERT_LIFETIME,
+        usages: &["client auth"],
+        sans: vec![],
+    }
 }
 
 pub struct TlsMaterial {
@@ -513,6 +559,9 @@ pub struct TlsMaterial {
     pub proxy_client_key_pem: Vec<u8>,
     /// Configured rustls ServerConfig for the axum server.
     pub server_config: Arc<ServerConfig>,
+    /// Every cert issued or loaded for this process, with its validity window.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub inventory: CertInventory,
 }
 
 /// Split an advertise address ("https://host:6443", "[fd00::1]:6443", "myhost") into its
@@ -585,7 +634,27 @@ fn build_server_sans(
     Ok(sans)
 }
 
+fn client_spec<'a>(
+    name: &'static str,
+    common_name: &'a str,
+    organization: Option<&'a str>,
+) -> CertSpec<'a> {
+    CertSpec {
+        name,
+        common_name,
+        organization,
+        role: CertRole::Leaf,
+        lifetime: CLIENT_CERT_LIFETIME,
+        usages: &["client auth"],
+        sans: vec![],
+    }
+}
+
 pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
+    generate_tls_with(args, &Pki::default())
+}
+
+fn generate_tls_with(args: &Args, pki: &Pki) -> anyhow::Result<TlsMaterial> {
     // Install the ML-KEM-768 hybrid post-quantum crypto provider.
     // `.ok()` makes this idempotent: a second call (e.g. in tests) is a no-op.
     rustls_post_quantum::provider().install_default().ok();
@@ -595,79 +664,96 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // stays stable across restarts. If either is missing, generate fresh and write.
     // ca_cert_der is the original DER bytes — stable across restarts.
     // ca_params is used to construct an Issuer for signing leaf certs (rcgen 0.14 API).
-    let (ca_key, ca_params, ca_cert_der) = load_or_generate_ca(&args.ca_key, &args.ca_cert)?;
+    let (ca_key, ca_params, ca_cert_der) =
+        load_or_generate_ca(pki, "ca", &args.ca_key, &args.ca_cert)?;
     // Build an Issuer from the CA params and key for signing leaf certificates.
     let ca_issuer = Issuer::new(ca_params, ca_key);
+    let ca_signer = Signer {
+        issuer: &ca_issuer,
+        not_after: cert_validity(&ca_cert_der)?.1,
+    };
 
     // --- Server cert ---
-    let server_key = KeyPair::generate()?;
-    let mut server_params = CertificateParams::default();
     // Always include localhost / 127.0.0.1 and the lima VM-to-host alias,
     // plus the advertise-address host if provided.
     let sans = build_server_sans(
         advertise_host(args.advertise_address.as_deref())?.as_deref(),
         &args.service_cluster_ip_range,
     )?;
-    server_params.subject_alt_names = sans;
-    server_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "u7s-apiserver");
-    let server_cert = server_params.signed_by(&server_key, &ca_issuer)?;
+    let server = pki.issue(
+        &CertSpec {
+            name: "apiserver-serving",
+            common_name: "u7s-apiserver",
+            organization: None,
+            role: CertRole::Leaf,
+            lifetime: SERVING_CERT_LIFETIME,
+            usages: &["server auth"],
+            sans,
+        },
+        Some(&ca_signer),
+    )?;
+    let (server_key, server_cert) = (server.key, server.cert);
 
     // --- Admin client cert: load-or-generate, persisted alongside the CA -----------------
     // Sibling files next to ca.key/ca.crt rather than new CLI flags -- see
     // load_or_generate_admin_cert's doc for why persisting this (not just the CA) matters.
     let admin_key_path = std::path::Path::new(&args.ca_key).with_file_name("admin.key");
     let admin_cert_path = std::path::Path::new(&args.ca_cert).with_file_name("admin.crt");
-    let (admin_cert_der, admin_key_pem) =
-        load_or_generate_admin_cert(&admin_key_path, &admin_cert_path, &ca_cert_der, &ca_issuer)?;
+    let (admin_cert_der, admin_key_pem) = load_or_generate_admin_cert(
+        pki,
+        &admin_key_path,
+        &admin_cert_path,
+        &ca_cert_der,
+        &ca_signer,
+    )?;
 
     // --- Kubelet client cert ---
     // Kubelet's --client-ca-file trusts our cluster CA, and kubelet accepts clients
     // from the system:masters organization as trusted. CN and O must match exactly
     // what real kube-apiserver uses so kubelet authorizes the proxy requests.
-    let kubelet_client_key = KeyPair::generate()?;
-    let mut kubelet_client_params = CertificateParams::default();
-    kubelet_client_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "kube-apiserver-kubelet-client");
-    kubelet_client_params
-        .distinguished_name
-        .push(rcgen::DnType::OrganizationName, "system:masters");
-    let kubelet_client_cert = kubelet_client_params.signed_by(&kubelet_client_key, &ca_issuer)?;
+    let kubelet_client = pki.issue(
+        &client_spec(
+            "kubelet-client",
+            "kube-apiserver-kubelet-client",
+            Some("system:masters"),
+        ),
+        Some(&ca_signer),
+    )?;
+    let (kubelet_client_key, kubelet_client_cert) = (kubelet_client.key, kubelet_client.cert);
 
     // --- KCM client cert ---
     // Real kubeadm gives kube-controller-manager a dedicated x509 identity, not a share
     // of admin/system:masters. No O= — the seeded ClusterRoleBinding
     // system:kube-controller-manager (see seed_rbac()) binds by username (kind: User),
     // so group membership is irrelevant here.
-    let kcm_key = KeyPair::generate()?;
-    let mut kcm_params = CertificateParams::default();
-    kcm_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "system:kube-controller-manager");
-    let kcm_cert = kcm_params.signed_by(&kcm_key, &ca_issuer)?;
+    let kcm = pki.issue(
+        &client_spec("kcm-client", "system:kube-controller-manager", None),
+        Some(&ca_signer),
+    )?;
+    let (kcm_key, kcm_cert) = (kcm.key, kcm.cert);
 
     // --- Scheduler client cert ---
-    let scheduler_key = KeyPair::generate()?;
-    let mut scheduler_params = CertificateParams::default();
-    scheduler_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "system:kube-scheduler");
-    let scheduler_cert = scheduler_params.signed_by(&scheduler_key, &ca_issuer)?;
+    let scheduler = pki.issue(
+        &client_spec("scheduler-client", "system:kube-scheduler", None),
+        Some(&ca_signer),
+    )?;
+    let (scheduler_key, scheduler_cert) = (scheduler.key, scheduler.cert);
 
     // --- Bootstrap-installer client cert ---
     // Identity for the in-process YAML applier (a later bead) that server-side-applies
     // bootstrap manifest bundles (e.g. CoreDNS) against the just-bound apiserver. No O= —
     // the seeded ClusterRoleBinding system:bootstrap-installer (see seed_rbac()) binds by
     // username, same as KCM/scheduler above.
-    let bootstrap_installer_key = KeyPair::generate()?;
-    let mut bootstrap_installer_params = CertificateParams::default();
-    bootstrap_installer_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "system:bootstrap-installer");
-    let bootstrap_installer_cert =
-        bootstrap_installer_params.signed_by(&bootstrap_installer_key, &ca_issuer)?;
+    let bootstrap_installer = pki.issue(
+        &client_spec(
+            "bootstrap-installer-client",
+            "system:bootstrap-installer",
+            None,
+        ),
+        Some(&ca_signer),
+    )?;
+    let (bootstrap_installer_key, bootstrap_installer_cert) =
+        (bootstrap_installer.key, bootstrap_installer.cert);
 
     // --- Dedicated front-proxy CA: load-or-generate ---
     // A CA distinct from the main cluster CA above -- see `TlsMaterial::proxy_client_cert_pem`'s
@@ -675,21 +761,28 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // KCM/scheduler/kubelet-client above) matters here: it's what an aggregated backend
     // trusts via requestheader-client-ca-file, so only a leaf THIS CA signed can assert
     // X-Remote-User/-Group identity, regardless of what other certs the cluster CA has signed.
-    let (proxy_client_ca_key, proxy_client_ca_params, _proxy_client_ca_cert_der) =
-        load_or_generate_ca(&args.proxy_client_ca_key, &args.proxy_client_ca_cert)?;
+    let (proxy_client_ca_key, proxy_client_ca_params, proxy_client_ca_cert_der) =
+        load_or_generate_ca(
+            pki,
+            "front-proxy-ca",
+            &args.proxy_client_ca_key,
+            &args.proxy_client_ca_cert,
+        )?;
     let proxy_client_ca_issuer = Issuer::new(proxy_client_ca_params, proxy_client_ca_key);
+    let proxy_client_ca_signer = Signer {
+        issuer: &proxy_client_ca_issuer,
+        not_after: cert_validity(&proxy_client_ca_cert_der)?.1,
+    };
 
     // --- Proxy-client cert ---
     // CN follows kubeadm's own "front-proxy-client" convention. Presented to aggregated
     // backends only (see doc); no O= is needed since the backend's own RBAC/authorization
     // config never sees this cert's Subject, only the X-Remote-User/-Group headers it vouches for.
-    let proxy_client_key = KeyPair::generate()?;
-    let mut proxy_client_params = CertificateParams::default();
-    proxy_client_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "front-proxy-client");
-    let proxy_client_cert =
-        proxy_client_params.signed_by(&proxy_client_key, &proxy_client_ca_issuer)?;
+    let proxy_client = pki.issue(
+        &client_spec("proxy-client", "front-proxy-client", None),
+        Some(&proxy_client_ca_signer),
+    )?;
+    let (proxy_client_key, proxy_client_cert) = (proxy_client.key, proxy_client.cert);
 
     // --- Build rustls ServerConfig ---
     // Present only the leaf cert in the chain. The CA cert is already in the
@@ -754,6 +847,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         proxy_client_cert_pem,
         proxy_client_key_pem: proxy_client_key.serialize_pem().into_bytes(),
         server_config: Arc::new(server_config),
+        inventory: pki.inventory.clone(),
     })
 }
 
@@ -1275,13 +1369,14 @@ mod tests {
         let ca_key_path = dir.join("ca.key").to_string_lossy().into_owned();
         let ca_cert_path = dir.join("ca.crt").to_string_lossy().into_owned();
         let (real_ca_key, real_ca_params, real_ca_cert_der) =
-            load_or_generate_ca(&ca_key_path, &ca_cert_path).expect("generate real CA");
+            load_or_generate_ca(&Pki::default(), "ca", &ca_key_path, &ca_cert_path)
+                .expect("generate real CA");
         let real_ca_issuer = Issuer::new(real_ca_params, real_ca_key);
 
         // A DIFFERENT, unrelated CA signs the "stale" admin cert.
         let other_ca_key = KeyPair::generate().expect("generate other CA key");
         let mut other_ca_params = CertificateParams::default();
-        other_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        other_ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         other_ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "some-other-ca");
@@ -1302,11 +1397,16 @@ mod tests {
             .expect("write stale admin key");
         std::fs::write(&admin_cert_path, stale_admin_cert.der()).expect("write stale admin cert");
 
+        let real_signer = Signer {
+            issuer: &real_ca_issuer,
+            not_after: cert_validity(&real_ca_cert_der).unwrap().1,
+        };
         let (admin_cert_der, _admin_key_pem) = load_or_generate_admin_cert(
+            &Pki::default(),
             &admin_key_path,
             &admin_cert_path,
             &real_ca_cert_der,
-            &real_ca_issuer,
+            &real_signer,
         )
         .expect("load_or_generate_admin_cert must recover, not fail");
 
@@ -1428,7 +1528,7 @@ mod tests {
     ) -> anyhow::Result<(KeyPair, CertificateParams, Vec<u8>)> {
         let ca_key_path = dir.join("ca.key").to_string_lossy().into_owned();
         let ca_cert_path = dir.join("ca.crt").to_string_lossy().into_owned();
-        load_or_generate_ca(&ca_key_path, &ca_cert_path)
+        load_or_generate_ca(&Pki::default(), "ca", &ca_key_path, &ca_cert_path)
     }
 
     /// Generate a CA in `dir`, returning its (key_path, cert_path).
@@ -1445,8 +1545,13 @@ mod tests {
         files: &[&std::path::Path],
     ) -> String {
         let before: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect(); // lgtm[rust/path-injection]
-        let err = load_or_generate_ca(&key.to_string_lossy(), &cert.to_string_lossy())
-            .expect_err("partial CA state must refuse to start");
+        let err = load_or_generate_ca(
+            &Pki::default(),
+            "ca",
+            &key.to_string_lossy(),
+            &cert.to_string_lossy(),
+        )
+        .expect_err("partial CA state must refuse to start");
         let msg = err.to_string();
         for p in [key, cert] {
             assert!(
@@ -1492,8 +1597,13 @@ mod tests {
         std::fs::rename(&key, &target).unwrap(); // lgtm[rust/path-injection]
         let key_tmp = dir.join("ca.key.tmp");
         std::os::unix::fs::symlink(&target, &key_tmp).unwrap(); // lgtm[rust/path-injection]
-        let err = load_or_generate_ca(&key.to_string_lossy(), &cert.to_string_lossy())
-            .expect_err("symlinked key.tmp must be refused");
+        let err = load_or_generate_ca(
+            &Pki::default(),
+            "ca",
+            &key.to_string_lossy(),
+            &cert.to_string_lossy(),
+        )
+        .expect_err("symlinked key.tmp must be refused");
         assert!(err.to_string().contains("not a regular file"), "{err}");
         assert!(!key.exists(), "symlink must not be renamed into place");
         assert!(
@@ -1571,7 +1681,13 @@ mod tests {
         let dir = test_temp_dir("fp-ca-partial");
         let key = dir.join("front-proxy-ca.key");
         let cert = dir.join("front-proxy-ca.crt");
-        load_or_generate_ca(&key.to_string_lossy(), &cert.to_string_lossy()).unwrap();
+        load_or_generate_ca(
+            &Pki::default(),
+            "ca",
+            &key.to_string_lossy(),
+            &cert.to_string_lossy(),
+        )
+        .unwrap();
         std::fs::remove_file(&key).unwrap(); // lgtm[rust/path-injection]
         let msg = assert_refuses_and_preserves(&key, &cert, &[&cert]);
         assert!(msg.contains("front-proxy-ca"), "{msg}");
@@ -2368,7 +2484,7 @@ mod tests {
         // Hand-build a CA the way pre-fix code did: literal CN="u7s-ca".
         let legacy_key = KeyPair::generate().expect("generate legacy CA key");
         let mut legacy_params = CertificateParams::default();
-        legacy_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        legacy_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         legacy_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "u7s-ca");
@@ -2382,6 +2498,8 @@ mod tests {
         std::fs::write(&ca_cert_path, &legacy_cert_der).expect("write legacy ca.crt"); // lgtm[rust/path-injection]
 
         let (loaded_key, loaded_params, loaded_cert_der) = load_or_generate_ca(
+            &Pki::default(),
+            "ca",
             &ca_key_path.to_string_lossy(),
             &ca_cert_path.to_string_lossy(),
         )
@@ -2503,6 +2621,213 @@ mod tests {
              for it; got: {yaml}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    fn expected_lifetimes() -> Vec<(&'static str, CertRole, std::time::Duration)> {
+        let year = CLIENT_CERT_LIFETIME;
+        vec![
+            ("ca", CertRole::Root, ROOT_CA_LIFETIME),
+            ("front-proxy-ca", CertRole::Root, ROOT_CA_LIFETIME),
+            ("admin", CertRole::Leaf, year),
+            ("kcm-client", CertRole::Leaf, year),
+            ("scheduler-client", CertRole::Leaf, year),
+            ("bootstrap-installer-client", CertRole::Leaf, year),
+            ("kubelet-client", CertRole::Leaf, year),
+            ("proxy-client", CertRole::Leaf, year),
+            ("apiserver-serving", CertRole::Leaf, SERVING_CERT_LIFETIME),
+        ]
+    }
+
+    fn assert_inventory_matches_decisions(inv: &CertInventory) {
+        let records = inv.snapshot();
+        let now = time::OffsetDateTime::now_utc();
+        for (name, role, lifetime) in expected_lifetimes() {
+            let r = records
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("inventory must list {name}: a cert the expiry beads cannot see is one nobody renews"));
+            assert_eq!(r.role, role, "{name} role");
+            assert_eq!(
+                r.not_after - r.not_before,
+                lifetime,
+                "{name} must live exactly its decided lifetime, not rcgen's 1975..4096 default"
+            );
+            assert!(r.not_before <= now, "{name} must already be valid");
+            assert!(
+                !r.usages.is_empty() && !r.subject.is_empty(),
+                "{name} must declare subject and usages"
+            );
+        }
+        assert_eq!(
+            records.len(),
+            expected_lifetimes().len(),
+            "unexpected extra cert: {records:?}"
+        );
+    }
+
+    #[test]
+    fn every_issued_cert_has_its_decided_finite_lifetime_and_is_inventoried() {
+        let dir = test_temp_dir("lifetimes");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls");
+        assert_inventory_matches_decisions(&tls.inventory);
+
+        // The inventory must describe the bytes actually served, not just the request.
+        let (nb, na) = cert_validity(&tls.server_cert_der).unwrap();
+        let rec = tls
+            .inventory
+            .snapshot()
+            .into_iter()
+            .find(|r| r.name == "apiserver-serving")
+            .unwrap();
+        assert_eq!((nb, na), (rec.not_before, rec.not_after));
+        assert_eq!(na - nb, SERVING_CERT_LIFETIME);
+
+        // A restart loads persisted certs; they must still be inventoried.
+        let tls2 = generate_tls(&args).expect("second generate_tls");
+        assert_inventory_matches_decisions(&tls2.inventory);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn no_leaf_outlives_the_ca_that_signed_it() {
+        let args = args_with(None);
+        let tls = generate_tls(&args).expect("generate_tls");
+        let records = tls.inventory.snapshot();
+        let not_after = |n: &str| records.iter().find(|r| r.name == n).unwrap().not_after;
+        for r in records.iter().filter(|r| r.role == CertRole::Leaf) {
+            let ca = if r.name == "proxy-client" {
+                "front-proxy-ca"
+            } else {
+                "ca"
+            };
+            assert!(
+                r.not_after <= not_after(ca),
+                "{} outlives {ca}: a leaf valid past its CA is trusted by nobody after the CA expires",
+                r.name
+            );
+        }
+
+        // A short-lived CA (e.g. a legacy or operator-supplied one) caps the leaf.
+        let pki = Pki::default();
+        let ca = pki
+            .issue(&ca_spec("ca", "short-ca"), None)
+            .expect("issue CA");
+        let ca_params = pki.params(
+            &ca_spec("ca", "short-ca"),
+            time::OffsetDateTime::now_utc(),
+            time::OffsetDateTime::now_utc(),
+        );
+        let issuer = Issuer::new(ca_params, ca.key);
+        let cap = time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(30 * 86400);
+        let leaf = pki
+            .issue(
+                &client_spec("kcm-client", "x", None),
+                Some(&Signer {
+                    issuer: &issuer,
+                    not_after: cap,
+                }),
+            )
+            .expect("issue leaf");
+        let (_, leaf_after) = cert_validity(leaf.cert.der()).unwrap();
+        assert!(
+            leaf_after <= cap,
+            "leaf must be clamped to the CA's not_after"
+        );
+    }
+
+    #[test]
+    fn key_algorithm_parameter_drives_key_and_signature_type() {
+        use x509_cert::der::Decode as _;
+        // id-ecPublicKey, ecdsa-with-SHA256
+        const EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+        const ECDSA_SHA256: &str = "1.2.840.10045.4.3.2";
+        {
+            let alg = crate::pki::KeyAlgorithm::EcdsaP256;
+            let pki = Pki {
+                algorithm: alg,
+                ..Pki::default()
+            };
+            let issued = pki.issue(&ca_spec("ca", "alg-ca"), None).unwrap();
+            assert!(
+                issued.key.is_compatible(alg.signature_algorithm()),
+                "key must be of the requested algorithm"
+            );
+            let cert = x509_cert::Certificate::from_der(issued.cert.der()).unwrap();
+            assert_eq!(
+                cert.tbs_certificate()
+                    .subject_public_key_info()
+                    .algorithm
+                    .oid
+                    .to_string(),
+                EC_PUBLIC_KEY
+            );
+            assert_eq!(cert.signature_algorithm().oid.to_string(), ECDSA_SHA256);
+        }
+    }
+
+    fn assert_admin_refuses_and_preserves(present: &str, remove: &str, tag: &str) {
+        let args = args_with(None);
+        generate_tls(&args).expect("first boot");
+        let dir = std::path::Path::new(&args.ca_key)
+            .parent()
+            .unwrap()
+            .to_owned();
+        let (present, removed) = (dir.join(present), dir.join(remove));
+        std::fs::remove_file(&removed).unwrap(); // lgtm[rust/path-injection]
+        let before = std::fs::read(&present).unwrap(); // lgtm[rust/path-injection]
+        let ca_before = std::fs::read(&args.ca_cert).unwrap(); // lgtm[rust/path-injection]
+
+        let err = generate_tls(&args)
+            .err()
+            .unwrap_or_else(|| panic!("{tag}: half an admin credential must stop startup"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&*removed.to_string_lossy()),
+            "{tag}: error must name the missing file: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&present).unwrap(),
+            before,
+            "{tag}: survivor must not be deleted or rewritten"
+        ); // lgtm[rust/path-injection]
+        assert!(!removed.exists(), "{tag}: nothing may be regenerated");
+        assert_eq!(
+            std::fs::read(&args.ca_cert).unwrap(),
+            ca_before,
+            "{tag}: CA untouched"
+        ); // lgtm[rust/path-injection]
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn admin_key_without_cert_is_refused_not_silently_replaced() {
+        assert_admin_refuses_and_preserves("admin.key", "admin.crt", "key only");
+    }
+
+    #[test]
+    fn admin_cert_without_key_is_refused_not_silently_replaced() {
+        assert_admin_refuses_and_preserves("admin.crt", "admin.key", "cert only");
+    }
+
+    #[test]
+    fn admin_write_interrupted_between_renames_resumes_with_the_same_credential() {
+        let args = args_with(None);
+        let first = generate_tls(&args).expect("first boot");
+        let dir = std::path::Path::new(&args.ca_key)
+            .parent()
+            .unwrap()
+            .to_owned();
+        std::fs::rename(dir.join("admin.key"), dir.join("admin.key.tmp")).unwrap(); // lgtm[rust/path-injection]
+        let second = generate_tls(&args).expect("cert + matching key.tmp must resume");
+        assert_eq!(first.admin_cert_der, second.admin_cert_der);
+        assert_eq!(first.admin_key_pem, second.admin_key_pem);
+        assert!(dir.join("admin.key").exists() && !dir.join("admin.key.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 }
