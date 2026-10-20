@@ -171,6 +171,38 @@ assert "...with empty stdout, and curl is never invoked -- a malformed PR number
   "$([ -z "$RUN_OUT" ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 6b. Built-payload mode: the wrapper turns markdown + flags into the JSON
+#     itself, so a caller with no Write tool needs no `> payload.json`.
+# ---------------------------------------------------------------------------
+MD=$'## critical-reviewer findings\n\n**Verdict**: needs-changes\n\n- `a.rs:3` has "quotes" and a $dollar'
+rm -f "$CURL_BODY_CAPTURE" "$CURL_CALLED_MARKER"
+RUN_OUT=$(printf '%s' "$MD" | PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" 9 litehop/politeia \
+  --event REQUEST_CHANGES --comment src/a.rs 3 RIGHT 'inline `note`' 2>"$WORK/stderr") && RUN_RC=0 || RUN_RC=$?
+assert "stdin markdown + --event builds a payload whose body round-trips verbatim (backticks, quotes, newlines) and carries the event" \
+  "$([ "$RUN_RC" -eq 0 ] && [ "$(jq -r .body "$CURL_BODY_CAPTURE")" = "$MD" ] && [ "$(jq -r .event "$CURL_BODY_CAPTURE")" = "REQUEST_CHANGES" ] && echo 1 || echo 0)"
+assert "...and --comment becomes an inline comment object with path/line/side/body, so findings anchor to diff lines" \
+  "$([ "$(jq -c '.comments' "$CURL_BODY_CAPTURE")" = '[{"path":"src/a.rs","line":3,"side":"RIGHT","body":"inline `note`"}]' ] && echo 1 || echo 0)"
+assert "...and the optional repo positional still selects the target repo when flags follow it" \
+  "$([ "$(curl_url)" = "https://api.github.com/repos/litehop/politeia/pulls/9/reviews" ] && echo 1 || echo 0)"
+
+printf '%s' "$MD" > "$WORK/body.md"
+RUN_OUT=$(PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" 9 --event APPROVE --body-file "$WORK/body.md" </dev/null 2>"$WORK/stderr") && RUN_RC=0 || RUN_RC=$?
+assert "--body-file reads the markdown from a file, defaults the repo to litehop/u7s, and an absent --comment yields an empty comments array" \
+  "$([ "$RUN_RC" -eq 0 ] && [ "$(jq -r .body "$CURL_BODY_CAPTURE")" = "$MD" ] && [ "$(jq -c .comments "$CURL_BODY_CAPTURE")" = "[]" ] && [ "$(curl_url)" = "https://api.github.com/repos/litehop/u7s/pulls/9/reviews" ] && echo 1 || echo 0)"
+
+for BADARGS in "--event BOGUS" "--event APPROVE --comment p x RIGHT t" "--event APPROVE --comment p 3 MIDDLE t" "--event APPROVE --nope"; do
+  rm -f "$CURL_CALLED_MARKER"
+  # shellcheck disable=SC2086
+  RUN_OUT=$(printf 'body' | PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" 9 $BADARGS 2>"$WORK/stderr") && RUN_RC=0 || RUN_RC=$?
+  assert "invalid builder args '$BADARGS' exit non-zero with no POST -- a malformed review must never reach GitHub" \
+    "$([ "$RUN_RC" -ne 0 ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
+done
+rm -f "$CURL_CALLED_MARKER"
+RUN_OUT=$(printf '' | PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" 9 --event APPROVE 2>"$WORK/stderr") && RUN_RC=0 || RUN_RC=$?
+assert "an empty body is refused -- the merge loop keys off the findings header in the body" \
+  "$([ "$RUN_RC" -ne 0 ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 7. Token-mint failure must abort before curl runs.
 # ---------------------------------------------------------------------------
 rm -f "$CURL_CALLED_MARKER"

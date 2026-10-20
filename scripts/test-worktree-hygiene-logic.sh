@@ -920,8 +920,28 @@ echo 'worker/agent-openpr'
 EOF
 chmod +x "$STUB_GH_STEP_F/gh"
 
+# Reapable only after archiving: an audit worker's PR-less branch whose sole
+# commit is the findings doc.
+BEAD_PFX="mayo""r-"
+git -C "$F" checkout -q -b worker/agent-audit main
+mkdir -p "$F/ai/findings"
+printf 'Bead: %saudit1\n' "$BEAD_PFX" > "$F/ai/findings/2026-01-01-${BEAD_PFX}audit1-cis.md"
+git -C "$F" add -A
+git -C "$F" commit -q -m "findings"
+AUDIT_TIP=$(git -C "$F" rev-parse HEAD)
+git -C "$F" push -q origin worker/agent-audit
+git -C "$F" checkout -q main
+git -C "$F" branch -D worker/agent-audit
+
 LIVE_AGENTS="liveagent" WORKTREE_HYGIENE_REPO_ROOT="$F" PATH="$STUB_GH_STEP_F:$PATH" \
   call step_f_orphaned_origin_branches >/dev/null 2>&1
+
+assert "STEP F tags an orphan branch whose commits touch ai/findings/ as archive/<bead>-findings at its tip, on origin -- otherwise deleting it destroys the only copy of an audit doc" \
+  "$([ "$(git -C "$BARE_F" rev-parse "refs/tags/archive/${BEAD_PFX}audit1-findings^{commit}" 2>/dev/null)" = "$AUDIT_TIP" ] && echo 1 || echo 0)"
+assert "...and only then deletes that branch from origin" \
+  "$(! git -C "$F" ls-remote --heads origin 'worker/agent-audit' | grep -q . && echo 1 || echo 0)"
+assert "a findings-free orphan branch gets no archive tag -- tags are for branches with unique findings only" \
+  "$([ "$(git -C "$BARE_F" tag -l 'archive/*' | wc -l | tr -d ' ')" = "1" ] && echo 1 || echo 0)"
 
 origin_f_heads() {
   git -C "$F" ls-remote --heads origin 'worker/agent-*' | awk '{print $2}'
