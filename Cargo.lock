@@ -3854,6 +3854,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "u7s-migrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hyper",
+ "politeia",
+ "serde",
+ "serde_json",
+ "tokio",
+ "u7s-apiserver",
+ "u7s-version",
+]
+
+[[package]]
 name = "u7s-proto-generated"
 version = "0.1.0"
 dependencies = [

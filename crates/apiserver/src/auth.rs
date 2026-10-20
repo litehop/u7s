@@ -878,6 +878,10 @@ pub(crate) fn is_long_running_request(
 /// not valid UTF-8: lossy replacement would let distinct attacker-chosen inputs collapse
 /// onto the same string and match a real name.
 pub(crate) fn percent_decode(s: &str) -> Option<String> {
+    String::from_utf8(percent_decode_bytes(s)).ok()
+}
+
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -895,7 +899,7 @@ pub(crate) fn percent_decode(s: &str) -> Option<String> {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(out).ok()
+    out
 }
 
 /// Extract the resource name implied by a `fieldSelector=metadata.name=<name>` query
@@ -971,10 +975,22 @@ struct ParsedPath {
 /// be seen here as the segment boundary it becomes downstream. A path that does not
 /// decode to UTF-8 is treated as a non-resource URL.
 fn parse_path(path: &str) -> ParsedPath {
-    let Some(decoded) = decode_path(path) else {
-        return unknown_path();
+    // Go keeps the raw bytes of an undecodable segment and still builds a resource
+    // RequestInfo; lossy replacement does the same here (U+FFFD never matches a real name)
+    // so such a path is authorized as a resource request, never as a non-resource URL.
+    let decoded = if path.contains('%') {
+        std::borrow::Cow::Owned(String::from_utf8_lossy(&percent_decode_bytes(path)).into_owned())
+    } else {
+        std::borrow::Cow::Borrowed(path)
     };
-    let segs: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
+    // Like upstream splitPath: trim the ends only, so an interior empty segment (e.g. a
+    // name of `%2Fn`) stays visible and cannot be authorized as the name `n`.
+    let trimmed = decoded.trim_matches('/');
+    let segs: Vec<&str> = if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        trimmed.split('/').collect()
+    };
 
     let (api_group, version, rest) = match segs.first().copied() {
         Some("api") => {
@@ -2205,10 +2221,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_path_treats_non_utf8_as_non_resource() {
-        assert!(parse_path("/api/v1/namespaces/ns/pods/%FF")
-            .resource
-            .is_empty());
+    fn parse_path_keeps_interior_empty_segment_out_of_the_name() {
+        let p = parse_path("/api/v1/namespaces/ns/pods/%2Fn");
+        assert_eq!(p.name.as_deref(), Some(""));
+        assert_eq!(p.subresource, "n");
+        let p = parse_path("/api/v1/namespaces/ns/pods/n/");
+        assert_eq!(p.name.as_deref(), Some("n"));
+        assert_eq!(p.subresource, "");
+    }
+
+    #[test]
+    fn parse_path_keeps_non_utf8_name_a_resource_request() {
+        let p = parse_path("/api/v1/namespaces/ns/pods/%FF");
+        assert_eq!(p.resource, "pods");
+        assert_eq!(p.namespace.as_deref(), Some("ns"));
+        assert_eq!(p.name.as_deref(), Some("\u{FFFD}"));
     }
 
     /// User impact: a user granted `get flunders` but not `get flunders/status` must not
