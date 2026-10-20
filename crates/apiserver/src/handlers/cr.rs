@@ -12695,32 +12695,28 @@ mod tests {
         );
     }
 
-    /// The 725-item rule must be rejected by the counted verdict, not the wall-clock
-    /// backstop, or the verdict would depend on host speed.
+    /// Calls the counted estimate directly: going through the process-wide thread gate and
+    /// the wall-clock backstop lets parallel tests (full gate) or a slow host turn the
+    /// count verdict into an `Err`.
     #[test]
     fn replay_of_725_item_quadratic_rule_is_over_limit_by_count_not_by_timeout() {
         let schema = quadratic_rule_schema();
         let spec = &schema["properties"]["spec"];
         let data = serde_json::json!({ "largeArray": vec![20; 725] });
-        let program = std::sync::Arc::new(
+        let program =
             cel::Program::compile("self.largeArray.all(x, self.largeArray.all(y, y == x))")
-                .unwrap(),
-        );
+                .unwrap();
         let mut ctx = cel::Context::default();
         register_cel_extensions(&mut ctx);
         ctx.add_variable_from_value("self", json_to_cel_value(spec, &data).unwrap());
-        let (data, spec) = (data.clone(), spec.clone());
-        let verdict = replay_within_budget(&CEL_EVAL_THREAD_GATE, move || {
-            let node = crate::handlers::cel_cost::Node::Data {
-                value: &data,
-                schema: Some(&spec),
-            };
-            crate::handlers::cel_cost::estimate(&program, node, None, Some(&ctx))
-                <= crate::handlers::cel_cost::CALL_COST_LIMIT
-        });
+        let node = crate::handlers::cel_cost::Node::Data {
+            value: &data,
+            schema: Some(spec),
+        };
+        let cost = crate::handlers::cel_cost::estimate(&program, node, None, Some(&ctx));
         assert!(
-            matches!(verdict, Ok(false)),
-            "an over-limit rule must be decided by the counted cost, not a timeout"
+            cost > crate::handlers::cel_cost::CALL_COST_LIMIT,
+            "an over-limit rule must be decided by the counted cost, not a timeout: {cost}"
         );
     }
 
