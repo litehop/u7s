@@ -233,7 +233,7 @@ runs:
         # Save the cert-based kubeconfig before overwriting with a token one
         # below -- kube-controller-manager needs the cert-based identity.
         cp "$WORKDIR/kubeconfig" "$WORKDIR/kubeconfig-cert"
-        CA_DATA=$(grep "certificate-authority-data" "$WORKDIR/kubeconfig" | awk '{print $2}')
+        CA_FILE=$(awk '/certificate-authority:/ {print $2}' "$WORKDIR/kubeconfig")
         echo "E2E_TOKEN=$E2E_TOKEN" >> "$GITHUB_ENV"
         printf '%s\n' \
           'apiVersion: v1' \
@@ -241,7 +241,7 @@ runs:
           'clusters:' \
           '- cluster:' \
           '    server: https://127.0.0.1:6443' \
-          "    certificate-authority-data: $CA_DATA" \
+          "    certificate-authority: $CA_FILE" \
           '  name: u7s' \
           'contexts:' \
           '- context:' \
@@ -560,7 +560,6 @@ runs:
           --kubeconfig="$WORKDIR/kubeconfig-cert" \
           --cluster-signing-cert-file="$WORKDIR/ca.pem" \
           --cluster-signing-key-file="$WORKDIR/ca.key" \
-          --service-account-private-key-file="$WORKDIR/sa.key" \
           --root-ca-file="$WORKDIR/ca.pem" \
           --controllers='*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller' \
           --allocate-node-cidrs=true \
@@ -582,7 +581,7 @@ runs:
         # pods just stay Pending until the scheduler is up), so there is
         # nothing to gain from serializing their launches.
         ./target/release/u7s-scheduler \
-          --kubeconfig "$WORKDIR/kubeconfig-cert" \
+          --kubeconfig "$WORKDIR/kubeconfig-scheduler" \
           >"$WORKDIR/scheduler.log" 2>&1 &
         echo "SCHEDULER_PID=$!" >> "$GITHUB_ENV"
 

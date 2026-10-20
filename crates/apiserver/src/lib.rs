@@ -251,7 +251,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     seed_cluster_info(&store, &server_address_early, &tls_material.ca_cert_der).await?;
 
     // 5. Write kubeconfig.
-    write_kubeconfig(&args.kubeconfig, &tls_material, &args)?;
+    write_kubeconfig(&args.kubeconfig, &args)?;
 
     // 5a. Write dedicated kubeconfigs for KCM and the scheduler so each authenticates as
     // its own least-privilege x509 identity (system:kube-controller-manager /
@@ -262,10 +262,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         std::path::Path::new(&args.kubeconfig).with_file_name("kcm-kubeconfig");
     write_component_kubeconfig(
         &kcm_kubeconfig_path.to_string_lossy(),
-        &tls_material,
         &args,
-        &tls_material.kcm_cert_der,
-        &tls_material.kcm_key_pem,
+        "kcm",
         "system:kube-controller-manager",
     )?;
     // Named "kubeconfig-scheduler", not "scheduler-kubeconfig": several out-of-scope
@@ -275,12 +273,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // scheduler correctly without needing their own changes.
     let scheduler_kubeconfig_path =
         std::path::Path::new(&args.kubeconfig).with_file_name("kubeconfig-scheduler");
-    write_component_kubeconfig(
+    // Embedded rather than file paths: the scheduler's kubeconfig reader only understands
+    // inline data and reads it once, so it still needs a restart after a rotation.
+    tls::write_identity_kubeconfig(
         &scheduler_kubeconfig_path.to_string_lossy(),
-        &tls_material,
-        &args,
-        &tls_material.scheduler_cert_der,
-        &tls_material.scheduler_key_pem,
+        &tls::kubeconfig_server(&args),
+        &tls::KubeconfigCreds::Embedded {
+            ca_cert_der: &tls_material.ca_cert_der,
+            cert_der: &tls_material.scheduler_cert_der,
+            key_pem: &tls_material.scheduler_key_pem,
+        },
         "system:kube-scheduler",
     )?;
     // No consumer yet: the in-process YAML applier that will use this identity to install
@@ -291,34 +293,22 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         std::path::Path::new(&args.kubeconfig).with_file_name("bootstrap-installer-kubeconfig");
     write_component_kubeconfig(
         &bootstrap_installer_kubeconfig_path.to_string_lossy(),
-        &tls_material,
         &args,
-        &tls_material.bootstrap_installer_cert_der,
-        &tls_material.bootstrap_installer_key_pem,
+        "bootstrap-installer",
         "system:bootstrap-installer",
     )?;
     let rotation_server_url = tls::kubeconfig_server(&args);
-    // Kubeconfigs that embed a rotating leaf, rewritten whenever that leaf is re-issued.
-    let rotating_kubeconfigs: Vec<(&'static str, String, &'static str)> = vec![
-        ("admin", args.kubeconfig.clone(), "admin"),
-        (
-            "kcm-client",
-            kcm_kubeconfig_path.to_string_lossy().into_owned(),
-            "system:kube-controller-manager",
-        ),
-        (
-            "scheduler-client",
-            scheduler_kubeconfig_path.to_string_lossy().into_owned(),
-            "system:kube-scheduler",
-        ),
+    // Leaves whose cert+key PEM (the file their kubeconfig references) is rewritten whenever
+    // the leaf is re-issued; the scheduler's embedded kubeconfig is rewritten whole.
+    let rotating_leaf_files: Vec<(&'static str, tls::LeafFiles)> = vec![
+        ("admin", tls::leaf_files(&args, "admin")),
+        ("kcm-client", tls::leaf_files(&args, "kcm")),
         (
             "bootstrap-installer-client",
-            bootstrap_installer_kubeconfig_path
-                .to_string_lossy()
-                .into_owned(),
-            "system:bootstrap-installer",
+            tls::leaf_files(&args, "bootstrap-installer"),
         ),
     ];
+    let scheduler_kubeconfig = scheduler_kubeconfig_path.to_string_lossy().into_owned();
 
     // 6. Load optional static token map.
     let token_map = match &args.token_auth_file {
@@ -436,16 +426,25 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let rotation_ca_der = tls_material.ca_cert_der.clone();
     tokio::spawn(Arc::clone(&tls_material.rotator).run(Arc::new(
         move |name: &'static str, leaf: &rotation::Leaf| {
-            if let Some((_, path, user)) = rotating_kubeconfigs.iter().find(|(n, ..)| *n == name) {
+            if let Some((_, files)) = rotating_leaf_files.iter().find(|(n, _)| *n == name) {
+                if let Err(e) = tls::write_leaf_pem(files, &leaf.cert_der, &leaf.key_pem) {
+                    tracing::error!(
+                        "rewrite {} after rotating {name}: {e:#}",
+                        files.pem().display()
+                    );
+                }
+            } else if name == "scheduler-client" {
                 if let Err(e) = tls::write_identity_kubeconfig(
-                    path,
+                    &scheduler_kubeconfig,
                     &rotation_server_url,
-                    &rotation_ca_der,
-                    &leaf.cert_der,
-                    &leaf.key_pem,
-                    user,
+                    &tls::KubeconfigCreds::Embedded {
+                        ca_cert_der: &rotation_ca_der,
+                        cert_der: &leaf.cert_der,
+                        key_pem: &leaf.key_pem,
+                    },
+                    "system:kube-scheduler",
                 ) {
-                    tracing::error!("rewrite {path} after rotating {name}: {e:#}");
+                    tracing::error!("rewrite {scheduler_kubeconfig} after rotating {name}: {e:#}");
                 }
             }
             let mut identity_pem = tls::pem_encode("CERTIFICATE", &leaf.cert_der);
@@ -13130,33 +13129,17 @@ mod tests {
     /// disk (the admin/`system:masters` identity), so the test can make real,
     /// RBAC-authenticated requests against the real listener the same way kubectl would.
     fn sighup_test_client_from_kubeconfig(raw: &str) -> (reqwest::Client, String) {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD;
         let server = sighup_test_extract_kubeconfig_field(raw, "server:")
             .expect("kubeconfig missing server")
             .to_owned();
-        let ca_pem = b64
-            .decode(
-                sighup_test_extract_kubeconfig_field(raw, "certificate-authority-data:")
-                    .expect("kubeconfig missing certificate-authority-data")
-                    .trim(),
-            )
-            .expect("decode CA cert");
-        let mut identity_pem = b64
-            .decode(
-                sighup_test_extract_kubeconfig_field(raw, "client-certificate-data:")
-                    .expect("kubeconfig missing client-certificate-data")
-                    .trim(),
-            )
-            .expect("decode client cert");
-        identity_pem.extend(
-            b64.decode(
-                sighup_test_extract_kubeconfig_field(raw, "client-key-data:")
-                    .expect("kubeconfig missing client-key-data")
-                    .trim(),
-            )
-            .expect("decode client key"),
-        );
+        let read = |key: &str| {
+            let path = sighup_test_extract_kubeconfig_field(raw, key)
+                .unwrap_or_else(|| panic!("kubeconfig missing {key}"));
+            std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+        };
+        let ca_pem = read("certificate-authority:");
+        // client-certificate and client-key name the same PEM file.
+        let identity_pem = read("client-certificate:");
         let client = reqwest::Client::builder()
             .use_rustls_tls()
             .tls_certs_only([reqwest::Certificate::from_pem(&ca_pem).expect("parse CA cert")])

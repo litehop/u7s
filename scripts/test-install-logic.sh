@@ -90,6 +90,32 @@ assert_true "u7s-kcm.service's ExecStart invokes kube-controller-manager directl
   grep -qF 'ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig' "$INSTALL"
 
 # ---------------------------------------------------------------------------
+# File-path kubeconfigs: KCM and the kubelet only live-reload a re-issued client
+# cert / CA when the kubeconfig names files, so a worker's kubeconfig must never
+# embed -data, and KCM's one-shot inputs must have a restart hook.
+# ---------------------------------------------------------------------------
+kcm_exec_line="$(grep -F 'ExecStart=$BIN_DIR/kube-controller-manager' "$INSTALL")"
+assert_false "u7s-kcm.service passes no --service-account-private-key-file: legacy service-account token Secrets are unsupported, so KCM's token controller must stay off" \
+  grep -qF -- '--service-account-private-key-file' <<<"$kcm_exec_line"
+
+assert_true "u7s-kcm.service reads --root-ca-file from the apiserver-published ca-bundle.pem, the file the restart hook watches" \
+  grep -qF -- '--root-ca-file=$STATE_DIR/ca-bundle.pem' <<<"$kcm_exec_line"
+
+assert_true "KCM restarts when ca-bundle.pem changes (--root-ca-file is read once, so root succession would otherwise leave KCM publishing a stale kube-root-ca.crt)" \
+  grep -qF 'PathChanged=$STATE_DIR/ca-bundle.pem' "$INSTALL"
+assert_true "the CA-bundle path unit triggers a restart of u7s-kcm.service" \
+  grep -qF 'ExecStart=/bin/systemctl restart u7s-kcm.service' "$INSTALL"
+
+join_kc_body="$(sed -n '/^  cat > "\$STATE_DIR\/kubeconfig" <<EOF$/,/^EOF$/p' "$INSTALL" | sed '1d;$d')"
+join_kc="$(STATE_DIR=/var/lib/u7s JOIN_SERVER=https://cp.example:6443 NODE_NAME=w1 bash -c "cat <<EOF
+$join_kc_body
+EOF")"
+assert "a joined worker's kubeconfig carries no embedded -data: the kubelet could not see a re-issued client cert or CA" \
+  "$(printf '%s' "$join_kc" | grep -q -- '-data:' && echo 0 || echo 1)"
+assert "a joined worker's kubeconfig names the CA, client cert and key files the join wrote" \
+  "$(printf '%s' "$join_kc" | grep -qF 'certificate-authority: /var/lib/u7s/ca.pem' && printf '%s' "$join_kc" | grep -qF 'client-certificate: /var/lib/u7s/kubelet-client.crt' && printf '%s' "$join_kc" | grep -qF 'client-key: /var/lib/u7s/kubelet-client.key' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Without ExecReload=, systemd has no reload mechanism for a plain unit and
 # 'systemctl reload u7s-apiserver' fails outright instead of delivering SIGHUP to the running
 # apiserver, which is what re-applies /etc/u7s/manifests without a restart.
