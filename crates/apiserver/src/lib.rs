@@ -2239,7 +2239,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection","bind","escalate"] },
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
@@ -5461,6 +5461,69 @@ mod tests {
                  modern Events API"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn seeded_admin_holder_cannot_mint_or_bind_a_wildcard_role_in_its_namespace() {
+        // A namespace admin holding `bind`/`escalate` could author a `*/*/*` Role and bind
+        // it, reaching resourcequotas, */status, pods/binding and leases that admin
+        // deliberately lacks. Upstream admin has plain CRUD on roles/rolebindings.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let state = handlers::test_support::make_state_with_store(store.clone());
+
+        let admin_key = keys::group_object_key(GROUP, "clusterroles", None, "admin");
+        let admin: serde_json::Value =
+            serde_json::from_slice(&store.get(&admin_key).await.unwrap().unwrap().value).unwrap();
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin",
+            &admin,
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns-a/rolebindings/alice-admin",
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "alice"}],
+                "roleRef": {"apiGroup": GROUP, "kind": "ClusterRole", "name": "admin"}
+            }),
+        );
+        let alice = crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let wildcard_rules =
+            serde_json::json!([{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]);
+        let role = serde_json::json!({
+            "metadata": {"name": "wild", "namespace": "ns-a"},
+            "rules": wildcard_rules,
+        });
+        let err =
+            handlers::generic::check_role_escalation("roles", GROUP, "ns-a", &alice, &role, &state)
+                .expect_err("admin must not author a Role carrying rules it does not hold");
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns-a/roles/wild",
+            &role,
+        );
+        let rb = serde_json::json!({
+            "metadata": {"name": "wild-rb", "namespace": "ns-a"},
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {"apiGroup": GROUP, "kind": "Role", "name": "wild"}
+        });
+        let err = handlers::generic::check_rb_escalation(
+            "rolebindings",
+            GROUP,
+            "ns-a",
+            &alice,
+            &rb,
+            &state,
+        )
+        .expect_err("admin must not bind a Role carrying rules it does not hold");
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
