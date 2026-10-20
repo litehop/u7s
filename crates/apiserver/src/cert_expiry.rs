@@ -14,7 +14,7 @@ use bytes::Bytes;
 use time::{Duration, OffsetDateTime};
 use u7s_store::{ListOptions, Store};
 
-use crate::auth::PeerCertificate;
+use crate::auth::{PeerCertificate, UserInfo};
 use crate::pki::{cert_validity, CertInventory, CertRecord, CertRole, Clock, RENEW_FRACTION};
 use crate::{keys, util, warnings};
 
@@ -38,14 +38,13 @@ pub struct CertWatch {
 /// How long before expiry a record counts as at risk. CAs are never rotated automatically.
 /// A leaf is renewed with a third of its lifetime left, so it is at risk once half of that
 /// lead is gone (renewal overdue), capped at the 120-day node-cert window.
-fn leaf_window(rec: &CertRecord) -> Duration {
-    let lifetime = rec.not_after - rec.not_before;
+fn leaf_window(lifetime: Duration) -> Duration {
     NODE_CERT_WINDOW.min(lifetime * ((1.0 - RENEW_FRACTION) / 2.0))
 }
 
 fn window(rec: &CertRecord) -> Duration {
     match rec.role {
-        CertRole::Leaf => leaf_window(rec),
+        CertRole::Leaf => leaf_window(rec.not_after - rec.not_before),
         CertRole::Root | CertRole::Intermediate => CA_WINDOW,
     }
 }
@@ -76,18 +75,33 @@ fn when(not_after: OffsetDateTime, now: OffsetDateTime) -> String {
     }
 }
 
-/// Warnings to attach to a response: the caller's own client cert when it is within the node
-/// cert window, plus every inventory cert that is at risk (CA, or a leaf whose rotation is
-/// overdue).
+/// Callers that act on cluster-wide certificate health: `system:masters` and kubectl. Everyone
+/// else (controllers, service accounts) would log the CA warning on every request; Node Events
+/// reach them instead.
+fn is_operator(user: Option<&UserInfo>, user_agent: &str) -> bool {
+    user_agent.starts_with("kubectl/")
+        || user.is_some_and(|u| u.groups.iter().any(|g| g == "system:masters"))
+}
+
+/// Warnings to attach to a response: the caller's own client cert when it is inside its window
+/// (the leaf window, scaled by that cert's lifetime), plus, for operators only, every inventory
+/// cert that is at risk (CA, or a leaf whose rotation is overdue).
+///
+/// Also observes the caller's remaining cert lifetime in the upstream
+/// `apiserver_client_certificate_expiration_seconds` histogram, since the cert is parsed here
+/// anyway.
 pub(crate) fn request_warnings(
     inv: &CertInventory,
     now: OffsetDateTime,
     peer_der: Option<&[u8]>,
+    operator: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(der) = peer_der {
-        if let Ok((_, not_after)) = cert_validity(der) {
-            if not_after - now <= NODE_CERT_WINDOW {
+        if let Ok((not_before, not_after)) = cert_validity(der) {
+            crate::metrics::CLIENT_CERT_EXPIRATION_SECONDS
+                .observe((not_after - now).as_seconds_f64());
+            if not_after - now <= leaf_window(not_after - not_before) {
                 let who = crate::auth::extract_client_cert_identity(der)
                     .map_or_else(|| "unknown".to_owned(), |u| u.username);
                 out.push(format!(
@@ -97,6 +111,9 @@ pub(crate) fn request_warnings(
                 ));
             }
         }
+    }
+    if !operator {
+        return out;
     }
     for rec in at_risk(inv, now) {
         out.push(if is_ca(&rec) {
@@ -118,23 +135,32 @@ pub(crate) fn request_warnings(
 }
 
 pub async fn warn_requests(State(watch): State<CertWatch>, req: Request, next: Next) -> Response {
+    let user_agent = req
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let operator = is_operator(req.extensions().get::<UserInfo>(), user_agent);
     let peer = req.extensions().get::<PeerCertificate>();
     for w in request_warnings(
         &watch.inventory,
         watch.clock.now(),
         peer.map(|c| c.0.as_slice()),
+        operator,
     ) {
         warnings::warn(w);
     }
     next.run(req).await
 }
 
-/// Publish one gauge series per inventory cert. Series are keyed by subject and usages, which
-/// are stable across rotation, so a rotated cert overwrites its own series.
+/// Publish one gauge series per inventory cert. Series are keyed by cert name, subject and
+/// usages, which are stable across rotation, so a rotated cert overwrites its own series and
+/// two certs sharing a CN never collide.
 pub(crate) fn sync_metrics(inv: &CertInventory, now: OffsetDateTime) {
+    std::sync::LazyLock::force(&crate::metrics::CLIENT_CERT_EXPIRATION_SECONDS);
     for rec in inv.snapshot() {
         crate::metrics::CERT_EXPIRATION_SECONDS
-            .with_label_values(&[&rec.subject, &rec.usages.join(",")])
+            .with_label_values(&[rec.name, &rec.subject, &rec.usages.join(",")])
             .set((rec.not_after - now).as_seconds_f64());
         // Create the series at 0 so absence of failures is visible, not just unknown.
         crate::metrics::CERT_ROTATION_FAILURES.with_label_values(&[rec.name]);
@@ -191,8 +217,8 @@ async fn upsert_event<S: Store>(
     now: OffsetDateTime,
 ) -> anyhow::Result<()> {
     let node_name = node["metadata"]["name"].as_str().unwrap_or_default();
-    let name = format!("{node_name}.u7s-cert-{}", finding.reason.to_lowercase());
-    let key = keys::group_object_key("", "events", Some("default"), &name);
+    let name = event_name(node_name, finding.reason);
+    let key = event_key(node_name, finding.reason);
     let ts = util::secs_to_rfc3339(now.unix_timestamp());
     let previous = match store.get(key.clone()).await? {
         Some(obj) => serde_json::from_slice::<serde_json::Value>(&obj.value).ok(),
@@ -237,9 +263,47 @@ async fn upsert_event<S: Store>(
     Ok(())
 }
 
-/// One monitor pass: emit the current findings as Events on every Node (every node trusts the
-/// CAs and talks to the apiserver-held leaves), or `CertificateExpirationOK` once per node
-/// when clean. Returns the number of nodes found.
+fn event_name(node_name: &str, reason: &str) -> String {
+    format!("{node_name}.u7s-cert-{}", reason.to_lowercase())
+}
+
+fn event_key(node_name: &str, reason: &str) -> String {
+    keys::group_object_key(
+        "",
+        "events",
+        Some("default"),
+        &event_name(node_name, reason),
+    )
+}
+
+/// Remove the Warning Events of a node whose certificates are healthy again, so no stale
+/// Warning sits next to the `CertificateExpirationOK` that superseded it.
+async fn clear_warnings<S: Store>(store: &S, node_name: &str) -> anyhow::Result<()> {
+    for reason in [
+        REASON_CERT_WARNING,
+        REASON_CA_WARNING,
+        REASON_ROTATION_FAILED,
+    ] {
+        let key = event_key(node_name, reason);
+        if store.get(key.clone()).await?.is_some() {
+            store.delete(key, None).await?;
+        }
+    }
+    Ok(())
+}
+
+fn is_control_plane(node: &serde_json::Value) -> bool {
+    node["metadata"]["labels"]
+        .get("node-role.kubernetes.io/control-plane")
+        .is_some()
+}
+
+/// One monitor pass. CA findings go to every Node (every node trusts the CAs); leaf and
+/// rotation-failure findings concern apiserver-held certs, so they go only to control-plane
+/// Nodes (label `node-role.kubernetes.io/control-plane`). u7s's apiserver usually runs outside
+/// the cluster with no such Node; then every Node gets them rather than nobody. A Node with
+/// nothing to report gets `CertificateExpirationOK` once, replacing its Warning Events.
+/// Returns the number of nodes found.
 pub(crate) async fn emit_events<S: Store>(
     store: &S,
     watch: &CertWatch,
@@ -260,34 +324,45 @@ pub(crate) async fn emit_events<S: Store>(
             return 0;
         }
     };
+    let count = nodes.len();
+    let nodes: Vec<serde_json::Value> = nodes
+        .iter()
+        .filter_map(|i| serde_json::from_slice(&i.value).ok())
+        .collect();
+    let any_control_plane = nodes.iter().any(is_control_plane);
     let found = findings(&watch.inventory, now);
-    let ok = [Finding {
+    let ok = Finding {
         reason: REASON_OK,
         message: "all certificates are valid beyond their warning windows".to_owned(),
-    }];
-    for item in &nodes {
-        let Ok(node) = serde_json::from_slice::<serde_json::Value>(&item.value) else {
-            continue;
-        };
+    };
+    for node in &nodes {
         let name = node["metadata"]["name"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        let to_emit: &[Finding] = if !found.is_empty() {
+        let holds_leaves = !any_control_plane || is_control_plane(node);
+        let relevant: Vec<&Finding> = found
+            .iter()
+            .filter(|f| holds_leaves || f.reason == REASON_CA_WARNING)
+            .collect();
+        let to_emit: Vec<&Finding> = if !relevant.is_empty() {
             ok_sent.remove(&name);
-            &found
+            relevant
         } else if ok_sent.insert(name.clone()) {
-            &ok
+            if let Err(e) = clear_warnings(store, &name).await {
+                tracing::warn!("cert expiry monitor: clear warnings for node {name}: {e:#}");
+            }
+            vec![&ok]
         } else {
-            &[]
+            vec![]
         };
         for finding in to_emit {
-            if let Err(e) = upsert_event(store, &node, finding, now).await {
+            if let Err(e) = upsert_event(store, node, finding, now).await {
                 tracing::warn!("cert expiry monitor: event for node {name}: {e:#}");
             }
         }
     }
-    nodes.len()
+    count
 }
 
 /// Run [`emit_events`] every 30 minutes (k3s's certCheckInterval), retrying quickly until the

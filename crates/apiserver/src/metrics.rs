@@ -310,18 +310,39 @@ pub static APF_NOMINAL_LIMIT_SEATS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+/// Remaining lifetime of the client certificate on each authenticated request that presented
+/// one. Same name, buckets and meaning as upstream's x509 authenticator histogram
+/// (staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go).
+pub static CLIENT_CERT_EXPIRATION_SECONDS: LazyLock<prometheus::Histogram> = LazyLock::new(|| {
+    let histogram = prometheus::Histogram::with_opts(
+        HistogramOpts::new(
+            "apiserver_client_certificate_expiration_seconds",
+            "Distribution of the remaining lifetime on the certificate used to authenticate a \
+             request.",
+        )
+        .buckets(vec![
+            0.0, 1800.0, 3600.0, 7200.0, 21600.0, 43200.0, 86400.0, 172800.0, 345600.0, 604800.0,
+            2592000.0, 7776000.0, 15552000.0, 31104000.0,
+        ]),
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(histogram.clone()))
+        .expect("apiserver_client_certificate_expiration_seconds is registered once per process");
+    histogram
+});
+
 /// Seconds until each cert in the inventory expires (negative once expired), one series per
-/// cert. A gauge of the time left rather than upstream's
-/// `apiserver_client_certificate_expiration_seconds` histogram, which only observes the client
-/// certs of requests that happen to arrive; this covers every CA and apiserver-held leaf even
-/// when nobody calls. Name, labels and meaning match k3s's `k3s_certificate_expiration_seconds`.
+/// cert, covering every CA and apiserver-held leaf even when nobody calls (the histogram above
+/// only sees certs that arrive on requests). Name, labels and meaning match k3s's
+/// `k3s_certificate_expiration_seconds`.
 pub static CERT_EXPIRATION_SECONDS: LazyLock<prometheus::GaugeVec> = LazyLock::new(|| {
     let gauge = prometheus::GaugeVec::new(
         Opts::new(
             "u7s_certificate_expiration_seconds",
             "Seconds until each certificate in the PKI inventory expires.",
         ),
-        &["subject", "usages"],
+        &["cert", "subject", "usages"],
     )
     .expect("static metric definition is valid");
     prometheus::default_registry()

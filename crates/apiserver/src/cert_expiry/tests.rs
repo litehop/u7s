@@ -74,34 +74,97 @@ fn cluster_named(ca_cn: &'static str) -> (CertInventory, Vec<u8>) {
 }
 
 #[test]
-fn caller_is_told_about_its_own_client_cert_only_inside_the_120_day_window() {
+fn caller_is_told_about_its_own_client_cert_only_inside_its_lifetime_scaled_window() {
     let (inv, admin_der) = cluster();
-    let early = request_warnings(&inv, after_days(244), Some(&admin_der));
+    let early = request_warnings(&inv, after_days(300), Some(&admin_der), false);
     assert!(
         early.is_empty(),
-        "121 days left must not nag the user: {early:?}"
+        "65 days left of a 1y cert (window 60d) must not nag the user: {early:?}"
     );
-    let late = request_warnings(&inv, after_days(250), Some(&admin_der));
+    let late = request_warnings(&inv, after_days(310), Some(&admin_der), false);
     assert_eq!(late.len(), 1, "{late:?}");
     assert!(
-        late[0].contains("CN=admin") && late[0].contains("expires in 11"),
+        late[0].contains("CN=admin") && late[0].contains("expires in 5"),
         "the user must see whose cert and how long is left: {late:?}"
     );
     assert!(
-        request_warnings(&inv, after_days(250), None).is_empty(),
+        request_warnings(&inv, after_days(310), None, false).is_empty(),
         "a caller without a client cert (token, anonymous) has no own cert to warn about"
     );
 }
 
 #[test]
-fn every_caller_is_warned_when_the_ca_is_within_365_days() {
+fn operators_are_warned_when_the_ca_is_within_365_days() {
     let inv = ca_only("kubernetes-ca");
-    assert!(request_warnings(&inv, ca_expires_in(366), None).is_empty());
-    let w = request_warnings(&inv, ca_expires_in(300), None);
+    assert!(request_warnings(&inv, ca_expires_in(366), None, true).is_empty());
+    let w = request_warnings(&inv, ca_expires_in(300), None, true);
     assert_eq!(w.len(), 1, "{w:?}");
     assert!(
         w[0].contains("kubernetes-ca") && w[0].contains("expires in 300d"),
         "kubectl users pinning the CA must learn it is ending: {w:?}"
+    );
+}
+
+#[test]
+fn own_cert_window_scales_with_lifetime_so_short_lived_certs_do_not_nag_from_day_one() {
+    let pki = Pki {
+        clock: Clock::new(t0),
+        ..Pki::default()
+    };
+    let short = pki
+        .issue(&spec("short", "short-lived", CertRole::Leaf, 30), None)
+        .unwrap();
+    let der = short.cert.der().to_vec();
+    let inv = CertInventory::default();
+    assert!(
+        request_warnings(&inv, after_days(10), Some(&der), false).is_empty(),
+        "20 days left of a 30d cert is far outside its 5d window; a flat 120d would warn"
+    );
+    assert_eq!(
+        request_warnings(&inv, after_days(27), Some(&der), false).len(),
+        1
+    );
+}
+
+#[test]
+fn cluster_wide_warnings_go_only_to_operators() {
+    let inv = ca_only("kubernetes-ca");
+    let now = ca_expires_in(300);
+    let user = |groups: &[&str]| UserInfo {
+        username: "u".into(),
+        uid: String::new(),
+        groups: groups.iter().map(|g| (*g).to_owned()).collect(),
+        extra: Default::default(),
+    };
+    let sa = user(&["system:serviceaccounts", "system:authenticated"]);
+    assert!(
+        !is_operator(Some(&sa), "kube-controller-manager/v1.37"),
+        "controllers would log the CA warning on every request"
+    );
+    assert!(request_warnings(&inv, now, None, false).is_empty());
+    assert!(is_operator(Some(&user(&["system:masters"])), "client-go"));
+    assert!(is_operator(Some(&sa), "kubectl/v1.37.1 (darwin/arm64)"));
+    assert!(!is_operator(None, "curl/8"));
+}
+
+#[test]
+fn client_cert_lifetime_is_observed_in_the_upstream_histogram() {
+    let (inv, admin_der) = cluster();
+    let h = &*crate::metrics::CLIENT_CERT_EXPIRATION_SECONDS;
+    let before = h.get_sample_count();
+    request_warnings(&inv, after_days(100), Some(&admin_der), false);
+    assert!(
+        h.get_sample_count() > before,
+        "dashboards built for upstream's apiserver_client_certificate_expiration_seconds need it"
+    );
+    sync_metrics(&inv, after_days(100));
+    let family = prometheus::gather()
+        .into_iter()
+        .find(|f| f.name() == "apiserver_client_certificate_expiration_seconds")
+        .expect("histogram is exported under the upstream name");
+    assert_eq!(
+        family.get_metric()[0].get_histogram().get_bucket().len(),
+        14
     );
 }
 
@@ -220,7 +283,7 @@ async fn cert_warning_is_appended_next_to_the_handlers_own_warning() {
     let (inv, admin_der) = cluster();
     let watch = CertWatch {
         inventory: inv,
-        clock: Clock::new(|| after_days(250)),
+        clock: Clock::new(|| after_days(320)),
     };
     let app = Router::new()
         .route(
@@ -255,7 +318,7 @@ fn metric_has_one_series_per_inventory_cert_with_seconds_to_expiry() {
     let inv = ca_only("metric-test-ca");
     sync_metrics(&inv, ca_expires_in(1));
     let ca = crate::metrics::CERT_EXPIRATION_SECONDS
-        .with_label_values(&["metric-test-ca", "cert sign"])
+        .with_label_values(&["ca", "metric-test-ca", "cert sign"])
         .get();
     assert!(
         (ca - DAY as f64).abs() < 1.0,
@@ -263,12 +326,104 @@ fn metric_has_one_series_per_inventory_cert_with_seconds_to_expiry() {
     );
     sync_metrics(&inv, ca_expires_in(-1));
     let expired = crate::metrics::CERT_EXPIRATION_SECONDS
-        .with_label_values(&["metric-test-ca", "cert sign"])
+        .with_label_values(&["ca", "metric-test-ca", "cert sign"])
         .get();
     assert!(
         expired < 0.0,
         "an expired cert must go negative, got {expired}"
     );
+}
+
+#[test]
+fn two_certs_sharing_cn_and_usages_keep_separate_series() {
+    let pki = Pki {
+        clock: Clock::new(t0),
+        ..Pki::default()
+    };
+    pki.issue(&spec("dup-a", "shared-cn", CertRole::Leaf, 10), None)
+        .unwrap();
+    pki.issue(&spec("dup-b", "shared-cn", CertRole::Leaf, 20), None)
+        .unwrap();
+    sync_metrics(&pki.inventory, t0());
+    let get = |name: &str| {
+        crate::metrics::CERT_EXPIRATION_SECONDS
+            .with_label_values(&[name, "shared-cn", "client auth"])
+            .get()
+    };
+    assert!(
+        (get("dup-a") - 10.0 * DAY as f64).abs() < 600.0
+            && (get("dup-b") - 20.0 * DAY as f64).abs() < 600.0,
+        "one cert must not overwrite the other's expiry: {} / {}",
+        get("dup-a"),
+        get("dup-b")
+    );
+}
+
+#[tokio::test]
+async fn leaf_events_stay_off_worker_nodes_and_ok_replaces_stale_warnings() {
+    let store = SqliteStore::new(":memory:").unwrap();
+    for (name, labels) in [
+        (
+            "cp-1",
+            serde_json::json!({"node-role.kubernetes.io/control-plane": ""}),
+        ),
+        ("worker-1", serde_json::json!({})),
+    ] {
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": { "name": name, "uid": format!("uid-{name}"), "labels": labels }
+        });
+        store
+            .put(
+                keys::group_object_key("", "nodes", None, name),
+                Bytes::from(node.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let (inv, _) = cluster();
+    let now = Arc::new(AtomicI64::new(ca_expires_in(300).unix_timestamp()));
+    let n = Arc::clone(&now);
+    let watch = CertWatch {
+        inventory: inv.clone(),
+        clock: Clock::new(move || {
+            OffsetDateTime::from_unix_timestamp(n.load(Ordering::SeqCst)).unwrap()
+        }),
+    };
+    let mut ok_sent = HashSet::new();
+    inv.record_failure("kcm-client", "read-only filesystem");
+    emit_events(&store, &watch, &mut ok_sent).await;
+    let on = |events: &[serde_json::Value], node: &str, reason: &str| {
+        events
+            .iter()
+            .any(|e| e["involvedObject"]["name"] == node && e["reason"] == reason)
+    };
+    let events = node_events(&store).await;
+    assert!(on(&events, "cp-1", REASON_CA_WARNING));
+    assert!(
+        on(&events, "worker-1", REASON_CA_WARNING),
+        "every node trusts the CA"
+    );
+    assert!(on(&events, "cp-1", REASON_ROTATION_FAILED));
+    assert!(
+        !on(&events, "worker-1", REASON_ROTATION_FAILED),
+        "apiserver-held leaves are not on a kubelet-only worker; the Event would mislead"
+    );
+
+    inv.clear_failure("kcm-client");
+    now.store(after_days(10).unix_timestamp(), Ordering::SeqCst);
+    emit_events(&store, &watch, &mut ok_sent).await;
+    let events = node_events(&store).await;
+    for node in ["cp-1", "worker-1"] {
+        assert!(on(&events, node, REASON_OK));
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["involvedObject"]["name"] == node && e["type"] == "Warning"),
+            "a stale Warning next to the OK would still look like an open problem on {node}"
+        );
+    }
 }
 
 #[test]
