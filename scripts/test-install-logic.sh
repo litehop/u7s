@@ -1633,6 +1633,39 @@ wf_kcm_line="$(grep -n '^systemctl restart u7s-kcm.service' "$INSTALL" | cut -d:
 assert "the file wait sits between the apiserver restart and the KCM/kubelet restarts (otherwise the wait guards nothing)" \
   "$([ -n "$wf_apiserver_line" ] && [ -n "$wf_wait_line" ] && [ -n "$wf_kcm_line" ] && [ "$wf_apiserver_line" -lt "$wf_wait_line" ] && [ "$wf_wait_line" -lt "$wf_kcm_line" ] && echo 1 || echo 0)"
 
+# ---------------------------------------------------------------------------
+# Supply chain: https-only curl, and a truncated download executes nothing.
+# ---------------------------------------------------------------------------
+
+# A curl without --proto '=https...' follows an https->http redirect, handing a
+# network attacker the bytes that become root-run binaries or apt keys.
+curl_lines="$(grep -nE '(^|[ (])curl ' "$INSTALL" | grep -vE '^[0-9]+:[[:space:]]*#|apt-get install' || true)"
+bad_curls="$(printf '%s\n' "$curl_lines" | grep -vE "curl --proto '=https(,file)?'( --proto-redir '=https')? --tlsv1\.2 " || true)"
+assert "every curl in install.sh is https-only with TLS >= 1.2, so a MITM cannot downgrade a fetch that feeds root-run code (offenders: ${bad_curls:-none})" \
+  "$([ -n "$curl_lines" ] && [ -z "$bad_curls" ] && echo 1 || echo 0)"
+
+# `curl | sudo bash` can be cut short anywhere. Bash parses a whole function
+# before running it, so cutting inside main() is a syntax error. A bogus flag
+# makes any executed prefix visible: main's arg parser would print "unknown
+# argument".
+main_line="$(grep -n '^main() {$' "$INSTALL" | cut -d: -f1)"
+total_lines="$(wc -l < "$INSTALL")"
+TRUNC_WORK="$(mktemp -d)"
+trunc_ok=1
+for cut_at in $(( main_line + 1 )) $(( (main_line + total_lines) / 2 )) $(( total_lines - 3 )); do
+  head -n "$cut_at" "$INSTALL" > "$TRUNC_WORK/install.sh"
+  trunc_status=0
+  trunc_out="$(bash "$TRUNC_WORK/install.sh" --bogus-flag 2>&1)" || trunc_status=$?
+  [ "$trunc_status" -ne 0 ] || trunc_ok=0
+  printf '%s' "$trunc_out" | grep -q 'unknown argument' && trunc_ok=0
+  printf '%s' "$trunc_out" | grep -qiE 'syntax error|unexpected end of file' || trunc_ok=0
+done
+rm -rf "$TRUNC_WORK"
+assert "a truncated install.sh fails to parse and executes nothing, instead of running a script prefix as root" \
+  "$trunc_ok"
+assert "install.sh invokes main on its last line" \
+  "$([ "$(tail -n 1 "$INSTALL")" = 'main "$@"' ] && echo 1 || echo 0)"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
