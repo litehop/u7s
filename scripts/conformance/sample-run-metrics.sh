@@ -329,17 +329,23 @@ sample_ring_gauges() {
 # --bind-address=127.0.0.1) is loopback-only inside the VM, so it needs a
 # `limactl shell` hop rather than a direct curl from the host. `-k` skips
 # verification of KCM's self-signed serving cert (same trust model as every
-# other in-VM scrape this script already does). Failure (KCM down, or a
-# future auth requirement) is non-fatal — same "warn and skip" contract as
+# other in-VM scrape this script already does). KCM delegates authz to the
+# apiserver, so the scrape carries a 1h kube-system/monitoring ServiceAccount token
+# (bound to system:monitoring), minted per snapshot and handed to curl on stdin
+# (-H @-) so it never appears in a process list; -f turns a 403 into a failure
+# instead of saving the JSON Forbidden body as if it were a snapshot. Failure
+# (KCM down, token not mintable) is non-fatal — same "warn and skip" contract as
 # take_snapshot's own apiserver scrape below, since a monitoring gap must
 # never abort the run it's trying to observe.
 take_kcm_snapshot() {
-  local label="$1" seq="$2" out
+  local label="$1" seq="$2" out token
   out="$WORKDIR/kcm-metrics-$(printf '%02d' "$seq")-${label}.prom"
-  if limactl shell "$VM" -- curl -sk --max-time 5 https://127.0.0.1:10257/metrics > "$out" 2>/dev/null && [ -s "$out" ]; then
+  token="$(kubectl --kubeconfig "$KUBECONFIG_PATH" create token monitoring -n kube-system --duration=1h 2>/dev/null)" || token=""
+  if [ -n "$token" ] && printf 'Authorization: Bearer %s\n' "$token" \
+      | limactl shell "$VM" -- curl -sfk --max-time 5 -H @- https://127.0.0.1:10257/metrics > "$out" 2>/dev/null && [ -s "$out" ]; then
     echo "kcm metrics snapshot (${label}): $out"
   else
-    echo "warning: failed to capture KCM /metrics snapshot (label=${label}) — kube-controller-manager may be down" >&2
+    echo "warning: failed to capture KCM /metrics snapshot (label=${label}) — kube-controller-manager may be down or the monitoring token could not be minted/authorized" >&2
     rm -f "$out"
   fi
 }
