@@ -216,6 +216,163 @@ fn walk(
     stack.pop();
 }
 
+// ---- Encode-direction completeness ---------------------------------------------------------
+//
+// The decode-side oracle above checks what a decoder emits. The functions below check the
+// opposite direction for ObjectMeta: a JSON object with every descriptor field populated must
+// come out of a `json_to_*_proto` encoder with every descriptor field on the wire. A field
+// forgotten by the encoder (managedFields was) cannot hide behind a hand-written field list.
+
+pub(crate) const OBJECT_META: &str = ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta";
+
+/// Wire fields an encoder legitimately never emits. Each entry is a decision.
+const ENCODE_EXCEPTIONS: &[(&str, &str, &str)] = &[
+    (
+        OBJECT_META,
+        "selfLink",
+        "upstream `Deprecated: selfLink is a legacy read-only field that is no longer populated \
+         by the system` — no u7s code sets it, so a JSON value is never carried",
+    ),
+    (
+        ".k8s.io.apimachinery.pkg.apis.meta.v1.Time",
+        "nanos",
+        "metav1.Time's JSON form is RFC3339 with whole seconds, so there is no sub-second \
+         value to carry into the protobuf",
+    ),
+];
+
+/// A JSON value for `message_name` with every descriptor field populated (including those in
+/// `ENCODE_EXCEPTIONS`: a field the encoder is excused from must still be harmless to supply).
+pub(crate) fn sample_json(message_name: &str) -> serde_json::Value {
+    use prost_types::field_descriptor_proto::Label;
+    use serde_json::{json, Value};
+    if message_name == ".k8s.io.apimachinery.pkg.apis.meta.v1.Time" {
+        return json!("2024-01-02T03:04:05Z");
+    }
+    if message_name == ".k8s.io.apimachinery.pkg.apis.meta.v1.FieldsV1" {
+        return json!({"f:metadata": {"f:labels": {}}});
+    }
+    let index = message_index();
+    let message = &index[message_name];
+    let mut obj = serde_json::Map::new();
+    for field in &message.field {
+        let key = json_key(message_name, field.name(), field.json_name());
+        let single = match field.r#type() {
+            Type::String => json!(format!("sample-{key}")),
+            Type::Bool => json!(true),
+            Type::Int32 | Type::Int64 => json!(7),
+            Type::Message => match map_value_type(index, field.type_name()) {
+                Some(None) => {
+                    obj.insert(key, json!({"k": "v"}));
+                    continue;
+                }
+                Some(Some(_)) => panic!("sample_json: message-valued map {key} unsupported"),
+                None => sample_json(field.type_name()),
+            },
+            other => panic!("sample_json: unsupported type {other:?} for {message_name}.{key}"),
+        };
+        let repeated = field.label() == Label::Repeated;
+        obj.insert(
+            key,
+            if repeated {
+                Value::Array(vec![single])
+            } else {
+                single
+            },
+        );
+    }
+    Value::Object(obj)
+}
+
+/// Field number -> payload of each occurrence (non-length-delimited payloads are left empty;
+/// only presence and length-delimited bodies matter to the completeness check).
+fn wire_fields(mut buf: &[u8]) -> HashMap<u32, Vec<Vec<u8>>> {
+    use prost::bytes::Buf;
+    use prost::encoding::{decode_key, decode_varint, WireType};
+    let mut out: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+    while buf.has_remaining() {
+        let (tag, wt) = decode_key(&mut buf).expect("valid protobuf key");
+        let payload = match wt {
+            WireType::Varint => {
+                decode_varint(&mut buf).expect("valid varint");
+                Vec::new()
+            }
+            WireType::LengthDelimited => {
+                let len = decode_varint(&mut buf).expect("valid length") as usize;
+                let body = buf[..len].to_vec();
+                buf.advance(len);
+                body
+            }
+            WireType::ThirtyTwoBit => {
+                buf.advance(4);
+                Vec::new()
+            }
+            WireType::SixtyFourBit => {
+                buf.advance(8);
+                Vec::new()
+            }
+            other => panic!("unsupported wire type {other:?}"),
+        };
+        out.entry(tag).or_default().push(payload);
+    }
+    out
+}
+
+/// Every non-excepted descriptor field of `message_name`, recursively, that is absent from the
+/// encoded `bytes`, as dotted paths.
+pub(crate) fn missing_wire_fields(message_name: &str, bytes: &[u8]) -> Vec<String> {
+    let mut missing = Vec::new();
+    collect_missing(message_name, bytes, "", &mut missing);
+    missing
+}
+
+fn collect_missing(message_name: &str, bytes: &[u8], parent: &str, missing: &mut Vec<String>) {
+    let index = message_index();
+    let wire = wire_fields(bytes);
+    for field in &index[message_name].field {
+        if ENCODE_EXCEPTIONS
+            .iter()
+            .any(|(m, f, _)| *m == message_name && *f == field.name())
+        {
+            continue;
+        }
+        let path = format!("{parent}{}", field.name());
+        let Some(occurrences) = wire.get(&(field.number() as u32)) else {
+            missing.push(path);
+            continue;
+        };
+        if field.r#type() == Type::Message {
+            for body in occurrences {
+                collect_missing(field.type_name(), body, &format!("{path}."), missing);
+            }
+        }
+    }
+}
+
+/// Feeds `encode` an object (or, for `is_list`, a one-item list) whose `metadata` has every
+/// ObjectMeta field set, then fails if `item_metadata` (which extracts the encoded
+/// ObjectMeta bytes from the encoder's output) lacks any non-excepted field.
+pub(crate) fn assert_encoder_carries_every_object_meta_field(
+    encoder: &str,
+    is_list: bool,
+    encode: fn(&serde_json::Value) -> Vec<u8>,
+    item_metadata: fn(&[u8]) -> Vec<u8>,
+) {
+    let item = serde_json::json!({ "metadata": sample_json(OBJECT_META) });
+    let input = if is_list {
+        serde_json::json!({ "items": [item] })
+    } else {
+        item
+    };
+    let meta_bytes = item_metadata(&encode(&input));
+    let missing = missing_wire_fields(OBJECT_META, &meta_bytes);
+    assert!(
+        missing.is_empty(),
+        "{encoder} dropped ObjectMeta fields {missing:?}: a protobuf client would read an \
+         object missing metadata that a JSON client sees"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

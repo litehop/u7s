@@ -1670,6 +1670,12 @@ assert "only the bead whose note says this PR completed it closes; other-PR-numb
 assert "...and skipping them is quiet: exit 0 with no gate exception (an epic close attempt used to raise bead-close-failed)" \
   "$([ "$TICK_RC" -eq 0 ] && [ "$(jq '.gate_exceptions | length' "$TICK_STATE")" = "0" ] && echo 1 || echo 0)"
 
+CLUSTER_TITLE="tooling(mayor): full bead IDs in cluster titles (${B}aa001, ${B}bb002, ${B}cc003)"
+assert "a Shape 2 cluster title lists every full bead ID, so extract_bead_ids returns all three and the tick can close them on merge" \
+  "$([ "$(call extract_bead_ids "$CLUSTER_TITLE" | tr '\n' ' ')" = "${B}aa001 ${B}bb002 ${B}cc003 " ] && echo 1 || echo 0)"
+assert "the old '(N beads incl. <id>)' title style yields at most the highlighted ID, never the whole cluster" \
+  "$([ "$(call extract_bead_ids "x: y (3 beads incl. ${B}fkj56)" | wc -l | tr -d ' ')" = "1" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
