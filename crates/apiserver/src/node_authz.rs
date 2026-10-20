@@ -32,7 +32,7 @@
 //! Upstream's graph additionally threads Secret access through a bound PersistentVolume
 //! (`pod -> pvc -> pv -> secret`, for CSI drivers that store credentials in a PV's
 //! `secretRef`) and subdivides `persistentvolumes`, `volumeattachments`, `csidrivers`, and
-//! `resourceslices` individually. u7s doesn't model PV objects at that granularity; those
+//! `resourceslices` by graph edge. u7s doesn't model PV objects at that granularity; those
 //! resources fall through to the same static, un-scoped rule match every other unsubdivided
 //! `system:node` permission gets (see the `_ =>` arm of `authorize`) — identical to today's
 //! behavior, not a regression. Mirror-pod create is authorized by the separate
@@ -269,7 +269,12 @@ pub(crate) fn node_identity<'a>(username: &'a str, groups: &[String]) -> Option<
 /// Decided on the same query decoding (`Query`) and parse (`FieldSelector::parse`) the pod
 /// list/watch handlers use, so authorizer and handler cannot read a selector differently (an
 /// escaped comma once did). A selector the handler would reject is not authorized.
-fn field_selector_selects_node(query: Option<&str>, node_name: &str) -> bool {
+fn field_selector_selects_node(
+    query: Option<&str>,
+    node_name: &str,
+    group: &str,
+    plural: &str,
+) -> bool {
     let Some(query) = query else {
         return false;
     };
@@ -285,7 +290,7 @@ fn field_selector_selects_node(query: Option<&str>, node_name: &str) -> bool {
     let (Some((_, raw)), None) = (selectors.next(), selectors.next()) else {
         return false;
     };
-    FieldSelector::parse(Some(raw), "", "pods")
+    FieldSelector::parse(Some(raw), group, plural)
         .is_ok_and(|s| s.requires_equal("spec.nodeName", node_name))
 }
 
@@ -331,12 +336,60 @@ fn authorize_lease(node_name: &str, req: &AuthzRequest<'_>) -> bool {
         return false;
     }
     if req.verb == "create" {
-        // The authorizer can't know the target name on create (no name in the URL); the
-        // request body's name is checked by admission upstream. u7s has no such admission
-        // plugin — this is a narrow, documented gap identical to upstream's own posture.
+        // No name in the URL on create; `restrict_node_create` checks the body's name.
         return true;
     }
     req.name == Some(node_name)
+}
+
+fn authorize_csinode(node_name: &str, req: &AuthzRequest<'_>) -> bool {
+    if !req.subresource.is_empty()
+        || !matches!(req.verb, "get" | "create" | "update" | "patch" | "delete")
+    {
+        return false;
+    }
+    // Create carries no name in the URL; `restrict_node_create` checks the body's name.
+    req.verb == "create" || req.name == Some(node_name)
+}
+
+/// A node may only wipe the DRA slices it published, so deletecollection must carry
+/// `spec.nodeName=<node>` (the delete-collection handler filters by the same selector).
+/// Per-slice create/update/patch/delete are not granted to nodes at all.
+fn authorize_resource_slice(
+    node_name: &str,
+    req: &AuthzRequest<'_>,
+    raw_query: Option<&str>,
+) -> bool {
+    req.subresource.is_empty()
+        && req.verb == "deletecollection"
+        && field_selector_selects_node(raw_query, node_name, "resource.k8s.io", "resourceslices")
+}
+
+/// Body-dependent half of node scoping for create requests, where the URL carries no name:
+/// a node identity may only create the lease / CSINode named after itself. `name` is the
+/// final object name (after `generateName` resolution). No-op for non-node identities and
+/// for other resources.
+pub fn restrict_node_create(
+    username: &str,
+    groups: &[String],
+    api_group: &str,
+    resource: &str,
+    name: &str,
+) -> Result<(), String> {
+    let Some(node_name) = node_identity(username, groups) else {
+        return Ok(());
+    };
+    let kind = match (api_group, resource) {
+        ("coordination.k8s.io", "leases") => "node lease",
+        ("storage.k8s.io", "csinodes") => "CSINode",
+        _ => return Ok(()),
+    };
+    if name != node_name {
+        return Err(format!(
+            "can only access {kind} with the same name as the requesting node"
+        ));
+    }
+    Ok(())
 }
 
 fn authorize_node(node_name: &str, req: &AuthzRequest<'_>) -> bool {
@@ -374,7 +427,8 @@ fn authorize_pod(
         "" => match req.verb {
             "get" | "delete" => req.name.is_some_and(owns),
             "list" | "watch" => {
-                field_selector_selects_node(raw_query, node_name) || req.name.is_some_and(owns)
+                field_selector_selects_node(raw_query, node_name, "", "pods")
+                    || req.name.is_some_and(owns)
             }
             // This layer can't tell a mirror pod (bound to this node) apart from any other
             // pod — that needs the request body (the `kubernetes.io/config.mirror`
@@ -628,10 +682,14 @@ pub fn authorize(
             authorize_sa_token(node_name, req, graph)
         }
         ("coordination.k8s.io", "leases") => authorize_lease(node_name, req),
+        ("storage.k8s.io", "csinodes") => authorize_csinode(node_name, req),
+        ("resource.k8s.io", "resourceslices") => {
+            authorize_resource_slice(node_name, req, raw_query)
+        }
         ("", "nodes") => authorize_node(node_name, req),
         ("", "pods") => authorize_pod(node_name, req, raw_query, graph, rbac_index),
         // Not subdivided by node: fall back to the same plain rule match RBAC would do
-        // against the `system:node` ClusterRole's own rules (services, events, csinodes,
+        // against the `system:node` ClusterRole's own rules (services, events,
         // csidrivers, persistentvolumes, volumeattachments, SAR/TokenReview/CSR creation,
         // ...). Reusing `cluster_role_rules` (rather than a hand-copied rule list) means this
         // stays correct if the seeded ClusterRole is ever edited.
@@ -1272,6 +1330,116 @@ mod tests {
             !authorize(&other, None, &graph, &idx),
             "node-a must not be able to update node-b's heartbeat Lease"
         );
+    }
+
+    fn node_a_allowed(
+        verb: &str,
+        group: &str,
+        resource: &str,
+        subresource: &str,
+        name: Option<&str>,
+        query: Option<&str>,
+    ) -> bool {
+        let groups = vec![NODES_GROUP.to_owned()];
+        let req = node_req(
+            "system:node:node-a",
+            &groups,
+            verb,
+            group,
+            resource,
+            subresource,
+            None,
+            name,
+        );
+        authorize(&req, query, &NodeGraph::new(), &RbacIndex::new())
+    }
+
+    #[test]
+    fn node_cannot_clobber_another_nodes_csinode() {
+        for verb in ["get", "update", "patch", "delete"] {
+            assert!(
+                node_a_allowed(verb, "storage.k8s.io", "csinodes", "", Some("node-a"), None),
+                "{verb} on its own CSINode is what kubelet's CSI registration does"
+            );
+            assert!(
+                !node_a_allowed(verb, "storage.k8s.io", "csinodes", "", Some("node-b"), None),
+                "{verb} on node-b's CSINode would let a compromised node break node-b's CSI drivers"
+            );
+        }
+        assert!(
+            !node_a_allowed("list", "storage.k8s.io", "csinodes", "", None, None),
+            "upstream grants nodes no CSINode list/watch"
+        );
+    }
+
+    #[test]
+    fn node_cannot_create_a_lease_or_csinode_named_after_another_node() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        for (group, resource) in [
+            ("coordination.k8s.io", "leases"),
+            ("storage.k8s.io", "csinodes"),
+        ] {
+            assert!(
+                restrict_node_create("system:node:node-a", &groups, group, resource, "node-a")
+                    .is_ok(),
+                "{resource}: node-a must still create its own object"
+            );
+            assert!(
+                restrict_node_create("system:node:node-a", &groups, group, resource, "node-b")
+                    .is_err(),
+                "{resource}: node-a creating node-b's object would spoof node-b before it registers"
+            );
+        }
+        assert!(
+            restrict_node_create("system:node:node-a", &groups, "", "configmaps", "node-b").is_ok(),
+            "only leases and csinodes are name-bound"
+        );
+        assert!(
+            restrict_node_create(
+                "alice",
+                &["system:masters".to_owned()],
+                "coordination.k8s.io",
+                "leases",
+                "node-b"
+            )
+            .is_ok(),
+            "non-node identities are not restricted"
+        );
+    }
+
+    #[test]
+    fn a_compromised_node_cannot_delete_another_nodes_dra_slices() {
+        let group = "resource.k8s.io";
+        let rs = "resourceslices";
+        assert!(node_a_allowed(
+            "deletecollection",
+            group,
+            rs,
+            "",
+            None,
+            Some("fieldSelector=spec.nodeName%3Dnode-a")
+        ));
+        assert!(
+            !node_a_allowed("deletecollection", group, rs, "", None, None),
+            "an unscoped deletecollection would wipe every node's slices"
+        );
+        assert!(
+            !node_a_allowed(
+                "deletecollection",
+                group,
+                rs,
+                "",
+                None,
+                Some("fieldSelector=spec.nodeName%3Dnode-b")
+            ),
+            "scoping to another node's slices must be refused"
+        );
+        for verb in ["create", "update", "patch", "delete"] {
+            assert!(
+                !node_a_allowed(verb, group, rs, "", Some("slice-1"), None),
+                "{verb} on slices is not granted to nodes"
+            );
+        }
     }
 
     #[test]
