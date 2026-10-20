@@ -3282,6 +3282,19 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "Role"
     );
 
+    // ClusterRoleBinding: system:monitoring → kube-system/monitoring ServiceAccount (seeded by
+    // seed_serviceaccounts), so a scraper can mint a short-lived `kubectl create token
+    // monitoring -n kube-system` instead of holding admin credentials.
+    let key = keys::group_object_key(GROUP, "clusterrolebindings", None, "u7s:monitoring");
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "u7s:monitoring", "uid": "00000000-0000-0000-0000-000000000309", "creationTimestamp": TS },
+        "subjects": [{ "kind": "ServiceAccount", "name": "monitoring", "namespace": "kube-system" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:monitoring" }
+    });
+    put!(key, body, "u7s:monitoring", "ClusterRoleBinding");
+
     // -----------------------------------------------------------------------
     // Bootstrap-signer / token-cleaner namespace Roles and bindings, as upstream's
     // namespace_policy.go, plus kubeadm's anonymous read of kube-public/cluster-info
@@ -3904,19 +3917,37 @@ async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
     // are required so token recipients can correlate a JWT's kubernetes.io.serviceaccount.uid
     // claim back to the ServiceAccount object. Without a UID the claim is empty, which
     // violates the Kubernetes token projection contract.
-    const NAMESPACES: &[(&str, &str)] = &[
-        ("default", "00000000-0000-0000-0001-000000000001"),
-        ("kube-system", "00000000-0000-0000-0001-000000000002"),
-        ("kube-node-lease", "00000000-0000-0000-0001-000000000003"),
-        ("kube-public", "00000000-0000-0000-0001-000000000004"),
+    // kube-system/monitoring is the scraper identity bound to system:monitoring.
+    const SERVICE_ACCOUNTS: &[(&str, &str, &str)] = &[
+        ("default", "default", "00000000-0000-0000-0001-000000000001"),
+        (
+            "kube-system",
+            "default",
+            "00000000-0000-0000-0001-000000000002",
+        ),
+        (
+            "kube-node-lease",
+            "default",
+            "00000000-0000-0000-0001-000000000003",
+        ),
+        (
+            "kube-public",
+            "default",
+            "00000000-0000-0000-0001-000000000004",
+        ),
+        (
+            "kube-system",
+            "monitoring",
+            "00000000-0000-0000-0001-000000000005",
+        ),
     ];
-    for (ns, uid) in NAMESPACES {
-        let key = keys::object_key("serviceaccounts", ns, "default");
+    for (ns, name, uid) in SERVICE_ACCOUNTS {
+        let key = keys::object_key("serviceaccounts", ns, name);
         let body = serde_json::json!({
             "apiVersion": "v1",
             "kind": "ServiceAccount",
             "metadata": {
-                "name": "default",
+                "name": name,
                 "namespace": ns,
                 "uid": uid,
                 "creationTimestamp": "2024-01-01T00:00:00Z"
@@ -3926,9 +3957,9 @@ async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
             .put(&key, Bytes::from(body.to_string()), Some(0))
             .await
         {
-            Ok(_) => tracing::info!("seeded ServiceAccount: {ns}/default"),
+            Ok(_) => tracing::info!("seeded ServiceAccount: {ns}/{name}"),
             Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
-            Err(e) => return Err(anyhow::anyhow!("seed ServiceAccount {ns}/default: {e}")),
+            Err(e) => return Err(anyhow::anyhow!("seed ServiceAccount {ns}/{name}: {e}")),
         }
     }
     Ok(())
@@ -9022,6 +9053,150 @@ mod tests {
         seed_serviceaccounts(&store)
             .await
             .expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn seed_serviceaccounts_creates_kube_system_monitoring_sa_with_uid() {
+        // `kubectl create token monitoring -n kube-system` 404s without the SA, and an empty
+        // UID leaves the token's serviceaccount.uid claim blank, so the scraper's token
+        // cannot be correlated back to the object.
+        let store = make_store();
+        seed_serviceaccounts(&store)
+            .await
+            .expect("seed must not fail");
+        let key = keys::object_key("serviceaccounts", "kube-system", "monitoring");
+        let obj = store
+            .get(&key)
+            .await
+            .expect("get must not fail")
+            .expect("kube-system/monitoring must be seeded");
+        let parsed: serde_json::Value = serde_json::from_slice(&obj.value).expect("valid json");
+        assert!(!parsed["metadata"]["uid"].as_str().unwrap_or("").is_empty());
+    }
+
+    #[tokio::test]
+    async fn monitoring_sa_may_scrape_metrics_but_other_identities_may_not() {
+        // KCM authorizes /metrics via SubjectAccessReview against this apiserver. Only the
+        // system:monitoring role (bound to the monitoring SA and the system:monitoring
+        // group) may pass; an ordinary SA, anonymous callers and a stray authenticated
+        // user must get 403, or the delegated-auth change would not actually gate /metrics.
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let sa_groups: Vec<String> = vec![
+            "system:serviceaccounts".into(),
+            "system:serviceaccounts:kube-system".into(),
+            "system:authenticated".into(),
+        ];
+        let anon_groups: Vec<String> = vec!["system:unauthenticated".into()];
+        let monitoring_group: Vec<String> =
+            vec!["system:monitoring".into(), "system:authenticated".into()];
+        let allowed = |username: &str, groups: &[String], url: &str| {
+            state.rbac_index.is_allowed(&rbac::AuthzRequest {
+                username,
+                groups,
+                verb: "get",
+                api_group: "",
+                resource: "",
+                subresource: "",
+                namespace: None,
+                name: None,
+                non_resource_url: Some(url),
+            })
+        };
+
+        let monitoring = "system:serviceaccount:kube-system:monitoring";
+        assert!(
+            allowed(monitoring, &sa_groups, "/metrics"),
+            "kube-system/monitoring must read /metrics, else the sampler gets 403"
+        );
+        assert!(allowed(monitoring, &sa_groups, "/healthz/ping"));
+        assert!(
+            allowed("someone", &monitoring_group, "/metrics"),
+            "upstream binds the system:monitoring group to the system:monitoring role"
+        );
+        assert!(
+            !allowed(
+                "system:serviceaccount:kube-system:default",
+                &sa_groups,
+                "/metrics"
+            ),
+            "a default SA must not read /metrics"
+        );
+        assert!(
+            !allowed("system:anonymous", &anon_groups, "/metrics"),
+            "anonymous /metrics must stay 403"
+        );
+    }
+
+    #[tokio::test]
+    async fn kcm_identity_can_delegate_authn_authz_and_read_the_authentication_configmap() {
+        // KCM runs with --authentication-kubeconfig/--authorization-kubeconfig pointing at
+        // its own kubeconfig. If the identity lacks tokenreviews/subjectaccessreviews create
+        // or kube-system/extension-apiserver-authentication read, KCM either fails at
+        // startup or answers every /metrics request 401/403 -- including for cluster-admin.
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+        let groups: Vec<String> = vec![];
+        let check = |verb: &str,
+                     api_group: &str,
+                     resource: &str,
+                     namespace: Option<&str>,
+                     name: Option<&str>| {
+            state.rbac_index.is_allowed(&rbac::AuthzRequest {
+                username: "system:kube-controller-manager",
+                groups: &groups,
+                verb,
+                api_group,
+                resource,
+                subresource: "",
+                namespace,
+                name,
+                non_resource_url: None,
+            })
+        };
+        assert!(check(
+            "create",
+            "authentication.k8s.io",
+            "tokenreviews",
+            None,
+            None
+        ));
+        assert!(check(
+            "create",
+            "authorization.k8s.io",
+            "subjectaccessreviews",
+            None,
+            None
+        ));
+        for verb in ["get", "list", "watch"] {
+            assert!(
+                check(
+                    verb,
+                    "",
+                    "configmaps",
+                    Some("kube-system"),
+                    Some("extension-apiserver-authentication")
+                ),
+                "KCM must {verb} the extension-apiserver-authentication configmap"
+            );
+        }
     }
 
     #[tokio::test]

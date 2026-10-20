@@ -3565,6 +3565,45 @@ pub(crate) fn apply_ephemeral_containers_patch(
     result
 }
 
+/// Run the admission chain for an ephemeralcontainers update and return the pod to persist.
+///
+/// Mutating admission runs first; afterwards only `spec.ephemeralContainers` is carried over onto
+/// the stored pod, because upstream's PrepareForUpdate for this subresource discards every other
+/// change before validating admission and validation run.
+async fn admit_ephemeral_containers_update<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    name: &str,
+    user: Option<&UserInfo>,
+    dry_run: bool,
+    old: &serde_json::Value,
+    new: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "pods/ephemeralcontainers",
+        name,
+        namespace: Some(ns),
+        operation: "UPDATE",
+        user_info: Some(serde_json::json!({
+            "username": user.map_or("", |u| u.username.as_str()),
+            "uid": user.map_or("", |u| u.uid.as_str()),
+            "groups": user.map(|u| &u.groups),
+            "extra": user.map(|u| &u.extra),
+        })),
+        dry_run,
+    };
+    let mutated = run_mutating_webhooks(state, new, Some(old), &admission_ctx).await?;
+    let mut admitted = old.clone();
+    admitted["status"] = old["status"].clone();
+    if !mutated["spec"]["ephemeralContainers"].is_null() {
+        admitted["spec"]["ephemeralContainers"] = mutated["spec"]["ephemeralContainers"].clone();
+    }
+    run_validating_webhooks(state, &admitted, Some(old), &admission_ctx).await?;
+    Ok(admitted)
+}
+
 pub(crate) async fn get_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
@@ -3618,14 +3657,14 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
 
     let spec_before = current_obj.body["spec"].clone();
     let before_write = current_obj.body.clone();
-    current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &patch);
-    crate::pod_security::admit_pod_update(
+    current_obj.body = admit_ephemeral_containers_update(
         &state,
         ns.as_str(),
         &name,
         user.as_ref().map(|u| &u.0),
-        &current_obj.body,
+        super::json_patch::is_dry_run_header(&headers),
         &before_write,
+        apply_ephemeral_containers_patch(&current_obj.body, &patch),
     )
     .await?;
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
@@ -3685,14 +3724,14 @@ pub(crate) async fn put_ephemeral_containers<S: Store>(
 
     let spec_before = current_obj.body["spec"].clone();
     let before_write = current_obj.body.clone();
-    current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &incoming);
-    crate::pod_security::admit_pod_update(
+    current_obj.body = admit_ephemeral_containers_update(
         &state,
         ns.as_str(),
         &name,
         user.as_ref().map(|u| &u.0),
-        &current_obj.body,
+        super::json_patch::is_dry_run_header(&headers),
         &before_write,
+        apply_ephemeral_containers_patch(&current_obj.body, &incoming),
     )
     .await?;
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
@@ -21703,6 +21742,235 @@ mod ephemeral_containers_route_tests {
         );
         assert!(owner(&pod, "put-debugger", "ephemeralcontainers"), "{pod}");
         assert!(owner(&pod, "resizer", "resize"), "{pod}");
+    }
+
+    async fn deny_webhook_url() -> String {
+        let app = Router::new().route(
+            "/webhook",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "u",
+                        "allowed": false,
+                        "status": {"code": 403, "message": "denied by test webhook"}
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/webhook")
+    }
+
+    async fn put_registry(store: &Arc<SqliteStore>, path: &str, v: serde_json::Value) {
+        store
+            .put(
+                &format!("/registry/admissionregistration.k8s.io/{path}"),
+                Bytes::from(serde_json::to_vec(&v).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn debug_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
+                patch(patch_ephemeral_containers).put(put_ephemeral_containers),
+            )
+            .with_state(state)
+    }
+
+    async fn status_of(
+        app: Router,
+        method: &str,
+        name: &str,
+        container: serde_json::Value,
+    ) -> StatusCode {
+        let body = serde_json::json!({"spec": {"ephemeralContainers": [container]}});
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(format!(
+                        "/api/v1/namespaces/default/pods/{name}/ephemeralcontainers"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(json_body(&body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    async fn stored_ephemeral_count(store: &Arc<SqliteStore>, key: &str) -> usize {
+        let stored = store.get(key).await.unwrap().unwrap();
+        let pod: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        pod["spec"]["ephemeralContainers"]
+            .as_array()
+            .map_or(0, Vec::len)
+    }
+
+    /// A validating webhook scoped to pods/ephemeralcontainers must be able to veto a debug
+    /// container on both PUT and PATCH; otherwise `kubectl debug` sidesteps org policy that
+    /// every other pod write is held to.
+    #[tokio::test]
+    async fn validating_webhook_on_ephemeralcontainers_denies_put_and_patch() {
+        let (state, store) = make_state();
+        let key = seed_running_pod(&store, "guarded").await;
+        let url = deny_webhook_url().await;
+        put_registry(
+            &store,
+            "validatingwebhookconfigurations/deny-debug",
+            serde_json::json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingWebhookConfiguration",
+                "metadata": {"name": "deny-debug"},
+                "webhooks": [{
+                    "name": "deny.debug.example.com",
+                    "clientConfig": {"url": url},
+                    "rules": [{"apiGroups": [""], "apiVersions": ["v1"],
+                        "resources": ["pods/ephemeralcontainers"], "operations": ["UPDATE"]}],
+                    "failurePolicy": "Fail"
+                }]
+            }),
+        )
+        .await;
+
+        let dbg = serde_json::json!({"name": "dbg", "image": "busybox"});
+        for method in ["PUT", "PATCH"] {
+            let status =
+                status_of(debug_router(state.clone()), method, "guarded", dbg.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} pods/ephemeralcontainers must be denied by the validating webhook"
+            );
+        }
+        assert_eq!(
+            stored_ephemeral_count(&store, &key).await,
+            0,
+            "a denied debug container must not be persisted"
+        );
+    }
+
+    /// A webhook registered for `pods` alone must not see pods/ephemeralcontainers writes
+    /// (upstream matches subresources only when the rule names them), or unrelated policy
+    /// webhooks would start rejecting `kubectl debug`.
+    #[tokio::test]
+    async fn pods_only_webhook_does_not_fire_for_ephemeralcontainers() {
+        let (state, store) = make_state();
+        let key = seed_running_pod(&store, "plain").await;
+        let url = deny_webhook_url().await;
+        put_registry(
+            &store,
+            "validatingwebhookconfigurations/deny-pods",
+            serde_json::json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingWebhookConfiguration",
+                "metadata": {"name": "deny-pods"},
+                "webhooks": [{
+                    "name": "deny.pods.example.com",
+                    "clientConfig": {"url": url},
+                    "rules": [{"apiGroups": [""], "apiVersions": ["v1"],
+                        "resources": ["pods"], "operations": ["*"]}],
+                    "failurePolicy": "Fail"
+                }]
+            }),
+        )
+        .await;
+
+        for method in ["PUT", "PATCH"] {
+            let status = status_of(
+                debug_router(state.clone()),
+                method,
+                "plain",
+                serde_json::json!({"name": format!("dbg-{method}"), "image": "busybox"}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{method}: a `pods`-only rule must not match the subresource"
+            );
+        }
+        assert_eq!(stored_ephemeral_count(&store, &key).await, 2);
+    }
+
+    /// A ValidatingAdmissionPolicy matching pods/ephemeralcontainers must deny a privileged
+    /// debug container on PUT and PATCH while still admitting an unprivileged one — the
+    /// escalation path `kubectl debug --profile=sysadmin` would otherwise open past the policy.
+    #[tokio::test]
+    async fn vap_denies_privileged_ephemeral_container_on_put_and_patch() {
+        let (state, store) = make_state();
+        let key = seed_running_pod(&store, "vap-guarded").await;
+        put_registry(
+            &store,
+            "validatingadmissionpolicies/no-privileged-debug",
+            serde_json::json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingAdmissionPolicy",
+                "metadata": {"name": "no-privileged-debug"},
+                "spec": {
+                    "matchConstraints": {"resourceRules": [{
+                        "apiGroups": [""], "apiVersions": ["v1"],
+                        "operations": ["UPDATE"], "resources": ["pods/ephemeralcontainers"]
+                    }]},
+                    "validations": [{
+                        "expression": "object.spec.ephemeralContainers[0].securityContext.privileged != true",
+                        "message": "privileged ephemeral containers are not allowed"
+                    }]
+                }
+            }),
+        )
+        .await;
+        put_registry(
+            &store,
+            "validatingadmissionpolicybindings/no-privileged-debug-binding",
+            serde_json::json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingAdmissionPolicyBinding",
+                "metadata": {"name": "no-privileged-debug-binding"},
+                "spec": {"policyName": "no-privileged-debug", "validationActions": ["Deny"]}
+            }),
+        )
+        .await;
+
+        for method in ["PUT", "PATCH"] {
+            let status = status_of(
+                debug_router(state.clone()),
+                method,
+                "vap-guarded",
+                serde_json::json!({
+                    "name": format!("priv-{method}"), "image": "busybox",
+                    "securityContext": {"privileged": true}
+                }),
+            )
+            .await;
+            assert!(
+                status.is_client_error(),
+                "{method}: the VAP must reject a privileged ephemeral container, got {status}"
+            );
+        }
+        assert_eq!(stored_ephemeral_count(&store, &key).await, 0);
+
+        let ok = status_of(
+            debug_router(state.clone()),
+            "PATCH",
+            "vap-guarded",
+            serde_json::json!({"name": "benign", "image": "busybox"}),
+        )
+        .await;
+        assert_eq!(
+            ok,
+            StatusCode::OK,
+            "an unprivileged debug container must still be admitted"
+        );
     }
 }
 
