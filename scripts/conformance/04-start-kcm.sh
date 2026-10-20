@@ -140,6 +140,16 @@ if grep -qE "https://127\." "\$KUBECONFIG_FILE" && grep -q "host.lima.internal" 
   KUBECONFIG_FILE="\$TMPDIR_KCM/kubeconfig"
 fi
 
+# Delegated authn/authz is fatal at KCM start until the apiserver has published
+# kube-system/extension-apiserver-authentication; the supervisor's crash-burst
+# breaker (5 crashes) could give up on that race, so wait here instead.
+if command -v kubectl &>/dev/null; then
+  for _ in \$(seq 1 60); do
+    kubectl --kubeconfig="\$KUBECONFIG_FILE" -n kube-system get configmap extension-apiserver-authentication >/dev/null 2>&1 && break
+    sleep 2
+  done
+fi
+
 echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
 SUPERVISOR_LOG="/tmp/kcm-supervisor.log"
 chmod +x /tmp/kcm-supervisor.sh
@@ -148,11 +158,9 @@ chmod +x /tmp/kcm-supervisor.sh
 # node-route-controller / service-lb-controller from this exclusion list:
 # see scripts/install.sh's u7s-kcm.service for why -- mirrored here so the
 # conformance run exercises what ships.
-# --authorization-always-allow-paths below adds /metrics to the default
-# /healthz,/readyz,/livez allow-list. Without it, sample-run-metrics.sh's
-# unauthenticated curl to :10257/metrics gets a 403 -- confirmed: archived
-# kcm-metrics-*.prom snapshots hold a JSON Forbidden body, not Prometheus
-# text, so it's not just missing go_memstats, it's zero series of any kind.
+# --authentication-kubeconfig/--authorization-kubeconfig delegate authn/authz to the
+# apiserver (as install.sh does), so :10257/metrics needs a system:monitoring
+# token; /healthz,/readyz,/livez stay open by default.
 setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --kubeconfig="\$KUBECONFIG_FILE" \\
   --cluster-signing-cert-file="\$CA_CERT" \\
@@ -167,7 +175,8 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --leader-elect=false \\
   --bind-address=127.0.0.1 \\
   --kube-api-content-type=application/json \\
-  --authorization-always-allow-paths=/healthz,/readyz,/livez,/metrics \\
+  --authentication-kubeconfig="\$KUBECONFIG_FILE" \\
+  --authorization-kubeconfig="\$KUBECONFIG_FILE" \\
   \$KCM_V_FLAG \\
   > "\$SUPERVISOR_LOG" 2>&1 &
 

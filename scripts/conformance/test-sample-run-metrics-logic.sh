@@ -103,12 +103,18 @@ find_free_port() {
 STUBDIR="$TMPDIR_TEST/stubbin"
 mkdir -p "$STUBDIR"
 KUBECTL_STUB_STATE="$TMPDIR_TEST/kubectl-state"
-export KUBECTL_STUB_STATE
+TOKEN_STUB_STATE="$TMPDIR_TEST/token-state"
+export KUBECTL_STUB_STATE TOKEN_STUB_STATE
 cat > "$STUBDIR/kubectl" <<'STUB'
 #!/usr/bin/env bash
 if [ -f "$KUBECTL_STUB_STATE" ] && [ "$(cat "$KUBECTL_STUB_STATE")" = "down" ]; then
   echo "stub kubectl: connection refused (simulated apiserver down)" >&2
   exit 1
+fi
+if [[ "$*" == *"create token monitoring -n kube-system"* ]]; then
+  [ -f "$TOKEN_STUB_STATE" ] && [ "$(cat "$TOKEN_STUB_STATE")" = "denied" ] && exit 1
+  echo "stub-monitoring-token"
+  exit 0
 fi
 cat <<'EOF'
 # HELP u7s_watch_ring_occupancy stub
@@ -154,7 +160,15 @@ export LIMACTL_STUB_STATE
 cat > "$STUBDIR/limactl" <<STUB
 #!/usr/bin/env bash
 if [ "\$1" = "shell" ] && [[ "\$*" == *"curl"*"10257/metrics"* ]]; then
+  # KCM authorizes /metrics via the monitoring SA token, which the sampler must send
+  # as an Authorization header on stdin (curl -H @-); anything else is a 403, and
+  # real curl -f then exits non-zero.
+  hdr="\$(cat)"
   if [ -f "\$LIMACTL_STUB_STATE" ] && [ "\$(cat "\$LIMACTL_STUB_STATE")" = "up" ]; then
+    if [ "\$hdr" != "Authorization: Bearer stub-monitoring-token" ]; then
+      echo "stub limactl: 403 Forbidden (no/invalid bearer token)" >&2
+      exit 22
+    fi
     cat <<'EOF'
 # HELP go_goroutines stub
 # TYPE go_goroutines gauge
@@ -381,6 +395,20 @@ else
   echo "PASS: an unreachable KCM leaves no kcm-metrics file behind, same non-fatal contract as the apiserver scrape"
   PASS=$(( PASS + 1 ))
 fi
+
+# With RBAC-gated /metrics, a scrape without a minted monitoring token is a 403: it must
+# leave no file (a saved Forbidden body would pass for a snapshot) and must not abort.
+echo "up" > "$LIMACTL_STUB_STATE"
+echo "denied" > "$TOKEN_STUB_STATE"
+bash "$SCRIPT" snapshot --workdir "$WORKDIR6" --label notoken --vm fake-vm
+if [ -f "$WORKDIR6/kcm-metrics-03-notoken.prom" ]; then
+  echo "FAIL: no monitoring token must mean no kcm snapshot file (an unauthenticated scrape is a 403, not metrics)"
+  FAIL=$(( FAIL + 1 ))
+else
+  echo "PASS: when the monitoring token cannot be minted no kcm snapshot is written and the snapshot command still succeeds"
+  PASS=$(( PASS + 1 ))
+fi
+rm -f "$TOKEN_STUB_STATE"
 
 # ===========================================================================
 # 5. This whole file must run to completion on a PATH with no limactl
