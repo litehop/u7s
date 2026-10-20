@@ -21,6 +21,7 @@ mod csr_approver;
 mod field_manager;
 mod go_unicode;
 pub mod handlers;
+mod health;
 mod inflight;
 mod keys;
 mod limit_range;
@@ -825,38 +826,15 @@ fn record_manifest_apply_outcome(
     }
 }
 
-/// Reports the apiserver's own listener as up, but only once the boot-time bootstrap manifest
-/// apply (`state.boot_ready`, see its doc) has resolved successfully. Before that, requests
-/// return 503 rather than 200 — the previous behavior of always answering "ok" here is exactly
-/// what forced `scripts/install.sh`'s `wait_for_apiserver` to bolt on a fixed sleep-and-recheck
-/// to guess whether the manifest apply had finished; gating the response itself instead makes
-/// the first 200 a deterministic "boot is fully done" signal, so that heuristic is no longer
-/// needed.
-async fn healthz(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::response::Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    if state.boot_ready.load(std::sync::atomic::Ordering::Acquire) {
-        (StatusCode::OK, "ok").into_response()
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "boot-time manifest apply in progress",
-        )
-            .into_response()
-    }
-}
-
 fn build_router(state: AppState) -> Router {
     Router::new()
         // Health endpoints — authorized through system:public-info-viewer like upstream.
-        // /healthz alone gates on boot_ready (see healthz's doc) — /livez and /readyz stay
-        // unconditional "ok" so a slow boot-time manifest apply can't trip a liveness-probe
-        // restart loop.
-        .route("/healthz", get(healthz))
-        .route("/livez", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ok" }))
+        .route("/healthz", get(health::healthz))
+        .route("/healthz/{check}", get(health::healthz_check))
+        .route("/livez", get(health::livez))
+        .route("/livez/{check}", get(health::livez_check))
+        .route("/readyz", get(health::readyz))
+        .route("/readyz/{check}", get(health::readyz_check))
         // Prometheus text-exposition metrics — RBAC-gated like every other route, matching
         // upstream kube-apiserver where /metrics requires the same bearer-token auth as any
         // other endpoint. The bootstrap system:monitoring
@@ -9286,7 +9264,7 @@ mod tests {
     }
 
     /// `/healthz` must distinguish "boot-time manifest apply still running" from "boot
-    /// complete" — unlike `/livez`/`/readyz`, which stay unconditional "ok".
+    /// complete" (through the poststarthook checks, like `/livez`/`/readyz`).
     /// Before this gate, `/healthz` answered 200 the instant the listener came up, racing the
     /// boot-time `apply_well_known_manifest_dir` task; `scripts/install.sh`'s
     /// `wait_for_apiserver` could only paper over that with a fixed sleep-and-recheck. If this
@@ -9318,7 +9296,7 @@ mod tests {
         let resp = router.call(req).await.expect("router must not error");
         assert_eq!(
             resp.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
             "/healthz must not report 200 while the boot-time manifest apply is still running \
              — install.sh's wait loop needs this to distinguish a booting apiserver from one \
              that already crashed applying a bad manifest"
@@ -9346,6 +9324,60 @@ mod tests {
             b"ok",
             "/healthz body must be 'ok' once ready"
         );
+    }
+
+    /// The conformance spec "health handlers should contain necessary checks" requires these
+    /// exact lines from `?verbose=1`; a bare "ok" fails it, and `/<endpoint>/<check>` lets
+    /// operators probe one check.
+    #[tokio::test]
+    async fn health_endpoints_serve_verbose_checks_and_per_check_paths() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower_service::Service as _;
+
+        let state = state::AppState::new(
+            std::sync::Arc::new(make_store()),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+        let mut get = |uri: &'static str| {
+            let req = Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("request build must not fail");
+            router.call(req)
+        };
+        for (path, extra) in [
+            ("/healthz?verbose=1", None),
+            ("/livez?verbose=1", None),
+            ("/readyz?verbose=1", Some("[+]informer-sync ok")),
+        ] {
+            let resp = get(path).await.expect("router must not error");
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let body = to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+            let body = String::from_utf8(body.to_vec()).expect("utf8");
+            let lines: Vec<&str> = body.lines().collect();
+            for want in [
+                "[+]ping ok",
+                "[+]log ok",
+                "[+]etcd ok",
+                "[+]poststarthook/bootstrap-controller ok",
+                "[+]autoregister-completion ok",
+                "[+]poststarthook/storage-readiness ok",
+            ]
+            .into_iter()
+            .chain(extra)
+            {
+                assert!(lines.contains(&want), "{path} missing {want}: {body}");
+            }
+        }
+        let resp = get("/healthz/etcd").await.expect("router must not error");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get("/healthz/nope").await.expect("router must not error");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// A panic partway through one SIGHUP-triggered reload (e.g. a future bug in
