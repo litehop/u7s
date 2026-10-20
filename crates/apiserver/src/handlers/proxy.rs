@@ -368,7 +368,7 @@ pub async fn pod_log<S: Store>(
     let kubelet_url = resolve_log_target(&state, &raw_ns, &pod_name, &query).await?;
 
     // Proxy via reqwest using the shared kubelet client (built once at startup).
-    let client = state.kubelet_client.clone().ok_or_else(|| {
+    let client = state.kubelet_client.get().ok_or_else(|| {
         Status::service_unavailable("kubelet TLS unavailable: no cluster CA configured".to_string())
     })?;
 
@@ -583,6 +583,7 @@ pub async fn resolve_attach_target<S: Store>(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
+            .get()
             .as_deref()
             .map(|v| v.as_slice()),
     )
@@ -1093,6 +1094,7 @@ pub async fn resolve_exec_target<S: Store>(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
+            .get()
             .as_deref()
             .map(|v| v.as_slice()),
     )
@@ -1555,6 +1557,7 @@ pub(crate) async fn validate_portforward<S: Store>(
         cluster_ca_der: state.cluster_ca_der.as_deref().map(|v| v.to_vec()),
         client_identity_pem: state
             .kubelet_client_identity_pem
+            .get()
             .as_deref()
             .map(|v| v.to_vec()),
     })
@@ -2082,7 +2085,7 @@ pub async fn resolve_node_proxy_target<S: Store>(
         ))
     })?;
 
-    let client = state.kubelet_client.clone().ok_or_else(|| {
+    let client = state.kubelet_client.get().ok_or_else(|| {
         Status::service_unavailable("kubelet TLS unavailable: no cluster CA configured".to_string())
     })?;
 
@@ -2799,6 +2802,7 @@ async fn pod_proxy_dispatch<S: Store>(
             state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
             state
                 .kubelet_client_identity_pem
+                .get()
                 .as_deref()
                 .map(|v| v.as_slice()),
             is_https,
@@ -2841,6 +2845,7 @@ async fn pod_proxy_dispatch<S: Store>(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
+            .get()
             .as_deref()
             .map(|v| v.as_slice()),
         is_https,
@@ -3136,6 +3141,7 @@ async fn service_proxy_dispatch<S: Store>(
             state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
             state
                 .kubelet_client_identity_pem
+                .get()
                 .as_deref()
                 .map(|v| v.as_slice()),
             is_https,
@@ -3177,6 +3183,7 @@ async fn service_proxy_dispatch<S: Store>(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
+            .get()
             .as_deref()
             .map(|v| v.as_slice()),
         is_https,
@@ -7986,7 +7993,7 @@ mod tests {
             sa_public_key_pem: None,
         });
         assert!(
-            state.kubelet_client.is_some(),
+            state.kubelet_client.get().is_some(),
             "AppState built with a cluster CA must have kubelet_client=Some — \
              if it is None, pod_log and node_proxy will 503 on every request instead of \
              reusing the shared connection pool (the fix for per-request TLS churn)"

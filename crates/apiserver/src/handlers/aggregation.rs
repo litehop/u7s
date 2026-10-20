@@ -301,7 +301,7 @@ async fn build_backend_client<S: Store>(
         }
     }
 
-    if let Some(pem) = state.proxy_client_identity_pem.as_deref() {
+    if let Some(pem) = state.proxy_client_identity_pem.get().as_deref() {
         if let Ok(identity) = reqwest::Identity::from_pem(pem) {
             builder = builder.identity(identity);
         }

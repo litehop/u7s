@@ -40,6 +40,7 @@ mod quota;
 mod rbac;
 mod rbac_gen_adapter;
 mod resource_gen_adapter;
+mod rotation;
 mod sa_sig_cache;
 mod serve;
 mod service_alloc;
@@ -296,6 +297,28 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         &tls_material.bootstrap_installer_key_pem,
         "system:bootstrap-installer",
     )?;
+    let rotation_server_url = tls::kubeconfig_server(&args);
+    // Kubeconfigs that embed a rotating leaf, rewritten whenever that leaf is re-issued.
+    let rotating_kubeconfigs: Vec<(&'static str, String, &'static str)> = vec![
+        ("admin", args.kubeconfig.clone(), "admin"),
+        (
+            "kcm-client",
+            kcm_kubeconfig_path.to_string_lossy().into_owned(),
+            "system:kube-controller-manager",
+        ),
+        (
+            "scheduler-client",
+            scheduler_kubeconfig_path.to_string_lossy().into_owned(),
+            "system:kube-scheduler",
+        ),
+        (
+            "bootstrap-installer-client",
+            bootstrap_installer_kubeconfig_path
+                .to_string_lossy()
+                .into_owned(),
+            "system:bootstrap-installer",
+        ),
+    ];
 
     // 6. Load optional static token map.
     let token_map = match &args.token_auth_file {
@@ -402,7 +425,45 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         sa_public_key_pem,
     });
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
-    state.proxy_client_identity_pem = Some(Arc::new(proxy_client_identity_pem));
+    state
+        .proxy_client_identity_pem
+        .set(Some(Arc::new(proxy_client_identity_pem)));
+
+    // Re-issue each leaf before it expires and hand the new one to every in-memory holder of
+    // the old one. Components that read their kubeconfig once (KCM, scheduler) pick the
+    // rewritten file up on their next start.
+    let rotation_state = state.clone();
+    let rotation_ca_der = tls_material.ca_cert_der.clone();
+    tokio::spawn(Arc::clone(&tls_material.rotator).run(Arc::new(
+        move |name: &'static str, leaf: &rotation::Leaf| {
+            if let Some((_, path, user)) = rotating_kubeconfigs.iter().find(|(n, ..)| *n == name) {
+                if let Err(e) = tls::write_identity_kubeconfig(
+                    path,
+                    &rotation_server_url,
+                    &rotation_ca_der,
+                    &leaf.cert_der,
+                    &leaf.key_pem,
+                    user,
+                ) {
+                    tracing::error!("rewrite {path} after rotating {name}: {e:#}");
+                }
+            }
+            let mut identity_pem = tls::pem_encode("CERTIFICATE", &leaf.cert_der);
+            identity_pem.extend_from_slice(&leaf.key_pem);
+            match name {
+                "admin" => {
+                    if let Err(e) = rotation_state.set_webhook_identity(identity_pem) {
+                        tracing::error!("webhook client after rotating {name}: {e}");
+                    }
+                }
+                "kubelet-client" => rotation_state.set_kubelet_identity(identity_pem),
+                "proxy-client" => rotation_state
+                    .proxy_client_identity_pem
+                    .set(Some(Arc::new(identity_pem))),
+                _ => {}
+            }
+        },
+    )));
     state.node_kubelet_ports = parse_node_kubelet_ports(&args.node_kubelet_port)?;
     // Not ready until the boot-time manifest-apply task (12a below) resolves successfully —
     // see the field's own doc. Overwrites new_with_config's ready-by-default value.
@@ -4623,7 +4684,7 @@ fn configure_accepted_socket(stream: &TcpStream) {
 async fn serve_tls(
     listener: TcpListener,
     app: Router,
-    server_config: Arc<rustls::ServerConfig>,
+    server_config: pki::Swap<Arc<rustls::ServerConfig>>,
 ) -> anyhow::Result<()> {
     tracing::info!("listening on {}", listener.local_addr()?);
     serve::serve_tls_with(listener, app, server_config, serve::ServeLimits::default()).await

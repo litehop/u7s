@@ -190,10 +190,9 @@ fn accept_error_backoff(e: &std::io::Error) -> Duration {
 pub(crate) async fn serve_tls_with<L: AcceptTcp>(
     listener: L,
     app: Router,
-    server_config: Arc<rustls::ServerConfig>,
+    server_config: crate::pki::Swap<Arc<rustls::ServerConfig>>,
     limits: ServeLimits,
 ) -> anyhow::Result<()> {
-    let acceptor = TlsAcceptor::from(server_config);
     // Auto-negotiating builder: dispatches each connection to HTTP/1.1 or HTTP/2 by
     // peeking at the first bytes for the HTTP/2 connection preface. Clients that
     // saw h2 win ALPN (rustls ServerConfig.alpn_protocols in tls.rs) send that
@@ -247,7 +246,7 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
             }
         };
         crate::configure_accepted_socket(&tcp_stream);
-        let acceptor = acceptor.clone();
+        let acceptor = TlsAcceptor::from(server_config.get());
         let app = app.clone();
         let conn_builder = conn_builder.clone();
 
@@ -470,7 +469,12 @@ mod tests {
         tls: &TestTls,
         limits: ServeLimits,
     ) {
-        tokio::spawn(serve_tls_with(listener, app, tls.server.clone(), limits));
+        tokio::spawn(serve_tls_with(
+            listener,
+            app,
+            crate::pki::Swap::new(tls.server.clone()),
+            limits,
+        ));
     }
 
     async fn tls_connect(

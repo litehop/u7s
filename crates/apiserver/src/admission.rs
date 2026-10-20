@@ -588,7 +588,7 @@ enum WebhookTarget {
 
 type TargetRouting<'a> = (
     Option<&'a str>,
-    Option<&'a [u8]>,
+    Option<std::sync::Arc<Vec<u8>>>,
     Option<(&'a str, std::net::SocketAddr)>,
 );
 
@@ -608,7 +608,7 @@ impl WebhookTarget {
                 let proxy = state.konnectivity_proxy_addr.as_deref();
                 (
                     proxy,
-                    state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
+                    state.webhook_identity_pem.get(),
                     proxy.is_none().then_some((host.as_str(), *dial)),
                 )
             }
@@ -1235,9 +1235,9 @@ pub(crate) async fn prepare_webhook_call<S: Store>(
         config.ca_bundle.as_deref(),
         effective_proxy,
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-        effective_identity,
+        effective_identity.as_deref().map(|v| v.as_slice()),
         dial,
-        &state.webhook_client,
+        &state.webhook_client.get(),
         None,
     );
     let url = match target {
@@ -1477,9 +1477,9 @@ async fn invoke_mutating_webhook<S: Store>(
         webhook.client_config.ca_bundle.as_deref(),
         effective_proxy,
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-        effective_identity,
+        effective_identity.as_deref().map(|v| v.as_slice()),
         dial,
-        &state.webhook_client,
+        &state.webhook_client.get(),
         webhook.timeout_seconds,
     );
     let (response, timed_out) = call_webhook(
@@ -4233,9 +4233,9 @@ pub async fn run_validating_webhooks<S: Store>(
                 webhook.client_config.ca_bundle.as_deref(),
                 effective_proxy,
                 state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-                effective_identity,
+                effective_identity.as_deref().map(|v| v.as_slice()),
                 dial,
-                &state.webhook_client,
+                &state.webhook_client.get(),
                 webhook.timeout_seconds,
             );
             let (response, timed_out) = call_webhook(

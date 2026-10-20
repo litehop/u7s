@@ -1,7 +1,8 @@
 use crate::pki::{
-    cert_validity, CertInventory, CertRole, CertSpec, Pki, Signer, CLIENT_CERT_LIFETIME,
-    ROOT_CA_LIFETIME, SERVING_CERT_LIFETIME,
+    cert_validity, CertInventory, CertRole, CertSpec, Pki, Swap, CLIENT_CERT_LIFETIME,
+    RENEW_FRACTION, ROOT_CA_LIFETIME, SERVING_CERT_LIFETIME,
 };
+use crate::rotation::{CaKind, CaSigner, LeafPlan, Rotator, SERVING_LEAF};
 use rcgen::{CertificateParams, Issuer, KeyPair, SanType};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{
@@ -357,7 +358,11 @@ fn ca_key_matches_cert(key: &KeyPair, cert_der: &[u8]) -> anyhow::Result<()> {
 /// webpki verification the live server runs on every mTLS handshake. A Name-string
 /// comparison of Issuer vs. Subject would wrongly trust a different-key CA that happens to
 /// share a Subject CN; this checks the signature, not just the claimed name.
-fn leaf_cert_chain_validates(leaf_der: &[u8], ca_der: &[u8]) -> bool {
+pub(crate) fn leaf_cert_chain_validates_at(
+    leaf_der: &[u8],
+    ca_der: &[u8],
+    now: time::OffsetDateTime,
+) -> bool {
     let mut root_store = RootCertStore::empty();
     if root_store
         .add(CertificateDer::from(ca_der.to_vec()))
@@ -375,49 +380,66 @@ fn leaf_cert_chain_validates(leaf_der: &[u8], ca_der: &[u8]) -> bool {
         .verify_client_cert(
             &CertificateDer::from(leaf_der.to_vec()),
             &[],
-            UnixTime::now(),
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+                now.unix_timestamp().max(0) as u64
+            )),
         )
         .is_ok()
 }
 
-/// Load-or-generate the admin client cert+key (CN=admin, O=system:masters) embedded in
-/// the "admin" kubeconfig. kubelet.service authenticates as this SAME identity too
-/// (install.sh points both at $STATE_DIR/kubeconfig).
-///
-/// Persisted the same way as the CA (`load_or_generate_ca`): the CA surviving a restart is
-/// not enough on its own to keep `--kubeconfig`'s bytes stable — without this, every
-/// restart still mints a brand-new system:masters credential (new key, new signature,
-/// unconditionally overwritten into the kubeconfig file), with no way to revoke the
-/// previous one.
-fn load_or_generate_admin_cert(
-    pki: &Pki,
-    key_path: &std::path::Path,
-    cert_path: &std::path::Path,
-    ca_cert_der: &[u8],
-    signer: &Signer<'_>,
-) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let key_exists = key_path.exists();
-    let cert_exists = cert_path.exists();
-    let key_tmp = format!("{}.tmp", key_path.display());
-    let cert_tmp = format!("{}.tmp", cert_path.display());
+#[cfg(test)]
+fn leaf_cert_chain_validates(leaf_der: &[u8], ca_der: &[u8]) -> bool {
+    leaf_cert_chain_validates_at(leaf_der, ca_der, time::OffsetDateTime::now_utc())
+}
 
-    // Same crash-recovery rules as the CA: an interrupted first write (cert renamed, key
-    // not yet) is resumed only when the tmp key provably matches the cert.
-    let key_exists = if cert_exists
-        && !key_exists
+/// On-disk home of a persisted leaf (admin, KCM, scheduler): the files later consumers
+/// reference by path.
+#[derive(Clone, Debug)]
+pub(crate) struct LeafFiles {
+    pub cert: std::path::PathBuf,
+    pub key: std::path::PathBuf,
+}
+
+fn key_file_matches_cert_file(key_path: &std::path::Path, cert_path: &std::path::Path) -> bool {
+    let (Ok(key_pem), Ok(cert_der)) = (std::fs::read_to_string(key_path), std::fs::read(cert_path))
+    else {
+        return false;
+    };
+    KeyPair::from_pem(&key_pem).is_ok_and(|k| ca_key_matches_cert(&k, &cert_der).is_ok())
+}
+
+/// Read a persisted leaf, finishing an interrupted write first. Ok(None) when there is
+/// nothing to load (neither file present, or the pair no longer chains to the CA);
+/// partial or mismatched state is an error, never a silent re-mint.
+///
+/// A rotation renames the new cert in before the new key, so a crash between the renames
+/// leaves new cert + old key + key.tmp. When key.tmp provably belongs to the cert it is
+/// rolled forward; any other mismatch is refused.
+pub(crate) fn load_persisted_leaf(
+    label: &str,
+    files: &LeafFiles,
+    ca_cert_der: &[u8],
+    now: time::OffsetDateTime,
+) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let (key_path, cert_path) = (&files.key, &files.cert);
+    let key_tmp = format!("{}.tmp", key_path.display());
+    let mut key_exists = key_path.exists();
+    let cert_exists = cert_path.exists();
+
+    if cert_exists
+        && !(key_exists && key_file_matches_cert_file(key_path, cert_path))
         && roll_forward_key_tmp(
             &cert_path.to_string_lossy(),
             &key_tmp,
             &key_path.to_string_lossy(),
-        )? {
-        tracing::warn!("rolled forward interrupted admin key write {key_tmp}");
-        true
-    } else {
-        key_exists
-    };
+        )?
+    {
+        tracing::warn!("rolled forward interrupted {label} key write {key_tmp}");
+        key_exists = true;
+    }
 
-    // One file alone is a crashed or tampered state; deleting it would silently mint a new
-    // system:masters credential, so refuse and leave both files untouched.
+    // One file alone is a crashed or tampered state; replacing it would silently mint a new
+    // credential, so refuse and leave both files untouched.
     if key_exists != cert_exists {
         let (present, missing) = if key_exists {
             (key_path, cert_path)
@@ -425,88 +447,78 @@ fn load_or_generate_admin_cert(
             (cert_path, key_path)
         };
         anyhow::bail!(
-            "partial admin cert state: {} exists but {} is missing; refusing to regenerate. \
-             Restore {}, or delete {} to deliberately mint a new admin credential",
+            "partial {label} cert state: {} exists but {} is missing; refusing to regenerate. \
+             Restore {}, or delete {} to deliberately mint a new {label} credential",
             present.display(),
             missing.display(),
             missing.display(),
             present.display()
         );
     }
-
-    if key_path.exists() && cert_path.exists() {
-        let key_pem = std::fs::read_to_string(validate_cli_path(key_path)?)
-            .map_err(|e| anyhow::anyhow!("read admin key {}: {e}", key_path.display()))?;
-        // Parse only to fail loud on a corrupt file; the PEM bytes (not this KeyPair) are
-        // what TlsMaterial actually carries forward.
-        KeyPair::from_pem(&key_pem).map_err(|e| anyhow::anyhow!("parse admin key: {e}"))?;
-        let cert_der = std::fs::read(validate_cli_path(cert_path)?)
-            .map_err(|e| anyhow::anyhow!("read admin cert {}: {e}", cert_path.display()))?;
-
-        if leaf_cert_chain_validates(&cert_der, ca_cert_der) {
-            pki.record_loaded(&admin_spec(), &cert_der)?;
-            tracing::info!("loaded admin cert from {}", cert_path.display());
-            return Ok((cert_der, key_pem.into_bytes()));
-        }
-        // The on-disk admin cert does not chain-validate against the CA just loaded
-        // (e.g. ca.key/ca.crt were rotated independently, or -- observed only under test
-        // parallelism, where multiple processes race on the same relative default paths --
-        // a concurrent writer regenerated the CA after this admin cert was signed).
-        // Loading it anyway would hand out a chain that fails verification for every
-        // client that receives it. Discard and regenerate against the CA now in memory.
-        tracing::error!(
-            "admin cert at {} does not chain-validate against the CA now loaded from disk; \
-             discarding and regenerating",
-            cert_path.display()
-        );
-        std::fs::remove_file(key_path)
-            .map_err(|e| anyhow::anyhow!("remove stale admin key {}: {e}", key_path.display()))?;
-        std::fs::remove_file(cert_path)
-            .map_err(|e| anyhow::anyhow!("remove stale admin cert {}: {e}", cert_path.display()))?;
+    if !key_exists {
+        return Ok(None);
     }
 
-    let spec = admin_spec();
-    let issued = pki.issue(&spec, Some(signer))?;
-    let admin_cert_der = issued.cert.der().to_vec();
-    let admin_key_pem = issued.key.serialize_pem().into_bytes();
+    let key_pem = std::fs::read_to_string(validate_cli_path(key_path)?)
+        .map_err(|e| anyhow::anyhow!("read {label} key {}: {e}", key_path.display()))?;
+    let key = KeyPair::from_pem(&key_pem)
+        .map_err(|e| anyhow::anyhow!("parse {label} key {}: {e}", key_path.display()))?;
+    let cert_der = std::fs::read(validate_cli_path(cert_path)?)
+        .map_err(|e| anyhow::anyhow!("read {label} cert {}: {e}", cert_path.display()))?;
+    ca_key_matches_cert(&key, &cert_der).map_err(|e| {
+        anyhow::anyhow!(
+            "{label} key {} and cert {} do not belong together: {e}; restore the pair, or \
+             delete both files to deliberately mint a new {label} credential",
+            key_path.display(),
+            cert_path.display()
+        )
+    })?;
 
-    // Both files go to tmp names first, then cert, then key: a crash between the renames
-    // leaves cert + key.tmp, which the next boot resumes, or cert alone, which it refuses.
+    if !leaf_cert_chain_validates_at(&cert_der, ca_cert_der, now) {
+        // Signed by a CA that is no longer the one loaded, or already expired: the pair
+        // cannot authenticate against the current trust store.
+        tracing::error!(
+            "{label} cert at {} does not chain-validate against the CA now loaded from disk; \
+             replacing it",
+            cert_path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some((cert_der, key_pem.into_bytes())))
+}
+
+/// Write a leaf so every crash point restarts into a loadable state: both tmp files are
+/// fsynced first, then the cert is renamed and then the key. Dying between the renames
+/// leaves the new cert beside key.tmp, which `load_persisted_leaf` rolls forward; dying
+/// earlier leaves the previous pair untouched.
+pub(crate) fn persist_leaf(
+    label: &str,
+    files: &LeafFiles,
+    cert_der: &[u8],
+    key_pem: &[u8],
+) -> anyhow::Result<()> {
+    let (key_path, cert_path) = (&files.key, &files.cert);
+    let key_tmp = format!("{}.tmp", key_path.display());
+    let cert_tmp = format!("{}.tmp", cert_path.display());
     let io = |what: &str, p: &std::path::Path, e: std::io::Error| {
         anyhow::anyhow!("{what} {}: {e}", p.display())
     };
-    write_private_key(
-        validate_cli_path(std::path::Path::new(&key_tmp))?,
-        &admin_key_pem,
-    )
-    .map_err(|e| io("write admin key", key_path, e))?;
+    write_private_key(validate_cli_path(std::path::Path::new(&key_tmp))?, key_pem)
+        .map_err(|e| io(&format!("write {label} key"), key_path, e))?;
     write_synced(
         validate_cli_path(std::path::Path::new(&cert_tmp))?,
-        &admin_cert_der,
+        cert_der,
     )
-    .map_err(|e| io("write admin cert", cert_path, e))?;
-    std::fs::rename(&cert_tmp, cert_path).map_err(|e| io("rename admin cert", cert_path, e))?;
+    .map_err(|e| io(&format!("write {label} cert"), cert_path, e))?;
+    std::fs::rename(&cert_tmp, cert_path)
+        .map_err(|e| io(&format!("rename {label} cert"), cert_path, e))?;
     sync_parent_dir(&cert_path.to_string_lossy())
-        .map_err(|e| io("fsync admin cert dir", cert_path, e))?;
-    std::fs::rename(&key_tmp, key_path).map_err(|e| io("rename admin key", key_path, e))?;
+        .map_err(|e| io(&format!("fsync {label} cert dir"), cert_path, e))?;
+    std::fs::rename(&key_tmp, key_path)
+        .map_err(|e| io(&format!("rename {label} key"), key_path, e))?;
     sync_parent_dir(&key_path.to_string_lossy())
-        .map_err(|e| io("fsync admin key dir", key_path, e))?;
-    tracing::info!("generated new admin cert → {}", cert_path.display());
-
-    Ok((admin_cert_der, admin_key_pem))
-}
-
-fn admin_spec() -> CertSpec<'static> {
-    CertSpec {
-        name: "admin",
-        common_name: "admin",
-        // O=system:masters bypasses RBAC.
-        organization: Some("system:masters"),
-        role: CertRole::Leaf,
-        lifetime: CLIENT_CERT_LIFETIME,
-        usages: &["client auth"],
-        sans: vec![],
-    }
+        .map_err(|e| io(&format!("fsync {label} key dir"), key_path, e))?;
+    Ok(())
 }
 
 pub struct TlsMaterial {
@@ -557,11 +569,15 @@ pub struct TlsMaterial {
     pub proxy_client_cert_pem: Vec<u8>,
     /// PEM-encoded proxy-client private key, paired with `proxy_client_cert_pem`.
     pub proxy_client_key_pem: Vec<u8>,
-    /// Configured rustls ServerConfig for the axum server.
-    pub server_config: Arc<ServerConfig>,
+    /// rustls ServerConfig for the axum server, replaced on every serving-cert rotation and
+    /// client-CA change; the accept loop loads it once per connection.
+    pub server_config: Swap<Arc<ServerConfig>>,
     /// Every cert issued or loaded for this process, with its validity window.
     #[cfg_attr(not(test), allow(dead_code))]
     pub inventory: CertInventory,
+    /// Re-issues every apiserver-owned leaf before it expires. The fields above are the
+    /// leaves as of startup; consumers learn of later ones through the rotator.
+    pub rotator: Arc<Rotator>,
 }
 
 /// Split an advertise address ("https://host:6443", "[fd00::1]:6443", "myhost") into its
@@ -634,163 +650,23 @@ fn build_server_sans(
     Ok(sans)
 }
 
-fn client_spec<'a>(
-    name: &'static str,
-    common_name: &'a str,
-    organization: Option<&'a str>,
-) -> CertSpec<'a> {
-    CertSpec {
-        name,
-        common_name,
-        organization,
-        role: CertRole::Leaf,
-        lifetime: CLIENT_CERT_LIFETIME,
-        usages: &["client auth"],
-        sans: vec![],
-    }
-}
-
-pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
-    generate_tls_with(args, &Pki::default())
-}
-
-fn generate_tls_with(args: &Args, pki: &Pki) -> anyhow::Result<TlsMaterial> {
-    // Install the ML-KEM-768 hybrid post-quantum crypto provider.
-    // `.ok()` makes this idempotent: a second call (e.g. in tests) is a no-op.
-    rustls_post_quantum::provider().install_default().ok();
-
-    // --- CA: load-or-generate ---
-    // If both ca.key (PEM) and ca.crt (DER) exist on disk, load them so the CA
-    // stays stable across restarts. If either is missing, generate fresh and write.
-    // ca_cert_der is the original DER bytes — stable across restarts.
-    // ca_params is used to construct an Issuer for signing leaf certs (rcgen 0.14 API).
-    let (ca_key, ca_params, ca_cert_der) =
-        load_or_generate_ca(pki, "ca", &args.ca_key, &args.ca_cert)?;
-    // Build an Issuer from the CA params and key for signing leaf certificates.
-    let ca_issuer = Issuer::new(ca_params, ca_key);
-    let ca_signer = Signer {
-        issuer: &ca_issuer,
-        not_after: cert_validity(&ca_cert_der)?.1,
-    };
-
-    // --- Server cert ---
-    // Always include localhost / 127.0.0.1 and the lima VM-to-host alias,
-    // plus the advertise-address host if provided.
-    let sans = build_server_sans(
-        advertise_host(args.advertise_address.as_deref())?.as_deref(),
-        &args.service_cluster_ip_range,
-    )?;
-    let server = pki.issue(
-        &CertSpec {
-            name: "apiserver-serving",
-            common_name: "u7s-apiserver",
-            organization: None,
-            role: CertRole::Leaf,
-            lifetime: SERVING_CERT_LIFETIME,
-            usages: &["server auth"],
-            sans,
-        },
-        Some(&ca_signer),
-    )?;
-    let (server_key, server_cert) = (server.key, server.cert);
-
-    // --- Admin client cert: load-or-generate, persisted alongside the CA -----------------
-    // Sibling files next to ca.key/ca.crt rather than new CLI flags -- see
-    // load_or_generate_admin_cert's doc for why persisting this (not just the CA) matters.
-    let admin_key_path = std::path::Path::new(&args.ca_key).with_file_name("admin.key");
-    let admin_cert_path = std::path::Path::new(&args.ca_cert).with_file_name("admin.crt");
-    let (admin_cert_der, admin_key_pem) = load_or_generate_admin_cert(
-        pki,
-        &admin_key_path,
-        &admin_cert_path,
-        &ca_cert_der,
-        &ca_signer,
-    )?;
-
-    // --- Kubelet client cert ---
-    // Kubelet's --client-ca-file trusts our cluster CA, and kubelet accepts clients
-    // from the system:masters organization as trusted. CN and O must match exactly
-    // what real kube-apiserver uses so kubelet authorizes the proxy requests.
-    let kubelet_client = pki.issue(
-        &client_spec(
-            "kubelet-client",
-            "kube-apiserver-kubelet-client",
-            Some("system:masters"),
-        ),
-        Some(&ca_signer),
-    )?;
-    let (kubelet_client_key, kubelet_client_cert) = (kubelet_client.key, kubelet_client.cert);
-
-    // --- KCM client cert ---
-    // Real kubeadm gives kube-controller-manager a dedicated x509 identity, not a share
-    // of admin/system:masters. No O= — the seeded ClusterRoleBinding
-    // system:kube-controller-manager (see seed_rbac()) binds by username (kind: User),
-    // so group membership is irrelevant here.
-    let kcm = pki.issue(
-        &client_spec("kcm-client", "system:kube-controller-manager", None),
-        Some(&ca_signer),
-    )?;
-    let (kcm_key, kcm_cert) = (kcm.key, kcm.cert);
-
-    // --- Scheduler client cert ---
-    let scheduler = pki.issue(
-        &client_spec("scheduler-client", "system:kube-scheduler", None),
-        Some(&ca_signer),
-    )?;
-    let (scheduler_key, scheduler_cert) = (scheduler.key, scheduler.cert);
-
-    // --- Bootstrap-installer client cert ---
-    // Identity for the in-process YAML applier (a later bead) that server-side-applies
-    // bootstrap manifest bundles (e.g. CoreDNS) against the just-bound apiserver. No O= —
-    // the seeded ClusterRoleBinding system:bootstrap-installer (see seed_rbac()) binds by
-    // username, same as KCM/scheduler above.
-    let bootstrap_installer = pki.issue(
-        &client_spec(
-            "bootstrap-installer-client",
-            "system:bootstrap-installer",
-            None,
-        ),
-        Some(&ca_signer),
-    )?;
-    let (bootstrap_installer_key, bootstrap_installer_cert) =
-        (bootstrap_installer.key, bootstrap_installer.cert);
-
-    // --- Dedicated front-proxy CA: load-or-generate ---
-    // A CA distinct from the main cluster CA above -- see `TlsMaterial::proxy_client_cert_pem`'s
-    // doc for why a dedicated CA (not just a dedicated leaf cert under the shared CA, like
-    // KCM/scheduler/kubelet-client above) matters here: it's what an aggregated backend
-    // trusts via requestheader-client-ca-file, so only a leaf THIS CA signed can assert
-    // X-Remote-User/-Group identity, regardless of what other certs the cluster CA has signed.
-    let (proxy_client_ca_key, proxy_client_ca_params, proxy_client_ca_cert_der) =
-        load_or_generate_ca(
-            pki,
-            "front-proxy-ca",
-            &args.proxy_client_ca_key,
-            &args.proxy_client_ca_cert,
-        )?;
-    let proxy_client_ca_issuer = Issuer::new(proxy_client_ca_params, proxy_client_ca_key);
-    let proxy_client_ca_signer = Signer {
-        issuer: &proxy_client_ca_issuer,
-        not_after: cert_validity(&proxy_client_ca_cert_der)?.1,
-    };
-
-    // --- Proxy-client cert ---
-    // CN follows kubeadm's own "front-proxy-client" convention. Presented to aggregated
-    // backends only (see doc); no O= is needed since the backend's own RBAC/authorization
-    // config never sees this cert's Subject, only the X-Remote-User/-Group headers it vouches for.
-    let proxy_client = pki.issue(
-        &client_spec("proxy-client", "front-proxy-client", None),
-        Some(&proxy_client_ca_signer),
-    )?;
-    let (proxy_client_key, proxy_client_cert) = (proxy_client.key, proxy_client.cert);
-
-    // --- Build rustls ServerConfig ---
+/// Serving config presenting only the leaf (see the comment at its call: the CA is already
+/// in every client's trust store) and verifying optional client certs against
+/// `client_ca_ders`. Rebuilt and swapped, never mutated, so a connection keeps the config
+/// it was accepted with.
+pub(crate) fn build_server_config(
+    server_cert_der: &[u8],
+    server_key_pem: &[u8],
+    client_ca_ders: &[Vec<u8>],
+) -> anyhow::Result<Arc<ServerConfig>> {
     // Present only the leaf cert in the chain. The CA cert is already in the
     // kubelet's trust store (via kubeconfig certificate-authority-data). Including
     // the self-signed CA as an intermediate causes Go's TLS verifier to reject the
     // chain on full re-handshake (after session cache expiry): it sees a chain where
     // intermediate == trust anchor, which is invalid per RFC 5246 chain validation.
-    let server_cert_chain = vec![CertificateDer::from(server_cert.der().to_vec())];
+    let server_cert_chain = vec![CertificateDer::from(server_cert_der.to_vec())];
+    let server_key = KeyPair::from_pem(&String::from_utf8_lossy(server_key_pem))
+        .map_err(|e| anyhow::anyhow!("serving key: {e}"))?;
     let server_key_der = PrivateKeyDer::try_from(server_key.serialize_der())
         .map_err(|e| anyhow::anyhow!("key error: {e}"))?;
 
@@ -798,7 +674,9 @@ fn generate_tls_with(args: &Args, pki: &Pki) -> anyhow::Result<TlsMaterial> {
     // Clients that present a cert signed by our CA will be authenticated via x509.
     // Clients without a cert fall through to other auth mechanisms (tokens, anonymous).
     let mut root_store = RootCertStore::empty();
-    root_store.add(CertificateDer::from(ca_cert_der.clone()))?;
+    for der in client_ca_ders {
+        root_store.add(CertificateDer::from(der.clone()))?;
+    }
     if root_store.is_empty() {
         // If no CA cert was loaded, rustls will reject all client certs silently.
         // This would disable x509 authentication entirely. Fail at startup rather than
@@ -820,34 +698,191 @@ fn generate_tls_with(args: &Args, pki: &Pki) -> anyhow::Result<TlsMaterial> {
     // stays as fallback because exec/attach/portforward's `Connection: Upgrade`
     // websocket handshake has no HTTP/2 equivalent wired up in serve_tls().
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(server_config))
+}
 
-    let server_cert_der = server_cert.der().to_vec();
-    let admin_cert_pem = pem_encode("CERTIFICATE", &admin_cert_der);
-    let kubelet_client_cert_der = kubelet_client_cert.der().to_vec();
-    let kubelet_client_cert_pem = pem_encode("CERTIFICATE", &kubelet_client_cert_der);
-    let kcm_cert_der = kcm_cert.der().to_vec();
-    let scheduler_cert_der = scheduler_cert.der().to_vec();
-    let bootstrap_installer_cert_der = bootstrap_installer_cert.der().to_vec();
-    let proxy_client_cert_der = proxy_client_cert.der().to_vec();
-    let proxy_client_cert_pem = pem_encode("CERTIFICATE", &proxy_client_cert_der);
+pub(crate) fn client_plan(
+    name: &'static str,
+    common_name: &'static str,
+    organization: Option<&'static str>,
+    ca: CaKind,
+    files: Option<LeafFiles>,
+) -> LeafPlan {
+    LeafPlan {
+        name,
+        common_name,
+        organization,
+        lifetime: CLIENT_CERT_LIFETIME,
+        usages: &["client auth"],
+        sans: vec![],
+        ca,
+        files,
+    }
+}
+
+pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
+    generate_tls_with(args, &Pki::default(), SERVING_CERT_LIFETIME, RENEW_FRACTION)
+}
+
+fn generate_tls_with(
+    args: &Args,
+    pki: &Pki,
+    serving_lifetime: std::time::Duration,
+    renew_fraction: f64,
+) -> anyhow::Result<TlsMaterial> {
+    // Install the ML-KEM-768 hybrid post-quantum crypto provider.
+    // `.ok()` makes this idempotent: a second call (e.g. in tests) is a no-op.
+    rustls_post_quantum::provider().install_default().ok();
+
+    // --- CAs: load-or-generate ---
+    // If both ca.key (PEM) and ca.crt (DER) exist on disk, load them so the CA
+    // stays stable across restarts. If either is missing, generate fresh and write.
+    // ca_cert_der is the original DER bytes — stable across restarts.
+    // ca_params is used to construct an Issuer for signing leaf certs (rcgen 0.14 API).
+    let (ca_key, ca_params, ca_cert_der) =
+        load_or_generate_ca(pki, "ca", &args.ca_key, &args.ca_cert)?;
+    let cluster_ca = CaSigner {
+        not_after: cert_validity(&ca_cert_der)?.1,
+        issuer: Issuer::new(ca_params, ca_key),
+        cert_der: ca_cert_der.clone(),
+    };
+
+    // Dedicated front-proxy CA, distinct from the main cluster CA -- see
+    // `TlsMaterial::proxy_client_cert_pem`'s doc for why a dedicated CA (not just a dedicated
+    // leaf cert under the shared CA) matters: it's what an aggregated backend trusts via
+    // requestheader-client-ca-file, so only a leaf THIS CA signed can assert
+    // X-Remote-User/-Group identity, regardless of what other certs the cluster CA has signed.
+    let (proxy_client_ca_key, proxy_client_ca_params, proxy_client_ca_cert_der) =
+        load_or_generate_ca(
+            pki,
+            "front-proxy-ca",
+            &args.proxy_client_ca_key,
+            &args.proxy_client_ca_cert,
+        )?;
+    let front_proxy_ca = CaSigner {
+        not_after: cert_validity(&proxy_client_ca_cert_der)?.1,
+        issuer: Issuer::new(proxy_client_ca_params, proxy_client_ca_key),
+        cert_der: proxy_client_ca_cert_der,
+    };
+
+    // Persisted leaves sit next to ca.key/ca.crt rather than behind new CLI flags.
+    let files = |stem: &str| LeafFiles {
+        cert: std::path::Path::new(&args.ca_cert).with_file_name(format!("{stem}.crt")),
+        key: std::path::Path::new(&args.ca_cert).with_file_name(format!("{stem}.key")),
+    };
+
+    // Always include localhost / 127.0.0.1 and the lima VM-to-host alias,
+    // plus the advertise-address host if provided.
+    let sans = build_server_sans(
+        advertise_host(args.advertise_address.as_deref())?.as_deref(),
+        &args.service_cluster_ip_range,
+    )?;
+    let plans = vec![
+        LeafPlan {
+            name: SERVING_LEAF,
+            common_name: "u7s-apiserver",
+            organization: None,
+            lifetime: serving_lifetime,
+            usages: &["server auth"],
+            sans,
+            ca: CaKind::Cluster,
+            files: None,
+        },
+        // CN=admin, O=system:masters (bypasses RBAC), embedded in the "admin" kubeconfig.
+        // kubelet.service authenticates as this SAME identity too (install.sh points both
+        // at $STATE_DIR/kubeconfig). Persisted so a restart does not mint a new, never
+        // revoked system:masters credential every time.
+        client_plan(
+            "admin",
+            "admin",
+            Some("system:masters"),
+            CaKind::Cluster,
+            Some(files("admin")),
+        ),
+        // Kubelet's --client-ca-file trusts our cluster CA, and kubelet accepts clients
+        // from the system:masters organization as trusted. CN and O must match exactly
+        // what real kube-apiserver uses so kubelet authorizes the proxy requests.
+        client_plan(
+            "kubelet-client",
+            "kube-apiserver-kubelet-client",
+            Some("system:masters"),
+            CaKind::Cluster,
+            None,
+        ),
+        // Real kubeadm gives kube-controller-manager a dedicated x509 identity, not a share
+        // of admin/system:masters. No O= — the seeded ClusterRoleBinding
+        // system:kube-controller-manager (see seed_rbac()) binds by username (kind: User),
+        // so group membership is irrelevant here.
+        client_plan(
+            "kcm-client",
+            "system:kube-controller-manager",
+            None,
+            CaKind::Cluster,
+            Some(files("kcm")),
+        ),
+        client_plan(
+            "scheduler-client",
+            "system:kube-scheduler",
+            None,
+            CaKind::Cluster,
+            Some(files("scheduler")),
+        ),
+        // Identity for the in-process YAML applier that server-side-applies bootstrap
+        // manifest bundles (e.g. CoreDNS) against the just-bound apiserver. No O= — the
+        // seeded ClusterRoleBinding system:bootstrap-installer (see seed_rbac()) binds by
+        // username, same as KCM/scheduler above.
+        client_plan(
+            "bootstrap-installer-client",
+            "system:bootstrap-installer",
+            None,
+            CaKind::Cluster,
+            None,
+        ),
+        // CN follows kubeadm's own "front-proxy-client" convention. Presented to aggregated
+        // backends only (see doc); no O= is needed since the backend's own RBAC/authorization
+        // config never sees this cert's Subject, only the X-Remote-User/-Group headers it vouches for.
+        client_plan(
+            "proxy-client",
+            "front-proxy-client",
+            None,
+            CaKind::FrontProxy,
+            None,
+        ),
+    ];
+    let rotator = Rotator::new(
+        pki.clone(),
+        renew_fraction,
+        cluster_ca,
+        front_proxy_ca,
+        plans,
+    )?;
+
+    let leaf = |name: &str| rotator.leaf(name);
+    let admin = leaf("admin");
+    let kubelet_client = leaf("kubelet-client");
+    let kcm = leaf("kcm-client");
+    let scheduler = leaf("scheduler-client");
+    let bootstrap_installer = leaf("bootstrap-installer-client");
+    let proxy_client = leaf("proxy-client");
     Ok(TlsMaterial {
         ca_cert_der,
-        server_cert_der,
-        admin_cert_der,
-        admin_cert_pem,
-        admin_key_pem,
-        kubelet_client_cert_pem,
-        kubelet_client_key_pem: kubelet_client_key.serialize_pem().into_bytes(),
-        kcm_cert_der,
-        kcm_key_pem: kcm_key.serialize_pem().into_bytes(),
-        scheduler_cert_der,
-        scheduler_key_pem: scheduler_key.serialize_pem().into_bytes(),
-        bootstrap_installer_cert_der,
-        bootstrap_installer_key_pem: bootstrap_installer_key.serialize_pem().into_bytes(),
-        proxy_client_cert_pem,
-        proxy_client_key_pem: proxy_client_key.serialize_pem().into_bytes(),
-        server_config: Arc::new(server_config),
+        server_cert_der: leaf(SERVING_LEAF).cert_der,
+        admin_cert_pem: pem_encode("CERTIFICATE", &admin.cert_der),
+        admin_cert_der: admin.cert_der,
+        admin_key_pem: admin.key_pem,
+        kubelet_client_cert_pem: pem_encode("CERTIFICATE", &kubelet_client.cert_der),
+        kubelet_client_key_pem: kubelet_client.key_pem,
+        kcm_cert_der: kcm.cert_der,
+        kcm_key_pem: kcm.key_pem,
+        scheduler_cert_der: scheduler.cert_der,
+        scheduler_key_pem: scheduler.key_pem,
+        bootstrap_installer_cert_der: bootstrap_installer.cert_der,
+        bootstrap_installer_key_pem: bootstrap_installer.key_pem,
+        proxy_client_cert_pem: pem_encode("CERTIFICATE", &proxy_client.cert_der),
+        proxy_client_key_pem: proxy_client.key_pem,
+        server_config: rotator.server_config(),
         inventory: pki.inventory.clone(),
+        rotator: Arc::new(rotator),
     })
 }
 
@@ -881,10 +916,11 @@ struct Kubeconfig {
 }
 
 impl Kubeconfig {
+    #[cfg(test)]
     fn new(server: &str, tls: &TlsMaterial) -> Self {
         Self::for_identity(
             server,
-            tls,
+            &tls.ca_cert_der,
             &tls.admin_cert_der,
             &tls.admin_key_pem,
             "admin",
@@ -895,7 +931,7 @@ impl Kubeconfig {
     /// embedding `cert_der`/`key_pem` under `username` instead of the admin cert.
     fn for_identity(
         server: &str,
-        tls: &TlsMaterial,
+        ca_cert_der: &[u8],
         cert_der: &[u8],
         key_pem: &[u8],
         username: &str,
@@ -903,7 +939,7 @@ impl Kubeconfig {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
         // kubeconfig fields expect base64(PEM), not base64(DER).
-        let ca_pem = pem_encode("CERTIFICATE", &tls.ca_cert_der);
+        let ca_pem = pem_encode("CERTIFICATE", ca_cert_der);
         let cert_pem = pem_encode("CERTIFICATE", cert_der);
         Kubeconfig {
             server: server.to_owned(),
@@ -959,18 +995,21 @@ fn kubeconfig_server_url(args: &Args) -> &str {
 /// The kubeconfig contains embedded client certificate and private key material,
 /// so it is written with mode 0o600 (owner read+write only), matching the same
 /// permission applied to the SA and CA key files by `write_private_key`.
+///
+/// The file is replaced by rename, so a reader never sees a half-written kubeconfig.
 pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, args: &Args) -> anyhow::Result<()> {
     // Use the advertise-address (or listen address) as the server URL so that
     // parallel workers running on non-default loopback IPs (127.0.0.2, etc.)
     // get a kubeconfig that points at their own apiserver.
     // lima-start.sh rewrites any 127.x address to host.lima.internal when copying into the VM.
-    let kc = Kubeconfig::new(kubeconfig_server_url(args), tls);
-    write_private_key(
-        validate_cli_path(std::path::Path::new(path))?,
-        kc.to_yaml().as_bytes(),
-    )?;
-    tracing::info!("kubeconfig written to {path}");
-    Ok(())
+    write_identity_kubeconfig(
+        path,
+        kubeconfig_server_url(args),
+        &tls.ca_cert_der,
+        &tls.admin_cert_der,
+        &tls.admin_key_pem,
+        "admin",
+    )
 }
 
 /// Write a kubeconfig for a dedicated component identity (KCM, scheduler) rather than the
@@ -986,17 +1025,36 @@ pub fn write_component_kubeconfig(
     key_pem: &[u8],
     username: &str,
 ) -> anyhow::Result<()> {
-    let kc = Kubeconfig::for_identity(
+    write_identity_kubeconfig(
+        path,
         kubeconfig_server_url(args),
-        tls,
+        &tls.ca_cert_der,
         cert_der,
         key_pem,
         username,
-    );
+    )
+}
+
+pub(crate) fn kubeconfig_server(args: &Args) -> String {
+    kubeconfig_server_url(args).to_owned()
+}
+
+pub(crate) fn write_identity_kubeconfig(
+    path: &str,
+    server: &str,
+    ca_cert_der: &[u8],
+    cert_der: &[u8],
+    key_pem: &[u8],
+    username: &str,
+) -> anyhow::Result<()> {
+    let kc = Kubeconfig::for_identity(server, ca_cert_der, cert_der, key_pem, username);
+    let tmp = format!("{path}.tmp");
     write_private_key(
-        validate_cli_path(std::path::Path::new(path))?,
+        validate_cli_path(std::path::Path::new(&tmp))?,
         kc.to_yaml().as_bytes(),
     )?;
+    std::fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("rename {tmp} -> {path}: {e}"))?;
+    sync_parent_dir(path).map_err(|e| anyhow::anyhow!("fsync dir of {path}: {e}"))?;
     tracing::info!("kubeconfig written to {path} (user={username})");
     Ok(())
 }
@@ -1004,6 +1062,7 @@ pub fn write_component_kubeconfig(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pki::Signer;
 
     /// Return a unique temp directory for a test, creating it on disk.
     /// Uses subsecond nanos + thread ID for uniqueness across parallel tests.
@@ -1364,12 +1423,8 @@ mod tests {
     #[test]
     fn admin_cert_from_a_different_ca_is_discarded_and_regenerated() {
         let dir = test_temp_dir("admin-cert-ca-mismatch");
-        let ca_key_path = dir.join("ca.key").to_string_lossy().into_owned();
-        let ca_cert_path = dir.join("ca.crt").to_string_lossy().into_owned();
-        let (real_ca_key, real_ca_params, real_ca_cert_der) =
-            load_or_generate_ca(&Pki::default(), "ca", &ca_key_path, &ca_cert_path)
-                .expect("generate real CA");
-        let real_ca_issuer = Issuer::new(real_ca_params, real_ca_key);
+        let args = args_in(&dir);
+        let first = generate_tls(&args).expect("first boot");
 
         // A DIFFERENT, unrelated CA signs the "stale" admin cert.
         let other_ca_key = KeyPair::generate().expect("generate other CA key");
@@ -1379,7 +1434,6 @@ mod tests {
             .distinguished_name
             .push(rcgen::DnType::CommonName, "some-other-ca");
         let other_ca_issuer = Issuer::new(other_ca_params, other_ca_key);
-
         let stale_admin_key = KeyPair::generate().expect("generate stale admin key");
         let mut stale_admin_params = CertificateParams::default();
         stale_admin_params
@@ -1388,33 +1442,133 @@ mod tests {
         let stale_admin_cert = stale_admin_params
             .signed_by(&stale_admin_key, &other_ca_issuer)
             .expect("sign stale admin cert");
-
-        let admin_key_path = dir.join("admin.key");
-        let admin_cert_path = dir.join("admin.crt");
-        write_private_key(&admin_key_path, stale_admin_key.serialize_pem().as_bytes())
-            .expect("write stale admin key");
-        std::fs::write(&admin_cert_path, stale_admin_cert.der()).expect("write stale admin cert");
-
-        let real_signer = Signer {
-            issuer: &real_ca_issuer,
-            not_after: cert_validity(&real_ca_cert_der).unwrap().1,
-        };
-        let (admin_cert_der, _admin_key_pem) = load_or_generate_admin_cert(
-            &Pki::default(),
-            &admin_key_path,
-            &admin_cert_path,
-            &real_ca_cert_der,
-            &real_signer,
+        write_private_key(
+            dir.join("admin.key"),
+            stale_admin_key.serialize_pem().as_bytes(),
         )
-        .expect("load_or_generate_admin_cert must recover, not fail");
+        .expect("write stale admin key");
+        std::fs::write(dir.join("admin.crt"), stale_admin_cert.der())
+            .expect("write stale admin cert");
 
+        let second = generate_tls(&args).expect("a stale admin pair must be replaced, not fatal");
+        assert_ne!(second.admin_cert_der, stale_admin_cert.der().to_vec());
+        assert_ne!(second.admin_cert_der, first.admin_cert_der);
         assert!(
-            leaf_cert_chain_validates(&admin_cert_der, &real_ca_cert_der),
+            leaf_cert_chain_validates(&second.admin_cert_der, &second.ca_cert_der),
             "a stale admin cert issued by a DIFFERENT CA must be discarded and replaced \
              with one actually issued by the CA now loaded from disk, or kubectl gets a \
              chain that fails real TLS validation"
         );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
 
+    fn args_in(dir: &std::path::Path) -> Args {
+        let join = |f: &str| dir.join(f).to_string_lossy().into_owned();
+        Args {
+            ca_key: join("ca.key"),
+            ca_cert: join("ca.crt"),
+            proxy_client_ca_key: join("proxy-client-ca.key"),
+            proxy_client_ca_cert: join("proxy-client-ca.crt"),
+            ..args_with(None)
+        }
+    }
+
+    fn pki_at(offset: std::time::Duration) -> Pki {
+        Pki {
+            clock: crate::pki::Clock::new(move || time::OffsetDateTime::now_utc() + offset),
+            ..Pki::default()
+        }
+    }
+
+    const DAY: std::time::Duration = std::time::Duration::from_secs(86400);
+
+    /// A restart must not keep handing out an admin kubeconfig that is about to expire:
+    /// past 2/3 of the year it is replaced, before that it is stable.
+    #[test]
+    fn persisted_admin_cert_is_reissued_at_startup_only_once_past_two_thirds() {
+        let dir = test_temp_dir("admin-due-at-startup");
+        let args = args_in(&dir);
+        let first = generate_tls(&args).expect("first boot");
+
+        let early = generate_tls_with(
+            &args,
+            &pki_at(200 * DAY),
+            SERVING_CERT_LIFETIME,
+            RENEW_FRACTION,
+        )
+        .expect("restart at day 200");
+        assert_eq!(
+            early.admin_cert_der, first.admin_cert_der,
+            "day 200 is before 2/3 of a year: churning the credential on every restart is a regression"
+        );
+
+        let late = generate_tls_with(
+            &args,
+            &pki_at(250 * DAY),
+            SERVING_CERT_LIFETIME,
+            RENEW_FRACTION,
+        )
+        .expect("restart at day 250");
+        assert_ne!(
+            late.admin_cert_der, first.admin_cert_der,
+            "day 250 is past 2/3 of a year: reloading the old admin cert would let it expire in the kubeconfig"
+        );
+        let on_disk = std::fs::read(dir.join("admin.crt")).unwrap();
+        assert_eq!(
+            on_disk, late.admin_cert_der,
+            "the new cert must be persisted"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Admin certs minted before lifetimes existed are valid 1975..4096, so a 2/3 rule
+    /// alone would never renew them.
+    #[test]
+    fn legacy_admin_cert_with_1975_to_4096_validity_is_reissued_at_startup() {
+        let dir = test_temp_dir("admin-legacy");
+        let args = args_in(&dir);
+        let first = generate_tls(&args).expect("first boot");
+
+        let (ca_key, ca_params, _) =
+            load_or_generate_ca(&Pki::default(), "ca", &args.ca_key, &args.ca_cert)
+                .expect("reload CA");
+        let ca_issuer = Issuer::new(ca_params, ca_key);
+        let legacy_key = KeyPair::generate().unwrap();
+        let mut legacy_params = CertificateParams::default();
+        legacy_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "admin");
+        let legacy = legacy_params.signed_by(&legacy_key, &ca_issuer).unwrap();
+        write_private_key(dir.join("admin.key"), legacy_key.serialize_pem().as_bytes()).unwrap();
+        std::fs::write(dir.join("admin.crt"), legacy.der()).unwrap();
+
+        let second = generate_tls(&args).expect("restart");
+        assert_ne!(second.admin_cert_der, legacy.der().to_vec());
+        assert_ne!(second.admin_cert_der, first.admin_cert_der);
+        let (nb, na) = cert_validity(&second.admin_cert_der).unwrap();
+        assert_eq!(
+            na - nb,
+            CLIENT_CERT_LIFETIME,
+            "the replacement must have a finite lifetime"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Persisting KCM/scheduler certs gives later consumers stable file paths.
+    #[test]
+    fn kcm_and_scheduler_leaves_are_persisted_and_stable_across_restarts() {
+        let dir = test_temp_dir("kcm-sched-persist");
+        let args = args_in(&dir);
+        let a = generate_tls(&args).unwrap();
+        for f in ["kcm.crt", "kcm.key", "scheduler.crt", "scheduler.key"] {
+            assert!(
+                dir.join(f).exists(),
+                "{f} must exist for file-path kubeconfigs"
+            );
+        }
+        let b = generate_tls(&args).unwrap();
+        assert_eq!(a.kcm_cert_der, b.kcm_cert_der);
+        assert_eq!(a.scheduler_cert_der, b.scheduler_cert_der);
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
@@ -2191,7 +2345,7 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-        let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config.clone());
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config.get());
 
         let (c, s) = tokio::io::duplex(16 * 1024);
         let name = rustls::pki_types::ServerName::IpAddress(
@@ -2719,7 +2873,7 @@ mod tests {
         let cap = time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(30 * 86400);
         let leaf = pki
             .issue(
-                &client_spec("kcm-client", "x", None),
+                &client_plan("kcm-client", "x", None, CaKind::Cluster, None).spec(),
                 Some(&Signer {
                     issuer: &issuer,
                     not_after: cap,
