@@ -159,6 +159,18 @@ fn strategic_merge_patch_at(
     path: &str,
     schema: Option<&serde_json::Value>,
 ) -> Result<(), PatchError> {
+    merge_patch_into(target, patch, path, schema, true)
+}
+
+/// `validate_retain` is false for content that does not exist yet: upstream never runs
+/// `$retainKeys` validation for an absent key, it only strips `$patch`.
+fn merge_patch_into(
+    target: &mut serde_json::Value,
+    patch: &serde_json::Value,
+    path: &str,
+    schema: Option<&serde_json::Value>,
+    validate_retain: bool,
+) -> Result<(), PatchError> {
     let patch_obj = patch.as_object().ok_or(PatchError::NotAnObject)?;
 
     // Ensure target is an object; if not, replace with empty object.
@@ -187,7 +199,7 @@ fn strategic_merge_patch_at(
             )));
         }
     };
-    if !replaced && was_object {
+    if !replaced && was_object && validate_retain {
         apply_retain_keys(target_obj, patch_obj)?;
     }
 
@@ -272,17 +284,20 @@ fn strategic_merge_patch_at(
                 }
             }
         } else if value.is_object() {
-            // `$patch: delete` on a map that does not exist yet has nothing to delete and
-            // must not leave an empty map behind.
+            // On a map that does not exist yet, `$patch: delete` has nothing to delete and
+            // upstream drops the key for `$patch: replace` too (outside new content, which is stored stripped); neither leaves a map behind.
             if !target_obj.contains_key(key)
-                && value.get(PATCH_DIRECTIVE).is_some_and(|d| d == "delete")
+                && value
+                    .get(PATCH_DIRECTIVE)
+                    .is_some_and(|d| d == "delete" || (d == "replace" && validate_retain))
             {
                 continue;
             }
+            let validate_retain = target_obj.contains_key(key);
             let entry = target_obj
                 .entry(key)
                 .or_insert(serde_json::Value::Object(Default::default()));
-            strategic_merge_patch_at(entry, value, &child_path, schema)?;
+            merge_patch_into(entry, value, &child_path, schema, validate_retain)?;
         } else {
             target_obj.insert(key.clone(), value.clone());
         }
@@ -1134,7 +1149,7 @@ fn new_value(
                 return Ok(None);
             }
             let mut v = serde_json::Value::Object(Default::default());
-            strategic_merge_patch_at(&mut v, patch, path, schema)?;
+            merge_patch_into(&mut v, patch, path, schema, false)?;
             Ok(Some(v))
         }
         serde_json::Value::Array(items) => {
@@ -4384,7 +4399,7 @@ mod tests {
     }
 
     #[test]
-    fn map_level_patch_wins_over_retain_keys_like_upstream() {
+    fn map_level_patch_replace_on_existing_map_wins_over_retain_keys_like_upstream() {
         let mut target = json!({"s": {"old": 1}});
         let patch = json!({"s": {"$patch": "replace", "$retainKeys": ["a"], "b": 2}});
         strategic_merge_patch(&mut target, &patch).unwrap();
@@ -4393,6 +4408,30 @@ mod tests {
             json!({"b": 2}),
             "a map-level $patch must be applied without validating $retainKeys"
         );
+    }
+
+    #[test]
+    fn retain_keys_on_new_content_is_not_validated_and_not_stored() {
+        // Upstream skips $retainKeys for an absent key; rejecting would 400 a valid apply.
+        let mut target = json!({"spec": {"containers": []}});
+        let patch = json!({"spec": {
+            "containers": [{"name": "x", "$retainKeys": ["a"], "b": 1}],
+            "s": {"$retainKeys": ["a"], "b": 1}
+        }});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(
+            target["spec"]["containers"][0],
+            json!({"name": "x", "b": 1})
+        );
+        assert_eq!(target["spec"]["s"], json!({"b": 1}));
+    }
+
+    #[test]
+    fn patch_replace_on_an_absent_map_key_stores_nothing_like_upstream() {
+        let mut target = json!({"keep": 1});
+        let patch = json!({"s": {"$patch": "replace", "b": 1}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(target, json!({"keep": 1}));
     }
 
     #[test]
