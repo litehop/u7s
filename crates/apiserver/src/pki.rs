@@ -13,8 +13,28 @@ pub(crate) const SERVING_CERT_LIFETIME: Duration = Duration::from_secs(90 * 24 *
 
 /// Leaves are valid from slightly before issuance so a peer whose clock lags a little does
 /// not reject a freshly minted cert. The window is shifted, not widened: the cert lives
-/// exactly its lifetime.
+/// exactly its lifetime. Capped at a twelfth of the lifetime so a short-lived cert is not
+/// born (nearly) expired.
 const BACKDATE: Duration = Duration::from_secs(5 * 60);
+
+/// Lifetime, in seconds, applied to the apiserver serving cert and the apiserver-held
+/// kubelet-client and proxy-client identities so rotation can be observed in real time.
+/// Compiled only with the `pki-test-knobs` feature, which no shipped build enables, so a
+/// production binary neither reads the variable nor can be made to issue short-lived certs.
+#[cfg(feature = "pki-test-knobs")]
+pub(crate) fn test_lifetime() -> Option<Duration> {
+    let secs: u64 = std::env::var("U7S_PKI_TEST_LIFETIME_SECS")
+        .ok()?
+        .parse()
+        .expect("U7S_PKI_TEST_LIFETIME_SECS must be an integer number of seconds");
+    tracing::warn!("pki-test-knobs: serving, kubelet-client and proxy-client lifetime is {secs}s");
+    Some(Duration::from_secs(secs))
+}
+
+#[cfg(not(feature = "pki-test-knobs"))]
+pub(crate) fn test_lifetime() -> Option<Duration> {
+    None
+}
 
 /// Renew once this fraction of a cert's lifetime has elapsed.
 pub(crate) const RENEW_FRACTION: f64 = 2.0 / 3.0;
@@ -204,7 +224,7 @@ impl Pki {
     ) -> anyhow::Result<Issued> {
         let key = self.generate_key()?;
         let now = OffsetDateTime::from_unix_timestamp(self.clock.now().unix_timestamp())?;
-        let not_before = now - BACKDATE;
+        let not_before = now - BACKDATE.min(spec.lifetime / 12);
         let mut not_after = not_before + spec.lifetime;
         if let Some(s) = signer {
             not_after = not_after.min(s.not_after);

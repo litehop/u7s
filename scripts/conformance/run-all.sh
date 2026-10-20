@@ -176,6 +176,11 @@
 #             RSS on a full suite (almost entirely profiler overhead, not real
 #             allocation growth) — reserve it for a --focus-scoped investigation,
 #             not a bare full-suite run.
+#   --pki-test-lifetime <secs>  Rebuild u7s-apiserver with --features pki-test-knobs and
+#             start it with U7S_PKI_TEST_LIFETIME_SECS=<secs>, so the apiserver serving
+#             cert and its kubelet-client/proxy-client identities live <secs> seconds
+#             and rotate at 2/3 of that. For scripts/e2e-pki-rotation/leaf-rotation.sh;
+#             use with --stack-only. Mutually exclusive with --binary and --profile.
 #   --sample-interval  Cadence in seconds for scripts/conformance/sample-run-metrics.sh,
 #             which starts once the node topology is final (after step 5 and any
 #             --extra-node join) and reaps at the same point run-all.sh's own
@@ -211,6 +216,7 @@ EXTRA_KUBELET_PORT=""
 NETWORK=""
 PROFILE=0
 DHAT_DEPTH=""
+PKI_TEST_LIFETIME=""
 SAMPLE_INTERVAL=""
 PROCS=""
 K8S_VERSION=""
@@ -238,6 +244,7 @@ while [[ $# -gt 0 ]]; do
     --extra-kubelet-port) EXTRA_KUBELET_PORT="$2"; shift 2 ;;
     --profile) PROFILE=1; shift ;;
     --dhat-depth) DHAT_DEPTH="$2"; shift 2 ;;
+    --pki-test-lifetime) PKI_TEST_LIFETIME="$2"; shift 2 ;;
     --sample-interval) SAMPLE_INTERVAL="$2"; shift 2 ;;
     --procs) PROCS="$2"; shift 2 ;;
     --k8s-version) K8S_VERSION="$2"; shift 2 ;;
@@ -280,6 +287,17 @@ fi
 if [ "$PROFILE" -eq 1 ] && [ -n "$BINARY" ]; then
   echo "error: --profile and --binary are mutually exclusive — --profile always rebuilds with --features dhat, but --binary points at a pre-built binary whose feature set is the caller's responsibility" >&2
   exit 1
+fi
+
+if [ -n "$PKI_TEST_LIFETIME" ]; then
+  if ! [[ "$PKI_TEST_LIFETIME" =~ ^[0-9]+$ ]] || [ "$PKI_TEST_LIFETIME" -lt 24 ]; then
+    echo "error: --pki-test-lifetime must be an integer >= 24 seconds, got '$PKI_TEST_LIFETIME'" >&2
+    exit 1
+  fi
+  if [ -n "$BINARY" ] || [ "$PROFILE" -eq 1 ]; then
+    echo "error: --pki-test-lifetime rebuilds u7s-apiserver with --features pki-test-knobs and is mutually exclusive with --binary and --profile" >&2
+    exit 1
+  fi
 fi
 
 # Both flags are required together: a 2nd node needs its own kubelet port, and a
@@ -418,6 +436,12 @@ if [ "$PROFILE" -eq 1 ]; then
   cargo build --release -p u7s-apiserver --features dhat --manifest-path "$REPO/Cargo.toml"
   DHAT_HEAP_FILE="$WORKDIR/dhat-heap.json"
   export U7S_DHAT_HEAP_FILE="$DHAT_HEAP_FILE"
+fi
+
+if [ -n "$PKI_TEST_LIFETIME" ]; then
+  banner "PKI test knobs: rebuilding u7s-apiserver with --features pki-test-knobs"
+  cargo build --release -p u7s-apiserver --features pki-test-knobs --manifest-path "$REPO/Cargo.toml"
+  export U7S_PKI_TEST_LIFETIME_SECS="$PKI_TEST_LIFETIME"
 fi
 
 # Step 02: Start apiserver — source so KUBECONFIG export propagates.

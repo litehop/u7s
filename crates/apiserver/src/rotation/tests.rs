@@ -366,3 +366,29 @@ fn crash_mid_rotation_restarts_into_the_new_pair_and_never_regenerates() {
         "nothing is rewritten on refusal"
     );
 }
+
+#[test]
+fn seconds_scale_leaf_is_valid_when_issued_and_rotates_at_two_thirds() {
+    let h = Harness::new("seconds-scale");
+    let r = h.start(Duration::from_secs(60)).unwrap();
+    let old = r.leaf("admin");
+    let now = h.pki.clock.now();
+    assert!(
+        old.not_before <= now && now < old.not_after,
+        "a 60s leaf backdated by the full 5min would be born expired and every client would reject it"
+    );
+    assert_eq!(old.not_after - old.not_before, time::Duration::seconds(60));
+
+    let rotated = Mutex::new(Vec::new());
+    let note = |n: &'static str, _: &Leaf| rotated.lock().unwrap().push(n);
+    h.advance((old.not_before + time::Duration::seconds(40) - now).whole_seconds() - 1);
+    r.rotate_due(&note).unwrap();
+    assert!(
+        rotated.lock().unwrap().is_empty(),
+        "a 60s leaf must not rotate before 40s"
+    );
+    h.advance(2);
+    r.rotate_due(&note).unwrap();
+    assert_eq!(*rotated.lock().unwrap(), vec!["admin"]);
+    assert_ne!(r.leaf("admin").cert_der, old.cert_der);
+}
