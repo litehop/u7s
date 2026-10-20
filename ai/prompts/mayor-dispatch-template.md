@@ -586,8 +586,10 @@ fix** (so a failing P1 fix doesn't strand the small cleanups); commit format
 `<WORKTREE_ROOT>/<cluster-name>-<HEAD_BEAD_ID>`; pre-claim each bead BEFORE
 its commit (so bd state mirrors history one-to-one and a stalled cluster
 leaves a clean partial trail); quality gates after EACH commit + full
-regression after ALL; PR titled `<scope>(<artefact>): <cluster name> (N beads
-incl. <P1 highlights>)`; return PR URL + per-bead one-liner + cross-bead
+regression after ALL; PR titled `<scope>(<artefact>): <cluster name>
+(mayor-a, mayor-b, mayor-c)` listing EVERY bead as its full `mayor-<id>`
+(mayor-tick closes beads on merge from IDs in the title only; "N beads incl."
+closes none); return PR URL + per-bead one-liner + cross-bead
 unifications spotted. Disjoint-surface "small-misc" clusters are valid at
 the tail of a drain — the binding rule is hot-zone parallelism, not strict
 same-surface.
@@ -631,10 +633,13 @@ Critical learnings:
   progress survives a watchdog timeout.
 - **Name the recent landings** so the audit reads the current reality.
 - **Severity tags** (HIGH/MED/LOW/DEFER) make later cluster-formation trivial.
-- **Commit the doc, don't wrap it in a PR.** It's git-tracked under the bead
-  lifecycle (see README's "Findings lifecycle"), but audit output isn't code
-  needing review-before-merge — commit it directly and reference it from the
-  bead's notes.
+- **Commit the doc on the worker branch and push it; don't wrap it in a PR.**
+  Main is protected (merge queue), so the doc lives on the PR-less
+  `worker/agent-<id>` branch, not on main. worktree-hygiene archives such a
+  branch as tag `archive/<bead>-findings` before deleting it; the worker
+  records the pushed branch and commit SHA in the bead's notes, and the mayor
+  reads the doc via `git show archive/<bead>-findings:<path>`. If the doc must
+  land on main (durable reference), open a small docs PR instead.
 
 ---
 

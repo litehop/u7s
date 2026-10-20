@@ -92,7 +92,10 @@
 #   origin directly rather than local `refs/remotes/origin/*` -- unlike
 #   STEP C/D, this branch may have no local ref to iterate at all. Guarded
 #   exactly like STEP C/D: an in-flight worker's branch (its agent-id is in
-#   --live-agents) and any branch with an open PR are never touched.
+#   --live-agents) and any branch with an open PR are never touched. A
+#   branch whose unmerged commits touch ai/findings/ is first archived as
+#   tag archive/<bead>-findings (pushed to origin); if that fails the branch
+#   is kept.
 #
 # Exit codes: 0 = clean tick, nothing found. Non-zero = an anomaly for the
 # mayor to look at -- currently only STEP A's kill-verify failure (a process
@@ -694,6 +697,30 @@ origin_worker_branches() {
   git -C "$repo_root" ls-remote --heads origin 'worker/agent-*' 2>/dev/null | awk '{print $2}' | sed -E 's#^refs/heads/##'
 }
 
+# Archives `branch` (an origin worker branch about to be deleted) as tag
+# archive/<bead>-findings, pushed to origin, iff it carries commits not in
+# origin/main that touch ai/findings/. Audit workers commit their findings doc
+# with no PR (main is protected), so such a branch can hold the only copy.
+# Returns 0 when nothing needs archiving or the archive is in place; nonzero
+# when the archive could not be made, so the caller keeps the branch.
+archive_findings_branch() {
+  local branch="$1" files bead name tip
+  git -C "$REPO_ROOT" fetch -q origin "refs/heads/$branch" || return 1
+  tip=$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD)
+  files=$(git -C "$REPO_ROOT" log --name-only --format= "$tip" --not origin/main -- ai/findings/ | sort -u)
+  [ -n "$files" ] || return 0
+  bead=$(printf '%s\n' "$files" | { grep -oE 'mayor-[a-z0-9]+(\.[0-9]+)*' || true; } | head -1)
+  [ -n "$bead" ] || bead="${branch//\//-}"
+  name="archive/$bead-findings"
+  if git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/$name" >/dev/null \
+    && [ "$(git -C "$REPO_ROOT" rev-parse "refs/tags/$name^{commit}")" != "$tip" ]; then
+    name="$name-${tip:0:8}"
+  fi
+  echo "worktree-hygiene: archiving $branch as tag $name before delete" >&2
+  run_cmd git -C "$REPO_ROOT" tag -f "$name" "$tip" || return 1
+  run_cmd git -C "$REPO_ROOT" push -q origin "refs/tags/$name"
+}
+
 step_f_orphaned_origin_branches() {
   local branch open_pr_branches
   # Fetched once up front, same reasoning as STEP C: a `gh` failure here
@@ -704,6 +731,10 @@ step_f_orphaned_origin_branches() {
     [ -n "$branch" ] || continue
     is_live_agent_branch "$branch" "$LIVE_AGENTS" && continue
     has_open_pr "$branch" "$open_pr_branches" && continue
+    if ! archive_findings_branch "$branch"; then
+      echo "worktree-hygiene: could not archive findings on $branch; keeping it" >&2
+      continue
+    fi
     run_cmd git -C "$REPO_ROOT" push origin --delete "$branch"
   done < <(origin_worker_branches "$REPO_ROOT")
 }
