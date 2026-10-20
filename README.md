@@ -41,6 +41,11 @@ and kube-controller-manager, and writes a systemd unit for each.
    kubectl --kubeconfig=/var/lib/u7s/kubeconfig get nodes
    ```
 
+   The kubeconfig refers to `ca-bundle.pem` and `admin.pem` beside it by path,
+   so a rotated certificate is picked up without rewriting it. To use it on
+   another machine, embed them first:
+   `kubectl --kubeconfig=/var/lib/u7s/kubeconfig config view --raw --flatten`.
+
 u7s does not ship metrics-server. The `scale` subresource is implemented, so
 `HorizontalPodAutoscaler` works once you install metrics-server yourself —
 apply upstream's release manifest:
