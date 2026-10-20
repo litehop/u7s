@@ -433,25 +433,15 @@ const RESYNC_PODS_PATH: &str = "/api/v1/pods?fieldSelector=spec.nodeName%3D";
 /// trips on a healthy cluster that is simply quiet — without it, an idle
 /// cluster forces a harmless but unnecessary reconnect every 5 minutes.
 ///
-/// `sendInitialEvents=true` is load-bearing: this watch never carries a
-/// `resourceVersion`, so the apiserver's default for a bare `resourceVersion`-
-/// less watch is `from_revision=0` — which replays the store's raw
-/// ring-buffer write history (every ADDED/MODIFIED write still retained),
-/// NOT a snapshot of current state. Without `sendInitialEvents=true`, EVERY
-/// (re)connect on this path — including the one the apiserver forces on any
-/// open watch after its ~30-minute default `stream_timeout_secs` — replays
-/// each pod's original, long-superseded creation event (`spec.nodeName`
-/// still empty at that point in history) alongside its later bind. Because
-/// `needs_scheduling` only ever looks at the event's own embedded object
-/// body, it cannot tell that stale replayed ADDED apart from a genuinely new
-/// unscheduled pod, and re-issues a bind for a pod that has been Running for
-/// however long — wasted apiserver load and confusing 201/404 log noise,
-/// every ~30 minutes, for the life of the scheduler process. With
-/// `sendInitialEvents=true`, every (re)connect instead gets one ADDED event
-/// per currently-existing pod reflecting its CURRENT `spec.nodeName`
-/// (`fetch_initial_events`/`core_list_resource` LIST the store, they don't
-/// replay history), so `needs_scheduling`'s already-scheduled check works
-/// the same on a reconnect as it does on the live tail.
+/// `sendInitialEvents=true` is kept for its explicit snapshot contract: every
+/// (re)connect — including the one the apiserver forces on any open watch
+/// after its ~30-minute default `stream_timeout_secs` — gets one ADDED event
+/// per currently-existing pod reflecting its CURRENT `spec.nodeName`, then an
+/// initial-events-end BOOKMARK. A bare `resourceVersion`-less watch now also
+/// serves current state as synthetic ADDED (never the raw write history), but
+/// carries no end-of-snapshot bookmark. `needs_scheduling` only looks at the
+/// event's own embedded object body, so it relies on never seeing a stale,
+/// long-superseded creation event for an already-bound pod.
 const POD_WATCH_PATH: &str =
     "/api/v1/pods?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
 

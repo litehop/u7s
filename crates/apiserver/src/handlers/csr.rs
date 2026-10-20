@@ -167,6 +167,7 @@ pub async fn list_csr<S: Store>(
                 kind,
                 from_revision: from_rv,
                 initial_items: initial,
+                explicit_no_initial_events: query.send_initial_events == Some(false),
                 label_selector: query.label_selector,
                 field_selector: query.field_selector,
                 allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
