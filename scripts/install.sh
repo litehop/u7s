@@ -299,6 +299,33 @@ fetch_tarball() {
   fi
 }
 
+# Fetch an apt repo signing key from <url>, require it to be exactly one
+# primary key whose fingerprint equals <expected_fpr>, and only then dearmor it
+# into <keyring>. The key comes from the same host that serves the packages, so
+# without the pin a compromised mirror ships a matching key and packages. A
+# second key in the file is rejected too: signed-by would trust it.
+install_apt_key() {
+  local url="$1" expected="$2" keyring="$3"
+  local keyfile fprs
+  keyfile="$(mktemp)"
+  if ! curl --proto '=https' --tlsv1.2 -fsSL -o "$keyfile" "$url"; then
+    rm -f "$keyfile"
+    echo "error: could not fetch apt key from $url" >&2
+    return 1
+  fi
+  fprs="$(gpg --batch --show-keys --with-colons "$keyfile" | awk -F: '/^pub:/{p=1} /^fpr:/&&p{print $10; p=0}')"
+  if [ "$fprs" != "$expected" ]; then
+    rm -f "$keyfile"
+    echo "error: apt key from $url has unexpected fingerprint(s)" >&2
+    echo "       expected: $expected" >&2
+    echo "       actual:   ${fprs:-<none>}" >&2
+    echo "       If the vendor rotated its key, verify the new fingerprint out of band and update the pin in install.sh." >&2
+    return 1
+  fi
+  gpg --batch --yes --dearmor -o "$keyring" < "$keyfile"
+  rm -f "$keyfile"
+}
+
 # Install each named binary found anywhere in $STAGE_DIR into $BIN_DIR,
 # rejecting a found-but-non-executable match rather than installing it (e.g. a
 # stray file sharing a required binary's name).
@@ -962,8 +989,11 @@ apt-get update -qq
 apt-get install -y apt-transport-https ca-certificates curl gpg
 
 install -d -m 0755 /etc/apt/keyrings
-curl --proto '=https' --tlsv1.2 -fsSL https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/Release.key \
-  | gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+# Pinned fingerprint of the isv:cri-o OBS project key (fetched and read with
+# `gpg --show-keys --with-colons` on 2026-10-20; expires 2027-04). Rotation: verify the new key
+# out of band, then update this value.
+install_apt_key https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/Release.key \
+  85B67D5C50100B1AC8CEFE49CBA9C85640A2B579 /etc/apt/keyrings/cri-o-apt-keyring.gpg
 echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/ /' \
   > /etc/apt/sources.list.d/cri-o.list
 apt-get update -qq
@@ -1066,8 +1096,11 @@ if [ -z "$KUBE_VERSION" ]; then
 fi
 KUBE_MINOR="${KUBE_VERSION%.*}"
 
-curl --proto '=https' --tlsv1.2 -fsSL "https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/Release.key" \
-  | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+# Pinned fingerprint of the isv:kubernetes OBS project key, identical for the
+# v1.35-v1.37 repos (fetched 2026-10-20; expires 2026-12-29, so expect to
+# update this pin when the vendor rotates it).
+install_apt_key "https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/Release.key" \
+  DE15B14486CD377B9E876E1A234654DA9A296436 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/ /" \
   > /etc/apt/sources.list.d/kubernetes.list
 apt-get update -qq
