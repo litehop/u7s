@@ -17,6 +17,7 @@ Each file should be structured like an AI Skill: front matter describing scope, 
 | [apiserver-code-gotchas.md](apiserver-code-gotchas.md) | Non-obvious apiserver correctness constraints that have bitten conformance (KCM panic propagation, read-time defaults on watch init, exec param translation, CSINode gap) |
 | [memory-management-state.md](memory-management-state.md) | Snapshot of memory-management state: allocation hotspots, known issues, low-hanging fruit, highest-leverage changes, diagnostic playbook. AS-OF dated; audited weekly by mayor-rr177's cron (audit-only — files drift beads, never edits the doc's content) — actual refreshes are manual or by a dispatched worker |
 | [project-priority-hierarchy.md](project-priority-hierarchy.md) | Operator's bucket-ordered priority framework for bead triage and dispatch order (testing-blockers > conformance > other correctness > memory-usage > new features > o11y/perf polish) |
+| [cert-rotation-and-release-gate-state.md](cert-rotation-and-release-gate-state.md) | Cert-rotation release-gating scope and what's left (`zboqh`), the 1 GiB burst gate's state and the rv=0 watch false-FAIL, the quiet-window protocol, and working rules from 2026-10-20 |
 | [e2e-focus-conformance-image-pull-postmortem-2026-08-25.md](e2e-focus-conformance-image-pull-postmortem-2026-08-25.md) | Postmortem: `e2e-focus.yaml` CI timeouts caused by CDN edge-cache misses on infrequently-pulled conformance-image tags, not a code regression |
 
 ## Frontmatter convention

@@ -1,52 +1,24 @@
 ---
-updated: 2026-10-20T03:12Z
+updated: 2026-10-20T11:11Z
 ---
-# Dashboard — session 2026-10-20 (main `1b5a0399`)
-**Stance:** pre-alpha; correctness (Conformance first) > security > perf > features; queue merge on green, never `--admin`. No GCP account/project in git.
-**Resume:** `ai/prompts/mayor-bootstrap.md`; `bd prime`; crons: tick 15m, posture 60m, hygiene 60m.
+# Dashboard — session 2026-10-20 WRAPPED (main `bfe00c53`)
+**Stance:** pre-alpha; correctness (Conformance first) > security > perf > features; match upstream unless incompatible; queue merge on green, never `--admin`. No GCP account/project in git.
+**Resume:** `ai/prompts/mayor-bootstrap.md`; `bd prime`; read `ai/extended-context/cert-rotation-and-release-gate-state.md`; re-register crons (tick 15m, posture 60m, hygiene 60m). No workers, worktrees, VMs or stashes left.
 
 ## 🎯 Waiting on you
-- **Pick:** `xdw6u.6.2` kubelet-serving IP-SAN tightening option (#1866 baseline accepted 2026-10-19)
-- Classifier denies mayor `limactl stop`: stop idle VMs when flagged.
+- 🚫 **Release gated** on the cert-rotation story: only `zboqh` (control-plane kubelet's own identity) left. `.8`/`.9` non-gating.
+- **Quiet window** when convenient (~1–2 h): `scripts/release-gate/burst-gate.sh --confirm` (last FAIL was the rv=0 watch bug, fixed #1924; `--runs 3` since passed 3/3 at 50) + `w898x` KCM/kubelet memory (scrape via `kubectl create token monitoring -n kube-system`).
+- `pki-rotation-e2e` → required check after 10 green runs (`bjuu2`).
+- Optional: GitHub Release page for politeia `v0.3.0` (tag exists).
 
-## ▶ In progress (wave 1, 02:35Z)
-- `zkchq` PR #1905 REQUEST_CHANGES (system:monitoring lacks /healthz/* etc.) → fix round on lima-node-2
-- `xojac` PR #1903 in merge queue; existing clusters keep the verbs until `tcewr`; drift `oua2n`
-- `4xypz` #1902 · `ufcno` #1904: LGTM, CI re-running → queue on green; follow-ons `itfmm`, `7ahpf`
-- ✅ `qgyz4` merged #1901 (`1b5a0399`); follow-on `2o37f`
-- Bookkeeping PR (end of wave): delete stale finding `ai/findings/2026-10-15-mayor-3kp5u-…` (bead closed)
-- Next: `d72sq` authz path decode (operator-approved 2026-10-19; then `60d7s`) · `rfet5` (snapshot.1 is out) · install.sh hardening (zboqh, fkj56, d07ct…) · PKI xdw6u.1→.7→.10 · admission (fg6oo, o985u…)
+## Next up (no operator input needed)
+- Gating: `zboqh`. Then `oebl7` (control-plane Node label, kubeadm parity), `g7cts` (VAP CEL macros + failurePolicy, P2), `2zd47` (ephemeralcontainers mutating tests + post-mutation validation, P2), `d07ct` (narrow KCM role; keep delegation rules).
+- P3 follow-ons from this session's reviews: `lrrru` `7uopb` `ynn8q` (pod subresource admission) · `rrwub` `mj8xq` `c4arr` `am6oj` `yzoq1` `s62j7` `7wrra` `l2imr` `wgo1c` `8h0e0` `2o37f` `lafbn` `u9ymo` `itfmm` `7ahpf` `3cuym` `oua2n` `tcewr` `q59ly` `d7uta` (k8s apt key pin, before 2026-12-15).
+- Renovate #1846 (politeia bump) is superseded by #1926 — close or let Renovate drop it.
 
-## Open PRs
-<!-- BEGIN AUTO: open-prs -->
-- #1905 apiserver(health): named checks with ?verbose, ?exclude and per-check paths (mayor-zkchq) (`worker/agent-a85432a06ca74aa88`, BLOCKED)
-- #1904 apiserver(node-authz): scope node access to own csinodes, leases, resourceslices (mayor-ufcno) (`worker/agent-a3153efd2c080c0a4`, BLOCKED)
-- #1903 apiserver(rbac): drop bind/escalate from seeded admin ClusterRole (mayor-xojac) (`worker/agent-ab723b3fbb707eabb`, CLEAN)
-- #1902 apiserver(patch): strip SMP directives from new list elements and map values (mayor-4xypz) (`worker/agent-a3275223d520b8da9`, BLOCKED)
-<!-- END AUTO: open-prs -->
-## ✅ Merged since last dashboard (#1891–#1900)
-#1893 aggregation guard kept strict + outbound_url tests · #1894 beep v0.6.0 default LB · #1895 Rust toolchain pinned to 1.99.1 · #1896/#1899 cloud-two-node.sh live-run fixes · #1897 KCM waits for CA on fresh install · #1898 kubelet webhook authz on install.sh clusters (SAR gate honours Node authorizer) · #1891/#1900 libc/tokio bumps.
+## Decided this session
+- Release gated on cert rotation done properly (`.5`, `.11` client scenarios, `.2`, `zboqh`); `.8`/`.9` P3. `xdw6u.6.2` deferred; `b8kun` pod-CIDR SAN exclusion shipped.
+- Gate spec = option A (50 else 40, quiet host). PodSecurity: full upstream port. KCM delegated auth with its own identity (kubeadm parity).
 
-## 🌲 Worktrees / hygiene
-<!-- BEGIN AUTO: worktrees -->
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-a3153efd2c080c0a4` (`worker/agent-a3153efd2c080c0a4`)
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-a3275223d520b8da9` (`worker/agent-a3275223d520b8da9`)
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-a81cfb6d11ef53025` (`fix2-1902`)
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-a85432a06ca74aa88` (`worker/agent-a85432a06ca74aa88`)
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-aa7df380e9e0e3eed` (`worker/agent-aa7df380e9e0e3eed`)
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-ab723b3fbb707eabb` (`worker/agent-ab723b3fbb707eabb`)
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-af84b141d06f9c3c4` (`fix-1902`)
-- `/Users/balint.erdos/litehop/u7s/temp/review-scratch/dash-beep` (`chore/dashboard-beep-rc`)
-<!-- END AUTO: worktrees -->
-## 🔁 Cron loops
-<!-- BEGIN AUTO: cron-loops -->
-15m mayor tick (`scripts/mayor-tick.sh`) · 60m reread posture · 60m worktree hygiene
-<!-- END AUTO: cron-loops -->
-## Repo state
-<!-- BEGIN AUTO: repo-state -->
-As of 2026-10-20T03:10:51Z (last tick) — Branch `main` @ `1b5a0399`, dirty, up to date with origin/main.
-<!-- END AUTO: repo-state -->
-## 📋 Review queue
-<!-- BEGIN AUTO: review-queue -->
-1 pending review-queue entries.
-<!-- END AUTO: review-queue -->
+## ✅ Merged this session (#1901–#1926)
+Conformance: 460/460 + 2/2 restored (#1919 DefaultTolerationSeconds on update + managedFields in protobuf) · rv=0 watch serves current state (#1924) · PodSecurity admission (#1916) · health ?verbose checks (#1905) · SMP directive parity (#1902) · **cert rotation**: finite lifetimes #1909, hot-swap + 2/3 rotation #1913, file-path kubeconfigs #1917, rotation e2e #1918, scheduler reload #1926 (politeia v0.3.0), expiry visibility #1925 · security: admin role bind/escalate #1903, node-authz scoping #1904, authz path decode #1908/#1914, pod-CIDR SANs #1911, ephemeralcontainers admission #1922, KCM `/metrics` RBAC #1923, supply chain #1907 · encode-direction proto check #1921 · migrate export dry-run #1915 · gate harness #1912 · mayor tooling #1920.
