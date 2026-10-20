@@ -874,6 +874,7 @@ mod tests {
             sa_sig_cache_size: None,
             manifest_dir: dir.join("manifests").to_string_lossy().into_owned(),
             embedded_scheduler: false,
+            admission_control_config_file: None,
         };
 
         let tls = crate::tls::generate_tls(&args).expect("generate_tls must succeed");

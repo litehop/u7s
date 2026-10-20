@@ -943,6 +943,10 @@ pub struct AppState<S = SqliteStore> {
     /// `false` until the task resolves; no test needs the gated behavior at construction time,
     /// same pattern as `node_kubelet_ports`/`sa_sig_cache`.
     pub boot_ready: Arc<AtomicBool>,
+    /// PodSecurity admission defaults and exemptions. Not part of `AppStateConfig`: `run()`
+    /// overwrites it from `--admission-control-config-file`; every test gets upstream's
+    /// default (everything privileged, nothing exempt).
+    pub pod_security: Arc<crate::pod_security::Config>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -1016,6 +1020,7 @@ impl<S> Clone for AppState<S> {
             sa_sig_cache: self.sa_sig_cache.clone(),
             flowcontrol_cache: self.flowcontrol_cache.clone(),
             boot_ready: self.boot_ready.clone(),
+            pod_security: self.pod_security.clone(),
         }
     }
 }
@@ -1268,6 +1273,7 @@ impl<S: Store> AppState<S> {
             // never boots that task) gets the ready default, matching node_kubelet_ports'
             // pattern.
             boot_ready: Arc::new(AtomicBool::new(true)),
+            pod_security: Arc::new(crate::pod_security::Config::default()),
         }
     }
 

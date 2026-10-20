@@ -32,6 +32,7 @@ mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
 mod node_authz;
 mod patch;
+mod pod_security;
 mod proto;
 #[cfg(test)]
 mod proto_descriptor;
@@ -53,6 +54,7 @@ mod test_utils;
 mod tls;
 mod types;
 mod util;
+mod warnings;
 
 use std::sync::Arc;
 
@@ -403,6 +405,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
     state.proxy_client_identity_pem = Some(Arc::new(proxy_client_identity_pem));
     state.node_kubelet_ports = parse_node_kubelet_ports(&args.node_kubelet_port)?;
+    if let Some(path) = &args.admission_control_config_file {
+        state.pod_security = Arc::new(
+            pod_security::load_config_file(std::path::Path::new(path))
+                .map_err(|e| anyhow::anyhow!(e))?,
+        );
+    }
     // Not ready until the boot-time manifest-apply task (12a below) resolves successfully —
     // see the field's own doc. Overwrites new_with_config's ready-by-default value.
     state.boot_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1315,6 +1323,9 @@ fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             handlers::json_patch::inject_dry_run_header,
         ))
+        // Outermost: admission plugins anywhere below push warnings into the request's sink,
+        // rendered here as `Warning` response headers.
+        .layer(axum::middleware::from_fn(warnings::collect))
         .with_state(state)
 }
 
@@ -12338,6 +12349,7 @@ mod tests {
             sa_sig_cache_size: None,
             manifest_dir: "/etc/u7s/manifests".into(),
             embedded_scheduler: false,
+            admission_control_config_file: None,
         };
         let tls = crate::tls::generate_tls(&args).expect("generate_tls must succeed");
 
@@ -13170,6 +13182,7 @@ mod tests {
             sa_sig_cache_size: None,
             manifest_dir: manifest_dir.to_string_lossy().into_owned(),
             embedded_scheduler: false,
+            admission_control_config_file: None,
         };
         let kubeconfig_path = std::path::PathBuf::from(&args.kubeconfig);
 
@@ -13367,6 +13380,7 @@ mod tests {
             sa_sig_cache_size: None,
             manifest_dir: manifest_dir.to_string_lossy().into_owned(),
             embedded_scheduler,
+            admission_control_config_file: None,
         };
         (args, dir, port)
     }
