@@ -658,7 +658,9 @@ pub async fn admit<S: Store>(
     }
     match (ctx.group, ctx.resource) {
         ("", "namespaces") => validate_namespace(state, ctx, object, old_object).await,
-        ("", "pods") => validate_pod(state, ctx, object, old_object).await,
+        ("", "pods" | "pods/ephemeralcontainers") => {
+            validate_pod(state, ctx, object, old_object).await
+        }
         (group, resource) => match pod_template(group, resource, object) {
             Some((metadata, spec)) => {
                 validate_pod_controller(state, ctx, metadata, spec).await;
@@ -838,31 +840,6 @@ async fn validate_pod_controller<S: Store>(
         return;
     }
     record(&evaluate_pod_policy(&policy, &errs, metadata, spec, false));
-}
-
-/// Pod-security evaluation of a pod update that does not pass through the generic admission
-/// chain (the ephemeralcontainers subresource).
-pub async fn admit_pod_update<S: Store>(
-    state: &AppState<S>,
-    namespace: &str,
-    name: &str,
-    user: Option<&crate::auth::UserInfo>,
-    pod: &Value,
-    old_pod: &Value,
-) -> Result<(), StatusError> {
-    let ctx = AdmissionContext {
-        group: "",
-        version: "v1",
-        resource: "pods",
-        name,
-        namespace: Some(namespace),
-        operation: "UPDATE",
-        user_info: Some(
-            serde_json::json!({ "username": user.map_or("", |u| u.username.as_str()) }),
-        ),
-        dry_run: false,
-    };
-    admit(state, &ctx, pod, Some(old_pod)).await
 }
 
 #[cfg(test)]
