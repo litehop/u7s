@@ -32,6 +32,12 @@ check "two different certs have different serials, so a swap is observable" \
 check "the same cert has a stable serial, so no swap is not mistaken for one" \
   test "$(serial_of a)" = "$(serial_of a)"
 
+cat "$TMP/a.pem" "$TMP/a.key" >"$TMP/a-bundle.pem"
+check "the serial of a combined cert+key file (what kubeconfigs reference) is the cert's own, so a re-issue shows up as a serial change" \
+  test "$(pem_file_serial "$TMP/a-bundle.pem")" = "$(pem_file_serial "$TMP/a.pem")"
+check "different combined files have different serials" \
+  not test "$(pem_file_serial "$TMP/a-bundle.pem")" = "$(pem_file_serial "$TMP/b.pem")"
+
 check "a cert valid for a day has an hour of life left" cert_has_life "$TMP/a.pem" 3600
 check "a cert valid for a day does not have two days of life left" not cert_has_life "$TMP/a.pem" 172800
 

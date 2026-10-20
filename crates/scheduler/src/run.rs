@@ -24,8 +24,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use politeia::{build_tls_connector, parse_kubeconfig};
-use tokio_rustls::TlsConnector;
+use politeia::{kubeconfig_client_with_reload, DEFAULT_RELOAD_INTERVAL};
 use tracing::{error, info};
 
 use crate::{
@@ -37,8 +36,8 @@ use crate::{
     patch_pod_status, pick_node, pods_needing_resync, preemption_reservation_still_fits,
     scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
-    stamp_selected_node_for_pvcs, stream_watch_events, unscheduled_pod_uids, BindError, NodeTally,
-    PendingPod, PodList,
+    stamp_selected_node_for_pvcs, stream_watch_events, unscheduled_pod_uids, ApiClient, BindError,
+    NodeTally, PendingPod, PodList,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -52,8 +51,7 @@ use crate::{
 /// here would under-count `node`'s real usage for a pod that is actually
 /// running fine).
 async fn bind_reserved_node(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     tally: &Mutex<NodeTally>,
     pending: &PendingPod,
     node: &str,
@@ -62,23 +60,8 @@ async fn bind_reserved_node(
     // PVCs BEFORE the bind POST below, so external-provisioner sees the node
     // choice the instant the pod is bound rather than after (see
     // `stamp_selected_node_for_pvcs`'s doc comment).
-    stamp_selected_node_for_pvcs(
-        connector,
-        server,
-        &pending.namespace,
-        &pending.pvc_names,
-        node,
-    )
-    .await;
-    if let Err(e) = bind_pod(
-        connector,
-        server,
-        &pending.namespace,
-        &pending.pod_name,
-        node,
-    )
-    .await
-    {
+    stamp_selected_node_for_pvcs(client, &pending.namespace, &pending.pvc_names, node).await;
+    if let Err(e) = bind_pod(client, &pending.namespace, &pending.pod_name, node).await {
         if !is_bind_already_assigned(&e) {
             tally
                 .lock()
@@ -167,8 +150,7 @@ enum SchedulingOutcome {
 /// it does, the reservation is rolled back first so the failed attempt does
 /// not permanently strand that capacity.
 async fn preempt_and_pick_node(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     pending: &PendingPod,
     tally: &Mutex<NodeTally>,
     namespace: &str,
@@ -200,8 +182,7 @@ async fn preempt_and_pick_node(
         // must not block the eviction itself, since freeing the slot for the
         // higher-priority pod matters more than the nomination annotation.
         if let Err(e) = patch_pod_status(
-            connector,
-            server,
+            client,
             namespace,
             pod_name,
             &nominated_node_name_patch(&plan.node_name),
@@ -213,7 +194,7 @@ async fn preempt_and_pick_node(
                 plan.node_name
             );
         }
-        match evict_victims(connector, server, &plan.victims, tally, pod_name).await {
+        match evict_victims(client, &plan.victims, tally, pod_name).await {
             Ok(()) => {
                 // Every victim in `plan.victims` has had its graceful DELETE
                 // acknowledged — NOT confirmed physically gone (see this
@@ -259,8 +240,7 @@ async fn preempt_and_pick_node(
 /// eviction failure is a single `?` there, making the reservation-rollback
 /// path easy to see.
 async fn evict_victims(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     victims: &[String],
     tally: &Mutex<NodeTally>,
     pod_name: &str,
@@ -273,20 +253,14 @@ async fn evict_victims(
         // DisruptionTarget on the victim before deleting it. A patch
         // failure must not block the eviction itself — freeing the slot
         // for the higher-priority pod matters more than the condition.
-        if let Err(e) = patch_pod_status(
-            connector,
-            server,
-            v_ns,
-            v_name,
-            &disruption_target_patch(pod_name),
-        )
-        .await
+        if let Err(e) =
+            patch_pod_status(client, v_ns, v_name, &disruption_target_patch(pod_name)).await
         {
             error!(
                 "failed to set DisruptionTarget condition on preemption victim {v_ns}/{v_name}: {e}"
             );
         }
-        delete_pod(connector, server, v_ns, v_name).await?;
+        delete_pod(client, v_ns, v_name).await?;
         tally
             .lock()
             .expect("tally lock poisoned")
@@ -323,8 +297,7 @@ async fn evict_victims(
 /// such a second attempt preempts a DIFFERENT node's innocent bystander pod
 /// and the pod ends up bound twice.
 async fn attempt_deferred_bind(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     tally: &Mutex<NodeTally>,
     in_flight: &Arc<Mutex<HashSet<String>>>,
     pending: PendingPod,
@@ -362,15 +335,14 @@ async fn attempt_deferred_bind(
             "deferred bind for {key}: every victim confirmed gone and fit re-verified — \
              attempting bind to {node_name}"
         );
-        match bind_reserved_node(connector, server, tally, &pending, &node_name).await {
+        match bind_reserved_node(client, tally, &pending, &node_name).await {
             Ok(()) => {
                 let message = format!(
                     "Successfully assigned {}/{} to {node_name}",
                     pending.namespace, pending.pod_name
                 );
                 if let Err(e) = emit_scheduling_event(
-                    connector,
-                    server,
+                    client,
                     &pending.namespace,
                     &pending.pod_name,
                     "Scheduled",
@@ -600,8 +572,7 @@ impl PodReplay {
 /// `requeue` (see `run_requeue_loop`).
 #[allow(clippy::too_many_arguments)]
 async fn run_cache_watch_loop(
-    connector: TlsConnector,
-    server: String,
+    client: ApiClient,
     tally: Arc<Mutex<NodeTally>>,
     path: &'static str,
     apply: fn(&mut NodeTally, &serde_json::Value) -> bool,
@@ -613,7 +584,7 @@ async fn run_cache_watch_loop(
         info!("starting cache watch on {path}");
         let tally_ref = &tally;
         let mut replay = ReplayBuffer::default();
-        let result = stream_watch_events(&connector, &server, path, |event| {
+        let result = stream_watch_events(&client, path, |event| {
             match replay.absorb(
                 &event,
                 tally_ref,
@@ -649,11 +620,10 @@ async fn run_cache_watch_loop(
 /// lib.rs) — the moment `main.rs`'s missing-PVC branch deferred it on, not
 /// `pods_needing_resync`'s RESYNC_INTERVAL (30s) bound. Split out of
 /// `run_cache_watch_loop`'s generic `fn(&mut NodeTally, &Value)` dispatch
-/// because this needs `in_flight`/`connector`/`server` to act on a waiter,
+/// because this needs `in_flight`/`client` to act on a waiter,
 /// which that shared signature has no room to carry.
 async fn run_pvc_watch_loop(
-    connector: TlsConnector,
-    server: String,
+    client: ApiClient,
     tally: Arc<Mutex<NodeTally>>,
     in_flight: Arc<Mutex<HashSet<String>>>,
     ready: tokio::sync::watch::Sender<bool>,
@@ -662,7 +632,7 @@ async fn run_pvc_watch_loop(
     loop {
         info!("starting cache watch on {PVC_WATCH_PATH}");
         let mut replay = ReplayBuffer::default();
-        let result = stream_watch_events(&connector, &server, PVC_WATCH_PATH, |event| {
+        let result = stream_watch_events(&client, PVC_WATCH_PATH, |event| {
             let mut waiting_pods = Vec::new();
             match replay.absorb(
                 &event,
@@ -688,12 +658,11 @@ async fn run_pvc_watch_loop(
                 }
             }
             for pod_key in waiting_pods {
-                let connector = connector.clone();
-                let server = server.clone();
+                let client = client.clone();
                 let in_flight = in_flight.clone();
                 let tally = tally.clone();
                 tokio::spawn(async move {
-                    redrive_pod(&pod_key, &connector, &server, &in_flight, &tally).await;
+                    redrive_pod(&pod_key, &client, &in_flight, &tally).await;
                 });
             }
         })
@@ -720,8 +689,7 @@ async fn run_pvc_watch_loop(
 /// faster, never a correctness gap.
 async fn redrive_pod(
     pod_key: &str,
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     in_flight: &Arc<Mutex<HashSet<String>>>,
     tally: &Arc<Mutex<NodeTally>>,
 ) {
@@ -729,7 +697,7 @@ async fn redrive_pod(
         return;
     };
     let path = format!("/api/v1/namespaces/{namespace}/pods/{pod_name}");
-    let Ok((status, body)) = http_get(connector, server, &path).await else {
+    let Ok((status, body)) = http_get(client, &path).await else {
         return;
     };
     if !status.is_success() {
@@ -740,8 +708,7 @@ async fn redrive_pod(
     };
     handle_pod_event(
         serde_json::json!({"type": "MODIFIED", "object": object}),
-        connector,
-        server,
+        client,
         in_flight,
         tally,
     );
@@ -786,8 +753,7 @@ fn is_initial_events_end_bookmark(event: &serde_json::Value) -> bool {
 /// a test can shrink it to a few milliseconds instead of waiting out the
 /// real 30s cadence to prove the gate holds across several ticks.
 async fn run_resync_loop(
-    connector: TlsConnector,
-    server: String,
+    client: ApiClient,
     in_flight: Arc<Mutex<HashSet<String>>>,
     tally: Arc<Mutex<NodeTally>>,
     mut synced_rx: tokio::sync::watch::Receiver<bool>,
@@ -796,7 +762,7 @@ async fn run_resync_loop(
     let _ = synced_rx.wait_for(|synced| *synced).await;
     loop {
         tokio::time::sleep(interval).await;
-        let _ = resync_once(&connector, &server, &in_flight, &tally, false).await;
+        let _ = resync_once(&client, &in_flight, &tally, false).await;
     }
 }
 
@@ -805,13 +771,12 @@ async fn run_resync_loop(
 /// are skipped; the periodic resync passes `false` and re-attempts them all.
 /// Returns the time until the earliest skipped backoff expires.
 async fn resync_once(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     in_flight: &Arc<Mutex<HashSet<String>>>,
     tally: &Arc<Mutex<NodeTally>>,
     respect_backoff: bool,
 ) -> Option<std::time::Duration> {
-    let (status, body) = match http_get(connector, server, RESYNC_PODS_PATH).await {
+    let (status, body) = match http_get(client, RESYNC_PODS_PATH).await {
         Ok(resp) => resp,
         Err(e) => {
             error!("resync: GET {RESYNC_PODS_PATH} failed: {e}");
@@ -846,7 +811,7 @@ async fn resync_once(
         in_flight_snapshot.extend(backed_off.into_iter().map(|(key, _)| key));
     }
     for event in pods_needing_resync(&list.items, &in_flight_snapshot) {
-        handle_pod_event(event, connector, server, in_flight, tally);
+        handle_pod_event(event, client, in_flight, tally);
     }
     earliest_expiry
 }
@@ -863,8 +828,7 @@ const REQUEUE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(1
 /// unscheduled pods per debounced burst, and `handle_pod_event`'s `in_flight`
 /// dedup bounds the rest. Gated on the pod cache like `run_resync_loop`.
 async fn run_requeue_loop(
-    connector: TlsConnector,
-    server: String,
+    client: ApiClient,
     in_flight: Arc<Mutex<HashSet<String>>>,
     tally: Arc<Mutex<NodeTally>>,
     mut synced_rx: tokio::sync::watch::Receiver<bool>,
@@ -877,7 +841,7 @@ async fn run_requeue_loop(
         tokio::time::sleep(REQUEUE_DEBOUNCE).await;
         // An event that lands while a pod is backing off is swallowed above;
         // re-wake once the backoff expires so it is not left to the resync.
-        let wait = resync_once(&connector, &server, &in_flight, &tally, true).await;
+        let wait = resync_once(&client, &in_flight, &tally, true).await;
         if let Some(old) = rearm.take() {
             old.abort();
         }
@@ -901,8 +865,7 @@ async fn run_requeue_loop(
 /// concurrent `bind_pod` for a pod the watch is already scheduling.
 fn handle_pod_event(
     event: serde_json::Value,
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     in_flight: &Arc<Mutex<HashSet<String>>>,
     tally: &Arc<Mutex<NodeTally>>,
 ) {
@@ -921,14 +884,12 @@ fn handle_pod_event(
         .expect("tally lock poisoned")
         .apply_event(&event);
     for (pending, node_name) in ready_deferred_binds {
-        let connector_clone = connector.clone();
-        let server_clone = server.to_string();
+        let client_clone = client.clone();
         let tally_clone = tally.clone();
         let in_flight_clone = in_flight.clone();
         tokio::spawn(async move {
             attempt_deferred_bind(
-                &connector_clone,
-                &server_clone,
+                &client_clone,
                 &tally_clone,
                 &in_flight_clone,
                 pending,
@@ -944,12 +905,10 @@ fn handle_pod_event(
     // {type: PodScheduled, reason: SchedulingGated}, not just "unscheduled")
     // times out even though the pod correctly stays Pending.
     if let Some(gated) = scheduling_gate_status_patch(&event) {
-        let connector_clone = connector.clone();
-        let server_clone = server.to_string();
+        let client_clone = client.clone();
         tokio::spawn(async move {
             if let Err(e) = patch_pod_status(
-                &connector_clone,
-                &server_clone,
+                &client_clone,
                 &gated.namespace,
                 &gated.pod_name,
                 &gated.patch,
@@ -990,8 +949,7 @@ fn handle_pod_event(
     );
 
     // Schedule asynchronously — spawn a task so we don't block the stream.
-    let connector_clone = connector.clone();
-    let server_clone = server.to_string();
+    let client_clone = client.clone();
     let in_flight_clone = in_flight.clone();
     let tally_clone = tally.clone();
     tokio::spawn(async move {
@@ -1004,15 +962,7 @@ fn handle_pod_event(
         // follows, since getting the pod running matters more than tidying up
         // a status message.
         if let Some(reset) = stale_gate_reset {
-            if let Err(e) = patch_pod_status(
-                &connector_clone,
-                &server_clone,
-                &namespace,
-                &pod_name,
-                &reset,
-            )
-            .await
-            {
+            if let Err(e) = patch_pod_status(&client_clone, &namespace, &pod_name, &reset).await {
                 error!(
                     "failed to clear stale SchedulingGated status for {namespace}/{pod_name}: {e}"
                 );
@@ -1036,8 +986,7 @@ fn handle_pod_event(
         // re-GETting the same PVCs/PVs.
         if !pending.pvc_names.is_empty() {
             let pvc_info = match fetch_pvc_binding_info_batch(
-                &connector_clone,
-                &server_clone,
+                &client_clone,
                 &namespace,
                 &pending.pvc_names,
             )
@@ -1092,21 +1041,14 @@ fn handle_pod_event(
                 // is negligible.
                 let message = format!(r#"persistentvolumeclaim "{missing}" not found"#);
                 if let Some(patch) = failed_scheduling_status_patch(&event, &message) {
-                    if let Err(patch_err) = patch_pod_status(
-                        &connector_clone,
-                        &server_clone,
-                        &namespace,
-                        &pod_name,
-                        &patch,
-                    )
-                    .await
+                    if let Err(patch_err) =
+                        patch_pod_status(&client_clone, &namespace, &pod_name, &patch).await
                     {
                         error!("failed to set PodScheduled=False status for {key}: {patch_err}");
                     }
                 }
                 if let Err(e) = emit_scheduling_event(
-                    &connector_clone,
-                    &server_clone,
+                    &client_clone,
                     &namespace,
                     &pod_name,
                     "FailedScheduling",
@@ -1132,13 +1074,7 @@ fn handle_pod_event(
                 .map(|info| info.volume_name.clone())
                 .filter(|name| !name.is_empty())
                 .collect();
-            let pv_info = match fetch_pv_info_batch(
-                &connector_clone,
-                &server_clone,
-                &bound_volume_names,
-            )
-            .await
-            {
+            let pv_info = match fetch_pv_info_batch(&client_clone, &bound_volume_names).await {
                 Ok(info) => info,
                 Err(e) => {
                     error!(
@@ -1163,14 +1099,8 @@ fn handle_pod_event(
             // driver never gets its per-driver volume count populated, so
             // `csi_volume_limits_fit` always sees an empty want-set and the
             // pod is bound even past the node's advertised attach limit.
-            match fetch_csi_volume_counts(
-                &connector_clone,
-                &server_clone,
-                &pvc_info,
-                &pv_info,
-                &pending.pvc_names,
-            )
-            .await
+            match fetch_csi_volume_counts(&client_clone, &pvc_info, &pv_info, &pending.pvc_names)
+                .await
             {
                 Ok(counts) => pending.csi_volume_counts = counts,
                 Err(e) => {
@@ -1199,13 +1129,7 @@ fn handle_pod_event(
             // driver never registered — the AnyVolumeDataSource populate-pod
             // hang this predicate exists to close (see
             // `fetch_unbound_csi_pvc_drivers`'s doc comment).
-            match fetch_unbound_csi_pvc_drivers(
-                &connector_clone,
-                &server_clone,
-                &pvc_info,
-                &pending.pvc_names,
-            )
-            .await
+            match fetch_unbound_csi_pvc_drivers(&client_clone, &pvc_info, &pending.pvc_names).await
             {
                 Ok(drivers) => pending.unbound_csi_pvc_drivers.extend(drivers),
                 Err(e) => {
@@ -1258,8 +1182,7 @@ fn handle_pod_event(
                     // up: evict lower-priority pods to make room rather than
                     // leaving a higher-priority pod Pending forever.
                     match preempt_and_pick_node(
-                        &connector_clone,
-                        &server_clone,
+                        &client_clone,
                         &pending,
                         &tally_clone,
                         &namespace,
@@ -1305,7 +1228,7 @@ fn handle_pod_event(
                     }
                 }
             };
-            match bind_reserved_node(&connector_clone, &server_clone, &tally_clone, &pending, &node)
+            match bind_reserved_node(&client_clone, &tally_clone, &pending, &node)
                 .await
             {
                 Ok(()) => SchedulingOutcome::Done(Ok(node)),
@@ -1376,14 +1299,8 @@ fn handle_pod_event(
                 // pod that keeps failing identically must NOT keep
                 // self-retriggering via its own PATCH's watch echo.
                 if let Some(patch) = failed_scheduling_status_patch(&event, &message) {
-                    if let Err(patch_err) = patch_pod_status(
-                        &connector_clone,
-                        &server_clone,
-                        &namespace,
-                        &pod_name,
-                        &patch,
-                    )
-                    .await
+                    if let Err(patch_err) =
+                        patch_pod_status(&client_clone, &namespace, &pod_name, &patch).await
                     {
                         error!("failed to set PodScheduled=False status for {key}: {patch_err}");
                     }
@@ -1403,8 +1320,7 @@ fn handle_pod_event(
             return;
         }
         if let Err(e) = emit_scheduling_event(
-            &connector_clone,
-            &server_clone,
+            &client_clone,
             &namespace,
             &pod_name,
             reason,
@@ -1416,6 +1332,23 @@ fn handle_pod_event(
             error!("failed to emit {reason} event for {key}: {e}");
         }
     });
+}
+
+/// The scheduler's single API client, built once from `kubeconfig_path` and shared by
+/// every request and watch reconnect so rotated client certs and CA bundles are
+/// picked up in place (file-path kubeconfigs) without a restart. `server_override`
+/// replaces the kubeconfig's server address.
+pub fn build_client(
+    kubeconfig_path: &str,
+    server_override: Option<&str>,
+    reload: Option<std::time::Duration>,
+) -> anyhow::Result<ApiClient> {
+    let mut client = kubeconfig_client_with_reload(kubeconfig_path, reload)?;
+    if let Some(server_override) = server_override {
+        info!("API server overridden to {server_override}");
+        client.server = server_override.to_string();
+    }
+    Ok(Arc::new(client))
 }
 
 /// Run the scheduler's watch/schedule loop until the process is killed — this call never
@@ -1431,16 +1364,12 @@ pub async fn run_scheduler(
     kubeconfig_path: &str,
     server_override: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut creds = parse_kubeconfig(kubeconfig_path)?;
-    if let Some(server_override) = server_override {
-        info!("API server overridden to {server_override}");
-        creds.server = server_override.to_string();
-    }
-
-    let server = creds.server.clone();
-    info!("connecting to API server at {server}");
-
-    let connector = build_tls_connector(&creds)?;
+    let client = build_client(
+        kubeconfig_path,
+        server_override,
+        Some(DEFAULT_RELOAD_INTERVAL),
+    )?;
+    info!("connecting to API server at {}", client.server);
 
     // in_flight tracks pod keys ("namespace/name") for which a bind task is already
     // running. Two rapid ADDED/MODIFIED events for the same pod must not spawn two
@@ -1488,8 +1417,7 @@ pub async fn run_scheduler(
 
     let requeue = Arc::new(tokio::sync::Notify::new());
     tokio::spawn(run_requeue_loop(
-        connector.clone(),
-        server.clone(),
+        client.clone(),
         in_flight.clone(),
         tally.clone(),
         pods_synced_rx.clone(),
@@ -1500,8 +1428,7 @@ pub async fn run_scheduler(
     // `run_resync_loop`'s doc comment for what it does and why it is gated
     // on the pod watch's own initial sync (itself after `caches_synced`).
     tokio::spawn(run_resync_loop(
-        connector.clone(),
-        server.clone(),
+        client.clone(),
         in_flight.clone(),
         tally.clone(),
         pods_synced_rx,
@@ -1522,8 +1449,7 @@ pub async fn run_scheduler(
     // connector/server to act on — context this generic loop's `fn(&mut
     // NodeTally, &Value)` apply signature has no room for.
     tokio::spawn(run_pvc_watch_loop(
-        connector.clone(),
-        server.clone(),
+        client.clone(),
         tally.clone(),
         in_flight.clone(),
         pvc_ready_tx,
@@ -1574,8 +1500,7 @@ pub async fn run_scheduler(
         ),
     ] {
         tokio::spawn(run_cache_watch_loop(
-            connector.clone(),
-            server.clone(),
+            client.clone(),
             tally.clone(),
             path,
             apply,
@@ -1599,15 +1524,13 @@ pub async fn run_scheduler(
         info!("starting pod watch on {POD_WATCH_PATH}");
         let path = POD_WATCH_PATH;
         // Collect events; for each ADDED/MODIFIED pod with empty nodeName, schedule it.
-        // We clone connector per loop iteration (cheap Arc clone inside).
-        let connector_ref = &connector;
-        let server_ref = &server;
+        let client_ref = &client;
         let in_flight_ref = &in_flight;
         let tally_ref = &tally;
         let pods_synced_tx_ref = &pods_synced_tx;
         let mut replay = PodReplay::default();
 
-        let result = stream_watch_events(connector_ref, server_ref, path, |event| {
+        let result = stream_watch_events(client_ref, path, |event| {
             let events = match replay.absorb(event, tally_ref) {
                 PodReplayStep::Deferred => return,
                 PodReplayStep::Live(event) => vec![event],
@@ -1640,7 +1563,7 @@ pub async fn run_scheduler(
                 }
             };
             for event in events {
-                handle_pod_event(event, connector_ref, server_ref, in_flight_ref, tally_ref);
+                handle_pod_event(event, client_ref, in_flight_ref, tally_ref);
             }
         })
         .await;
@@ -2048,14 +1971,16 @@ mod tests {
             client_cert: cert.der().clone(),
             client_key: PrivateKeyDer::Pkcs8(key.serialize_der().into()),
         };
-        let connector = build_tls_connector(&creds).expect("build connector");
+        let client = crate::fixed_client(
+            politeia::build_tls_connector(&creds).expect("build connector"),
+            creds.server.clone(),
+        );
 
         let (node_cache_synced_tx, node_cache_synced_rx) = tokio::sync::watch::channel(false);
         let in_flight = Arc::new(Mutex::new(HashSet::new()));
         let tally = Arc::new(Mutex::new(NodeTally::default()));
         tokio::spawn(run_resync_loop(
-            connector,
-            creds.server,
+            client,
             in_flight,
             tally,
             node_cache_synced_rx,
@@ -2202,8 +2127,10 @@ mod tests {
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-        let server = format!("https://127.0.0.1:{port}");
+        let client = crate::fixed_client(
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            format!("https://127.0.0.1:{port}"),
+        );
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
@@ -2270,13 +2197,7 @@ mod tests {
         // to preemption, which evicts "victim" on worker-0 and defers the
         // bind. Wait for that eviction to actually land — this is the exact
         // "victims evicted, bind not yet attempted" window the race lived in.
-        handle_pod_event(
-            pod_added_event.clone(),
-            &connector,
-            &server,
-            &in_flight,
-            &tally,
-        );
+        handle_pod_event(pod_added_event.clone(), &client, &in_flight, &tally);
         wait_until(
             || delete_victim_count.load(Ordering::SeqCst) >= 1,
             "the first attempt's preemption to evict the legitimate victim",
@@ -2294,7 +2215,7 @@ mod tests {
         // is still in `in_flight` and this is deduped synchronously, right
         // here, before any network call. Without the fix, this spawns its
         // own preempt_and_pick_node cycle.
-        handle_pod_event(pod_added_event, &connector, &server, &in_flight, &tally);
+        handle_pod_event(pod_added_event, &client, &in_flight, &tally);
 
         // Give a would-be second preemption cycle (the bug) time to run to
         // completion against the in-process mock server — everything here is
@@ -2304,20 +2225,8 @@ mod tests {
         // Now confirm each victim's real removal, exactly as a live
         // kubelet's own DELETED watch event would — this is what resolves
         // whichever `PreemptionWaiters` plan(s) are actually outstanding.
-        handle_pod_event(
-            deleted_event("victim"),
-            &connector,
-            &server,
-            &in_flight,
-            &tally,
-        );
-        handle_pod_event(
-            deleted_event("bystander"),
-            &connector,
-            &server,
-            &in_flight,
-            &tally,
-        );
+        handle_pod_event(deleted_event("victim"), &client, &in_flight, &tally);
+        handle_pod_event(deleted_event("bystander"), &client, &in_flight, &tally);
         wait_until(
             || bind_count.load(Ordering::SeqCst) >= 1,
             "the deferred bind to actually complete",
@@ -2378,7 +2287,7 @@ mod tests {
     async fn spawn_bind_outcome_mock_server(
         bind_status: u16,
         bind_body: &'static str,
-    ) -> (TlsConnector, String, Arc<BindOutcomeCounts>) {
+    ) -> (ApiClient, Arc<BindOutcomeCounts>) {
         use rcgen::{CertificateParams, KeyPair, SanType};
         use rustls::pki_types::PrivateKeyDer;
         use std::sync::atomic::Ordering;
@@ -2472,10 +2381,12 @@ mod tests {
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-        let server = format!("https://127.0.0.1:{port}");
+        let client = crate::fixed_client(
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            format!("https://127.0.0.1:{port}"),
+        );
 
-        (connector, server, counts)
+        (client, counts)
     }
 
     /// One unscheduled pod, shared by both bind-outcome tests: no
@@ -2502,7 +2413,7 @@ mod tests {
         // The exact 409 body the apiserver's own binding handler returns
         // when `spec.nodeName` is already set — see
         // `crates/apiserver/src/handlers/pods.rs`'s `bind_pod`.
-        let (connector, server, counts) = spawn_bind_outcome_mock_server(
+        let (client, counts) = spawn_bind_outcome_mock_server(
             409,
             r#"{"kind":"Status","status":"Failure","message":"Pod \"web-0\" is already assigned to node \"worker-0\"","reason":"Conflict","code":409}"#,
         )
@@ -2521,13 +2432,7 @@ mod tests {
                 "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
             }));
 
-        handle_pod_event(
-            bind_outcome_test_pod_event(),
-            &connector,
-            &server,
-            &in_flight,
-            &tally,
-        );
+        handle_pod_event(bind_outcome_test_pod_event(), &client, &in_flight, &tally);
         wait_until(
             || counts.bind.load(Ordering::SeqCst) >= 1,
             "the bind attempt to reach the mock server",
@@ -2575,7 +2480,7 @@ mod tests {
         // before `BindError::AlreadyAssigned` existed. Without this test, an
         // over-broadened classification could silently swallow a real
         // scheduling failure too.
-        let (connector, server, counts) = spawn_bind_outcome_mock_server(
+        let (client, counts) = spawn_bind_outcome_mock_server(
             500,
             r#"{"kind":"Status","status":"Failure","message":"internal error","reason":"InternalError","code":500}"#,
         )
@@ -2594,13 +2499,7 @@ mod tests {
                 "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
             }));
 
-        handle_pod_event(
-            bind_outcome_test_pod_event(),
-            &connector,
-            &server,
-            &in_flight,
-            &tally,
-        );
+        handle_pod_event(bind_outcome_test_pod_event(), &client, &in_flight, &tally);
         wait_until(
             || counts.event.load(Ordering::SeqCst) >= 1,
             "the FailedScheduling event for a genuine bind failure",
@@ -2657,8 +2556,7 @@ mod tests {
     /// Node candidates come from the caller seeding `NodeTally` directly
     /// (`pick_node` reads the node cache, not a live GET), not from anything
     /// this server serves.
-    async fn spawn_volume_binding_mock_server() -> (TlsConnector, String, Arc<VolumeBindingRecorder>)
-    {
+    async fn spawn_volume_binding_mock_server() -> (ApiClient, Arc<VolumeBindingRecorder>) {
         use rcgen::{CertificateParams, KeyPair, SanType};
         use rustls::pki_types::PrivateKeyDer;
         use std::sync::atomic::Ordering;
@@ -2804,17 +2702,19 @@ mod tests {
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-        let server = format!("https://127.0.0.1:{port}");
+        let client = crate::fixed_client(
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            format!("https://127.0.0.1:{port}"),
+        );
 
-        (connector, server, recorder)
+        (client, recorder)
     }
 
     #[tokio::test]
     async fn bind_stamps_selected_node_on_unbound_wait_for_first_consumer_pvc_only() {
         use std::sync::atomic::Ordering;
 
-        let (connector, server, recorder) = spawn_volume_binding_mock_server().await;
+        let (client, recorder) = spawn_volume_binding_mock_server().await;
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
@@ -2847,7 +2747,7 @@ mod tests {
             }
         });
 
-        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        handle_pod_event(pod_event, &client, &in_flight, &tally);
         wait_until(
             || recorder.bind_count.load(Ordering::SeqCst) >= 1,
             "the pod bind to actually complete",
@@ -2909,14 +2809,13 @@ mod tests {
     async fn spawn_missing_referenced_pvc_mock_server(
         flip_after: usize,
     ) -> (
-        TlsConnector,
-        String,
+        ApiClient,
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<Mutex<Vec<String>>>,
     ) {
-        let (connector, server, bind_count, bound_nodes, _, _) =
+        let (client, bind_count, bound_nodes, _, _) =
             spawn_counting_pvc_mock_server(flip_after).await;
-        (connector, server, bind_count, bound_nodes)
+        (client, bind_count, bound_nodes)
     }
 
     /// `spawn_missing_referenced_pvc_mock_server`, additionally returning the
@@ -2925,8 +2824,7 @@ mod tests {
     async fn spawn_counting_pvc_mock_server(
         flip_after: usize,
     ) -> (
-        TlsConnector,
-        String,
+        ApiClient,
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<Mutex<Vec<String>>>,
         Arc<std::sync::atomic::AtomicUsize>,
@@ -3121,17 +3019,12 @@ mod tests {
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-        let server = format!("https://127.0.0.1:{port}");
+        let client = crate::fixed_client(
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            format!("https://127.0.0.1:{port}"),
+        );
 
-        (
-            connector,
-            server,
-            bind_count,
-            bound_nodes,
-            status_patches,
-            event_posts,
-        )
+        (client, bind_count, bound_nodes, status_patches, event_posts)
     }
 
     #[tokio::test]
@@ -3157,8 +3050,7 @@ mod tests {
         // permanently dropped this pod from resync (e.g. a
         // `pods_needing_resync` filter regression) would leave `bind_count`
         // at 0 forever and this test would time out instead of passing.
-        let (connector, server, bind_count, bound_nodes) =
-            spawn_missing_referenced_pvc_mock_server(2).await;
+        let (client, bind_count, bound_nodes) = spawn_missing_referenced_pvc_mock_server(2).await;
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
@@ -3209,7 +3101,7 @@ mod tests {
             }
         });
 
-        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        handle_pod_event(pod_event, &client, &in_flight, &tally);
         wait_until(
             || {
                 !in_flight
@@ -3250,8 +3142,7 @@ mod tests {
         // `run_resync_loop` directly in a test.
         let (_node_cache_synced_tx, node_cache_synced_rx) = tokio::sync::watch::channel(true);
         tokio::spawn(run_resync_loop(
-            connector.clone(),
-            server.clone(),
+            client.clone(),
             in_flight.clone(),
             tally.clone(),
             node_cache_synced_rx,
@@ -3297,8 +3188,7 @@ mod tests {
     async fn redrive_pod_binds_the_deferred_pod_once_its_pvc_appears() {
         use std::sync::atomic::Ordering;
 
-        let (connector, server, bind_count, bound_nodes) =
-            spawn_missing_referenced_pvc_mock_server(1).await;
+        let (client, bind_count, bound_nodes) = spawn_missing_referenced_pvc_mock_server(1).await;
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
@@ -3331,7 +3221,7 @@ mod tests {
             }
         });
 
-        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        handle_pod_event(pod_event, &client, &in_flight, &tally);
         wait_until(
             || {
                 !in_flight
@@ -3348,7 +3238,7 @@ mod tests {
             "the pod must still be deferred (PVC still 404s) before redrive_pod is ever called"
         );
 
-        redrive_pod("default/web-0", &connector, &server, &in_flight, &tally).await;
+        redrive_pod("default/web-0", &client, &in_flight, &tally).await;
 
         wait_until(
             || bind_count.load(Ordering::SeqCst) >= 1,
@@ -3378,8 +3268,7 @@ mod tests {
     async fn node_change_requeues_pending_pod_without_waiting_for_the_resync_tick() {
         use std::sync::atomic::Ordering;
 
-        let (connector, server, bind_count, bound_nodes) =
-            spawn_missing_referenced_pvc_mock_server(0).await;
+        let (client, bind_count, bound_nodes) = spawn_missing_referenced_pvc_mock_server(0).await;
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
         let node_event = |cpu: &str| {
@@ -3413,7 +3302,7 @@ mod tests {
                 "status": {}
             }
         });
-        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        handle_pod_event(pod_event, &client, &in_flight, &tally);
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(
             bind_count.load(Ordering::SeqCst),
@@ -3424,8 +3313,7 @@ mod tests {
         let requeue = Arc::new(tokio::sync::Notify::new());
         let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
         tokio::spawn(run_requeue_loop(
-            connector.clone(),
-            server.clone(),
+            client.clone(),
             in_flight.clone(),
             tally.clone(),
             synced_rx,
@@ -3453,8 +3341,7 @@ mod tests {
     }
 
     type PendingFixture = (
-        TlsConnector,
-        String,
+        ApiClient,
         Arc<Mutex<HashSet<String>>>,
         Arc<Mutex<NodeTally>>,
         Arc<std::sync::atomic::AtomicUsize>,
@@ -3475,8 +3362,7 @@ mod tests {
     async fn pod_failed_once_for_cpu() -> PendingFixture {
         use std::sync::atomic::Ordering;
 
-        let (connector, server, bind_count, _bound, patches, events) =
-            spawn_counting_pvc_mock_server(0).await;
+        let (client, bind_count, _bound, patches, events) = spawn_counting_pvc_mock_server(0).await;
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
         {
@@ -3503,15 +3389,13 @@ mod tests {
                 "status": {}
             }
         });
-        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        handle_pod_event(pod_event, &client, &in_flight, &tally);
         wait_until(
             || events.load(Ordering::SeqCst) >= 1,
             "the first FailedScheduling event",
         )
         .await;
-        (
-            connector, server, in_flight, tally, bind_count, patches, events,
-        )
+        (client, in_flight, tally, bind_count, patches, events)
     }
 
     /// Under PV/PVC churn every event wakes the requeue loop; without a
@@ -3521,13 +3405,11 @@ mod tests {
     async fn event_burst_attempts_unschedulable_pod_at_most_twice_and_posts_one_event() {
         use std::sync::atomic::Ordering;
 
-        let (connector, server, in_flight, tally, _bind, patches, events) =
-            pod_failed_once_for_cpu().await;
+        let (client, in_flight, tally, _bind, patches, events) = pod_failed_once_for_cpu().await;
         let requeue = Arc::new(tokio::sync::Notify::new());
         let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
         tokio::spawn(run_requeue_loop(
-            connector,
-            server,
+            client,
             in_flight,
             tally,
             synced_rx,
@@ -3559,13 +3441,12 @@ mod tests {
     async fn node_change_after_backoff_expiry_binds_promptly() {
         use std::sync::atomic::Ordering;
 
-        let (connector, server, in_flight, tally, bind_count, _patches, _events) =
+        let (client, in_flight, tally, bind_count, _patches, _events) =
             pod_failed_once_for_cpu().await;
         let requeue = Arc::new(tokio::sync::Notify::new());
         let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
         tokio::spawn(run_requeue_loop(
-            connector,
-            server,
+            client,
             in_flight,
             tally.clone(),
             synced_rx,
@@ -3595,7 +3476,7 @@ mod tests {
     async fn backed_off_pod_is_retried_by_the_rearm_timer_without_further_events() {
         use std::sync::atomic::Ordering;
 
-        let (connector, server, in_flight, tally, bind_count, _patches, _events) =
+        let (client, in_flight, tally, bind_count, _patches, _events) =
             pod_failed_once_for_cpu().await;
         assert!(tally
             .lock()
@@ -3604,8 +3485,7 @@ mod tests {
         let requeue = Arc::new(tokio::sync::Notify::new());
         let (_synced_tx, synced_rx) = tokio::sync::watch::channel(true);
         tokio::spawn(run_requeue_loop(
-            connector,
-            server,
+            client,
             in_flight,
             tally,
             synced_rx,
@@ -3839,13 +3719,15 @@ mod tests {
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
+        let client = crate::fixed_client(
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            format!("https://127.0.0.1:{port}"),
+        );
 
         let requeue = Arc::new(tokio::sync::Notify::new());
         let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(run_pvc_watch_loop(
-            connector,
-            format!("https://127.0.0.1:{port}"),
+            client,
             Arc::new(Mutex::new(NodeTally::default())),
             Arc::new(Mutex::new(HashSet::new())),
             ready_tx,
@@ -3870,12 +3752,8 @@ mod tests {
     /// `POST .../events` request body, so a test can assert on the
     /// FailedScheduling event and PodScheduled=False condition the
     /// missing-PVC branch must emit for this case.
-    async fn spawn_permanently_missing_pvc_mock_server() -> (
-        TlsConnector,
-        String,
-        Arc<Mutex<Vec<String>>>,
-        Arc<Mutex<Vec<String>>>,
-    ) {
+    async fn spawn_permanently_missing_pvc_mock_server(
+    ) -> (ApiClient, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
         use rcgen::{CertificateParams, KeyPair, SanType};
         use rustls::pki_types::PrivateKeyDer;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3996,10 +3874,12 @@ mod tests {
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-        let server = format!("https://127.0.0.1:{port}");
+        let client = crate::fixed_client(
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            format!("https://127.0.0.1:{port}"),
+        );
 
-        (connector, server, status_patches, events)
+        (client, status_patches, events)
     }
 
     /// Upstream visibility for a PVC that never appears at all (typo'd
@@ -4013,8 +3893,7 @@ mod tests {
     /// conformance test's condition-message assertion) would look for.
     #[tokio::test]
     async fn missing_pvc_branch_emits_failed_scheduling_event_and_condition() {
-        let (connector, server, status_patches, events) =
-            spawn_permanently_missing_pvc_mock_server().await;
+        let (client, status_patches, events) = spawn_permanently_missing_pvc_mock_server().await;
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
@@ -4040,7 +3919,7 @@ mod tests {
             }
         });
 
-        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        handle_pod_event(pod_event, &client, &in_flight, &tally);
         wait_until(
             || !events.lock().expect("events lock poisoned").is_empty(),
             "a FailedScheduling event to be posted for a pod whose referenced PVC never appears",
@@ -4088,8 +3967,7 @@ mod tests {
     #[tokio::test]
     async fn missing_pvc_waiter_holds_one_entry_per_pod_across_repeated_resync_ticks_and_drops_on_pod_delete(
     ) {
-        let (connector, server, _status_patches, _events) =
-            spawn_permanently_missing_pvc_mock_server().await;
+        let (client, _status_patches, _events) = spawn_permanently_missing_pvc_mock_server().await;
 
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
@@ -4119,7 +3997,7 @@ mod tests {
         // exactly what production's 30s RESYNC_INTERVAL loop does forever
         // for a pod stuck this way.
         for _ in 0..5 {
-            handle_pod_event(pod_event.clone(), &connector, &server, &in_flight, &tally);
+            handle_pod_event(pod_event.clone(), &client, &in_flight, &tally);
             wait_until(
                 || {
                     !in_flight
@@ -4149,7 +4027,7 @@ mod tests {
         // Register the waiter again, then delete the pod — its own entry
         // must be dropped, or it would sit here forever waiting on a PVC it
         // can never actually use once the pod referencing it is gone.
-        handle_pod_event(pod_event.clone(), &connector, &server, &in_flight, &tally);
+        handle_pod_event(pod_event.clone(), &client, &in_flight, &tally);
         wait_until(
             || {
                 !in_flight
@@ -4170,8 +4048,7 @@ mod tests {
                     "status": {}
                 }
             }),
-            &connector,
-            &server,
+            &client,
             &in_flight,
             &tally,
         );

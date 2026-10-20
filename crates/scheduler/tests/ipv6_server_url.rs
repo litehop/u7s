@@ -89,11 +89,10 @@ async fn scheduler_get_reaches_apiserver_at_ipv6_literal_with_ip_san_cert() {
     );
     let path = std::env::temp_dir().join(format!("u7s-sched-ipv6-{}.yaml", std::process::id()));
     std::fs::write(&path, yaml).unwrap();
-    let creds = politeia::parse_kubeconfig(path.to_str().unwrap()).expect("parse kubeconfig");
+    let client = politeia::kubeconfig_client(path.to_str().unwrap()).expect("build client");
     let _ = std::fs::remove_file(&path);
-    let connector = politeia::build_tls_connector(&creds).expect("build connector");
 
-    let (status, body) = u7s_scheduler::http_get(&connector, &creds.server, "/healthz")
+    let (status, body) = u7s_scheduler::http_get(&client, "/healthz")
         .await
         .expect("GET to an IPv6-literal server URL must verify against the IP SAN");
     assert_eq!(status, hyper::StatusCode::OK);
