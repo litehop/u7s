@@ -113,6 +113,7 @@ pub(crate) async fn core_list_resource<S: Store>(
                     kind: watch_kind,
                     from_revision: from_rv,
                     initial_items: initial,
+                    explicit_no_initial_events: query.send_initial_events == Some(false),
                     label_selector: query.label_selector,
                     field_selector: query.field_selector,
                     allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),

@@ -2509,6 +2509,7 @@ pub async fn list_cr<S: Store>(
                         kind: watch_kind,
                         from_revision: query.resource_version.unwrap_or(0),
                         initial_items: Some((vec![], 0)),
+                        explicit_no_initial_events: false,
                         label_selector: query.label_selector,
                         // No CRD is left to declare selectable fields, and the stream is empty.
                         field_selector: None,
@@ -2578,6 +2579,7 @@ pub async fn list_cr<S: Store>(
                 kind: watch_kind,
                 from_revision: query.resource_version.unwrap_or(0),
                 initial_items,
+                explicit_no_initial_events: query.send_initial_events == Some(false),
                 label_selector: query.label_selector,
                 field_selector: query.field_selector,
                 allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
@@ -3521,6 +3523,7 @@ pub async fn list_cr_namespaced<S: Store>(
                         kind: watch_kind,
                         from_revision: query.resource_version.unwrap_or(0),
                         initial_items: Some((vec![], 0)),
+                        explicit_no_initial_events: false,
                         label_selector: query.label_selector,
                         // No CRD is left to declare selectable fields, and the stream is empty.
                         field_selector: None,
@@ -3591,6 +3594,7 @@ pub async fn list_cr_namespaced<S: Store>(
                 kind: watch_kind,
                 from_revision: query.resource_version.unwrap_or(0),
                 initial_items,
+                explicit_no_initial_events: query.send_initial_events == Some(false),
                 label_selector: query.label_selector,
                 field_selector: query.field_selector,
                 allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
@@ -8166,6 +8170,97 @@ mod tests {
             !body_str.contains("\"gizmo-b\""),
             "gizmo-b converts to port=8080, which must NOT match the v2 selector port=80 \
              (got: {body_str})"
+        );
+    }
+
+    /// A CR watch with resourceVersion and sendInitialEvents both unset serves current state
+    /// as synthetic ADDED events; those must be converted to the requested version before the
+    /// field selector runs, exactly like LIST. Fails on revert of the conversion in
+    /// `watch_generic_impl`'s rv-unset branch: the raw v1 body has no `port`, so `port=80`
+    /// matches nothing and the watch delivers neither CR.
+    #[tokio::test]
+    async fn list_cr_namespaced_watch_rv_unset_converts_current_state_before_field_selector() {
+        use crate::handlers::crd;
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+
+        let state = make_state();
+        let ns = "default";
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            hostport_crd_bytes(&base_url),
+        )
+        .await
+        .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
+
+        for (name, host, port) in [("gizmo-a", "host1", "80"), ("gizmo-b", "host1", "8080")] {
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    HOSTPORT_CRD_GROUP.to_string(),
+                    "v2".to_string(),
+                    ns.to_string(),
+                    "gizmos".to_string(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                gizmo_v2_body(name, ns, host, port),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create {name} via v2 must succeed: {e:?}"));
+        }
+        let call_count_before_watch = call_count.load(Ordering::SeqCst);
+
+        let watch_query = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            field_selector: Some("port=80".to_string()),
+            timeout_seconds: Some(2),
+            ..no_watch_query()
+        };
+        let resp = list_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v2".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            watch_query,
+            "test-user".to_string(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v2 rv-unset watch must succeed, got {e:?}"));
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("watch stream must complete within 15 seconds")
+        .expect("collect watch stream body");
+        let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
+
+        assert!(
+            call_count.load(Ordering::SeqCst) > call_count_before_watch,
+            "stored v1 objects watched at v2 must go through the conversion webhook (got: {body_str})"
+        );
+        assert!(
+            body_str.contains("\"ADDED\"")
+                && body_str.contains("\"gizmo-a\"")
+                && body_str.contains("\"port\":\"80\""),
+            "gizmo-a must arrive converted to v2 (port present) (got: {body_str})"
+        );
+        assert!(
+            !body_str.contains("\"gizmo-b\""),
+            "gizmo-b converts to port=8080 and must not match port=80 (got: {body_str})"
         );
     }
 

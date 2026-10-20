@@ -534,6 +534,7 @@ pub async fn list_crds<S: Store>(
                 kind: watch_kind,
                 from_revision: query.resource_version.unwrap_or(0),
                 initial_items,
+                explicit_no_initial_events: query.send_initial_events == Some(false),
                 label_selector: query.label_selector,
                 field_selector: query.field_selector,
                 allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
