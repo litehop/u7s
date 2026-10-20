@@ -111,7 +111,7 @@ esac
 
 KCM_BINARY="\$CACHE_DIR/kube-controller-manager-\${K8S_VERSION}-linux-\${ARCH}"
 
-for f in "\$WORKDIR/kcm-kubeconfig" "\$WORKDIR/ca.crt" "\$WORKDIR/ca.key" "\$WORKDIR/sa.key"; do
+for f in "\$WORKDIR/kcm-kubeconfig" "\$WORKDIR/ca.crt" "\$WORKDIR/ca.key" "\$WORKDIR/ca-bundle.pem"; do
   if [ ! -f "\$f" ]; then
     echo "error: missing required file: \$f" >&2
     exit 1
@@ -132,6 +132,8 @@ TMPDIR_KCM="\$(mktemp -d)"
 openssl x509 -inform DER -in "\$WORKDIR/ca.crt" -out "\$TMPDIR_KCM/ca.pem"
 CA_CERT="\$TMPDIR_KCM/ca.pem"
 
+# The kubeconfig names its cert/key/CA files by absolute path under \$WORKDIR, so the
+# address-rewritten copy below still reads the files the apiserver re-issues in place.
 KUBECONFIG_FILE="\$WORKDIR/kcm-kubeconfig"
 if grep -qE "https://127\." "\$KUBECONFIG_FILE" && grep -q "host.lima.internal" /etc/hosts 2>/dev/null; then
   sed "s|https://127\.[0-9]*\.[0-9]*\.[0-9]*:[0-9]*|https://host.lima.internal:${PORT}|g" "\$KUBECONFIG_FILE" > "\$TMPDIR_KCM/kubeconfig"
@@ -155,8 +157,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --kubeconfig="\$KUBECONFIG_FILE" \\
   --cluster-signing-cert-file="\$CA_CERT" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
-  --service-account-private-key-file="\$WORKDIR/sa.key" \\
-  --root-ca-file="\$CA_CERT" \\
+  --root-ca-file="\$WORKDIR/ca-bundle.pem" \\
   --controllers='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller' \\
   --cluster-cidr=10.244.0.0/16 \\
   --allocate-node-cidrs=true \\

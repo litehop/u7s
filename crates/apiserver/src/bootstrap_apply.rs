@@ -13,7 +13,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use base64::Engine;
 
 /// `?fieldManager=` value stamped on every PATCH — distinguishes this applier's field
 /// ownership from kubectl/other controllers in `managedFields`, matching the upstream SSA
@@ -394,24 +393,21 @@ fn read_kubeconfig_creds(path: &Path) -> anyhow::Result<KubeconfigCreds> {
     let server = extract_kubeconfig_field(&raw, "server:")
         .context("bootstrap-installer kubeconfig missing server")?
         .to_owned();
-    let ca_data = extract_kubeconfig_field(&raw, "certificate-authority-data:")
-        .context("bootstrap-installer kubeconfig missing certificate-authority-data")?;
-    let cert_data = extract_kubeconfig_field(&raw, "client-certificate-data:")
-        .context("bootstrap-installer kubeconfig missing client-certificate-data")?;
-    let key_data = extract_kubeconfig_field(&raw, "client-key-data:")
-        .context("bootstrap-installer kubeconfig missing client-key-data")?;
+    let ca_path = extract_kubeconfig_field(&raw, "certificate-authority:")
+        .context("bootstrap-installer kubeconfig missing certificate-authority")?;
+    let cert_path = extract_kubeconfig_field(&raw, "client-certificate:")
+        .context("bootstrap-installer kubeconfig missing client-certificate")?;
+    let key_path = extract_kubeconfig_field(&raw, "client-key:")
+        .context("bootstrap-installer kubeconfig missing client-key")?;
 
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let ca_pem = b64
-        .decode(ca_data.trim())
-        .context("decode kubeconfig certificate-authority-data")?;
-    let mut identity_pem = b64
-        .decode(cert_data.trim())
-        .context("decode kubeconfig client-certificate-data")?;
-    identity_pem.extend(
-        b64.decode(key_data.trim())
-            .context("decode kubeconfig client-key-data")?,
-    );
+    let read = |what: &str, p: &str| {
+        std::fs::read(p).with_context(|| format!("reading bootstrap-installer {what} {p}"))
+    };
+    let ca_pem = read("certificate-authority", ca_path)?;
+    let mut identity_pem = read("client-certificate", cert_path)?;
+    if key_path != cert_path {
+        identity_pem.extend(read("client-key", key_path)?);
+    }
 
     Ok(KubeconfigCreds {
         server,
@@ -768,12 +764,20 @@ mod tests {
         cert_pem: &[u8],
         key_pem: &[u8],
     ) {
-        let b64 = base64::engine::general_purpose::STANDARD;
+        let dir = path.parent().expect("kubeconfig has a parent dir");
+        let (ca, cert, key) = (
+            dir.join("ca.pem"),
+            dir.join("cert.pem"),
+            dir.join("key.pem"),
+        );
+        std::fs::write(&ca, ca_pem).expect("write test CA");
+        std::fs::write(&cert, cert_pem).expect("write test cert");
+        std::fs::write(&key, key_pem).expect("write test key");
         let yaml = format!(
-            "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: {server}\n    certificate-authority-data: {}\n  name: u7s\nusers:\n- name: system:bootstrap-installer\n  user:\n    client-certificate-data: {}\n    client-key-data: {}\n",
-            b64.encode(ca_pem),
-            b64.encode(cert_pem),
-            b64.encode(key_pem),
+            "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: {server}\n    certificate-authority: {}\n  name: u7s\nusers:\n- name: system:bootstrap-installer\n  user:\n    client-certificate: {}\n    client-key: {}\n",
+            ca.display(),
+            cert.display(),
+            key.display(),
         );
         std::fs::write(path, yaml).expect("write test kubeconfig");
     }
@@ -889,10 +893,8 @@ mod tests {
         let kubeconfig_path = dir.join("bootstrap-installer-kubeconfig");
         crate::tls::write_component_kubeconfig(
             &kubeconfig_path.to_string_lossy(),
-            &tls,
             &args,
-            &tls.bootstrap_installer_cert_der,
-            &tls.bootstrap_installer_key_pem,
+            "bootstrap-installer",
             "system:bootstrap-installer",
         )
         .expect("write bootstrap-installer kubeconfig");
