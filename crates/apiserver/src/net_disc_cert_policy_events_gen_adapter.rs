@@ -8,6 +8,8 @@ use u7s_proto_generated::k8s::io::api::networking::v1 as networking_v1;
 use u7s_proto_generated::k8s::io::api::policy::v1 as policy_v1;
 use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
+use crate::core_gen_adapter::json_to_object_meta_proto;
+
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     crate::core_gen_adapter::gen_object_meta_to_json(meta)
 }
@@ -619,59 +621,6 @@ fn jstrmap(v: &serde_json::Value, key: &str) -> std::collections::HashMap<String
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
-    let meta = obj
-        .get("metadata")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let owner_references = meta
-        .get("ownerReferences")
-        .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|r| meta_v1::OwnerReference {
-                    api_version: jstr(r, "apiVersion"),
-                    kind: jstr(r, "kind"),
-                    name: jstr(r, "name"),
-                    uid: jstr(r, "uid"),
-                    controller: jbool(r, "controller"),
-                    block_owner_deletion: jbool(r, "blockOwnerDeletion"),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    meta_v1::ObjectMeta {
-        name: jstr(&meta, "name"),
-        generate_name: jstr(&meta, "generateName"),
-        namespace: jstr(&meta, "namespace"),
-        uid: jstr(&meta, "uid"),
-        resource_version: jstr(&meta, "resourceVersion"),
-        generation: meta.get("generation").and_then(|x| x.as_i64()),
-        labels: meta
-            .get("labels")
-            .and_then(|m| m.as_object())
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        annotations: meta
-            .get("annotations")
-            .and_then(|m| m.as_object())
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        owner_references,
-        finalizers: jstrs(&meta, "finalizers"),
-        managed_fields: crate::core_gen_adapter::json_to_managed_fields_proto(&meta),
-        ..Default::default()
-    }
 }
 
 fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
@@ -1818,6 +1767,40 @@ mod tests {
             "an explicit empty-string port name must round-trip as present-and-empty, not \
              vanish into a missing key (see mb9ed: a missing key reads as a *different* port \
              to kube-proxy's endpointslicecache.go than an empty-string name does)"
+        );
+    }
+
+    /// Both EndpointSlice encoders must carry every ObjectMeta field the descriptor defines
+    /// (managedFields included), or a protobuf client sees an object different from the JSON
+    /// view of it.
+    #[test]
+    fn encode_endpointslice_proto_gen_carries_every_object_meta_field() {
+        use crate::proto_descriptor::assert_encoder_carries_every_object_meta_field as check;
+        check(
+            "encode_endpointslice_proto_gen",
+            false,
+            encode_endpointslice_proto_gen,
+            |b| {
+                discovery_v1::EndpointSlice::decode(b)
+                    .unwrap()
+                    .metadata
+                    .unwrap()
+                    .encode_to_vec()
+            },
+        );
+        check(
+            "encode_endpointslicelist_proto_gen",
+            true,
+            encode_endpointslicelist_proto_gen,
+            |b| {
+                discovery_v1::EndpointSliceList::decode(b)
+                    .unwrap()
+                    .items
+                    .remove(0)
+                    .metadata
+                    .unwrap()
+                    .encode_to_vec()
+            },
         );
     }
 
