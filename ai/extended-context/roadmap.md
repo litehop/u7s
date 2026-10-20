@@ -88,17 +88,15 @@ Release-gate run 2026-10-15, peak PSS: kubelet 82-114 MiB, KCM 76-81, CRI-O
 75-84, apiserver 27-31; idle MemAvailable ~430 MiB on a 947 MiB VM.
 
 ### Release gate — FAILING (first verdict 2026-10-15)
-Every release must pass the 1 GiB / 1 vCPU burst test (no swap):
-WordPress+MariaDB, then 20- and 80-pod bursts. No separate alpha milestone;
-the first release is the first to clear it. Runs on a local Lima VM; ask the
-operator ahead for a quiet host window. Harness: `scripts/release-gate/`
-(PR #1807, hardening `mayor-6uez9`).
+Every release must pass the 1 GiB / 1 vCPU no-swap burst test: WordPress+MariaDB,
+then 20- and N-pod bursts. N = largest of 50, 40 passing 3/3 on a quiet host
+(`burst-gate.sh --confirm`, minor releases only), measured at release time
+(operator 2026-10-20; swap/zram documented, not installed). Local Lima VM;
+ask the operator for a quiet window. Harness: `scripts/release-gate/` (`mayor-6uez9`).
 
-First verdict FAIL: page-cache refault memory thrash in the 80-pod burst
-causes lease and CRI timeouts, node NotReady, then immediate eviction because
-`DefaultTolerationSeconds` admission is missing (`mayor-7afq6`, P1). Lever:
-control-plane memory protection (`mayor-i4bvb`).
-
+First verdict FAIL (80-pod, no swap): page-cache refault thrash causes lease
+and CRI timeouts, node NotReady, then eviction because `DefaultTolerationSeconds`
+admission is missing (`mayor-7afq6`). Lever: `mayor-i4bvb`.
 ### Gate 5 — Correctness beyond Conformance (ongoing, opportunistic)
 Representative workloads (WordPress+MariaDB, GPU-request workload, Argo CD
 as a probe not a milestone) and non-Conformance upstream e2e subsets

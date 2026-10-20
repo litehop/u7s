@@ -73,10 +73,11 @@ To run the Kubernetes conformance suite against u7s locally:
 
 ## Release gate: 1 GiB burst survival
 
-Every release must pass `scripts/release-gate/burst-gate.sh` (operator decision 2026-10-15). It boots fresh 1 vCPU / 1 GiB arm64 Lima VMs from `scripts/release-gate/u7s-vps-1g.yaml`, installs a tarball built from the current checkout with the zero-argument `install.sh`, deploys WordPress+MariaDB, then runs a 20-pod and an 80-pod burst and `scripts/e2e-workload/webhook-smoke.sh`.
+Every release must pass `scripts/release-gate/burst-gate.sh` (operator decision 2026-10-15). It boots fresh 1 vCPU / 1 GiB arm64 Lima VMs from `scripts/release-gate/u7s-vps-1g.yaml`, installs a tarball built from the current checkout with the zero-argument `install.sh`, deploys WordPress+MariaDB, then runs a 20-pod and an N-pod burst (`--burst-pods`, default 50) and `scripts/e2e-workload/webhook-smoke.sh`. The gated size is the no-swap ceiling: the largest of 50, 40 that passes 3/3 on a quiet host, found with `--confirm` before cutting a minor release (patch releases skip it). Denser workloads need swap/zram (see the README).
 
 ```sh
 scripts/release-gate/burst-gate.sh                  # 3 runs, VMs deleted afterwards
+scripts/release-gate/burst-gate.sh --confirm        # release confirmation: 3x at 50, else 3x at 40; prints the gated ceiling (~1-2 h, quiet host)
 scripts/release-gate/burst-gate.sh --runs 1 --keep   # debug one run, keep the VM
 scripts/release-gate/burst-gate.sh --memory 0.625    # forced-failure check
 ```

@@ -27,7 +27,8 @@ oom_victims=
 notready_events=0
 node_ready_final=True
 burst20_secs=12
-burst80_secs=140
+burst_pods=50
+burst_secs=140
 wp_ok=1
 webhook_ok=1
 EOF
@@ -61,7 +62,7 @@ expect_fail "(a) kube-system pod OOM-killed -> FAIL: CoreDNS dying breaks cluste
 expect_fail "(b) node went not-Ready during the run -> FAIL" notready_events 1 '(b)'
 expect_fail "(b) node not Ready at the end -> FAIL even with no recorded flap" node_ready_final False '(b)'
 expect_fail "(c) 20-pod burst over the cap -> FAIL: pods stuck Pending is the user-visible symptom of thrash" burst20_secs 301 '(c)'
-expect_fail "(c) 80-pod burst hit the hard kill -> FAIL" burst80_secs timeout '(c)'
+expect_fail "(c) 50-pod burst hit the hard kill -> FAIL" burst_secs timeout '(c)'
 expect_fail "(d) WordPress dead after the burst -> FAIL: the workload the node exists to serve" wp_ok 0 '(d)'
 expect_fail "(e) webhook smoke failed -> FAIL: only gate for the shipped webhook dial path" webhook_ok 0 '(e)'
 expect_fail "install failed -> FAIL" install_ok 0 install
@@ -70,7 +71,7 @@ verdict_of "$(mutate burst20_secs 300)"
 assert "burst exactly at the 300 s cap passes (cap is inclusive: 'within 5 min')" "$([ "$V_RC" = 0 ] && echo 1 || echo 0)"
 
 # Missing data must never pass.
-for key in oom_host oom_kubesystem notready_events node_ready_final burst20_secs burst80_secs wp_ok webhook_ok install_ok; do
+for key in oom_host oom_kubesystem notready_events node_ready_final burst20_secs burst_pods burst_secs wp_ok webhook_ok install_ok; do
   verdict_of "$(mutate "$key" -)"
   assert "missing $key -> FAIL: a run that died before producing it must not look green" "$([ "$V_RC" != 0 ] && echo 1 || echo 0)"
 done
@@ -216,6 +217,29 @@ assert "ramp step slower than the burst cap fails (c)" "$(BURST_CAP_SECS=180 rg_
 printf 'install_ok=0\n' > "$TMP/rampi.env"
 assert "ramp with failed install fails" "$(rg_ramp_verdict "$TMP/rampi.env" "30" "$TMP/s.tsv" >/dev/null && echo 0 || echo 1)"
 
+assert "verdict names the gated pod count so release notes can cite it" \
+  "$(verdict_of "$TMP/good.env"; echo "$V_OUT" | grep -q '^RESULT: PASS (50-pod burst)' && echo 1 || echo 0)"
+verdict_of "$(mutate burst_pods -)"
+assert "missing burst_pods fails (c): a verdict that cannot name its pod count is not citable" "$([ "$V_RC" != 0 ] && echo 1 || echo 0)"
+
+# Confirm mode: ceiling is the first size (50, then 40) passing every run.
+out="$(rg_confirm_verdict 50:3:3)" && crc=0 || crc=$?
+assert "50 passes 3/3 -> gated ceiling 50 (the highest tried size wins)" \
+  "$([ "$crc" = 0 ] && echo "$out" | grep -q 'gated no-swap burst ceiling = 50 pods' && echo 1 || echo 0)"
+out="$(rg_confirm_verdict 50:2:3 40:3:3)" && crc=0 || crc=$?
+assert "50 fails once -> falls to 40 and gates at 40: one flaky run at 50 must not ship a 50-pod claim" \
+  "$([ "$crc" = 0 ] && echo "$out" | grep -q 'gated no-swap burst ceiling = 40 pods' && ! echo "$out" | grep -q 'ceiling = 50' && echo 1 || echo 0)"
+out="$(rg_confirm_verdict 50:1:3 40:2:3)" && crc=0 || crc=$?
+assert "40 also fails -> FAIL with no ceiling: the release must not claim a burst size it did not confirm" \
+  "$([ "$crc" != 0 ] && echo "$out" | grep -q '^CONFIRM: FAIL' && ! echo "$out" | grep -q 'ceiling =' && echo 1 || echo 0)"
+rg_confirm_verdict 50:0:0 >/dev/null && crc=0 || crc=$?
+assert "0/0 runs is not a pass (a gate that ran nothing must not confirm a ceiling)" "$([ "$crc" != 0 ] && echo 1 || echo 0)"
+
+rc=0; "$HERE/burst-gate.sh" --burst-pods 0 --tarball-dir "$TMP/tb" --out "$TMP/out-bp" >/dev/null 2>&1 || rc=$?
+assert "--burst-pods 0 rejected" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
+rc=0; "$HERE/burst-gate.sh" --confirm --ramp 30,40 --tarball-dir "$TMP/tb" --out "$TMP/out-bp" >/dev/null 2>&1 || rc=$?
+assert "--confirm with --ramp rejected" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
+
 # Ramp/capture flags: malformed lists never reach a VM; valid ones reach the VM env.
 for bad in abc 30,30 40,30 30,; do
   : > "$LIMA_CALLS"; rm -rf "$TMP/out-ramp"
@@ -233,6 +257,12 @@ assert "--probe-kill reaches the VM env" "$("$HERE/burst-gate.sh" --ramp 30 --pr
 assert "vm-capture is off by default (its kubectl probes cost memory on the 1 GiB node)" "$(grep -qx 'CAPTURE=0' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
 "$HERE/burst-gate.sh" --capture --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-cap" >/dev/null 2>&1 || true
 assert "--capture opts vm-capture in" "$(grep -qx 'CAPTURE=1' "$TMP/out-cap/stage/gate.env" && echo 1 || echo 0)"
+
+assert "default burst is 50 pods, reaching the VM env" "$(grep -qx 'BURST_PODS=50' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
+rm -rf "$TMP/out-conf"
+rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-conf" 2>/dev/null)" || rc=$?
+assert "--confirm with every run failing tries 50 then falls to 40 and ends FAIL (exit non-zero)" \
+  "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=50' "$TMP/out-conf/burst-50/stage/gate.env" && grep -qx 'BURST_PODS=40' "$TMP/out-conf/burst-40/stage/gate.env" && echo "$out" | grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
