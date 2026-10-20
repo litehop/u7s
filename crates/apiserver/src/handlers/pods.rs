@@ -838,6 +838,7 @@ pub(crate) async fn replace_pod<S: Store>(
         })),
         dry_run: replace_query.is_dry_run(),
     };
+    apply_default_toleration_seconds(&mut obj.body);
     obj.body =
         run_mutating_webhooks(&state, obj.body, Some(&stored_obj.body), &admission_ctx).await?;
     validate_pod_spec_immutable(&spec_before, &obj.body["spec"])
@@ -1632,6 +1633,7 @@ pub(crate) async fn patch_pod<S: Store>(
         let pre_patch_body =
             crate::admission::load_old_object_for_admission(&state, &admission_ctx, &stored.value)
                 .await?;
+        apply_default_toleration_seconds(&mut current_obj.body);
         current_obj.body = run_mutating_webhooks(
             &state,
             current_obj.body,
@@ -5103,8 +5105,8 @@ pub(crate) fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
 
 const DEFAULT_TOLERATION_SECONDS: i64 = 300;
 
-/// DefaultTolerationSeconds admission (CREATE only): add `not-ready` and `unreachable`
-/// NoExecute tolerations with tolerationSeconds=300 unless the pod already tolerates the
+/// DefaultTolerationSeconds admission (CREATE and UPDATE of the main resource): add `not-ready`
+/// and `unreachable` NoExecute tolerations with tolerationSeconds=300 unless the pod already tolerates the
 /// taint. Mirrors upstream's match rule: a toleration counts when its key is the taint key
 /// or empty AND its effect is NoExecute or empty (operator is not consulted).
 pub(crate) fn apply_default_toleration_seconds(pod: &mut serde_json::Value) {
@@ -22338,6 +22340,111 @@ mod admission_tests {
             "mutating webhook label must be present after replace_pod — \
              without the fix, replace_pod bypassed admission and the label was never injected"
         );
+    }
+
+    async fn seed_pod_with_default_tolerations(
+        store: &Arc<SqliteStore>,
+        name: &str,
+    ) -> (String, Vec<serde_json::Value>) {
+        let mut existing = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        apply_default_toleration_seconds(&mut existing);
+        let defaults = existing["spec"]["tolerations"].as_array().unwrap().clone();
+        let key = format!("/registry/pods/default/{name}");
+        store
+            .put(
+                &key,
+                Bytes::from(serde_json::to_vec(&existing).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        (key, defaults)
+    }
+
+    /// A client that replaces spec.tolerations wholesale (it never saw the server-added
+    /// defaults, or just overwrote them) must still get the PUT accepted: DefaultTolerationSeconds
+    /// re-adds not-ready/unreachable on UPDATE before the append-only check runs.
+    #[tokio::test]
+    async fn replace_pod_readds_default_tolerations_so_replacing_tolerations_is_accepted() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+        let (key, defaults) = seed_pod_with_default_tolerations(&store, "tol-pod").await;
+        let rv = store.get(&key).await.unwrap().unwrap().revision;
+
+        let own = serde_json::json!({"key": "foo", "operator": "Equal", "value": "bar", "effect": "NoSchedule"});
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "tol-pod", "namespace": "default", "resourceVersion": rv.to_string()},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}], "tolerations": [own.clone()]}
+            })
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let result = replace_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(), "tol-pod".to_string())),
+            axum::extract::Query(crate::handlers::json_patch::ReplaceQuery::default()),
+            test_user(),
+            headers,
+            body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "PUT replacing tolerations must succeed (422 breaks every client that rewrites them)"
+        );
+        let stored: serde_json::Value =
+            serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
+        let mut expected = vec![own];
+        expected.extend(defaults);
+        assert_eq!(stored["spec"]["tolerations"], serde_json::json!(expected));
+    }
+
+    /// Same as the PUT case for a JSON merge patch, which replaces the tolerations array.
+    #[tokio::test]
+    async fn patch_pod_readds_default_tolerations_so_replacing_tolerations_is_accepted() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+        seed_namespace(&store, "default").await;
+        let (key, defaults) = seed_pod_with_default_tolerations(&store, "tol-patch-pod").await;
+
+        let own = serde_json::json!({"key": "foo", "operator": "Equal", "value": "bar", "effect": "NoSchedule"});
+        let patch =
+            Bytes::from(serde_json::json!({"spec": {"tolerations": [own.clone()]}}).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let result = patch_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(), "tol-patch-pod".to_string())),
+            axum::extract::Query(crate::handlers::json_patch::PatchQuery::default()),
+            test_user(),
+            headers,
+            patch,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "merge-patching tolerations must succeed (422 breaks every client that rewrites them)"
+        );
+        let stored: serde_json::Value =
+            serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
+        let mut expected = vec![own];
+        expected.extend(defaults);
+        assert_eq!(stored["spec"]["tolerations"], serde_json::json!(expected));
     }
 
     /// patch_pod must refuse any patch type that rewrites metadata.name/namespace (upstream's

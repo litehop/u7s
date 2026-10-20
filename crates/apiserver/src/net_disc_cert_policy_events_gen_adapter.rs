@@ -669,6 +669,7 @@ fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
             .unwrap_or_default(),
         owner_references,
         finalizers: jstrs(&meta, "finalizers"),
+        managed_fields: crate::core_gen_adapter::json_to_managed_fields_proto(&meta),
         ..Default::default()
     }
 }
