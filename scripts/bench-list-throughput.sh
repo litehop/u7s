@@ -48,9 +48,7 @@ if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
 fi
 
 # Extract CA cert from kubeconfig for curl TLS verification
-grep "certificate-authority-data" "$TMPDIR/kubeconfig" \
-    | awk '{print $2}' \
-    | base64 -d > "$TMPDIR/ca.pem"
+cp "$(awk '/certificate-authority:/ {print $2}' "$TMPDIR/kubeconfig")" "$TMPDIR/ca.pem"
 
 BASE_URL="https://127.0.0.1:$PORT"
 AUTH_HDR="Authorization: Bearer $BENCH_TOKEN"

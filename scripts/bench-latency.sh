@@ -43,9 +43,7 @@ if ! nc -z 127.0.0.1 6443 2>/dev/null; then
 fi
 
 # Extract CA cert from kubeconfig for curl TLS verification
-grep "certificate-authority-data" "$TMPDIR/kubeconfig" \
-    | awk '{print $2}' \
-    | base64 -d > "$TMPDIR/ca.pem"
+cp "$(awk '/certificate-authority:/ {print $2}' "$TMPDIR/kubeconfig")" "$TMPDIR/ca.pem"
 
 TIMINGS_FILE="$TMPDIR/timings.txt"
 

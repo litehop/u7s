@@ -4083,6 +4083,10 @@ pub async fn run_validating_webhooks<S: Store>(
         return Ok(());
     }
 
+    // Built-in PodSecurity plugin: runs with the validating chain, ahead of webhooks, as
+    // upstream orders its built-in validating plugins before ValidatingAdmissionWebhook.
+    crate::pod_security::admit(state, ctx, object, old_object).await?;
+
     let start = std::time::Instant::now();
 
     // Already-flattened, typed webhook entries — the cache holds the parsed form so

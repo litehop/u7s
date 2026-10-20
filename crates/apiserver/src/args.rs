@@ -137,6 +137,14 @@ pub struct Args {
     /// blast radius is small, but this is a real behavior change, not a free lunch.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) embedded_scheduler: bool,
+
+    /// Upstream-format `AdmissionConfiguration` YAML configuring the `PodSecurity` plugin
+    /// (cluster-wide default level/version per mode and exemptions for usernames,
+    /// runtimeClasses and namespaces). Omitted: every mode defaults to privileged/latest
+    /// and nothing is exempt, exactly like an upstream cluster with no config file. Any other
+    /// plugin entry is rejected at startup — none of u7s's other admission is configurable.
+    #[arg(long)]
+    pub(crate) admission_control_config_file: Option<String>,
 }
 
 #[cfg(test)]

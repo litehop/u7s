@@ -634,17 +634,15 @@ join_cluster() {
   fi
   printf '%s' "$signed_cert_b64" | base64 -d > "$STATE_DIR/kubelet-client.crt"
 
-  local ca_b64 cert_b64 key_b64
-  ca_b64="$(base64 -w0 "$STATE_DIR/ca.pem")"
-  cert_b64="$(base64 -w0 "$STATE_DIR/kubelet-client.crt")"
-  key_b64="$(base64 -w0 "$STATE_DIR/kubelet-client.key")"
+  # File paths, not -data: the kubelet re-reads them, so a re-issued client cert or CA
+  # reaches it without a rewrite of this file.
   cat > "$STATE_DIR/kubeconfig" <<EOF
 apiVersion: v1
 kind: Config
 clusters:
 - cluster:
     server: $JOIN_SERVER
-    certificate-authority-data: $ca_b64
+    certificate-authority: $STATE_DIR/ca.pem
   name: u7s
 contexts:
 - context:
@@ -655,8 +653,8 @@ current-context: u7s
 users:
 - name: system:node:$NODE_NAME
   user:
-    client-certificate-data: $cert_b64
-    client-key-data: $key_b64
+    client-certificate: $STATE_DIR/kubelet-client.crt
+    client-key: $STATE_DIR/kubelet-client.key
 EOF
   chmod 600 "$STATE_DIR/kubeconfig"
   echo "Join CSR approved and signed -- kubelet's dedicated x509 kubeconfig written to $STATE_DIR/kubeconfig"
@@ -1389,6 +1387,10 @@ Type=simple
 WorkingDirectory=$STATE_DIR
 # ca.crt is DER from u7s but KCM needs PEM, converted at start rather than at
 # install time because it does not exist until apiserver's first run.
+# No --service-account-private-key-file: u7s does not support legacy
+# service-account token Secrets, so KCM's token controller stays off.
+# kcm-kubeconfig references files, so KCM live-reloads a re-issued client cert and
+# CA; --root-ca-file is read once, hence the restart hook below.
 # ExecStartPre rather than a bash -c wrapper so --controllers=*,-... stays a
 # literal argv entry: systemd's own line-splitting never globs, but a real
 # shell would expand that "*" against WorkingDirectory's contents.
@@ -1423,12 +1425,35 @@ Environment=GOMAXPROCS=2
 # no longer knows about is a hard --controllers validation error ("is not
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# Root CA succession hook: the apiserver rewrites ca-bundle.pem only when cluster trust
+# changes, and KCM reads --root-ca-file once, so restart it then and only then. Client
+# cert and CA reloads need no restart (kcm-kubeconfig references files).
+cat > /etc/systemd/system/u7s-kcm-restart.path <<EOF
+[Unit]
+Description=Restart u7s-kcm when the cluster CA bundle changes
+
+[Path]
+PathChanged=$STATE_DIR/ca-bundle.pem
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/u7s-kcm-restart.service <<EOF
+[Unit]
+Description=Restart u7s-kcm to re-read --root-ca-file
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart u7s-kcm.service
 EOF
 
 cat > /etc/systemd/system/kubelet.service <<EOF
@@ -1485,6 +1510,8 @@ fi
 wait_for_apiserver_files "$STATE_DIR"
 systemctl enable u7s-kcm.service
 systemctl restart u7s-kcm.service
+systemctl enable u7s-kcm-restart.path
+systemctl restart u7s-kcm-restart.path
 systemctl enable kubelet.service
 systemctl restart kubelet.service
 
@@ -1516,6 +1543,7 @@ fi
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"
 echo "Run: kubectl --kubeconfig=$KUBECONFIG_PATH get nodes"
+echo "It references ca-bundle.pem and admin.pem in $STATE_DIR by path; to use it elsewhere: kubectl --kubeconfig=$KUBECONFIG_PATH config view --raw --flatten > portable-kubeconfig"
 }
 
 main "$@"

@@ -3591,6 +3591,7 @@ pub(crate) async fn get_ephemeral_containers<S: Store>(
 pub(crate) async fn patch_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -3618,6 +3619,15 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
     let spec_before = current_obj.body["spec"].clone();
     let before_write = current_obj.body.clone();
     current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &patch);
+    crate::pod_security::admit_pod_update(
+        &state,
+        ns.as_str(),
+        &name,
+        user.as_ref().map(|u| &u.0),
+        &current_obj.body,
+        &before_write,
+    )
+    .await?;
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
     crate::field_manager::WriteIdentity::new(None, &headers).record(
         &before_write,
@@ -3648,6 +3658,7 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
 pub(crate) async fn put_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -3675,6 +3686,15 @@ pub(crate) async fn put_ephemeral_containers<S: Store>(
     let spec_before = current_obj.body["spec"].clone();
     let before_write = current_obj.body.clone();
     current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &incoming);
+    crate::pod_security::admit_pod_update(
+        &state,
+        ns.as_str(),
+        &name,
+        user.as_ref().map(|u| &u.0),
+        &current_obj.body,
+        &before_write,
+    )
+    .await?;
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
     crate::field_manager::WriteIdentity::new(None, &headers).record(
         &before_write,
