@@ -133,6 +133,11 @@ CA_CERT_HASH=""
 # Set by join_cluster to the server-side creationTimestamp of this join's client CSR.
 JOIN_STARTED_AT=""
 
+# Everything below runs inside main(), invoked on the last line: bash must
+# parse the whole function before executing any of it, so a truncated
+# `curl | bash` download is a syntax error that executes nothing. The body is
+# deliberately not indented, to keep heredoc contents byte-identical.
+main() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --node-name) NODE_NAME="$2"; shift 2 ;;
@@ -269,6 +274,7 @@ mktemp_disk_dir() {
 # (including a 404, e.g. a pre-checksum release) fails the same as any other
 # curl error here: unverified bytes reaching `tar -xzf` become binaries run
 # as root, so a URL-based fetch always requires a passing checksum.
+# --proto allows file:// only for local tarballs (release-gate bakes one); redirects must stay https.
 fetch_tarball() {
   local url="$1"
   DOWNLOAD_DIR="$(mktemp_disk_dir)"
@@ -277,10 +283,10 @@ fetch_tarball() {
   local checksum_file="$TARBALL.sha256"
 
   echo "Downloading release tarball from $url..."
-  curl -fsSL --retry 3 --retry-connrefused -o "$TARBALL" "$url"
+  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$TARBALL" "$url"
 
   echo "Downloading checksum sidecar from $checksum_url..."
-  curl -fsSL --retry 3 --retry-connrefused -o "$checksum_file" "$checksum_url"
+  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$checksum_file" "$checksum_url"
 
   local expected actual
   expected="$(cut -d' ' -f1 "$checksum_file")"
@@ -291,6 +297,33 @@ fetch_tarball() {
     echo "       actual:                        $actual" >&2
     exit 1
   fi
+}
+
+# Fetch an apt repo signing key from <url>, require it to be exactly one
+# primary key whose fingerprint equals <expected_fpr>, and only then dearmor it
+# into <keyring>. The key comes from the same host that serves the packages, so
+# without the pin a compromised mirror ships a matching key and packages. A
+# second key in the file is rejected too: signed-by would trust it.
+install_apt_key() {
+  local url="$1" expected="$2" keyring="$3"
+  local keyfile fprs
+  keyfile="$(mktemp)"
+  if ! curl --proto '=https' --tlsv1.2 -fsSL -o "$keyfile" "$url"; then
+    rm -f "$keyfile"
+    echo "error: could not fetch apt key from $url" >&2
+    return 1
+  fi
+  fprs="$(gpg --batch --show-keys --with-colons "$keyfile" | awk -F: '/^pub:/{p=1} /^fpr:/&&p{print $10; p=0}')"
+  if [ "$fprs" != "$expected" ]; then
+    rm -f "$keyfile"
+    echo "error: apt key from $url has unexpected fingerprint(s)" >&2
+    echo "       expected: $expected" >&2
+    echo "       actual:   ${fprs:-<none>}" >&2
+    echo "       If the vendor rotated its key, verify the new fingerprint out of band and update the pin in install.sh." >&2
+    return 1
+  fi
+  gpg --batch --yes --dearmor -o "$keyring" < "$keyfile"
+  rm -f "$keyfile"
 }
 
 # Install each named binary found anywhere in $STAGE_DIR into $BIN_DIR,
@@ -454,7 +487,7 @@ discover_cluster_ca() {
   info="$work/info.json"
   # KCM's bootstrapsigner signs a new token's JWS asynchronously after the mint.
   for _ in $(seq 1 30); do
-    curl -fsSk "$JOIN_SERVER/api/v1/namespaces/kube-public/configmaps/cluster-info" > "$info" 2>/dev/null || true
+    curl --proto '=https' --tlsv1.2 -fsSk "$JOIN_SERVER/api/v1/namespaces/kube-public/configmaps/cluster-info" > "$info" 2>/dev/null || true
     jws="$(jq -r --arg k "jws-kubeconfig-$token_id" '.data[$k] // empty' "$info" 2>/dev/null || true)"
     [ -n "$jws" ] && break
     sleep 2
@@ -559,7 +592,7 @@ join_cluster() {
   # as a config file on a pipe, never argv.
   local watch_out watch_pid
   watch_out="$(mktemp)"
-  curl -fsSN --cacert "$STATE_DIR/ca.pem" \
+  curl --proto '=https' --tlsv1.2 -fsSN --cacert "$STATE_DIR/ca.pem" \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$bootstrap_token") \
     "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests?watch=true&fieldSelector=metadata.name%3D$csr_name&timeoutSeconds=150" \
     > "$watch_out" 2>/dev/null &
@@ -572,7 +605,7 @@ join_cluster() {
   # lower bound for the serving CSR wait_for_joined_node accepts: a serving CSR
   # issued to an earlier incarnation of the same node name is older than it.
   # It is the server's clock on both sides, so node clock skew cannot matter.
-  JOIN_STARTED_AT="$(curl -fsSL --cacert "$STATE_DIR/ca.pem" \
+  JOIN_STARTED_AT="$(curl --proto '=https' --tlsv1.2 -fsSL --cacert "$STATE_DIR/ca.pem" \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$bootstrap_token") \
     -H "Content-Type: application/json" \
     -X POST "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" \
@@ -640,11 +673,11 @@ wait_for_joined_node() {
   echo "Waiting up to 5 min for node $NODE_NAME to be Ready with an issued kubelet serving certificate..."
   for _ in $(seq 1 150); do
     if [ -z "$ready" ]; then
-      resp="$(curl -fsSL "${node_auth[@]}" "$JOIN_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
+      resp="$(curl --proto '=https' --tlsv1.2 -fsSL "${node_auth[@]}" "$JOIN_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
       ready="$(printf '%s' "$resp" | jq -r '.status.conditions[]? | select(.type == "Ready" and .status == "True") | .type' 2>/dev/null || true)"
     fi
     if [ -z "$serving" ]; then
-      resp="$(curl -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" 2>/dev/null || true)"
+      resp="$(curl --proto '=https' --tlsv1.2 -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" 2>/dev/null || true)"
       # RFC3339 UTC timestamps compare correctly as strings.
       serving="$(printf '%s' "$resp" | jq -r --arg u "system:node:$NODE_NAME" --arg since "$JOIN_STARTED_AT" '[.items[]? | select(.spec.signerName == "kubernetes.io/kubelet-serving" and .spec.username == $u and .metadata.creationTimestamp >= $since and ((.status.certificate // "") != "") and any(.status.conditions[]?; .type == "Approved"))] | length' 2>/dev/null || true)"
       [ "${serving:-0}" -ge 1 ] 2>/dev/null || serving=""
@@ -705,7 +738,7 @@ worker_api_get() {
   key="$STATE_DIR/kubelet-client.key"
   [ "$cert" = "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" ] && key="$cert"
   server="$(sed -n 's/^ *server: *//p' "$STATE_DIR/kubeconfig" | head -n1)"
-  curl -fsSL --cacert "$STATE_DIR/ca.pem" --cert "$cert" --key "$key" "$@" "$server$path"
+  curl --proto '=https' --tlsv1.2 -fsSL --cacert "$STATE_DIR/ca.pem" --cert "$cert" --key "$key" "$@" "$server$path"
 }
 
 # lastHeartbeatTime (epoch seconds) of the Node's Ready condition as served by
@@ -956,8 +989,11 @@ apt-get update -qq
 apt-get install -y apt-transport-https ca-certificates curl gpg
 
 install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/Release.key \
-  | gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+# Pinned fingerprint of the isv:cri-o OBS project key (fetched and read with
+# `gpg --show-keys --with-colons` on 2026-10-20; expires 2027-04). Rotation: verify the new key
+# out of band, then update this value.
+install_apt_key https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/Release.key \
+  85B67D5C50100B1AC8CEFE49CBA9C85640A2B579 /etc/apt/keyrings/cri-o-apt-keyring.gpg
 echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/ /' \
   > /etc/apt/sources.list.d/cri-o.list
 apt-get update -qq
@@ -1060,8 +1096,11 @@ if [ -z "$KUBE_VERSION" ]; then
 fi
 KUBE_MINOR="${KUBE_VERSION%.*}"
 
-curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/Release.key" \
-  | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+# Pinned fingerprint of the isv:kubernetes OBS project key, identical for the
+# v1.35-v1.37 repos (fetched 2026-10-20; expires 2026-12-29, so expect to
+# update this pin when the vendor rotates it).
+install_apt_key "https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/Release.key" \
+  DE15B14486CD377B9E876E1A234654DA9A296436 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/ /" \
   > /etc/apt/sources.list.d/kubernetes.list
 apt-get update -qq
@@ -1477,3 +1516,6 @@ fi
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"
 echo "Run: kubectl --kubeconfig=$KUBECONFIG_PATH get nodes"
+}
+
+main "$@"

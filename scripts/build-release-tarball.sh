@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds the u7s release tarball for linux/x86_64: cargo-builds
 # u7s-apiserver + u7s-scheduler for x86_64-unknown-linux-gnu, downloads the
-# matching kubelet + kube-controller-manager from dl.k8s.io (checksum-
-# verified), and packages all four into the flat layout scripts/install.sh
+# matching kubelet + kube-controller-manager from dl.k8s.io (checksum- and
+# cosign-verified; the .sig/.cert ship alongside), and packages all four into the flat layout scripts/install.sh
 # expects (it finds each binary by name anywhere in the extracted tree, so
 # internal layout is not load-bearing --
 # docs/decisions/upstream-component-shipping-shape.md).
@@ -15,7 +15,7 @@
 #   scripts/build-release-tarball.sh v0.1.0
 #
 # Requires: cargo/rustup (with the x86_64-unknown-linux-gnu target
-# installable), curl, sha256sum, tar.
+# installable), curl, sha256sum, tar, cosign.
 set -euo pipefail
 
 # Same Kubernetes version pinned elsewhere in this project (e2e-focus.yaml's
@@ -54,20 +54,49 @@ U7S_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 cp "$ROOT_DIR/target/$TARGET/release/u7s-apiserver" "$STAGE_DIR/"
 cp "$ROOT_DIR/target/$TARGET/release/u7s-scheduler" "$STAGE_DIR/"
 
+# Kubernetes signs every release binary keylessly (Sigstore); the signer
+# identity and OIDC issuer below are the ones documented at
+# https://kubernetes.io/docs/tasks/administer-cluster/verify-signed-artifacts/.
+# The same-origin .sha256 only catches corruption, not a compromised dl.k8s.io.
+K8S_COSIGN_IDENTITY="krel-staging@k8s-releng-prod.iam.gserviceaccount.com"
+K8S_COSIGN_ISSUER="https://accounts.google.com"
+
+# Fetch <binary>'s .sig and .cert (from <url>.sig / <url>.cert) next to it and
+# verify them against the binary; any failure aborts the build.
+verify_k8s_signature() {
+  local binary="$1" url="$2"
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$binary.sig" "${url}.sig"
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$binary.cert" "${url}.cert"
+  if ! cosign verify-blob "$binary" \
+    --signature "$binary.sig" \
+    --certificate "$binary.cert" \
+    --certificate-identity "$K8S_COSIGN_IDENTITY" \
+    --certificate-oidc-issuer "$K8S_COSIGN_ISSUER"; then
+    echo "error: cosign signature verification failed for $(basename "$binary") (expected identity $K8S_COSIGN_IDENTITY, issuer $K8S_COSIGN_ISSUER)" >&2
+    exit 1
+  fi
+}
+
+if ! command -v cosign >/dev/null 2>&1; then
+  echo "error: cosign not found on PATH -- it verifies the upstream kubelet/kube-controller-manager signatures" >&2
+  exit 1
+fi
+
 echo "==> Fetching kubelet + kube-controller-manager v$K8S_VERSION for linux/$K8S_ARCH" >&2
 for bin in kubelet kube-controller-manager; do
   url="https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/${K8S_ARCH}/${bin}"
-  curl -fL --retry 3 --retry-connrefused -o "$STAGE_DIR/$bin" "$url"
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$STAGE_DIR/$bin" "$url"
 
   # dl.k8s.io publishes a raw-hex sha256 sidecar alongside every binary --
   # verify it rather than trusting -fL's exit code alone (a proxy could serve
   # a truncated-but-200 response, or a corrupted-in-transit file).
-  expected="$(curl -fsSL --retry 3 --retry-connrefused "${url}.sha256")"
+  expected="$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused "${url}.sha256")"
   actual="$(sha256sum "$STAGE_DIR/$bin" | cut -d' ' -f1)"
   if [ "$expected" != "$actual" ]; then
     echo "error: checksum mismatch for $bin: expected $expected, got $actual" >&2
     exit 1
   fi
+  verify_k8s_signature "$STAGE_DIR/$bin" "$url"
   chmod +x "$STAGE_DIR/$bin"
 done
 
