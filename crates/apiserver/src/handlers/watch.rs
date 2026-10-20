@@ -1072,6 +1072,17 @@ async fn watch_generic_impl<S: Store>(
     // as a synthetic ADDED in the initial phase — before the BOOKMARK — not after
     // it. Emitting an event after the BOOKMARK would violate the Kubernetes watch
     // protocol invariant: everything before BOOKMARK is "initial state".
+    //
+    // resourceVersion unset/"0" without sendInitialEvents is "start at any": upstream serves
+    // the current state as synthetic ADDED events (no bookmark) and never replays write
+    // history. Replaying the ring would hand clients (e.g. `kubectl get node X -w`)
+    // long-superseded states of every object as if they were live transitions.
+    let initial_events_bookmark = initial_items.is_some();
+    let initial_items = if from_revision == 0 && initial_items.is_none() {
+        fetch_initial_events(&state, &prefix, true, &group, &plural).await?
+    } else {
+        initial_items
+    };
     let watch_from_rv = match &initial_items {
         Some((_, list_rv)) => *list_rv,
         None => from_revision,
@@ -1203,8 +1214,10 @@ async fn watch_generic_impl<S: Store>(
                     yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &v));
                 }
             }
-            record_watch_event();
-            yield Ok::<Bytes, axum::BoxError>(ndjson_initial_events_bookmark(&api_version, &kind, last_rv));
+            if initial_events_bookmark {
+                record_watch_event();
+                yield Ok::<Bytes, axum::BoxError>(ndjson_initial_events_bookmark(&api_version, &kind, last_rv));
+            }
         }
 
         loop {
@@ -3349,6 +3362,84 @@ mod tests {
              NDJSON envelope; any deviation (re-encoded formatting, dropped field, wrong event \
              type) is exactly the class of bug that desyncs an informer's cache from the \
              server without a visible decode error"
+        );
+    }
+
+    /// A watch opened without a resourceVersion must see each object once, in its current
+    /// state, and never the superseded writes still sitting in the ring buffer. Replaying
+    /// history made `kubectl get node X -w` report the node's registration-time NotReady/empty
+    /// status as live transitions right after it went Ready, failing the release gate's
+    /// "node stays Ready" criterion. Fails on revert: the stream would carry the stale ADDED
+    /// plus a MODIFIED per later write.
+    #[tokio::test]
+    async fn watch_generic_rv_zero_serves_current_state_not_write_history() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/configmaps/default/cm-hist";
+        // An earlier watcher (kubelet, KCM informers) is what makes the store keep write
+        // history for the prefix; a cold shard would be seeded from current state anyway.
+        let _earlier_watcher = store
+            .watch("/registry/configmaps/default/", 0)
+            .await
+            .unwrap();
+        let mut rev = 0;
+        for v in ["v1", "v2", "v3"] {
+            let obj = serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": { "name": "cm-hist", "namespace": "default" },
+                "data": { "k": v }
+            });
+            rev = store
+                .put(
+                    key,
+                    bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                    Some(rev),
+                )
+                .await
+                .unwrap();
+        }
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must open"));
+
+        let events = read_watch_body_with_timeout(resp).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "rv=0 watch must emit one synthetic ADDED for the current state only (no history, \
+             no initial-events-end bookmark); got: {events:?}"
+        );
+        assert_eq!(events[0]["type"], "ADDED");
+        assert_eq!(
+            events[0]["object"]["data"]["k"], "v3",
+            "the synthetic ADDED must carry the latest state, not a superseded write"
         );
     }
 
