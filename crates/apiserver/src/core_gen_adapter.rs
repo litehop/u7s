@@ -2936,7 +2936,7 @@ pub(crate) fn json_to_managed_fields_proto(
         .unwrap_or_default()
 }
 
-fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
+pub(crate) fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
     let meta = obj
         .get("metadata")
         .cloned()
@@ -9606,6 +9606,98 @@ mod tests {
             decoded_list.metadata.unwrap().resource_version.as_deref(),
             Some("99"),
             "list resourceVersion must survive"
+        );
+    }
+
+    /// Every `encode_*_proto_gen` must carry every ObjectMeta field the descriptor defines (the
+    /// field list comes from the schema, not from this test), or a protobuf client sees an
+    /// object different from the JSON view of it — managedFields once vanished this way.
+    #[test]
+    fn encode_core_proto_gen_carries_every_object_meta_field() {
+        use crate::proto_descriptor::assert_encoder_carries_every_object_meta_field as check;
+        macro_rules! single {
+            ($ty:ident) => {
+                |b: &[u8]| {
+                    core_v1::$ty::decode(b)
+                        .unwrap()
+                        .metadata
+                        .unwrap()
+                        .encode_to_vec()
+                }
+            };
+        }
+        macro_rules! list {
+            ($ty:ident) => {
+                |b: &[u8]| {
+                    core_v1::$ty::decode(b)
+                        .unwrap()
+                        .items
+                        .remove(0)
+                        .metadata
+                        .unwrap()
+                        .encode_to_vec()
+                }
+            };
+        }
+        check(
+            "encode_pod_proto_gen",
+            false,
+            encode_pod_proto_gen,
+            single!(Pod),
+        );
+        check(
+            "encode_podlist_proto_gen",
+            true,
+            encode_podlist_proto_gen,
+            list!(PodList),
+        );
+        check(
+            "encode_service_proto_gen",
+            false,
+            encode_service_proto_gen,
+            single!(Service),
+        );
+        check(
+            "encode_servicelist_proto_gen",
+            true,
+            encode_servicelist_proto_gen,
+            list!(ServiceList),
+        );
+        check(
+            "encode_node_proto_gen",
+            false,
+            encode_node_proto_gen,
+            single!(Node),
+        );
+        check(
+            "encode_nodelist_proto_gen",
+            true,
+            encode_nodelist_proto_gen,
+            list!(NodeList),
+        );
+        check(
+            "encode_endpoints_proto_gen",
+            false,
+            encode_endpoints_proto_gen,
+            single!(Endpoints),
+        );
+        check(
+            "encode_endpointslist_proto_gen",
+            true,
+            encode_endpointslist_proto_gen,
+            list!(EndpointsList),
+        );
+        check(
+            "encode_event_proto_gen",
+            false,
+            encode_event_proto_gen,
+            single!(Event),
+        );
+        check(
+            "encode_eventlist_proto_gen",
+            true,
+            encode_eventlist_proto_gen,
+            list!(EventList),
         );
     }
 

@@ -216,10 +216,10 @@ Then post it yourself, per deliverable type:
 
 - **`deliverable_type: pr`** (ref is a PR URL, extract `<N>`): post ONE
   Pull Request Review — not a plain issue comment — under the
-  `litehop-reviewer[bot]` App identity by redirecting a payload file into
-  `scripts/gh-app-review.sh <N> < temp/<file>` (never the operator's own `gh
-  api ... --input -`, and never `gh pr review` directly: the wrapper mints
-  the App's installation token and POSTs in one process). The call must
+  `litehop-reviewer[bot]` App identity via `scripts/gh-app-review.sh <N>
+  --event <EVENT> ...` (never the operator's own `gh api ... --input -`, and
+  never `gh pr review` directly: the wrapper builds the payload, mints the
+  App's installation token and POSTs in one process). The call must
   START with `scripts/gh-app-review.sh` to match the operator's
   `Bash(scripts/gh-app-review.sh *)` allow rule; a `jq ... | scripts/...`
   pipeline starts with `jq` and is denied. Map the
@@ -231,8 +231,8 @@ Then post it yourself, per deliverable type:
   today (workers push under the operator identity).
 
   **Other repos:** for a PR outside `litehop/u7s`, pass the repo as the
-  second argument: `scripts/gh-app-review.sh <N> litehop/<repo> <
-  temp/<file>`. Omitting it targets `litehop/u7s`, so a bare `<N>` against
+  second argument: `scripts/gh-app-review.sh <N> litehop/<repo> --event
+  <EVENT> ...`. Omitting it targets `litehop/u7s`, so a bare `<N>` against
   another repo's PR number reviews the wrong PR. Take the repo from the PR
   URL you were given.
 
@@ -242,7 +242,7 @@ Then post it yourself, per deliverable type:
   token. Return the script's exact error and the full findings text to the
   mayor instead.
 
-  Partition your findings before building the JSON payload:
+  Partition your findings before posting:
   - Each **Confirmed findings** / **Suspicions** bullet whose Evidence cites
     exactly one `path:line` inside the diff (`gh pr diff <N>`) becomes one
     entry in the payload's `comments` array, with `side` `"RIGHT"` when the
@@ -262,42 +262,24 @@ Then post it yourself, per deliverable type:
     otherwise be header+Verdict+Meta only — never post an empty `body` and
     never drop the header, since the merge-PR loop keys off it (see above).
 
-  **Build the payload with `jq`, never by hand-splicing JSON text.** Findings
-  blocks are always multi-line and routinely contain backticks and quotes
-  (citations, code spans); a literal newline inside a JSON string is invalid
-  JSON, and an unquoted heredoc delimiter lets the shell command-substitute
-  on backticks before `gh` ever sees the payload. `jq`'s `--arg`/`--argjson`
-  escape every field correctly by construction, so use them for both the
-  top-level body and every comment (matches this repo's own convention —
-  see `jq -n --arg`/`--argjson` usage in `scripts/conformance/`,
-  `scripts/test-critical-reviewer-hook.sh`):
-  1. Capture the top-level body text into a shell variable via a
-     quote-delimited heredoc — `BODY=$(cat <<'FINDINGS_EOF'` ... `FINDINGS_EOF`
-     `)` — the quotes around the delimiter stop the shell from expanding
-     anything inside (backticks, `$vars`), so the raw markdown is captured
-     verbatim as plain text, NOT as JSON; never type the findings text
-     directly inside JSON double-quotes yourself, that is what breaks.
-  2. For each anchored finding, emit one compact comment object the same
-     way — capture its bullet text into a variable via a quote-delimited
-     heredoc, then: `jq -nc --arg path 'PATH' --argjson line LINE --arg side
-     'SIDE' --arg body "$BULLET_TEXT" '{path:$path, line:$line, side:$side,
-     body:$body}'`.
-  3. Splice the resulting one-line objects into an array literal —
-     `COMMENTS="[$obj1, $obj2, ...]"` (or `[]` if none) — the same pattern
-     this repo already uses to compose JSON arrays from `jq`-built pieces
-     (e.g. `scripts/conformance/write-build-provenance.sh`'s
-     `VM_SPECS_JSON="[$(vm_spec_json "$VM"), ...]"`). Each piece is already
-     safely escaped, so string-splicing compact `jq -c` output is safe.
-  4. Write the final payload to a file (you have no Write tool; `jq`
-     output goes to the file via Bash): `jq -n --arg body "$BODY" --arg
-     event "$EVENT" --argjson comments "$COMMENTS" '{body:$body,
-     event:$event, comments:$comments}' > temp/review-<N>.json`. Then, as a
-     SEPARATE Bash call, post it: `scripts/gh-app-review.sh <N> [owner/repo] <
-     temp/review-<N>.json`. Never chain the two, and put any `bd` note in a
-     third call. On a non-zero exit, follow "No operator-token fallback"
-     above. Shell variables do not persist across
-     Bash calls, so steps 1-4 (heredocs through `jq ... > temp/<file>`) are
-     one call.
+  **The script builds the JSON; you never write a payload file.** Post with
+  ONE Bash call whose first token is the script, markdown body on stdin via
+  a quote-delimited heredoc (the quotes stop the shell expanding backticks
+  or `$vars` inside the findings), one `--comment PATH LINE SIDE TEXT` per
+  anchored finding (single-quote TEXT; write an apostrophe as `'\''`):
+
+  ```
+  scripts/gh-app-review.sh <N> [owner/repo] --event <EVENT> --comment <path> <line> <RIGHT|LEFT> '<bullet text>' <<'FINDINGS_EOF'
+  ## critical-reviewer findings
+  ...
+  FINDINGS_EOF
+  ```
+
+  The script validates the event/line/side, rejects an empty body, and
+  builds the payload with `jq`, so no `jq ... > file` and no hand-spliced
+  JSON. Put any `bd` note in a separate call. On a non-zero exit, follow "No
+  operator-token fallback" above.
+
 - **`deliverable_type: findings`** (ref is a file path under `ai/findings/`):
   there is no PR to comment on. Identify the originating bead ID — findings
   docs consistently name it in their own title/intro (grep the doc for the
