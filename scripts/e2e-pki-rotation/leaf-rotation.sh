@@ -3,8 +3,8 @@
 # expire, with live clients riding through it. Lifetimes are seconds (U7S_PKI_TEST_LIFETIME_SECS,
 # honoured only by an apiserver built with --features pki-test-knobs): the serving cert and the
 # apiserver-held kubelet-client and proxy-client identities live --lifetime seconds, so
-# rotation (at 2/3 lifetime) happens in real time. admin, KCM, scheduler and
-# bootstrap-installer certs stay at their long production lifetime.
+# rotation (at 2/3 lifetime) happens in real time. So do the KCM and scheduler client certs.
+# admin and bootstrap-installer certs stay at their long production lifetime.
 #
 # Bring the stack up first, e.g.
 #   scripts/conformance/run-all.sh --pki-test-lifetime 60 --vm <VM> --port <PORT> \
@@ -13,7 +13,9 @@
 #   scripts/e2e-pki-rotation/leaf-rotation.sh --kubeconfig temp/u7s/kubeconfig \
 #       --workdir temp/u7s --port <PORT> --vm <VM> --iterations 10
 # Without --vm only the apiserver is exercised (no kubelet, KCM or scheduler), which is the
-# shape a plain CI runner can host.
+# shape a plain CI runner can host. With --vm, --lifetime must be at least 120: the scheduler
+# re-reads its cert files every 30s, and renewal at 2/3 lifetime must leave more than that
+# before the old cert expires.
 #
 # Each iteration waits for the currently served serving cert to expire, so it takes about
 # --lifetime seconds; a whole run is ~(iterations x lifetime) plus the pod image pull.
@@ -24,13 +26,16 @@
 #   3. new kubectl requests succeed after the original serving cert expired (they would
 #      fail x509 expired without the hot swap);
 #   4. with --vm: `kubectl exec` into a pod works after the apiserver's original
-#      kubelet-client cert expired, and a Deployment created then is made into a scheduled
-#      pod (KCM and scheduler still reach the apiserver);
-#   5. the apiserver log shows serving, kubelet-client and proxy-client rotated.
+#      kubelet-client cert expired;
+#   5. with --vm: the scheduler and KCM client certs are re-issued, the old ones expire, and a
+#      new Deployment is still made into a scheduled pod, with the scheduler and KCM processes
+#      unchanged (same PID and start time -- no restart) and the scheduler logging that it
+#      reloaded its TLS material;
+#   6. the apiserver log shows serving, kubelet-client, proxy-client and, with --vm,
+#      scheduler-client and kcm-client rotated.
 #
-# Pending (need other beads, not asserted here): KCM and scheduler client-cert rotation
-# and kubelet client-cert reload (file-path kubeconfigs and politeia file mode),
-# intermediate rotation, root succession. proxy-client rotation is checked by log only:
+# Pending (need other beads, not asserted here): kubelet client-cert reload, intermediate
+# rotation, root succession. proxy-client rotation is checked by log only:
 # no aggregated backend in this harness verifies the identity.
 #
 # On failure the script dumps the served cert, the rotation log lines and component logs.
@@ -50,10 +55,16 @@ poll() {
 
 pem_serial() { openssl x509 -noout -serial; }
 
+# pem_file_serial <file>: serial of the first certificate in a PEM file (a cert+key bundle is fine).
+pem_file_serial() { openssl x509 -noout -serial -in "$1"; }
+
 # cert_has_life <pem-file> <seconds>: true while the cert is valid for at least that long.
 cert_has_life() { openssl x509 -checkend "$2" -noout -in "$1" >/dev/null; }
 
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
+
+# shellcheck source=scripts/_kill-pattern.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../_kill-pattern.sh"
 
 KC=""
 WORKDIR=""
@@ -77,6 +88,7 @@ done
   exit 1
 }
 
+ABS_WORKDIR="$(cd "$WORKDIR" && pwd)"
 TMP="$(mktemp -d)"
 NS=default
 NAME="pki-rot-$$"
@@ -131,6 +143,11 @@ set -E
 grep -q "pki-test-knobs" "$WORKDIR/apiserver.log" ||
   fail "apiserver.log has no pki-test-knobs line: the binary was not built with --features pki-test-knobs or was started without U7S_PKI_TEST_LIFETIME_SECS"
 
+if [ -n "$VM" ] && [ "$LIFETIME" -lt 120 ]; then
+  echo "error: --lifetime must be at least 120 with --vm (the scheduler re-reads its certs every 30s)" >&2
+  exit 1
+fi
+
 poll 60 k get --raw /readyz >/dev/null 2>&1 || fail "apiserver not ready"
 
 kubectl --kubeconfig "$KC" -n "$NS" get configmaps -w -o name >"$TMP/watch.out" 2>"$TMP/watch.err" &
@@ -147,10 +164,31 @@ watch_saw() { grep -q "configmap/$1" "$TMP/watch.out"; }
 cert_expired() { ! cert_has_life "$1" 0; }
 scheduled() { [ -n "$(k -n "$NS" get pods -l "app=$NAME" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)" ]; }
 
+proc_start() { ps -o lstart= -p "$1" 2>/dev/null | sed "s/^ *//"; }
+kcm_pid() { limactl shell "$VM" pgrep -x kube-controller 2>/dev/null | head -1; }
+kcm_start() { limactl shell "$VM" ps -o lstart= -p "$1" 2>/dev/null | sed "s/^ *//"; }
+sched_pid() { pgrep -f "$(workdir_kill_pattern scheduler "$ABS_WORKDIR")" | head -1; }
+file_serial_differs() { [ "$(pem_file_serial "$1")" != "$2" ]; }
+
+if [ -n "$VM" ]; then
+  SCHED_PID="$(sched_pid)"
+  [ -n "$SCHED_PID" ] || fail "no standalone u7s-scheduler process for $ABS_WORKDIR (rotation of its client cert cannot be observed with --embedded-scheduler)"
+  SCHED_START="$(proc_start "$SCHED_PID")"
+  KCM_PID="$(kcm_pid)"
+  [ -n "$KCM_PID" ] || fail "no kube-controller-manager process in $VM"
+  KCM_START="$(kcm_start "$KCM_PID")"
+  echo "scheduler pid $SCHED_PID started $SCHED_START; kcm pid $KCM_PID started $KCM_START"
+fi
+
 START=$SECONDS
 for i in $(seq 1 "$ITERATIONS"); do
   served_pem >"$TMP/old.pem"
   old_serial="$(pem_serial <"$TMP/old.pem")"
+  if [ -n "$VM" ]; then
+    for who in scheduler kcm; do
+      cp "$ABS_WORKDIR/$who.pem" "$TMP/$who.old.pem"
+    done
+  fi
   t0=$SECONDS
 
   poll $((LIFETIME + 20)) serial_differs "$old_serial" ||
@@ -181,15 +219,32 @@ for i in $(seq 1 "$ITERATIONS"); do
     k -n "$NS" logs "$NAME" >/dev/null || fail "iteration $i: kubectl logs failed"
     echo "PASS[$i]: kubectl exec/logs through the rotated kubelet-client identity"
 
+    for who in scheduler kcm; do
+      old="$(pem_file_serial "$TMP/$who.old.pem")"
+      poll $((LIFETIME + 20)) file_serial_differs "$ABS_WORKDIR/$who.pem" "$old" ||
+        fail "iteration $i: $who client cert $old was never re-issued"
+      poll $((LIFETIME + 10)) cert_expired "$TMP/$who.old.pem" || fail "iteration $i: old $who client cert never expired"
+    done
+    echo "PASS[$i]: scheduler and KCM client certs re-issued and the originals expired"
+
     k -n "$NS" delete deployment "$NAME" --ignore-not-found >/dev/null
     k -n "$NS" create deployment "$NAME" --image="$IMAGE" -- /agnhost pause >/dev/null
     poll 120 scheduled || fail "iteration $i: KCM did not create, or the scheduler did not place, a Deployment's pod"
     echo "PASS[$i]: KCM and scheduler still serve new work"
+    [ "$(sched_pid)" = "$SCHED_PID" ] && [ "$(proc_start "$SCHED_PID")" = "$SCHED_START" ] ||
+      fail "iteration $i: the scheduler was restarted (pid $SCHED_PID, started $SCHED_START)"
+    [ "$(kcm_pid)" = "$KCM_PID" ] && [ "$(kcm_start "$KCM_PID")" = "$KCM_START" ] ||
+      fail "iteration $i: KCM was restarted (pid $KCM_PID, started $KCM_START)"
+    reloads="$(grep -c "TLS material changed on disk" "$WORKDIR/scheduler.log" || true)"
+    [ "$reloads" -ge "$i" ] || fail "iteration $i: scheduler.log shows $reloads TLS reloads, expected at least $i"
+    echo "PASS[$i]: scheduler and KCM kept their processes (no restart); scheduler reloaded TLS material $reloads time(s)"
   fi
 done
 
-for leaf in apiserver-serving kubelet-client proxy-client; do
+leaves="apiserver-serving kubelet-client proxy-client"
+[ -z "$VM" ] || leaves="$leaves scheduler-client kcm-client"
+for leaf in $leaves; do
   grep -q "rotated $leaf" "$WORKDIR/apiserver.log" || fail "apiserver log never reports rotating $leaf"
 done
 ! grep -q "rotation failed" "$WORKDIR/apiserver.log" || fail "apiserver log reports a failed rotation"
-echo "PASS: serving, kubelet-client and proxy-client all rotated; $ITERATIONS iteration(s) in $((SECONDS - START))s"
+echo "PASS: $leaves all rotated; $ITERATIONS iteration(s) in $((SECONDS - START))s"

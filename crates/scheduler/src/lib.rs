@@ -7,14 +7,28 @@ use hyper::{Method, StatusCode, Uri};
 use politeia::HyperApiClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio_rustls::TlsConnector;
+use std::sync::Arc;
 use tracing::{debug, error, info};
 
 mod run;
+
+/// The scheduler's one shared API client: every request and every watch reconnect
+/// goes through it, so the reloadable TLS material it holds keeps its state.
+pub type ApiClient = Arc<HyperApiClient>;
+
+#[cfg(test)]
+pub(crate) fn fixed_client(connector: tokio_rustls::TlsConnector, server: String) -> ApiClient {
+    Arc::new(HyperApiClient {
+        server,
+        connector: connector.into(),
+        bearer: None,
+    })
+}
+
 /// The scheduler's watch/schedule loop as a callable library function — see
 /// `run.rs` for why (`u7s-apiserver`'s `--embedded-scheduler` task calls this
 /// directly).
-pub use run::run_scheduler;
+pub use run::{build_client, run_scheduler};
 
 // ---------------------------------------------------------------------------
 // HTTP helpers — delegates to HyperApiClient in kubeconfig.
@@ -32,44 +46,23 @@ pub fn parse_uri_parts(base: &str, path: &str) -> anyhow::Result<(String, u16, S
     Ok((host, port, addr))
 }
 
-pub async fn http_get(
-    connector: &TlsConnector,
-    base: &str,
-    path: &str,
-) -> anyhow::Result<(StatusCode, String)> {
-    let client = HyperApiClient {
-        server: base.to_owned(),
-        connector: connector.clone(),
-        bearer: None,
-    };
+pub async fn http_get(client: &HyperApiClient, path: &str) -> anyhow::Result<(StatusCode, String)> {
     client.request(Method::GET, path, None).await
 }
 
 pub async fn http_post_json(
-    connector: &TlsConnector,
-    base: &str,
+    client: &HyperApiClient,
     path: &str,
     payload: &Value,
 ) -> anyhow::Result<(StatusCode, String)> {
-    let client = HyperApiClient {
-        server: base.to_owned(),
-        connector: connector.clone(),
-        bearer: None,
-    };
     let body_str = serde_json::to_string(payload)?;
     client.request(Method::POST, path, Some(body_str)).await
 }
 
 pub async fn http_delete(
-    connector: &TlsConnector,
-    base: &str,
+    client: &HyperApiClient,
     path: &str,
 ) -> anyhow::Result<(StatusCode, String)> {
-    let client = HyperApiClient {
-        server: base.to_owned(),
-        connector: connector.clone(),
-        bearer: None,
-    };
     client.request(Method::DELETE, path, None).await
 }
 
@@ -78,16 +71,10 @@ pub async fn http_delete(
 /// `accepts_patch_content_type` rejects the plain `application/json` that
 /// [`http_post_json`]/[`request`] send, with 415).
 pub async fn http_patch_status(
-    connector: &TlsConnector,
-    base: &str,
+    client: &HyperApiClient,
     path: &str,
     payload: &Value,
 ) -> anyhow::Result<(StatusCode, String)> {
-    let client = HyperApiClient {
-        server: base.to_owned(),
-        connector: connector.clone(),
-        bearer: None,
-    };
     let body_str = serde_json::to_string(payload)?;
     client
         .request_with_content_type(
@@ -110,16 +97,10 @@ pub async fn http_patch_status(
 pub use politeia::drain_watch_buffer;
 
 pub async fn stream_watch_events(
-    connector: &TlsConnector,
-    base: &str,
+    client: &ApiClient,
     path: &str,
     handler: impl FnMut(Value),
 ) -> anyhow::Result<()> {
-    let client = HyperApiClient {
-        server: base.to_owned(),
-        connector: connector.clone(),
-        bearer: None,
-    };
     client.watch_stream(path, handler).await
 }
 
@@ -4583,13 +4564,12 @@ fn selected_node_annotation_patch(node_name: &str) -> Value {
 }
 
 async fn fetch_pvc_binding_info(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     namespace: &str,
     name: &str,
 ) -> anyhow::Result<Option<PvcBindingInfo>> {
     let path = pvc_path(namespace, name);
-    let (status, body) = http_get(connector, server, &path).await?;
+    let (status, body) = http_get(client, &path).await?;
     if status.as_u16() == 404 {
         return Ok(None);
     }
@@ -4620,8 +4600,7 @@ async fn fetch_pvc_binding_info(
 /// silently make every one of those derivations treat it as gone and
 /// mis-schedule the pod against a volume constraint it never checked.
 pub(crate) async fn fetch_pvc_binding_info_batch(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     namespace: &str,
     pvc_names: &[String],
 ) -> anyhow::Result<std::collections::HashMap<String, PvcBindingInfo>> {
@@ -4631,7 +4610,7 @@ pub(crate) async fn fetch_pvc_binding_info_batch(
         if !seen.insert(pvc_name.clone()) {
             continue;
         }
-        if let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await? {
+        if let Some(info) = fetch_pvc_binding_info(client, namespace, pvc_name).await? {
             infos.insert(pvc_name.clone(), info);
         }
     }
@@ -4665,12 +4644,11 @@ pub(crate) fn fetch_read_write_once_pod_pvc_names(
 }
 
 async fn fetch_storage_class_binding_mode(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     name: &str,
 ) -> anyhow::Result<Option<String>> {
     let path = storage_class_path(name);
-    let (status, body) = http_get(connector, server, &path).await?;
+    let (status, body) = http_get(client, &path).await?;
     if status.as_u16() == 404 {
         return Ok(None);
     }
@@ -4687,12 +4665,11 @@ async fn fetch_storage_class_binding_mode(
 /// type): the two are independent call sites (selected-node stamping vs. the
 /// CSILimits predicate) that happen to read the same object.
 async fn fetch_storage_class_provisioner(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     name: &str,
 ) -> anyhow::Result<Option<String>> {
     let path = storage_class_path(name);
-    let (status, body) = http_get(connector, server, &path).await?;
+    let (status, body) = http_get(client, &path).await?;
     if status.as_u16() == 404 {
         return Ok(None);
     }
@@ -4717,8 +4694,7 @@ async fn fetch_storage_class_provisioner(
 /// that misses its stamp this way simply stays Pending for the PVC's own
 /// controller resync, or a future re-bind of this pod, to retry.
 pub async fn stamp_selected_node_for_pvcs(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     namespace: &str,
     pvc_names: &[String],
     node_name: &str,
@@ -4728,7 +4704,7 @@ pub async fn stamp_selected_node_for_pvcs(
     }
     let mut pvc_info = std::collections::HashMap::new();
     for name in pvc_names {
-        match fetch_pvc_binding_info(connector, server, namespace, name).await {
+        match fetch_pvc_binding_info(client, namespace, name).await {
             Ok(Some(info)) => {
                 pvc_info.insert(name.clone(), info);
             }
@@ -4746,7 +4722,7 @@ pub async fn stamp_selected_node_for_pvcs(
         if sc_mode.contains_key(sc_name) {
             continue;
         }
-        match fetch_storage_class_binding_mode(connector, server, sc_name).await {
+        match fetch_storage_class_binding_mode(client, sc_name).await {
             Ok(Some(mode)) => {
                 sc_mode.insert(sc_name.to_owned(), mode);
             }
@@ -4765,7 +4741,7 @@ pub async fn stamp_selected_node_for_pvcs(
     for patch in patches {
         let path = pvc_path(namespace, &patch.pvc_name);
         let payload = selected_node_annotation_patch(&patch.node_name);
-        match http_patch_status(connector, server, &path, &payload).await {
+        match http_patch_status(client, &path, &payload).await {
             Ok((status, _)) if status.is_success() => {
                 info!(
                     pvc = %patch.pvc_name, node = %patch.node_name,
@@ -4849,13 +4825,9 @@ struct PvInfo {
     csi_driver: Option<String>,
 }
 
-async fn fetch_pv_info(
-    connector: &TlsConnector,
-    server: &str,
-    name: &str,
-) -> anyhow::Result<Option<PvInfo>> {
+async fn fetch_pv_info(client: &ApiClient, name: &str) -> anyhow::Result<Option<PvInfo>> {
     let path = pv_path(name);
-    let (status, body) = http_get(connector, server, &path).await?;
+    let (status, body) = http_get(client, &path).await?;
     if status.as_u16() == 404 {
         return Ok(None);
     }
@@ -4876,8 +4848,7 @@ async fn fetch_pv_info(
 /// the same PV object. A PV that no longer exists (404) is simply absent
 /// from the returned map, matching `fetch_pv_info`'s own convention.
 pub(crate) async fn fetch_pv_info_batch(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     volume_names: &[String],
 ) -> anyhow::Result<std::collections::HashMap<String, PvInfo>> {
     let mut infos = std::collections::HashMap::new();
@@ -4886,7 +4857,7 @@ pub(crate) async fn fetch_pv_info_batch(
         if name.is_empty() || !seen.insert(name.clone()) {
             continue;
         }
-        if let Some(info) = fetch_pv_info(connector, server, name).await? {
+        if let Some(info) = fetch_pv_info(client, name).await? {
             infos.insert(name.clone(), info);
         }
     }
@@ -4977,8 +4948,7 @@ const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
 /// `pvc_info` is the caller's already-fetched batch (`fetch_pvc_binding_info_batch`)
 /// — this only issues the StorageClass provisioner GET, not a per-PVC one.
 pub(crate) async fn fetch_unbound_csi_pvc_drivers(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
     pvc_names: &[String],
 ) -> anyhow::Result<Vec<String>> {
@@ -4993,9 +4963,7 @@ pub(crate) async fn fetch_unbound_csi_pvc_drivers(
         let Some(sc_name) = info.storage_class_name.as_deref().filter(|s| !s.is_empty()) else {
             continue;
         };
-        if let Some(provisioner) =
-            fetch_storage_class_provisioner(connector, server, sc_name).await?
-        {
+        if let Some(provisioner) = fetch_storage_class_provisioner(client, sc_name).await? {
             if provisioner != NO_PROVISIONER {
                 drivers.push(provisioner);
             }
@@ -5017,8 +4985,7 @@ pub(crate) async fn fetch_unbound_csi_pvc_drivers(
 /// (`fetch_pvc_binding_info_batch`/`fetch_pv_info_batch`) — this only issues
 /// the StorageClass provisioner GET, not a per-PVC/PV one.
 async fn resolve_csi_driver(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
     pv_info: &std::collections::HashMap<String, PvInfo>,
     pvc_name: &str,
@@ -5037,7 +5004,7 @@ async fn resolve_csi_driver(
     let Some(sc_name) = info.storage_class_name.as_deref().filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    fetch_storage_class_provisioner(connector, server, sc_name).await
+    fetch_storage_class_provisioner(client, sc_name).await
 }
 
 /// Count how many CSI volumes `pvc_names` (deduplicated — the same PVC
@@ -5047,8 +5014,7 @@ async fn resolve_csi_driver(
 /// scheduling decision, so a PVC referenced by more than one pod — or
 /// checked again while tallying a second node — is only ever resolved once.
 async fn count_csi_volumes_by_driver(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
     pv_info: &std::collections::HashMap<String, PvInfo>,
     pvc_names: &[String],
@@ -5063,8 +5029,7 @@ async fn count_csi_volumes_by_driver(
         let driver = if let Some(cached) = cache.get(pvc_name) {
             cached.clone()
         } else {
-            let resolved =
-                resolve_csi_driver(connector, server, pvc_info, pv_info, pvc_name).await?;
+            let resolved = resolve_csi_driver(client, pvc_info, pv_info, pvc_name).await?;
             cache.insert(pvc_name.clone(), resolved.clone());
             resolved
         };
@@ -5083,14 +5048,13 @@ async fn count_csi_volumes_by_driver(
 /// already-fetched batches, shared with the other three pre-`pick_node`
 /// derivations instead of each re-GETting the same PVCs/PVs.
 pub(crate) async fn fetch_csi_volume_counts(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     pvc_info: &std::collections::HashMap<String, PvcBindingInfo>,
     pv_info: &std::collections::HashMap<String, PvInfo>,
     pvc_names: &[String],
 ) -> anyhow::Result<std::collections::BTreeMap<String, i64>> {
     let mut cache = std::collections::HashMap::new();
-    count_csi_volumes_by_driver(connector, server, pvc_info, pv_info, pvc_names, &mut cache).await
+    count_csi_volumes_by_driver(client, pvc_info, pv_info, pvc_names, &mut cache).await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -5248,8 +5212,7 @@ pub fn missing_required_csi_driver<'a>(
 
 /// Bind a pod to a node via POST .../pods/:name/binding.
 pub async fn bind_pod(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     namespace: &str,
     pod_name: &str,
     node_name: &str,
@@ -5258,7 +5221,7 @@ pub async fn bind_pod(
     let payload = binding_payload(namespace, pod_name, node_name);
 
     let start = std::time::Instant::now();
-    let (status, body) = http_post_json(connector, server, &path, &payload).await?;
+    let (status, body) = http_post_json(client, &path, &payload).await?;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     debug!(pod = %pod_name, node = %node_name, elapsed_ms, "bind_pod: POST completed");
     check_bind_response(status.as_u16(), &body)?;
@@ -5459,8 +5422,7 @@ pub fn events_path(namespace: &str) -> String {
 /// created — the scheduler made the right bind/reject decision but nobody outside
 /// process memory ever heard about it.
 pub async fn emit_scheduling_event(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     namespace: &str,
     pod_name: &str,
     reason: &str,
@@ -5484,7 +5446,7 @@ pub async fn emit_scheduling_event(
     );
     let path = events_path(namespace);
     let start = std::time::Instant::now();
-    let (status, body) = http_post_json(connector, server, &path, &payload).await?;
+    let (status, body) = http_post_json(client, &path, &payload).await?;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     debug!(pod = %pod_name, reason, elapsed_ms, "emit_scheduling_event: POST completed");
     if !status.is_success() {
@@ -5563,15 +5525,10 @@ pub fn nominated_node_name_patch(node_name: &str) -> Value {
 /// upstream's e2e preemption test (`test/e2e/scheduling/preemption.go`,
 /// 1s poll interval) to ever observe the intermediate
 /// "DeletionTimestamp set, still Gettable" state it asserts on.
-pub async fn delete_pod(
-    connector: &TlsConnector,
-    server: &str,
-    namespace: &str,
-    pod_name: &str,
-) -> anyhow::Result<()> {
+pub async fn delete_pod(client: &ApiClient, namespace: &str, pod_name: &str) -> anyhow::Result<()> {
     let path = delete_pod_path(namespace, pod_name);
     let start = std::time::Instant::now();
-    let (status, body) = http_delete(connector, server, &path).await?;
+    let (status, body) = http_delete(client, &path).await?;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     debug!(pod = %pod_name, elapsed_ms, "delete_pod: DELETE completed");
     check_delete_response(status.as_u16())
@@ -5607,15 +5564,14 @@ pub fn check_status_patch_response(status: u16, body: &str) -> anyhow::Result<()
 /// (see `merge_conditions`), so `patch` only needs to carry the single
 /// condition being added or changed; unrelated conditions are preserved.
 pub async fn patch_pod_status(
-    connector: &TlsConnector,
-    server: &str,
+    client: &ApiClient,
     namespace: &str,
     pod_name: &str,
     patch: &Value,
 ) -> anyhow::Result<()> {
     let path = pod_status_path(namespace, pod_name);
     let start = std::time::Instant::now();
-    let (status, body) = http_patch_status(connector, server, &path, patch).await?;
+    let (status, body) = http_patch_status(client, &path, patch).await?;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     debug!(pod = %pod_name, elapsed_ms, "patch_pod_status: PATCH completed");
     check_status_patch_response(status.as_u16(), &body)
@@ -5932,23 +5888,24 @@ mod tests {
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-        let server = format!("https://127.0.0.1:{port}");
+        let client = crate::fixed_client(
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            format!("https://127.0.0.1:{port}"),
+        );
 
         let pvc_names = vec!["pvc-bound".to_owned(), "pvc-unbound".to_owned()];
 
         // The pre-batch behavior the batch fetch must reproduce exactly.
-        let individual_bound = fetch_pvc_binding_info(&connector, &server, namespace, "pvc-bound")
+        let individual_bound = fetch_pvc_binding_info(&client, namespace, "pvc-bound")
             .await
             .expect("individual fetch must succeed")
             .expect("PVC must exist");
-        let individual_unbound =
-            fetch_pvc_binding_info(&connector, &server, namespace, "pvc-unbound")
-                .await
-                .expect("individual fetch must succeed")
-                .expect("PVC must exist");
+        let individual_unbound = fetch_pvc_binding_info(&client, namespace, "pvc-unbound")
+            .await
+            .expect("individual fetch must succeed")
+            .expect("PVC must exist");
 
-        let pvc_info = fetch_pvc_binding_info_batch(&connector, &server, namespace, &pvc_names)
+        let pvc_info = fetch_pvc_binding_info_batch(&client, namespace, &pvc_names)
             .await
             .expect("batch fetch must succeed");
 
@@ -5989,22 +5946,20 @@ mod tests {
             .map(|info| info.volume_name.clone())
             .filter(|name| !name.is_empty())
             .collect();
-        let pv_info = fetch_pv_info_batch(&connector, &server, &bound_volume_names)
+        let pv_info = fetch_pv_info_batch(&client, &bound_volume_names)
             .await
             .expect("PV batch fetch must succeed");
 
         // Drive all four pre-`pick_node` derivations off the SAME
         // already-fetched batch, exactly like run.rs's scheduling loop.
         let affinities = fetch_bound_pv_node_affinities(&pvc_info, &pv_info, &pvc_names);
-        let csi_counts =
-            fetch_csi_volume_counts(&connector, &server, &pvc_info, &pv_info, &pvc_names)
-                .await
-                .expect("csi volume counts must succeed");
+        let csi_counts = fetch_csi_volume_counts(&client, &pvc_info, &pv_info, &pvc_names)
+            .await
+            .expect("csi volume counts must succeed");
         let rwop_names = fetch_read_write_once_pod_pvc_names(&pvc_info, &pvc_names);
-        let unbound_drivers =
-            fetch_unbound_csi_pvc_drivers(&connector, &server, &pvc_info, &pvc_names)
-                .await
-                .expect("unbound csi pvc drivers must succeed");
+        let unbound_drivers = fetch_unbound_csi_pvc_drivers(&client, &pvc_info, &pvc_names)
+            .await
+            .expect("unbound csi pvc drivers must succeed");
 
         assert_eq!(
             affinities.len(),
@@ -11922,7 +11877,6 @@ mod tests {
         use rcgen::{CertificateParams, KeyPair, SanType};
         use rustls::pki_types::PrivateKeyDer;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         use tokio_rustls::TlsAcceptor;
@@ -11996,10 +11950,11 @@ mod tests {
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-
-        let server = format!("https://127.0.0.1:{port}");
-        delete_pod(&connector, &server, "default", "victim")
+        let client = crate::fixed_client(
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            format!("https://127.0.0.1:{port}"),
+        );
+        delete_pod(&client, "default", "victim")
             .await
             .expect("delete_pod must succeed against a mock server that returns 200");
 

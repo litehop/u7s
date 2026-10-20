@@ -553,12 +553,10 @@ pub struct TlsMaterial {
     /// O=), the identity of the in-process YAML applier.
     #[cfg_attr(not(test), allow(dead_code))]
     pub bootstrap_installer_cert_der: Vec<u8>,
-    /// DER-encoded scheduler client certificate (CN=system:kube-scheduler, no O=), embedded in
-    /// the scheduler's dedicated kubeconfig so it authenticates as its own least-privilege
-    /// identity instead of sharing the admin/system:masters kubeconfig.
+    /// DER-encoded scheduler client certificate (CN=system:kube-scheduler, no O=); its kubeconfig
+    /// references the persisted leaf file.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub scheduler_cert_der: Vec<u8>,
-    /// PEM-encoded scheduler client private key.
-    pub scheduler_key_pem: Vec<u8>,
     /// PEM-encoded proxy-client certificate (CN=front-proxy-client), signed by the
     /// DEDICATED front-proxy CA (`--proxy-client-ca-key`/`--proxy-client-ca-cert`), not
     /// the main cluster CA. Presented by u7s to AGGREGATED BACKENDS (never to u7s itself)
@@ -736,7 +734,7 @@ fn generate_tls_with(
 ) -> anyhow::Result<TlsMaterial> {
     let test_lifetime = crate::pki::test_lifetime();
     let serving_lifetime = test_lifetime.unwrap_or(serving_lifetime);
-    let held_client_lifetime = test_lifetime.unwrap_or(CLIENT_CERT_LIFETIME);
+    let test_client_lifetime = test_lifetime.unwrap_or(CLIENT_CERT_LIFETIME);
     // Install the ML-KEM-768 hybrid post-quantum crypto provider.
     // `.ok()` makes this idempotent: a second call (e.g. in tests) is a no-op.
     rustls_post_quantum::provider().install_default().ok();
@@ -807,7 +805,7 @@ fn generate_tls_with(
         // from the system:masters organization as trusted. CN and O must match exactly
         // what real kube-apiserver uses so kubelet authorizes the proxy requests.
         LeafPlan {
-            lifetime: held_client_lifetime,
+            lifetime: test_client_lifetime,
             ..client_plan(
                 "kubelet-client",
                 "kube-apiserver-kubelet-client",
@@ -820,20 +818,26 @@ fn generate_tls_with(
         // of admin/system:masters. No O= — the seeded ClusterRoleBinding
         // system:kube-controller-manager (see seed_rbac()) binds by username (kind: User),
         // so group membership is irrelevant here.
-        client_plan(
-            "kcm-client",
-            "system:kube-controller-manager",
-            None,
-            CaKind::Cluster,
-            Some(files("kcm")),
-        ),
-        client_plan(
-            "scheduler-client",
-            "system:kube-scheduler",
-            None,
-            CaKind::Cluster,
-            Some(files("scheduler")),
-        ),
+        LeafPlan {
+            lifetime: test_client_lifetime,
+            ..client_plan(
+                "kcm-client",
+                "system:kube-controller-manager",
+                None,
+                CaKind::Cluster,
+                Some(files("kcm")),
+            )
+        },
+        LeafPlan {
+            lifetime: test_client_lifetime,
+            ..client_plan(
+                "scheduler-client",
+                "system:kube-scheduler",
+                None,
+                CaKind::Cluster,
+                Some(files("scheduler")),
+            )
+        },
         // Identity for the in-process YAML applier that server-side-applies bootstrap
         // manifest bundles (e.g. CoreDNS) against the just-bound apiserver. No O= — the
         // seeded ClusterRoleBinding system:bootstrap-installer (see seed_rbac()) binds by
@@ -849,7 +853,7 @@ fn generate_tls_with(
         // backends only (see doc); no O= is needed since the backend's own RBAC/authorization
         // config never sees this cert's Subject, only the X-Remote-User/-Group headers it vouches for.
         LeafPlan {
-            lifetime: held_client_lifetime,
+            lifetime: test_client_lifetime,
             ..client_plan(
                 "proxy-client",
                 "front-proxy-client",
@@ -881,6 +885,7 @@ fn generate_tls_with(
     for (stem, leaf) in [
         ("admin", &admin),
         ("kcm", &kcm),
+        ("scheduler", &scheduler),
         ("bootstrap-installer", &bootstrap_installer),
     ] {
         write_leaf_pem(&files(stem), &leaf.cert_der, &leaf.key_pem)?;
@@ -895,7 +900,6 @@ fn generate_tls_with(
         kubelet_client_key_pem: kubelet_client.key_pem,
         kcm_cert_der: kcm.cert_der,
         scheduler_cert_der: scheduler.cert_der,
-        scheduler_key_pem: scheduler.key_pem,
         bootstrap_installer_cert_der: bootstrap_installer.cert_der,
         proxy_client_cert_pem: pem_encode("CERTIFICATE", &proxy_client.cert_der),
         proxy_client_key_pem: proxy_client.key_pem,
@@ -919,19 +923,12 @@ pub(crate) fn pem_encode(label: &str, der: &[u8]) -> Vec<u8> {
 }
 
 /// How a kubeconfig carries its credentials. Files are re-read by client-go on every
-/// handshake, so a re-issued cert or CA is picked up without restarting the component;
-/// embedded data is read once.
+/// handshake, so a re-issued cert or CA is picked up without restarting the component.
 pub(crate) enum KubeconfigCreds<'a> {
     Files {
         ca: &'a std::path::Path,
         /// One PEM holding the client cert and key, replaced by a single rename.
         identity: &'a std::path::Path,
-    },
-    /// For a consumer that cannot read file references yet.
-    Embedded {
-        ca_cert_der: &'a [u8],
-        cert_der: &'a [u8],
-        key_pem: &'a [u8],
     },
 }
 
@@ -961,33 +958,12 @@ fn absolute(path: &std::path::Path) -> String {
 
 impl Kubeconfig {
     fn new(server: &str, creds: &KubeconfigCreds<'_>, username: &str) -> Self {
-        let (ca, cert, key) = match creds {
-            KubeconfigCreds::Files { ca, identity } => (
-                ("certificate-authority", absolute(ca)),
-                ("client-certificate", absolute(identity)),
-                ("client-key", absolute(identity)),
-            ),
-            KubeconfigCreds::Embedded {
-                ca_cert_der,
-                cert_der,
-                key_pem,
-            } => {
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD;
-                // kubeconfig fields expect base64(PEM), not base64(DER).
-                (
-                    (
-                        "certificate-authority-data",
-                        b64.encode(pem_encode("CERTIFICATE", ca_cert_der)),
-                    ),
-                    (
-                        "client-certificate-data",
-                        b64.encode(pem_encode("CERTIFICATE", cert_der)),
-                    ),
-                    ("client-key-data", b64.encode(key_pem)),
-                )
-            }
-        };
+        let KubeconfigCreds::Files { ca, identity } = creds;
+        let (ca, cert, key) = (
+            ("certificate-authority", absolute(ca)),
+            ("client-certificate", absolute(identity)),
+            ("client-key", absolute(identity)),
+        );
         Kubeconfig {
             server: server.to_owned(),
             ca,
@@ -1129,10 +1105,6 @@ pub fn write_component_kubeconfig(
         },
         username,
     )
-}
-
-pub(crate) fn kubeconfig_server(args: &Args) -> String {
-    kubeconfig_server_url(args).to_owned()
 }
 
 pub(crate) fn write_identity_kubeconfig(
@@ -2369,7 +2341,7 @@ mod tests {
         der_from_pem(&text.as_bytes()[..end])
     }
 
-    /// KCM and the kubelet only re-read client certs and the CA when the kubeconfig names
+    /// KCM, the scheduler and the kubelet only re-read client certs and the CA when the kubeconfig names
     /// files; embedded `-data` is read once, so a rotated cert would stay invisible to them
     /// until a restart. Every writer that feeds an upstream component must therefore emit
     /// paths only, and the paths must be files that exist and hold the leaf in use.
@@ -2382,13 +2354,19 @@ mod tests {
             ..args_with(Some("https://127.0.0.1:6447"))
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
-        let writers: [(&str, &str, &str, &[u8]); 3] = [
+        let writers: [(&str, &str, &str, &[u8]); 4] = [
             ("kubeconfig", "admin", "admin", &tls.admin_cert_der),
             (
                 "kcm-kubeconfig",
                 "kcm",
                 "system:kube-controller-manager",
                 &tls.kcm_cert_der,
+            ),
+            (
+                "kubeconfig-scheduler",
+                "scheduler",
+                "system:kube-scheduler",
+                &tls.scheduler_cert_der,
             ),
             (
                 "bootstrap-installer-kubeconfig",
@@ -3017,53 +2995,6 @@ mod tests {
             scheduler_id.groups,
             vec!["system:authenticated".to_owned()],
             "scheduler's cert must carry no O=system:masters, for the same reason as KCM's"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
-    }
-
-    /// Regression: the embedded-credential kubeconfig (the scheduler's, until its reader
-    /// understands file references) must embed the given component's own cert/key under its
-    /// own username, and must NOT carry any bearer token — every identity this module writes
-    /// is cert-only (see `Kubeconfig`'s doc), so a token field here would silently grant
-    /// whatever identity that token resolves to alongside the component's own
-    /// least-privilege cert.
-    #[test]
-    fn embedded_component_kubeconfig_uses_component_identity_with_no_token() {
-        let dir = test_temp_dir("component-kubeconfig");
-        let args = Args {
-            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
-            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            ..args_with(None)
-        };
-        let tls = generate_tls(&args).expect("generate_tls must succeed");
-        let out_path = dir.join("scheduler-kubeconfig");
-
-        write_identity_kubeconfig(
-            &out_path.to_string_lossy(),
-            kubeconfig_server_url(&args),
-            &KubeconfigCreds::Embedded {
-                ca_cert_der: &tls.ca_cert_der,
-                cert_der: &tls.scheduler_cert_der,
-                key_pem: &tls.scheduler_key_pem,
-            },
-            "system:kube-scheduler",
-        )
-        .expect("write_identity_kubeconfig must succeed");
-
-        let yaml = std::fs::read_to_string(&out_path).expect("kubeconfig must be written"); // lgtm[rust/path-injection]
-        assert!(
-            yaml.contains("client-certificate-data:") && yaml.contains("client-key-data:"),
-            "the scheduler's reader only understands embedded data; got: {yaml}"
-        );
-        assert!(
-            yaml.contains("user: system:kube-scheduler"),
-            "component kubeconfig must reference its own identity, not 'admin'; got: {yaml}"
-        );
-        assert!(
-            !yaml.contains("token:"),
-            "component kubeconfig must have no token field at all when none was minted \
-             for it; got: {yaml}"
         );
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
