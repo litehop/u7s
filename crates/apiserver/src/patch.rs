@@ -159,18 +159,52 @@ fn strategic_merge_patch_at(
     path: &str,
     schema: Option<&serde_json::Value>,
 ) -> Result<(), PatchError> {
+    merge_patch_into(target, patch, path, schema, true)
+}
+
+/// `validate_retain` is false for content that does not exist yet: upstream never runs
+/// `$retainKeys` validation for an absent key; it drops any map carrying `$patch` instead.
+fn merge_patch_into(
+    target: &mut serde_json::Value,
+    patch: &serde_json::Value,
+    path: &str,
+    schema: Option<&serde_json::Value>,
+    validate_retain: bool,
+) -> Result<(), PatchError> {
     let patch_obj = patch.as_object().ok_or(PatchError::NotAnObject)?;
 
     // Ensure target is an object; if not, replace with empty object.
-    if !target.is_object() {
+    let was_object = target.is_object();
+    if !was_object {
         *target = serde_json::Value::Object(Default::default());
     }
     let target_obj = target.as_object_mut().unwrap();
 
-    apply_retain_keys(target_obj, patch_obj)?;
+    // A map-level `$patch` is resolved before `$retainKeys`, which it makes moot: the target
+    // is emptied, so there is nothing to retain. A non-object target is likewise overwritten
+    // wholesale without validating the patch against it.
+    let replaced = match patch_obj.get(PATCH_DIRECTIVE) {
+        None => false,
+        Some(d) if d == "replace" => {
+            target_obj.clear();
+            true
+        }
+        Some(d) if d == "delete" => {
+            target_obj.clear();
+            return Ok(());
+        }
+        Some(d) => {
+            return Err(PatchError::InvalidDirective(format!(
+                "unknown $patch directive '{d}'"
+            )));
+        }
+    };
+    if !replaced && was_object && validate_retain {
+        apply_retain_keys(target_obj, patch_obj)?;
+    }
 
     for (key, value) in patch_obj {
-        if key == RETAIN_KEYS {
+        if key == RETAIN_KEYS || key == PATCH_DIRECTIVE {
             continue;
         }
 
@@ -243,21 +277,23 @@ fn strategic_merge_patch_at(
                              for this path — cannot identify which element to delete"
                         )));
                     }
-                    // Last-write-wins: check for $patch:replace directive in elements.
-                    if has_replace_directive(value) {
-                        // Strip directive elements from patch before storing.
-                        let cleaned = strip_directives(value);
-                        target_obj.insert(key.clone(), cleaned);
-                    } else {
-                        target_obj.insert(key.clone(), value.clone());
+                    // Last-write-wins; elements are stored directive-free.
+                    if let Some(v) = new_value(value, &child_path, schema)? {
+                        target_obj.insert(key.clone(), v);
                     }
                 }
             }
         } else if value.is_object() {
+            // Upstream removeDirectives drops the entire map carrying `$patch` (any value,
+            // any depth) when its key is absent from the target; no map is left behind.
+            if !target_obj.contains_key(key) && value.get(PATCH_DIRECTIVE).is_some() {
+                continue;
+            }
+            let validate_retain = target_obj.contains_key(key);
             let entry = target_obj
                 .entry(key)
                 .or_insert(serde_json::Value::Object(Default::default()));
-            strategic_merge_patch_at(entry, value, &child_path, schema)?;
+            merge_patch_into(entry, value, &child_path, schema, validate_retain)?;
         } else {
             target_obj.insert(key.clone(), value.clone());
         }
@@ -292,6 +328,7 @@ fn strategic_merge_patch_at(
 }
 
 const RETAIN_KEYS: &str = "$retainKeys";
+const PATCH_DIRECTIVE: &str = "$patch";
 
 /// `$retainKeys: [k...]` marks a struct whose patchStrategy includes `retainKeys` (Deployment
 /// `spec.strategy`, PodSpec `volumes[*]` sources, ...): keys of `target` not listed are dropped
@@ -587,7 +624,7 @@ fn strategic_merge_array(
                     None => {
                         index.insert(target_arr.len(), &index_fields(patch_elem, merge_keys));
                         deleted.push(false);
-                        target_arr.push(patch_elem.clone());
+                        target_arr.extend(new_value(patch_elem, path, schema)?);
                     }
                 }
             }
@@ -1093,22 +1130,37 @@ fn has_delete_directive(arr: &serde_json::Value) -> bool {
     })
 }
 
-fn has_replace_directive(arr: &serde_json::Value) -> bool {
-    arr.as_array().is_some_and(|a| {
-        a.iter()
-            .any(|e| e.get("$patch").and_then(|v| v.as_str()) == Some("replace"))
-    })
-}
-
-fn strip_directives(arr: &serde_json::Value) -> serde_json::Value {
-    match arr.as_array() {
-        Some(a) => serde_json::Value::Array(
-            a.iter()
-                .filter(|e| e.get("$patch").is_none())
-                .cloned()
-                .collect(),
-        ),
-        None => arr.clone(),
+/// The value a patch fragment contributes when there is nothing to merge it into (a new list
+/// element, an atomic list's items): objects are merged against an empty map so every
+/// directive is applied or stripped exactly as for an existing object, and directive-only
+/// list items (`{"$patch": ...}`) are dropped. `None` means the fragment deletes itself.
+fn new_value(
+    patch: &serde_json::Value,
+    path: &str,
+    schema: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>, PatchError> {
+    match patch {
+        serde_json::Value::Object(_) => {
+            if patch.get(PATCH_DIRECTIVE).is_some_and(|d| d == "delete") {
+                return Ok(None);
+            }
+            let mut v = serde_json::Value::Object(Default::default());
+            merge_patch_into(&mut v, patch, path, schema, false)?;
+            Ok(Some(v))
+        }
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                if item.get(PATCH_DIRECTIVE).is_some() {
+                    continue;
+                }
+                if let Some(v) = new_value(item, path, schema)? {
+                    out.push(v);
+                }
+            }
+            Ok(Some(serde_json::Value::Array(out)))
+        }
+        _ => Ok(Some(patch.clone())),
     }
 }
 
@@ -4210,5 +4262,194 @@ mod tests {
         let patch = json!({"a": {"$retainKeys": ["x"], "x": 2}});
         let err = run_strategic_merge(&mut target, &patch, None, false, 1).unwrap_err();
         assert!(matches!(err, PatchError::TooComplex(_)), "{err:?}");
+    }
+
+    fn assert_no_directive_keys(v: &serde_json::Value, ctx: &str) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, child) in m {
+                    assert!(
+                        !k.starts_with('$'),
+                        "{ctx}: directive key {k:?} persisted in {v}"
+                    );
+                    assert_no_directive_keys(child, ctx);
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|c| assert_no_directive_keys(c, ctx)),
+            _ => {}
+        }
+    }
+
+    /// Where a directive-bearing fragment lands when its container is new to the target.
+    fn place(location: &str, frag: serde_json::Value) -> (serde_json::Value, &'static str) {
+        match location {
+            "new list element" => {
+                let mut elem = frag;
+                elem["name"] = json!("new");
+                (
+                    json!({"spec": {"containers": [elem]}}),
+                    "/spec/containers/0",
+                )
+            }
+            "new map value" => (json!({"spec": {"strategy": frag}}), "/spec/strategy"),
+            _ => (
+                json!({"spec": {"containers": [{"name": "new", "resources": frag}]}}),
+                "/spec/containers/0/resources",
+            ),
+        }
+    }
+
+    const DIRECTIVE_SITES: [&str; 3] = ["new list element", "new map value", "nested new map"];
+
+    fn directive_fragment(kind: &str) -> serde_json::Value {
+        match kind {
+            "$patch: replace" => json!({"cfg": {"$patch": "replace", "keep": 1}}),
+            "$patch: delete" => json!({"gone": {"$patch": "delete"}, "keep": 1}),
+            "$retainKeys" => json!({"$retainKeys": ["type", "name"], "type": "X"}),
+            "$setElementOrder" => json!({
+                "$setElementOrder/env": [{"name": "A"}, {"name": "B"}],
+                "env": [{"name": "B"}, {"name": "A"}]
+            }),
+            _ => json!({"$deleteFromPrimitiveList/finalizers": ["f"], "keep": 1}),
+        }
+    }
+
+    #[test]
+    fn directives_are_never_persisted_inside_new_list_elements_or_map_values() {
+        for kind in [
+            "$patch: replace",
+            "$patch: delete",
+            "$retainKeys",
+            "$setElementOrder",
+            "$deleteFromPrimitiveList",
+        ] {
+            for location in DIRECTIVE_SITES {
+                let ctx = format!("{kind} in {location}");
+                let (patch, ptr) = place(location, directive_fragment(kind));
+                let mut target = json!({"spec": {"containers": [{"name": "old"}]}});
+                strategic_merge_patch(&mut target, &patch).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+                assert_no_directive_keys(&target, &ctx);
+                let got = target
+                    .pointer(ptr)
+                    .unwrap_or_else(|| panic!("{ctx}: {ptr} missing in {target}"));
+                match kind {
+                    "$patch: replace" => assert!(
+                        got.get("cfg").is_none(),
+                        "{ctx}: upstream removeDirectives drops the whole map carrying $patch"
+                    ),
+                    "$patch: delete" => {
+                        assert!(got.get("gone").is_none(), "{ctx}: deleted map stored");
+                        assert_eq!(got["keep"], 1, "{ctx}");
+                    }
+                    "$retainKeys" => assert_eq!(got["type"], "X", "{ctx}"),
+                    "$setElementOrder" => {
+                        let names: Vec<_> = got["env"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|e| e["name"].as_str().unwrap().to_string())
+                            .collect();
+                        assert_eq!(names, ["A", "B"], "{ctx}");
+                    }
+                    _ => assert_eq!(got["keep"], 1, "{ctx}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ssa_apply_of_a_new_list_element_strips_directives_too() {
+        let mut target = json!({"spec": {"containers": [{"name": "old"}]}});
+        let patch = json!({"spec": {"containers": [{
+            "name": "new",
+            "resources": {"$retainKeys": ["limits"], "limits": {"cpu": "1"}},
+        }]}});
+        strategic_merge_patch_ssa(&mut target, &patch).unwrap();
+        assert_no_directive_keys(&target, "ssa");
+        assert_eq!(
+            target["spec"]["containers"][0]["resources"],
+            json!({"limits": {"cpu": "1"}})
+        );
+    }
+
+    #[test]
+    fn new_items_of_an_atomic_list_are_stored_without_directives() {
+        let mut target = json!({"rules": []});
+        let patch = json!({"rules": [{"verbs": ["get"], "sub": {"$patch": "replace", "a": 1}}]});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert!(
+            target["rules"][0].get("sub").is_none(),
+            "upstream removeDirectives drops the whole map carrying $patch"
+        );
+        assert_eq!(target["rules"][0]["verbs"], json!(["get"]));
+    }
+
+    #[test]
+    fn map_level_patch_replace_swaps_the_whole_map_for_kubectl_apply() {
+        let mut target =
+            json!({"spec": {"strategy": {"type": "RollingUpdate", "rollingUpdate": {}}}});
+        let patch = json!({"spec": {"strategy": {"$patch": "replace", "type": "Recreate"}}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(target["spec"]["strategy"], json!({"type": "Recreate"}));
+    }
+
+    #[test]
+    fn map_level_patch_delete_empties_an_existing_map() {
+        let mut target = json!({"spec": {"strategy": {"type": "Recreate"}}});
+        let patch = json!({"spec": {"strategy": {"$patch": "delete"}}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(target["spec"]["strategy"], json!({}));
+    }
+
+    #[test]
+    fn map_level_patch_replace_on_existing_map_wins_over_retain_keys_like_upstream() {
+        let mut target = json!({"s": {"old": 1}});
+        let patch = json!({"s": {"$patch": "replace", "$retainKeys": ["a"], "b": 2}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(
+            target["s"],
+            json!({"b": 2}),
+            "a map-level $patch must be applied without validating $retainKeys"
+        );
+    }
+
+    #[test]
+    fn retain_keys_on_new_content_is_not_validated_and_not_stored() {
+        // Upstream skips $retainKeys for an absent key; rejecting would 400 a valid apply.
+        let mut target = json!({"spec": {"containers": []}});
+        let patch = json!({"spec": {
+            "containers": [{"name": "x", "$retainKeys": ["a"], "b": 1}],
+            "s": {"$retainKeys": ["a"], "b": 1}
+        }});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(
+            target["spec"]["containers"][0],
+            json!({"name": "x", "b": 1})
+        );
+        assert_eq!(target["spec"]["s"], json!({"b": 1}));
+    }
+
+    #[test]
+    fn patch_replace_on_an_absent_map_key_stores_nothing_like_upstream() {
+        let mut target = json!({"keep": 1});
+        let patch = json!({"s": {"$patch": "replace", "b": 1}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(target, json!({"keep": 1}));
+    }
+
+    #[test]
+    fn retain_keys_is_not_validated_against_a_non_object_target() {
+        let mut target = json!({"s": "scalar"});
+        let patch = json!({"s": {"$retainKeys": ["a"], "b": 2}});
+        strategic_merge_patch(&mut target, &patch).unwrap();
+        assert_eq!(target["s"], json!({"b": 2}));
+    }
+
+    #[test]
+    fn unknown_map_level_patch_directive_is_rejected() {
+        let mut target = json!({"s": {}});
+        let patch = json!({"s": {"$patch": "bogus"}});
+        let err = strategic_merge_patch(&mut target, &patch).unwrap_err();
+        assert!(matches!(err, PatchError::InvalidDirective(_)), "{err:?}");
     }
 }

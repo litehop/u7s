@@ -21,6 +21,7 @@ mod csr_approver;
 mod field_manager;
 mod go_unicode;
 pub mod handlers;
+mod health;
 mod inflight;
 mod keys;
 mod limit_range;
@@ -693,7 +694,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // operator who dropped a broken manifest needs the apiserver to refuse to start, not run
     // half-configured — so its result is threaded back via well_known_manifest_rx and raced
     // against serve_tls below instead of being discarded. On success it also flips
-    // `state.boot_ready` so `/healthz` starts reporting 200 (see the field's doc) — on failure
+    // `state.boot_ready` so `/healthz`, `/livez` and `/readyz` start reporting 200 (see the field's doc) — on failure
     // it stays `false` forever, since the `tokio::select!` below tears the process down anyway.
     // This fatal-at-boot behavior is unchanged by the SIGHUP-triggered reload spawned right
     // below, which reuses the same manifest directory but with log-and-skip semantics instead.
@@ -826,38 +827,15 @@ fn record_manifest_apply_outcome(
     }
 }
 
-/// Reports the apiserver's own listener as up, but only once the boot-time bootstrap manifest
-/// apply (`state.boot_ready`, see its doc) has resolved successfully. Before that, requests
-/// return 503 rather than 200 — the previous behavior of always answering "ok" here is exactly
-/// what forced `scripts/install.sh`'s `wait_for_apiserver` to bolt on a fixed sleep-and-recheck
-/// to guess whether the manifest apply had finished; gating the response itself instead makes
-/// the first 200 a deterministic "boot is fully done" signal, so that heuristic is no longer
-/// needed.
-async fn healthz(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::response::Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    if state.boot_ready.load(std::sync::atomic::Ordering::Acquire) {
-        (StatusCode::OK, "ok").into_response()
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "boot-time manifest apply in progress",
-        )
-            .into_response()
-    }
-}
-
 fn build_router(state: AppState) -> Router {
     Router::new()
         // Health endpoints — authorized through system:public-info-viewer like upstream.
-        // /healthz alone gates on boot_ready (see healthz's doc) — /livez and /readyz stay
-        // unconditional "ok" so a slow boot-time manifest apply can't trip a liveness-probe
-        // restart loop.
-        .route("/healthz", get(healthz))
-        .route("/livez", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ok" }))
+        .route("/healthz", get(health::healthz))
+        .route("/healthz/{check}", get(health::healthz_check))
+        .route("/livez", get(health::livez))
+        .route("/livez/{check}", get(health::livez_check))
+        .route("/readyz", get(health::readyz))
+        .route("/readyz/{check}", get(health::readyz_check))
         // Prometheus text-exposition metrics — RBAC-gated like every other route, matching
         // upstream kube-apiserver where /metrics requires the same bearer-token auth as any
         // other endpoint. The bootstrap system:monitoring
@@ -1914,13 +1892,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
 
     // -----------------------------------------------------------------------
     // ClusterRole: system:monitoring — read-only access to health/metrics endpoints.
-    // Upstream also advertises "/metrics/slis" plus "/livez/*","/readyz/*","/healthz/*"
-    // (per-healthcheck subpaths). Neither is advertised here: we have no healthz
-    // checker framework (our /healthz, /readyz, /livez handlers are unconditional
-    // "ok", not a set of named checks), so there is no SLI data to back a
-    // "/metrics/slis" route — advertising it in RBAC without a route would be a
-    // 404 trap for any caller who reads this ClusterRole and expects the endpoint
-    // to exist.
+    // Upstream also advertises "/metrics/slis". It is not advertised here: no route serves
+    // it, so granting it in RBAC would be a 404 trap. The "/healthz/*", "/livez/*" and
+    // "/readyz/*" per-check subpaths are served by the health handlers and granted.
     // -----------------------------------------------------------------------
     let key = keys::group_object_key(GROUP, "clusterroles", None, "system:monitoring");
     let body = serde_json::json!({
@@ -1928,7 +1902,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:monitoring", "uid": "00000000-0000-0000-0000-000000000026", "creationTimestamp": TS },
         "rules": [
-            { "nonResourceURLs": ["/metrics","/healthz","/readyz","/livez"], "verbs": ["get"] }
+            { "nonResourceURLs": ["/metrics","/healthz","/healthz/*","/livez","/livez/*","/readyz","/readyz/*"], "verbs": ["get"] }
         ]
     });
     put!(key, body, "system:monitoring", "ClusterRole");
@@ -2240,7 +2214,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection","bind","escalate"] },
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
@@ -5465,6 +5439,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seeded_admin_holder_cannot_mint_or_bind_a_wildcard_role_in_its_namespace() {
+        // A namespace admin holding `bind`/`escalate` could author a `*/*/*` Role and bind
+        // it, reaching resourcequotas, */status, pods/binding and leases that admin
+        // deliberately lacks. Upstream admin has plain CRUD on roles/rolebindings.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let state = handlers::test_support::make_state_with_store(store.clone());
+
+        let admin_key = keys::group_object_key(GROUP, "clusterroles", None, "admin");
+        let admin: serde_json::Value =
+            serde_json::from_slice(&store.get(&admin_key).await.unwrap().unwrap().value).unwrap();
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin",
+            &admin,
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns-a/rolebindings/alice-admin",
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "alice"}],
+                "roleRef": {"apiGroup": GROUP, "kind": "ClusterRole", "name": "admin"}
+            }),
+        );
+        let alice = crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let wildcard_rules =
+            serde_json::json!([{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]);
+        let role = serde_json::json!({
+            "metadata": {"name": "wild", "namespace": "ns-a"},
+            "rules": wildcard_rules,
+        });
+        let err =
+            handlers::generic::check_role_escalation("roles", GROUP, "ns-a", &alice, &role, &state)
+                .expect_err("admin must not author a Role carrying rules it does not hold");
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns-a/roles/wild",
+            &role,
+        );
+        let rb = serde_json::json!({
+            "metadata": {"name": "wild-rb", "namespace": "ns-a"},
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {"apiGroup": GROUP, "kind": "Role", "name": "wild"}
+        });
+        let err = handlers::generic::check_rb_escalation(
+            "rolebindings",
+            GROUP,
+            "ns-a",
+            &alice,
+            &rb,
+            &state,
+        )
+        .expect_err("admin must not bind a Role carrying rules it does not hold");
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn seed_rbac_system_node_clusterrole_allows_kubelet_sar_and_endpoints_and_sa_reads() {
         // Regression test for the three P2 NodeRules parity gaps: localsubjectaccessreviews
         // (paired with subjectaccessreviews upstream), endpoints get (glusterfs volumes per
@@ -6133,10 +6170,8 @@ mod tests {
 
     #[tokio::test]
     async fn system_monitoring_role_does_not_grant_metrics_slis() {
-        // Upstream's system:monitoring ClusterRole advertises "/metrics/slis", but we have
-        // no healthz-checker framework behind it (our /healthz, /readyz, /livez handlers are
-        // unconditional "ok", not a set of named checks producing per-check SLI data), so no
-        // axum route ever serves it. If "/metrics/slis" were listed here, any caller who reads
+        // Upstream's system:monitoring ClusterRole advertises "/metrics/slis", but no axum
+        // route serves it. If "/metrics/slis" were listed here, any caller who reads
         // this ClusterRole and is granted "get" on it would be RBAC-authorized for an endpoint
         // that 404s on every request — a silent over-promise. This test pins the ClusterRole to
         // only what we actually serve; if it starts failing, someone re-added the dangling grant
@@ -6176,6 +6211,56 @@ mod tests {
             "system:monitoring must still grant /metrics — that route does exist and is the \
              ClusterRole's whole purpose"
         );
+    }
+
+    /// Monitoring scrapers probe single checks (`/readyz/etcd`, `/livez/ping`); without the
+    /// `/*` grants those 403 even though the bare paths work.
+    #[tokio::test]
+    async fn system_monitoring_group_can_probe_per_check_health_paths() {
+        use axum::http::StatusCode;
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let app = seeded_rbac_app(&store).await;
+
+        for path in ["/readyz/etcd", "/livez/ping", "/healthz/log"] {
+            assert_eq!(
+                status_of(&app, path, Some("mon-token")).await,
+                StatusCode::OK,
+                "system:monitoring must be allowed GET {path}"
+            );
+            assert_eq!(
+                status_of(&app, path, Some("alice-token")).await,
+                StatusCode::FORBIDDEN,
+                "{path} must stay closed to non-monitoring users (upstream grants /* only to \
+                 system:monitoring)"
+            );
+        }
+    }
+
+    /// Clusters seeded before the `/*` grants existed must gain them on restart.
+    #[tokio::test]
+    async fn seed_rbac_adds_health_subpath_grants_to_an_existing_monitoring_role() {
+        use u7s_store::Store as _;
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = make_store();
+        let key = keys::group_object_key(GROUP, "clusterroles", None, "system:monitoring");
+        let old = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": { "name": "system:monitoring" },
+            "rules": [{ "nonResourceURLs": ["/metrics","/healthz","/readyz","/livez"], "verbs": ["get"] }]
+        });
+        store
+            .put(&key, bytes::Bytes::from(old.to_string()), Some(0))
+            .await
+            .expect("put old role");
+        seed_rbac(&store).await.expect("seed must not fail");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let cr: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let urls = cr.to_string();
+        for want in ["/healthz/*", "/livez/*", "/readyz/*"] {
+            assert!(urls.contains(want), "reconcile must add {want}: {urls}");
+        }
     }
 
     #[tokio::test]
@@ -9095,6 +9180,15 @@ mod tests {
                 extra: Default::default(),
             },
         );
+        tokens.insert(
+            "mon-token".to_owned(),
+            auth::UserInfo {
+                username: "mon".into(),
+                uid: String::new(),
+                groups: vec!["system:monitoring".into()],
+                extra: Default::default(),
+            },
+        );
         let state = state::AppState::new(
             std::sync::Arc::clone(store),
             None,
@@ -9287,7 +9381,7 @@ mod tests {
     }
 
     /// `/healthz` must distinguish "boot-time manifest apply still running" from "boot
-    /// complete" — unlike `/livez`/`/readyz`, which stay unconditional "ok".
+    /// complete" (through the poststarthook checks, like `/livez`/`/readyz`).
     /// Before this gate, `/healthz` answered 200 the instant the listener came up, racing the
     /// boot-time `apply_well_known_manifest_dir` task; `scripts/install.sh`'s
     /// `wait_for_apiserver` could only paper over that with a fixed sleep-and-recheck. If this
@@ -9319,7 +9413,7 @@ mod tests {
         let resp = router.call(req).await.expect("router must not error");
         assert_eq!(
             resp.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
             "/healthz must not report 200 while the boot-time manifest apply is still running \
              — install.sh's wait loop needs this to distinguish a booting apiserver from one \
              that already crashed applying a bad manifest"
@@ -9347,6 +9441,77 @@ mod tests {
             b"ok",
             "/healthz body must be 'ok' once ready"
         );
+    }
+
+    /// The conformance spec "health handlers should contain necessary checks" requires these
+    /// exact lines from `?verbose=1`; a bare "ok" fails it, and `/<endpoint>/<check>` lets
+    /// operators probe one check.
+    #[tokio::test]
+    async fn health_endpoints_serve_verbose_checks_and_per_check_paths() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower_service::Service as _;
+
+        let state = state::AppState::new(
+            std::sync::Arc::new(make_store()),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+        let mut get = |uri: &'static str| {
+            let req = Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("request build must not fail");
+            router.call(req)
+        };
+        for (path, extra) in [
+            ("/healthz?verbose=1", None),
+            ("/livez?verbose=1", None),
+            ("/readyz?verbose=1", Some("[+]informer-sync ok")),
+        ] {
+            let resp = get(path).await.expect("router must not error");
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let body = to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+            let body = String::from_utf8(body.to_vec()).expect("utf8");
+            let lines: Vec<&str> = body.lines().collect();
+            for want in [
+                "[+]ping ok",
+                "[+]log ok",
+                "[+]etcd ok",
+                "[+]poststarthook/bootstrap-controller ok",
+                "[+]autoregister-completion ok",
+                "[+]poststarthook/storage-readiness ok",
+            ]
+            .into_iter()
+            .chain(extra)
+            {
+                assert!(lines.contains(&want), "{path} missing {want}: {body}");
+            }
+        }
+        let resp = get("/healthz/etcd").await.expect("router must not error");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get("/healthz/nope").await.expect("router must not error");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = get("/readyz/informer-sync")
+            .await
+            .expect("router must not error");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get("/healthz/informer-sync")
+            .await
+            .expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "informer-sync is a readyz-only check"
+        );
+        // Probes must never 400 on a malformed query; upstream ignores bad escapes.
+        for path in ["/healthz?verbose=%zz", "/healthz?exclude=%zz", "/readyz?%"] {
+            let resp = get(path).await.expect("router must not error");
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
     }
 
     /// A panic partway through one SIGHUP-triggered reload (e.g. a future bug in
