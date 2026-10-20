@@ -81,6 +81,7 @@ async fn run_checks(endpoint: Endpoint, state: &AppState) -> Vec<CheckResult> {
         },
     ];
     if endpoint == Endpoint::Readyz {
+        // Reports boot readiness, not a measured informer sync.
         out.push(CheckResult {
             name: "informer-sync",
             ok: booted,
@@ -166,16 +167,21 @@ async fn root(endpoint: Endpoint, state: AppState, query: Vec<(String, String)>)
     text_response(status, body)
 }
 
-async fn sub(endpoint: Endpoint, state: AppState, check: String) -> Response {
-    let checks = run_checks(endpoint, &state).await;
+fn render_sub(checks: &[CheckResult], check: &str) -> (StatusCode, String) {
     match checks.iter().find(|c| c.name == check) {
-        None => (StatusCode::NOT_FOUND, "404 page not found\n").into_response(),
-        Some(c) if c.ok => text_response(StatusCode::OK, "ok".to_string()),
-        Some(_) => text_response(
+        None => (StatusCode::NOT_FOUND, "404 page not found\n".to_string()),
+        Some(c) if c.ok => (StatusCode::OK, "ok".to_string()),
+        Some(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal server error: check failed\n".to_string(),
         ),
     }
+}
+
+async fn sub(endpoint: Endpoint, state: AppState, check: String) -> Response {
+    let checks = run_checks(endpoint, &state).await;
+    let (status, body) = render_sub(&checks, &check);
+    text_response(status, body)
 }
 
 pub async fn healthz(
@@ -250,6 +256,23 @@ mod tests {
         assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body.contains("[-]etcd failed: reason withheld\n"), "{body}");
         assert!(body.ends_with("readyz check failed\n"));
+    }
+
+    #[test]
+    fn failing_per_check_path_returns_500_and_unknown_is_404() {
+        let mut checks = all(true);
+        checks[2].ok = false;
+        let (s, body) = render_sub(&checks, "etcd");
+        assert_eq!(
+            (s, body.as_str()),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error: check failed\n"
+            ),
+            "a probe of one failing check must fail, or per-check probes hide outages"
+        );
+        assert_eq!(render_sub(&checks, "log").0, StatusCode::OK);
+        assert_eq!(render_sub(&checks, "nope").0, StatusCode::NOT_FOUND);
     }
 
     #[test]

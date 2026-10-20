@@ -693,7 +693,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // operator who dropped a broken manifest needs the apiserver to refuse to start, not run
     // half-configured — so its result is threaded back via well_known_manifest_rx and raced
     // against serve_tls below instead of being discarded. On success it also flips
-    // `state.boot_ready` so `/healthz` starts reporting 200 (see the field's doc) — on failure
+    // `state.boot_ready` so `/healthz`, `/livez` and `/readyz` start reporting 200 (see the field's doc) — on failure
     // it stays `false` forever, since the `tokio::select!` below tears the process down anyway.
     // This fatal-at-boot behavior is unchanged by the SIGHUP-triggered reload spawned right
     // below, which reuses the same manifest directory but with log-and-skip semantics instead.
@@ -1891,13 +1891,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
 
     // -----------------------------------------------------------------------
     // ClusterRole: system:monitoring — read-only access to health/metrics endpoints.
-    // Upstream also advertises "/metrics/slis" plus "/livez/*","/readyz/*","/healthz/*"
-    // (per-healthcheck subpaths). Neither is advertised here: we have no healthz
-    // checker framework (our /healthz, /readyz, /livez handlers are unconditional
-    // "ok", not a set of named checks), so there is no SLI data to back a
-    // "/metrics/slis" route — advertising it in RBAC without a route would be a
-    // 404 trap for any caller who reads this ClusterRole and expects the endpoint
-    // to exist.
+    // Upstream also advertises "/metrics/slis". It is not advertised here: no route serves
+    // it, so granting it in RBAC would be a 404 trap. The "/healthz/*", "/livez/*" and
+    // "/readyz/*" per-check subpaths are served by the health handlers and granted.
     // -----------------------------------------------------------------------
     let key = keys::group_object_key(GROUP, "clusterroles", None, "system:monitoring");
     let body = serde_json::json!({
@@ -1905,7 +1901,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:monitoring", "uid": "00000000-0000-0000-0000-000000000026", "creationTimestamp": TS },
         "rules": [
-            { "nonResourceURLs": ["/metrics","/healthz","/readyz","/livez"], "verbs": ["get"] }
+            { "nonResourceURLs": ["/metrics","/healthz","/healthz/*","/livez","/livez/*","/readyz","/readyz/*"], "verbs": ["get"] }
         ]
     });
     put!(key, body, "system:monitoring", "ClusterRole");
@@ -6110,10 +6106,8 @@ mod tests {
 
     #[tokio::test]
     async fn system_monitoring_role_does_not_grant_metrics_slis() {
-        // Upstream's system:monitoring ClusterRole advertises "/metrics/slis", but we have
-        // no healthz-checker framework behind it (our /healthz, /readyz, /livez handlers are
-        // unconditional "ok", not a set of named checks producing per-check SLI data), so no
-        // axum route ever serves it. If "/metrics/slis" were listed here, any caller who reads
+        // Upstream's system:monitoring ClusterRole advertises "/metrics/slis", but no axum
+        // route serves it. If "/metrics/slis" were listed here, any caller who reads
         // this ClusterRole and is granted "get" on it would be RBAC-authorized for an endpoint
         // that 404s on every request — a silent over-promise. This test pins the ClusterRole to
         // only what we actually serve; if it starts failing, someone re-added the dangling grant
@@ -6153,6 +6147,56 @@ mod tests {
             "system:monitoring must still grant /metrics — that route does exist and is the \
              ClusterRole's whole purpose"
         );
+    }
+
+    /// Monitoring scrapers probe single checks (`/readyz/etcd`, `/livez/ping`); without the
+    /// `/*` grants those 403 even though the bare paths work.
+    #[tokio::test]
+    async fn system_monitoring_group_can_probe_per_check_health_paths() {
+        use axum::http::StatusCode;
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let app = seeded_rbac_app(&store).await;
+
+        for path in ["/readyz/etcd", "/livez/ping", "/healthz/log"] {
+            assert_eq!(
+                status_of(&app, path, Some("mon-token")).await,
+                StatusCode::OK,
+                "system:monitoring must be allowed GET {path}"
+            );
+            assert_eq!(
+                status_of(&app, path, Some("alice-token")).await,
+                StatusCode::FORBIDDEN,
+                "{path} must stay closed to non-monitoring users (upstream grants /* only to \
+                 system:monitoring)"
+            );
+        }
+    }
+
+    /// Clusters seeded before the `/*` grants existed must gain them on restart.
+    #[tokio::test]
+    async fn seed_rbac_adds_health_subpath_grants_to_an_existing_monitoring_role() {
+        use u7s_store::Store as _;
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = make_store();
+        let key = keys::group_object_key(GROUP, "clusterroles", None, "system:monitoring");
+        let old = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": { "name": "system:monitoring" },
+            "rules": [{ "nonResourceURLs": ["/metrics","/healthz","/readyz","/livez"], "verbs": ["get"] }]
+        });
+        store
+            .put(&key, bytes::Bytes::from(old.to_string()), Some(0))
+            .await
+            .expect("put old role");
+        seed_rbac(&store).await.expect("seed must not fail");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let cr: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let urls = cr.to_string();
+        for want in ["/healthz/*", "/livez/*", "/readyz/*"] {
+            assert!(urls.contains(want), "reconcile must add {want}: {urls}");
+        }
     }
 
     #[tokio::test]
@@ -9072,6 +9116,15 @@ mod tests {
                 extra: Default::default(),
             },
         );
+        tokens.insert(
+            "mon-token".to_owned(),
+            auth::UserInfo {
+                username: "mon".into(),
+                uid: String::new(),
+                groups: vec!["system:monitoring".into()],
+                extra: Default::default(),
+            },
+        );
         let state = state::AppState::new(
             std::sync::Arc::clone(store),
             None,
@@ -9378,6 +9431,23 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let resp = get("/healthz/nope").await.expect("router must not error");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = get("/readyz/informer-sync")
+            .await
+            .expect("router must not error");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get("/healthz/informer-sync")
+            .await
+            .expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "informer-sync is a readyz-only check"
+        );
+        // Probes must never 400 on a malformed query; upstream ignores bad escapes.
+        for path in ["/healthz?verbose=%zz", "/healthz?exclude=%zz", "/readyz?%"] {
+            let resp = get(path).await.expect("router must not error");
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
     }
 
     /// A panic partway through one SIGHUP-triggered reload (e.g. a future bug in
