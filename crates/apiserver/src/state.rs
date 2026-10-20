@@ -8,6 +8,7 @@ use u7s_store::{ListOptions, SqliteStore, Store};
 use crate::admission::WebhookEntry;
 use crate::auth::UserInfo;
 use crate::node_authz::NodeGraph;
+use crate::pki::Swap;
 use crate::rbac::RbacIndex;
 use crate::sa_sig_cache::SigCache;
 use crate::types::{ResourceKey, ResourceMeta};
@@ -845,17 +846,17 @@ pub struct AppState<S = SqliteStore> {
     /// Per-client watch stream concurrency limiter.
     pub watch_limit: WatchLimitState,
     /// HTTP client for admission webhook calls.
-    pub webhook_client: reqwest::Client,
+    pub webhook_client: Swap<reqwest::Client>,
     /// Shared HTTP client for kubelet proxy calls (log/node-proxy). Built once at startup
     /// from the cluster CA and kubelet client identity so all requests share the connection
     /// pool — avoids per-request TLS handshakes that kubelet resets under concurrent load.
     /// None when no cluster CA is configured (tests / no-CA deployments); handlers return 503.
-    pub kubelet_client: Option<reqwest::Client>,
+    pub kubelet_client: Swap<Option<reqwest::Client>>,
     /// DER-encoded cluster CA certificate used to verify kubelet TLS. None in tests.
     pub cluster_ca_der: Option<Arc<Vec<u8>>>,
     /// Concatenated PEM (cert + key) for the kubelet proxy client certificate.
     /// Kubelet accepts clients with O=system:masters when --client-ca-file is our cluster CA.
-    pub kubelet_client_identity_pem: Option<Arc<Vec<u8>>>,
+    pub kubelet_client_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
     /// When set, use this hostname/IP instead of node_address() for all kubelet proxy
     /// requests. Needed when the apiserver runs on a different host than the kubelet
     /// (e.g. Mac host + Lima VM) and the node's InternalIP is not reachable from the host.
@@ -882,7 +883,7 @@ pub struct AppState<S = SqliteStore> {
     /// Concatenated PEM (cert + key) used as the mTLS client cert when calling admission webhooks.
     /// Stored here so the per-webhook reqwest::Client can present the same identity as the shared
     /// webhook_client when talking to the konnectivity proxy (which requires mTLS).
-    pub webhook_identity_pem: Option<Arc<Vec<u8>>>,
+    pub webhook_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
     /// Concatenated PEM (cert + key) presented to AGGREGATED BACKENDS (not to u7s itself)
     /// by `handlers::aggregation::build_backend_client`. Signed by the dedicated front-proxy
     /// CA (`TlsMaterial::proxy_client_cert_pem`'s doc), NOT the same identity as
@@ -891,7 +892,7 @@ pub struct AppState<S = SqliteStore> {
     /// to assert X-Remote-User/-Group identity. Not part of `AppStateConfig`: no test caller
     /// needs a non-default value at construction time, so `run()` sets this field directly
     /// after construction, same pattern as `node_kubelet_ports`/`sa_sig_cache`.
-    pub proxy_client_identity_pem: Option<Arc<Vec<u8>>>,
+    pub proxy_client_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
     /// PEM-encoded RSA public key for the SA signing key.
     /// Stored so the OIDC JWKS endpoint can serve the public key material without
     /// holding a reference to the private key. None when SA key is unavailable.
@@ -1190,6 +1191,28 @@ impl<S: Store> AppState<S> {
             .ok()
     }
 
+    /// Present `pem` (cert + key) on admission webhook calls from now on; in-flight calls
+    /// finish on the old client.
+    pub fn set_webhook_identity(&self, pem: Vec<u8>) -> Result<(), String> {
+        let client = Self::build_webhook_client(
+            self.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            Some(&pem),
+            self.konnectivity_proxy_addr.as_deref(),
+        )?;
+        self.webhook_client.set(client);
+        self.webhook_identity_pem.set(Some(Arc::new(pem)));
+        Ok(())
+    }
+
+    /// Present `pem` (cert + key) to kubelets from now on.
+    pub fn set_kubelet_identity(&self, pem: Vec<u8>) {
+        self.kubelet_client.set(Self::build_kubelet_client(
+            self.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            Some(&pem),
+        ));
+        self.kubelet_client_identity_pem.set(Some(Arc::new(pem)));
+    }
+
     /// Construct an `AppState` from an [`AppStateConfig`].
     ///
     /// This is the primary constructor used by both production code (`main.rs`) and tests.
@@ -1229,10 +1252,10 @@ impl<S: Store> AppState<S> {
             token_map: Arc::new(cfg.token_map),
             server_address: cfg.server_address,
             watch_limit: WatchLimitState::new(),
-            webhook_client,
-            kubelet_client,
+            webhook_client: Swap::new(webhook_client),
+            kubelet_client: Swap::new(kubelet_client),
             cluster_ca_der: cfg.cluster_ca_der.map(Arc::new),
-            kubelet_client_identity_pem: cfg.kubelet_client_identity_pem.map(Arc::new),
+            kubelet_client_identity_pem: Swap::new(cfg.kubelet_client_identity_pem.map(Arc::new)),
             kubelet_preferred_address: cfg.kubelet_preferred_address.map(Arc::new),
             kubelet_port: cfg.kubelet_port,
             // Not part of AppStateConfig: no production or test caller needs a non-empty
@@ -1244,10 +1267,10 @@ impl<S: Store> AppState<S> {
             service_ip_allocator: cfg.service_ip_allocator.map(Arc::new),
             continue_token_key: Arc::new(continue_token_key),
             konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,
-            webhook_identity_pem: cfg.webhook_identity_pem.map(Arc::new),
+            webhook_identity_pem: Swap::new(cfg.webhook_identity_pem.map(Arc::new)),
             // Not part of AppStateConfig: see the field's own doc — run() sets this
             // directly after construction, same pattern as node_kubelet_ports above.
-            proxy_client_identity_pem: None,
+            proxy_client_identity_pem: Swap::new(None),
             sa_public_key_pem: cfg.sa_public_key_pem.map(Arc::new),
             admission_cache: Arc::new(AdmissionConfigCache::new()),
             apiservice_cache: Arc::new(ApiServiceCache::new()),

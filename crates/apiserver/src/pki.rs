@@ -16,6 +16,73 @@ pub(crate) const SERVING_CERT_LIFETIME: Duration = Duration::from_secs(90 * 24 *
 /// exactly its lifetime.
 const BACKDATE: Duration = Duration::from_secs(5 * 60);
 
+/// Renew once this fraction of a cert's lifetime has elapsed.
+pub(crate) const RENEW_FRACTION: f64 = 2.0 / 3.0;
+
+/// A cert whose window exceeds its policy lifetime by more than this was not issued under
+/// the current policy (legacy rcgen default: 1975..4096) and is due immediately.
+const LEGACY_SLACK: Duration = Duration::from_secs(60);
+
+/// Time source for issuance and renewal decisions, injectable so tests can move time.
+#[derive(Clone)]
+pub struct Clock(Arc<dyn Fn() -> OffsetDateTime + Send + Sync>);
+
+impl Clock {
+    pub fn new(now: impl Fn() -> OffsetDateTime + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    pub fn now(&self) -> OffsetDateTime {
+        (self.0)()
+    }
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self::new(OffsetDateTime::now_utc)
+    }
+}
+
+/// When a cert valid over `not_before..not_after` is due for renewal under a policy that
+/// issues `lifetime`-long certs: `fraction` of the way through its window, or immediately
+/// if its window is longer than the policy allows.
+pub(crate) fn renew_at(
+    not_before: OffsetDateTime,
+    not_after: OffsetDateTime,
+    lifetime: Duration,
+    fraction: f64,
+) -> OffsetDateTime {
+    let window = not_after - not_before;
+    if window > lifetime + LEGACY_SLACK {
+        return not_before;
+    }
+    not_before + window * fraction
+}
+
+/// A value read by many tasks and replaced wholesale; readers get a snapshot and never
+/// block the writer for longer than a clone.
+pub struct Swap<T>(Arc<RwLock<T>>);
+
+impl<T> Clone for Swap<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T: Clone> Swap<T> {
+    pub fn new(value: T) -> Self {
+        Self(Arc::new(RwLock::new(value)))
+    }
+
+    pub fn get(&self) -> T {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set(&self, value: T) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = value;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum KeyAlgorithm {
     #[default]
@@ -85,6 +152,7 @@ impl CertInventory {
 pub struct Pki {
     pub(crate) algorithm: KeyAlgorithm,
     pub(crate) inventory: CertInventory,
+    pub(crate) clock: Clock,
 }
 
 pub(crate) struct Issued {
@@ -135,7 +203,7 @@ impl Pki {
         signer: Option<&Signer<'_>>,
     ) -> anyhow::Result<Issued> {
         let key = self.generate_key()?;
-        let now = OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp())?;
+        let now = OffsetDateTime::from_unix_timestamp(self.clock.now().unix_timestamp())?;
         let not_before = now - BACKDATE;
         let mut not_after = not_before + spec.lifetime;
         if let Some(s) = signer {
