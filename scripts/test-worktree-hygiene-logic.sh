@@ -1061,8 +1061,10 @@ assert "audit_verdict: a success conclusion is ok" \
   "$([ "$(call audit_verdict '[{"conclusion":"success"}]')" = ok ] && echo 1 || echo 0)"
 assert "audit_verdict: a failure conclusion is failing (the whole point: a red main audit must not read as ok)" \
   "$([ "$(call audit_verdict "$FAIL_JSON")" = failing ] && echo 1 || echo 0)"
-assert "audit_verdict: any non-success conclusion (timed_out) is failing" \
-  "$([ "$(call audit_verdict '[{"conclusion":"timed_out"}]')" = failing ] && echo 1 || echo 0)"
+assert "audit_verdict: a cancelled run is unknown, not failing -- a manual cancel must not raise a false red-audit alert" \
+  "$([ "$(call audit_verdict '[{"conclusion":"cancelled"}]')" = unknown ] && echo 1 || echo 0)"
+assert "audit_verdict: a skipped run is unknown, not failing" \
+  "$([ "$(call audit_verdict '[{"conclusion":"skipped"}]')" = unknown ] && echo 1 || echo 0)"
 assert "audit_verdict: an empty run list is unknown, not failing" \
   "$([ "$(call audit_verdict '[]')" = unknown ] && echo 1 || echo 0)"
 assert "audit_verdict: garbage input is unknown, not failing" \

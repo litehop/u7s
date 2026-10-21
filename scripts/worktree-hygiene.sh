@@ -98,7 +98,7 @@
 #   is kept.
 # STEP G: reap fix-round worktrees on non-worker branch names (see below).
 # STEP H: read-only. Report loudly when the latest completed `audit.yaml`
-#   run on main is not a success (run URL plus any RUSTSEC-/GHSA- ids from
+#   run on main is red (`failure`) (run URL plus any RUSTSEC-/GHSA- ids from
 #   its log). The audit is deliberately non-blocking for PRs, so this is
 #   the only place a red main audit gets noticed. Runs under both
 #   --live-agents and --no-live-workers; never skipped by a guard.
@@ -109,7 +109,7 @@
 #       could not remove a worktree/branch).
 #   2 = refusal: missing/conflicting --live-agents / --no-live-workers (no
 #       step ran).
-#   4 = STEP H: main's latest completed audit run is not a success. Combines
+#   4 = STEP H: main's latest completed audit run failed (`failure`). Combines
 #       with 1 (5). A `gh` failure or no completed run is reported as a
 #       warning and does NOT set this bit: the check could not decide, and
 #       a spurious "audit failing" on every offline tick would train the
@@ -796,16 +796,16 @@ step_g_fix_round_worktrees() {
 AUDIT_FAILING_RC=4
 
 # Pure: `gh run list --json conclusion,...` output (arg 1) ->
-# prints ok | failing | unknown. Anything but a `success` conclusion on the
-# latest completed run is failing; an empty list or unparseable input is
-# unknown (nothing to judge).
+# prints ok | failing | unknown. Only a `failure` conclusion on the latest
+# completed run is failing; cancelled/skipped/anything else, an empty list or
+# unparseable input is unknown (nothing to judge).
 audit_verdict() {
   local conclusion
   conclusion=$(printf '%s' "${1:-}" | jq -r '.[0].conclusion // empty' 2>/dev/null) || conclusion=""
   case "$conclusion" in
-    "") echo unknown ;;
     success) echo ok ;;
-    *) echo failing ;;
+    failure) echo failing ;;
+    *) echo unknown ;;
   esac
 }
 

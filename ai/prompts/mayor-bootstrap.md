@@ -239,13 +239,11 @@ open PR keeps alive. See the script for the STEP A–D implementation and
 its design rationale.
 
 Auto-kill/auto-delete with no approval gate (operator decision) — the script
-logs loudly instead of asking. Exit 0 means a clean tick; non-zero means an
-anomaly for the mayor to investigate (currently: a killed process that didn't
-actually die, surfaced by the script's own verify step). STEP H also checks
-main's latest completed `audit.yaml` run (the audit is non-blocking for PRs);
-exit bit 4 (5 if combined with 1) means it is red — read the logged run URL
-and advisory ids, then dispatch a dependency-bump bead. A `gh` failure only
-warns and does not set the bit.
+logs loudly instead of asking. Exit 0 is a clean tick; 1 = a killed process
+didn't die (investigate the host); 2 = refused, no `--live-agents` /
+`--no-live-workers`; 4 = STEP H found main's latest `cargo audit` run
+(non-blocking for PRs) red — read the advisory IDs in the log and dispatch a
+lockfile bump; 5 = 1+4. A `gh` failure or cancelled run only warns.
 
 This loop is the drift backstop, not the primary defense: workers are required
 to run `scripts/conformance/reset.sh --host-only` as their own final step before
