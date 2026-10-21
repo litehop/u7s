@@ -12,6 +12,8 @@ mod autoscaling_gen_adapter;
 mod batch_gen_adapter;
 mod bootstrap_apply;
 mod bootstrap_rbac;
+#[cfg(test)]
+mod bootstrap_rbac_upstream;
 mod bootstrap_token;
 mod cert_expiry;
 mod certificates_v1beta1_gen_adapter;
@@ -1519,6 +1521,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         }};
     }
 
+    bootstrap_rbac::remove_legacy_cluster_roles(store).await?;
+
     // -----------------------------------------------------------------------
     // ClusterRole: system:node — permissions kubelet needs.
     // -----------------------------------------------------------------------
@@ -1712,19 +1716,27 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:kube-controller-manager", "uid": "00000000-0000-0000-0000-000000000020", "creationTimestamp": TS },
         "rules": [
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] },
-            { "apiGroups": [""], "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": ["","events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] },
+            // create is limited to what upstream's per-controller roles grant; the rest of the
+            // verbs come from the generic rule at the end. pods/binding (daemonset controller),
+            // endpoints/restricted (endpointslicemirroring) and serviceaccounts/token
+            // (service-account controller) are subresources the wildcard doesn't reach.
+            { "apiGroups": [""], "resources": ["endpoints","pods","serviceaccounts","configmaps","secrets","persistentvolumes","persistentvolumeclaims"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["endpoints/restricted","pods/binding","serviceaccounts/token"], "verbs": ["create"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"], "verbs": ["get","list","watch","update","patch","delete"] },
             { "apiGroups": [""], "resources": ["resourcequotas/status"], "verbs": ["get","update","patch"] },
-            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": ["apps"], "resources": ["replicasets","controllerrevisions"], "verbs": ["create"] },
+            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","update","patch","delete"] },
             { "apiGroups": ["apps"], "resources": ["daemonsets/status","deployments/status","replicasets/status","statefulsets/status"], "verbs": ["get","update","patch"] },
-            { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create"] },
+            { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","update","patch","delete"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","update","patch"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] },
             // The endpointslice controller mirrors each Service's endpoints into
             // EndpointSlice objects; the generic read-only discovery rule below doesn't
             // cover this because it needs write verbs too.
             { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings","roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","escalate","bind"] },
             { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
             { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] },
@@ -2232,11 +2244,19 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             "labels": { "rbac.authorization.k8s.io/aggregate-to-cluster-admin": "true" }
         },
         "rules": [
-            { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            // endpoints and controllerrevisions are read-only here (below): upstream withdrew
+            // endpoints write from edit/admin (a namespace editor could redirect a Service to
+            // arbitrary IPs) and never granted controllerrevisions write.
+            { "apiGroups": [""], "resources": ["pods","services","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["events.k8s.io"], "resources": ["events"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["apps"], "resources": ["deployments/rollback"], "verbs": ["create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims","resourceclaimtemplates"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims/status"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["localsubjectaccessreviews"], "verbs": ["create"] },
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
@@ -2268,7 +2288,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // The resolved "edit"/"admin" ClusterRole only gets the READ-ONLY grant
             // viewRules() contributes via the aggregation edit/admin pull in, so this
             // duplicates "view"'s base rule below rather than granting CRUD.
-            { "apiGroups": [""], "resources": ["namespaces","resourcequotas"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["namespaces","resourcequotas","endpoints","limitranges","bindings","pods/log"], "verbs": ["get","list","watch"] },
             // Upstream's editRules() never mentions any of these /status subresources —
             // they reach the resolved "edit"/"admin" ClusterRole only via the view
             // aggregation, so admin/edit get exactly the same READ-ONLY grant as "view"
@@ -2277,7 +2297,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // the domain of the system"); only controller identities like
             // system:kube-controller-manager can write status.
             { "apiGroups": [""], "resources": ["pods/status","services/status","resourcequotas/status","namespaces/status","replicationcontrollers/status","persistentvolumeclaims/status"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["apps"], "resources": ["statefulsets/status","daemonsets/status","deployments/status","replicasets/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["apps"], "resources": ["controllerrevisions","statefulsets/status","daemonsets/status","deployments/status","replicasets/status"], "verbs": ["get","list","watch"] },
             // Unlike the /status entries above, statefulsets/scale, deployments/scale, and
             // replicasets/scale ARE granted write directly by upstream's editRules(), so
             // admin/edit get full CRUD here — the same convention already used for
@@ -2310,8 +2330,15 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             "labels": { "rbac.authorization.k8s.io/aggregate-to-admin": "true" }
         },
         "rules": [
-            { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            // endpoints and controllerrevisions are read-only here (below): upstream withdrew
+            // endpoints write from edit/admin (a namespace editor could redirect a Service to
+            // arbitrary IPs) and never granted controllerrevisions write.
+            { "apiGroups": [""], "resources": ["pods","services","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["events.k8s.io"], "resources": ["events"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["apps"], "resources": ["deployments/rollback"], "verbs": ["create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims","resourceclaimtemplates"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims/status"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
@@ -2324,10 +2351,10 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"] },
             { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             // See the identical block in "admin" above for why each of these exists.
-            { "apiGroups": [""], "resources": ["namespaces","resourcequotas"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["namespaces","resourcequotas","endpoints","limitranges","bindings","pods/log"], "verbs": ["get","list","watch"] },
             // See the identical block in "admin" above for why each of these exists.
             { "apiGroups": [""], "resources": ["pods/status","services/status","resourcequotas/status","namespaces/status","replicationcontrollers/status","persistentvolumeclaims/status"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["apps"], "resources": ["statefulsets/status","daemonsets/status","deployments/status","replicasets/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["apps"], "resources": ["controllerrevisions","statefulsets/status","daemonsets/status","deployments/status","replicasets/status"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["apps"], "resources": ["statefulsets/scale","deployments/scale","replicasets/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers/status"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["batch"], "resources": ["cronjobs/status","jobs/status"], "verbs": ["get","list","watch"] },
@@ -2352,7 +2379,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             "labels": { "rbac.authorization.k8s.io/aggregate-to-edit": "true" }
         },
         "rules": [
-            { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","serviceaccounts","events","replicationcontrollers","namespaces","nodes","resourcequotas","limitranges"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","serviceaccounts","events","replicationcontrollers","namespaces","resourcequotas","limitranges","bindings","pods/log"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["events.k8s.io"], "resources": ["events"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims","resourceclaims/status","resourceclaimtemplates"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch"] },
@@ -3066,29 +3095,6 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         key,
         body,
         "system:controller:ephemeral-volume-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:storage-version-garbage-collector
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:storage-version-garbage-collector",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:storage-version-garbage-collector", "uid": "00000000-0000-0000-0000-000000000064", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["internal.apiserver.k8s.io"], "resources": ["storageversions","storageversions/status"], "verbs": ["get","list","watch","patch","update","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:storage-version-garbage-collector",
         "ClusterRole"
     );
 
