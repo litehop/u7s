@@ -9,6 +9,7 @@
 use bytes::Bytes;
 use serde_json::{json, Value};
 use u7s_store::{Store, StoreError};
+use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::SqliteStore;
 
@@ -31,6 +32,56 @@ pub(crate) enum Reconciled {
 pub(crate) fn stamp_bootstrap_markers(obj: &mut Value) {
     obj["metadata"]["annotations"][AUTOUPDATE_ANNOTATION] = json!("true");
     obj["metadata"]["labels"][BOOTSTRAP_LABEL] = json!(BOOTSTRAP_LABEL_VALUE);
+}
+
+pub(crate) fn yaml_to_json(y: &Yaml) -> Value {
+    match y {
+        Yaml::Hash(h) => Value::Object(
+            h.iter()
+                .map(|(k, v)| (k.as_str().unwrap_or_default().to_string(), yaml_to_json(v)))
+                .collect(),
+        ),
+        Yaml::Array(a) => Value::Array(a.iter().map(yaml_to_json).collect()),
+        Yaml::String(s) => json!(s),
+        Yaml::Boolean(b) => json!(b),
+        Yaml::Integer(i) => json!(i),
+        _ => Value::Null,
+    }
+}
+
+/// The `items` of an upstream `bootstrappolicy` testdata list.
+pub(crate) fn yaml_items(yaml: &str) -> Vec<Value> {
+    let docs = YamlLoader::load_from_str(yaml).expect("embedded upstream RBAC YAML parses");
+    yaml_to_json(&docs[0])["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The per-controller `system:controller:*` ClusterRoles and their ClusterRoleBindings, verbatim
+/// from upstream release-1.37 (the vendored golden files are the single source), as
+/// `(plural, object)` with a stable uid.
+pub(crate) fn upstream_controller_objects() -> Vec<(&'static str, Value)> {
+    let roles = yaml_items(include_str!(
+        "../testdata/rbac-upstream-1.37/controller-roles.yaml"
+    ));
+    let bindings = yaml_items(include_str!(
+        "../testdata/rbac-upstream-1.37/controller-role-bindings.yaml"
+    ));
+    let tagged = |plural, series: u8, items: Vec<Value>| {
+        items
+            .into_iter()
+            .enumerate()
+            .map(move |(i, mut o)| {
+                o["metadata"]["uid"] =
+                    json!(format!("00000000-0000-0000-000{series}-{:012x}", i + 1));
+                (plural, o)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut out = tagged("clusterroles", 1, roles);
+    out.extend(tagged("clusterrolebindings", 2, bindings));
+    out
 }
 
 fn strs<'a>(v: &'a Value, field: &str) -> Vec<&'a str> {
@@ -199,6 +250,19 @@ fn legacy_rules(role: &str) -> Vec<Value> {
                     "resources": ["clusterroles","clusterrolebindings","roles","rolebindings"],
                     "verbs": ["get","list","watch","create","update","patch","escalate","bind"]
                 }),
+            ]
+        }
+        "system:node" => {
+            let rule = |group: &str, resource: &str, verbs: &[&str]| json!({ "apiGroups": [group], "resources": [resource], "verbs": verbs });
+            let all_verbs = [
+                "get", "list", "watch", "create", "update", "patch", "delete",
+            ];
+            vec![
+                rule("", "nodes/status", &["get", "update", "patch"]),
+                rule("", "pods/status", &["get", "update", "patch"]),
+                rule("", "pods/log", &["get"]),
+                rule("coordination.k8s.io", "leases", &all_verbs),
+                rule("storage.k8s.io", "csinodes", &all_verbs),
             ]
         }
         _ => vec![],
@@ -651,6 +715,36 @@ mod tests {
             .put(&k, Bytes::from(obj.to_string()), Some(rev))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upgraded_node_role_loses_pre_upstream_grants_so_kubelet_cannot_read_every_pods_logs() {
+        // Reconcile only adds rules, so a cluster seeded before system:node was aligned with
+        // upstream keeps these grants forever: every node identity could read any pod's logs
+        // and status, rewrite any node's lease and list/watch every CSINode.
+        let old = [
+            json!({"apiGroups": [""], "resources": ["nodes/status"], "verbs": ["get","update","patch"]}),
+            json!({"apiGroups": [""], "resources": ["pods/status"], "verbs": ["get","update","patch"]}),
+            json!({"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}),
+            json!({"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"]}),
+            json!({"apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch","delete"]}),
+        ];
+        let store = SqliteStore::new(":memory:").unwrap();
+        crate::seed_rbac(&store).await.unwrap();
+        let (fresh, _) = stored(&store, &key("clusterroles", "system:node")).await;
+        rewrite_role(&store, "system:node", |o| {
+            o["rules"].as_array_mut().unwrap().extend(old.clone());
+        })
+        .await;
+
+        crate::seed_rbac(&store).await.unwrap();
+
+        let (obj, _) = stored(&store, &key("clusterroles", "system:node")).await;
+        let got = obj["rules"].as_array().unwrap();
+        for rule in &old {
+            assert!(!got.contains(rule), "system:node still carries {rule}");
+        }
+        assert_eq!(got, fresh["rules"].as_array().unwrap());
     }
 
     #[tokio::test]

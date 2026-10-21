@@ -1818,17 +1818,27 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:kube-scheduler", "uid": "00000000-0000-0000-0000-000000000022", "creationTimestamp": TS },
         "rules": [
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch","delete"] },
-            { "apiGroups": [""], "resources": ["pods/binding","pods/status"], "verbs": ["update","patch","create"] },
+            { "apiGroups": ["","events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["create"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["kube-scheduler"], "verbs": ["get","list","update","watch"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leasecandidates"], "verbs": ["create","delete","deletecollection","get","list","patch","update","watch"] },
             { "apiGroups": [""], "resources": ["nodes"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] },
-            { "apiGroups": [""], "resources": ["services","replicationcontrollers","persistentvolumeclaims","persistentvolumes"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["apps"], "resources": ["statefulsets","replicasets"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["pods"], "verbs": ["delete","get","list","watch"] },
+            { "apiGroups": [""], "resources": ["bindings","pods/binding"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["pods/status"], "verbs": ["patch","update"] },
+            { "apiGroups": [""], "resources": ["replicationcontrollers","services"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["apps"], "resources": ["replicasets","statefulsets"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["persistentvolumeclaims","persistentvolumes"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
-            { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] }
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
+            { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes","csidrivers","csistoragecapacities","volumeattachments"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["namespaces"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["deviceclasses","devicetaintrules","resourceslices"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims","resourceclaims/status"], "verbs": ["get","list","patch","update","watch"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": ["create","delete"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims/binding"], "verbs": ["patch","update"] },
+            { "apiGroups": [""], "resources": ["pods/finalizers"], "verbs": ["update"] }
         ]
     });
     put!(key, body, "system:kube-scheduler", "ClusterRole");
@@ -1905,10 +1915,11 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:node-proxier", "uid": "00000000-0000-0000-0000-000000000024", "creationTimestamp": TS },
         "rules": [
-            { "apiGroups": [""], "resources": ["endpoints","services","nodes"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] },
-            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["networking.k8s.io"], "resources": ["servicecidrs"], "verbs": ["get","list","watch"] }
+            { "apiGroups": [""], "resources": ["endpoints","services"], "verbs": ["list","watch"] },
+            { "apiGroups": [""], "resources": ["nodes"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["","events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] },
+            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["list","watch"] },
+            { "apiGroups": ["networking.k8s.io"], "resources": ["servicecidrs"], "verbs": ["list","watch"] }
         ]
     });
     put!(key, body, "system:node-proxier", "ClusterRole");
@@ -1973,9 +1984,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "rules": [
             { "apiGroups": [""], "resources": ["persistentvolumes"], "verbs": ["get","list","watch","create","delete"] },
             { "apiGroups": [""], "resources": ["persistentvolumeclaims"], "verbs": ["get","list","watch","update"] },
-            { "apiGroups": [""], "resources": ["storageclasses"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","update","patch"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses"], "verbs": ["get","list","watch"] }
+            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["events"], "verbs": ["watch"] },
+            { "apiGroups": ["","events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] }
         ]
     });
     put!(
@@ -2195,7 +2206,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:service-account-issuer-discovery", "uid": "00000000-0000-0000-0000-000000000031", "creationTimestamp": TS },
         "rules": [
-            { "nonResourceURLs": ["/.well-known/openid-configuration","/openid/v1/jwks"], "verbs": ["get"] }
+            { "nonResourceURLs": ["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"], "verbs": ["get"] }
         ]
     });
     put!(
@@ -2412,761 +2423,11 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     });
     put!(key, body, "view", "ClusterRole");
 
-    // -----------------------------------------------------------------------
-    // Controller ClusterRoles — each KCM sub-controller needs its own least-
-    // privilege role so it only touches the resources it manages.
-    // -----------------------------------------------------------------------
-
-    // system:controller:attachdetach-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:attachdetach-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:attachdetach-controller", "uid": "00000000-0000-0000-0000-000000000035", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["persistentvolumes","persistentvolumeclaims","nodes","pods"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["nodes/status"], "verbs": ["patch","update"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments","csinodes","csidrivers"], "verbs": ["get","list","watch","create","update","patch","delete"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:attachdetach-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:certificate-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:certificate-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:certificate-controller", "uid": "00000000-0000-0000-0000-000000000036", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests"], "verbs": ["get","list","watch","delete"] },
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests/status","certificatesigningrequests/approval"], "verbs": ["update","patch"] },
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-client-kubelet"], "verbs": ["approve"] },
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kubelet-serving","kubernetes.io/kube-apiserver-client-kubelet","kubernetes.io/kube-apiserver-client","kubernetes.io/legacy-unknown"], "verbs": ["sign"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:certificate-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:clusterrole-aggregation-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:clusterrole-aggregation-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:clusterrole-aggregation-controller", "uid": "00000000-0000-0000-0000-000000000037", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles"], "verbs": ["get","list","watch","update","patch"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:clusterrole-aggregation-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:cronjob-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:cronjob-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:cronjob-controller", "uid": "00000000-0000-0000-0000-000000000038", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["batch"], "resources": ["cronjobs","jobs"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:cronjob-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:daemon-set-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:daemon-set-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:daemon-set-controller", "uid": "00000000-0000-0000-0000-000000000039", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["apps"], "resources": ["daemonsets","daemonsets/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["nodes","pods","podtemplates"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["create","delete","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:daemon-set-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:deployment-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:deployment-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:deployment-controller", "uid": "00000000-0000-0000-0000-000000000040", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["apps"], "resources": ["deployments","deployments/status","replicasets"], "verbs": ["get","list","watch","create","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:deployment-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:disruption-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:disruption-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:disruption-controller", "uid": "00000000-0000-0000-0000-000000000041", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["apps"], "resources": ["deployments","replicasets","statefulsets"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets","poddisruptionbudgets/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:disruption-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:endpoint-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:endpoint-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:endpoint-controller", "uid": "00000000-0000-0000-0000-000000000042", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["endpoints","pods","services"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] },
-            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch","create","update","patch","delete"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:endpoint-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:expand-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:expand-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:expand-controller", "uid": "00000000-0000-0000-0000-000000000043", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["persistentvolumes","persistentvolumeclaims","persistentvolumeclaims/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:expand-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:generic-garbage-collector
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:generic-garbage-collector",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:generic-garbage-collector", "uid": "00000000-0000-0000-0000-000000000044", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["*"], "resources": ["*"], "verbs": ["get","list","watch","patch","update","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:generic-garbage-collector",
-        "ClusterRole"
-    );
-
-    // system:controller:horizontal-pod-autoscaler
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:horizontal-pod-autoscaler",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:horizontal-pod-autoscaler", "uid": "00000000-0000-0000-0000-000000000045", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers","horizontalpodautoscalers/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods","replicationcontrollers","replicationcontrollers/scale"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": ["apps"], "resources": ["deployments","deployments/scale","replicasets","replicasets/scale","statefulsets","statefulsets/scale"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] },
-            { "apiGroups": ["metrics.k8s.io"], "resources": ["pods","nodes"], "verbs": ["get","list"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:horizontal-pod-autoscaler",
-        "ClusterRole"
-    );
-
-    // system:controller:job-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:job-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:job-controller", "uid": "00000000-0000-0000-0000-000000000046", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["batch"], "resources": ["jobs","jobs/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch","create","delete","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(key, body, "system:controller:job-controller", "ClusterRole");
-
-    // system:controller:namespace-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:namespace-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:namespace-controller", "uid": "00000000-0000-0000-0000-000000000047", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["*"], "resources": ["*"], "verbs": ["get","list","watch","delete","deletecollection"] },
-            { "apiGroups": [""], "resources": ["namespaces","namespaces/status","namespaces/finalize"], "verbs": ["get","list","watch","update","patch"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:namespace-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:node-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:node-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:node-controller", "uid": "00000000-0000-0000-0000-000000000048", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["nodes","nodes/status"], "verbs": ["get","list","watch","update","patch","delete"] },
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch","update","patch","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:node-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:persistent-volume-binder
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:persistent-volume-binder",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:persistent-volume-binder", "uid": "00000000-0000-0000-0000-000000000049", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["persistentvolumes","persistentvolumeclaims","persistentvolumeclaims/status","pods"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": [""], "resources": ["namespaces","nodes","services"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update","watch","list","get"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:persistent-volume-binder",
-        "ClusterRole"
-    );
-
-    // system:controller:pod-garbage-collector
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:pod-garbage-collector",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:pod-garbage-collector", "uid": "00000000-0000-0000-0000-000000000050", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch","delete"] },
-            { "apiGroups": [""], "resources": ["nodes"], "verbs": ["get","list","watch"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:pod-garbage-collector",
-        "ClusterRole"
-    );
-
-    // system:controller:pvc-protection-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:pvc-protection-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:pvc-protection-controller", "uid": "00000000-0000-0000-0000-000000000051", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["persistentvolumeclaims","persistentvolumeclaims/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:pvc-protection-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:replicaset-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:replicaset-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:replicaset-controller", "uid": "00000000-0000-0000-0000-000000000052", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["apps"], "resources": ["replicasets","replicasets/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch","create","delete","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:replicaset-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:replication-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:replication-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:replication-controller", "uid": "00000000-0000-0000-0000-000000000053", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["replicationcontrollers","replicationcontrollers/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch","create","delete","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:replication-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:resourcequota-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:resourcequota-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:resourcequota-controller", "uid": "00000000-0000-0000-0000-000000000054", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["*"], "resources": ["*"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["resourcequotas","resourcequotas/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:resourcequota-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:route-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:route-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:route-controller", "uid": "00000000-0000-0000-0000-000000000055", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["nodes"], "verbs": ["get","list","watch","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:route-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:service-account-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:service-account-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:service-account-controller", "uid": "00000000-0000-0000-0000-000000000056", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:service-account-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:service-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:service-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:service-controller", "uid": "00000000-0000-0000-0000-000000000057", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["services","services/status","nodes","endpoints"], "verbs": ["get","list","watch","update","patch","create","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:service-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:statefulset-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:statefulset-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:statefulset-controller", "uid": "00000000-0000-0000-0000-000000000058", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["apps"], "resources": ["statefulsets","statefulsets/status"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods","persistentvolumeclaims"], "verbs": ["get","list","watch","create","delete","update","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:statefulset-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:ttl-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:ttl-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:ttl-controller", "uid": "00000000-0000-0000-0000-000000000059", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["nodes"], "verbs": ["get","list","watch","patch","update"] }
-        ]
-    });
-    put!(key, body, "system:controller:ttl-controller", "ClusterRole");
-
-    // system:controller:ttl-after-finished-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:ttl-after-finished-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:ttl-after-finished-controller", "uid": "00000000-0000-0000-0000-000000000060", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["get","list","watch","delete"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:ttl-after-finished-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:endpointslice-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:endpointslice-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:endpointslice-controller", "uid": "00000000-0000-0000-0000-000000000061", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["pods","services","endpoints","nodes"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:endpointslice-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:endpointslicemirroring-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:endpointslicemirroring-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:endpointslicemirroring-controller", "uid": "00000000-0000-0000-0000-000000000062", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["endpoints","endpointslices","services"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:endpointslicemirroring-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:ephemeral-volume-controller
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:ephemeral-volume-controller",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:ephemeral-volume-controller", "uid": "00000000-0000-0000-0000-000000000063", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["persistentvolumeclaims"], "verbs": ["get","list","watch","create","update","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:ephemeral-volume-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:legacy-service-account-token-cleaner
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:legacy-service-account-token-cleaner",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:legacy-service-account-token-cleaner", "uid": "00000000-0000-0000-0000-000000000065", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["secrets"], "verbs": ["get","list","watch","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:legacy-service-account-token-cleaner",
-        "ClusterRole"
-    );
-
-    // system:controller:root-ca-cert-publisher
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:root-ca-cert-publisher",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:root-ca-cert-publisher", "uid": "00000000-0000-0000-0000-000000000066", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": [""], "resources": ["configmaps"], "verbs": ["get","list","watch","create","update","patch"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:root-ca-cert-publisher",
-        "ClusterRole"
-    );
-
-    // system:controller:kube-apiserver-serving-clustertrustbundle-publisher
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:kube-apiserver-serving-clustertrustbundle-publisher",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:kube-apiserver-serving-clustertrustbundle-publisher", "uid": "00000000-0000-0000-0000-000000000080", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "verbs": ["attest"] },
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create","update","delete","list","watch"] },
-            { "apiGroups": ["", "events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:kube-apiserver-serving-clustertrustbundle-publisher",
-        "ClusterRole"
-    );
+    for (plural, body) in bootstrap_rbac::upstream_controller_objects() {
+        let name = body["metadata"]["name"].as_str().unwrap().to_string();
+        let key = keys::group_object_key(GROUP, plural, None, &name);
+        put!(key, body, name, plural);
+    }
 
     // ClusterRole system:cluster-trust-bundle-discovery + binding to system:serviceaccounts:
     // workloads may read ClusterTrustBundles (e.g. clusterTrustBundle projected volumes).
@@ -5665,118 +4926,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seeded_system_node_rules_equal_upstream_release_1_37() {
-        // A kubelet without any of these verbs cannot e.g. mount projected
-        // ClusterTrustBundle / PodCertificate volumes, so Conformance pods hang Pending. The
-        // kubelet runs under this role (no admin masking), so every missing verb is a
-        // regression. Expected grants transcribed from release-1.37 bootstrappolicy
-        // testdata/cluster-roles.yaml (system:node); no deviations.
-        const GROUP: &str = "rbac.authorization.k8s.io";
-        const EXPECTED: &[(&str, &str, &[&str])] = &[
-            ("authentication.k8s.io", "tokenreviews", &["create"]),
-            (
-                "authorization.k8s.io",
-                "localsubjectaccessreviews",
-                &["create"],
-            ),
-            ("authorization.k8s.io", "subjectaccessreviews", &["create"]),
-            ("", "services", &["get", "list", "watch"]),
-            (
-                "",
-                "nodes",
-                &["create", "get", "list", "watch", "patch", "update"],
-            ),
-            ("", "nodes/status", &["patch", "update"]),
-            ("", "events", &["create", "patch", "update"]),
-            ("events.k8s.io", "events", &["create", "patch", "update"]),
-            ("", "pods", &["get", "list", "watch", "create", "delete"]),
-            ("", "pods/status", &["patch", "update"]),
-            ("", "pods/eviction", &["create"]),
-            ("", "configmaps", &["get", "list", "watch"]),
-            ("", "secrets", &["get", "list", "watch"]),
-            ("", "persistentvolumeclaims", &["get"]),
-            ("", "persistentvolumes", &["get"]),
-            ("", "endpoints", &["get"]),
-            (
-                "certificates.k8s.io",
-                "certificatesigningrequests",
-                &["create", "get", "list", "watch"],
-            ),
-            (
-                "coordination.k8s.io",
-                "leases",
-                &["create", "delete", "get", "patch", "update"],
-            ),
-            ("storage.k8s.io", "volumeattachments", &["get"]),
-            ("", "serviceaccounts/token", &["create"]),
-            (
-                "",
-                "persistentvolumeclaims/status",
-                &["get", "patch", "update"],
-            ),
-            ("storage.k8s.io", "csidrivers", &["get", "list", "watch"]),
-            (
-                "storage.k8s.io",
-                "csinodes",
-                &["create", "delete", "get", "patch", "update"],
-            ),
-            ("node.k8s.io", "runtimeclasses", &["get", "list", "watch"]),
-            ("resource.k8s.io", "resourceclaims", &["get"]),
-            ("resource.k8s.io", "resourceslices", &["deletecollection"]),
-            (
-                "certificates.k8s.io",
-                "clustertrustbundles",
-                &["get", "list", "watch"],
-            ),
-            ("", "serviceaccounts", &["get"]),
-            (
-                "certificates.k8s.io",
-                "podcertificaterequests",
-                &["create", "get", "list", "watch"],
-            ),
-        ];
-
-        let store = make_store();
-        seed_rbac(&store).await.expect("seed must not fail");
-        let key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
-        let obj = store
-            .get(&key)
-            .await
-            .expect("get")
-            .expect("system:node exists");
-        let cr: serde_json::Value = serde_json::from_slice(&obj.value).expect("valid json");
-
-        let mut actual = std::collections::BTreeSet::new();
-        for rule in cr["rules"].as_array().expect("rules array") {
-            let strs = |k: &str| -> Vec<String> {
-                rule[k]
-                    .as_array()
-                    .map(|a| a.iter().map(|v| v.as_str().unwrap().to_owned()).collect())
-                    .unwrap_or_default()
-            };
-            for g in strs("apiGroups") {
-                for r in strs("resources") {
-                    for v in strs("verbs") {
-                        actual.insert((g.clone(), r.clone(), v));
-                    }
-                }
-            }
-        }
-        let mut expected = std::collections::BTreeSet::new();
-        for (g, r, verbs) in EXPECTED {
-            for v in *verbs {
-                expected.insert((g.to_string(), r.to_string(), v.to_string()));
-            }
-        }
-        let missing: Vec<_> = expected.difference(&actual).collect();
-        let extra: Vec<_> = actual.difference(&expected).collect();
-        assert!(
-            missing.is_empty() && extra.is_empty(),
-            "seeded system:node must equal upstream release-1.37; missing: {missing:?}; extra: {extra:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn seed_rbac_creates_cluster_admin_and_system_masters_binding() {
         // The cluster-admin ClusterRole and system:masters ClusterRoleBinding must exist after
         // seeding.  This replaces the former hardcoded bypass in is_allowed(); if these objects
@@ -8061,7 +7210,7 @@ mod tests {
         }
     }
 
-    /// Regression test: the scheduler must be able to PATCH pods/binding and pods/status
+    /// Regression test: the scheduler must be able to create (POST) pods/binding and pods/status
     /// once it authenticates as its own dedicated identity (system:kube-scheduler) instead
     /// of sharing the admin/system:masters kubeconfig. Without pods/binding, the scheduler
     /// can never actually place a pod on a node — every pod stays Pending forever. Also
@@ -8088,7 +7237,7 @@ mod tests {
         let bind_pod = rbac::AuthzRequest {
             username: "system:kube-scheduler",
             groups: &groups,
-            verb: "patch",
+            verb: "create",
             api_group: "",
             resource: "pods",
             subresource: "binding",
@@ -8098,7 +7247,7 @@ mod tests {
         };
         assert!(
             state.rbac_index.is_allowed(&bind_pod),
-            "system:kube-scheduler must be allowed to PATCH pods/binding — without this \
+            "system:kube-scheduler must be allowed to create (POST) pods/binding — without this \
              the scheduler can never place a pod on a node and every pod stays Pending forever"
         );
 
