@@ -7,33 +7,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use u7s_store::{ListOptions, Store};
-use yaml_rust2::{Yaml, YamlLoader};
 
-use crate::bootstrap_rbac::rules_cover;
+use crate::bootstrap_rbac::{rules_cover, yaml_items};
 use crate::SqliteStore;
 
 const GROUP: &str = "rbac.authorization.k8s.io";
 
-fn to_json(y: &Yaml) -> Value {
-    match y {
-        Yaml::Hash(h) => Value::Object(
-            h.iter()
-                .map(|(k, v)| (k.as_str().unwrap_or_default().to_string(), to_json(v)))
-                .collect(),
-        ),
-        Yaml::Array(a) => Value::Array(a.iter().map(to_json).collect()),
-        Yaml::String(s) => json!(s),
-        Yaml::Boolean(b) => json!(b),
-        Yaml::Integer(i) => json!(i),
-        _ => Value::Null,
-    }
-}
-
 fn upstream_roles(yaml: &str) -> BTreeMap<String, Vec<Value>> {
-    let doc = &YamlLoader::load_from_str(yaml).unwrap()[0];
-    to_json(doc)["items"]
-        .as_array()
-        .unwrap()
+    yaml_items(yaml)
         .iter()
         .map(|r| {
             (
@@ -201,21 +182,6 @@ async fn seeded_view_edit_admin_grant_exactly_what_upstream_aggregation_resolves
 }
 
 #[tokio::test]
-async fn seeded_controller_roles_are_all_upstream_default_roles() {
-    // Roles for alpha-gated controllers (e.g. storage-version-garbage-collector) are not
-    // created by a default upstream cluster; seeding them advertises a controller u7s doesn't run.
-    let seeded = seeded_roles().await;
-    let ctl = upstream_roles(include_str!(
-        "../testdata/rbac-upstream-1.37/controller-roles.yaml"
-    ));
-    let extra: Vec<&String> = seeded
-        .keys()
-        .filter(|n| n.starts_with("system:controller:") && !ctl.contains_key(*n))
-        .collect();
-    assert!(extra.is_empty(), "non-upstream controller roles: {extra:?}");
-}
-
-#[tokio::test]
 async fn seeded_kcm_identity_holds_exactly_the_union_of_upstream_controller_permissions() {
     // With --use-service-account-credentials=false one identity runs every controller, so it
     // must hold the union of upstream's per-controller roles -- missing a create stalls that
@@ -250,6 +216,162 @@ async fn seeded_kcm_identity_holds_exactly_the_union_of_upstream_controller_perm
     );
 }
 
+fn upstream_cluster_objects(yamls: &[&str]) -> BTreeMap<String, Value> {
+    yamls
+        .iter()
+        .flat_map(|y| yaml_items(y))
+        .map(|v| (v["metadata"]["name"].as_str().unwrap().to_string(), v))
+        .collect()
+}
+
+async fn seeded_cluster_scoped(plural: &str) -> BTreeMap<String, Value> {
+    let store = SqliteStore::new(":memory:").unwrap();
+    crate::seed_rbac(&store).await.unwrap();
+    let prefix = crate::keys::group_list_prefix(GROUP, plural, None);
+    let all = store.list(&prefix, ListOptions::default()).await.unwrap();
+    all.items
+        .iter()
+        .map(|o| serde_json::from_slice::<Value>(&o.value).unwrap())
+        .filter(|v| v["metadata"]["namespace"].is_null())
+        .map(|v| (v["metadata"]["name"].as_str().unwrap().to_string(), v))
+        .collect()
+}
+
+const CLUSTER_ROLES: &str = include_str!("../testdata/rbac-upstream-1.37/cluster-roles.yaml");
+const CONTROLLER_ROLES: &str = include_str!("../testdata/rbac-upstream-1.37/controller-roles.yaml");
+const CLUSTER_ROLE_BINDINGS: &str =
+    include_str!("../testdata/rbac-upstream-1.37/cluster-role-bindings.yaml");
+const CONTROLLER_ROLE_BINDINGS: &str =
+    include_str!("../testdata/rbac-upstream-1.37/controller-role-bindings.yaml");
+
+#[tokio::test]
+async fn seeded_cluster_roles_match_upstream_except_listed_deviations() {
+    // Every seeded ClusterRole is live for some identity (kubelet = system:node, scheduler,
+    // kube-proxy, per-controller service accounts), so an under-grant stalls that component
+    // (a kubelet without clustertrustbundles get/list/watch hangs every projected-volume pod)
+    // and an over-grant is blast radius. Roles for alpha-gated controllers upstream does not
+    // create by default must not be seeded either: they advertise a controller u7s doesn't run.
+    let seeded = seeded_cluster_scoped("clusterroles").await;
+    let upstream = upstream_cluster_objects(&[CLUSTER_ROLES, CONTROLLER_ROLES]);
+
+    assert_eq!(
+        id_diff(&upstream, &seeded),
+        set(&[
+            // The aggregation controller is disabled; admin/edit/view are seeded pre-resolved
+            // (see the view/edit/admin test).
+            "system:aggregate-to-admin",
+            "system:aggregate-to-edit",
+            "system:aggregate-to-view",
+            // Optional add-ons u7s neither ships nor binds: kube-dns/coredns carry their own
+            // role, there is no kube-aggregator or node-problem-detector, and the CSR approver
+            // roles are only ever bound by an operator.
+            "system:certificates.k8s.io:kube-apiserver-client-approver",
+            "system:certificates.k8s.io:kube-apiserver-client-kubelet-approver",
+            "system:certificates.k8s.io:kubelet-serving-approver",
+            "system:certificates.k8s.io:legacy-unknown-approver",
+            "system:kube-aggregator",
+            "system:kube-dns",
+            "system:kubelet-api-admin",
+            "system:node-problem-detector",
+        ]),
+        "upstream ClusterRoles dropped or newly seeded"
+    );
+    assert_eq!(
+        id_diff(&seeded, &upstream),
+        // Identity for the in-process manifest applier; has no upstream counterpart.
+        set(&["system:bootstrap-installer"]),
+        "seeded ClusterRoles with no upstream counterpart"
+    );
+
+    // role -> (permissions upstream grants that u7s lacks, permissions u7s grants that
+    // upstream does not)
+    let deviations: BTreeMap<&str, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::from([
+        // No route serves these paths; advertising them in RBAC would turn a 404 into a 403/200
+        // mismatch for monitoring clients.
+        (
+            "system:monitoring",
+            (
+                set(&[
+                    "/flagz: get",
+                    "/metrics/slis: get",
+                    "/nodes/metrics: get",
+                    "/statusz: get",
+                ]),
+                set(&[]),
+            ),
+        ),
+    ]);
+    // admin/edit/view: aggregation test. KCM: union test.
+    let covered_elsewhere = ["admin", "edit", "view", "system:kube-controller-manager"];
+    for (name, up) in upstream.iter().filter(|(n, _)| seeded.contains_key(*n)) {
+        if covered_elsewhere.contains(&name.as_str()) {
+            continue;
+        }
+        let want = without_extensions(up["rules"].as_array().unwrap_or(&vec![]));
+        let have = without_extensions(seeded[name]["rules"].as_array().unwrap_or(&vec![]));
+        let (under, over) = deviations.get(name.as_str()).cloned().unwrap_or_default();
+        assert_eq!(uncovered(&want, &have), under, "{name} under-grants");
+        assert_eq!(uncovered(&have, &want), over, "{name} over-grants");
+    }
+}
+
+#[tokio::test]
+async fn seeded_cluster_role_bindings_match_upstream_except_listed_deviations() {
+    // Bindings decide who holds the roles above: a missing per-controller binding leaves that
+    // controller's service account with nothing; a stray subject hands a role to the wrong
+    // identity.
+    let seeded = seeded_cluster_scoped("clusterrolebindings").await;
+    let upstream = upstream_cluster_objects(&[CLUSTER_ROLE_BINDINGS, CONTROLLER_ROLE_BINDINGS]);
+
+    assert_eq!(
+        id_diff(&upstream, &seeded),
+        set(&[
+            // u7s names the cluster-admin binding after its subject group, system:masters.
+            "cluster-admin",
+            // system:kube-dns role is not seeded (see above).
+            "system:kube-dns",
+        ]),
+        "upstream ClusterRoleBindings dropped or newly seeded"
+    );
+    assert_eq!(
+        id_diff(&seeded, &upstream),
+        set(&[
+            // See the cluster-admin note above.
+            "system:masters",
+            // Upstream leaves these roles unbound (kubeadm binds them); u7s binds them so
+            // TLS bootstrap and kubelet client-cert renewal work out of the box.
+            "system:node-bootstrapper",
+            "system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+            "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient",
+            // Binding for the in-process manifest applier's identity.
+            "system:bootstrap-installer",
+            // Lets the kube-system/monitoring ServiceAccount mint a scrape token.
+            "u7s:monitoring",
+        ]),
+        "seeded ClusterRoleBindings with no upstream counterpart"
+    );
+
+    let deviations: BTreeMap<&str, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::from([]);
+    for (name, up) in upstream.iter().filter(|(n, _)| seeded.contains_key(*n)) {
+        assert_eq!(
+            seeded[name]["roleRef"]["name"], up["roleRef"]["name"],
+            "{name} roleRef"
+        );
+        let (missing, extra) = deviations.get(name.as_str()).cloned().unwrap_or_default();
+        let (want, have) = (subject_set(up), subject_set(&seeded[name]));
+        assert_eq!(
+            want.difference(&have).cloned().collect::<BTreeSet<_>>(),
+            missing,
+            "{name} lacks upstream subjects"
+        );
+        assert_eq!(
+            have.difference(&want).cloned().collect::<BTreeSet<_>>(),
+            extra,
+            "{name} has non-upstream subjects"
+        );
+    }
+}
+
 async fn seeded_namespaced(plural: &str) -> BTreeMap<String, Value> {
     let store = SqliteStore::new(":memory:").unwrap();
     crate::seed_rbac(&store).await.unwrap();
@@ -271,18 +393,15 @@ async fn seeded_namespaced(plural: &str) -> BTreeMap<String, Value> {
 }
 
 fn upstream_namespaced(yaml: &str) -> BTreeMap<String, Value> {
-    let doc = &YamlLoader::load_from_str(yaml).unwrap()[0];
-    to_json(doc)["items"]
-        .as_array()
-        .unwrap()
-        .iter()
+    yaml_items(yaml)
+        .into_iter()
         .map(|v| {
             let id = format!(
                 "{}/{}",
                 v["metadata"]["namespace"].as_str().unwrap(),
                 v["metadata"]["name"].as_str().unwrap()
             );
-            (id, v.clone())
+            (id, v)
         })
         .collect()
 }
@@ -290,8 +409,8 @@ fn upstream_namespaced(yaml: &str) -> BTreeMap<String, Value> {
 fn subject_set(v: &Value) -> BTreeSet<String> {
     v["subjects"]
         .as_array()
-        .unwrap()
-        .iter()
+        .into_iter()
+        .flatten()
         .map(|s| {
             format!(
                 "{}:{}/{}",
