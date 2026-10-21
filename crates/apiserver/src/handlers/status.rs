@@ -9,7 +9,7 @@ use serde::Deserialize;
 use u7s_store::Store;
 
 use crate::{
-    admission::{admit_write, AdmissionTarget},
+    admission::{admit_write, mutating_admission_configured, AdmissionTarget},
     auth::UserInfo,
     keys::group_object_key,
     state::AppState,
@@ -115,8 +115,14 @@ pub(crate) async fn admit_status_write<S: Store>(
     } else {
         format!("{}/{}", target.group, target.version)
     };
+    // Nothing to re-project when no mutator exists: the handler already validated `new`.
+    let may_mutate = mutating_admission_configured(state).await;
     admit_write(state, target, "UPDATE", Some(old), new, |mutated| {
-        status_write_strategy(old, mutated, &api_version, kind)
+        if may_mutate {
+            status_write_strategy(old, mutated, &api_version, kind)
+        } else {
+            Ok(mutated)
+        }
     })
     .await
 }

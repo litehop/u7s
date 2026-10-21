@@ -4321,6 +4321,14 @@ pub async fn run_validating_webhooks<S: Store>(
     result
 }
 
+/// True when any mutating webhook or MutatingAdmissionPolicy exists, i.e. when the object
+/// leaving the mutating stage may differ from the one that entered it. Lets a subresource skip
+/// re-projecting an object nothing could have changed (kubelet status writes are hot).
+pub async fn mutating_admission_configured<S: Store>(state: &AppState<S>) -> bool {
+    !fetch_mutating_configs(state).await.is_empty()
+        || !fetch_mutating_policies(state).await.is_empty()
+}
+
 /// The request a write runs admission as: the GVR it is admitted under (`resource` is
 /// `resource/subresource` for a subresource, e.g. `pods/status`), the target object, and who
 /// asked.
