@@ -24,12 +24,13 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::{
+    admission::{admit_write, AdmissionTarget},
     auth::UserInfo,
     handlers::generic::{store_err, validate_path_segment},
     handlers::json_patch::{
         apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
     },
-    handlers::status::merge_incoming_metadata,
+    handlers::status::{merge_incoming_metadata, status_write_strategy},
     keys::group_object_key,
     state::AppState,
     status::Status,
@@ -54,6 +55,48 @@ fn record_approval_write(
         Some("approval"),
         None,
     );
+}
+
+/// Admission for an UPDATE of `certificatesigningrequests/approval`. After mutation only
+/// `status.conditions` and the status-writable metadata survive, as in the handlers' own
+/// restore of `spec` and `status.certificate`.
+async fn admit_approval<S: Store>(
+    state: &AppState<S>,
+    name: &str,
+    user: &UserInfo,
+    headers: &HeaderMap,
+    old: &serde_json::Value,
+    new: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    admit_write(
+        state,
+        &AdmissionTarget {
+            group: GROUP,
+            version: "v1",
+            resource: "certificatesigningrequests/approval",
+            name,
+            namespace: None,
+            user: Some(user),
+            dry_run: is_dry_run_header(headers),
+        },
+        "UPDATE",
+        Some(old),
+        new,
+        |mutated| {
+            let mut out = status_write_strategy(old, mutated, "certificates.k8s.io/v1", KIND)?;
+            let conditions = out["status"]["conditions"].clone();
+            out["status"] = old["status"].clone();
+            if conditions.is_null() {
+                out["status"]
+                    .as_object_mut()
+                    .map(|s| s.remove("conditions"));
+            } else {
+                out["status"]["conditions"] = conditions;
+            }
+            Ok(out)
+        },
+    )
+    .await
 }
 
 /// PUT /apis/certificates.k8s.io/v1/certificatesigningrequests/{name}/approval
@@ -98,6 +141,7 @@ pub async fn put_approval<S: Store>(
         &crate::util::utc_now_rfc3339(),
     );
     merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+    current.body = admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
     record_approval_write(&headers, &old_body, &mut current.body);
 
     // Dry-run: return the would-be approval object without persisting — mirrors
@@ -227,6 +271,7 @@ pub async fn patch_approval<S: Store>(
         }
     }
 
+    current.body = admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
     record_approval_write(&headers, &old_body, &mut current.body);
 
     // Dry-run: return the would-be patched approval object without persisting —

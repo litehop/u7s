@@ -10,7 +10,8 @@ use u7s_store::{ListOptions, Store};
 use crate::{
     admission::{
         prepare_webhook_call, run_mutating_webhooks, run_validating_webhooks,
-        send_webhook_request_with_retry, AdmissionContext, DEFAULT_WEBHOOK_TIMEOUT_SECS,
+        send_webhook_request_with_retry, AdmissionContext, AdmissionTarget,
+        DEFAULT_WEBHOOK_TIMEOUT_SECS,
     },
     auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
@@ -5336,6 +5337,23 @@ pub async fn put_cr_status<S: Store>(
         crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
     }
 
+    current = crate::handlers::status::admit_status_write(
+        &state,
+        &AdmissionTarget {
+            group: &group,
+            version: &version,
+            resource: &format!("{plural}/status"),
+            name: &name,
+            namespace: None,
+            user: Some(&user),
+            dry_run: is_dry_run_header(&headers),
+        },
+        &before_write,
+        current,
+        &kind,
+    )
+    .await?;
+
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
     record_cr_status_write(&headers, &before_write, &mut current, &group, &version);
@@ -5564,6 +5582,23 @@ pub async fn patch_cr_status<S: Store>(
         crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
     }
 
+    current = crate::handlers::status::admit_status_write(
+        &state,
+        &AdmissionTarget {
+            group: &group,
+            version: &version,
+            resource: &format!("{plural}/status"),
+            name: &name,
+            namespace: None,
+            user: Some(&user),
+            dry_run: is_dry_run_header(&headers),
+        },
+        &before_write,
+        current,
+        &kind,
+    )
+    .await?;
+
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
     record_cr_status_write(&headers, &before_write, &mut current, &group, &version);
@@ -5712,10 +5747,41 @@ async fn cr_scale_get_impl<S: Store>(
     .into_response())
 }
 
+/// Run admission for a CRD scale write and return the replica count to store.
+/// `replicas` is `(old, new, status)`; `selector_rv` is `(label selector, resourceVersion)`.
+async fn admit_cr_scale<S: Store>(
+    state: &AppState<S>,
+    target: &CrScaleTarget<'_>,
+    user: Option<&UserInfo>,
+    dry_run: bool,
+    replicas: (i64, i64, i64),
+    selector_rv: (&str, &str),
+) -> Result<i64, crate::status::StatusError> {
+    let (old, new, status) = replicas;
+    let (selector, rv) = selector_rv;
+    let ns = target.ns.unwrap_or("");
+    super::scale::admit_scale_write(
+        state,
+        &AdmissionTarget {
+            group: target.group,
+            version: target.version,
+            resource: &format!("{}/scale", target.plural),
+            name: target.name,
+            namespace: target.ns,
+            user,
+            dry_run,
+        },
+        &super::scale::build_scale(target.name, ns, old, status, rv, selector),
+        super::scale::build_scale(target.name, ns, new, status, rv, selector),
+    )
+    .await
+}
+
 async fn cr_scale_put_impl<S: Store>(
     state: &AppState<S>,
     ctx: &CrContext,
     target: CrScaleTarget<'_>,
+    user: Option<&UserInfo>,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -5749,7 +5815,23 @@ async fn cr_scale_put_impl<S: Store>(
         .unwrap_or_default();
 
     let before = obj.clone();
-    scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas as i64);
+    let new_replicas = admit_cr_scale(
+        state,
+        &target,
+        user,
+        is_dry_run_header(headers),
+        (
+            scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
+            new_replicas as i64,
+            status_replicas,
+        ),
+        (
+            &selector,
+            obj["metadata"]["resourceVersion"].as_str().unwrap_or(""),
+        ),
+    )
+    .await?;
+    scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
     apply_cr_generation_on_update(&before, &mut obj);
     record_cr_scale_write(
         headers,
@@ -5770,7 +5852,7 @@ async fn cr_scale_put_impl<S: Store>(
         return Ok(Json(super::scale::build_scale(
             target.name,
             target.ns.unwrap_or(""),
-            new_replicas as i64,
+            new_replicas,
             status_replicas,
             old_rv.as_deref().unwrap_or(""),
             &selector,
@@ -5790,7 +5872,7 @@ async fn cr_scale_put_impl<S: Store>(
     Ok(Json(super::scale::build_scale(
         target.name,
         target.ns.unwrap_or(""),
-        new_replicas as i64,
+        new_replicas,
         status_replicas,
         &new_rv.to_string(),
         &selector,
@@ -5801,6 +5883,7 @@ async fn cr_scale_patch_impl<S: Store>(
     state: &AppState<S>,
     ctx: &CrContext,
     target: CrScaleTarget<'_>,
+    user: Option<&UserInfo>,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -5831,13 +5914,26 @@ async fn cr_scale_patch_impl<S: Store>(
     // otherwise leave the stored value unchanged (a patch that doesn't touch spec.replicas
     // is a no-op write, not an error).
     let before = obj.clone();
-    let new_replicas = match scale_body.spec.replicas {
-        Some(r) => {
-            scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, r as i64);
-            r as i64
-        }
-        None => scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
-    };
+    let old_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
+    let new_replicas = admit_cr_scale(
+        state,
+        &target,
+        user,
+        is_dry_run_header(headers),
+        (
+            old_replicas,
+            scale_body.spec.replicas.map_or(old_replicas, |r| r as i64),
+            status_replicas,
+        ),
+        (
+            &selector,
+            obj["metadata"]["resourceVersion"].as_str().unwrap_or(""),
+        ),
+    )
+    .await?;
+    if scale_body.spec.replicas.is_some() || new_replicas != old_replicas {
+        scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
+    }
     apply_cr_generation_on_update(&before, &mut obj);
     record_cr_scale_write(
         headers,
@@ -5909,6 +6005,7 @@ pub async fn get_cr_scale<S: Store>(
 pub async fn put_cr_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -5924,13 +6021,22 @@ pub async fn put_cr_scale<S: Store>(
         ns: None,
         name: &name,
     };
-    cr_scale_put_impl(&state, &ctx, target, &headers, &body).await
+    cr_scale_put_impl(
+        &state,
+        &ctx,
+        target,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &body,
+    )
+    .await
 }
 
 /// PATCH /apis/{group}/{version}/{plural}/{name}/scale (cluster-scoped)
 pub async fn patch_cr_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -5946,7 +6052,15 @@ pub async fn patch_cr_scale<S: Store>(
         ns: None,
         name: &name,
     };
-    cr_scale_patch_impl(&state, &ctx, target, &headers, &body).await
+    cr_scale_patch_impl(
+        &state,
+        &ctx,
+        target,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &body,
+    )
+    .await
 }
 
 /// GET /apis/{group}/{version}/namespaces/{ns}/{plural}/{name}/scale
@@ -5974,6 +6088,7 @@ pub async fn get_cr_namespaced_scale<S: Store>(
 pub async fn put_cr_namespaced_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -5990,13 +6105,22 @@ pub async fn put_cr_namespaced_scale<S: Store>(
         ns: Some(&ns),
         name: &name,
     };
-    cr_scale_put_impl(&state, &ctx, target, &headers, &body).await
+    cr_scale_put_impl(
+        &state,
+        &ctx,
+        target,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &body,
+    )
+    .await
 }
 
 /// PATCH /apis/{group}/{version}/namespaces/{ns}/{plural}/{name}/scale
 pub async fn patch_cr_namespaced_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -6013,7 +6137,15 @@ pub async fn patch_cr_namespaced_scale<S: Store>(
         ns: Some(&ns),
         name: &name,
     };
-    cr_scale_patch_impl(&state, &ctx, target, &headers, &body).await
+    cr_scale_patch_impl(
+        &state,
+        &ctx,
+        target,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &body,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -9305,6 +9437,7 @@ mod tests {
         let resp = crate::handlers::status::put_namespaced_resource_status(
             State(state.clone()),
             v2_path("default", "g"),
+            None,
             axum::http::HeaderMap::new(),
             Bytes::from(body.to_string()),
         )
@@ -9433,6 +9566,7 @@ mod tests {
         put_cr_namespaced_scale(
             State(state.clone()),
             v2_path("default", "g"),
+            None,
             {
                 let mut h = axum::http::HeaderMap::new();
                 h.insert(
@@ -9542,6 +9676,7 @@ mod tests {
         let result = crate::handlers::status::put_namespaced_resource_status(
             State(state.clone()),
             gizmo_version_path("v9", "default", "g"),
+            None,
             axum::http::HeaderMap::new(),
             gizmo_status_put_body("v9"),
         )
@@ -9571,6 +9706,7 @@ mod tests {
         let result = crate::handlers::status::patch_namespaced_resource_status(
             State(state.clone()),
             gizmo_version_path("v9", "default", "g"),
+            None,
             json_content_type("application/merge-patch+json"),
             Bytes::from(r#"{"status":{"ready":true}}"#),
         )
@@ -9601,6 +9737,7 @@ mod tests {
         let result = put_cr_namespaced_scale(
             State(state.clone()),
             gizmo_version_path("v9", "default", "g"),
+            None,
             json_content_type("application/json"),
             gizmo_scale_put_body(),
         )
@@ -9630,6 +9767,7 @@ mod tests {
         crate::handlers::status::put_namespaced_resource_status(
             State(state.clone()),
             gizmo_version_path("v1", "default", "g"),
+            None,
             axum::http::HeaderMap::new(),
             gizmo_status_put_body("v1"),
         )
@@ -9657,6 +9795,7 @@ mod tests {
         put_cr_namespaced_scale(
             State(state.clone()),
             gizmo_version_path("v1", "default", "g"),
+            None,
             json_content_type("application/json"),
             gizmo_scale_put_body(),
         )
@@ -9684,6 +9823,7 @@ mod tests {
         let result = crate::handlers::status::put_namespaced_resource_status(
             State(state.clone()),
             v2_path("default", "g"),
+            None,
             axum::http::HeaderMap::new(),
             gizmo_status_put_body("v2"),
         )
@@ -9710,6 +9850,7 @@ mod tests {
         let result = put_cr_namespaced_scale(
             State(state.clone()),
             v2_path("default", "g"),
+            None,
             json_content_type("application/json"),
             gizmo_scale_put_body(),
         )
@@ -10749,6 +10890,7 @@ mod tests {
                     plural.clone(),
                     name.clone(),
                 )),
+                None,
                 axum::http::HeaderMap::new(),
                 status_put_body,
             )
@@ -10960,6 +11102,7 @@ mod tests {
                     plural.clone(),
                     name.clone(),
                 )),
+                None,
                 axum::http::HeaderMap::new(),
                 status_body,
             )
@@ -25778,6 +25921,7 @@ mod tests {
                 plural.clone(),
                 name.clone(),
             )),
+            None,
             axum::http::HeaderMap::new(),
             scale_body,
         )
@@ -25870,6 +26014,7 @@ mod tests {
                 plural.clone(),
                 name.clone(),
             )),
+            None,
             dry_run_headers,
             scale_body,
         )

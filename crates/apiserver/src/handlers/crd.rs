@@ -13,7 +13,9 @@ use crate::handlers::json_patch::{
     apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
 };
 use crate::{
-    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
+    admission::{
+        run_mutating_webhooks, run_validating_webhooks, AdmissionContext, AdmissionTarget,
+    },
     auth::UserInfo,
     state::AppState,
     status::Status,
@@ -1646,6 +1648,32 @@ pub async fn get_crd_status<S: Store>(
     get_crd(state, Path(name)).await
 }
 
+async fn admit_crd_status<S: Store>(
+    state: &AppState<S>,
+    name: &str,
+    user: Option<&UserInfo>,
+    headers: &HeaderMap,
+    old: &serde_json::Value,
+    new: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    crate::handlers::status::admit_status_write(
+        state,
+        &AdmissionTarget {
+            group: GROUP,
+            version: "v1",
+            resource: "customresourcedefinitions/status",
+            name,
+            namespace: None,
+            user,
+            dry_run: is_dry_run_header(headers),
+        },
+        old,
+        new,
+        KIND,
+    )
+    .await
+}
+
 /// PUT /apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}/status
 ///
 /// Replaces only the status field. Without this route, status requests fell through
@@ -1655,6 +1683,7 @@ pub async fn get_crd_status<S: Store>(
 pub async fn put_crd_status<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1687,6 +1716,15 @@ pub async fn put_crd_status<S: Store>(
     )?;
 
     crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+    current.body = admit_crd_status(
+        &state,
+        &name,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &before_write,
+        current.body,
+    )
+    .await?;
     crate::handlers::status::record_status_write(
         &headers,
         &before_write,
@@ -1719,6 +1757,7 @@ pub async fn put_crd_status<S: Store>(
 pub async fn patch_crd_status<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1782,6 +1821,15 @@ pub async fn patch_crd_status<S: Store>(
     // `validate_status_json_patch_paths` permits a whole-`/status` replace and
     // `apply_json_patch` happily turns that into a scalar.
     crate::handlers::status::reject_non_object_status(&current.body["status"])?;
+    current.body = admit_crd_status(
+        &state,
+        &name,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &before_write,
+        current.body,
+    )
+    .await?;
     crate::handlers::status::record_status_write(
         &headers,
         &before_write,
@@ -3617,6 +3665,7 @@ mod tests {
         let resp = put_crd_status(
             State(state.clone()),
             Path(name.to_string()),
+            None,
             HeaderMap::new(),
             put_body,
         )
@@ -3684,6 +3733,7 @@ mod tests {
         let resp = put_crd_status(
             State(state.clone()),
             Path(name.to_string()),
+            None,
             dry_run_headers,
             put_body,
         )
@@ -3748,6 +3798,7 @@ mod tests {
             let result = put_crd_status(
                 State(state.clone()),
                 Path(name.to_string()),
+                None,
                 HeaderMap::new(),
                 put_body,
             )
@@ -3790,6 +3841,7 @@ mod tests {
         let result = put_crd_status(
             State(state.clone()),
             Path(name.to_string()),
+            None,
             HeaderMap::new(),
             put_body,
         )
@@ -3822,10 +3874,16 @@ mod tests {
             "application/merge-patch+json".parse().unwrap(),
         );
 
-        let resp = patch_crd_status(State(state), Path(name.to_string()), headers, patch_bytes)
-            .await
-            .expect("patch status must succeed — before the fix this route did not exist")
-            .into_response();
+        let resp = patch_crd_status(
+            State(state),
+            Path(name.to_string()),
+            None,
+            headers,
+            patch_bytes,
+        )
+        .await
+        .expect("patch status must succeed — before the fix this route did not exist")
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -3867,6 +3925,7 @@ mod tests {
         let resp = patch_crd_status(
             State(state.clone()),
             Path(name.to_string()),
+            None,
             headers,
             patch_bytes,
         )
@@ -3926,6 +3985,7 @@ mod tests {
         let err = patch_crd_status(
             State(state.clone()),
             Path(name.to_string()),
+            None,
             headers,
             patch_bytes,
         )
@@ -3980,6 +4040,7 @@ mod tests {
         let err = patch_crd_status(
             State(state.clone()),
             Path(name.to_string()),
+            None,
             headers,
             patch_bytes,
         )
@@ -4040,15 +4101,21 @@ mod tests {
             "application/apply-patch+yaml".parse().unwrap(),
         );
 
-        let resp = patch_crd_status(State(state), Path(name.to_string()), headers, patch_bytes)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "apply-patch+yaml with a genuine YAML body on CRD /status must succeed, \
+        let resp = patch_crd_status(
+            State(state),
+            Path(name.to_string()),
+            None,
+            headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "apply-patch+yaml with a genuine YAML body on CRD /status must succeed, \
                      not 400 'invalid patch JSON': {e:?}"
-                )
-            })
-            .into_response();
+            )
+        })
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -4096,6 +4163,7 @@ mod tests {
         let resp = patch_crd_status(
             State(state.clone()),
             Path(name.to_string()),
+            None,
             headers,
             patch_bytes,
         )
@@ -4160,6 +4228,7 @@ mod tests {
         let err = match patch_crd_status(
             State(state.clone()),
             Path(name.to_string()),
+            None,
             headers,
             patch_bytes,
         )
@@ -4209,8 +4278,14 @@ mod tests {
             "application/json-patch+json".parse().unwrap(),
         );
 
-        let err = match patch_crd_status(State(state), Path(name.to_string()), headers, patch_bytes)
-            .await
+        let err = match patch_crd_status(
+            State(state),
+            Path(name.to_string()),
+            None,
+            headers,
+            patch_bytes,
+        )
+        .await
         {
             Ok(_) => panic!("a JSON Patch on /status targeting /metadata/labels must be rejected"),
             Err(e) => e,
@@ -4243,10 +4318,16 @@ mod tests {
             "application/json-patch+json".parse().unwrap(),
         );
 
-        let resp = patch_crd_status(State(state), Path(name.to_string()), headers, patch_bytes)
-            .await
-            .expect("a JSON Patch touching only /status must be accepted")
-            .into_response();
+        let resp = patch_crd_status(
+            State(state),
+            Path(name.to_string()),
+            None,
+            headers,
+            patch_bytes,
+        )
+        .await
+        .expect("a JSON Patch touching only /status must be accepted")
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -4267,6 +4348,7 @@ mod tests {
         let err = match put_crd_status(
             State(state.clone()),
             Path(name.to_string()),
+            None,
             HeaderMap::new(),
             put_body,
         )
@@ -4283,8 +4365,14 @@ mod tests {
             "application/merge-patch+json".parse().unwrap(),
         );
         let patch_body = Bytes::from(serde_json::json!({"status": {}}).to_string());
-        let err = match patch_crd_status(State(state), Path(name.to_string()), headers, patch_body)
-            .await
+        let err = match patch_crd_status(
+            State(state),
+            Path(name.to_string()),
+            None,
+            headers,
+            patch_body,
+        )
+        .await
         {
             Ok(_) => panic!("expected 404"),
             Err(e) => e,
@@ -6369,6 +6457,7 @@ mod ownership_tests {
         put_crd_status(
             axum::extract::State(state.clone()),
             Path(NAME.to_string()),
+            None,
             headers("application/json", "crd-controller/1.0"),
             Bytes::from(status.to_string()),
         )
@@ -6380,6 +6469,7 @@ mod ownership_tests {
         patch_crd_status(
             axum::extract::State(state.clone()),
             Path(NAME.to_string()),
+            None,
             headers("application/merge-patch+json", "status-patcher/1.0"),
             Bytes::from(r#"{"status":{"storedVersions":["v1alpha1"]}}"#),
         )

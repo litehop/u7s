@@ -63,10 +63,6 @@ mod cases {
         move |_| json!({"allowed": false, "status": {"code": 403, "message": message}})
     }
 
-    pub(crate) fn allow() -> impl Fn(&Value) -> Value + Send + Sync + 'static {
-        |_| json!({"allowed": true})
-    }
-
     pub(crate) fn json_patch(ops: Value) -> impl Fn(&Value) -> Value + Send + Sync + 'static {
         move |_| {
             json!({
@@ -176,6 +172,7 @@ mod cases {
     pub(crate) struct Cluster {
         pub router: Router,
         pub store: Arc<SqliteStore>,
+        pub state: AppState,
     }
 
     impl Cluster {
@@ -184,9 +181,15 @@ mod cases {
             let state: AppState = make_state_with_store(store.clone());
             seed_namespace(&state, "default").await;
             Self {
-                router: crate::build_router(state),
+                router: crate::build_router(state.clone()),
                 store,
+                state,
             }
+        }
+
+        pub(crate) async fn create(&self, uri: &str, body: Value) {
+            let (status, resp) = self.call("POST", uri, "application/json", body).await;
+            assert_eq!(status, StatusCode::CREATED, "create {uri}: {resp}");
         }
 
         pub(crate) async fn call(
@@ -868,5 +871,577 @@ mod cases {
             c.stored_pod("p").await["metadata"]["deletionTimestamp"].is_null(),
             "a denied eviction must not delete the pod"
         );
+    }
+
+    const JSON_PATCH: &str = "application/json-patch+json";
+    const APPLY: &str = "application/apply-patch+yaml";
+
+    /// One write against a subresource: `(label, method, uri, content type, body)`.
+    type Cell = (String, &'static str, String, &'static str, Value);
+
+    /// Every verb/content type a `/status` route accepts for the object at `base`.
+    fn status_cells(
+        base: &str,
+        api_version: &str,
+        kind: &str,
+        name: &str,
+        status: Value,
+    ) -> Vec<Cell> {
+        let uri = format!("{base}/status");
+        let obj = json!({"apiVersion": api_version, "kind": kind,
+            "metadata": {"name": name}, "status": status});
+        let patch = json!({"status": status});
+        let op = |s: &Value| {
+            let (k, v) = s.as_object().unwrap().iter().next().unwrap();
+            json!([{"op": "add", "path": format!("/status/{k}"), "value": v}])
+        };
+        vec![
+            (
+                "PUT".into(),
+                "PUT",
+                uri.clone(),
+                "application/json",
+                obj.clone(),
+            ),
+            (
+                "merge-PATCH".into(),
+                "PATCH",
+                uri.clone(),
+                MERGE,
+                patch.clone(),
+            ),
+            (
+                "strategic-PATCH".into(),
+                "PATCH",
+                uri.clone(),
+                STRATEGIC,
+                patch,
+            ),
+            (
+                "json-PATCH".into(),
+                "PATCH",
+                uri.clone(),
+                JSON_PATCH,
+                op(&status),
+            ),
+            ("apply-PATCH".into(), "PATCH", uri, APPLY, obj),
+        ]
+    }
+
+    /// Scale PUT and PATCH for the object at `base`.
+    fn scale_cells(base: &str, name: &str, ns: &str, replicas: i64) -> Vec<Cell> {
+        let uri = format!("{base}/scale");
+        vec![
+            (
+                "scale PUT".into(),
+                "PUT",
+                uri.clone(),
+                "application/json",
+                json!({"apiVersion": "autoscaling/v1", "kind": "Scale",
+                    "metadata": {"name": name, "namespace": ns},
+                    "spec": {"replicas": replicas}}),
+            ),
+            (
+                "scale merge-PATCH".into(),
+                "PATCH",
+                uri,
+                MERGE,
+                json!({"spec": {"replicas": replicas}}),
+            ),
+        ]
+    }
+
+    /// Register a deny webhook on `group`/`resource` (`<res>/<sub>`), fire every cell and
+    /// assert each was vetoed by it with upstream's request shape. Returns the hook for
+    /// further assertions.
+    async fn assert_every_write_is_vetoed(
+        c: &Cluster,
+        group: &str,
+        resource: &str,
+        kind: &str,
+        cells: &[Cell],
+    ) -> Hook {
+        let hook = spawn_hook(deny("frozen by policy")).await;
+        register_webhook(
+            &c.store,
+            false,
+            "freeze",
+            &hook.url,
+            group,
+            &[resource],
+            &["UPDATE"],
+        )
+        .await;
+        for (label, method, uri, ct, body) in cells {
+            let (status, resp) = c.call(method, uri, ct, body.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{resource} {label}: the webhook registered for {resource} must veto it: {resp}"
+            );
+            assert!(
+                resp["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("frozen by policy")),
+                "{resource} {label}: {resp}"
+            );
+        }
+        let (base, sub) = resource.split_once('/').unwrap();
+        let reqs = hook.requests();
+        assert_eq!(reqs.len(), cells.len(), "{resource}: {reqs:?}");
+        for r in &reqs {
+            assert_eq!(r["subResource"], sub, "{resource}");
+            assert_eq!(r["resource"]["resource"], base, "{resource}");
+            assert_eq!(r["resource"]["group"], group, "{resource}");
+            assert_eq!(r["kind"]["kind"], kind, "{resource}");
+            assert_eq!(r["operation"], "UPDATE", "{resource}");
+            assert_eq!(r["userInfo"]["username"], "alice", "{resource}");
+        }
+        hook
+    }
+
+    fn deployment(name: &str) -> Value {
+        json!({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name},
+            "spec": {"replicas": 1, "selector": {"matchLabels": {"a": "b"}},
+                "template": {"metadata": {"labels": {"a": "b"}},
+                    "spec": {"containers": [{"name": "c", "image": "nginx"}]}}}})
+    }
+
+    async fn stored_deployment(c: &Cluster) -> Value {
+        c.stored("/registry/apps/deployments/default/d").await
+    }
+
+    /// Built-in namespaced kinds share one status route: a policy on deployments/status
+    /// (e.g. blocking a rogue controller from marking rollouts complete) is bypassed if any
+    /// of its five write verbs skips admission.
+    #[tokio::test]
+    async fn webhook_on_namespaced_builtin_status_vetoes_every_write_verb() {
+        let c = Cluster::new().await;
+        c.create(
+            "/apis/apps/v1/namespaces/default/deployments",
+            deployment("d"),
+        )
+        .await;
+        let before = stored_deployment(&c).await["status"].clone();
+        let cells = status_cells(
+            "/apis/apps/v1/namespaces/default/deployments/d",
+            "apps/v1",
+            "Deployment",
+            "d",
+            json!({"replicas": 2}),
+        );
+        let hook =
+            assert_every_write_is_vetoed(&c, "apps", "deployments/status", "Deployment", &cells)
+                .await;
+        assert_eq!(stored_deployment(&c).await["status"], before);
+        let first = &hook.requests()[0];
+        assert_eq!(first["namespace"], "default");
+        assert_eq!(first["name"], "d");
+        assert_eq!(first["object"]["status"]["replicas"], 2);
+    }
+
+    /// Core-group workloads take a separate route wrapper than apps/*, and cluster-scoped
+    /// kinds another; each must reach admission too.
+    #[tokio::test]
+    async fn webhook_on_core_namespaced_and_cluster_scoped_status_vetoes_every_write_verb() {
+        let c = Cluster::new().await;
+        c.create(
+            "/api/v1/namespaces/default/replicationcontrollers",
+            json!({"apiVersion": "v1", "kind": "ReplicationController", "metadata": {"name": "rc"},
+                "spec": {"replicas": 1, "selector": {"a": "b"},
+                    "template": {"metadata": {"labels": {"a": "b"}},
+                        "spec": {"containers": [{"name": "c", "image": "nginx"}]}}}}),
+        )
+        .await;
+        let cells = status_cells(
+            "/api/v1/namespaces/default/replicationcontrollers/rc",
+            "v1",
+            "ReplicationController",
+            "rc",
+            json!({"replicas": 2}),
+        );
+        assert_every_write_is_vetoed(
+            &c,
+            "",
+            "replicationcontrollers/status",
+            "ReplicationController",
+            &cells,
+        )
+        .await;
+
+        let c = Cluster::new().await;
+        c.create(
+            "/api/v1/nodes",
+            json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "n1"}}),
+        )
+        .await;
+        let cells = status_cells(
+            "/api/v1/nodes/n1",
+            "v1",
+            "Node",
+            "n1",
+            json!({"allocatable": {"cpu": "2"}}),
+        );
+        assert_every_write_is_vetoed(&c, "", "nodes/status", "Node", &cells).await;
+    }
+
+    /// Namespace status and finalize are bespoke handlers; the namespace controller drives
+    /// both, and a policy on namespaces/finalize is the only way to gate namespace teardown.
+    #[tokio::test]
+    async fn webhook_on_namespace_status_and_finalize_vetoes_every_write() {
+        let c = Cluster::new().await;
+        c.create(
+            "/api/v1/namespaces",
+            json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ns1"}}),
+        )
+        .await;
+        let status = status_cells(
+            "/api/v1/namespaces/ns1",
+            "v1",
+            "Namespace",
+            "ns1",
+            json!({"phase": "Active"}),
+        );
+        assert_every_write_is_vetoed(&c, "", "namespaces/status", "Namespace", &status).await;
+
+        let c = Cluster::new().await;
+        c.create(
+            "/api/v1/namespaces",
+            json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ns1"}}),
+        )
+        .await;
+        let finalize: Vec<Cell> = vec![(
+            "finalize PUT".into(),
+            "PUT",
+            "/api/v1/namespaces/ns1/finalize".into(),
+            "application/json",
+            json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ns1"},
+                "spec": {"finalizers": []}}),
+        )];
+        assert_every_write_is_vetoed(&c, "", "namespaces/finalize", "Namespace", &finalize).await;
+        assert_eq!(
+            c.stored("/registry/namespaces/ns1").await["spec"]["finalizers"],
+            json!(["kubernetes"]),
+            "a denied finalize must leave the finalizer in place"
+        );
+    }
+
+    fn crd(plural: &str, kind: &str, scope: &str) -> Value {
+        json!({
+            "apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+            "metadata": {"name": format!("{plural}.example.com")},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": plural, "singular": plural, "kind": kind,
+                    "listKind": format!("{kind}List")},
+                "scope": scope,
+                "versions": [{
+                    "name": "v1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object",
+                        "x-kubernetes-preserve-unknown-fields": true}},
+                    "subresources": {"status": {}, "scale": {
+                        "specReplicasPath": ".spec.replicas",
+                        "statusReplicasPath": ".status.replicas"}}
+                }]
+            }
+        })
+    }
+
+    /// CRs are admitted like built-ins: operators gate their own APIs with the same
+    /// subresource rules, for namespaced and cluster-scoped CRDs and for both /status
+    /// and /scale.
+    #[tokio::test]
+    async fn webhook_on_custom_resource_status_and_scale_vetoes_every_write() {
+        for (plural, kind, scope, base) in [
+            (
+                "widgets",
+                "Widget",
+                "Namespaced",
+                "/apis/example.com/v1/namespaces/default/widgets",
+            ),
+            (
+                "gadgets",
+                "Gadget",
+                "Cluster",
+                "/apis/example.com/v1/gadgets",
+            ),
+        ] {
+            let c = Cluster::new().await;
+            c.create(
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                crd(plural, kind, scope),
+            )
+            .await;
+            c.create(
+                base,
+                json!({"apiVersion": "example.com/v1", "kind": kind,
+                    "metadata": {"name": "w"}, "spec": {"replicas": 1}}),
+            )
+            .await;
+            let obj = format!("{base}/w");
+            let status = status_cells(&obj, "example.com/v1", kind, "w", json!({"replicas": 2}));
+            assert_every_write_is_vetoed(
+                &c,
+                "example.com",
+                &format!("{plural}/status"),
+                kind,
+                &status,
+            )
+            .await;
+
+            let c = Cluster::new().await;
+            c.create(
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                crd(plural, kind, scope),
+            )
+            .await;
+            c.create(
+                base,
+                json!({"apiVersion": "example.com/v1", "kind": kind,
+                    "metadata": {"name": "w"}, "spec": {"replicas": 1}}),
+            )
+            .await;
+            let ns = if scope == "Namespaced" { "default" } else { "" };
+            let scale = scale_cells(&obj, "w", ns, 3);
+            let hook = assert_every_write_is_vetoed(
+                &c,
+                "example.com",
+                &format!("{plural}/scale"),
+                "Scale",
+                &scale,
+            )
+            .await;
+            let r = &hook.requests()[0];
+            assert_eq!(
+                r["kind"]["group"], "autoscaling",
+                "{plural}: request kind is the Scale"
+            );
+            assert_eq!(r["object"]["spec"]["replicas"], 3);
+            assert_eq!(r["oldObject"]["spec"]["replicas"], 1);
+        }
+    }
+
+    /// The CRD's own /status route is a separate handler from every other kind's.
+    #[tokio::test]
+    async fn webhook_on_crd_status_vetoes_every_write_verb() {
+        let c = Cluster::new().await;
+        c.create(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            crd("widgets", "Widget", "Namespaced"),
+        )
+        .await;
+        let cells = status_cells(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.com",
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            "widgets.example.com",
+            json!({"storedVersions": ["v1"]}),
+        );
+        assert_every_write_is_vetoed(
+            &c,
+            "apiextensions.k8s.io",
+            "customresourcedefinitions/status",
+            "CustomResourceDefinition",
+            &cells,
+        )
+        .await;
+    }
+
+    /// Scale is how HPAs and `kubectl scale` change replicas; a replica-cap policy on
+    /// deployments/scale must hold for apps workloads and ReplicationControllers, PUT and PATCH.
+    #[tokio::test]
+    async fn webhook_and_vap_on_workload_scale_veto_and_mutate_replicas() {
+        let c = Cluster::new().await;
+        c.create(
+            "/apis/apps/v1/namespaces/default/deployments",
+            deployment("d"),
+        )
+        .await;
+        let cells = scale_cells(
+            "/apis/apps/v1/namespaces/default/deployments/d",
+            "d",
+            "default",
+            3,
+        );
+        let hook =
+            assert_every_write_is_vetoed(&c, "apps", "deployments/scale", "Scale", &cells).await;
+        let r = &hook.requests()[0];
+        assert_eq!(r["kind"]["group"], "autoscaling");
+        assert_eq!(r["kind"]["version"], "v1");
+        assert_eq!(r["object"]["spec"]["replicas"], 3);
+        assert_eq!(r["oldObject"]["spec"]["replicas"], 1);
+        assert_eq!(stored_deployment(&c).await["spec"]["replicas"], 1);
+
+        let c = Cluster::new().await;
+        c.create(
+            "/api/v1/namespaces/default/replicationcontrollers",
+            json!({"apiVersion": "v1", "kind": "ReplicationController", "metadata": {"name": "rc"},
+                "spec": {"replicas": 1, "selector": {"a": "b"},
+                    "template": {"metadata": {"labels": {"a": "b"}},
+                        "spec": {"containers": [{"name": "c", "image": "nginx"}]}}}}),
+        )
+        .await;
+        let cells = scale_cells(
+            "/api/v1/namespaces/default/replicationcontrollers/rc",
+            "rc",
+            "default",
+            3,
+        );
+        assert_every_write_is_vetoed(&c, "", "replicationcontrollers/scale", "Scale", &cells).await;
+
+        let c = Cluster::new().await;
+        c.create(
+            "/apis/apps/v1/namespaces/default/deployments",
+            deployment("d"),
+        )
+        .await;
+        register_vap(
+            &c.store,
+            "max-replicas",
+            "apps",
+            &["deployments/scale"],
+            "object.spec.replicas <= 5",
+            "at most 5 replicas",
+        )
+        .await;
+        for (label, method, uri, ct, body) in scale_cells(
+            "/apis/apps/v1/namespaces/default/deployments/d",
+            "d",
+            "default",
+            8,
+        ) {
+            let (status, resp) = c.call(method, &uri, ct, body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {resp}");
+            assert!(
+                resp["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("at most 5 replicas"),
+                "{label}: {resp}"
+            );
+        }
+        assert_eq!(stored_deployment(&c).await["spec"]["replicas"], 1);
+
+        let hook = spawn_hook(json_patch(json!([
+            {"op": "replace", "path": "/spec/replicas", "value": 4}
+        ])))
+        .await;
+        register_webhook(
+            &c.store,
+            true,
+            "clamp",
+            &hook.url,
+            "apps",
+            &["deployments/scale"],
+            &["UPDATE"],
+        )
+        .await;
+        for (label, method, uri, ct, body) in scale_cells(
+            "/apis/apps/v1/namespaces/default/deployments/d",
+            "d",
+            "default",
+            2,
+        ) {
+            let (status, resp) = c.call(method, &uri, ct, body).await;
+            assert_eq!(status, StatusCode::OK, "{label}: {resp}");
+            assert_eq!(
+                stored_deployment(&c).await["spec"]["replicas"],
+                4,
+                "{label}: the scale webhook's replicas must be what is stored"
+            );
+            assert_eq!(resp["spec"]["replicas"], 4, "{label}: {resp}");
+            let (status, _) = c
+                .call(
+                    "PUT",
+                    "/apis/apps/v1/namespaces/default/deployments/d/scale",
+                    "application/json",
+                    json!({"spec": {"replicas": 1}}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    /// Status mutators may stamp status but, as upstream's per-kind status strategies do,
+    /// cannot change spec; the same must hold for generic kinds, not just pods.
+    #[tokio::test]
+    async fn mutating_webhook_on_generic_status_keeps_status_and_drops_spec_edits() {
+        let c = Cluster::new().await;
+        c.create(
+            "/apis/apps/v1/namespaces/default/deployments",
+            deployment("d"),
+        )
+        .await;
+        let hook = spawn_hook(json_patch(json!([
+            {"op": "add", "path": "/status/replicas", "value": 7},
+            {"op": "replace", "path": "/spec/replicas", "value": 99}
+        ])))
+        .await;
+        register_webhook(
+            &c.store,
+            true,
+            "stamp",
+            &hook.url,
+            "apps",
+            &["deployments/status"],
+            &["UPDATE"],
+        )
+        .await;
+        for (label, method, uri, ct, body) in status_cells(
+            "/apis/apps/v1/namespaces/default/deployments/d",
+            "apps/v1",
+            "Deployment",
+            "d",
+            json!({"replicas": 2}),
+        ) {
+            let (status, resp) = c.call(method, &uri, ct, body).await;
+            assert_eq!(status, StatusCode::OK, "{label}: {resp}");
+            let d = stored_deployment(&c).await;
+            assert_eq!(d["status"]["replicas"], 7, "{label}: {d}");
+            assert_eq!(d["spec"]["replicas"], 1, "{label}: {d}");
+        }
+    }
+
+    /// CSR approval is its own subresource with its own webhook rules upstream; approving
+    /// must be gated by a policy on certificatesigningrequests/approval.
+    #[tokio::test]
+    async fn webhook_on_csr_approval_vetoes_put_and_patch() {
+        let c = Cluster::new().await;
+        grant_signer_verb(&c.state, "alice", "approve", "example.com/signer");
+        c.store
+            .put(
+                "/registry/certificates.k8s.io/certificatesigningrequests/c1",
+                Bytes::from(
+                    json!({"apiVersion": "certificates.k8s.io/v1",
+                        "kind": "CertificateSigningRequest", "metadata": {"name": "c1"},
+                        "spec": {"request": "AAAA", "signerName": "example.com/signer",
+                            "usages": ["digital signature"]}})
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let uri = "/apis/certificates.k8s.io/v1/certificatesigningrequests/c1/approval";
+        let cond = json!({"status": {"conditions": [
+            {"type": "Approved", "status": "True", "reason": "ok"}]}});
+        let cells: Vec<Cell> = vec![
+            (
+                "PUT".into(),
+                "PUT",
+                uri.into(),
+                "application/json",
+                cond.clone(),
+            ),
+            ("merge-PATCH".into(), "PATCH", uri.into(), MERGE, cond),
+        ];
+        assert_every_write_is_vetoed(
+            &c,
+            "certificates.k8s.io",
+            "certificatesigningrequests/approval",
+            "CertificateSigningRequest",
+            &cells,
+        )
+        .await;
     }
 }

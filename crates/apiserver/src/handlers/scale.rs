@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use prost::Message;
@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use u7s_store::Store;
 
 use crate::{
+    admission::{admit_write, AdmissionTarget},
+    auth::UserInfo,
     keys::group_object_key,
     state::AppState,
     status::Status,
@@ -18,6 +20,7 @@ use crate::{
 };
 
 use super::generic::{store_err, validate_path_segment};
+
 use super::json_patch::is_dry_run_header;
 
 // ---------------------------------------------------------------------------
@@ -269,6 +272,34 @@ pub fn build_scale(
     })
 }
 
+/// Run the admission chain for an UPDATE of `<resource>/scale`: webhooks and policies see the
+/// autoscaling/v1 Scale (as upstream's scale REST storage hands them) and may rewrite
+/// `spec.replicas`. Returns the replica count to store.
+pub(crate) async fn admit_scale_write<S: Store>(
+    state: &AppState<S>,
+    target: &AdmissionTarget<'_>,
+    old_scale: &serde_json::Value,
+    new_scale: serde_json::Value,
+) -> Result<i64, crate::status::StatusError> {
+    let admitted = admit_write(
+        state,
+        target,
+        "UPDATE",
+        Some(old_scale),
+        new_scale,
+        |mutated| match mutated["spec"]["replicas"].as_i64() {
+            Some(r) if (0..=i32::MAX as i64).contains(&r) => Ok(mutated),
+            _ => Err(Status::unprocessable_entity(format!(
+                "Scale.autoscaling \"{}\" is invalid: spec.replicas: Invalid value: {}: \
+                 must be a non-negative 32-bit integer",
+                target.name, mutated["spec"]["replicas"]
+            ))),
+        },
+    )
+    .await?;
+    Ok(admitted["spec"]["replicas"].as_i64().unwrap_or(0))
+}
+
 /// Serialize a workload's `spec.selector` into the label-selector string form
 /// required by the Scale subresource's `status.selector` field.
 ///
@@ -463,10 +494,10 @@ fn record_scale_write(
 
 async fn scale_put_impl<S: Store>(
     state: AppState<S>,
-    group: &str,
-    resource: &str,
+    (group, resource): (&str, &str),
     ns: &str,
     name: &str,
+    user: Option<&UserInfo>,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -496,6 +527,35 @@ async fn scale_put_impl<S: Store>(
     let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
     let before_write = obj.body.clone();
 
+    let new_replicas = admit_scale_write(
+        &state,
+        &AdmissionTarget {
+            group,
+            version: "v1",
+            resource: &format!("{resource}/scale"),
+            name,
+            namespace: Some(ns),
+            user,
+            dry_run: is_dry_run_header(headers),
+        },
+        &build_scale(
+            name,
+            ns,
+            extract_replicas(&obj.body),
+            status_replicas,
+            obj.resource_version().unwrap_or(""),
+            &selector,
+        ),
+        build_scale(
+            name,
+            ns,
+            new_replicas as i64,
+            status_replicas,
+            obj.resource_version().unwrap_or(""),
+            &selector,
+        ),
+    )
+    .await? as i32;
     write_scale_replicas(&mut obj, new_replicas)?;
 
     // Dry-run: spec.replicas was computed above; return the would-be Scale object
@@ -533,10 +593,10 @@ async fn scale_put_impl<S: Store>(
 
 async fn scale_patch_impl<S: Store>(
     state: AppState<S>,
-    group: &str,
-    resource: &str,
+    (group, resource): (&str, &str),
     ns: &str,
     name: &str,
+    user: Option<&UserInfo>,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -580,13 +640,39 @@ async fn scale_patch_impl<S: Store>(
     let before_write = obj.body.clone();
 
     // Extract replicas from patch if present; otherwise keep current value (no write).
-    let new_replicas = match patch_scale_spec.replicas {
-        Some(r) => {
-            write_scale_replicas(&mut obj, r)?;
-            r as i64
-        }
-        None => extract_replicas(&obj.body),
-    };
+    let old_replicas = extract_replicas(&obj.body);
+    let new_replicas = admit_scale_write(
+        &state,
+        &AdmissionTarget {
+            group,
+            version: "v1",
+            resource: &format!("{resource}/scale"),
+            name,
+            namespace: Some(ns),
+            user,
+            dry_run: is_dry_run_header(headers),
+        },
+        &build_scale(
+            name,
+            ns,
+            old_replicas,
+            status_replicas,
+            obj.resource_version().unwrap_or(""),
+            &selector,
+        ),
+        build_scale(
+            name,
+            ns,
+            patch_scale_spec.replicas.map_or(old_replicas, |r| r as i64),
+            status_replicas,
+            obj.resource_version().unwrap_or(""),
+            &selector,
+        ),
+    )
+    .await?;
+    if patch_scale_spec.replicas.is_some() || new_replicas != old_replicas {
+        write_scale_replicas(&mut obj, new_replicas as i32)?;
+    }
 
     // Dry-run: same shared-impl reasoning as scale_put_impl above — covers both
     // apps/v1 and ReplicationController scale PATCH routes.
@@ -650,11 +736,21 @@ pub async fn get_scale<S: Store>(
 pub async fn put_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, resource, name)): Path<(String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     require_scale_resource(&resource)?;
-    scale_put_impl(state, "apps", &resource, &ns, &name, &headers, &body).await
+    scale_put_impl(
+        state,
+        ("apps", &resource),
+        &ns,
+        &name,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &body,
+    )
+    .await
 }
 
 /// PATCH /apis/apps/v1/namespaces/:ns/:resource/:name/scale
@@ -667,11 +763,21 @@ pub async fn put_scale<S: Store>(
 pub async fn patch_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, resource, name)): Path<(String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     require_scale_resource(&resource)?;
-    scale_patch_impl(state, "apps", &resource, &ns, &name, &headers, &body).await
+    scale_patch_impl(
+        state,
+        ("apps", &resource),
+        &ns,
+        &name,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &body,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -700,15 +806,16 @@ pub async fn get_rc_scale<S: Store>(
 pub async fn put_rc_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     scale_put_impl(
         state,
-        "",
-        "replicationcontrollers",
+        ("", "replicationcontrollers"),
         &ns,
         &name,
+        user.as_ref().map(|u| &u.0),
         &headers,
         &body,
     )
@@ -719,15 +826,16 @@ pub async fn put_rc_scale<S: Store>(
 pub async fn patch_rc_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     scale_patch_impl(
         state,
-        "",
-        "replicationcontrollers",
+        ("", "replicationcontrollers"),
         &ns,
         &name,
+        user.as_ref().map(|u| &u.0),
         &headers,
         &body,
     )

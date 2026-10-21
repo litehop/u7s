@@ -1424,6 +1424,7 @@ pub(crate) async fn put_pod_certificate_request_status<S: Store>(
     super::status::put_namespaced_resource_status_guarded(
         State(state.clone()),
         Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string(), name)),
+        Some(&user),
         headers,
         body,
         Some(&guard),
@@ -1445,6 +1446,7 @@ pub(crate) async fn patch_pod_certificate_request_status<S: Store>(
     super::status::patch_namespaced_resource_status_guarded(
         State(state.clone()),
         Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string(), name)),
+        Some(&user),
         headers,
         body,
         Some(&guard),

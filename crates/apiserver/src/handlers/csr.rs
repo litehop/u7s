@@ -2769,6 +2769,7 @@ mod tests {
                 PLURAL.into(),
                 "c1".into(),
             )),
+            None,
             json_headers("application/json"),
             Bytes::from(body.to_string()),
         )

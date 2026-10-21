@@ -3642,13 +3642,12 @@ async fn admit_pod_status_update<S: Store>(
     old: &serde_json::Value,
     new: serde_json::Value,
 ) -> Result<serde_json::Value, crate::status::StatusError> {
-    admit_write(
+    super::status::admit_status_write(
         state,
         &pod_target(ns, name, "pods/status", user, dry_run),
-        "UPDATE",
-        Some(old),
+        old,
         new,
-        |mutated| super::status::status_write_strategy(old, mutated, "v1", "Pod"),
+        "Pod",
     )
     .await
 }

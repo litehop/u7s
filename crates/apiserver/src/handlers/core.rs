@@ -542,12 +542,14 @@ pub(crate) async fn core_get_namespaced_resource_status<S: Store>(
 pub(crate) async fn core_put_namespaced_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     put_namespaced_resource_status(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
+        user,
         headers,
         body,
     )
@@ -557,12 +559,14 @@ pub(crate) async fn core_put_namespaced_resource_status<S: Store>(
 pub(crate) async fn core_patch_namespaced_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     patch_namespaced_resource_status(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
+        user,
         headers,
         body,
     )
