@@ -147,12 +147,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build apiserver with pki-test-knobs
-        run: cargo build --locked --release -p u7s-apiserver --features pki-test-knobs
+      - name: Build apiserver with pki-test-knobs and the scheduler
+        run: cargo build --locked --release -p u7s-apiserver --features pki-test-knobs && cargo build --locked --release -p u7s-scheduler
 
-      - name: Start apiserver with 60s test lifetimes
+      - name: Start apiserver with 120s test lifetimes
         env:
-          U7S_PKI_TEST_LIFETIME_SECS: "60"
+          U7S_PKI_TEST_LIFETIME_SECS: "120"
         run: |
           W="$PWD/temp/pki-e2e"
           mkdir -p "$W/manifests"
@@ -170,15 +170,25 @@ jobs:
           cat "$W/apiserver.log"
           exit 1
 
+      - name: Start standalone scheduler on the apiserver's file-path kubeconfig
+        run: |
+          W="$PWD/temp/pki-e2e"
+          ./target/release/u7s-scheduler --kubeconfig "$W/kubeconfig-scheduler" >"$W/scheduler.log" 2>&1 &
+          sleep 2
+          pgrep -f "u7s-scheduler.*$W/kubeconfig" >/dev/null || { cat "$W/scheduler.log"; exit 1; }
+
       - name: Leaf rotation e2e (3 iterations)
         run: |
           scripts/e2e-pki-rotation/leaf-rotation.sh \
-            --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443 --iterations 3
+            --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443 --iterations 3 \
+            --scheduler --lifetime 120
 
       - name: Upload apiserver log
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: pki-rotation-e2e-apiserver-log
-          path: temp/pki-e2e/apiserver.log
+          name: pki-rotation-e2e-logs
+          path: |
+            temp/pki-e2e/apiserver.log
+            temp/pki-e2e/scheduler.log
           retention-days: 7
