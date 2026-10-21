@@ -1145,6 +1145,55 @@ fresh_install_out="$(bash "$PERSIST_CHECK_RUNNER" "$fresh_install_dir" 0 "node-a
 assert "a genuinely fresh install (no persisted config, EXISTING_INSTALL=0) never trips the mismatch guard, even with explicit --iface/--node-name flags -- the guard is upgrade-only" \
   "$(printf '%s' "$fresh_install_out" | grep -q '^NODE_NAME=node-a$' && printf '%s' "$fresh_install_out" | grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
 
+# Case 6: a host named with capitals (the release-gate VMs are
+# u7s-rg-<stamp with T/Z>) must still install. The kubelet CSR name and the
+# CSR subject CN are derived from NODE_NAME and the apiserver rejects any
+# uppercase in them, so NODE_NAME must be lowercased like upstream kubelet's
+# GetHostname, for both the explicit override and the hostname default.
+UPPER_HOST="U7S-RG-20261021T053138Z-1"
+LOWER_HOST="u7s-rg-20261021t053138z-1"
+upper_runner="$PERSIST_WORK/upper-name.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'STATE_DIR="$1"; CONFIG_FILE="$STATE_DIR/config"; EXISTING_INSTALL="${3:-0}"'
+  echo 'NODE_NAME="$2"; IFACE=eth0'
+  echo "hostname() { echo \"  $UPPER_HOST\"; }"
+  awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Defaults: node name, network interface/ { if ($0 !~ /^# --- Defaults: node name, network interface/) print }' "$INSTALL"
+  awk '/^# --- Defaults: node name/{f=1} f{print} f&&/^fi$/{exit}' "$INSTALL"
+  echo 'echo "NODE_NAME=$NODE_NAME"'
+} > "$upper_runner"
+mkdir -p "$PERSIST_WORK/upper"
+upper_default_out="$(bash "$upper_runner" "$PERSIST_WORK/upper" "" 2>&1)"
+assert "a host named with capitals still gets a lowercase, trimmed node name from hostname (otherwise the kubelet CSR name is invalid and install fails)" \
+  "$(printf '%s' "$upper_default_out" | grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
+upper_flag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper" "$UPPER_HOST" 2>&1)"
+assert "an uppercase --node-name is lowercased too, so an explicit override cannot produce an invalid CSR name" \
+  "$(printf '%s' "$upper_flag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
+# A host that already hit the uppercase bug persisted the uppercase name (config
+# is written before the kubelet identity CSR fails). It must recover by simply
+# re-running install, with or without a lowercase --node-name.
+mkdir -p "$PERSIST_WORK/upper-persisted"
+printf 'NODE_NAME="%s"\nIFACE="eth0"\n' "$UPPER_HOST" > "$PERSIST_WORK/upper-persisted/config"
+recover_noflag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper-persisted" "" 1 2>&1 || true)"
+assert "a persisted UPPERCASE node name is lowercased on re-run with no flag (otherwise a host broken by the uppercase bug fails the same way forever)" \
+  "$(printf '%s' "$recover_noflag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
+recover_flag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper-persisted" "$LOWER_HOST" 1 2>&1 || true)"
+assert "a lowercase --node-name does not conflict with the persisted uppercase spelling of the same name (operator can recover by passing the fix explicitly)" \
+  "$(printf '%s' "$recover_flag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && ! printf '%s' "$recover_flag_out" | grep -q 'conflicts with the node name persisted' && echo 1 || echo 0)"
+for csr_fmt in 'join-%s-1' 'kubelet-%s-1'; do
+  # shellcheck disable=SC2059
+  csr_name="$(printf "$csr_fmt" "$(printf '%s' "$upper_default_out" | sed -n 's/^NODE_NAME=//p')")"
+  assert "the CSR name $csr_name built from a capitalised host is a valid DNS-1123 name (apiserver rejects uppercase)" \
+    "$(printf '%s' "$csr_name" | grep -Eq '^[a-z0-9.-]+$' && echo 1 || echo 0)"
+done
+assert_true "the join CSR name is built from NODE_NAME (so the lowercasing reaches it)" \
+  grep -qF 'csr_name="join-${NODE_NAME}-$(date +%s)"' "$INSTALL"
+assert_true "the control-plane kubelet CSR name is built from NODE_NAME (so the lowercasing reaches it)" \
+  grep -qF 'csr_name="kubelet-${NODE_NAME}-$(date +%s)"' "$INSTALL"
+assert_true "the CSR subject CN uses NODE_NAME, so it is the lowercase system:node:<name> the node authorizer expects" \
+  grep -qF -- '-subj "/O=system:nodes/CN=system:node:$NODE_NAME"' "$INSTALL"
+
 # ---------------------------------------------------------------------------
 # Mutation self-check (CLAUDE.md rule 14): prove the --iface refusal assertion
 # above would actually catch a reverted fix. Bypass the guard in a scratch
