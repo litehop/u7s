@@ -2,7 +2,8 @@
 //!
 //! Mirrors `ensureRBACPolicy` / `ReconcileRoleOptions` / `ReconcileRoleBindingOptions`: a missing
 //! object is created; an existing one is brought up to the bootstrap policy by *adding* missing
-//! rules, subjects, labels and annotations, never removing anything an operator added; an
+//! rules, subjects, labels and annotations, never removing anything an operator added (except
+//! exact copies of rules earlier u7s releases seeded, see `legacy_rules`); an
 //! object annotated `rbac.authorization.kubernetes.io/autoupdate: "false"` is left alone.
 
 use bytes::Bytes;
@@ -15,6 +16,7 @@ const AUTOUPDATE_ANNOTATION: &str = "rbac.authorization.kubernetes.io/autoupdate
 const BOOTSTRAP_LABEL: &str = "kubernetes.io/bootstrapping";
 const BOOTSTRAP_LABEL_VALUE: &str = "rbac-defaults";
 const MAX_ATTEMPTS: usize = 5;
+const GROUP: &str = "rbac.authorization.k8s.io";
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Reconciled {
@@ -131,8 +133,84 @@ fn merge_string_map(obj: &mut Value, field: &str, expected: &Value) -> Vec<Strin
     added
 }
 
+const WRITE: [&str; 5] = ["create", "update", "patch", "delete", "deletecollection"];
+
+fn crud() -> Vec<&'static str> {
+    ["get", "list", "watch"].into_iter().chain(WRITE).collect()
+}
+
+/// Rules earlier u7s releases seeded that are broader than the current policy.
+///
+/// Upstream's bootstrap reconcile only ever adds permissions (`RemoveExtraPermissions` is never
+/// set in `ensureRBACPolicy`), so a rule dropped from the policy survives on every cluster that
+/// already stored it. u7s is pre-release and owns what it seeded, so these exact rules are
+/// removed from stored bootstrap roles. Matching is by full equality: a rule an operator edited
+/// or wrote themselves is left alone.
+fn legacy_rules(role: &str) -> Vec<Value> {
+    let read = ["get", "list", "watch"];
+    let core_crud_with_endpoints = json!({
+        "apiGroups": [""],
+        "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"],
+        "verbs": crud()
+    });
+    let apps_crud_with_revisions = json!({
+        "apiGroups": ["apps"],
+        "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"],
+        "verbs": crud()
+    });
+    match role {
+        "admin" => vec![
+            core_crud_with_endpoints,
+            apps_crud_with_revisions,
+            json!({
+                "apiGroups": [GROUP],
+                "resources": ["roles", "rolebindings"],
+                "verbs": crud().into_iter().chain(["bind", "escalate"]).collect::<Vec<_>>()
+            }),
+        ],
+        "edit" => vec![core_crud_with_endpoints, apps_crud_with_revisions],
+        "view" => vec![json!({
+            "apiGroups": [""],
+            "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","serviceaccounts","events","replicationcontrollers","namespaces","nodes","resourcequotas","limitranges"],
+            "verbs": read
+        })],
+        "system:kube-controller-manager" => {
+            let write_no_collection = [
+                "get", "list", "watch", "create", "update", "patch", "delete",
+            ];
+            vec![
+                json!({
+                    "apiGroups": [""],
+                    "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"],
+                    "verbs": write_no_collection
+                }),
+                json!({
+                    "apiGroups": ["apps"],
+                    "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"],
+                    "verbs": write_no_collection
+                }),
+                json!({
+                    "apiGroups": ["batch"],
+                    "resources": ["jobs", "cronjobs"],
+                    "verbs": write_no_collection
+                }),
+                json!({
+                    "apiGroups": [GROUP],
+                    "resources": ["clusterroles","clusterrolebindings","roles","rolebindings"],
+                    "verbs": ["get","list","watch","create","update","patch","escalate","bind"]
+                }),
+            ]
+        }
+        _ => vec![],
+    }
+}
+
+/// Bootstrap ClusterRoles earlier releases seeded that the current policy no longer has.
+pub(crate) const LEGACY_CLUSTER_ROLES: &[&str] =
+    &["system:controller:storage-version-garbage-collector"];
+
 /// Computes what must change on `existing` to satisfy `expected`, without ever removing
-/// operator additions.
+/// operator additions (only the exact rules listed by `legacy_rules`).
 pub(crate) fn reconcile(existing: &Value, expected: &Value) -> Reconciled {
     if existing["metadata"]["annotations"][AUTOUPDATE_ANNOTATION].as_str() == Some("false") {
         return Reconciled::Unchanged;
@@ -183,10 +261,23 @@ pub(crate) fn reconcile(existing: &Value, expected: &Value) -> Reconciled {
             obj.as_object_mut().map(|m| m.remove("aggregationRule"));
             changes.push("aggregationRule removed".to_string());
         }
-        let have = list(existing, "rules");
-        let mut rules = have.to_vec();
+        let legacy = if expected["kind"] == "ClusterRole" {
+            legacy_rules(expected["metadata"]["name"].as_str().unwrap_or_default())
+        } else {
+            vec![]
+        };
+        let have: Vec<Value> = list(existing, "rules")
+            .iter()
+            .filter(|r| !legacy.contains(r))
+            .cloned()
+            .collect();
+        let removed = list(existing, "rules").len() - have.len();
+        if removed > 0 {
+            changes.push(format!("removed {removed} legacy rule(s)"));
+        }
+        let mut rules = have.clone();
         for r in list(expected, "rules") {
-            if !rules_cover(have, r) {
+            if !rules_cover(&have, r) {
                 changes.push(format!(
                     "rule {}/{}",
                     strs(r, "apiGroups").join(","),
@@ -195,7 +286,7 @@ pub(crate) fn reconcile(existing: &Value, expected: &Value) -> Reconciled {
                 rules.push(r.clone());
             }
         }
-        if rules.len() != have.len() {
+        if removed > 0 || rules.len() != have.len() {
             obj["rules"] = Value::Array(rules);
         }
     }
@@ -205,6 +296,35 @@ pub(crate) fn reconcile(existing: &Value, expected: &Value) -> Reconciled {
     } else {
         Reconciled::Update(obj, changes.join(", "))
     }
+}
+
+/// Deletes the `LEGACY_CLUSTER_ROLES` still stored. Operator-owned roles (no bootstrap label) and
+/// opted-out ones (`autoupdate: "false"`) are kept.
+pub(crate) async fn remove_legacy_cluster_roles(store: &SqliteStore) -> anyhow::Result<()> {
+    for name in LEGACY_CLUSTER_ROLES {
+        let key = crate::keys::group_object_key(GROUP, "clusterroles", None, name);
+        for _ in 0..MAX_ATTEMPTS {
+            let Some(stored) = store.get(&key).await? else {
+                break;
+            };
+            let obj: Value = serde_json::from_slice(&stored.value)?;
+            let bootstrap = obj["metadata"]["labels"][BOOTSTRAP_LABEL] == BOOTSTRAP_LABEL_VALUE;
+            let opted_out =
+                obj["metadata"]["annotations"][AUTOUPDATE_ANNOTATION].as_str() == Some("false");
+            if !bootstrap || opted_out {
+                break;
+            }
+            match store.delete(&key, Some(stored.revision)).await {
+                Ok(_) => {
+                    tracing::info!("removed legacy ClusterRole {name}");
+                    break;
+                }
+                Err(StoreError::RevisionMismatch { .. }) => {}
+                Err(e) => return Err(anyhow::anyhow!("remove legacy ClusterRole {name}: {e}")),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Creates the bootstrap object at `key`, or reconciles the stored one towards `expected`.
@@ -231,7 +351,7 @@ pub(crate) async fn reconcile_object(
                 Reconciled::Update(obj, what) => store
                     .put(key, Bytes::from(obj.to_string()), Some(stored.revision))
                     .await
-                    .map(|_| tracing::info!("reconciled {kind} {name}: added {what}")),
+                    .map(|_| tracing::info!("reconciled {kind} {name}: {what}")),
                 Reconciled::Recreate => match store.delete(key, Some(stored.revision)).await {
                     Ok(_) => store
                         .put(key, Bytes::from(expected.to_string()), Some(0))
@@ -511,6 +631,117 @@ mod tests {
             obj["rules"],
             json!([pods_get()]),
             "computed rules of an aggregated role are the controller's, not ours"
+        );
+    }
+
+    fn grants(rules: &Value, verb: &str) -> bool {
+        rules
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| strs(r, "verbs").contains(&verb))
+    }
+
+    async fn rewrite_role(store: &SqliteStore, name: &str, f: impl FnOnce(&mut Value)) {
+        let k = key("clusterroles", name);
+        let (mut obj, rev) = stored(store, &k).await;
+        f(&mut obj);
+        store
+            .put(&k, Bytes::from(obj.to_string()), Some(rev))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upgraded_cluster_loses_legacy_rules_so_admin_can_no_longer_escalate() {
+        // Reconcile only adds permissions, so without legacy removal a cluster seeded before
+        // bind/escalate was dropped keeps letting a namespace admin mint and bind a wildcard Role.
+        for name in ["admin", "edit", "view", "system:kube-controller-manager"] {
+            let store = SqliteStore::new(":memory:").unwrap();
+            crate::seed_rbac(&store).await.unwrap();
+            let (fresh, _) = stored(&store, &key("clusterroles", name)).await;
+            rewrite_role(&store, name, |o| o["rules"] = json!(legacy_rules(name))).await;
+
+            crate::seed_rbac(&store).await.unwrap();
+
+            let (obj, _) = stored(&store, &key("clusterroles", name)).await;
+            for legacy in legacy_rules(name) {
+                assert!(
+                    !obj["rules"].as_array().unwrap().contains(&legacy),
+                    "{name} still carries legacy rule {legacy}"
+                );
+            }
+            let mut got = obj["rules"].as_array().unwrap().clone();
+            let mut want = fresh["rules"].as_array().unwrap().clone();
+            got.sort_by_key(Value::to_string);
+            want.sort_by_key(Value::to_string);
+            assert_eq!(got, want, "{name} must converge to the current policy");
+            if name != "system:kube-controller-manager" {
+                assert!(!grants(&obj["rules"], "bind") && !grants(&obj["rules"], "escalate"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_removal_keeps_operator_edited_rules_and_honors_opt_out() {
+        let store = SqliteStore::new(":memory:").unwrap();
+        crate::seed_rbac(&store).await.unwrap();
+        let mut edited = legacy_rules("admin")[2].clone();
+        edited["verbs"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("impersonate"));
+        let edited_copy = edited.clone();
+        rewrite_role(&store, "admin", |o| {
+            o["rules"] = json!([legacy_rules("admin")[0].clone(), edited]);
+        })
+        .await;
+        rewrite_role(&store, "edit", |o| {
+            o["metadata"]["annotations"][AUTOUPDATE_ANNOTATION] = json!("false");
+            o["rules"] = json!(legacy_rules("edit"));
+        })
+        .await;
+
+        crate::seed_rbac(&store).await.unwrap();
+
+        let (admin, _) = stored(&store, &key("clusterroles", "admin")).await;
+        assert!(
+            admin["rules"].as_array().unwrap().contains(&edited_copy),
+            "a rule that differs from the seeded legacy one is the operator's and must survive"
+        );
+        let (edit, _) = stored(&store, &key("clusterroles", "edit")).await;
+        assert_eq!(edit["rules"], json!(legacy_rules("edit")));
+    }
+
+    #[tokio::test]
+    async fn legacy_clusterrole_is_deleted_unless_operator_owned() {
+        let store = SqliteStore::new(":memory:").unwrap();
+        let name = "system:controller:storage-version-garbage-collector";
+        let k = key("clusterroles", name);
+        let mut obj = role(json!([pods_get()]));
+        obj["metadata"]["name"] = json!(name);
+        obj["metadata"]["labels"][BOOTSTRAP_LABEL] = json!(BOOTSTRAP_LABEL_VALUE);
+        store
+            .put(&k, Bytes::from(obj.to_string()), Some(0))
+            .await
+            .unwrap();
+
+        crate::seed_rbac(&store).await.unwrap();
+        assert!(
+            store.get(&k).await.unwrap().is_none(),
+            "a bootstrap-labelled legacy role must be removed on upgrade"
+        );
+
+        let mut mine = role(json!([pods_get()]));
+        mine["metadata"]["name"] = json!(name);
+        store
+            .put(&k, Bytes::from(mine.to_string()), Some(0))
+            .await
+            .unwrap();
+        crate::seed_rbac(&store).await.unwrap();
+        assert!(
+            store.get(&k).await.unwrap().is_some(),
+            "a role without the bootstrap label belongs to the operator"
         );
     }
 }

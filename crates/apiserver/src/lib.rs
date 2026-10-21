@@ -1521,6 +1521,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         }};
     }
 
+    bootstrap_rbac::remove_legacy_cluster_roles(store).await?;
+
     // -----------------------------------------------------------------------
     // ClusterRole: system:node — permissions kubelet needs.
     // -----------------------------------------------------------------------
