@@ -429,16 +429,6 @@ limactl shell "$VM_NAME" sudo systemctl restart systemd-journald
 limactl shell "$VM_NAME" sudo journalctl --rotate
 limactl shell "$VM_NAME" sudo journalctl --vacuum-size=1M
 
-# Rewrite server address to host.lima.internal for in-VM use.
-# Match any loopback alias (127.0.0.1, 127.0.0.2, …) so parallel workers work correctly.
-echo "Copying kubeconfig into VM..."
-REWRITTEN=$(mktemp)
-sed "s|https://127\.[0-9]*\.[0-9]*\.[0-9]*:[0-9]*|https://host.lima.internal:${PORT}|g" "$KUBECONFIG_PATH" > "$REWRITTEN"
-limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/kubelet-kubeconfig"
-rm "$REWRITTEN"
-limactl shell "$VM_NAME" sudo cp /tmp/kubelet-kubeconfig /etc/kubelet-kubeconfig
-limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
-
 # Copy cluster CA so the kubelet can authenticate the apiserver's mTLS client cert
 # when proxying log/exec/attach requests. Without --client-ca-file the kubelet falls
 # back to webhook auth and rejects the apiserver's cert with 401.
@@ -451,6 +441,60 @@ if [ -f "$CA_CERT" ]; then
   limactl copy "$CA_PEM" "${VM_NAME}:/tmp/kubelet-ca.crt"
   limactl shell "$VM_NAME" sudo cp /tmp/kubelet-ca.crt /etc/kubelet-ca.crt
   limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-ca.crt
+
+  # The kubelet authenticates as system:node:<VM> (O=system:nodes), never as the admin
+  # kubeconfig, so the Node authorizer and NodeRestriction bind it as on a real node.
+  # The CA key is on this host, so the initial client cert is signed here; the kubelet
+  # then rotates it through the CSR API (rotateCertificates in its config below).
+  # File-path kubeconfig: kubelet re-reads the cert files it points at.
+  NODE_CLIENT_KEY="$(dirname "$KUBECONFIG_PATH")/kubelet-client${NODE_SUFFIX}.key"
+  NODE_CLIENT_CRT="$(dirname "$KUBECONFIG_PATH")/kubelet-client${NODE_SUFFIX}.crt"
+  if [ ! -f "$NODE_CLIENT_KEY" ] || [ ! -f "$NODE_CLIENT_CRT" ]; then
+    NODE_CLIENT_CSR=$(mktemp)
+    openssl ecparam -genkey -name prime256v1 -noout -out "$NODE_CLIENT_KEY"
+    openssl req -new -key "$NODE_CLIENT_KEY" \
+      -subj "/O=system:nodes/CN=system:node:${VM_NAME}" -sha256 \
+      -out "$NODE_CLIENT_CSR"
+    openssl x509 -req -in "$NODE_CLIENT_CSR" \
+      -CA "$CA_PEM" -CAkey "$(dirname "$KUBECONFIG_PATH")/ca.key" \
+      -CAcreateserial -CAserial "$(dirname "$KUBECONFIG_PATH")/ca.srl" \
+      -days 365 -sha256 \
+      -extfile <(printf 'extendedKeyUsage=clientAuth\n') \
+      -out "$NODE_CLIENT_CRT"
+    rm -f "$NODE_CLIENT_CSR"
+  fi
+  limactl copy "$NODE_CLIENT_CRT" "${VM_NAME}:/tmp/kubelet-client.crt"
+  limactl copy "$NODE_CLIENT_KEY" "${VM_NAME}:/tmp/kubelet-client.key"
+  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-client.crt /etc/kubelet-client.crt
+  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-client.key /etc/kubelet-client.key
+  limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-client.crt
+  limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-client.key
+  NODE_KUBECONFIG=$(mktemp)
+  cat > "$NODE_KUBECONFIG" <<KCEOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://host.lima.internal:${PORT}
+    certificate-authority: /etc/kubelet-ca.crt
+  name: u7s
+contexts:
+- context:
+    cluster: u7s
+    user: system:node:${VM_NAME}
+  name: u7s
+current-context: u7s
+users:
+- name: system:node:${VM_NAME}
+  user:
+    client-certificate: /etc/kubelet-client.crt
+    client-key: /etc/kubelet-client.key
+KCEOF
+  limactl copy "$NODE_KUBECONFIG" "${VM_NAME}:/tmp/kubelet-kubeconfig"
+  rm -f "$NODE_KUBECONFIG"
+  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-kubeconfig /etc/kubelet-kubeconfig
+  limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
+  limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml < "$(dirname "$0")/../set-kubelet-rotate-certificates.sh"
 
   # Generate a kubelet serving cert signed by the cluster CA so the apiserver can
   # verify the kubelet's TLS cert on exec/log/attach connections (closes the MITM
