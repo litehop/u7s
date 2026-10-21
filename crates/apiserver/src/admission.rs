@@ -4314,6 +4314,60 @@ pub async fn run_validating_webhooks<S: Store>(
     result
 }
 
+/// The request a write runs admission as: the GVR it is admitted under (`resource` is
+/// `resource/subresource` for a subresource, e.g. `pods/status`), the target object, and who
+/// asked.
+pub struct AdmissionTarget<'a> {
+    pub group: &'a str,
+    pub version: &'a str,
+    pub resource: &'a str,
+    pub name: &'a str,
+    pub namespace: Option<&'a str>,
+    pub user: Option<&'a crate::auth::UserInfo>,
+    pub dry_run: bool,
+}
+
+/// The one admission convergence point for writes that are not a plain create/update of a
+/// main resource (subresource PUT/PATCH, binding, eviction, scale, approval, ...).
+///
+/// Order matches upstream's update path (`apiserver/pkg/registry/generic/registry/store.go`
+/// `Update`: mutating admission via `UpdatedObject`, then `BeforeUpdate` =
+/// `PrepareForUpdate` + validation, then `updateValidation` = validating admission): mutating
+/// webhooks/policies see `candidate`, then `strategy` re-applies the subresource's field
+/// restrictions and validation to what they returned, then validating webhooks, policies and
+/// PodSecurity see the result. Returns the object to persist.
+///
+/// `strategy` always runs: a webhook may have rewritten fields the subresource must not let
+/// it touch, and the pre-mutation checks in the handler never saw those edits.
+pub async fn admit_write<S: Store>(
+    state: &AppState<S>,
+    target: &AdmissionTarget<'_>,
+    operation: &str,
+    old: Option<&serde_json::Value>,
+    candidate: serde_json::Value,
+    strategy: impl FnOnce(serde_json::Value) -> Result<serde_json::Value, StatusError>,
+) -> Result<serde_json::Value, StatusError> {
+    let ctx = AdmissionContext {
+        group: target.group,
+        version: target.version,
+        resource: target.resource,
+        name: target.name,
+        namespace: target.namespace,
+        operation,
+        user_info: Some(serde_json::json!({
+            "username": target.user.map_or("", |u| u.username.as_str()),
+            "uid": target.user.map_or("", |u| u.uid.as_str()),
+            "groups": target.user.map(|u| &u.groups),
+            "extra": target.user.map(|u| &u.extra),
+        })),
+        dry_run: target.dry_run,
+    };
+    let mutated = run_mutating_webhooks(state, candidate, old, &ctx).await?;
+    let admitted = strategy(mutated)?;
+    run_validating_webhooks(state, &admitted, old, &ctx).await?;
+    Ok(admitted)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
