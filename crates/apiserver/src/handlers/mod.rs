@@ -27,6 +27,8 @@ pub mod status;
 pub mod storage_versions;
 pub mod storagemigration;
 pub mod stream;
+#[cfg(test)]
+mod subresource_admission_tests;
 pub mod table;
 #[cfg(test)]
 pub(crate) mod test_support;

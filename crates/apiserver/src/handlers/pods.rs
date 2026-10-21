@@ -10,8 +10,8 @@ use u7s_store::{CreateNamespacedError, ListOptions, Store, StoreError};
 
 use crate::{
     admission::{
-        label_selector_matches, run_mutating_webhooks, run_validating_webhooks, AdmissionContext,
-        LabelSelector,
+        admit_write, label_selector_matches, run_mutating_webhooks, run_validating_webhooks,
+        AdmissionContext, AdmissionTarget, LabelSelector,
     },
     auth::UserInfo,
     handlers::{field_selector::FieldSelector, generic::validate_path_segment},
@@ -1795,26 +1795,19 @@ pub(crate) async fn evict_pod<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    // Admission webhook pipeline (validating only — eviction's effect on the pod is
-    // delete-like, mirroring delete_pod's validating-only admission point). A
-    // `sideEffects: Some` webhook has no contractual guarantee it honors `dryRun: true`,
-    // so it must not be invoked at all on a dry-run eviction — see webhook_dry_run_supported.
-    let admission_ctx = AdmissionContext {
-        group: "",
-        version: "v1",
-        resource: "pods/eviction",
-        name: &name,
-        namespace: Some(ns.as_str()),
-        operation: "CREATE",
-        user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-            "extra": user.extra,
-        })),
-        dry_run,
-    };
-    run_validating_webhooks(&state, &eviction, None, &admission_ctx).await?;
+    // Eviction is a CREATE of an Eviction object, so both mutating and validating admission
+    // apply (unlike DELETE). A `sideEffects: Some` webhook has no contractual guarantee it
+    // honors `dryRun: true`, so it must not be invoked at all on a dry-run eviction — see
+    // webhook_dry_run_supported.
+    let eviction = admit_write(
+        &state,
+        &pod_target(ns.as_str(), &name, "pods/eviction", Some(&user), dry_run),
+        "CREATE",
+        None,
+        eviction,
+        Ok,
+    )
+    .await?;
 
     let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
     let already_terminating = meta.deletion_timestamp.is_some();
@@ -2628,6 +2621,7 @@ pub(crate) async fn get_pod_status<S: Store>(
 pub(crate) async fn replace_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -2672,6 +2666,16 @@ pub(crate) async fn replace_pod_status<S: Store>(
     }
 
     crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, "Pod");
+    current_obj.body = admit_pod_status_update(
+        &state,
+        ns.as_str(),
+        &name,
+        user.as_ref().map(|u| &u.0),
+        super::json_patch::is_dry_run_header(&headers),
+        &before_write,
+        current_obj.body,
+    )
+    .await?;
     crate::field_manager::WriteIdentity::new(None, &headers).record(
         &before_write,
         &mut current_obj.body,
@@ -2913,6 +2917,7 @@ fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_jso
 pub(crate) async fn patch_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -2963,6 +2968,16 @@ pub(crate) async fn patch_pod_status<S: Store>(
 
         let before_write = current_obj.body.clone();
         current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
+        current_obj.body = admit_pod_status_update(
+            &state,
+            ns.as_str(),
+            &name,
+            user.as_ref().map(|u| &u.0),
+            super::json_patch::is_dry_run_header(&headers),
+            &before_write,
+            current_obj.body,
+        )
+        .await?;
         crate::field_manager::WriteIdentity::new(None, &headers).record(
             &before_write,
             &mut current_obj.body,
@@ -3423,6 +3438,7 @@ pub(crate) fn apply_resize_patch(
 pub(crate) async fn patch_pod_resize<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -3451,7 +3467,24 @@ pub(crate) async fn patch_pod_resize<S: Store>(
 
     let spec_before = current_obj.body["spec"].clone();
     let before_write = current_obj.body.clone();
-    current_obj.body = apply_resize_patch(&current_obj.body, &incoming);
+    current_obj.body = admit_write(
+        &state,
+        &pod_target(
+            ns.as_str(),
+            &name,
+            "pods/resize",
+            user.as_ref().map(|u| &u.0),
+            super::json_patch::is_dry_run_header(&headers),
+        ),
+        "UPDATE",
+        Some(&before_write),
+        apply_resize_patch(&before_write, &incoming),
+        |mutated| {
+            validate_resize_patch(&before_write, &mutated).map_err(Status::unprocessable_entity)?;
+            Ok(apply_resize_patch(&before_write, &mutated))
+        },
+    )
+    .await?;
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
     crate::field_manager::WriteIdentity::new(None, &headers).record(
         &before_write,
@@ -3580,29 +3613,171 @@ async fn admit_ephemeral_containers_update<S: Store>(
     old: &serde_json::Value,
     new: serde_json::Value,
 ) -> Result<serde_json::Value, crate::status::StatusError> {
-    let admission_ctx = AdmissionContext {
+    admit_write(
+        state,
+        &pod_target(ns, name, "pods/ephemeralcontainers", user, dry_run),
+        "UPDATE",
+        Some(old),
+        new,
+        |mutated| {
+            let mut admitted = old.clone();
+            if !mutated["spec"]["ephemeralContainers"].is_null() {
+                admitted["spec"]["ephemeralContainers"] =
+                    mutated["spec"]["ephemeralContainers"].clone();
+            }
+            validate_ephemeral_containers_update(old, &admitted)
+                .map_err(Status::unprocessable_entity)?;
+            Ok(admitted)
+        },
+    )
+    .await
+}
+
+async fn admit_pod_status_update<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    name: &str,
+    user: Option<&UserInfo>,
+    dry_run: bool,
+    old: &serde_json::Value,
+    new: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    super::status::admit_status_write(
+        state,
+        &pod_target(ns, name, "pods/status", user, dry_run),
+        old,
+        new,
+        "Pod",
+    )
+    .await
+}
+
+fn pod_target<'a>(
+    ns: &'a str,
+    name: &'a str,
+    resource: &'a str,
+    user: Option<&'a UserInfo>,
+    dry_run: bool,
+) -> AdmissionTarget<'a> {
+    AdmissionTarget {
         group: "",
         version: "v1",
-        resource: "pods/ephemeralcontainers",
+        resource,
         name,
         namespace: Some(ns),
-        operation: "UPDATE",
-        user_info: Some(serde_json::json!({
-            "username": user.map_or("", |u| u.username.as_str()),
-            "uid": user.map_or("", |u| u.uid.as_str()),
-            "groups": user.map(|u| &u.groups),
-            "extra": user.map(|u| &u.extra),
-        })),
+        user,
         dry_run,
-    };
-    let mutated = run_mutating_webhooks(state, new, Some(old), &admission_ctx).await?;
-    let mut admitted = old.clone();
-    admitted["status"] = old["status"].clone();
-    if !mutated["spec"]["ephemeralContainers"].is_null() {
-        admitted["spec"]["ephemeralContainers"] = mutated["spec"]["ephemeralContainers"].clone();
     }
-    run_validating_webhooks(state, &admitted, Some(old), &admission_ctx).await?;
-    Ok(admitted)
+}
+
+/// The subset of upstream's `ValidatePodEphemeralContainersUpdate` / `validateEphemeralContainers`
+/// (`pkg/apis/core/validation/validation.go`) that a mutating webhook can violate: existing
+/// ephemeral containers are immutable and cannot be removed, names are unique across every
+/// container kind, `targetContainerName` names a regular or init container, and only the
+/// fields in `allowedEphemeralContainerFields` are set.
+fn validate_ephemeral_containers_update(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> Result<(), String> {
+    const FORBIDDEN: &[&str] = &[
+        "ports",
+        "resources",
+        "livenessProbe",
+        "readinessProbe",
+        "startupProbe",
+        "lifecycle",
+        "resizePolicy",
+        "restartPolicy",
+    ];
+    let names = |pod: &serde_json::Value, list: &str| -> Vec<String> {
+        pod["spec"][list]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let unset = |v: &serde_json::Value| match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(m) => m.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        _ => false,
+    };
+    let empty = Vec::new();
+    let new_ecs = new["spec"]["ephemeralContainers"]
+        .as_array()
+        .unwrap_or(&empty);
+
+    for old_ec in old["spec"]["ephemeralContainers"]
+        .as_array()
+        .unwrap_or(&empty)
+    {
+        let name = old_ec["name"].as_str().unwrap_or("");
+        match new_ecs.iter().find(|c| c["name"].as_str() == Some(name)) {
+            None => {
+                return Err(format!(
+                    "Pod \"{}\" is invalid: spec.ephemeralContainers: Forbidden: existing ephemeral containers \"{name}\" may not be removed",
+                    new["metadata"]["name"].as_str().unwrap_or("")
+                ))
+            }
+            Some(c) if c != old_ec => {
+                return Err(format!(
+                    "Pod \"{}\" is invalid: spec.ephemeralContainers: Forbidden: existing ephemeral containers \"{name}\" may not be changed",
+                    new["metadata"]["name"].as_str().unwrap_or("")
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+
+    let other_names: Vec<String> = names(new, "containers")
+        .into_iter()
+        .chain(names(new, "initContainers"))
+        .collect();
+    let mut seen = other_names.clone();
+    for (i, ec) in new_ecs.iter().enumerate() {
+        let at = format!("spec.ephemeralContainers[{i}]");
+        let name = ec["name"].as_str().unwrap_or("");
+        if name.is_empty() {
+            return Err(format!("{at}.name: Required value"));
+        }
+        if ec["image"].as_str().unwrap_or("").is_empty() {
+            return Err(format!("{at}.image: Required value"));
+        }
+        if seen.iter().any(|n| n == name) {
+            return Err(format!("{at}.name: Duplicate value: \"{name}\""));
+        }
+        seen.push(name.to_owned());
+        if let Some(target) = ec["targetContainerName"].as_str().filter(|t| !t.is_empty()) {
+            if !other_names.iter().any(|n| n == target) {
+                return Err(format!("{at}.targetContainerName: Not found: \"{target}\""));
+            }
+        }
+        for field in FORBIDDEN {
+            if !unset(&ec[*field]) {
+                return Err(format!(
+                    "{at}.{field}: Forbidden: cannot be set for an Ephemeral Container"
+                ));
+            }
+        }
+        for (j, vm) in ec["volumeMounts"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .enumerate()
+        {
+            for field in ["subPath", "subPathExpr"] {
+                if vm[field].as_str().is_some_and(|s| !s.is_empty()) {
+                    return Err(format!(
+                        "{at}.volumeMounts[{j}].{field}: Forbidden: cannot be set for an Ephemeral Container"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn get_ephemeral_containers<S: Store>(
@@ -8457,6 +8632,7 @@ pub(crate) fn extract_binding_node_name(
 pub(crate) async fn bind_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -8468,9 +8644,29 @@ pub(crate) async fn bind_pod<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let body = extract_body(&body, ct)?;
-    let binding: serde_json::Value = serde_json::from_slice(&body)
+    let mut binding: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    extract_binding_node_name(&binding)?;
+    binding["apiVersion"] = "v1".into();
+    binding["kind"] = "Binding".into();
+    binding["metadata"]["name"] = name.as_str().into();
+    binding["metadata"]["namespace"] = ns.as_str().into();
 
+    let binding = admit_write(
+        &state,
+        &pod_target(
+            ns.as_str(),
+            &name,
+            "pods/binding",
+            user.as_ref().map(|u| &u.0),
+            super::json_patch::is_dry_run_header(&headers),
+        ),
+        "CREATE",
+        None,
+        binding,
+        |mutated| extract_binding_node_name(&mutated).map(|_| mutated),
+    )
+    .await?;
     let node_name = extract_binding_node_name(&binding)?;
 
     let key = object_key("pods", ns.as_str(), &name);
@@ -21792,6 +21988,15 @@ mod ephemeral_containers_route_tests {
         name: &str,
         container: serde_json::Value,
     ) -> StatusCode {
+        reply_of(app, method, name, container).await.0
+    }
+
+    async fn reply_of(
+        app: Router,
+        method: &str,
+        name: &str,
+        container: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         let body = serde_json::json!({"spec": {"ephemeralContainers": [container]}});
         let resp = app
             .oneshot(
@@ -21806,7 +22011,14 @@ mod ephemeral_containers_route_tests {
             )
             .await
             .unwrap();
-        resp.status()
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     async fn stored_ephemeral_count(store: &Arc<SqliteStore>, key: &str) -> usize {
@@ -21943,7 +22155,7 @@ mod ephemeral_containers_route_tests {
         .await;
 
         for method in ["PUT", "PATCH"] {
-            let status = status_of(
+            let (status, body) = reply_of(
                 debug_router(state.clone()),
                 method,
                 "vap-guarded",
@@ -21953,9 +22165,16 @@ mod ephemeral_containers_route_tests {
                 }),
             )
             .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{method}: the VAP's own Invalid denial, not an unrelated 4xx or a CEL eval error: {body}"
+            );
             assert!(
-                status.is_client_error(),
-                "{method}: the VAP must reject a privileged ephemeral container, got {status}"
+                body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("privileged ephemeral containers are not allowed")),
+                "{method}: the denial must carry the policy's message, got {body}"
             );
         }
         assert_eq!(stored_ephemeral_count(&store, &key).await, 0);
@@ -24029,5 +24248,104 @@ mod status_patch_metadata_tests {
             "status subresource must not set deletionTimestamp; \
              only the delete handler may stamp it, otherwise soft-delete semantics break"
         );
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_validation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pod(ecs: serde_json::Value) -> serde_json::Value {
+        json!({
+            "metadata": {"name": "p"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}],
+                "initContainers": [{"name": "init", "image": "busybox"}],
+                "ephemeralContainers": ecs
+            }
+        })
+    }
+
+    /// Without this check a mutating webhook (or a client) can drop or rewrite a debug
+    /// container that is already running, which upstream forbids because the kubelet has
+    /// already started it.
+    #[test]
+    fn existing_ephemeral_containers_cannot_be_removed_or_changed() {
+        let old = pod(json!([{"name": "dbg", "image": "busybox"}]));
+        let removed = pod(json!([]));
+        let changed = pod(json!([{"name": "dbg", "image": "evil"}]));
+        let kept = pod(json!([
+            {"name": "dbg", "image": "busybox"},
+            {"name": "dbg2", "image": "busybox"}
+        ]));
+        assert!(validate_ephemeral_containers_update(&old, &removed)
+            .unwrap_err()
+            .contains("may not be removed"));
+        assert!(validate_ephemeral_containers_update(&old, &changed)
+            .unwrap_err()
+            .contains("may not be changed"));
+        validate_ephemeral_containers_update(&old, &kept).unwrap();
+    }
+
+    /// Duplicate names across container kinds make `kubectl exec -c` ambiguous and are
+    /// rejected upstream (`field.Duplicate`); a dangling targetContainerName would be silently
+    /// ignored by the runtime instead of failing the debug session at admission.
+    #[test]
+    fn ephemeral_container_names_are_unique_and_target_must_exist() {
+        let none = pod(json!([]));
+        for dup in ["app", "init"] {
+            let new = pod(json!([{"name": dup, "image": "busybox"}]));
+            assert!(
+                validate_ephemeral_containers_update(&none, &new)
+                    .unwrap_err()
+                    .contains("Duplicate"),
+                "{dup}"
+            );
+        }
+        let bad_target = pod(json!([
+            {"name": "dbg", "image": "busybox", "targetContainerName": "nope"}
+        ]));
+        assert!(validate_ephemeral_containers_update(&none, &bad_target)
+            .unwrap_err()
+            .contains("targetContainerName"));
+        let ok = pod(json!([
+            {"name": "dbg", "image": "busybox", "targetContainerName": "app", "stdin": true, "tty": true}
+        ]));
+        validate_ephemeral_containers_update(&none, &ok).unwrap();
+    }
+
+    /// Ephemeral containers are an allow-list of fields upstream: probes, ports, lifecycle,
+    /// resources and resize/restart policy would let a debug container pose as workload.
+    #[test]
+    fn fields_outside_the_ephemeral_allow_list_are_forbidden() {
+        let none = pod(json!([]));
+        for (field, value) in [
+            ("ports", json!([{"containerPort": 80}])),
+            ("resources", json!({"limits": {"cpu": "1"}})),
+            ("livenessProbe", json!({"exec": {"command": ["true"]}})),
+            ("lifecycle", json!({"preStop": {}})),
+            ("restartPolicy", json!("Always")),
+        ] {
+            let mut ec = json!({"name": "dbg", "image": "busybox"});
+            ec[field] = value;
+            let new = pod(json!([ec]));
+            let err = validate_ephemeral_containers_update(&none, &new).unwrap_err();
+            assert!(
+                err.contains(field) && err.contains("Forbidden"),
+                "{field}: {err}"
+            );
+        }
+        let with_subpath = json!({"name": "dbg", "image": "busybox",
+            "volumeMounts": [{"name": "v", "mountPath": "/x", "subPath": "s"}]});
+        assert!(
+            validate_ephemeral_containers_update(&none, &pod(json!([with_subpath])))
+                .unwrap_err()
+                .contains("subPath")
+        );
+        let empty_resources = pod(json!([
+            {"name": "dbg", "image": "busybox", "resources": {}, "ports": []}
+        ]));
+        validate_ephemeral_containers_update(&none, &empty_resources).unwrap();
     }
 }

@@ -5963,6 +5963,7 @@ mod tests {
                 plural.to_string(),
                 name.to_string(),
             )),
+            None,
             json_headers(),
             body_bytes,
         )
@@ -6634,6 +6635,7 @@ mod tests {
         crate::handlers::scale::put_scale(
             axum::extract::State(state.clone()),
             axum::extract::Path(("default".into(), "deployments".into(), "web".into())),
+            None,
             headers,
             bytes::Bytes::from(
                 serde_json::to_vec(&serde_json::json!({

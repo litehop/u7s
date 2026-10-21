@@ -9,7 +9,10 @@ use serde::Deserialize;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
-    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
+    admission::{
+        admit_write, run_mutating_webhooks, run_validating_webhooks, AdmissionContext,
+        AdmissionTarget,
+    },
     auth::UserInfo,
     handlers::{
         generic::apply_delete_policy,
@@ -678,6 +681,7 @@ pub(crate) async fn patch_namespace<S: Store>(
 pub(crate) async fn finalize_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -720,6 +724,35 @@ pub(crate) async fn finalize_namespace<S: Store>(
     let before_write = current.body.clone();
     current.body["spec"] = serde_json::to_value(&spec)
         .map_err(|e| Status::internal(format!("failed to serialize NamespaceSpec: {e}")))?;
+    current.body = admit_write(
+        &state,
+        &AdmissionTarget {
+            group: "",
+            version: "v1",
+            resource: "namespaces/finalize",
+            name: &name,
+            namespace: None,
+            user: user.as_ref().map(|u| &u.0),
+            dry_run: is_dry_run_header(&headers),
+        },
+        "UPDATE",
+        Some(&before_write),
+        current.body,
+        // Upstream's finalize strategy keeps only spec.finalizers.
+        |mutated| {
+            let mut admitted = before_write.clone();
+            match mutated["spec"].get("finalizers").filter(|f| !f.is_null()) {
+                Some(f) => admitted["spec"]["finalizers"] = f.clone(),
+                None => {
+                    admitted["spec"]
+                        .as_object_mut()
+                        .map(|s| s.remove("finalizers"));
+                }
+            }
+            Ok(admitted)
+        },
+    )
+    .await?;
     crate::field_manager::WriteIdentity::new(None, &headers).record(
         &before_write,
         &mut current.body,
@@ -781,9 +814,36 @@ pub(crate) async fn get_namespace_status<S: Store>(
 ///
 /// Replaces only the status field of a namespace. The KCM namespace controller calls this
 /// to set status.conditions (e.g. NamespaceDeletionContentFailure) during namespace deletion.
+async fn admit_namespace_status<S: Store>(
+    state: &AppState<S>,
+    name: &str,
+    user: Option<&UserInfo>,
+    headers: &HeaderMap,
+    old: &serde_json::Value,
+    new: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    super::status::admit_status_write(
+        state,
+        &AdmissionTarget {
+            group: "",
+            version: "v1",
+            resource: "namespaces/status",
+            name,
+            namespace: None,
+            user,
+            dry_run: is_dry_run_header(headers),
+        },
+        old,
+        new,
+        "Namespace",
+    )
+    .await
+}
+
 pub(crate) async fn put_namespace_status<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -824,6 +884,15 @@ pub(crate) async fn put_namespace_status<S: Store>(
         "Namespace",
     );
 
+    current.body = admit_namespace_status(
+        &state,
+        &name,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &before_write,
+        current.body,
+    )
+    .await?;
     super::status::record_status_write(&headers, &before_write, &mut current.body, "", "v1");
 
     // Dry-run: return the would-be status object without persisting — mirrors
@@ -850,6 +919,7 @@ pub(crate) async fn put_namespace_status<S: Store>(
 pub(crate) async fn patch_namespace_status<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -934,6 +1004,15 @@ pub(crate) async fn patch_namespace_status<S: Store>(
         }
     }
 
+    current.body = admit_namespace_status(
+        &state,
+        &name,
+        user.as_ref().map(|u| &u.0),
+        &headers,
+        &before_write,
+        current.body,
+    )
+    .await?;
     super::status::record_status_write(&headers, &before_write, &mut current.body, "", "v1");
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
@@ -2021,6 +2100,7 @@ mod tests {
             put_namespace_status(
                 State(state.clone()),
                 Path("status-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 status_body,
             )
@@ -2510,6 +2590,7 @@ mod tests {
             put_namespace_status(
                 State(state.clone()),
                 Path("patch-status-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 status_body,
             )
@@ -2682,6 +2763,7 @@ mod tests {
             finalize_namespace(
                 State(state.clone()),
                 Path("ext-fin-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 add_body,
             )
@@ -2744,6 +2826,7 @@ mod tests {
             finalize_namespace(
                 State(state.clone()),
                 Path("ext-fin-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 remove_ext_body,
             )
@@ -2776,6 +2859,7 @@ mod tests {
             finalize_namespace(
                 State(state.clone()),
                 Path("ext-fin-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 remove_k8s_body,
             )
@@ -3417,6 +3501,7 @@ mod tests {
             put_namespace_status(
                 State(state.clone()),
                 Path("repeat-delete-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 status_body,
             )
@@ -3994,6 +4079,7 @@ mod tests {
             finalize_namespace(
                 State(state.clone()),
                 Path("finalize-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 finalize_body,
             )
@@ -4063,6 +4149,7 @@ mod tests {
         let resp = finalize_namespace(
             State(state.clone()),
             Path("finalize-ns-dry-run".to_string()),
+            None,
             dry_run_headers,
             finalize_body,
         )
@@ -4136,6 +4223,7 @@ mod tests {
             finalize_namespace(
                 State(state.clone()),
                 Path("multi-fin-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 finalize_body,
             )
@@ -4215,6 +4303,7 @@ mod tests {
         let resp = finalize_namespace(
             State(state.clone()),
             Path("divergence-ns".to_string()),
+            None,
             axum::http::HeaderMap::new(),
             finalize_body,
         )
@@ -4301,6 +4390,7 @@ mod tests {
         let resp = finalize_namespace(
             State(state.clone()),
             Path("occ-fin-ns".to_string()),
+            None,
             axum::http::HeaderMap::new(),
             finalize_body,
         )
@@ -4335,6 +4425,7 @@ mod tests {
         let result = finalize_namespace(
             State(state.clone()),
             Path("no-such-ns".to_string()),
+            None,
             axum::http::HeaderMap::new(),
             finalize_body,
         )
@@ -4511,6 +4602,7 @@ mod tests {
             put_namespace_status(
                 State(state.clone()),
                 Path("status-put-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 status_body,
             )
@@ -4587,6 +4679,7 @@ mod tests {
         let result = put_namespace_status(
             State(state.clone()),
             Path("status-scalar-ns".to_string()),
+            None,
             axum::http::HeaderMap::new(),
             status_body,
         )
@@ -4657,6 +4750,7 @@ mod tests {
         let resp = put_namespace_status(
             State(state.clone()),
             Path("status-put-dry-run-ns".to_string()),
+            None,
             dry_run_headers,
             status_body,
         )
@@ -4753,6 +4847,7 @@ mod tests {
             put_namespace_status(
                 State(state.clone()),
                 Path("status-fields-ns".to_string()),
+                None,
                 axum::http::HeaderMap::new(),
                 status_body,
             )
@@ -4810,6 +4905,7 @@ mod tests {
         let result = put_namespace_status(
             State(state.clone()),
             Path("ghost-status-ns".to_string()),
+            None,
             axum::http::HeaderMap::new(),
             status_body,
         )
@@ -4865,6 +4961,7 @@ mod tests {
             patch_namespace_status(
                 State(state.clone()),
                 Path("status-patch-ns".to_string()),
+                None,
                 headers,
                 patch_body,
             )
@@ -4935,6 +5032,7 @@ mod tests {
         let resp = patch_namespace_status(
             State(state.clone()),
             Path("status-patch-dry-run-ns".to_string()),
+            None,
             headers,
             patch_body,
         )
@@ -4995,6 +5093,7 @@ mod tests {
         let result = patch_namespace_status(
             State(state.clone()),
             Path("scalar-status-ns".to_string()),
+            None,
             headers,
             patch_body,
         )
@@ -5056,6 +5155,7 @@ mod tests {
         let result = patch_namespace_status(
             State(state.clone()),
             Path("scalar-status-jp-ns".to_string()),
+            None,
             headers,
             patch_body,
         )
@@ -5119,6 +5219,7 @@ mod tests {
         let result = patch_namespace_status(
             State(state.clone()),
             Path("wrong-typed-phase-ns".to_string()),
+            None,
             headers,
             patch_body,
         )
@@ -5193,6 +5294,7 @@ mod tests {
         let result = patch_namespace_status(
             State(state.clone()),
             Path("ssa-status-ns".to_string()),
+            None,
             headers,
             patch_body,
         )
@@ -5242,6 +5344,7 @@ mod tests {
             patch_namespace_status(
                 State(state.clone()),
                 Path("json-status-ns".to_string()),
+                None,
                 headers,
                 patch_body,
             )
@@ -5292,6 +5395,7 @@ mod tests {
         let err = match patch_namespace_status(
             State(state.clone()),
             Path("psa-bypass-ns".to_string()),
+            None,
             headers,
             patch_body,
         )
@@ -5361,6 +5465,7 @@ mod tests {
             patch_namespace_status(
                 State(state.clone()),
                 Path("spec-bypass-ns".to_string()),
+                None,
                 headers,
                 patch_body,
             )
@@ -5411,6 +5516,7 @@ mod tests {
         let result = patch_namespace_status(
             State(state.clone()),
             Path("psa-merge-bypass-ns".to_string()),
+            None,
             headers,
             patch_body,
         )
@@ -5478,6 +5584,7 @@ mod tests {
         let result = patch_namespace_status(
             State(state.clone()),
             Path("spec-merge-bypass-ns".to_string()),
+            None,
             headers,
             patch_body,
         )
@@ -5628,6 +5735,7 @@ mod tests {
         let resp = put_namespace_status(
             State(state.clone()),
             Path("status-put-proto-ns".to_string()),
+            None,
             headers,
             proto_body,
         )
@@ -6167,6 +6275,7 @@ mod status_tests {
         let result = put_namespace_status(
             State(state),
             Path("fin-ns".to_string()),
+            None,
             json_headers(),
             Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -6221,6 +6330,7 @@ mod status_tests {
         let result = patch_namespace_status(
             State(state),
             Path("fin-ns-patch".to_string()),
+            None,
             merge_patch_headers(),
             Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -6941,6 +7051,7 @@ mod namespace_status_cas_tests {
         let result = put_namespace_status(
             State(state),
             Path("cas-ns".to_string()),
+            None,
             json_headers(),
             Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -6991,6 +7102,7 @@ mod namespace_status_cas_tests {
         let result = put_namespace_status(
             State(state),
             Path("norev-ns".to_string()),
+            None,
             json_headers(),
             Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -7171,6 +7283,7 @@ mod ownership_tests {
         put_namespace_status(
             State(state.clone()),
             Path("ns-sub".into()),
+            None,
             headers("application/json", "ns-controller/1.0"),
             Bytes::from(ns.to_string()),
         )
@@ -7179,6 +7292,7 @@ mod ownership_tests {
         finalize_namespace(
             State(state.clone()),
             Path("ns-sub".into()),
+            None,
             headers("application/json", "ns-finalizer/1.0"),
             Bytes::from(r#"{"spec":{"finalizers":["kubernetes","example.com/x"]}}"#),
         )

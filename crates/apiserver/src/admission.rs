@@ -1072,14 +1072,21 @@ pub fn build_review(
         _ => None,
     };
     let (base_resource, sub_resource) = split_subresource(ctx.resource);
+    // The request kind is the object's own GVK, which differs from the resource's group for
+    // objects like Scale (autoscaling/v1) and Eviction (policy/v1) written through a
+    // subresource of another group's resource.
+    let (kind_group, kind_version) = match object["apiVersion"].as_str().filter(|v| !v.is_empty()) {
+        Some(av) => av.split_once('/').unwrap_or(("", av)),
+        None => (ctx.group, ctx.version),
+    };
     AdmissionReview {
         api_version: "admission.k8s.io/v1".to_string(),
         kind: "AdmissionReview".to_string(),
         request: Some(AdmissionRequest {
             uid: uid.to_string(),
             kind: GroupVersionKind {
-                group: ctx.group.to_string(),
-                version: ctx.version.to_string(),
+                group: kind_group.to_string(),
+                version: kind_version.to_string(),
                 // Read kind from the object itself. Webhooks such as Kyverno and OPA
                 // Gatekeeper dispatch on request.kind — an empty string causes them to
                 // apply the wrong policy or skip evaluation entirely.
@@ -4312,6 +4319,68 @@ pub async fn run_validating_webhooks<S: Store>(
         "admission: run_validating_webhooks exit"
     );
     result
+}
+
+/// True when any mutating webhook or MutatingAdmissionPolicy exists, i.e. when the object
+/// leaving the mutating stage may differ from the one that entered it. Lets a subresource skip
+/// re-projecting an object nothing could have changed (kubelet status writes are hot).
+pub async fn mutating_admission_configured<S: Store>(state: &AppState<S>) -> bool {
+    !fetch_mutating_configs(state).await.is_empty()
+        || !fetch_mutating_policies(state).await.is_empty()
+}
+
+/// The request a write runs admission as: the GVR it is admitted under (`resource` is
+/// `resource/subresource` for a subresource, e.g. `pods/status`), the target object, and who
+/// asked.
+pub struct AdmissionTarget<'a> {
+    pub group: &'a str,
+    pub version: &'a str,
+    pub resource: &'a str,
+    pub name: &'a str,
+    pub namespace: Option<&'a str>,
+    pub user: Option<&'a crate::auth::UserInfo>,
+    pub dry_run: bool,
+}
+
+/// The one admission convergence point for writes that are not a plain create/update of a
+/// main resource (subresource PUT/PATCH, binding, eviction, scale, approval, ...).
+///
+/// Order matches upstream's update path (`apiserver/pkg/registry/generic/registry/store.go`
+/// `Update`: mutating admission via `UpdatedObject`, then `BeforeUpdate` =
+/// `PrepareForUpdate` + validation, then `updateValidation` = validating admission): mutating
+/// webhooks/policies see `candidate`, then `strategy` re-applies the subresource's field
+/// restrictions and validation to what they returned, then validating webhooks, policies and
+/// PodSecurity see the result. Returns the object to persist.
+///
+/// `strategy` always runs: a webhook may have rewritten fields the subresource must not let
+/// it touch, and the pre-mutation checks in the handler never saw those edits.
+pub async fn admit_write<S: Store>(
+    state: &AppState<S>,
+    target: &AdmissionTarget<'_>,
+    operation: &str,
+    old: Option<&serde_json::Value>,
+    candidate: serde_json::Value,
+    strategy: impl FnOnce(serde_json::Value) -> Result<serde_json::Value, StatusError>,
+) -> Result<serde_json::Value, StatusError> {
+    let ctx = AdmissionContext {
+        group: target.group,
+        version: target.version,
+        resource: target.resource,
+        name: target.name,
+        namespace: target.namespace,
+        operation,
+        user_info: Some(serde_json::json!({
+            "username": target.user.map_or("", |u| u.username.as_str()),
+            "uid": target.user.map_or("", |u| u.uid.as_str()),
+            "groups": target.user.map(|u| &u.groups),
+            "extra": target.user.map(|u| &u.extra),
+        })),
+        dry_run: target.dry_run,
+    };
+    let mutated = run_mutating_webhooks(state, candidate, old, &ctx).await?;
+    let admitted = strategy(mutated)?;
+    run_validating_webhooks(state, &admitted, old, &ctx).await?;
+    Ok(admitted)
 }
 
 // ---------------------------------------------------------------------------

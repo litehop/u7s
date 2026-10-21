@@ -9,6 +9,7 @@ use serde::Deserialize;
 use u7s_store::Store;
 
 use crate::{
+    admission::{admit_write, mutating_admission_configured, AdmissionTarget},
     auth::UserInfo,
     keys::group_object_key,
     state::AppState,
@@ -61,6 +62,15 @@ pub(crate) fn merge_incoming_metadata(
     if !incoming_meta.is_object() {
         return;
     }
+    let saved = protected_metadata(&current["metadata"], kind);
+    crate::patch::merge_patch(&mut current["metadata"], incoming_meta);
+    restore_metadata(&mut current["metadata"], saved);
+}
+
+fn protected_metadata(
+    metadata: &serde_json::Value,
+    kind: &str,
+) -> Vec<(&'static str, serde_json::Value)> {
     const PROTECTED: &[&str] = &[
         "name",
         "namespace",
@@ -72,23 +82,82 @@ pub(crate) fn merge_incoming_metadata(
         "deletionTimestamp",
         "labels",
     ];
-    let saved: Vec<(&str, serde_json::Value)> = PROTECTED
+    PROTECTED
         .iter()
         .filter(|&&k| !(kind == "Node" && k == "labels"))
-        .map(|&k| (k, current["metadata"][k].clone()))
-        .collect();
+        .map(|&k| (k, metadata[k].clone()))
+        .collect()
+}
 
-    crate::patch::merge_patch(&mut current["metadata"], incoming_meta);
-
+fn restore_metadata(metadata: &mut serde_json::Value, saved: Vec<(&str, serde_json::Value)>) {
     for (k, v) in saved {
         if v.is_null() {
-            if let Some(meta_obj) = current["metadata"].as_object_mut() {
+            if let Some(meta_obj) = metadata.as_object_mut() {
                 meta_obj.remove(k);
             }
         } else {
-            current["metadata"][k] = v;
+            metadata[k] = v;
         }
     }
+}
+
+/// Run the admission chain for an UPDATE of `<resource>/status` and return the object to
+/// persist (see `status_write_strategy` for what survives mutation).
+pub(crate) async fn admit_status_write<S: Store>(
+    state: &AppState<S>,
+    target: &AdmissionTarget<'_>,
+    old: &serde_json::Value,
+    new: serde_json::Value,
+    kind: &str,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    let api_version = if target.group.is_empty() {
+        target.version.to_owned()
+    } else {
+        format!("{}/{}", target.group, target.version)
+    };
+    // Nothing to re-project when no mutator exists: the handler already validated `new`.
+    let may_mutate = mutating_admission_configured(state).await;
+    admit_write(state, target, "UPDATE", Some(old), new, |mutated| {
+        if may_mutate {
+            status_write_strategy(old, mutated, &api_version, kind)
+        } else {
+            Ok(mutated)
+        }
+    })
+    .await
+}
+
+/// What a status subresource keeps of an object after mutating admission, mirroring upstream's
+/// `PrepareForUpdate` + validation for `*/status` (run after `UpdatedObject` in
+/// `registry/generic/registry/store.go`): everything but `status` and the metadata a status
+/// write may change comes from the stored object, and the status must still decode.
+pub(crate) fn status_write_strategy(
+    old: &serde_json::Value,
+    mutated: serde_json::Value,
+    api_version: &str,
+    kind: &str,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    let mut out = old.clone();
+    match mutated.get("status") {
+        Some(s) if !s.is_null() => out["status"] = s.clone(),
+        _ => {
+            out.as_object_mut().map(|m| m.remove("status"));
+        }
+    }
+    if mutated["metadata"].is_object() {
+        let saved = protected_metadata(&old["metadata"], kind);
+        out["metadata"] = mutated["metadata"].clone();
+        restore_metadata(&mut out["metadata"], saved);
+    }
+    if !out["status"].is_null() {
+        match crate::status_dispatch::decode_status_patch(api_version, kind, &out["status"]) {
+            Some(result) => {
+                result?;
+            }
+            None => reject_non_object_status(&out["status"])?,
+        }
+    }
+    Ok(out)
 }
 
 /// Reject a status merge/strategic patch whose `metadata.name`/`metadata.namespace` names a
@@ -232,6 +301,23 @@ pub async fn put_resource_status<S: Store>(
             .map_err(Status::unprocessable_entity)?;
     }
 
+    current.body = admit_status_write(
+        &state,
+        &AdmissionTarget {
+            group: &group,
+            version: &version,
+            resource: &format!("{plural}/status"),
+            name: &name,
+            namespace: None,
+            user: Some(&user),
+            dry_run: is_dry_run_header(&headers),
+        },
+        &before_write,
+        current.body,
+        &meta.kind,
+    )
+    .await?;
+
     // Dry-run: validation and node-restriction checks passed; return the would-be
     // status object without persisting — mirrors replace_pod/replace_namespace's
     // dry-run early-return.
@@ -369,6 +455,23 @@ pub async fn patch_resource_status<S: Store>(
             .map_err(Status::unprocessable_entity)?;
     }
 
+    current.body = admit_status_write(
+        &state,
+        &AdmissionTarget {
+            group: &group,
+            version: &version,
+            resource: &format!("{plural}/status"),
+            name: &name,
+            namespace: None,
+            user: Some(&user),
+            dry_run: is_dry_run_header(&headers),
+        },
+        &before_write,
+        current.body,
+        &meta.kind,
+    )
+    .await?;
+
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
     record_status_write(&headers, &before_write, &mut current.body, &group, &version);
@@ -442,15 +545,25 @@ pub(crate) type StatusWriteGuard<'a> = dyn Fn(&serde_json::Value, &serde_json::V
 pub async fn put_namespaced_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path(path): Path<(String, String, String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    put_namespaced_resource_status_guarded(State(state), Path(path), headers, body, None).await
+    put_namespaced_resource_status_guarded(
+        State(state),
+        Path(path),
+        user.as_ref().map(|u| &u.0),
+        headers,
+        body,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    user: Option<&UserInfo>,
     headers: HeaderMap,
     body: Bytes,
     guard: Option<&StatusWriteGuard<'_>>,
@@ -526,6 +639,23 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
         guard(stored_body, &current.body)?;
     }
 
+    current.body = admit_status_write(
+        &state,
+        &AdmissionTarget {
+            group: &group,
+            version: &version,
+            resource: &format!("{plural}/status"),
+            name: &name,
+            namespace: Some(&ns),
+            user,
+            dry_run: is_dry_run_header(&headers),
+        },
+        &before_write,
+        current.body,
+        &kind,
+    )
+    .await?;
+
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return above.
     record_status_write(&headers, &before_write, &mut current.body, &group, &version);
@@ -550,15 +680,25 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
 pub async fn patch_namespaced_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path(path): Path<(String, String, String, String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    patch_namespaced_resource_status_guarded(State(state), Path(path), headers, body, None).await
+    patch_namespaced_resource_status_guarded(
+        State(state),
+        Path(path),
+        user.as_ref().map(|u| &u.0),
+        headers,
+        body,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    user: Option<&UserInfo>,
     headers: HeaderMap,
     body: Bytes,
     guard: Option<&StatusWriteGuard<'_>>,
@@ -677,6 +817,23 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
     if let (Some(guard), Some(stored_body)) = (guard, &stored_body) {
         guard(stored_body, &current.body)?;
     }
+
+    current.body = admit_status_write(
+        &state,
+        &AdmissionTarget {
+            group: &group,
+            version: &version,
+            resource: &format!("{plural}/status"),
+            name: &name,
+            namespace: Some(&ns),
+            user,
+            dry_run: is_dry_run_header(&headers),
+        },
+        &before_write,
+        current.body,
+        &kind,
+    )
+    .await?;
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
@@ -1525,6 +1682,7 @@ mod tests {
                 "leases".into(),
                 "node-y".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -1562,6 +1720,7 @@ mod tests {
                 "leases".into(),
                 "missing".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -1626,6 +1785,7 @@ mod tests {
                 "leases".into(),
                 "dry-run-lease".into(),
             )),
+            None,
             dry_run_headers,
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -1697,6 +1857,7 @@ mod tests {
                 "leases".into(),
                 "node-z".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&null_body).unwrap()),
         )
@@ -1758,6 +1919,7 @@ mod tests {
                     "leases".into(),
                     "put-scalar-lease".into(),
                 )),
+                None,
                 json_headers(),
                 bytes::Bytes::from(serde_json::to_vec(&bad_body).unwrap()),
             )
@@ -1823,6 +1985,7 @@ mod tests {
                 "leases".into(),
                 "node-w".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2004,6 +2167,7 @@ mod tests {
                 "leases".into(),
                 "smp-lease".into(),
             )),
+            None,
             smp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2071,6 +2235,7 @@ mod tests {
                     "leases".into(),
                     "id-lease".into(),
                 )),
+                None,
                 headers,
                 bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
             )
@@ -2140,6 +2305,7 @@ mod tests {
                 "leases".into(),
                 "ssa-lease".into(),
             )),
+            None,
             ssa_headers,
             bytes::Bytes::from(yaml_body),
         )
@@ -2166,6 +2332,7 @@ mod tests {
                 "leases".into(),
                 "nonexistent".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2223,6 +2390,7 @@ mod tests {
                 "leases".into(),
                 "dry-run-patch-lease".into(),
             )),
+            None,
             dry_run_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2616,6 +2784,7 @@ mod tests {
                 "leases".into(),
                 "scalar-status-lease".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2687,6 +2856,7 @@ mod tests {
                 "leases".into(),
                 "scalar-status-jp-lease".into(),
             )),
+            None,
             jp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2817,6 +2987,7 @@ mod tests {
                 "leases".into(),
                 "jp-lease".into(),
             )),
+            None,
             jp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2889,6 +3060,7 @@ mod tests {
                 "certificates".into(),
                 "my-cert".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -2960,6 +3132,7 @@ mod tests {
                 "certificates".into(),
                 "patch-cert".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3066,6 +3239,7 @@ mod tests {
                 "resourcequotas".into(),
                 "compute-quota".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3144,6 +3318,7 @@ mod tests {
                 "resourcequotas".into(),
                 "put-scalar-quota".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -3184,6 +3359,7 @@ mod tests {
                 "resourcequotas".into(),
                 "merge-scalar-quota".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3241,6 +3417,7 @@ mod tests {
                 "resourcequotas".into(),
                 "sm-wrong-typed-quota".into(),
             )),
+            None,
             headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3285,6 +3462,7 @@ mod tests {
                 "resourcequotas".into(),
                 "jp-scalar-quota".into(),
             )),
+            None,
             json_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3325,6 +3503,7 @@ mod tests {
                 "resourcequotas".into(),
                 "wrong-typed-quota".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3373,6 +3552,7 @@ mod tests {
                 "resourcequotas".into(),
                 "valid-quota".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -3453,6 +3633,7 @@ mod tests {
                 "deployments".into(),
                 "scalar-deploy".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -3626,6 +3807,7 @@ mod tests {
                 "poddisruptionbudgets".into(),
                 "my-pdb".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -3711,6 +3893,7 @@ mod tests {
                 "poddisruptionbudgets".into(),
                 "patch-pdb".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3987,6 +4170,7 @@ mod tests {
                 "deployments".into(),
                 "myapp".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -4143,6 +4327,7 @@ mod tests {
                 "cronjobs".into(),
                 "test-cj".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -4218,6 +4403,7 @@ mod tests {
                 "cronjobs".into(),
                 "ann-cj".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4296,6 +4482,7 @@ mod tests {
                 "cronjobs".into(),
                 "label-cj".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4505,6 +4692,7 @@ mod tests {
                 "deployments".into(),
                 "safe-deploy".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4629,6 +4817,7 @@ mod tests {
                 "deployments".into(),
                 "uid-guard".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -4778,6 +4967,7 @@ mod tests {
                 "deployments".into(),
                 "fin-deploy".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -4872,6 +5062,7 @@ mod tests {
                 "persistentvolumeclaims".into(),
                 "my-pvc".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4981,6 +5172,7 @@ mod tests {
                 "persistentvolumeclaims".into(),
                 "put-pvc".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -5280,6 +5472,7 @@ mod tests {
                 "poddisruptionbudgets".into(),
                 "cas-pdb".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -5346,6 +5539,7 @@ mod tests {
                 "poddisruptionbudgets".into(),
                 "norev-pdb".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -5536,6 +5730,7 @@ mod tests {
                 "deployments".into(),
                 "guarded-deploy".into(),
             )),
+            None,
             json_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -5606,6 +5801,7 @@ mod tests {
                 "deployments".into(),
                 "status-write-deploy".into(),
             )),
+            None,
             json_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -5816,6 +6012,7 @@ mod tests {
                 "deployments".into(),
                 "stale-status-deploy".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -5876,6 +6073,7 @@ mod tests {
                 "deployments".into(),
                 "norev-status-deploy".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -5941,6 +6139,7 @@ mod tests {
                 "deployments".into(),
                 "notm-deploy".into(),
             )),
+            None,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -5970,6 +6169,7 @@ mod tests {
                 "deployments".into(),
                 "notm-deploy".into(),
             )),
+            None,
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
