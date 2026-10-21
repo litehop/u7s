@@ -2158,6 +2158,7 @@ mod tests {
             selectable_fields: vec![],
             schema_cache_key: ("example.io".to_string(), "v1".to_string(), "1".to_string()),
             storage_version: "v1".to_string(),
+            served_versions: Vec::new(),
             scale: None,
             terminating: false,
         });

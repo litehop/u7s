@@ -210,6 +210,10 @@ pub struct CrContext {
     /// request naming a served-but-non-storage version needs its write converted, a
     /// request naming the storage version itself does not.
     pub storage_version: String,
+    /// Every `served` version name of the CRD, in spec order. A request at one of these is
+    /// equivalent to a request at any other, which is what webhook `matchPolicy: Equivalent`
+    /// matches across.
+    pub served_versions: Vec<String>,
     /// The matched version's `subresources.scale` configuration, if declared. Unlike
     /// `has_status_subresource` (a version-independent bool — status is always just the
     /// `.status` key), scale requires the three CRD-author-declared JSON paths, which are
@@ -400,6 +404,13 @@ pub async fn find_crd<S: Store>(
             selectable_fields,
             schema_cache_key,
             storage_version,
+            served_versions: crd
+                .spec
+                .versions
+                .iter()
+                .filter(|v| v.served)
+                .map(|v| v.name.clone())
+                .collect(),
             scale,
             terminating: crd.metadata.deletion_timestamp.is_some(),
         };
@@ -11382,6 +11393,7 @@ mod tests {
             selectable_fields: vec![],
             schema_cache_key: ("test".into(), "v1".into(), "0".into()),
             storage_version: "v1".into(),
+            served_versions: Vec::new(),
             scale: None,
             terminating: false,
         };
@@ -11519,6 +11531,7 @@ mod tests {
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
             storage_version: "v1".into(),
+            served_versions: Vec::new(),
             scale: None,
             terminating: false,
         };
@@ -11570,6 +11583,7 @@ mod tests {
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
             storage_version: "v1".into(),
+            served_versions: Vec::new(),
             scale: None,
             terminating: false,
         };
@@ -11638,6 +11652,7 @@ mod tests {
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), rv.into()),
             storage_version: "v1".into(),
+            served_versions: Vec::new(),
             scale: None,
             terminating: false,
         };
