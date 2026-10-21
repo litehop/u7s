@@ -1065,6 +1065,16 @@ assert "audit_verdict: a cancelled run is unknown, not failing -- a manual cance
   "$([ "$(call audit_verdict '[{"conclusion":"cancelled"}]')" = unknown ] && echo 1 || echo 0)"
 assert "audit_verdict: a skipped run is unknown, not failing" \
   "$([ "$(call audit_verdict '[{"conclusion":"skipped"}]')" = unknown ] && echo 1 || echo 0)"
+assert "audit_verdict: a cancelled newest run over an older failure is still failing -- a cancel must not mask a red audit" \
+  "$([ "$(call audit_verdict '[{"conclusion":"cancelled"},{"conclusion":"failure"}]')" = failing ] && echo 1 || echo 0)"
+assert "audit_verdict: a cancelled newest run over an older success is ok -- a cancel must not raise a false alert" \
+  "$([ "$(call audit_verdict '[{"conclusion":"cancelled"},{"conclusion":"success"}]')" = ok ] && echo 1 || echo 0)"
+assert "audit_verdict: timed_out is failing -- an audit that cannot complete is as actionable as a red one" \
+  "$([ "$(call audit_verdict '[{"conclusion":"timed_out"}]')" = failing ] && echo 1 || echo 0)"
+assert "audit_verdict: startup_failure is failing -- a broken audit workflow must not read as healthy" \
+  "$([ "$(call audit_verdict '[{"conclusion":"startup_failure"}]')" = failing ] && echo 1 || echo 0)"
+assert "audit_verdict: all-cancelled history is unknown, nothing decisive to judge" \
+  "$([ "$(call audit_verdict '[{"conclusion":"cancelled"},{"conclusion":"skipped"},{"conclusion":"neutral"}]')" = unknown ] && echo 1 || echo 0)"
 assert "audit_verdict: an empty run list is unknown, not failing" \
   "$([ "$(call audit_verdict '[]')" = unknown ] && echo 1 || echo 0)"
 assert "audit_verdict: garbage input is unknown, not failing" \
@@ -1090,8 +1100,12 @@ assert "STEP H returns 4 when main's audit failed, so the mayor tick sees a dist
 assert "...and the alert carries the run URL and the deduplicated advisory ids" \
   "$(echo "$H_OUT" | grep -q 'https://example.test/runs/42' && echo "$H_OUT" | grep -q 'GHSA-abcd-1234-wxyz' && [ "$(echo "$H_OUT" | grep -o 'RUSTSEC-2026-0001' | wc -l)" -eq 1 ] && echo 1 || echo 0)"
 
+H_OUT=$(PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[{"databaseId":50,"conclusion":"cancelled","url":"https://example.test/runs/50"},{"databaseId":42,"conclusion":"timed_out","createdAt":"2026-01-02T03:04:05Z","url":"https://example.test/runs/42"}]' bash "$SCRIPT" __call step_h_main_audit 2>&1) && H_RC=0 || H_RC=$?
+assert "STEP H alert names the decisive run (id, conclusion, created time, URL), not the cancelled newest one" \
+  "$([ "$H_RC" -eq 4 ] && echo "$H_OUT" | grep -q 'run 42 timed_out at 2026-01-02T03:04:05Z: https://example.test/runs/42' && echo 1 || echo 0)"
+
 H_RC=0
-PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[{"conclusion":"success"}]' bash "$SCRIPT" __call step_h_main_audit >/dev/null 2>&1 || H_RC=$?
+PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[{"conclusion":"success"}]'bash "$SCRIPT" __call step_h_main_audit >/dev/null 2>&1 || H_RC=$?
 assert "STEP H returns 0 when main's audit is green" \
   "$([ "$H_RC" -eq 0 ] && echo 1 || echo 0)"
 

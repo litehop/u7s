@@ -240,10 +240,12 @@ its design rationale.
 
 Auto-kill/auto-delete with no approval gate (operator decision) — the script
 logs loudly instead of asking. Exit 0 is a clean tick; 1 = a killed process
-didn't die (investigate the host); 2 = refused, no `--live-agents` /
-`--no-live-workers`; 4 = STEP H found main's latest `cargo audit` run
-(non-blocking for PRs) red — read the advisory IDs in the log and dispatch a
-lockfile bump; 5 = 1+4. A `gh` failure or cancelled run only warns.
+didn't die, or a STEP G worktree-remove / branch-delete failed (investigate);
+2 = refused, no `--live-agents` / `--no-live-workers`; 4 = main's latest
+DECISIVE `cargo audit` run (non-blocking for PRs) is red or couldn't complete
+(cancelled/skipped runs are looked past) — read the advisory IDs in the log
+and dispatch a lockfile bump; 5 = 1+4. A `gh` failure or no decisive run only
+warns.
 
 This loop is the drift backstop, not the primary defense: workers are required
 to run `scripts/conformance/reset.sh --host-only` as their own final step before
