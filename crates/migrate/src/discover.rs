@@ -147,7 +147,7 @@ impl Source {
         Ok(Self {
             client: HyperApiClient {
                 server: creds.server,
-                connector,
+                connector: connector.into(),
                 bearer: None,
             },
         })
