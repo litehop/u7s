@@ -41,6 +41,16 @@ check "different combined files have different serials" \
 check "a cert valid for a day has an hour of life left" cert_has_life "$TMP/a.pem" 3600
 check "a cert valid for a day does not have two days of life left" not cert_has_life "$TMP/a.pem" 172800
 
+stat_line='4242 (u7s sched) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 7 0 987654 1000 100 18446744073709551615'
+check "start ticks are field 22 even when comm contains spaces, so a restart is detected exactly and a cosmetic ps drift is not" \
+  test "$(stat_start_ticks "$stat_line")" = "987654"
+check "a restarted process (new start tick) differs from the original, so a scheduler restart fails the run" \
+  not test "$(stat_start_ticks "${stat_line/987654/987655}")" = "987654"
+
+check "one reload in the window passes" reload_window_ok 3 4
+check "no reload in the window fails, so a scheduler that never reloaded its cert is caught even if earlier iterations reloaded" \
+  not reload_window_ok 4 4
+
 tries="$TMP/tries"; : >"$tries"
 third_try() { echo x >>"$tries"; [ "$(wc -l <"$tries")" -ge 3 ]; }
 check "poll returns success once the condition turns true" poll 5 third_try

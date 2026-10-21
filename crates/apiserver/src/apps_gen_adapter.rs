@@ -1061,32 +1061,19 @@ mod tests {
     use std::collections::BTreeSet;
     use u7s_sentinel::Sentinel;
 
-    use crate::util::sentinel_test_util::{assert_fields_present, collect_leaf_paths};
+    use crate::util::sentinel_test_util::{
+        assert_fields_present, collect_leaf_paths, derived_expected_with_blanked,
+    };
 
-    // selfLink is a legacy field the system no longer populates — permanently omitted.
-    // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
-    // pending a separate investigation into gen_object_meta_to_json's correct handling of
-    // them (this file delegates to core_gen_adapter's copy, which has the same omissions); do
-    // not guess at the fix here.
-    // labels/annotations are maps: their own field name is never a real leaf once populated,
-    // only their sentinel-populated entry is (the deterministic "__sentinel__" map-key literal
-    // u7s_sentinel's blanket `Sentinel for String` always produces). ownerReferences is an array
-    // of a real struct (OwnerReference), so its own field name is likewise never a leaf; `uid`
-    // pins the check to ownerReferences specifically rather than colliding with ObjectMeta's own
-    // (separately checked) `uid`.
-    const OBJECT_META_EXPECTED: &[&str] = &[
-        "name",
-        "generateName",
-        "namespace",
-        "uid",
-        "resourceVersion",
-        "generation",
-        "creationTimestamp",
-        "labels.__sentinel__",
-        "annotations.__sentinel__",
-        "ownerReferences.uid",
-        "finalizers",
-    ];
+    /// Asserts every field the descriptor defines for `root` survives into `decoded`, with
+    /// `blanked` subtrees demanded only as keys (see `blank_template`).
+    fn assert_decoded_complete(decoded: &serde_json::Value, root: &str, blanked: &[&str]) {
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(decoded, "", &mut paths);
+        let expected = derived_expected_with_blanked(&[root], blanked);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
 
     /// PodSpec/Container's own completeness is covered separately in core_gen_adapter.rs; this
     /// blanks (but keeps the key of) the nested template so a dropped *SetSpec-level field
@@ -1111,46 +1098,11 @@ mod tests {
             blank_template(spec);
         }
 
-        let mut paths = BTreeSet::new();
-        collect_leaf_paths(&decoded, "", &mut paths);
-
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend([
-            "replicas",
-            // "selector" is a LabelSelector: never a leaf itself once populated, only its
-            // sentinel map entry is.
-            "selector.matchLabels.__sentinel__",
-            "template",
-            // "volumeClaimTemplates" holds full PersistentVolumeClaim objects; that struct's own
-            // completeness is covered by core_gen_adapter's PVC tests, so this only needs one
-            // leaf proving the array survives decode at all.
-            "volumeClaimTemplates.metadata.name",
-            "serviceName",
-            "podManagementPolicy",
-            "revisionHistoryLimit",
-            "minReadySeconds",
-            // "updateStrategy"/"persistentVolumeClaimRetentionPolicy"/"ordinals" are containers
-            // whose own field name is never itself a leaf; the leaf children below already
-            // exercise each one (a decoder that dropped the whole container drops these too).
-            "whenDeleted",
-            "whenScaled",
-            "start",
-            "partition",
-            "maxUnavailable",
-            "observedGeneration",
-            "readyReplicas",
-            "currentReplicas",
-            "updatedReplicas",
-            "currentRevision",
-            "updateRevision",
-            "collisionCount",
-            "availableReplicas",
-            "type",
-            "reason",
-            "message",
-            "lastTransitionTime",
-        ]);
-        assert_fields_present(&paths, &expected);
+        assert_decoded_complete(
+            &decoded,
+            ".k8s.io.api.apps.v1.StatefulSet",
+            &["spec.template"],
+        );
     }
 
     #[test]
@@ -1168,36 +1120,11 @@ mod tests {
             blank_template(spec);
         }
 
-        let mut paths = BTreeSet::new();
-        collect_leaf_paths(&decoded, "", &mut paths);
-
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend([
-            "replicas",
-            "selector.matchLabels.__sentinel__",
-            "template",
-            // "strategy" is a container (DeploymentStrategy: type + rollingUpdate); its leaf
-            // children below already exercise it.
-            "maxUnavailable",
-            "maxSurge",
-            "revisionHistoryLimit",
-            "progressDeadlineSeconds",
-            "minReadySeconds",
-            "paused",
-            "observedGeneration",
-            "updatedReplicas",
-            "readyReplicas",
-            "availableReplicas",
-            "unavailableReplicas",
-            "terminatingReplicas",
-            "collisionCount",
-            "type",
-            "reason",
-            "message",
-            "lastTransitionTime",
-            "lastUpdateTime",
-        ]);
-        assert_fields_present(&paths, &expected);
+        assert_decoded_complete(
+            &decoded,
+            ".k8s.io.api.apps.v1.Deployment",
+            &["spec.template"],
+        );
     }
 
     #[test]
@@ -1215,34 +1142,11 @@ mod tests {
             blank_template(spec);
         }
 
-        let mut paths = BTreeSet::new();
-        collect_leaf_paths(&decoded, "", &mut paths);
-
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend([
-            "selector.matchLabels.__sentinel__",
-            "template",
-            // "updateStrategy" is a container (DaemonSetUpdateStrategy: type + rollingUpdate);
-            // its leaf children below already exercise it.
-            "maxUnavailable",
-            "maxSurge",
-            "minReadySeconds",
-            "revisionHistoryLimit",
-            "currentNumberScheduled",
-            "numberMisscheduled",
-            "desiredNumberScheduled",
-            "numberReady",
-            "observedGeneration",
-            "updatedNumberScheduled",
-            "numberAvailable",
-            "numberUnavailable",
-            "collisionCount",
-            "type",
-            "reason",
-            "message",
-            "lastTransitionTime",
-        ]);
-        assert_fields_present(&paths, &expected);
+        assert_decoded_complete(
+            &decoded,
+            ".k8s.io.api.apps.v1.DaemonSet",
+            &["spec.template"],
+        );
     }
 
     #[test]
@@ -1260,26 +1164,11 @@ mod tests {
             blank_template(spec);
         }
 
-        let mut paths = BTreeSet::new();
-        collect_leaf_paths(&decoded, "", &mut paths);
-
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend([
-            "replicas",
-            "minReadySeconds",
-            "selector.matchLabels.__sentinel__",
-            "template",
-            "fullyLabeledReplicas",
-            "readyReplicas",
-            "availableReplicas",
-            "terminatingReplicas",
-            "observedGeneration",
-            "type",
-            "reason",
-            "message",
-            "lastTransitionTime",
-        ]);
-        assert_fields_present(&paths, &expected);
+        assert_decoded_complete(
+            &decoded,
+            ".k8s.io.api.apps.v1.ReplicaSet",
+            &["spec.template"],
+        );
     }
 
     #[test]
@@ -1292,7 +1181,9 @@ mod tests {
             metadata: Some(meta_v1::ObjectMeta::sentinel()),
             data: Some(
                 u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
-                    raw: Some(br#"{"a":1}"#.to_vec()),
+                    // A JSON scalar: RawExtension is opaque to the descriptor oracle, so its own
+                    // path ("data") must be the leaf; an object payload would nest under it.
+                    raw: Some(br#"1"#.to_vec()),
                 },
             ),
             revision: Some(2),
@@ -1302,14 +1193,7 @@ mod tests {
         let decoded = decode_controllerrevision_proto_gen(&buf)
             .expect("sentinel ControllerRevision must decode via the generated path");
 
-        let mut paths = BTreeSet::new();
-        collect_leaf_paths(&decoded, "", &mut paths);
-
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        // "data" is a RawExtension, inlined as the parsed JSON document — {"a": 1} here — so
-        // its own field name is never a leaf; "data.a" is the real decoded leaf.
-        expected.extend(["revision", "data.a"]);
-        assert_fields_present(&paths, &expected);
+        assert_decoded_complete(&decoded, ".k8s.io.api.apps.v1.ControllerRevision", &[]);
     }
 
     // ---- Field-omission: all-default proto must decode with no stray nulls ----
