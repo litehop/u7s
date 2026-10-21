@@ -591,6 +591,23 @@ pub(crate) mod sentinel_test_util {
             .any(|p| p == field || p.ends_with(&suffix))
     }
 
+    /// Descriptor-derived expected keys for `roots`, with each of `blanked` (a dotted path from
+    /// the root, e.g. `"spec.template"`) collapsed to just that path. A test that blanks a nested
+    /// subtree after decode (because its own completeness is covered elsewhere) must collapse the
+    /// same subtree here, so the key's presence is still demanded but its children are not.
+    pub(crate) fn derived_expected_with_blanked(roots: &[&str], blanked: &[&str]) -> Vec<String> {
+        let mut keys: BTreeSet<String> = crate::proto_descriptor::expected_json_keys_for(roots)
+            .into_iter()
+            .filter(|k| {
+                !blanked
+                    .iter()
+                    .any(|b| k.strip_prefix(b).is_some_and(|rest| rest.starts_with('.')))
+            })
+            .collect();
+        keys.extend(blanked.iter().map(|b| b.to_string()));
+        keys.into_iter().collect()
+    }
+
     /// Convention going forward: new sentinel-completeness tests should build `expected` from
     /// `proto_descriptor::expected_json_keys_for` (the descriptor-derived oracle) rather than
     /// hand-typing a list — a hand-written list is a second, independent transcription of the

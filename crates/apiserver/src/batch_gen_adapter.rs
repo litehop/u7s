@@ -900,7 +900,9 @@ mod tests {
     use std::collections::BTreeSet;
     use u7s_sentinel::Sentinel;
 
-    use crate::util::sentinel_test_util::{assert_fields_present, collect_leaf_paths};
+    use crate::util::sentinel_test_util::{
+        assert_fields_present, collect_leaf_paths, derived_expected_with_blanked,
+    };
 
     #[test]
     fn sentinel_completeness_decode_job_proto_gen() {
@@ -925,77 +927,11 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&decoded, "", &mut paths);
 
-        // selfLink is a legacy field the system no longer populates — permanently omitted.
-        // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
-        // pending a separate investigation into gen_object_meta_to_json's correct handling of
-        // them; do not guess at the fix here.
-        //
-        // JobCondition.status is left off `expected` too: it lives under this object's own
-        // "status" key, so the check would trivially pass off the ancestor key alone and could
-        // never actually fail if condition.status handling regressed — existing hand-written
-        // tests in this file cover it instead.
-        let expected = [
-            "name",
-            "generateName",
-            "namespace",
-            "uid",
-            "resourceVersion",
-            "generation",
-            "creationTimestamp",
-            // labels/annotations are maps: their own field name is never a real leaf once
-            // populated, only the sentinel-populated entry's deterministic "__sentinel__" key is
-            // (from u7s_sentinel's blanket `Sentinel for String`). ownerReferences is an array of
-            // a real struct; `uid` pins the check to it specifically rather than colliding with
-            // ObjectMeta's own (separately checked) `uid`.
-            "labels.__sentinel__",
-            "annotations.__sentinel__",
-            "ownerReferences.uid",
-            "finalizers",
-            "parallelism",
-            "completions",
-            "activeDeadlineSeconds",
-            "backoffLimit",
-            "ttlSecondsAfterFinished",
-            "completionMode",
-            "suspend",
-            "podReplacementPolicy",
-            "backoffLimitPerIndex",
-            "maxFailedIndexes",
-            "managedBy",
-            // "selector"/"podFailurePolicy"/"successPolicy" are containers whose own field name
-            // is never itself a leaf once populated; each dotted entry below pins the check to a
-            // genuine leaf child instead.
-            "selector.matchLabels.__sentinel__",
-            "manualSelector",
-            "podFailurePolicy.rules.action",
-            "successPolicy.rules.succeededIndexes",
-            "scheduling.schedulingPolicy.basic",
-            "scheduling.schedulingPolicy.gang.minCount",
-            "scheduling.schedulingConstraints.topology.key",
-            "scheduling.disruptionMode.single",
-            "scheduling.disruptionMode.all",
-            "scheduling.resourceClaims.name",
-            "scheduling.resourceClaims.resourceClaimName",
-            "scheduling.resourceClaims.resourceClaimTemplateName",
-            "template",
-            "startTime",
-            "completionTime",
-            "active",
-            "succeeded",
-            "failed",
-            "completedIndexes",
-            // "uncountedTerminatedPods" is a container too; "succeeded" here is its own repeated
-            // string field, so its path IS the leaf (arrays of scalars don't add a path segment).
-            "uncountedTerminatedPods.succeeded",
-            "ready",
-            "failedIndexes",
-            "terminating",
-            "type",
-            "reason",
-            "message",
-            "lastProbeTime",
-            "lastTransitionTime",
-        ];
+        // Derived from the descriptor: a field added to Job upstream is demanded here
+        // automatically. spec.template is blanked above, so only its key is demanded.
+        let expected =
+            derived_expected_with_blanked(&[".k8s.io.api.batch.v1.Job"], &["spec.template"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 
@@ -1022,35 +958,10 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&decoded, "", &mut paths);
 
-        // Same ObjectMeta omissions as sentinel_completeness_decode_job_proto_gen; see there.
-        // labels/annotations/ownerReferences dotted for the same reason as that test.
-        let expected = [
-            "name",
-            "generateName",
-            "namespace",
-            "uid",
-            "resourceVersion",
-            "generation",
-            "creationTimestamp",
-            "labels.__sentinel__",
-            "annotations.__sentinel__",
-            "ownerReferences.uid",
-            "finalizers",
-            "schedule",
-            "timeZone",
-            "startingDeadlineSeconds",
-            "concurrencyPolicy",
-            "suspend",
-            "jobTemplate",
-            "successfulJobsHistoryLimit",
-            "failedJobsHistoryLimit",
-            // "active" is an array of ObjectReference (a real struct), so its own field name is
-            // never a leaf; resourceVersion is the one ObjectReference field with no top-level
-            // envelope/metadata namesake to accidentally cross-satisfy the check.
-            "active.resourceVersion",
-            "lastScheduleTime",
-            "lastSuccessfulTime",
-        ];
+        // Derived from the descriptor; jobTemplate is blanked above, so only its key is demanded.
+        let expected =
+            derived_expected_with_blanked(&[".k8s.io.api.batch.v1.CronJob"], &["spec.jobTemplate"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 
