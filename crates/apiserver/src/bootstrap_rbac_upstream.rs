@@ -249,3 +249,127 @@ async fn seeded_kcm_identity_holds_exactly_the_union_of_upstream_controller_perm
         "KCM holds permissions no upstream controller needs"
     );
 }
+
+async fn seeded_namespaced(plural: &str) -> BTreeMap<String, Value> {
+    let store = SqliteStore::new(":memory:").unwrap();
+    crate::seed_rbac(&store).await.unwrap();
+    let prefix = crate::keys::group_list_prefix(GROUP, plural, None);
+    let all = store.list(&prefix, ListOptions::default()).await.unwrap();
+    all.items
+        .iter()
+        .map(|o| serde_json::from_slice::<Value>(&o.value).unwrap())
+        .filter(|v| v["metadata"]["namespace"].is_string())
+        .map(|v| {
+            let id = format!(
+                "{}/{}",
+                v["metadata"]["namespace"].as_str().unwrap(),
+                v["metadata"]["name"].as_str().unwrap()
+            );
+            (id, v)
+        })
+        .collect()
+}
+
+fn upstream_namespaced(yaml: &str) -> BTreeMap<String, Value> {
+    let doc = &YamlLoader::load_from_str(yaml).unwrap()[0];
+    to_json(doc)["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let id = format!(
+                "{}/{}",
+                v["metadata"]["namespace"].as_str().unwrap(),
+                v["metadata"]["name"].as_str().unwrap()
+            );
+            (id, v.clone())
+        })
+        .collect()
+}
+
+fn subject_set(v: &Value) -> BTreeSet<String> {
+    v["subjects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            format!(
+                "{}:{}/{}",
+                s["kind"].as_str().unwrap(),
+                s["namespace"].as_str().unwrap_or(""),
+                s["name"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
+
+fn id_diff(a: &BTreeMap<String, Value>, b: &BTreeMap<String, Value>) -> BTreeSet<String> {
+    a.keys().filter(|k| !b.contains_key(*k)).cloned().collect()
+}
+
+#[tokio::test]
+async fn seeded_namespace_roles_match_upstream_except_listed_deviations() {
+    // bootstrap-signer and token-cleaner run as their own service accounts when KCM uses
+    // per-controller credentials; an under-granted Role silently stops token cleanup and
+    // cluster-info signing.
+    let seeded = seeded_namespaced("roles").await;
+    let upstream = upstream_namespaced(include_str!(
+        "../testdata/rbac-upstream-1.37/namespace-roles.yaml"
+    ));
+
+    // Leader election uses the cluster-wide lease grants in the KCM/scheduler ClusterRoles, and
+    // there is no cloud-controller-manager.
+    assert_eq!(
+        id_diff(&upstream, &seeded),
+        set(&[
+            "kube-system/system::leader-locking-kube-controller-manager",
+            "kube-system/system::leader-locking-kube-scheduler",
+            "kube-system/system:controller:cloud-provider",
+        ]),
+        "upstream namespaced Roles dropped or newly seeded"
+    );
+    // kubeadm's anonymous read of the discovery document a joining node fetches pre-credential.
+    assert_eq!(
+        id_diff(&seeded, &upstream),
+        set(&["kube-public/kubeadm:bootstrap-signer-clusterinfo"])
+    );
+
+    for (id, up) in upstream.iter().filter(|(k, _)| seeded.contains_key(*k)) {
+        let want = without_extensions(up["rules"].as_array().unwrap());
+        let have = seeded[id]["rules"].as_array().unwrap();
+        assert_eq!(uncovered(&want, have), set(&[]), "{id} under-grants");
+        assert_eq!(uncovered(have, &want), set(&[]), "{id} over-grants");
+    }
+}
+
+#[tokio::test]
+async fn seeded_namespace_rolebindings_match_upstream_except_listed_deviations() {
+    let seeded = seeded_namespaced("rolebindings").await;
+    let upstream = upstream_namespaced(include_str!(
+        "../testdata/rbac-upstream-1.37/namespace-role-bindings.yaml"
+    ));
+
+    // Same unseeded Roles as above, plus the extension-apiserver-authentication-reader binding:
+    // the u7s KCM holds cluster-wide configmap read, the u7s scheduler never reads that
+    // ConfigMap, and extension servers bind the Role themselves.
+    assert_eq!(
+        id_diff(&upstream, &seeded),
+        set(&[
+            "kube-system/system::extension-apiserver-authentication-reader",
+            "kube-system/system::leader-locking-kube-controller-manager",
+            "kube-system/system::leader-locking-kube-scheduler",
+            "kube-system/system:controller:cloud-provider",
+        ]),
+        "upstream namespaced RoleBindings dropped or newly seeded"
+    );
+    assert_eq!(
+        id_diff(&seeded, &upstream),
+        set(&["kube-public/kubeadm:bootstrap-signer-clusterinfo"])
+    );
+
+    for (id, up) in upstream.iter().filter(|(k, _)| seeded.contains_key(*k)) {
+        assert_eq!(seeded[id]["roleRef"]["name"], up["roleRef"]["name"], "{id}");
+        assert_eq!(seeded[id]["roleRef"]["kind"], up["roleRef"]["kind"], "{id}");
+        assert_eq!(subject_set(&seeded[id]), subject_set(up), "{id} subjects");
+    }
+}

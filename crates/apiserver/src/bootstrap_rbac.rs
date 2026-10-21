@@ -261,7 +261,8 @@ pub(crate) fn reconcile(existing: &Value, expected: &Value) -> Reconciled {
             obj.as_object_mut().map(|m| m.remove("aggregationRule"));
             changes.push("aggregationRule removed".to_string());
         }
-        let legacy = if expected["kind"] == "ClusterRole" {
+        let bootstrap = existing["metadata"]["labels"][BOOTSTRAP_LABEL] == BOOTSTRAP_LABEL_VALUE;
+        let legacy = if bootstrap && expected["kind"] == "ClusterRole" {
             legacy_rules(expected["metadata"]["name"].as_str().unwrap_or_default())
         } else {
             vec![]
@@ -711,6 +712,30 @@ mod tests {
         );
         let (edit, _) = stored(&store, &key("clusterroles", "edit")).await;
         assert_eq!(edit["rules"], json!(legacy_rules("edit")));
+    }
+
+    #[tokio::test]
+    async fn unlabelled_role_keeps_legacy_rules_since_operator_owned_roles_are_never_rewritten() {
+        let store = SqliteStore::new(":memory:").unwrap();
+        crate::seed_rbac(&store).await.unwrap();
+        rewrite_role(&store, "admin", |o| {
+            o["metadata"]["labels"]
+                .as_object_mut()
+                .unwrap()
+                .remove(BOOTSTRAP_LABEL);
+            o["rules"] = json!(legacy_rules("admin"));
+        })
+        .await;
+
+        crate::seed_rbac(&store).await.unwrap();
+
+        let (admin, _) = stored(&store, &key("clusterroles", "admin")).await;
+        for legacy in legacy_rules("admin") {
+            assert!(
+                admin["rules"].as_array().unwrap().contains(&legacy),
+                "an operator-owned role lost rule {legacy}"
+            );
+        }
     }
 
     #[tokio::test]
