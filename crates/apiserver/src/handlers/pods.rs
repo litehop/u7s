@@ -1795,26 +1795,19 @@ pub(crate) async fn evict_pod<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    // Admission webhook pipeline (validating only — eviction's effect on the pod is
-    // delete-like, mirroring delete_pod's validating-only admission point). A
-    // `sideEffects: Some` webhook has no contractual guarantee it honors `dryRun: true`,
-    // so it must not be invoked at all on a dry-run eviction — see webhook_dry_run_supported.
-    let admission_ctx = AdmissionContext {
-        group: "",
-        version: "v1",
-        resource: "pods/eviction",
-        name: &name,
-        namespace: Some(ns.as_str()),
-        operation: "CREATE",
-        user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-            "extra": user.extra,
-        })),
-        dry_run,
-    };
-    run_validating_webhooks(&state, &eviction, None, &admission_ctx).await?;
+    // Eviction is a CREATE of an Eviction object, so both mutating and validating admission
+    // apply (unlike DELETE). A `sideEffects: Some` webhook has no contractual guarantee it
+    // honors `dryRun: true`, so it must not be invoked at all on a dry-run eviction — see
+    // webhook_dry_run_supported.
+    let eviction = admit_write(
+        &state,
+        &pod_target(ns.as_str(), &name, "pods/eviction", Some(&user), dry_run),
+        "CREATE",
+        None,
+        eviction,
+        Ok,
+    )
+    .await?;
 
     let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
     let already_terminating = meta.deletion_timestamp.is_some();
@@ -2628,6 +2621,7 @@ pub(crate) async fn get_pod_status<S: Store>(
 pub(crate) async fn replace_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -2672,6 +2666,16 @@ pub(crate) async fn replace_pod_status<S: Store>(
     }
 
     crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, "Pod");
+    current_obj.body = admit_pod_status_update(
+        &state,
+        ns.as_str(),
+        &name,
+        user.as_ref().map(|u| &u.0),
+        super::json_patch::is_dry_run_header(&headers),
+        &before_write,
+        current_obj.body,
+    )
+    .await?;
     crate::field_manager::WriteIdentity::new(None, &headers).record(
         &before_write,
         &mut current_obj.body,
@@ -2913,6 +2917,7 @@ fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_jso
 pub(crate) async fn patch_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -2963,6 +2968,16 @@ pub(crate) async fn patch_pod_status<S: Store>(
 
         let before_write = current_obj.body.clone();
         current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
+        current_obj.body = admit_pod_status_update(
+            &state,
+            ns.as_str(),
+            &name,
+            user.as_ref().map(|u| &u.0),
+            super::json_patch::is_dry_run_header(&headers),
+            &before_write,
+            current_obj.body,
+        )
+        .await?;
         crate::field_manager::WriteIdentity::new(None, &headers).record(
             &before_write,
             &mut current_obj.body,
@@ -3423,6 +3438,7 @@ pub(crate) fn apply_resize_patch(
 pub(crate) async fn patch_pod_resize<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -3451,7 +3467,24 @@ pub(crate) async fn patch_pod_resize<S: Store>(
 
     let spec_before = current_obj.body["spec"].clone();
     let before_write = current_obj.body.clone();
-    current_obj.body = apply_resize_patch(&current_obj.body, &incoming);
+    current_obj.body = admit_write(
+        &state,
+        &pod_target(
+            ns.as_str(),
+            &name,
+            "pods/resize",
+            user.as_ref().map(|u| &u.0),
+            super::json_patch::is_dry_run_header(&headers),
+        ),
+        "UPDATE",
+        Some(&before_write),
+        apply_resize_patch(&before_write, &incoming),
+        |mutated| {
+            validate_resize_patch(&before_write, &mutated).map_err(Status::unprocessable_entity)?;
+            Ok(apply_resize_patch(&before_write, &mutated))
+        },
+    )
+    .await?;
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
     crate::field_manager::WriteIdentity::new(None, &headers).record(
         &before_write,
@@ -3596,6 +3629,26 @@ async fn admit_ephemeral_containers_update<S: Store>(
                 .map_err(Status::unprocessable_entity)?;
             Ok(admitted)
         },
+    )
+    .await
+}
+
+async fn admit_pod_status_update<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    name: &str,
+    user: Option<&UserInfo>,
+    dry_run: bool,
+    old: &serde_json::Value,
+    new: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    admit_write(
+        state,
+        &pod_target(ns, name, "pods/status", user, dry_run),
+        "UPDATE",
+        Some(old),
+        new,
+        |mutated| super::status::status_write_strategy(old, mutated, "v1", "Pod"),
     )
     .await
 }
@@ -8580,6 +8633,7 @@ pub(crate) fn extract_binding_node_name(
 pub(crate) async fn bind_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    user: Option<Extension<UserInfo>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -8591,9 +8645,29 @@ pub(crate) async fn bind_pod<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let body = extract_body(&body, ct)?;
-    let binding: serde_json::Value = serde_json::from_slice(&body)
+    let mut binding: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    extract_binding_node_name(&binding)?;
+    binding["apiVersion"] = "v1".into();
+    binding["kind"] = "Binding".into();
+    binding["metadata"]["name"] = name.as_str().into();
+    binding["metadata"]["namespace"] = ns.as_str().into();
 
+    let binding = admit_write(
+        &state,
+        &pod_target(
+            ns.as_str(),
+            &name,
+            "pods/binding",
+            user.as_ref().map(|u| &u.0),
+            super::json_patch::is_dry_run_header(&headers),
+        ),
+        "CREATE",
+        None,
+        binding,
+        |mutated| extract_binding_node_name(&mutated).map(|_| mutated),
+    )
+    .await?;
     let node_name = extract_binding_node_name(&binding)?;
 
     let key = object_key("pods", ns.as_str(), &name);

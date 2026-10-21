@@ -61,6 +61,15 @@ pub(crate) fn merge_incoming_metadata(
     if !incoming_meta.is_object() {
         return;
     }
+    let saved = protected_metadata(&current["metadata"], kind);
+    crate::patch::merge_patch(&mut current["metadata"], incoming_meta);
+    restore_metadata(&mut current["metadata"], saved);
+}
+
+fn protected_metadata(
+    metadata: &serde_json::Value,
+    kind: &str,
+) -> Vec<(&'static str, serde_json::Value)> {
     const PROTECTED: &[&str] = &[
         "name",
         "namespace",
@@ -72,23 +81,56 @@ pub(crate) fn merge_incoming_metadata(
         "deletionTimestamp",
         "labels",
     ];
-    let saved: Vec<(&str, serde_json::Value)> = PROTECTED
+    PROTECTED
         .iter()
         .filter(|&&k| !(kind == "Node" && k == "labels"))
-        .map(|&k| (k, current["metadata"][k].clone()))
-        .collect();
+        .map(|&k| (k, metadata[k].clone()))
+        .collect()
+}
 
-    crate::patch::merge_patch(&mut current["metadata"], incoming_meta);
-
+fn restore_metadata(metadata: &mut serde_json::Value, saved: Vec<(&str, serde_json::Value)>) {
     for (k, v) in saved {
         if v.is_null() {
-            if let Some(meta_obj) = current["metadata"].as_object_mut() {
+            if let Some(meta_obj) = metadata.as_object_mut() {
                 meta_obj.remove(k);
             }
         } else {
-            current["metadata"][k] = v;
+            metadata[k] = v;
         }
     }
+}
+
+/// What a status subresource keeps of an object after mutating admission, mirroring upstream's
+/// `PrepareForUpdate` + validation for `*/status` (run after `UpdatedObject` in
+/// `registry/generic/registry/store.go`): everything but `status` and the metadata a status
+/// write may change comes from the stored object, and the status must still decode.
+pub(crate) fn status_write_strategy(
+    old: &serde_json::Value,
+    mutated: serde_json::Value,
+    api_version: &str,
+    kind: &str,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    let mut out = old.clone();
+    match mutated.get("status") {
+        Some(s) if !s.is_null() => out["status"] = s.clone(),
+        _ => {
+            out.as_object_mut().map(|m| m.remove("status"));
+        }
+    }
+    if mutated["metadata"].is_object() {
+        let saved = protected_metadata(&old["metadata"], kind);
+        out["metadata"] = mutated["metadata"].clone();
+        restore_metadata(&mut out["metadata"], saved);
+    }
+    if !out["status"].is_null() {
+        match crate::status_dispatch::decode_status_patch(api_version, kind, &out["status"]) {
+            Some(result) => {
+                result?;
+            }
+            None => reject_non_object_status(&out["status"])?,
+        }
+    }
+    Ok(out)
 }
 
 /// Reject a status merge/strategic patch whose `metadata.name`/`metadata.namespace` names a

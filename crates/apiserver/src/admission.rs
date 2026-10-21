@@ -1072,14 +1072,21 @@ pub fn build_review(
         _ => None,
     };
     let (base_resource, sub_resource) = split_subresource(ctx.resource);
+    // The request kind is the object's own GVK, which differs from the resource's group for
+    // objects like Scale (autoscaling/v1) and Eviction (policy/v1) written through a
+    // subresource of another group's resource.
+    let (kind_group, kind_version) = match object["apiVersion"].as_str().filter(|v| !v.is_empty()) {
+        Some(av) => av.split_once('/').unwrap_or(("", av)),
+        None => (ctx.group, ctx.version),
+    };
     AdmissionReview {
         api_version: "admission.k8s.io/v1".to_string(),
         kind: "AdmissionReview".to_string(),
         request: Some(AdmissionRequest {
             uid: uid.to_string(),
             kind: GroupVersionKind {
-                group: ctx.group.to_string(),
-                version: ctx.version.to_string(),
+                group: kind_group.to_string(),
+                version: kind_version.to_string(),
                 // Read kind from the object itself. Webhooks such as Kyverno and OPA
                 // Gatekeeper dispatch on request.kind — an empty string causes them to
                 // apply the wrong policy or skip evaluation entirely.
