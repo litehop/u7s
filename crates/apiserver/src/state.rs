@@ -561,7 +561,13 @@ struct CrContextCacheState {
     /// Bumped by every `invalidate` call. See `CrContextCache`'s doc for why this is what
     /// makes `insert_if_current` safe against the insert-after-evict race.
     epoch: u64,
+    /// Keys `find_crd` found no CRD for. Cleared wholesale by every `invalidate` and
+    /// `invalidate_absent` (a CRD create or version change can make any absent key resolve),
+    /// and capped at `MAX_ABSENT` because the keys come from request URLs.
+    absent: std::collections::HashSet<CrContextCacheKey>,
 }
+
+const MAX_ABSENT: usize = 1024;
 
 impl CrContextCache {
     pub fn new() -> Self {
@@ -569,6 +575,7 @@ impl CrContextCache {
             inner: RwLock::new(CrContextCacheState {
                 map: HashMap::new(),
                 epoch: 0,
+                absent: std::collections::HashSet::new(),
             }),
             #[cfg(test)]
             miss_count: std::sync::atomic::AtomicUsize::new(0),
@@ -616,6 +623,27 @@ impl CrContextCache {
         let mut state = self.inner.write().unwrap();
         state.epoch = state.epoch.wrapping_add(1);
         state.map.remove(key);
+        state.absent.clear();
+    }
+
+    /// Drops every negative entry; called when a CRD is created.
+    pub fn invalidate_absent(&self) {
+        let mut state = self.inner.write().unwrap();
+        state.epoch = state.epoch.wrapping_add(1);
+        state.absent.clear();
+    }
+
+    pub fn is_absent(&self, key: &CrContextCacheKey) -> bool {
+        self.inner.read().unwrap().absent.contains(key)
+    }
+
+    /// Records that a scan begun at `expected_epoch` found no CRD for `key`; refused if an
+    /// invalidation raced the scan, like `insert_if_current`.
+    pub fn insert_absent_if_current(&self, key: CrContextCacheKey, expected_epoch: u64) {
+        let mut state = self.inner.write().unwrap();
+        if state.epoch == expected_epoch && state.absent.len() < MAX_ABSENT {
+            state.absent.insert(key);
+        }
     }
 
     #[cfg(test)]
@@ -2126,6 +2154,36 @@ mod tests {
         assert!(
             cache.contains(&("999".to_string(), "example.io/v1".to_string())),
             "the most-recently-inserted key must survive its own insert"
+        );
+    }
+
+    // A cached "no CRD" must not outlive the CRD's creation (or a version added to it), or
+    // every request for the new resource would 404 until restart; and a scan that raced such
+    // a write must not record its stale "absent" verdict.
+    #[test]
+    fn cr_context_cache_absent_entries_are_dropped_by_invalidation_and_refused_when_stale() {
+        let cache = CrContextCache::new();
+        let key: CrContextCacheKey = ("example.io".into(), "v1".into(), "widgets".into());
+
+        cache.insert_absent_if_current(key.clone(), cache.epoch());
+        assert!(cache.is_absent(&key));
+
+        cache.invalidate_absent();
+        assert!(!cache.is_absent(&key), "CRD create must clear absent keys");
+
+        cache.insert_absent_if_current(key.clone(), cache.epoch());
+        cache.invalidate(&("example.io".into(), "v2".into(), "gadgets".into()));
+        assert!(
+            !cache.is_absent(&key),
+            "a CRD change for any key (e.g. a version added) can resolve an absent one"
+        );
+
+        let epoch_before_scan = cache.epoch();
+        cache.invalidate_absent();
+        cache.insert_absent_if_current(key.clone(), epoch_before_scan);
+        assert!(
+            !cache.is_absent(&key),
+            "an absent verdict from a scan that raced a CRD write is stale"
         );
     }
 

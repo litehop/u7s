@@ -281,6 +281,9 @@ pub async fn find_crd<S: Store>(
     if let Some(cached) = state.cr_context_cache.get(&cache_key) {
         return Ok((*cached).clone());
     }
+    if state.cr_context_cache.is_absent(&cache_key) {
+        return Err(Status::route_not_found());
+    }
     // Captured before the store scan below so `insert_if_current` can detect a concurrent
     // `replace_crd`/`patch_crd`/`delete_crd` that evicts this key while we're scanning — see
     // `CrContextCache`'s doc for why an unconditional insert here would let that race silently
@@ -438,6 +441,9 @@ pub async fn find_crd<S: Store>(
         )));
     }
 
+    state
+        .cr_context_cache
+        .insert_absent_if_current(cache_key, epoch_before_scan);
     Err(Status::route_not_found())
 }
 

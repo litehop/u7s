@@ -1921,6 +1921,56 @@ mod cases {
         assert_eq!(resp["spec"]["seen"], true);
     }
 
+    /// A DELETE is stored at the storage version, but `kind` names the version the client
+    /// addressed; the webhook must see an object of that same version, or a v2 policy reads
+    /// a v1-shaped body labelled v2.
+    #[tokio::test]
+    async fn delete_at_a_non_storage_version_shows_the_webhook_a_body_matching_its_kind() {
+        let c = Cluster::new().await;
+        let url = spawn_size_count_converter().await;
+        c.create(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            widgets_v1_v2_crd(Some(&url)),
+        )
+        .await;
+        c.create(&widgets_at("v1"), widget_at("v1", json!({"size": 4})))
+            .await;
+        let hook = spawn_hook(|_| json!({"allowed": true})).await;
+        register_webhook_for(
+            &c.store,
+            false,
+            "v2delete",
+            &hook.url,
+            "example.com",
+            "v2",
+            Some("Exact"),
+            &["widgets"],
+            &["DELETE"],
+        )
+        .await;
+
+        let (status, resp) = c
+            .call(
+                "DELETE",
+                &format!("{}/w", widgets_at("v2")),
+                "application/json",
+                json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+
+        let reqs = hook.requests();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        let r = &reqs[0];
+        assert_eq!(r["kind"]["version"], "v2", "{r}");
+        assert_eq!(r["oldObject"]["apiVersion"], "example.com/v2", "{r}");
+        assert_eq!(
+            r["oldObject"]["spec"],
+            json!({"count": 4}),
+            "oldObject must be converted to the version kind names: {r}"
+        );
+    }
+
     /// Every cell of {mutating, validating} x {Exact, Equivalent} x {request at the rule's
     /// version, at an equivalent version} x {main resource, /status, /scale} x {CREATE, UPDATE,
     /// DELETE} (subresources only have UPDATE) must be called exactly when upstream calls it,

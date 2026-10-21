@@ -1159,7 +1159,7 @@ async fn match_webhook_rules<S: Store>(
     state: &AppState<S>,
     webhook: &WebhookEntry,
     ctx: &AdmissionContext<'_>,
-) -> Option<RuleMatch> {
+) -> Result<Option<RuleMatch>, StatusError> {
     if webhook.rules.is_empty()
         || webhook.rules.iter().any(|rule| {
             matches_rule_typed(
@@ -1172,10 +1172,10 @@ async fn match_webhook_rules<S: Store>(
             )
         })
     {
-        return Some(RuleMatch::Exact);
+        return Ok(Some(RuleMatch::Exact));
     }
     if webhook.match_policy != "Equivalent" {
-        return None;
+        return Ok(None);
     }
     let candidates: Vec<&str> = webhook
         .rules
@@ -1196,19 +1196,54 @@ async fn match_webhook_rules<S: Store>(
         .map(|(_, v)| v)
         .collect();
     if candidates.is_empty() {
-        return None;
+        return Ok(None);
     }
     let base_resource = split_subresource(ctx.resource).0;
-    let crd = crate::handlers::cr::find_crd(state, ctx.group, ctx.version, base_resource)
-        .await
-        .ok()?;
-    let version = candidates
+    // Only "no such CRD" means there are no equivalents; any other failure must reach the
+    // caller so the webhook's failurePolicy applies instead of silently skipping it.
+    let crd =
+        match crate::handlers::cr::find_crd(state, ctx.group, ctx.version, base_resource).await {
+            Ok(crd) => crd,
+            Err(e)
+                if matches!(
+                    e.0,
+                    axum::http::StatusCode::NOT_FOUND | axum::http::StatusCode::GONE
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
+    let Some(version) = candidates
         .into_iter()
-        .find(|v| crd.served_versions.iter().any(|s| s == v))?
-        .to_string();
-    Some(RuleMatch::Equivalent {
-        version,
+        .find(|v| crd.served_versions.iter().any(|s| s == v))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RuleMatch::Equivalent {
+        version: version.to_string(),
         crd: Box::new(crd),
+    }))
+}
+
+/// A failure to evaluate a webhook's rules follows the webhook's failurePolicy:
+/// Ignore skips the webhook, Fail rejects the request.
+fn rule_match_failure(webhook: &WebhookEntry, err: StatusError) -> Result<(), StatusError> {
+    if webhook.failure_policy == "Ignore" {
+        tracing::warn!(
+            "admission: webhook \"{}\" rule matching failed, ignoring (failurePolicy=Ignore): {err:?}",
+            webhook.name
+        );
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// True when `obj` belongs to `group` at a version other than `version`.
+fn is_other_version_of_group(obj: &serde_json::Value, group: &str, version: &str) -> bool {
+    obj["apiVersion"].as_str().is_some_and(|av| {
+        av != format!("{group}/{version}") && av.split_once('/').is_some_and(|(g, _)| g == group)
     })
 }
 
@@ -1223,10 +1258,7 @@ async fn convert_to_version<S: Store>(
     obj: &serde_json::Value,
 ) -> Result<serde_json::Value, StatusError> {
     let target = format!("{group}/{to_version}");
-    let in_group = obj["apiVersion"]
-        .as_str()
-        .is_some_and(|av| av != target && av.split_once('/').is_some_and(|(g, _)| g == group));
-    if !in_group {
+    if !is_other_version_of_group(obj, group, to_version) {
         return Ok(obj.clone());
     }
     let mut converted = crate::handlers::cr::convert_cr_to_request_version(
@@ -1254,8 +1286,24 @@ async fn build_webhook_review<S: Store>(
     old_object: Option<&Arc<serde_json::Value>>,
 ) -> Result<(AdmissionReview, Arc<serde_json::Value>), StatusError> {
     let mut review = build_review(uid, ctx, object, old_object);
-    let RuleMatch::Equivalent { version, crd } = matched else {
-        return Ok((review, Arc::clone(object)));
+    let delete_crd;
+    let (version, crd) = match matched {
+        RuleMatch::Equivalent { version, crd } => (version.as_str(), &**crd),
+        // A DELETE's bodies are the stored copy, but `kind` names the addressed version.
+        RuleMatch::Exact
+            if ctx.operation == "DELETE"
+                && is_other_version_of_group(object, ctx.group, ctx.version) =>
+        {
+            delete_crd = crate::handlers::cr::find_crd(
+                state,
+                ctx.group,
+                ctx.version,
+                split_subresource(ctx.resource).0,
+            )
+            .await?;
+            (ctx.version, &delete_crd)
+        }
+        RuleMatch::Exact => return Ok((review, Arc::clone(object))),
     };
     let seen = Arc::new(convert_to_version(state, crd, ctx.group, version, object).await?);
     let seen_old = match old_object {
@@ -1266,9 +1314,9 @@ async fn build_webhook_review<S: Store>(
     };
     if let Some(req) = review.request.as_mut() {
         if req.kind.group == ctx.group {
-            req.kind.version = version.clone();
+            req.kind.version = version.to_string();
         }
-        req.resource.version = version.clone();
+        req.resource.version = version.to_string();
         req.object = Arc::clone(&seen);
         if req.old_object.is_some() {
             req.old_object = seen_old;
@@ -1530,8 +1578,10 @@ async fn invoke_mutating_webhook<S: Store>(
         return Ok((None, false));
     }
 
-    let Some(matched) = match_webhook_rules(state, webhook, ctx).await else {
-        return Ok((None, false));
+    let matched = match match_webhook_rules(state, webhook, ctx).await {
+        Ok(Some(matched)) => matched,
+        Ok(None) => return Ok((None, false)),
+        Err(e) => return rule_match_failure(webhook, e).map(|()| (None, false)),
     };
 
     // namespaceSelector: skip this webhook if the request namespace's labels don't match.
@@ -4284,8 +4334,13 @@ pub async fn run_validating_webhooks<S: Store>(
         let old_object_arc = old_object.map(|v| Arc::new(v.clone()));
 
         for webhook in all_webhooks.iter() {
-            let Some(matched) = match_webhook_rules(state, webhook, ctx).await else {
-                continue;
+            let matched = match match_webhook_rules(state, webhook, ctx).await {
+                Ok(Some(matched)) => matched,
+                Ok(None) => continue,
+                Err(e) => {
+                    rule_match_failure(webhook, e)?;
+                    continue;
+                }
             };
 
             // namespaceSelector: skip if the request namespace's labels don't match.
@@ -4840,6 +4895,181 @@ mod tests {
             result.is_ok(),
             "ValidatingWebhookConfiguration create must bypass admission pipeline to prevent deadlock"
         );
+    }
+
+    /// Delegates to an in-memory `SqliteStore`, failing `list` under the CRD prefix while
+    /// `fail_crd_list` is set.
+    struct CrdListFaultStore {
+        inner: Arc<SqliteStore>,
+        fail_crd_list: std::sync::atomic::AtomicBool,
+    }
+
+    impl u7s_store::Store for CrdListFaultStore {
+        fn get(
+            &self,
+            key: impl Into<String> + Send,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key: String = key.into();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: impl Into<String> + Send,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix: String = prefix.into();
+            let fail = self.fail_crd_list.load(std::sync::atomic::Ordering::SeqCst)
+                && prefix.contains("customresourcedefinitions");
+            async move {
+                if fail {
+                    return Err(u7s_store::StoreError::Compacted {
+                        requested: 0,
+                        horizon: 0,
+                    });
+                }
+                inner.list(&prefix, opts).await
+            }
+        }
+
+        fn put(
+            &self,
+            key: impl Into<String> + Send,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key: String = key.into();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: impl Into<String> + Send,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let inner = self.inner.clone();
+            let key: String = key.into();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// A webhook whose rule names v1 matches a v2 request only after looking up the
+    /// resource's CRD. If that lookup fails for any reason other than "no such CRD", skipping
+    /// the webhook would let a write bypass a `failurePolicy: Fail` webhook on a transient
+    /// store hiccup; it must reject (Fail) or skip (Ignore) per the webhook's policy.
+    #[tokio::test]
+    async fn a_transient_store_error_must_never_let_a_write_bypass_a_fail_webhook() {
+        let store = Arc::new(CrdListFaultStore {
+            inner: Arc::new(SqliteStore::new(":memory:").expect("in-memory store")),
+            fail_crd_list: std::sync::atomic::AtomicBool::new(false),
+        });
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        for (name, policy) in [("fail-vwc", "Fail"), ("ignore-vwc", "Ignore")] {
+            let vwc = json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingWebhookConfiguration",
+                "metadata": {"name": name},
+                "webhooks": [{
+                    "name": format!("{name}.example.com"),
+                    "clientConfig": { "url": "http://127.0.0.1:1" },
+                    "rules": [{"apiGroups": ["example.com"], "apiVersions": ["v1"],
+                        "resources": ["widgets"], "operations": ["CREATE"]}],
+                    "failurePolicy": policy
+                }]
+            });
+            store
+                .put(
+                    &format!(
+                        "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/{name}"
+                    ),
+                    bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let ctx = AdmissionContext {
+            group: "example.com",
+            version: "v2",
+            resource: "widgets",
+            name: "w",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let obj = json!({"apiVersion": "example.com/v2", "kind": "Widget",
+            "metadata": {"name": "w"}});
+
+        // No CRD at all is not an error: no equivalents, both webhooks skipped.
+        run_validating_webhooks(&state, &obj, None, &ctx)
+            .await
+            .expect("a resource with no CRD has no equivalent versions");
+
+        store
+            .fail_crd_list
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Drop the negative entry the first request cached, as a CRD write would.
+        state.cr_context_cache.invalidate_absent();
+        let err = run_validating_webhooks(&state, &obj, None, &ctx)
+            .await
+            .expect_err("store error with a Fail webhook must reject the write");
+        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Deleting a ValidatingWebhookConfiguration must bypass the admission pipeline too.
