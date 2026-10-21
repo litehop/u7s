@@ -1006,12 +1006,13 @@ fi
 # conditionally today (for --mint-join-token/--join).
 PERSISTED_NODE_NAME=""
 PERSISTED_IFACE=""
-NODE_NAME="$(printf '%s' "$NODE_NAME" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+normalize_node_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'; }
+NODE_NAME="$(normalize_node_name "$NODE_NAME")"
 if [ -f "$CONFIG_FILE" ]; then
   # Sourced inside a subshell, not the main shell, so this cannot clobber the
   # NODE_NAME/IFACE already resolved from flags/env above.
   # shellcheck disable=SC1090 # dynamic path: this project's own prior-run file
-  PERSISTED_NODE_NAME="$(. "$CONFIG_FILE"; printf '%s' "${NODE_NAME:-}")"
+  PERSISTED_NODE_NAME="$(normalize_node_name "$(. "$CONFIG_FILE"; printf '%s' "${NODE_NAME:-}")")"
   # shellcheck disable=SC1090
   PERSISTED_IFACE="$(. "$CONFIG_FILE"; printf '%s' "${IFACE:-}")"
 fi
@@ -1044,7 +1045,7 @@ fi
 if [ -z "$NODE_NAME" ]; then
   # Node names are DNS-1123 (lowercase); upstream kubelet's GetHostname
   # lowercases and trims the hostname the same way.
-  NODE_NAME="$(hostname | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  NODE_NAME="$(normalize_node_name "$(hostname)")"
 fi
 
 if [ -z "$IFACE" ]; then

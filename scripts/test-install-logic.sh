@@ -1156,7 +1156,7 @@ upper_runner="$PERSIST_WORK/upper-name.sh"
 {
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
-  echo 'STATE_DIR="$1"; CONFIG_FILE="$STATE_DIR/config"; EXISTING_INSTALL=0'
+  echo 'STATE_DIR="$1"; CONFIG_FILE="$STATE_DIR/config"; EXISTING_INSTALL="${3:-0}"'
   echo 'NODE_NAME="$2"; IFACE=eth0'
   echo "hostname() { echo \"  $UPPER_HOST\"; }"
   awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Defaults: node name, network interface/ { if ($0 !~ /^# --- Defaults: node name, network interface/) print }' "$INSTALL"
@@ -1170,6 +1170,17 @@ assert "a host named with capitals still gets a lowercase, trimmed node name fro
 upper_flag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper" "$UPPER_HOST" 2>&1)"
 assert "an uppercase --node-name is lowercased too, so an explicit override cannot produce an invalid CSR name" \
   "$(printf '%s' "$upper_flag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
+# A host that already hit the uppercase bug persisted the uppercase name (config
+# is written before the kubelet identity CSR fails). It must recover by simply
+# re-running install, with or without a lowercase --node-name.
+mkdir -p "$PERSIST_WORK/upper-persisted"
+printf 'NODE_NAME="%s"\nIFACE="eth0"\n' "$UPPER_HOST" > "$PERSIST_WORK/upper-persisted/config"
+recover_noflag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper-persisted" "" 1 2>&1 || true)"
+assert "a persisted UPPERCASE node name is lowercased on re-run with no flag (otherwise a host broken by the uppercase bug fails the same way forever)" \
+  "$(printf '%s' "$recover_noflag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
+recover_flag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper-persisted" "$LOWER_HOST" 1 2>&1 || true)"
+assert "a lowercase --node-name does not conflict with the persisted uppercase spelling of the same name (operator can recover by passing the fix explicitly)" \
+  "$(printf '%s' "$recover_flag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && ! printf '%s' "$recover_flag_out" | grep -q 'conflicts with the node name persisted' && echo 1 || echo 0)"
 for csr_fmt in 'join-%s-1' 'kubelet-%s-1'; do
   # shellcheck disable=SC2059
   csr_name="$(printf "$csr_fmt" "$(printf '%s' "$upper_default_out" | sed -n 's/^NODE_NAME=//p')")"
