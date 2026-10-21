@@ -63,7 +63,7 @@ fn url_matches(have: &[&str], want: &str) -> bool {
 /// True when every (group, resource, verb[, name]) and every (url, verb) tuple granted by `rule`
 /// is granted by some single rule in `have`. Like upstream's `Covers`, a rule carrying both
 /// resources and nonResourceURLs is split into both kinds of tuples and all must be covered.
-fn rules_cover(have: &[Value], rule: &Value) -> bool {
+pub(crate) fn rules_cover(have: &[Value], rule: &Value) -> bool {
     let verbs = strs(rule, "verbs");
     let urls = strs(rule, "nonResourceURLs");
     let urls_covered = urls.iter().all(|url| {
