@@ -210,6 +210,10 @@ pub struct CrContext {
     /// request naming a served-but-non-storage version needs its write converted, a
     /// request naming the storage version itself does not.
     pub storage_version: String,
+    /// Every `served` version name of the CRD, in spec order. A request at one of these is
+    /// equivalent to a request at any other, which is what webhook `matchPolicy: Equivalent`
+    /// matches across.
+    pub served_versions: Vec<String>,
     /// The matched version's `subresources.scale` configuration, if declared. Unlike
     /// `has_status_subresource` (a version-independent bool — status is always just the
     /// `.status` key), scale requires the three CRD-author-declared JSON paths, which are
@@ -264,9 +268,9 @@ pub struct CrScaleConfig {
 /// - `Err(404 NotFound)` when the group/version/plural was never registered.
 ///
 /// A hit on `state.cr_context_cache` (see that type's doc for the invalidation contract)
-/// skips the store list-scan and CRD re-parse below entirely. Only successful lookups are
-/// cached — a 404/410 is cheap (no list-scan match, or a single tombstone `get`) and caching
-/// it would need its own invalidation on CRD create, for no meaningful benefit.
+/// skips the store list-scan and CRD re-parse below entirely. Absent results (404/410) are
+/// cached too; `invalidate` clears a key and `invalidate_absent` clears all absent entries
+/// when a CRD is created.
 pub async fn find_crd<S: Store>(
     state: &AppState<S>,
     group: &str,
@@ -276,6 +280,9 @@ pub async fn find_crd<S: Store>(
     let cache_key = (group.to_string(), version.to_string(), plural.to_string());
     if let Some(cached) = state.cr_context_cache.get(&cache_key) {
         return Ok((*cached).clone());
+    }
+    if state.cr_context_cache.is_absent(&cache_key) {
+        return Err(Status::route_not_found());
     }
     // Captured before the store scan below so `insert_if_current` can detect a concurrent
     // `replace_crd`/`patch_crd`/`delete_crd` that evicts this key while we're scanning — see
@@ -400,6 +407,13 @@ pub async fn find_crd<S: Store>(
             selectable_fields,
             schema_cache_key,
             storage_version,
+            served_versions: crd
+                .spec
+                .versions
+                .iter()
+                .filter(|v| v.served)
+                .map(|v| v.name.clone())
+                .collect(),
             scale,
             terminating: crd.metadata.deletion_timestamp.is_some(),
         };
@@ -427,6 +441,9 @@ pub async fn find_crd<S: Store>(
         )));
     }
 
+    state
+        .cr_context_cache
+        .insert_absent_if_current(cache_key, epoch_before_scan);
     Err(Status::route_not_found())
 }
 
@@ -11382,6 +11399,7 @@ mod tests {
             selectable_fields: vec![],
             schema_cache_key: ("test".into(), "v1".into(), "0".into()),
             storage_version: "v1".into(),
+            served_versions: Vec::new(),
             scale: None,
             terminating: false,
         };
@@ -11519,6 +11537,7 @@ mod tests {
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
             storage_version: "v1".into(),
+            served_versions: Vec::new(),
             scale: None,
             terminating: false,
         };
@@ -11570,6 +11589,7 @@ mod tests {
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
             storage_version: "v1".into(),
+            served_versions: Vec::new(),
             scale: None,
             terminating: false,
         };
@@ -11638,6 +11658,7 @@ mod tests {
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), rv.into()),
             storage_version: "v1".into(),
+            served_versions: Vec::new(),
             scale: None,
             terminating: false,
         };

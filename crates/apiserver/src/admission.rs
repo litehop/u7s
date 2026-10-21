@@ -175,6 +175,15 @@ pub struct AdmissionRequest {
     /// "pods/attach" string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub_resource: Option<String>,
+    /// The kind/resource/subresource as the client sent them. `kind`/`resource` differ from
+    /// these only when an Equivalent-policy webhook matched through another served version
+    /// and received the object converted to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_kind: Option<GroupVersionKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_resource: Option<GroupVersionResource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_sub_resource: Option<String>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
@@ -249,6 +258,10 @@ pub(crate) struct WebhookEntry {
     client_config: WebhookClientConfig,
     #[serde(default)]
     rules: Vec<RuleWithOperations>,
+    /// `Exact` or `Equivalent` (the v1 default): whether a request at another served version
+    /// of a rule's resource also matches; see `match_webhook_rules`.
+    #[serde(default = "default_match_policy")]
+    match_policy: String,
     #[serde(default = "default_failure_policy")]
     failure_policy: String,
     #[serde(default)]
@@ -299,6 +312,10 @@ struct LabelSelectorRequirement {
     operator: String, // In, NotIn, Exists, DoesNotExist
     #[serde(default)]
     values: Vec<String>,
+}
+
+fn default_match_policy() -> String {
+    "Equivalent".to_string()
 }
 
 fn default_failure_policy() -> String {
@@ -1074,29 +1091,39 @@ pub fn build_review(
     let (base_resource, sub_resource) = split_subresource(ctx.resource);
     // The request kind is the object's own GVK, which differs from the resource's group for
     // objects like Scale (autoscaling/v1) and Eviction (policy/v1) written through a
-    // subresource of another group's resource.
+    // subresource of another group's resource. An object of the resource's own group is of
+    // the version the client addressed, even when the stored copy (a DELETE's object) is at
+    // the storage version.
     let (kind_group, kind_version) = match object["apiVersion"].as_str().filter(|v| !v.is_empty()) {
-        Some(av) => av.split_once('/').unwrap_or(("", av)),
+        Some(av) => match av.split_once('/').unwrap_or(("", av)) {
+            (g, _) if g == ctx.group => (g, ctx.version),
+            gv => gv,
+        },
         None => (ctx.group, ctx.version),
+    };
+    let kind = GroupVersionKind {
+        group: kind_group.to_string(),
+        version: kind_version.to_string(),
+        // Read kind from the object itself. Webhooks such as Kyverno and OPA
+        // Gatekeeper dispatch on request.kind — an empty string causes them to
+        // apply the wrong policy or skip evaluation entirely.
+        kind: object["kind"].as_str().unwrap_or("").to_string(),
+    };
+    let resource = GroupVersionResource {
+        group: ctx.group.to_string(),
+        version: ctx.version.to_string(),
+        resource: base_resource.to_string(),
     };
     AdmissionReview {
         api_version: "admission.k8s.io/v1".to_string(),
         kind: "AdmissionReview".to_string(),
         request: Some(AdmissionRequest {
             uid: uid.to_string(),
-            kind: GroupVersionKind {
-                group: kind_group.to_string(),
-                version: kind_version.to_string(),
-                // Read kind from the object itself. Webhooks such as Kyverno and OPA
-                // Gatekeeper dispatch on request.kind — an empty string causes them to
-                // apply the wrong policy or skip evaluation entirely.
-                kind: object["kind"].as_str().unwrap_or("").to_string(),
-            },
-            resource: GroupVersionResource {
-                group: ctx.group.to_string(),
-                version: ctx.version.to_string(),
-                resource: base_resource.to_string(),
-            },
+            request_kind: Some(kind.clone()),
+            request_resource: Some(resource.clone()),
+            request_sub_resource: sub_resource.map(str::to_string),
+            kind,
+            resource,
             sub_resource: sub_resource.map(str::to_string),
             name: ctx.name.to_string(),
             namespace: ctx.namespace.map(|s| s.to_string()),
@@ -1107,6 +1134,181 @@ pub fn build_review(
         }),
         response: None,
     }
+}
+
+/// How a webhook's rules matched a request.
+enum RuleMatch {
+    Exact,
+    /// Matched through another served version of the request's resource
+    /// (`matchPolicy: Equivalent`): the webhook is called with the object converted to
+    /// `version`, as upstream's `ShouldCallHook` does via the equivalent-resource mapper.
+    Equivalent {
+        version: String,
+        crd: Box<crate::handlers::cr::CrContext>,
+    },
+}
+
+/// Upstream `ShouldCallHook` rule phase: an exact rule match first, then — only under
+/// `matchPolicy: Equivalent` — a match at another served version of the same resource.
+///
+/// u7s's only multi-version resources are CRDs, so equivalence is the CRD's served versions
+/// (upstream's mapper additionally links cross-group built-ins that u7s does not serve).
+/// A CRD lookup happens only when some rule would match at a different concrete version,
+/// keeping the hot path for ordinary requests free of CRD scans.
+async fn match_webhook_rules<S: Store>(
+    state: &AppState<S>,
+    webhook: &WebhookEntry,
+    ctx: &AdmissionContext<'_>,
+) -> Result<Option<RuleMatch>, StatusError> {
+    if webhook.rules.is_empty()
+        || webhook.rules.iter().any(|rule| {
+            matches_rule_typed(
+                rule,
+                ctx.group,
+                ctx.version,
+                ctx.resource,
+                ctx.namespace,
+                ctx.operation,
+            )
+        })
+    {
+        return Ok(Some(RuleMatch::Exact));
+    }
+    if webhook.match_policy != "Equivalent" {
+        return Ok(None);
+    }
+    let candidates: Vec<&str> = webhook
+        .rules
+        .iter()
+        .flat_map(|rule| rule.api_versions.iter().map(move |v| (rule, v.as_str())))
+        .filter(|(rule, v)| {
+            *v != "*"
+                && *v != ctx.version
+                && matches_rule_typed(
+                    rule,
+                    ctx.group,
+                    v,
+                    ctx.resource,
+                    ctx.namespace,
+                    ctx.operation,
+                )
+        })
+        .map(|(_, v)| v)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let base_resource = split_subresource(ctx.resource).0;
+    // Only "no such CRD" means there are no equivalents; any other failure returns 500
+    // InternalError regardless of failurePolicy (upstream ShouldCallHook).
+    let crd =
+        match crate::handlers::cr::find_crd(state, ctx.group, ctx.version, base_resource).await {
+            Ok(crd) => crd,
+            Err(e)
+                if matches!(
+                    e.0,
+                    axum::http::StatusCode::NOT_FOUND | axum::http::StatusCode::GONE
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
+    let Some(version) = candidates
+        .into_iter()
+        .find(|v| crd.served_versions.iter().any(|s| s == v))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RuleMatch::Equivalent {
+        version: version.to_string(),
+        crd: Box::new(crd),
+    }))
+}
+
+/// True when `obj` belongs to `group` at a version other than `version`.
+fn is_other_version_of_group(obj: &serde_json::Value, group: &str, version: &str) -> bool {
+    obj["apiVersion"].as_str().is_some_and(|av| {
+        av != format!("{group}/{version}") && av.split_once('/').is_some_and(|(g, _)| g == group)
+    })
+}
+
+/// Converts a custom resource of `group` to `to_version`: through the CRD's conversion
+/// webhook when it has one, otherwise by rewriting `apiVersion` (the `None` strategy).
+/// Objects of another kind/group (a Scale written through `/scale`) are returned as-is.
+async fn convert_to_version<S: Store>(
+    state: &AppState<S>,
+    crd: &crate::handlers::cr::CrContext,
+    group: &str,
+    to_version: &str,
+    obj: &serde_json::Value,
+) -> Result<serde_json::Value, StatusError> {
+    let target = format!("{group}/{to_version}");
+    if !is_other_version_of_group(obj, group, to_version) {
+        return Ok(obj.clone());
+    }
+    let mut converted = crate::handlers::cr::convert_cr_to_request_version(
+        state,
+        crd,
+        group,
+        to_version,
+        obj.clone(),
+    )
+    .await?;
+    converted["apiVersion"] = serde_json::Value::String(target);
+    Ok(converted)
+}
+
+/// The AdmissionReview a matched webhook receives, plus the object it was shown (the
+/// version a mutating webhook's patch applies to). For an Equivalent match the object is
+/// converted to the matched version and `kind`/`resource` follow it, while
+/// `requestKind`/`requestResource` keep the client's original.
+async fn build_webhook_review<S: Store>(
+    state: &AppState<S>,
+    uid: &str,
+    ctx: &AdmissionContext<'_>,
+    matched: &RuleMatch,
+    object: &Arc<serde_json::Value>,
+    old_object: Option<&Arc<serde_json::Value>>,
+) -> Result<(AdmissionReview, Arc<serde_json::Value>), StatusError> {
+    let mut review = build_review(uid, ctx, object, old_object);
+    let delete_crd;
+    let (version, crd) = match matched {
+        RuleMatch::Equivalent { version, crd } => (version.as_str(), &**crd),
+        // A DELETE's bodies are the stored copy, but `kind` names the addressed version.
+        RuleMatch::Exact
+            if ctx.operation == "DELETE"
+                && is_other_version_of_group(object, ctx.group, ctx.version) =>
+        {
+            delete_crd = crate::handlers::cr::find_crd(
+                state,
+                ctx.group,
+                ctx.version,
+                split_subresource(ctx.resource).0,
+            )
+            .await?;
+            (ctx.version, &delete_crd)
+        }
+        RuleMatch::Exact => return Ok((review, Arc::clone(object))),
+    };
+    let seen = Arc::new(convert_to_version(state, crd, ctx.group, version, object).await?);
+    let seen_old = match old_object {
+        Some(old) => Some(Arc::new(
+            convert_to_version(state, crd, ctx.group, version, old).await?,
+        )),
+        None => None,
+    };
+    if let Some(req) = review.request.as_mut() {
+        if req.kind.group == ctx.group {
+            req.kind.version = version.to_string();
+        }
+        req.resource.version = version.to_string();
+        req.object = Arc::clone(&seen);
+        if req.old_object.is_some() {
+            req.old_object = seen_old;
+        }
+    }
+    Ok((review, seen))
 }
 
 /// POST the AdmissionReview to the webhook URL and return the response.
@@ -1362,22 +1564,11 @@ async fn invoke_mutating_webhook<S: Store>(
         return Ok((None, false));
     }
 
-    // Check if this webhook matches any rule.
-    if !webhook.rules.is_empty() {
-        let has_match = webhook.rules.iter().any(|rule| {
-            matches_rule_typed(
-                rule,
-                ctx.group,
-                ctx.version,
-                ctx.resource,
-                ctx.namespace,
-                ctx.operation,
-            )
-        });
-        if !has_match {
-            return Ok((None, false));
-        }
-    }
+    let matched = match match_webhook_rules(state, webhook, ctx).await {
+        Ok(Some(matched)) => matched,
+        Ok(None) => return Ok((None, false)),
+        Err(e) => return Err(e),
+    };
 
     // namespaceSelector: skip this webhook if the request namespace's labels don't match.
     // Cluster-scoped requests (namespace == None) always pass the namespace selector.
@@ -1487,7 +1678,8 @@ async fn invoke_mutating_webhook<S: Store>(
     let call_url = webhook_url_with_timeout(base_url, secs);
 
     let uid = uuid::Uuid::new_v4().to_string();
-    let review = build_review(&uid, ctx, object, old_object);
+    let (review, seen) =
+        build_webhook_review(state, &uid, ctx, &matched, object, old_object).await?;
 
     let (effective_proxy, effective_identity, dial) = target.routing(state);
 
@@ -1533,8 +1725,12 @@ async fn invoke_mutating_webhook<S: Store>(
             // Apply patch if present.
             if let Some(patch_b64) = resp.patch.as_deref() {
                 if !patch_b64.is_empty() {
-                    let mut mutated = object.as_ref().clone();
+                    let mut mutated = seen.as_ref().clone();
                     apply_webhook_patch(&mut mutated, patch_b64)?;
+                    if let RuleMatch::Equivalent { crd, .. } = &matched {
+                        mutated = convert_to_version(state, crd, ctx.group, ctx.version, &mutated)
+                            .await?;
+                    }
                     return Ok((Some(mutated), true));
                 }
             }
@@ -4124,22 +4320,11 @@ pub async fn run_validating_webhooks<S: Store>(
         let old_object_arc = old_object.map(|v| Arc::new(v.clone()));
 
         for webhook in all_webhooks.iter() {
-            // Check rule match.
-            if !webhook.rules.is_empty() {
-                let has_match = webhook.rules.iter().any(|rule| {
-                    matches_rule_typed(
-                        rule,
-                        ctx.group,
-                        ctx.version,
-                        ctx.resource,
-                        ctx.namespace,
-                        ctx.operation,
-                    )
-                });
-                if !has_match {
-                    continue;
-                }
-            }
+            let matched = match match_webhook_rules(state, webhook, ctx).await {
+                Ok(Some(matched)) => matched,
+                Ok(None) => continue,
+                Err(e) => return Err(e),
+            };
 
             // namespaceSelector: skip if the request namespace's labels don't match.
             if webhook.namespace_selector.is_some() {
@@ -4247,7 +4432,15 @@ pub async fn run_validating_webhooks<S: Store>(
             let call_url = webhook_url_with_timeout(base_url, secs);
 
             let uid = uuid::Uuid::new_v4().to_string();
-            let review = build_review(&uid, ctx, &object_arc, old_object_arc.as_ref());
+            let (review, _) = build_webhook_review(
+                state,
+                &uid,
+                ctx,
+                &matched,
+                &object_arc,
+                old_object_arc.as_ref(),
+            )
+            .await?;
 
             let (effective_proxy, effective_identity, dial) = target.routing(state);
 
@@ -4685,6 +4878,185 @@ mod tests {
             result.is_ok(),
             "ValidatingWebhookConfiguration create must bypass admission pipeline to prevent deadlock"
         );
+    }
+
+    /// Delegates to an in-memory `SqliteStore`, failing `list` under the CRD prefix while
+    /// `fail_crd_list` is set.
+    struct CrdListFaultStore {
+        inner: Arc<SqliteStore>,
+        fail_crd_list: std::sync::atomic::AtomicBool,
+    }
+
+    impl u7s_store::Store for CrdListFaultStore {
+        fn get(
+            &self,
+            key: impl Into<String> + Send,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key: String = key.into();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: impl Into<String> + Send,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix: String = prefix.into();
+            let fail = self.fail_crd_list.load(std::sync::atomic::Ordering::SeqCst)
+                && prefix.contains("customresourcedefinitions");
+            async move {
+                if fail {
+                    return Err(u7s_store::StoreError::Compacted {
+                        requested: 0,
+                        horizon: 0,
+                    });
+                }
+                inner.list(&prefix, opts).await
+            }
+        }
+
+        fn put(
+            &self,
+            key: impl Into<String> + Send,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key: String = key.into();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: impl Into<String> + Send,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let inner = self.inner.clone();
+            let key: String = key.into();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// A webhook whose rule names v1 matches a v2 request only after looking up the
+    /// resource's CRD. If that lookup fails for any reason other than "no such CRD", skipping
+    /// the webhook would let a write bypass a webhook on a transient store hiccup. A lookup
+    /// error is an apiserver fault, not a webhook failure, so it rejects with 500 whatever the
+    /// webhook's failurePolicy (upstream ShouldCallHook returns it without applying policy).
+    #[tokio::test]
+    async fn a_transient_store_error_must_reject_the_write_regardless_of_failure_policy() {
+        for (name, policy) in [("fail-vwc", "Fail"), ("ignore-vwc", "Ignore")] {
+            let store = Arc::new(CrdListFaultStore {
+                inner: Arc::new(SqliteStore::new(":memory:").expect("in-memory store")),
+                fail_crd_list: std::sync::atomic::AtomicBool::new(false),
+            });
+            let state = AppState::new(
+                store.clone(),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            );
+            let vwc = json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingWebhookConfiguration",
+                "metadata": {"name": name},
+                "webhooks": [{
+                    "name": format!("{name}.example.com"),
+                    "clientConfig": { "url": "http://127.0.0.1:1" },
+                    "rules": [{"apiGroups": ["example.com"], "apiVersions": ["v1"],
+                        "resources": ["widgets"], "operations": ["CREATE"]}],
+                    "failurePolicy": policy
+                }]
+            });
+            store
+                .put(
+                    &format!(
+                        "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/{name}"
+                    ),
+                    bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let ctx = AdmissionContext {
+                group: "example.com",
+                version: "v2",
+                resource: "widgets",
+                name: "w",
+                namespace: None,
+                operation: "CREATE",
+                user_info: None,
+                dry_run: false,
+            };
+            let obj = json!({"apiVersion": "example.com/v2", "kind": "Widget",
+                "metadata": {"name": "w"}});
+
+            // No CRD at all is not an error: no equivalents, webhook skipped.
+            run_validating_webhooks(&state, &obj, None, &ctx)
+                .await
+                .expect("a resource with no CRD has no equivalent versions");
+
+            store
+                .fail_crd_list
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Drop the negative entry the first request cached, as a CRD write would.
+            state.cr_context_cache.invalidate_absent();
+            let err = run_validating_webhooks(&state, &obj, None, &ctx)
+                .await
+                .expect_err(&format!(
+                    "store error with a failurePolicy={policy} webhook must reject: \
+                     a lookup error is an apiserver fault, not a webhook failure"
+                ));
+            assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 
     /// Deleting a ValidatingWebhookConfiguration must bypass the admission pipeline too.
@@ -8084,7 +8456,7 @@ mod tests {
         let review = build_review("wire-stability-uid", &ctx, &object, Some(&old_object));
 
         let actual = serde_json::to_string(&review).expect("AdmissionReview must serialize");
-        let expected = "{\"apiVersion\":\"admission.k8s.io/v1\",\"kind\":\"AdmissionReview\",\"request\":{\"uid\":\"wire-stability-uid\",\"kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"resource\":{\"group\":\"apps\",\"version\":\"v1\",\"resource\":\"deployments\"},\"name\":\"my-deploy\",\"namespace\":\"default\",\"operation\":\"UPDATE\",\"object\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":3}},\"oldObject\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":1}},\"userInfo\":{\"groups\":[\"system:authenticated\"],\"username\":\"alice\"}}}";
+        let expected = "{\"apiVersion\":\"admission.k8s.io/v1\",\"kind\":\"AdmissionReview\",\"request\":{\"uid\":\"wire-stability-uid\",\"kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"resource\":{\"group\":\"apps\",\"version\":\"v1\",\"resource\":\"deployments\"},\"requestKind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"requestResource\":{\"group\":\"apps\",\"version\":\"v1\",\"resource\":\"deployments\"},\"name\":\"my-deploy\",\"namespace\":\"default\",\"operation\":\"UPDATE\",\"object\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":3}},\"oldObject\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":1}},\"userInfo\":{\"groups\":[\"system:authenticated\"],\"username\":\"alice\"}}}";
         assert_eq!(
             actual, expected,
             "AdmissionReview wire bytes changed — a webhook consumer parsing a fixed \
@@ -13831,6 +14203,7 @@ mod tests {
                 operations: vec!["CREATE".to_string()],
                 scope: None,
             }],
+            match_policy: default_match_policy(),
             failure_policy: default_failure_policy(),
             reinvocation_policy: String::new(),
             namespace_selector: None,
@@ -13903,6 +14276,7 @@ mod tests {
                 ca_bundle: None,
             },
             rules: vec![],
+            match_policy: default_match_policy(),
             failure_policy: default_failure_policy(),
             reinvocation_policy: String::new(),
             namespace_selector: None,

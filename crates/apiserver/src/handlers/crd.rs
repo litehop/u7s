@@ -701,6 +701,7 @@ pub async fn create_crd<S: Store>(
         .await
         .map_err(|e| store_err_crd(e, &name))?;
 
+    state.cr_context_cache.invalidate_absent();
     let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
     let _ = state.store.delete(&tombstone_key, None).await;
     crate::handlers::discovery::refresh_discovery_cache(&state).await;
@@ -1496,6 +1497,7 @@ pub async fn patch_crd<S: Store>(
             .await
             .map_err(|e| store_err_crd(e, &name))?;
 
+        state.cr_context_cache.invalidate_absent();
         let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
         let _ = state.store.delete(&tombstone_key, None).await;
         crate::handlers::discovery::refresh_discovery_cache(&state).await;

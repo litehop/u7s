@@ -97,6 +97,26 @@ mod cases {
         resources: &[&str],
         operations: &[&str],
     ) {
+        register_webhook_for(
+            store, mutating, name, url, api_group, "*", None, resources, operations,
+        )
+        .await;
+    }
+
+    /// Like `register_webhook`, with the rule pinned to `api_version` and an explicit
+    /// `matchPolicy` (`None` leaves it unset, i.e. the API default).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_webhook_for(
+        store: &Arc<SqliteStore>,
+        mutating: bool,
+        name: &str,
+        url: &str,
+        api_group: &str,
+        api_version: &str,
+        match_policy: Option<&str>,
+        resources: &[&str],
+        operations: &[&str],
+    ) {
         let (kind, plural) = if mutating {
             (
                 "MutatingWebhookConfiguration",
@@ -108,6 +128,18 @@ mod cases {
                 "validatingwebhookconfigurations",
             )
         };
+        let mut webhook = json!({
+            "name": format!("{name}.example.com"),
+            "clientConfig": {"url": url},
+            "rules": [{"apiGroups": [api_group], "apiVersions": [api_version],
+                "resources": resources, "operations": operations}],
+            "failurePolicy": "Fail",
+            "sideEffects": "None",
+            "admissionReviewVersions": ["v1"]
+        });
+        if let Some(policy) = match_policy {
+            webhook["matchPolicy"] = json!(policy);
+        }
         put_registry(
             store,
             &format!("{plural}/{name}"),
@@ -115,15 +147,7 @@ mod cases {
                 "apiVersion": "admissionregistration.k8s.io/v1",
                 "kind": kind,
                 "metadata": {"name": name},
-                "webhooks": [{
-                    "name": format!("{name}.example.com"),
-                    "clientConfig": {"url": url},
-                    "rules": [{"apiGroups": [api_group], "apiVersions": ["*"],
-                        "resources": resources, "operations": operations}],
-                    "failurePolicy": "Fail",
-                    "sideEffects": "None",
-                    "admissionReviewVersions": ["v1"]
-                }]
+                "webhooks": [webhook]
             }),
         )
         .await;
@@ -1608,5 +1632,502 @@ mod cases {
             assert_eq!(r["kind"]["kind"], "Widget", "{r}");
             assert_eq!(r["resource"]["version"], "v2", "resource version: {r}");
         }
+    }
+
+    /// Serves a ConversionReview endpoint for a CRD whose v1 shape is `spec.size` and whose v2
+    /// shape is `spec.count`, so a webhook that sees the wrong version sees the wrong field.
+    async fn spawn_size_count_converter() -> String {
+        let app = Router::new().route(
+            "/convert",
+            axum::routing::post(|axum::Json(review): axum::Json<Value>| async move {
+                let desired = review["request"]["desiredAPIVersion"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let objects: Vec<Value> = review["request"]["objects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|o| {
+                        let mut o = o.clone();
+                        o["apiVersion"] = json!(desired);
+                        let (from, to) = if desired.ends_with("/v1") {
+                            ("count", "size")
+                        } else {
+                            ("size", "count")
+                        };
+                        if let Some(v) = o["spec"].as_object_mut().and_then(|s| s.remove(from)) {
+                            o["spec"][to] = v;
+                        }
+                        o
+                    })
+                    .collect();
+                axum::Json(json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "ConversionReview",
+                    "response": {
+                        "uid": review["request"]["uid"],
+                        "result": {"status": "Success"},
+                        "convertedObjects": objects,
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/convert")
+    }
+
+    /// Widgets served at v1 (storage) and v2, both with /status and /scale. With a
+    /// `converter`, the CRD converts through that webhook; without, it uses the `None`
+    /// strategy (apiVersion rewrite only).
+    fn widgets_v1_v2_crd(converter: Option<&str>) -> Value {
+        let mut c = crd("widgets", "Widget", "Namespaced");
+        let version = |name: &str, storage: bool| {
+            let mut v = c["spec"]["versions"][0].clone();
+            v["name"] = json!(name);
+            v["storage"] = json!(storage);
+            v
+        };
+        c["spec"]["versions"] = json!([version("v1", true), version("v2", false)]);
+        if let Some(url) = converter {
+            c["spec"]["conversion"] = json!({"strategy": "Webhook", "webhook": {
+                "conversionReviewVersions": ["v1"], "clientConfig": {"url": url}}});
+        }
+        c
+    }
+
+    const WIDGETS: &str = "/apis/example.com/{v}/namespaces/default/widgets";
+
+    fn widgets_at(version: &str) -> String {
+        WIDGETS.replace("{v}", version)
+    }
+
+    fn widget_at(version: &str, spec: Value) -> Value {
+        json!({"apiVersion": format!("example.com/{version}"), "kind": "Widget",
+            "metadata": {"name": "w"}, "spec": spec})
+    }
+
+    /// A webhook registered for v1 of a resource must also guard v2 requests (the default
+    /// `matchPolicy: Equivalent`): otherwise writing through the other served version is a
+    /// trivial bypass of any admission policy. It must be shown the object converted to the
+    /// version its rule names, with the client's original recorded in `requestKind` etc.
+    #[tokio::test]
+    async fn equivalent_webhook_for_v1_is_called_for_a_v2_request_with_the_object_converted_to_v1()
+    {
+        let c = Cluster::new().await;
+        let url = spawn_size_count_converter().await;
+        c.create(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            widgets_v1_v2_crd(Some(&url)),
+        )
+        .await;
+        let hook = spawn_hook(|_| json!({"allowed": true})).await;
+        register_webhook_for(
+            &c.store,
+            false,
+            "v1only",
+            &hook.url,
+            "example.com",
+            "v1",
+            None,
+            &["widgets"],
+            &["CREATE"],
+        )
+        .await;
+
+        let (status, resp) = c
+            .call(
+                "POST",
+                &widgets_at("v2"),
+                "application/json",
+                widget_at("v2", json!({"count": 7})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{resp}");
+
+        let reqs = hook.requests();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "the v1 rule must match a v2 request: {reqs:?}"
+        );
+        let r = &reqs[0];
+        assert_eq!(r["kind"]["version"], "v1", "{r}");
+        assert_eq!(r["resource"]["version"], "v1", "{r}");
+        assert_eq!(r["requestKind"]["version"], "v2", "{r}");
+        assert_eq!(r["requestKind"]["kind"], "Widget", "{r}");
+        assert_eq!(r["requestResource"]["version"], "v2", "{r}");
+        assert_eq!(r["requestResource"]["resource"], "widgets", "{r}");
+        assert_eq!(r["object"]["apiVersion"], "example.com/v1", "{r}");
+        assert_eq!(
+            r["object"]["spec"],
+            json!({"size": 7}),
+            "the webhook must see the v1 shape, not the v2 one the client sent: {r}"
+        );
+        assert_eq!(
+            resp["apiVersion"], "example.com/v2",
+            "client keeps its version"
+        );
+        assert_eq!(resp["spec"], json!({"count": 7}));
+    }
+
+    /// `matchPolicy: Exact` is the opt-out: a v1-only webhook must not see v2 requests.
+    #[tokio::test]
+    async fn exact_policy_webhook_for_v1_is_not_called_for_a_v2_request() {
+        let c = Cluster::new().await;
+        c.create(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            widgets_v1_v2_crd(None),
+        )
+        .await;
+        let hook = spawn_hook(deny("v1 only")).await;
+        register_webhook_for(
+            &c.store,
+            false,
+            "exact",
+            &hook.url,
+            "example.com",
+            "v1",
+            Some("Exact"),
+            &["widgets"],
+            &["CREATE"],
+        )
+        .await;
+
+        let (status, resp) = c
+            .call(
+                "POST",
+                &widgets_at("v2"),
+                "application/json",
+                widget_at("v2", json!({})),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "Exact must not match v2: {resp}"
+        );
+        assert!(hook.requests().is_empty());
+
+        let (status, _) = c
+            .call(
+                "POST",
+                &widgets_at("v1"),
+                "application/json",
+                json!({"apiVersion": "example.com/v1", "kind": "Widget",
+                    "metadata": {"name": "w1"}, "spec": {}}),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "Exact still matches its own version"
+        );
+        assert_eq!(hook.requests().len(), 1);
+    }
+
+    /// A mutating webhook matched through v1 patches the v1-shaped object; the patch must
+    /// reach the client and the store in the right shape (v2 response, v1 storage), or an
+    /// Equivalent mutation silently corrupts objects written at the other version.
+    #[tokio::test]
+    async fn equivalent_mutating_patch_is_converted_back_and_persisted() {
+        let c = Cluster::new().await;
+        let url = spawn_size_count_converter().await;
+        c.create(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            widgets_v1_v2_crd(Some(&url)),
+        )
+        .await;
+        let hook = spawn_hook(json_patch(json!([
+            {"op": "replace", "path": "/spec/size", "value": 9},
+            {"op": "add", "path": "/metadata/annotations", "value": {"mutated": "by-v1"}}
+        ])))
+        .await;
+        register_webhook_for(
+            &c.store,
+            true,
+            "mutate",
+            &hook.url,
+            "example.com",
+            "v1",
+            None,
+            &["widgets"],
+            &["CREATE"],
+        )
+        .await;
+
+        let (status, resp) = c
+            .call(
+                "POST",
+                &widgets_at("v2"),
+                "application/json",
+                widget_at("v2", json!({"count": 1})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{resp}");
+        assert_eq!(resp["apiVersion"], "example.com/v2", "{resp}");
+        assert_eq!(
+            resp["spec"],
+            json!({"count": 9}),
+            "patched size must come back as count: {resp}"
+        );
+        assert_eq!(resp["metadata"]["annotations"]["mutated"], "by-v1");
+
+        let stored = c.stored("/registry/cr/example.com/widgets/default/w").await;
+        assert_eq!(stored["apiVersion"], "example.com/v1", "{stored}");
+        assert_eq!(stored["spec"], json!({"size": 9}), "{stored}");
+        assert_eq!(stored["metadata"]["annotations"]["mutated"], "by-v1");
+    }
+
+    /// With the `None` conversion strategy the "conversion" is an apiVersion rewrite; the
+    /// Equivalent webhook must still see (and answer in) the version its rule names.
+    #[tokio::test]
+    async fn equivalent_webhook_on_a_none_strategy_crd_sees_the_rewritten_api_version() {
+        let c = Cluster::new().await;
+        c.create(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            widgets_v1_v2_crd(None),
+        )
+        .await;
+        let hook = spawn_hook(json_patch(json!([
+            {"op": "add", "path": "/spec/seen", "value": true}
+        ])))
+        .await;
+        register_webhook_for(
+            &c.store,
+            true,
+            "mutate",
+            &hook.url,
+            "example.com",
+            "v1",
+            None,
+            &["widgets"],
+            &["CREATE"],
+        )
+        .await;
+        let (status, resp) = c
+            .call(
+                "POST",
+                &widgets_at("v2"),
+                "application/json",
+                widget_at("v2", json!({"size": 1})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{resp}");
+        assert_eq!(hook.requests()[0]["object"]["apiVersion"], "example.com/v1");
+        assert_eq!(resp["apiVersion"], "example.com/v2");
+        assert_eq!(resp["spec"]["seen"], true);
+    }
+
+    /// A DELETE is stored at the storage version, but `kind` names the version the client
+    /// addressed; the webhook must see an object of that same version, or a v2 policy reads
+    /// a v1-shaped body labelled v2.
+    #[tokio::test]
+    async fn delete_at_a_non_storage_version_shows_the_webhook_a_body_matching_its_kind() {
+        let c = Cluster::new().await;
+        let url = spawn_size_count_converter().await;
+        c.create(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            widgets_v1_v2_crd(Some(&url)),
+        )
+        .await;
+        c.create(&widgets_at("v1"), widget_at("v1", json!({"size": 4})))
+            .await;
+        let hook = spawn_hook(|_| json!({"allowed": true})).await;
+        register_webhook_for(
+            &c.store,
+            false,
+            "v2delete",
+            &hook.url,
+            "example.com",
+            "v2",
+            Some("Exact"),
+            &["widgets"],
+            &["DELETE"],
+        )
+        .await;
+
+        let (status, resp) = c
+            .call(
+                "DELETE",
+                &format!("{}/w", widgets_at("v2")),
+                "application/json",
+                json!({}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+
+        let reqs = hook.requests();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        let r = &reqs[0];
+        assert_eq!(r["kind"]["version"], "v2", "{r}");
+        assert_eq!(r["oldObject"]["apiVersion"], "example.com/v2", "{r}");
+        assert_eq!(
+            r["oldObject"]["spec"],
+            json!({"count": 4}),
+            "oldObject must be converted to the version kind names: {r}"
+        );
+    }
+
+    /// Every cell of {mutating, validating} x {Exact, Equivalent} x {request at the rule's
+    /// version, at an equivalent version} x {main resource, /status, /scale} x {CREATE, UPDATE,
+    /// DELETE} (subresources only have UPDATE) must be called exactly when upstream calls it,
+    /// and the review must name both the matched and the original version.
+    #[tokio::test]
+    async fn match_policy_matrix_calls_webhooks_exactly_when_upstream_does() {
+        let mut cells = 0;
+        for mutating in [false, true] {
+            for policy in [Some("Exact"), Some("Equivalent"), None] {
+                for request_version in ["v1", "v2"] {
+                    for (resource, op) in [
+                        ("widgets", "CREATE"),
+                        ("widgets", "UPDATE"),
+                        ("widgets", "DELETE"),
+                        ("widgets/status", "UPDATE"),
+                        ("widgets/scale", "UPDATE"),
+                    ] {
+                        // u7s never runs mutating webhooks on DELETE (upstream does); tracked separately.
+                        if mutating && op == "DELETE" {
+                            continue;
+                        }
+                        cells += 1;
+                        let label = format!(
+                            "mutating={mutating} policy={policy:?} request={request_version} \
+                             {resource} {op}"
+                        );
+                        let c = Cluster::new().await;
+                        let url = spawn_size_count_converter().await;
+                        c.create(
+                            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                            widgets_v1_v2_crd(Some(&url)),
+                        )
+                        .await;
+                        c.create(&widgets_at("v1"), widget_at("v1", json!({"size": 1})))
+                            .await;
+                        let hook = spawn_hook(|_| json!({"allowed": true})).await;
+                        register_webhook_for(
+                            &c.store,
+                            mutating,
+                            "matrix",
+                            &hook.url,
+                            "example.com",
+                            "v1",
+                            policy,
+                            &[resource],
+                            &[op],
+                        )
+                        .await;
+
+                        let base = widgets_at(request_version);
+                        let spec = if request_version == "v1" {
+                            json!({"size": 2})
+                        } else {
+                            json!({"count": 2})
+                        };
+                        let (status, resp) = match (resource, op) {
+                            ("widgets", "CREATE") => {
+                                let mut body = widget_at(request_version, spec);
+                                body["metadata"]["name"] = json!("w-new");
+                                c.call("POST", &base, "application/json", body).await
+                            }
+                            ("widgets", "UPDATE") => {
+                                c.call(
+                                    "PUT",
+                                    &format!("{base}/w"),
+                                    "application/json",
+                                    widget_at(request_version, spec),
+                                )
+                                .await
+                            }
+                            ("widgets", "DELETE") => {
+                                c.call(
+                                    "DELETE",
+                                    &format!("{base}/w"),
+                                    "application/json",
+                                    json!({}),
+                                )
+                                .await
+                            }
+                            ("widgets/status", _) => {
+                                c.call(
+                                    "PUT",
+                                    &format!("{base}/w/status"),
+                                    "application/json",
+                                    json!({"apiVersion": format!("example.com/{request_version}"),
+                                        "kind": "Widget", "metadata": {"name": "w"},
+                                        "status": {"replicas": 2}}),
+                                )
+                                .await
+                            }
+                            _ => {
+                                c.call(
+                                    "PUT",
+                                    &format!("{base}/w/scale"),
+                                    "application/json",
+                                    json!({"apiVersion": "autoscaling/v1", "kind": "Scale",
+                                        "metadata": {"name": "w", "namespace": "default"},
+                                        "spec": {"replicas": 3}}),
+                                )
+                                .await
+                            }
+                        };
+                        assert!(status.is_success(), "{label}: {status} {resp}");
+
+                        let should_call = request_version == "v1" || policy != Some("Exact");
+                        let reqs = hook.requests();
+                        assert_eq!(
+                            reqs.len(),
+                            usize::from(should_call),
+                            "{label}: webhook call count: {reqs:?}"
+                        );
+                        let Some(r) = reqs.first() else { continue };
+                        let (base_resource, sub) = match resource.split_once('/') {
+                            Some((b, s)) => (b, Some(s)),
+                            None => (resource, None),
+                        };
+                        assert_eq!(r["operation"], op, "{label}");
+                        assert_eq!(r["resource"]["version"], "v1", "{label}: {r}");
+                        assert_eq!(r["resource"]["resource"], base_resource, "{label}");
+                        assert_eq!(
+                            r["requestResource"]["version"], request_version,
+                            "{label}: {r}"
+                        );
+                        assert_eq!(r["requestResource"]["resource"], base_resource, "{label}");
+                        assert_eq!(
+                            r["subResource"],
+                            sub.map_or(Value::Null, |s| json!(s)),
+                            "{label}"
+                        );
+                        assert_eq!(
+                            r["requestSubResource"],
+                            sub.map_or(Value::Null, |s| json!(s)),
+                            "{label}"
+                        );
+                        if sub == Some("scale") {
+                            assert_eq!(r["kind"]["group"], "autoscaling", "{label}: {r}");
+                            assert_eq!(r["requestKind"]["group"], "autoscaling", "{label}: {r}");
+                        } else {
+                            assert_eq!(r["kind"]["version"], "v1", "{label}: {r}");
+                            assert_eq!(r["kind"]["kind"], "Widget", "{label}");
+                            assert_eq!(
+                                r["requestKind"]["version"], request_version,
+                                "{label}: {r}"
+                            );
+                        }
+                        if op != "DELETE" && sub.is_none() {
+                            assert_eq!(r["object"]["apiVersion"], "example.com/v1", "{label}");
+                            assert_eq!(r["object"]["spec"], json!({"size": 2}), "{label}: {r}");
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            cells,
+            (2 * 5 - 1) * 3 * 2,
+            "every matrix cell must have run"
+        );
     }
 }
