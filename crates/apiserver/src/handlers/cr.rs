@@ -268,9 +268,9 @@ pub struct CrScaleConfig {
 /// - `Err(404 NotFound)` when the group/version/plural was never registered.
 ///
 /// A hit on `state.cr_context_cache` (see that type's doc for the invalidation contract)
-/// skips the store list-scan and CRD re-parse below entirely. Only successful lookups are
-/// cached — a 404/410 is cheap (no list-scan match, or a single tombstone `get`) and caching
-/// it would need its own invalidation on CRD create, for no meaningful benefit.
+/// skips the store list-scan and CRD re-parse below entirely. Absent results (404/410) are
+/// cached too; `invalidate` clears a key and `invalidate_absent` clears all absent entries
+/// when a CRD is created.
 pub async fn find_crd<S: Store>(
     state: &AppState<S>,
     group: &str,

@@ -1226,20 +1226,6 @@ async fn match_webhook_rules<S: Store>(
     }))
 }
 
-/// A failure to evaluate a webhook's rules follows the webhook's failurePolicy:
-/// Ignore skips the webhook, Fail rejects the request.
-fn rule_match_failure(webhook: &WebhookEntry, err: StatusError) -> Result<(), StatusError> {
-    if webhook.failure_policy == "Ignore" {
-        tracing::warn!(
-            "admission: webhook \"{}\" rule matching failed, ignoring (failurePolicy=Ignore): {err:?}",
-            webhook.name
-        );
-        Ok(())
-    } else {
-        Err(err)
-    }
-}
-
 /// True when `obj` belongs to `group` at a version other than `version`.
 fn is_other_version_of_group(obj: &serde_json::Value, group: &str, version: &str) -> bool {
     obj["apiVersion"].as_str().is_some_and(|av| {
@@ -1581,7 +1567,7 @@ async fn invoke_mutating_webhook<S: Store>(
     let matched = match match_webhook_rules(state, webhook, ctx).await {
         Ok(Some(matched)) => matched,
         Ok(None) => return Ok((None, false)),
-        Err(e) => return rule_match_failure(webhook, e).map(|()| (None, false)),
+        Err(e) => return Err(e),
     };
 
     // namespaceSelector: skip this webhook if the request namespace's labels don't match.
@@ -4337,10 +4323,7 @@ pub async fn run_validating_webhooks<S: Store>(
             let matched = match match_webhook_rules(state, webhook, ctx).await {
                 Ok(Some(matched)) => matched,
                 Ok(None) => continue,
-                Err(e) => {
-                    rule_match_failure(webhook, e)?;
-                    continue;
-                }
+                Err(e) => return Err(e),
             };
 
             // namespaceSelector: skip if the request namespace's labels don't match.
@@ -5004,22 +4987,23 @@ mod tests {
 
     /// A webhook whose rule names v1 matches a v2 request only after looking up the
     /// resource's CRD. If that lookup fails for any reason other than "no such CRD", skipping
-    /// the webhook would let a write bypass a `failurePolicy: Fail` webhook on a transient
-    /// store hiccup; it must reject (Fail) or skip (Ignore) per the webhook's policy.
+    /// the webhook would let a write bypass a webhook on a transient store hiccup. A lookup
+    /// error is an apiserver fault, not a webhook failure, so it rejects with 500 whatever the
+    /// webhook's failurePolicy (upstream ShouldCallHook returns it without applying policy).
     #[tokio::test]
-    async fn a_transient_store_error_must_never_let_a_write_bypass_a_fail_webhook() {
-        let store = Arc::new(CrdListFaultStore {
-            inner: Arc::new(SqliteStore::new(":memory:").expect("in-memory store")),
-            fail_crd_list: std::sync::atomic::AtomicBool::new(false),
-        });
-        let state = AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
+    async fn a_transient_store_error_must_reject_the_write_regardless_of_failure_policy() {
         for (name, policy) in [("fail-vwc", "Fail"), ("ignore-vwc", "Ignore")] {
+            let store = Arc::new(CrdListFaultStore {
+                inner: Arc::new(SqliteStore::new(":memory:").expect("in-memory store")),
+                fail_crd_list: std::sync::atomic::AtomicBool::new(false),
+            });
+            let state = AppState::new(
+                store.clone(),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            );
             let vwc = json!({
                 "apiVersion": "admissionregistration.k8s.io/v1",
                 "kind": "ValidatingWebhookConfiguration",
@@ -5042,34 +5026,37 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let ctx = AdmissionContext {
+                group: "example.com",
+                version: "v2",
+                resource: "widgets",
+                name: "w",
+                namespace: None,
+                operation: "CREATE",
+                user_info: None,
+                dry_run: false,
+            };
+            let obj = json!({"apiVersion": "example.com/v2", "kind": "Widget",
+                "metadata": {"name": "w"}});
+
+            // No CRD at all is not an error: no equivalents, webhook skipped.
+            run_validating_webhooks(&state, &obj, None, &ctx)
+                .await
+                .expect("a resource with no CRD has no equivalent versions");
+
+            store
+                .fail_crd_list
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Drop the negative entry the first request cached, as a CRD write would.
+            state.cr_context_cache.invalidate_absent();
+            let err = run_validating_webhooks(&state, &obj, None, &ctx)
+                .await
+                .expect_err(&format!(
+                    "store error with a failurePolicy={policy} webhook must reject: \
+                     a lookup error is an apiserver fault, not a webhook failure"
+                ));
+            assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         }
-        let ctx = AdmissionContext {
-            group: "example.com",
-            version: "v2",
-            resource: "widgets",
-            name: "w",
-            namespace: None,
-            operation: "CREATE",
-            user_info: None,
-            dry_run: false,
-        };
-        let obj = json!({"apiVersion": "example.com/v2", "kind": "Widget",
-            "metadata": {"name": "w"}});
-
-        // No CRD at all is not an error: no equivalents, both webhooks skipped.
-        run_validating_webhooks(&state, &obj, None, &ctx)
-            .await
-            .expect("a resource with no CRD has no equivalent versions");
-
-        store
-            .fail_crd_list
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Drop the negative entry the first request cached, as a CRD write would.
-        state.cr_context_cache.invalidate_absent();
-        let err = run_validating_webhooks(&state, &obj, None, &ctx)
-            .await
-            .expect_err("store error with a Fail webhook must reject the write");
-        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Deleting a ValidatingWebhookConfiguration must bypass the admission pipeline too.
