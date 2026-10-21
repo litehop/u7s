@@ -752,17 +752,23 @@ will be dispatched only after that — do NOT preemptively reserve any slot as
 
 | VM name | Host port | Kubelet port | Companion kubelet port | Konnectivity | Network | Notes |
 |---|---|---|---|---|---|---|
-| `lima-node` | `6443` | `10270` | `10260` | `8135` | `user-v2-mayor` | assignable to workers; the operator will communicate if they need this slot |
-| slot 1 = `lima-node-2` | `6444` | `10271` | `10261` | `8235` | `user-v2-workers-a` | |
-| slot 2 = `lima-node-3` | `6445` | `10272` | `10262` | `8335` | `user-v2-workers-a` | workers may pair this slot with any other via `--extra-node <vm>` when a bead needs a 2-node topology — check `limactl list` / the dashboard before assuming it's free |
-| slot 3 = `lima-node-4` | `6446` | `10273` | `10263` | `8435` | `user-v2-workers-a` | |
-| slot 4 = `lima-node-5` | `6447` | `10274` | `10264` | `8535` | `user-v2-workers-b` | |
-| slot 5 = `lima-node-smoke` | `6448` | `10275` | `10265` | `8635` | `user-v2-workers-b` | |
+| `lima-node` | `6443` | `10250` | `10260` | `8135` | `user-v2-mayor` | assignable to workers; the operator will communicate if they need this slot |
+| slot 1 = `lima-node-2` | `6444` | `10273` | `10261` | `8235` | `user-v2-workers-a` | |
+| slot 2 = `lima-node-3` | `6445` | `10271` | `10262` | `8335` | `user-v2-workers-a` | workers may pair this slot with any other via `--extra-node <vm>` when a bead needs a 2-node topology — check `limactl list` / the dashboard before assuming it's free |
+| slot 3 = `lima-node-4` | `6446` | `10272` | `10263` | `8435` | `user-v2-workers-a` | |
+| slot 4 = `lima-node-5` | `6447` | `10280` | `10264` | `8535` | `user-v2-workers-b` | |
+| slot 5 = `lima-node-smoke` | `6448` | `10264` | `10265` | `8635` | `user-v2-workers-b` | |
 
 Kubelet ports avoid `10248`-`10259`: other projects' Lima guests (kubelet,
 kube-proxy, KCM `10257`, scheduler `10259` defaults) auto-forward those onto the
 same host ports. A VM provisioned before this change keeps its old forward
 until `--reset`; always pass what `lima-kubelet-port.sh` prints.
+
+The kubelet column shows the live forwards as of 2026-10-21 (`lima-kubelet-port.sh`
+per VM). `lima-node`'s `10250` is inside the avoided range and needs a reprovision
+(`limactl delete lima-node`, then `run-all.sh --reset --kubelet-port <free port>`)
+while the slot is idle (mayor-ex89s). The six live kubelet ports are mutually
+distinct, but `lima-node-smoke`'s `10264` equals `lima-node-5`'s companion port.
 
 Pairing two slots via `--extra-node` for a 2-node topology requires the same
 Network value — `lima-start.sh`'s inter-node route loop compares each VM's
