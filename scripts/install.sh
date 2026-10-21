@@ -1006,6 +1006,7 @@ fi
 # conditionally today (for --mint-join-token/--join).
 PERSISTED_NODE_NAME=""
 PERSISTED_IFACE=""
+NODE_NAME="$(printf '%s' "$NODE_NAME" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 if [ -f "$CONFIG_FILE" ]; then
   # Sourced inside a subshell, not the main shell, so this cannot clobber the
   # NODE_NAME/IFACE already resolved from flags/env above.
@@ -1041,7 +1042,9 @@ fi
 # --- Defaults: node name, network interface ----------------------------------
 
 if [ -z "$NODE_NAME" ]; then
-  NODE_NAME="$(hostname)"
+  # Node names are DNS-1123 (lowercase); upstream kubelet's GetHostname
+  # lowercases and trims the hostname the same way.
+  NODE_NAME="$(hostname | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 fi
 
 if [ -z "$IFACE" ]; then
