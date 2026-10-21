@@ -199,3 +199,53 @@ async fn seeded_view_edit_admin_grant_exactly_what_upstream_aggregation_resolves
         );
     }
 }
+
+#[tokio::test]
+async fn seeded_controller_roles_are_all_upstream_default_roles() {
+    // Roles for alpha-gated controllers (e.g. storage-version-garbage-collector) are not
+    // created by a default upstream cluster; seeding them advertises a controller u7s doesn't run.
+    let seeded = seeded_roles().await;
+    let ctl = upstream_roles(include_str!(
+        "../testdata/rbac-upstream-1.37/controller-roles.yaml"
+    ));
+    let extra: Vec<&String> = seeded
+        .keys()
+        .filter(|n| n.starts_with("system:controller:") && !ctl.contains_key(*n))
+        .collect();
+    assert!(extra.is_empty(), "non-upstream controller roles: {extra:?}");
+}
+
+#[tokio::test]
+async fn seeded_kcm_identity_holds_exactly_the_union_of_upstream_controller_permissions() {
+    // With --use-service-account-credentials=false one identity runs every controller, so it
+    // must hold the union of upstream's per-controller roles -- missing a create stalls that
+    // controller (e.g. daemonset pods never bind), and any surplus is blast radius for a
+    // compromised KCM.
+    let seeded = seeded_roles().await;
+    let cr = upstream_roles(include_str!(
+        "../testdata/rbac-upstream-1.37/cluster-roles.yaml"
+    ));
+    let ctl = upstream_roles(include_str!(
+        "../testdata/rbac-upstream-1.37/controller-roles.yaml"
+    ));
+    let mut upstream = cr["system:kube-controller-manager"].clone();
+    for (name, rules) in &ctl {
+        if name.starts_with("system:controller:") {
+            upstream.extend(rules.clone());
+        }
+    }
+    let upstream = without_extensions(&upstream);
+    let have = &seeded["system:kube-controller-manager"];
+    assert_eq!(
+        uncovered(&upstream, have),
+        // clusterrole-aggregation-controller is the only consumer and the u7s KCM runs with it
+        // disabled (the seeded admin/edit/view are pre-resolved).
+        set(&["rbac.authorization.k8s.io/clusterroles: escalate"]),
+        "KCM lacks permissions its controllers need"
+    );
+    assert_eq!(
+        uncovered(have, &upstream),
+        set(&[]),
+        "KCM holds permissions no upstream controller needs"
+    );
+}

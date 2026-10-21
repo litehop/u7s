@@ -1763,19 +1763,27 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:kube-controller-manager", "uid": "00000000-0000-0000-0000-000000000020", "creationTimestamp": TS },
         "rules": [
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] },
-            { "apiGroups": [""], "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": ["","events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] },
+            // create is limited to what upstream's per-controller roles grant; the rest of the
+            // verbs come from the generic rule at the end. pods/binding (daemonset controller),
+            // endpoints/restricted (endpointslicemirroring) and serviceaccounts/token
+            // (service-account controller) are subresources the wildcard doesn't reach.
+            { "apiGroups": [""], "resources": ["endpoints","pods","serviceaccounts","configmaps","secrets","persistentvolumes","persistentvolumeclaims"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["endpoints/restricted","pods/binding","serviceaccounts/token"], "verbs": ["create"] },
+            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"], "verbs": ["get","list","watch","update","patch","delete"] },
             { "apiGroups": [""], "resources": ["resourcequotas/status"], "verbs": ["get","update","patch"] },
-            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": ["apps"], "resources": ["replicasets","controllerrevisions"], "verbs": ["create"] },
+            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","update","patch","delete"] },
             { "apiGroups": ["apps"], "resources": ["daemonsets/status","deployments/status","replicasets/status","statefulsets/status"], "verbs": ["get","update","patch"] },
-            { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create"] },
+            { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","update","patch","delete"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","update","patch"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] },
             // The endpointslice controller mirrors each Service's endpoints into
             // EndpointSlice objects; the generic read-only discovery rule below doesn't
             // cover this because it needs write verbs too.
             { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings","roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","escalate","bind"] },
             { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
             { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] },
@@ -3134,29 +3142,6 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         key,
         body,
         "system:controller:ephemeral-volume-controller",
-        "ClusterRole"
-    );
-
-    // system:controller:storage-version-garbage-collector
-    let key = keys::group_object_key(
-        GROUP,
-        "clusterroles",
-        None,
-        "system:controller:storage-version-garbage-collector",
-    );
-    let body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": { "name": "system:controller:storage-version-garbage-collector", "uid": "00000000-0000-0000-0000-000000000064", "creationTimestamp": TS },
-        "rules": [
-            { "apiGroups": ["internal.apiserver.k8s.io"], "resources": ["storageversions","storageversions/status"], "verbs": ["get","list","watch","patch","update","delete"] },
-            { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] }
-        ]
-    });
-    put!(
-        key,
-        body,
-        "system:controller:storage-version-garbage-collector",
         "ClusterRole"
     );
 
