@@ -2223,25 +2223,6 @@ dependencies = [
 
 [[package]]
 name = "politeia"
-version = "0.2.1"
-source = "git+https://github.com/litehop/politeia?tag=v0.2.1#8005d9a015137d6e2b0d345288f0a7c8fe7c68b5"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "rustls",
- "rustls-post-quantum",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "tracing",
-]
-
-[[package]]
-name = "politeia"
 version = "0.3.0"
 source = "git+https://github.com/litehop/politeia?tag=v0.3.0#b2d7b0a668a4730b5825ba7ac9f4f8b6ecd5efbe"
 dependencies = [
@@ -3875,7 +3856,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hyper",
- "politeia 0.2.1",
+ "politeia",
  "serde",
  "serde_json",
  "tokio",
@@ -3905,7 +3886,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "politeia 0.3.0",
+ "politeia",
  "rcgen",
  "rustls",
  "serde",
