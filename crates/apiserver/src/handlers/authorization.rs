@@ -2950,4 +2950,126 @@ mod handler_tests {
         let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(val["status"]["userInfo"]["username"], "carol");
     }
+
+    /// Runs one access review of every kind (SSAR as alice, SAR/LSAR as an admin about
+    /// alice) and returns `[ssar, sar, lsar]` allowed flags.
+    async fn review_all_kinds(
+        state: &AppState,
+        resource_attributes: serde_json::Value,
+    ) -> [bool; 3] {
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .route(
+                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                post(subject_access_review),
+            )
+            .route(
+                "/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews",
+                post(local_subject_access_review),
+            )
+            .with_state(state.clone());
+        let cases = [
+            (
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                serde_json::json!({ "spec": { "resourceAttributes": resource_attributes } }),
+                user("alice", &[]),
+            ),
+            (
+                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                serde_json::json!({ "spec": {
+                    "user": "alice", "resourceAttributes": resource_attributes } }),
+                user("admin", &["system:masters"]),
+            ),
+            (
+                "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews",
+                serde_json::json!({ "spec": {
+                    "user": "alice", "resourceAttributes": resource_attributes } }),
+                user("admin", &["system:masters"]),
+            ),
+        ];
+        let mut out = [false; 3];
+        for (i, (uri, body, caller)) in cases.into_iter().enumerate() {
+            let resp = app
+                .clone()
+                .oneshot(json_req("POST", uri, body, caller))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            out[i] = val["status"]["allowed"].as_bool().unwrap();
+        }
+        out
+    }
+
+    fn pods_attrs(resource: &str, subresource: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "namespace": "default", "verb": "get", "group": "",
+            "resource": resource, "subresource": subresource, "name": name
+        })
+    }
+
+    /// A user granted only `pods` get must never be told `pods/log` is allowed, in any
+    /// review kind or spelling (split, or combined `pods/log`): the real GET
+    /// `/pods/x/log` is 403, and an auditor trusting a false "yes" would ship a policy
+    /// that silently exposes container logs. The one "yes" is `resource=pods name=log`,
+    /// which is what `kubectl auth can-i get pods/log` actually sends (the part after
+    /// the slash is a pod NAME) — a genuine get of a pod called "log".
+    #[tokio::test]
+    async fn access_reviews_deny_pods_log_when_only_pods_get_is_granted_in_every_kind() {
+        let state = make_state_with_binding(
+            serde_json::json!([{ "apiGroups": [""], "resources": ["pods"], "verbs": ["get"] }]),
+            "alice",
+        );
+        assert_eq!(
+            review_all_kinds(&state, pods_attrs("pods", "", "x")).await,
+            [true; 3],
+            "pods get is granted"
+        );
+        assert_eq!(
+            review_all_kinds(&state, pods_attrs("pods", "log", "x")).await,
+            [false; 3],
+            "split pods+subresource=log must be denied by every review kind"
+        );
+        assert_eq!(
+            review_all_kinds(&state, pods_attrs("pods/log", "", "x")).await,
+            [false; 3],
+            "combined pods/log must be denied by every review kind"
+        );
+        assert_eq!(
+            review_all_kinds(&state, pods_attrs("pods", "", "log")).await,
+            [true; 3],
+            "kubectl's `can-i get pods/log` asks about a pod NAMED log, which pods get allows"
+        );
+    }
+
+    /// The positive half: once `pods/log` is granted every review kind and spelling must
+    /// report allowed, or operators cannot verify the grant they just made.
+    #[tokio::test]
+    async fn access_reviews_allow_pods_log_when_granted_in_every_kind() {
+        let state = make_state_with_binding(
+            serde_json::json!([{ "apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"] }]),
+            "alice",
+        );
+        assert_eq!(
+            review_all_kinds(&state, pods_attrs("pods", "log", "x")).await,
+            [true; 3],
+            "split pods+subresource=log is granted"
+        );
+        assert_eq!(
+            review_all_kinds(&state, pods_attrs("pods/log", "", "x")).await,
+            [true; 3],
+            "combined pods/log is granted"
+        );
+        assert_eq!(
+            review_all_kinds(&state, pods_attrs("pods", "", "x")).await,
+            [false; 3],
+            "pods/log grant must not leak to the parent resource"
+        );
+    }
 }
