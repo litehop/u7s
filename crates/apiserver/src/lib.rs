@@ -1527,83 +1527,34 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRole",
         "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000010", "creationTimestamp": TS },
+        // Mirrors upstream release-1.37 bootstrappolicy NodeRules() verbatim, in order.
         "rules": [
-            { "apiGroups": [""], "resources": ["nodes"],        "verbs": ["get","list","watch","create","update","patch"] },
-            { "apiGroups": [""], "resources": ["nodes/status"], "verbs": ["get","update","patch"] },
-            // Kubelet must be able to delete a pod once its containers have exited and the
-            // grace period elapses, to complete pod-termination reconciliation. Without this,
-            // terminated pods stay in `Terminating` forever until force-deleted by a client
-            // with higher privileges than the node's own identity (upstream kubelet's
-            // pkg/kubelet/status/status_manager.go:1219). `create` is needed for kubelet to
-            // register mirror pods for static pods under its own identity. Matches upstream
-            // bootstrappolicy.go's NodeRules() `create,delete` rule on pods exactly.
-            { "apiGroups": [""], "resources": ["pods"],         "verbs": ["get","list","watch","create","delete"] },
-            { "apiGroups": [""], "resources": ["pods/status"],  "verbs": ["get","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods/log"],     "verbs": ["get"] },
-            // Kubelet's node-pressure eviction path POSTs to the Eviction subresource (which
-            // respects PDBs) to evict its own bound pods under resource pressure. Without this,
-            // every such eviction 403s. Matches upstream bootstrappolicy.go's NodeRules() exactly.
+            { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["localsubjectaccessreviews","subjectaccessreviews"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["services"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["nodes"], "verbs": ["create","get","list","watch"] },
+            { "apiGroups": [""], "resources": ["nodes/status"], "verbs": ["patch","update"] },
+            { "apiGroups": [""], "resources": ["nodes"], "verbs": ["patch","update"] },
+            { "apiGroups": ["","events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] },
+            { "apiGroups": [""], "resources": ["pods"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["pods"], "verbs": ["create","delete"] },
+            { "apiGroups": [""], "resources": ["pods/status"], "verbs": ["patch","update"] },
             { "apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"] },
-            // events.k8s.io is the modern Event API kubelet's default event recorder posts to;
-            // "" is the legacy group. Upstream NodeRules() grants create/update/patch on events
-            // under both groups in the same rule.
-            { "apiGroups": ["", "events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] },
-            // Kubelet's own service informer populates Service-discovery env vars
-            // (SERVICE_HOST/SERVICE_PORT) injected into every pod's containers. Without this
-            // rule the informer's List/Watch is denied, the informer never completes its first
-            // sync, and every container on that node fails to start with
-            // CreateContainerConfigError: "services have not yet been read at least once" --
-            // silently masked as long as the only kubelet ever exercised authenticates as
-            // system:masters (admin) instead of a real system:node identity. Matches upstream
-            // bootstrappolicy.go's NodeRules() exactly.
-            { "apiGroups": [""], "resources": ["services"],     "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["configmaps"],          "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["secrets"],             "verbs": ["get","list","watch"] },
-            // Needed for the (legacy) glusterfs in-tree volume plugin, per upstream's own comment.
+            { "apiGroups": [""], "resources": ["configmaps","secrets"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["persistentvolumeclaims","persistentvolumes"], "verbs": ["get"] },
             { "apiGroups": [""], "resources": ["endpoints"], "verbs": ["get"] },
-            // Kubelet calls TokenRequest to project SA tokens into pods (projected volumes).
-            // Without this rule the kubelet's POST to serviceaccounts/{name}/token returns 403
-            // and containers never get an SA token, breaking in-cluster API calls.
-            { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
-            // Only activates when a kubelet credentialProviders config entry requests SA tokens
-            // for image-pull auth (KubeletServiceAccountTokenForCredentialProviders, default-true
-            // upstream since 1.34).
-            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["get"] },
-            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] },
-            // Needed for kubelet to mount PVC-backed volumes: it must read the PVC and the PV
-            // it's bound to before it can attach/mount the underlying volume.
-            { "apiGroups": [""], "resources": ["persistentvolumeclaims"], "verbs": ["get"] },
-            { "apiGroups": [""], "resources": ["persistentvolumes"], "verbs": ["get"] },
-            { "apiGroups": [""], "resources": ["persistentvolumeclaims/status"], "verbs": ["get","update","patch"] },
-            // CSI: kubelet reads the VolumeAttachment to learn when volume attach has completed
-            // before it mounts.
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests"], "verbs": ["create","get","list","watch"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["create","delete","get","patch","update"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments"], "verbs": ["get"] },
-            // Unconditional upstream rule (not feature-gated). Any pod with spec.runtimeClassName
-            // set has its kubelet RuntimeClass lookup denied without this.
+            { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["persistentvolumeclaims/status"], "verbs": ["get","patch","update"] },
+            { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["create","delete","get","patch","update"] },
             { "apiGroups": ["node.k8s.io"], "resources": ["runtimeclasses"], "verbs": ["get","list","watch"] },
-            // DRA (Dynamic Resource Allocation), GA and default-true upstream since 1.34: kubelet's
-            // DRA plugin manager resolves ResourceClaims for pods using accelerator/device
-            // scheduling, and cleans up stale ResourceSlices it published.
             { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": ["get"] },
             { "apiGroups": ["resource.k8s.io"], "resources": ["resourceslices"], "verbs": ["deletecollection"] },
-            // Kubelet webhook authorizer and authenticator call back to the apiserver via
-            // SubjectAccessReview and TokenReview. Without these the kubelet denies all
-            // proxy requests (logs, exec, attach) with "Authorization error".
-            { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
-            { "apiGroups": ["authorization.k8s.io"], "resources": ["localsubjectaccessreviews"], "verbs": ["create"] },
-            { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
-            // Used to create a certificatesigningrequest for a node-specific client certificate,
-            // and watch for it to be signed. This allows the kubelet to rotate its own
-            // certificate. Matches upstream bootstrappolicy.go's NodeRules() exactly — without
-            // this, a joined node has no permission to even submit its own self-renewal CSR,
-            // regardless of whether the selfnodeclient ClusterRole/binding (which only governs
-            // KCM's SAR-based auto-approval) exists.
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests"], "verbs": ["create","get","list","watch"] },
-            // podCertificate projected volumes: kubelet creates and watches its own
-            // PodCertificateRequests; create is narrowed to the node's own pods by the
-            // NodeRestriction-equivalent check in the create handler.
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["get"] },
             { "apiGroups": ["certificates.k8s.io"], "resources": ["podcertificaterequests"], "verbs": ["create","get","list","watch"] }
         ]
     });
@@ -5704,6 +5655,118 @@ mod tests {
             has_rule("storage.k8s.io", "csinodes", "delete"),
             "system:node must be able to delete CSINode objects so kubelet can remove a stale \
              CSINode on CSI driver/node deregistration"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_system_node_rules_equal_upstream_release_1_37() {
+        // A kubelet without any of these verbs cannot e.g. mount projected
+        // ClusterTrustBundle / PodCertificate volumes, so Conformance pods hang Pending. The
+        // kubelet runs under this role (no admin masking), so every missing verb is a
+        // regression. Expected grants transcribed from release-1.37 bootstrappolicy
+        // testdata/cluster-roles.yaml (system:node); no deviations.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        const EXPECTED: &[(&str, &str, &[&str])] = &[
+            ("authentication.k8s.io", "tokenreviews", &["create"]),
+            (
+                "authorization.k8s.io",
+                "localsubjectaccessreviews",
+                &["create"],
+            ),
+            ("authorization.k8s.io", "subjectaccessreviews", &["create"]),
+            ("", "services", &["get", "list", "watch"]),
+            (
+                "",
+                "nodes",
+                &["create", "get", "list", "watch", "patch", "update"],
+            ),
+            ("", "nodes/status", &["patch", "update"]),
+            ("", "events", &["create", "patch", "update"]),
+            ("events.k8s.io", "events", &["create", "patch", "update"]),
+            ("", "pods", &["get", "list", "watch", "create", "delete"]),
+            ("", "pods/status", &["patch", "update"]),
+            ("", "pods/eviction", &["create"]),
+            ("", "configmaps", &["get", "list", "watch"]),
+            ("", "secrets", &["get", "list", "watch"]),
+            ("", "persistentvolumeclaims", &["get"]),
+            ("", "persistentvolumes", &["get"]),
+            ("", "endpoints", &["get"]),
+            (
+                "certificates.k8s.io",
+                "certificatesigningrequests",
+                &["create", "get", "list", "watch"],
+            ),
+            (
+                "coordination.k8s.io",
+                "leases",
+                &["create", "delete", "get", "patch", "update"],
+            ),
+            ("storage.k8s.io", "volumeattachments", &["get"]),
+            ("", "serviceaccounts/token", &["create"]),
+            (
+                "",
+                "persistentvolumeclaims/status",
+                &["get", "patch", "update"],
+            ),
+            ("storage.k8s.io", "csidrivers", &["get", "list", "watch"]),
+            (
+                "storage.k8s.io",
+                "csinodes",
+                &["create", "delete", "get", "patch", "update"],
+            ),
+            ("node.k8s.io", "runtimeclasses", &["get", "list", "watch"]),
+            ("resource.k8s.io", "resourceclaims", &["get"]),
+            ("resource.k8s.io", "resourceslices", &["deletecollection"]),
+            (
+                "certificates.k8s.io",
+                "clustertrustbundles",
+                &["get", "list", "watch"],
+            ),
+            ("", "serviceaccounts", &["get"]),
+            (
+                "certificates.k8s.io",
+                "podcertificaterequests",
+                &["create", "get", "list", "watch"],
+            ),
+        ];
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+        let key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let obj = store
+            .get(&key)
+            .await
+            .expect("get")
+            .expect("system:node exists");
+        let cr: serde_json::Value = serde_json::from_slice(&obj.value).expect("valid json");
+
+        let mut actual = std::collections::BTreeSet::new();
+        for rule in cr["rules"].as_array().expect("rules array") {
+            let strs = |k: &str| -> Vec<String> {
+                rule[k]
+                    .as_array()
+                    .map(|a| a.iter().map(|v| v.as_str().unwrap().to_owned()).collect())
+                    .unwrap_or_default()
+            };
+            for g in strs("apiGroups") {
+                for r in strs("resources") {
+                    for v in strs("verbs") {
+                        actual.insert((g.clone(), r.clone(), v));
+                    }
+                }
+            }
+        }
+        let mut expected = std::collections::BTreeSet::new();
+        for (g, r, verbs) in EXPECTED {
+            for v in *verbs {
+                expected.insert((g.to_string(), r.to_string(), v.to_string()));
+            }
+        }
+        let missing: Vec<_> = expected.difference(&actual).collect();
+        let extra: Vec<_> = actual.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "seeded system:node must equal upstream release-1.37; missing: {missing:?}; extra: {extra:?}"
         );
     }
 

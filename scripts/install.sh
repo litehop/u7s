@@ -679,6 +679,86 @@ EOF
   echo "Join CSR approved and signed -- kubelet's dedicated x509 kubeconfig written to $STATE_DIR/kubeconfig"
 }
 
+# Control-plane kubelet identity: system:node:<name> in system:nodes, issued the
+# way join_cluster issues a worker's (kubelet-client CSR, signed by KCM), but
+# submitted with the operator's admin kubeconfig since no bootstrap token is
+# needed on the node that holds the CA. KCM's csrapproving controller approves
+# it because the submitter, admin (system:masters), passes the node-client
+# SubjectAccessReview. The admin kubeconfig never reaches the kubelet, so the
+# Node authorizer and NodeRestriction bind it like any other node; kubelet then
+# rotates the cert itself (rotateCertificates). This narrows the kubelet's
+# network credential only: it runs as root beside admin.pem and ca.key, so it is
+# not a filesystem boundary. Skipped while a valid cert chaining to the current
+# CA exists, so a re-run never replaces the identity kubelet already rotated.
+issue_cp_kubelet_identity() {
+  local kubelet_kubeconfig="$STATE_DIR/kubelet-kubeconfig"
+  local cert
+  if [ -s "$kubelet_kubeconfig" ] && cert="$(current_client_cert)"; then
+    echo "Control-plane kubelet identity present ($cert); not re-issuing."
+    return 0
+  fi
+
+  ensure_jq
+  local admin=(kubectl --kubeconfig="$STATE_DIR/kubeconfig")
+  local server
+  server="$("${admin[@]}" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+
+  openssl ecparam -name prime256v1 -genkey -noout -out "$STATE_DIR/kubelet-client.key"
+  chmod 600 "$STATE_DIR/kubelet-client.key"
+  openssl req -new -key "$STATE_DIR/kubelet-client.key" \
+    -subj "/O=system:nodes/CN=system:node:$NODE_NAME" \
+    -out "$STATE_DIR/kubelet-client.csr"
+
+  local csr_name
+  csr_name="kubelet-${NODE_NAME}-$(date +%s)"
+  jq -n -c \
+    --arg name "$csr_name" \
+    --arg request "$(base64 -w0 < "$STATE_DIR/kubelet-client.csr")" \
+    '{apiVersion: "certificates.k8s.io/v1", kind: "CertificateSigningRequest",
+      metadata: {name: $name},
+      spec: {request: $request,
+             signerName: "kubernetes.io/kube-apiserver-client-kubelet",
+             usages: ["digital signature", "key encipherment", "client auth"]}}' \
+    | "${admin[@]}" create -f - >/dev/null
+  rm -f "$STATE_DIR/kubelet-client.csr"
+
+  echo "Waiting for kube-controller-manager to auto-approve and sign CSR '$csr_name'..."
+  local signed_cert_b64=""
+  for _ in $(seq 1 60); do
+    signed_cert_b64="$("${admin[@]}" get csr "$csr_name" -o jsonpath='{.status.certificate}' 2>/dev/null || true)"
+    [ -n "$signed_cert_b64" ] && break
+    sleep 2
+  done
+  if [ -z "$signed_cert_b64" ]; then
+    echo "error: CSR '$csr_name' was not approved+signed within 120s (check: kubectl get csr $csr_name, journalctl -u u7s-kcm)" >&2
+    exit 1
+  fi
+  printf '%s' "$signed_cert_b64" | base64 -d > "$STATE_DIR/kubelet-client.crt"
+
+  cat > "$kubelet_kubeconfig" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: $server
+    certificate-authority: $STATE_DIR/ca-bundle.pem
+  name: u7s
+contexts:
+- context:
+    cluster: u7s
+    user: system:node:$NODE_NAME
+  name: u7s
+current-context: u7s
+users:
+- name: system:node:$NODE_NAME
+  user:
+    client-certificate: $STATE_DIR/kubelet-client.crt
+    client-key: $STATE_DIR/kubelet-client.key
+EOF
+  chmod 600 "$kubelet_kubeconfig"
+  echo "Control-plane kubelet identity issued: system:node:$NODE_NAME ($kubelet_kubeconfig)"
+}
+
 # Success condition of a join, checked as the new node identity after kubelet
 # started: the Node is Ready and the kubelet's own kubelet-serving CSR
 # (serverTLSBootstrap) is Approved and Issued. The apiserver's approver only
@@ -717,11 +797,14 @@ wait_for_joined_node() {
 # rotated client cert, from --cert-dir). It authenticates with its own client
 # cert, so an upgrade needs no token.
 
-# Prints the path of the newest still-valid client cert, rotated first.
+# Prints the path of the newest client cert that is unexpired and chains to
+# the current CA (ca-bundle.pem on the control plane, else ca.pem), rotated first.
 current_client_cert() {
-  local c
+  local c ca="$STATE_DIR/ca.pem"
+  [ -s "$STATE_DIR/ca-bundle.pem" ] && ca="$STATE_DIR/ca-bundle.pem"
   for c in "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" "$STATE_DIR/kubelet-client.crt"; do
-    if [ -s "$c" ] && openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1; then
+    if [ -s "$c" ] && openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1 \
+      && openssl verify -CAfile "$ca" "$c" >/dev/null 2>&1; then
       printf '%s' "$c"
       return 0
     fi
@@ -1513,7 +1596,7 @@ ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE
 ExecStartPre=/bin/bash -c 'test -s $STATE_DIR/kubelet-serving.crt || { openssl ecparam -name prime256v1 -genkey -noout -out $STATE_DIR/kubelet-serving.key && chmod 600 $STATE_DIR/kubelet-serving.key && openssl req -new -key $STATE_DIR/kubelet-serving.key -subj "/CN=$NODE_NAME" -out $STATE_DIR/kubelet-serving.csr && openssl x509 -req -in $STATE_DIR/kubelet-serving.csr -CA $STATE_DIR/ca.pem -CAkey $STATE_DIR/ca.key -CAcreateserial -days 3650 -extfile <(printf "subjectAltName=IP:$IFACE_IP\nextendedKeyUsage=serverAuth\n") -out $STATE_DIR/kubelet-serving.crt; }'
 # --cert-dir -- see the worker-mode kubelet.service block above for why this
 # must be a CLI flag under $STATE_DIR rather than a kubelet-config.yaml key.
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubelet-kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 
@@ -1539,6 +1622,7 @@ systemctl enable u7s-kcm.service
 systemctl restart u7s-kcm.service
 systemctl enable u7s-kcm-restart.path
 systemctl restart u7s-kcm-restart.path
+issue_cp_kubelet_identity
 systemctl enable kubelet.service
 systemctl restart kubelet.service
 

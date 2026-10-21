@@ -1248,7 +1248,7 @@ write_join_runner() {
     echo 'sleep() { :; }'
     echo 'ensure_jq() { :; }'
     grep '^JOIN_TOKEN_TTL_SECONDS=' "$INSTALL"
-    for fn in wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
+    for fn in issue_cp_kubelet_identity current_client_cert wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1326,6 +1326,59 @@ assert_true "the control-plane kubelet keeps its minted CA-signed serving cert" 
   grep -qxF "tlsCertFile: $JOIN_WORK/cfg-cp/kubelet-serving.crt" "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
 assert_false "the control-plane kubelet does not enable serverTLSBootstrap (its CSR would sit beside the minted cert)" \
   grep -q '^serverTLSBootstrap' "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
+assert_true "the control-plane kubelet rotates its own client cert (a node identity that never renews is a time bomb at cert expiry)" \
+  grep -qxF 'rotateCertificates: true' "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
+
+# ---------------------------------------------------------------------------
+# A compromised control-plane kubelet must not be cluster-admin: it runs on its
+# own system:node:<name> client cert, never the admin kubeconfig, so the Node
+# authorizer / NodeRestriction apply to it.
+# ---------------------------------------------------------------------------
+assert_false "the control-plane kubelet.service must not be handed the admin kubeconfig (system:masters would bypass the Node authorizer and NodeRestriction, and the admin cert never rotates)" \
+  grep -qF -- '--kubeconfig=$STATE_DIR/kubeconfig' <<<"$kubelet_cp_block"
+assert_true "the control-plane kubelet.service uses the dedicated node kubeconfig" \
+  grep -qF -- '--kubeconfig=$STATE_DIR/kubelet-kubeconfig' <<<"$kubelet_cp_block"
+
+CPID_DIR="$JOIN_WORK/cp-identity"
+mkdir -p "$CPID_DIR"
+cp "$JOIN_CA_DIR/ca.pem" "$CPID_DIR/ca.pem"
+touch "$CPID_DIR/kubeconfig"
+CPID_RUNNER="$JOIN_WORK/cpid.sh"
+write_join_runner "$CPID_RUNNER" '
+NODE_NAME=cp1
+kubectl() {
+  printf "%s\n" "$*" >> "$STATE_DIR/kubectl-argv"
+  case "$*" in
+    *"config view"*) printf "https://cp.example:6443" ;;
+    *"create -f -"*) cat > "$STATE_DIR/created-csr.json" ;;
+    *"get csr"*)
+      jq -r .spec.request "$STATE_DIR/created-csr.json" | command base64 -d > "$STATE_DIR/stub.csr"
+      openssl x509 -req -in "$STATE_DIR/stub.csr" -CA "$STATE_DIR/ca.pem" -CAkey "$CPID_CA_KEY" -CAcreateserial -days 1 -out "$STATE_DIR/stub.crt" 2>/dev/null
+      command base64 < "$STATE_DIR/stub.crt" | tr -d "\n" ;;
+  esac
+}
+issue_cp_kubelet_identity'
+cpid_out="$(CPID_CA_KEY="$JOIN_WORK/ca.key" bash "$CPID_RUNNER" "$CPID_DIR" 2>&1)" || {
+  echo "FAIL: control-plane identity runner crashed: $cpid_out"
+  exit 1
+}
+cpid_csr_subject="$(openssl req -in "$CPID_DIR/stub.csr" -noout -subject 2>/dev/null)"
+assert "the control-plane kubelet CSR asks for CN=system:node:<name> in O=system:nodes (the identity the Node authorizer recognises)" \
+  "$(printf '%s' "$cpid_csr_subject" | grep -q 'system:node:cp1' && printf '%s' "$cpid_csr_subject" | grep -q 'system:nodes' && echo 1 || echo 0)"
+assert "the control-plane kubelet CSR uses the kubelet-client signer, the only one csrapproving auto-approves for nodes" \
+  "$([ "$(jq -r .spec.signerName "$CPID_DIR/created-csr.json")" = kubernetes.io/kube-apiserver-client-kubelet ] && echo 1 || echo 0)"
+assert "the node kubeconfig points at the issued kubelet client cert/key, not the admin cert" \
+  "$(grep -qF "client-certificate: $CPID_DIR/kubelet-client.crt" "$CPID_DIR/kubelet-kubeconfig" && ! grep -q 'admin' "$CPID_DIR/kubelet-kubeconfig" && echo 1 || echo 0)"
+assert "the node kubeconfig is not world-readable (it holds a node credential)" \
+  "$([ "$(stat -c %a "$CPID_DIR/kubelet-kubeconfig" 2>/dev/null || stat -f %Lp "$CPID_DIR/kubelet-kubeconfig")" = 600 ] && echo 1 || echo 0)"
+cpid_csr_before="$(grep -c 'create -f -' "$CPID_DIR/kubectl-argv")"
+CPID_CA_KEY="$JOIN_WORK/ca.key" bash "$CPID_RUNNER" "$CPID_DIR" >/dev/null 2>&1 || true
+assert "a re-run keeps the existing valid identity instead of issuing another CSR (kubelet may already have rotated it)" \
+  "$([ "$(grep -c 'create -f -' "$CPID_DIR/kubectl-argv")" -eq "$cpid_csr_before" ] && echo 1 || echo 0)"
+openssl req -x509 -new -key "$CPID_DIR/kubelet-client.key" -subj "/CN=old-ca-issued" -days 30 -out "$CPID_DIR/kubelet-client.crt" 2>/dev/null
+CPID_CA_KEY="$JOIN_WORK/ca.key" bash "$CPID_RUNNER" "$CPID_DIR" >/dev/null 2>&1 || true
+assert "a re-run re-issues the identity when the stored cert does not chain to the current CA (a restored/reset CA would otherwise leave the kubelet on a cert the apiserver rejects)" \
+  "$([ "$(grep -c 'create -f -' "$CPID_DIR/kubectl-argv")" -eq $((cpid_csr_before + 1)) ] && echo 1 || echo 0)"
 FLAGS_RUNNER="$JOIN_WORK/flags.sh"
 {
   awk '/^kubelet_round2_flags\(\) \{$/,/^}$/' "$INSTALL"
@@ -1461,7 +1514,8 @@ write_upgrade_runner() {
 UPG_KEY="$UPG_WORK/client.key"
 openssl ecparam -name prime256v1 -genkey -noout -out "$UPG_KEY"
 openssl req -new -key "$UPG_KEY" -subj "/O=system:nodes/CN=system:node:n1" -out "$UPG_WORK/client.csr"
-openssl req -x509 -new -key "$UPG_KEY" -subj "/CN=valid" -days 30 -out "$UPG_WORK/valid.crt" 2>/dev/null
+openssl x509 -req -in "$UPG_WORK/client.csr" -CA "$JOIN_CA_DIR/ca.pem" -CAkey "$JOIN_WORK/ca.key" -CAcreateserial -days 1 -out "$UPG_WORK/valid.crt" 2>/dev/null
+openssl req -x509 -new -key "$UPG_KEY" -subj "/CN=valid" -days 30 -out "$UPG_WORK/foreign-ca.crt" 2>/dev/null
 mkdir -p "$UPG_WORK/ca"
 : > "$UPG_WORK/ca/index.txt"
 echo 01 > "$UPG_WORK/ca/serial"
@@ -1501,6 +1555,18 @@ ok_dir="$(new_worker_state valid "$UPG_WORK/valid.crt")"
 ok_status=0; bash "$VERIFY_RUNNER" "$ok_dir" >/dev/null 2>&1 || ok_status=$?
 assert "a joined worker with a valid client identity passes the pre-upgrade check (no token is asked for)" \
   "$([ "$ok_status" -eq 0 ] && echo 1 || echo 0)"
+
+CURRENT_RUNNER="$UPG_WORK/current.sh"
+write_upgrade_runner "$CURRENT_RUNNER" 'current_client_cert'
+foreign_dir="$(new_worker_state foreign "$UPG_WORK/foreign-ca.crt")"
+foreign_status=0; bash "$CURRENT_RUNNER" "$foreign_dir" >/dev/null 2>&1 || foreign_status=$?
+assert "an unexpired client cert NOT signed by the current CA is not treated as current (after a CA reset the kubelet would 401 and the control plane would never re-issue)" \
+  "$([ "$foreign_status" -ne 0 ] && echo 1 || echo 0)"
+cp "$UPG_WORK/foreign-ca.crt" "$ok_dir/ca-bundle.pem"
+bundle_status=0; bash "$CURRENT_RUNNER" "$ok_dir" >/dev/null 2>&1 || bundle_status=$?
+assert "ca-bundle.pem, when present, is the trust anchor: a cert it does not chain to is rejected even if ca.pem signed it" \
+  "$([ "$bundle_status" -ne 0 ] && echo 1 || echo 0)"
+rm -f "$ok_dir/ca-bundle.pem"
 
 exp_dir="$(new_worker_state expired "$UPG_WORK/expired.crt")"
 exp_status=0; exp_out="$(bash "$VERIFY_RUNNER" "$exp_dir" 2>&1)" || exp_status=$?
