@@ -1444,4 +1444,169 @@ mod cases {
         )
         .await;
     }
+
+    /// With no mutating admission configured the status write skips the status strategy, so
+    /// the handler's own field restriction is the only guard. A /status writer (e.g. a
+    /// kubelet-scoped client) must never be able to change spec or labels by sneaking them into
+    /// the body, for built-ins and for custom resources alike.
+    #[tokio::test]
+    async fn status_write_without_mutators_never_persists_spec_or_label_edits() {
+        let c = Cluster::new().await;
+        c.create_pod("p").await;
+        c.create(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            crd("widgets", "Widget", "Namespaced"),
+        )
+        .await;
+        let widgets = "/apis/example.com/v1/namespaces/default/widgets";
+        c.create(
+            widgets,
+            json!({"apiVersion": "example.com/v1", "kind": "Widget",
+                "metadata": {"name": "w", "labels": {"owner": "team-a"}},
+                "spec": {"size": 1}}),
+        )
+        .await;
+
+        let cases = [
+            (
+                "pod",
+                "/api/v1/namespaces/default/pods/p/status".to_string(),
+                json!({"apiVersion": "v1", "kind": "Pod",
+                    "metadata": {"name": "p", "labels": {"owner": "mallory"}},
+                    "spec": {"containers": [{"name": "app", "image": "evil"}]},
+                    "status": {"phase": "Running"}}),
+                json!({"metadata": {"labels": {"owner": "mallory"}},
+                    "spec": {"containers": [{"name": "app", "image": "evil"}]},
+                    "status": {"phase": "Running"}}),
+            ),
+            (
+                "custom resource",
+                format!("{widgets}/w/status"),
+                json!({"apiVersion": "example.com/v1", "kind": "Widget",
+                    "metadata": {"name": "w", "labels": {"owner": "mallory"}},
+                    "spec": {"size": 99}, "status": {"replicas": 5}}),
+                json!({"metadata": {"labels": {"owner": "mallory"}},
+                    "spec": {"size": 99}, "status": {"replicas": 5}}),
+            ),
+        ];
+        for (what, uri, put_body, patch_body) in cases {
+            for (verb, ct, body) in [
+                ("PUT", "application/json", put_body),
+                ("merge-PATCH", MERGE, patch_body),
+            ] {
+                let method = if verb == "PUT" { "PUT" } else { "PATCH" };
+                let (status, resp) = c.call(method, &uri, ct, body).await;
+                assert_eq!(status, StatusCode::OK, "{what} {verb}: {resp}");
+                let stored = if what == "pod" {
+                    c.stored_pod("p").await
+                } else {
+                    c.stored("/registry/cr/example.com/widgets/default/w").await
+                };
+                if what == "pod" {
+                    assert_eq!(stored["status"]["phase"], "Running", "{what} {verb}");
+                    assert_eq!(
+                        stored["spec"]["containers"][0]["image"], "nginx",
+                        "{what} {verb}: a /status write must not change spec: {stored}"
+                    );
+                    assert!(
+                        stored["metadata"]["labels"].is_null(),
+                        "{what} {verb}: a /status write must not set labels: {stored}"
+                    );
+                } else {
+                    assert_eq!(stored["status"]["replicas"], 5, "{what} {verb}");
+                    assert_eq!(
+                        stored["spec"]["size"], 1,
+                        "{what} {verb}: a /status write must not change spec: {stored}"
+                    );
+                    assert_eq!(
+                        stored["metadata"]["labels"]["owner"], "team-a",
+                        "{what} {verb}: a /status write must not change labels: {stored}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A CRD served at two versions where the storage version is not the one the client uses.
+    fn two_version_crd() -> Value {
+        let mut c = crd("widgets", "Widget", "Namespaced");
+        let schema = c["spec"]["versions"][0]["schema"].clone();
+        c["spec"]["versions"] = json!([
+            {"name": "v1", "served": true, "storage": true, "schema": schema.clone(),
+                "subresources": {"status": {}}},
+            {"name": "v2", "served": true, "storage": false, "schema": schema,
+                "subresources": {"status": {}}}
+        ]);
+        c
+    }
+
+    /// Webhooks dispatch on `request.kind`/`request.resource` versions. When a client writes a
+    /// CR through a non-storage version, upstream sends that version (the version the rule
+    /// matched, which for an exact match is the request's own): reporting the storage version
+    /// would make a v2-only policy see an object shape the client never sent.
+    #[tokio::test]
+    async fn webhook_for_cr_written_at_non_storage_version_sees_the_requested_version() {
+        let c = Cluster::new().await;
+        c.create(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            two_version_crd(),
+        )
+        .await;
+        let widgets = "/apis/example.com/v2/namespaces/default/widgets";
+        c.create(
+            widgets,
+            json!({"apiVersion": "example.com/v2", "kind": "Widget",
+                "metadata": {"name": "w"}, "spec": {"size": 1}}),
+        )
+        .await;
+        let hook = spawn_hook(|_| json!({"allowed": true})).await;
+        register_webhook(
+            &c.store,
+            false,
+            "seen",
+            &hook.url,
+            "example.com",
+            &["widgets", "widgets/status"],
+            &["CREATE", "UPDATE"],
+        )
+        .await;
+
+        let (status, resp) = c
+            .call(
+                "POST",
+                widgets,
+                "application/json",
+                json!({"apiVersion": "example.com/v2", "kind": "Widget",
+                    "metadata": {"name": "w2"}, "spec": {"size": 1}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{resp}");
+        let (status, resp) = c
+            .call(
+                "PUT",
+                &format!("{widgets}/w/status"),
+                "application/json",
+                json!({"apiVersion": "example.com/v2", "kind": "Widget",
+                    "metadata": {"name": "w"}, "status": {"replicas": 2}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let (status, resp) = c
+            .call(
+                "PATCH",
+                &format!("{widgets}/w/status"),
+                MERGE,
+                json!({"status": {"replicas": 3}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+
+        let reqs = hook.requests();
+        assert_eq!(reqs.len(), 3, "{reqs:?}");
+        for r in &reqs {
+            assert_eq!(r["kind"]["version"], "v2", "kind version: {r}");
+            assert_eq!(r["kind"]["kind"], "Widget", "{r}");
+            assert_eq!(r["resource"]["version"], "v2", "resource version: {r}");
+        }
+    }
 }
