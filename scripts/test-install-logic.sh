@@ -1194,6 +1194,40 @@ assert_true "the control-plane kubelet CSR name is built from NODE_NAME (so the 
 assert_true "the CSR subject CN uses NODE_NAME, so it is the lowercase system:node:<name> the node authorizer expects" \
   grep -qF -- '-subj "/O=system:nodes/CN=system:node:$NODE_NAME"' "$INSTALL"
 
+# Case 6b: the control-plane Node must carry node-role.kubernetes.io/control-plane
+# (empty value) like kubeadm's mark-control-plane. The kubelet cannot label
+# itself under NodeRestriction, so install.sh does it with the admin kubeconfig.
+LABEL_WORK="$PERSIST_WORK/label"
+mkdir -p "$LABEL_WORK"
+label_runner="$LABEL_WORK/label.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'STATE_DIR="$1"; NODE_NAME="$2"'
+  echo 'sleep() { :; }'
+  echo 'kubectl() { echo "$*" >> "$STATE_DIR/kubectl.log"; if [ -f "$STATE_DIR/kubectl-fail" ]; then echo "nodes \"$NODE_NAME\" not found" >&2; return 1; fi; }'
+  awk '/^label_control_plane_node\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$INSTALL"
+  echo 'label_control_plane_node'
+} > "$label_runner"
+label_ok_out="$(bash "$label_runner" "$LABEL_WORK" "$LOWER_HOST" 2>&1 || true)"
+assert "install labels the lowercase Node with node-role.kubernetes.io/control-plane= via the admin kubeconfig (otherwise tooling that selects control-plane nodes by this label finds none, and kubectl get nodes shows no ROLES)" \
+  "$(grep -qxF -- "--kubeconfig=$LABEL_WORK/kubeconfig label node $LOWER_HOST --overwrite node-role.kubernetes.io/control-plane=" "$LABEL_WORK/kubectl.log" && echo 1 || echo 0)"
+assert "labelling uses --overwrite so an install.sh re-run on a labelled Node is a no-op instead of an error" \
+  "$(grep -qF -- '--overwrite' "$LABEL_WORK/kubectl.log" && echo 1 || echo 0)"
+assert "labelling reports success on the happy path" \
+  "$(printf '%s' "$label_ok_out" | grep -q 'labelled node-role.kubernetes.io/control-plane' && echo 1 || echo 0)"
+assert_false "install does not add a control-plane NoSchedule taint (u7s is single-node-first; workloads must schedule on the only node)" \
+  grep -qE 'kubectl.*taint|NoSchedule' <(awk '/^label_control_plane_node\(\) \{/{f=1} f&&!/^#/{print} f&&/^}$/{exit}' "$INSTALL")
+touch "$LABEL_WORK/kubectl-fail"
+if bash "$label_runner" "$LABEL_WORK" "$LOWER_HOST" > "$LABEL_WORK/fail.out" 2>&1; then
+  assert "a Node that never accepts the label fails the install loudly (silent success would leave no control-plane-labelled Node)" 0
+else
+  assert "a Node that never accepts the label fails the install loudly (silent success would leave no control-plane-labelled Node)" \
+    "$(grep -q 'could not label node' "$LABEL_WORK/fail.out" && echo 1 || echo 0)"
+fi
+assert "the control-plane install path calls label_control_plane_node exactly once, and join_cluster does not (joined workers must not carry the control-plane role)" \
+  "$([ "$(grep -c '^label_control_plane_node || exit 1$' "$INSTALL")" = 1 ] && ! awk '/^join_cluster\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$INSTALL" | grep -q label_control_plane_node && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # Mutation self-check (CLAUDE.md rule 14): prove the --iface refusal assertion
 # above would actually catch a reverted fix. Bypass the guard in a scratch

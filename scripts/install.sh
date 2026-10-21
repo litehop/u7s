@@ -759,6 +759,28 @@ EOF
   echo "Control-plane kubelet identity issued: system:node:$NODE_NAME ($kubelet_kubeconfig)"
 }
 
+# kubeadm's mark-control-plane phase labels the control-plane Node
+# node-role.kubernetes.io/control-plane="". The kubelet cannot do it itself:
+# NodeRestriction forbids a node setting node-role.* labels on its own Node,
+# so the admin kubeconfig applies it once the Node has registered. --overwrite
+# makes a re-run a no-op. Deliberately not applied: kubeadm's control-plane
+# NoSchedule taint (u7s is single-node-first, so workloads must schedule here)
+# and the exclude-from-external-load-balancers label (it would drop the only
+# node from every LB).
+label_control_plane_node() {
+  local admin=(kubectl --kubeconfig="$STATE_DIR/kubeconfig") i err=""
+  echo "Waiting up to 5 min for node $NODE_NAME to register, then labelling it control-plane..."
+  for i in $(seq 1 150); do
+    if err="$("${admin[@]}" label node "$NODE_NAME" --overwrite node-role.kubernetes.io/control-plane= 2>&1)"; then
+      echo "Node $NODE_NAME labelled node-role.kubernetes.io/control-plane."
+      return 0
+    fi
+    sleep 2
+  done
+  echo "error: could not label node $NODE_NAME node-role.kubernetes.io/control-plane within 5 min (last error: $err). Tooling that selects control-plane nodes by this label would find none; check 'kubectl get node $NODE_NAME' and journalctl -u kubelet." >&2
+  return 1
+}
+
 # Success condition of a join, checked as the new node identity after kubelet
 # started: the Node is Ready and the kubelet's own kubelet-serving CSR
 # (serverTLSBootstrap) is Approved and Issued. The apiserver's approver only
@@ -1654,6 +1676,7 @@ wait_for_apiserver "$KUBECONFIG_PATH"
 if [ "$EXISTING_INSTALL" -eq 1 ]; then
   verify_cp_identity_preserved "$CP_IDENTITY_BEFORE" || exit 1
 fi
+label_control_plane_node || exit 1
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"
