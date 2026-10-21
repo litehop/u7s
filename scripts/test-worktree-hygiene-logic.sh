@@ -1105,7 +1105,7 @@ assert "STEP H alert names the decisive run (id, conclusion, created time, URL),
   "$([ "$H_RC" -eq 4 ] && echo "$H_OUT" | grep -q 'run 42 timed_out at 2026-01-02T03:04:05Z: https://example.test/runs/42' && echo 1 || echo 0)"
 
 H_RC=0
-PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[{"conclusion":"success"}]'bash "$SCRIPT" __call step_h_main_audit >/dev/null 2>&1 || H_RC=$?
+PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[{"conclusion":"success"}]' bash "$SCRIPT" __call step_h_main_audit >/dev/null 2>&1 || H_RC=$?
 assert "STEP H returns 0 when main's audit is green" \
   "$([ "$H_RC" -eq 0 ] && echo 1 || echo 0)"
 
