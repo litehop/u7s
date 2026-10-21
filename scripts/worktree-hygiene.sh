@@ -98,7 +98,7 @@
 #   is kept.
 # STEP G: reap fix-round worktrees on non-worker branch names (see below).
 # STEP H: read-only. Report loudly when the latest completed `audit.yaml`
-#   run on main is not a success (run URL plus any RUSTSEC-/GHSA- ids from
+#   decisive run on main is red (`failure`/`timed_out`/`startup_failure`) (run URL plus any RUSTSEC-/GHSA- ids from
 #   its log). The audit is deliberately non-blocking for PRs, so this is
 #   the only place a red main audit gets noticed. Runs under both
 #   --live-agents and --no-live-workers; never skipped by a guard.
@@ -109,9 +109,10 @@
 #       could not remove a worktree/branch).
 #   2 = refusal: missing/conflicting --live-agents / --no-live-workers (no
 #       step ran).
-#   4 = STEP H: main's latest completed audit run is not a success. Combines
-#       with 1 (5). A `gh` failure or no completed run is reported as a
-#       warning and does NOT set this bit: the check could not decide, and
+#   4 = STEP H: main's latest decisive audit run is red (`failure`,
+#       `timed_out`, `startup_failure`; cancelled/skipped runs are looked
+#       past). Combines with 1 (5). A `gh` failure or no decisive run is
+#       reported as a warning and does NOT set this bit: the check could not decide, and
 #       a spurious "audit failing" on every offline tick would train the
 #       mayor to ignore the code.
 # Details on code 1 -- STEP A's kill-verify failure (a process
@@ -795,23 +796,31 @@ step_g_fix_round_worktrees() {
 # ---------------------------------------------------------------------------
 AUDIT_FAILING_RC=4
 
-# Pure: `gh run list --json conclusion,...` output (arg 1) ->
-# prints ok | failing | unknown. Anything but a `success` conclusion on the
-# latest completed run is failing; an empty list or unparseable input is
-# unknown (nothing to judge).
+# Pure: `gh run list --json conclusion,...` output (arg 1, newest first) ->
+# prints the newest decisive run as one JSON object, or nothing. Decisive =
+# success, or failure/timed_out/startup_failure (an audit that cannot
+# complete is as actionable as a red one). cancelled/skipped/neutral/
+# action_required/anything else says nothing about the lockfile, so it is
+# looked past.
+audit_decisive_run() {
+  printf '%s' "${1:-}" | jq -c '[.[] | select(.conclusion == "success" or .conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure")] | first // empty' 2>/dev/null || true
+}
+
+# Pure: same input -> prints ok | failing | unknown. Unknown = no decisive
+# run, an empty list or unparseable input (nothing to judge).
 audit_verdict() {
   local conclusion
-  conclusion=$(printf '%s' "${1:-}" | jq -r '.[0].conclusion // empty' 2>/dev/null) || conclusion=""
+  conclusion=$(audit_decisive_run "${1:-}" | jq -r '.conclusion' 2>/dev/null) || conclusion=""
   case "$conclusion" in
-    "") echo unknown ;;
     success) echo ok ;;
-    *) echo failing ;;
+    failure|timed_out|startup_failure) echo failing ;;
+    *) echo unknown ;;
   esac
 }
 
 step_h_main_audit() {
-  local json verdict id url advisories
-  if ! json=$(gh run list -R litehop/u7s --workflow audit.yaml --branch main --status completed --limit 1 --json databaseId,conclusion,createdAt,event,url); then
+  local json verdict run id url conclusion created advisories
+  if ! json=$(gh run list -R litehop/u7s --workflow audit.yaml --branch main --status completed --limit 10 --json databaseId,conclusion,createdAt,event,url); then
     echo "worktree-hygiene: STEP H WARNING: could not query main's audit runs (gh failed); audit status unknown" >&2
     return 0
   fi
@@ -819,14 +828,17 @@ step_h_main_audit() {
   case "$verdict" in
     ok) return 0 ;;
     unknown)
-      echo "worktree-hygiene: STEP H WARNING: no completed audit.yaml run on main (or unparseable gh output); audit status unknown" >&2
+      echo "worktree-hygiene: STEP H WARNING: no decisive audit.yaml run among main's last completed runs (or unparseable gh output); audit status unknown" >&2
       return 0
       ;;
   esac
-  id=$(printf '%s' "$json" | jq -r '.[0].databaseId')
-  url=$(printf '%s' "$json" | jq -r '.[0].url')
+  run=$(audit_decisive_run "$json")
+  id=$(printf '%s' "$run" | jq -r '.databaseId')
+  url=$(printf '%s' "$run" | jq -r '.url')
+  conclusion=$(printf '%s' "$run" | jq -r '.conclusion')
+  created=$(printf '%s' "$run" | jq -r '.createdAt')
   advisories=$(gh run view "$id" -R litehop/u7s --log 2>/dev/null | grep -oE 'RUSTSEC-[0-9]{4}-[0-9]+|GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}' | sort -u | tr '\n' ' ' || true)
-  echo "worktree-hygiene: STEP H ALERT: main's latest audit.yaml run FAILED ($(printf '%s' "$json" | jq -r '.[0].conclusion')): $url -- advisories: ${advisories:-none extracted}. Investigate and dispatch a bump bead." >&2
+  echo "worktree-hygiene: STEP H ALERT: main's latest decisive audit.yaml run is red: run $id $conclusion at $created: $url -- advisories: ${advisories:-none extracted}. Investigate and dispatch a bump bead." >&2
   return "$AUDIT_FAILING_RC"
 }
 
