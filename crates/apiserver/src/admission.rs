@@ -1199,8 +1199,8 @@ async fn match_webhook_rules<S: Store>(
         return Ok(None);
     }
     let base_resource = split_subresource(ctx.resource).0;
-    // Only "no such CRD" means there are no equivalents; any other failure must reach the
-    // caller so the webhook's failurePolicy applies instead of silently skipping it.
+    // Only "no such CRD" means there are no equivalents; any other failure returns 500
+    // InternalError regardless of failurePolicy (upstream ShouldCallHook).
     let crd =
         match crate::handlers::cr::find_crd(state, ctx.group, ctx.version, base_resource).await {
             Ok(crd) => crd,
