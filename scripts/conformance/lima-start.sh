@@ -449,7 +449,7 @@ if [ -f "$CA_CERT" ]; then
   # File-path kubeconfig: kubelet re-reads the cert files it points at.
   NODE_CLIENT_KEY="$(dirname "$KUBECONFIG_PATH")/kubelet-client${NODE_SUFFIX}.key"
   NODE_CLIENT_CRT="$(dirname "$KUBECONFIG_PATH")/kubelet-client${NODE_SUFFIX}.crt"
-  if [ ! -f "$NODE_CLIENT_KEY" ] || [ ! -f "$NODE_CLIENT_CRT" ]; then
+  if [ ! -f "$NODE_CLIENT_KEY" ] || ! node_client_cert_valid "$NODE_CLIENT_CRT" "$CA_PEM"; then
     NODE_CLIENT_CSR=$(mktemp)
     openssl ecparam -genkey -name prime256v1 -noout -out "$NODE_CLIENT_KEY"
     openssl req -new -key "$NODE_CLIENT_KEY" \
@@ -469,6 +469,7 @@ if [ -f "$CA_CERT" ]; then
   limactl shell "$VM_NAME" sudo cp /tmp/kubelet-client.key /etc/kubelet-client.key
   limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-client.crt
   limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-client.key
+  limactl shell "$VM_NAME" rm -f /tmp/kubelet-client.key
   NODE_KUBECONFIG=$(mktemp)
   cat > "$NODE_KUBECONFIG" <<KCEOF
 apiVersion: v1

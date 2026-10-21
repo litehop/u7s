@@ -680,13 +680,16 @@ EOF
 }
 
 # Control-plane kubelet identity: system:node:<name> in system:nodes, issued the
-# way join_cluster issues a worker's (kubelet-client CSR, auto-approved and
-# signed by KCM), but submitted with the operator's admin kubeconfig since no
-# bootstrap token is needed on the node that holds the CA. The admin kubeconfig
-# (system:masters) never reaches the kubelet, so the Node authorizer and
-# NodeRestriction bind it like any other node; kubelet then rotates the cert
-# itself (rotateCertificates). Skipped while a still-valid cert exists, so a
-# re-run never replaces the identity kubelet already rotated.
+# way join_cluster issues a worker's (kubelet-client CSR, signed by KCM), but
+# submitted with the operator's admin kubeconfig since no bootstrap token is
+# needed on the node that holds the CA. KCM's csrapproving controller approves
+# it because the submitter, admin (system:masters), passes the node-client
+# SubjectAccessReview. The admin kubeconfig never reaches the kubelet, so the
+# Node authorizer and NodeRestriction bind it like any other node; kubelet then
+# rotates the cert itself (rotateCertificates). This narrows the kubelet's
+# network credential only: it runs as root beside admin.pem and ca.key, so it is
+# not a filesystem boundary. Skipped while a valid cert chaining to the current
+# CA exists, so a re-run never replaces the identity kubelet already rotated.
 issue_cp_kubelet_identity() {
   local kubelet_kubeconfig="$STATE_DIR/kubelet-kubeconfig"
   local cert
@@ -794,11 +797,14 @@ wait_for_joined_node() {
 # rotated client cert, from --cert-dir). It authenticates with its own client
 # cert, so an upgrade needs no token.
 
-# Prints the path of the newest still-valid client cert, rotated first.
+# Prints the path of the newest client cert that is unexpired and chains to
+# the current CA (ca-bundle.pem on the control plane, else ca.pem), rotated first.
 current_client_cert() {
-  local c
+  local c ca="$STATE_DIR/ca.pem"
+  [ -s "$STATE_DIR/ca-bundle.pem" ] && ca="$STATE_DIR/ca-bundle.pem"
   for c in "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" "$STATE_DIR/kubelet-client.crt"; do
-    if [ -s "$c" ] && openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1; then
+    if [ -s "$c" ] && openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1 \
+      && openssl verify -CAfile "$ca" "$c" >/dev/null 2>&1; then
       printf '%s' "$c"
       return 0
     fi

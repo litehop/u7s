@@ -50,6 +50,42 @@ bash "$SET_ROTATE" "$WORK/off.yaml"
 assert "re-running is idempotent (lima-start.sh runs on every invocation)" \
   "$([ "$(grep -c '^rotateCertificates:' "$WORK/off.yaml")" -eq 1 ] && echo 1 || echo 0)"
 
+source "$DIR/_lib.sh"
+ca_key() { openssl ecparam -genkey -name prime256v1 -noout -out "$1"; openssl req -x509 -new -key "$1" -subj "/CN=$2" -days 2 -out "$3" 2>/dev/null; }
+ca_key "$WORK/ca1.key" ca1 "$WORK/ca1.pem"
+ca_key "$WORK/ca2.key" ca2 "$WORK/ca2.pem"
+openssl ecparam -genkey -name prime256v1 -noout -out "$WORK/n.key"
+openssl req -new -key "$WORK/n.key" -subj "/O=system:nodes/CN=system:node:x" -out "$WORK/n.csr"
+openssl x509 -req -in "$WORK/n.csr" -CA "$WORK/ca1.pem" -CAkey "$WORK/ca1.key" -CAcreateserial -days 1 -out "$WORK/good.crt" 2>/dev/null
+: > "$WORK/index.txt"
+echo 01 > "$WORK/serial"
+cat > "$WORK/ca.cnf" <<EOF
+[ca]
+default_ca = d
+[d]
+database = $WORK/index.txt
+new_certs_dir = $WORK
+serial = $WORK/serial
+certificate = $WORK/ca1.pem
+private_key = $WORK/ca1.key
+default_md = sha256
+policy = p
+unique_subject = no
+[p]
+commonName = supplied
+EOF
+openssl ca -config "$WORK/ca.cnf" -in "$WORK/n.csr" -startdate 20200101000000Z -enddate 20200102000000Z -batch -notext -out "$WORK/expired.crt" >/dev/null 2>&1
+assert "a cert signed by the current CA is reused (no needless re-issue)" \
+  "$(node_client_cert_valid "$WORK/good.crt" "$WORK/ca1.pem" && echo 1 || echo 0)"
+assert "a cert signed by a previous CA is re-issued (a wiped workdir mints a new ca.key; the kubelet would 401 on a healthy stack)" \
+  "$(node_client_cert_valid "$WORK/good.crt" "$WORK/ca2.pem" && echo 0 || echo 1)"
+assert "a missing cert is re-issued" \
+  "$(node_client_cert_valid "$WORK/absent.crt" "$WORK/ca1.pem" && echo 0 || echo 1)"
+assert "the expired fixture really is expired (otherwise the expiry check proves nothing)" \
+  "$(openssl x509 -in "$WORK/expired.crt" -noout -checkend 0 >/dev/null 2>&1 && echo 0 || echo 1)"
+assert "an expired cert is re-issued even when it chains to the current CA" \
+  "$(node_client_cert_valid "$WORK/expired.crt" "$WORK/ca1.pem" && echo 0 || echo 1)"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]

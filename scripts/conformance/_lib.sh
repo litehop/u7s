@@ -38,6 +38,16 @@ check_port_free() {
   fi
 }
 
+# True when the rig kubelet's client cert is unexpired and signed by the current
+# CA; anything else (a wiped/rotated CA, expiry) needs re-issuing or the kubelet
+# is rejected with 401 on an otherwise healthy stack.
+node_client_cert_valid() {
+  local crt="$1" ca_pem="$2"
+  [ -s "$crt" ] \
+    && openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1 \
+    && openssl verify -CAfile "$ca_pem" "$crt" >/dev/null 2>&1
+}
+
 # Derives the per-node resource suffix (konnectivity-agent Pod/Secret, kubelet
 # serving cert) for a VM_NAME. Single source of truth for BOTH lima-start.sh
 # (the primary/direct-start path) and add-node.sh (the --extra-node join path)
