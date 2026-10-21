@@ -1052,6 +1052,71 @@ assert "...and returns nonzero so the failed branch delete counts as an anomaly"
   "$([ "$G_RC" -ne 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# STEP H: main's audit status. A red main audit is otherwise invisible
+# (the audit is non-blocking for PRs), so the verdict and exit code are what
+# make the mayor notice.
+# ---------------------------------------------------------------------------
+FAIL_JSON='[{"databaseId":42,"conclusion":"failure","url":"https://example.test/runs/42"}]'
+assert "audit_verdict: a success conclusion is ok" \
+  "$([ "$(call audit_verdict '[{"conclusion":"success"}]')" = ok ] && echo 1 || echo 0)"
+assert "audit_verdict: a failure conclusion is failing (the whole point: a red main audit must not read as ok)" \
+  "$([ "$(call audit_verdict "$FAIL_JSON")" = failing ] && echo 1 || echo 0)"
+assert "audit_verdict: any non-success conclusion (timed_out) is failing" \
+  "$([ "$(call audit_verdict '[{"conclusion":"timed_out"}]')" = failing ] && echo 1 || echo 0)"
+assert "audit_verdict: an empty run list is unknown, not failing" \
+  "$([ "$(call audit_verdict '[]')" = unknown ] && echo 1 || echo 0)"
+assert "audit_verdict: garbage input is unknown, not failing" \
+  "$([ "$(call audit_verdict 'not json')" = unknown ] && echo 1 || echo 0)"
+
+STUB_GH_AUDIT="$SANDBOX_ROOT/stub-gh-audit"
+mkdir -p "$STUB_GH_AUDIT"
+cat > "$STUB_GH_AUDIT/gh" <<'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "run list")
+    [ -n "${STUB_AUDIT_LIST_FAIL:-}" ] && exit 1
+    printf '%s' "${STUB_AUDIT_JSON:-}" ;;
+  "run view") echo "error: RUSTSEC-2026-0001 found; also GHSA-abcd-1234-wxyz and RUSTSEC-2026-0001" ;;
+esac
+exit 0
+EOF
+chmod +x "$STUB_GH_AUDIT/gh"
+
+H_OUT=$(PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON="$FAIL_JSON" bash "$SCRIPT" __call step_h_main_audit 2>&1) && H_RC=0 || H_RC=$?
+assert "STEP H returns 4 when main's audit failed, so the mayor tick sees a distinct code" \
+  "$([ "$H_RC" -eq 4 ] && echo 1 || echo 0)"
+assert "...and the alert carries the run URL and the deduplicated advisory ids" \
+  "$(echo "$H_OUT" | grep -q 'https://example.test/runs/42' && echo "$H_OUT" | grep -q 'GHSA-abcd-1234-wxyz' && [ "$(echo "$H_OUT" | grep -o 'RUSTSEC-2026-0001' | wc -l)" -eq 1 ] && echo 1 || echo 0)"
+
+H_RC=0
+PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[{"conclusion":"success"}]' bash "$SCRIPT" __call step_h_main_audit >/dev/null 2>&1 || H_RC=$?
+assert "STEP H returns 0 when main's audit is green" \
+  "$([ "$H_RC" -eq 0 ] && echo 1 || echo 0)"
+
+H_RC=0
+H_OUT=$(PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_LIST_FAIL=1 bash "$SCRIPT" __call step_h_main_audit 2>&1) || H_RC=$?
+assert "STEP H returns 0 with a warning when gh errors -- an offline tick must not be reported as a failing audit" \
+  "$([ "$H_RC" -eq 0 ] && echo "$H_OUT" | grep -q 'WARNING' && echo 1 || echo 0)"
+
+H_RC=0
+PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[]' bash "$SCRIPT" __call step_h_main_audit >/dev/null 2>&1 || H_RC=$?
+assert "STEP H returns 0 when there is no completed audit run yet" \
+  "$([ "$H_RC" -eq 0 ] && echo 1 || echo 0)"
+
+# End to end: the destructive-step guards (the refusal, the live-agent
+# sets) must not hide the audit result, in either live-set mode.
+H_RC=0
+DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_MAIN" PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON="$FAIL_JSON" \
+  bash "$SCRIPT" --no-live-workers >/dev/null 2>&1 || H_RC=$?
+assert "main() exits with the audit bit (4) under --no-live-workers when main's audit failed" \
+  "$([ "$H_RC" -eq 4 ] && echo 1 || echo 0)"
+H_RC=0
+DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_MAIN" PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON="$FAIL_JSON" \
+  bash "$SCRIPT" --live-agents someagent >/dev/null 2>&1 || H_RC=$?
+assert "main() exits with the audit bit (4) under --live-agents when main's audit failed" \
+  "$([ "$H_RC" -eq 4 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

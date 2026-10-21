@@ -241,7 +241,11 @@ its design rationale.
 Auto-kill/auto-delete with no approval gate (operator decision) — the script
 logs loudly instead of asking. Exit 0 means a clean tick; non-zero means an
 anomaly for the mayor to investigate (currently: a killed process that didn't
-actually die, surfaced by the script's own verify step).
+actually die, surfaced by the script's own verify step). STEP H also checks
+main's latest completed `audit.yaml` run (the audit is non-blocking for PRs);
+exit bit 4 (5 if combined with 1) means it is red — read the logged run URL
+and advisory ids, then dispatch a dependency-bump bead. A `gh` failure only
+warns and does not set the bit.
 
 This loop is the drift backstop, not the primary defense: workers are required
 to run `scripts/conformance/reset.sh --host-only` as their own final step before
