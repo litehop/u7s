@@ -1,72 +1,59 @@
 ---
-as_of: 2026-10-20
+as_of: 2026-10-21
 kind: initiative-state
 ---
 
-# Cert rotation and the release gate: state as of 2026-10-20
+# Cert rotation and the release gate: state as of 2026-10-21
 
-No release until the cert-rotation story is done properly: `mayor-zboqh` is
-the one gating item left. The 1 GiB burst gate has not yet produced a
-confirmed ceiling; re-run `--confirm` in a quiet window.
+Main (`4d3641a2`) is release-ready: cert rotation is complete, the 1 GiB
+burst gate passed at 50 pods 3/3, and `cargo audit` is clean. Cutting the
+snapshot is the operator's call.
 
-## Release-gating scope (operator 2026-10-20)
+## Release checks
 
-Certs have finite lifetimes on main since #1909, so the next snapshot or
-release waits for renewal to be complete end to end. Gating set:
+| Check | Result |
+|---|---|
+| Cert rotation (`xdw6u.2-.5`, `.11`, `zboqh`) | merged; control-plane kubelet runs as `system:node:<name>` with rotating certs (#1932) |
+| Burst gate (`f2gfd` option A) | 50 pods, 3/3, quiet host, main `360b9750`; MemAvailable ≥ 202 MiB, bursts 24–32 s |
+| Install on uppercase hostnames (`zl285`) | fixed (#1935); hosts that already failed recover on re-run |
+| Advisories (`09au3`) | `cmov`, `rustls-webpki`, `webpki-root-certs` bumped (#1938) |
 
-| Bead | What | State |
-|---|---|---|
-| `mayor-xdw6u.3` | apiserver hot-swaps serving TLS + client-CA store; leaves rotate at 2/3 lifetime | merged #1913 |
-| `mayor-xdw6u.4` | file-path kubeconfigs; KCM/kubelet live-reload via client-go | merged #1917 |
-| `mayor-xdw6u.5` | scheduler on politeia v0.3.0, one shared reloading client | merged #1926 |
-| `mayor-xdw6u.11` | rotation e2e on real binaries (`pki-rotation-e2e` CI job + `leaf-rotation.sh --vm`) | merged #1918; bead open for .8/.9 scenarios |
-| `mayor-xdw6u.2` | expiry visibility: Warning headers (admins/kubectl only), Node Events, `apiserver_client_certificate_expiration_seconds` + `u7s_certificate_*` | merged #1925 |
-| `mayor-zboqh` | control-plane kubelet gets its own `system:node` identity instead of admin | **open** |
+Non-gating: `xdw6u.8` (two-tier CA), `.9` (root succession; carries a note
+about worker `ca.pem` going stale after succession). `pki-rotation-e2e`
+becomes a required check after 10 green runs (`bjuu2`, operator action).
+`d7uta`: the pinned pkgs.k8s.io apt key expires 2026-12-29 and upstream had
+not extended it on 2026-10-21; re-check by 2026-12-08.
 
-`mayor-xdw6u.8` (two-tier CA) and `.9` (root succession) are P3,
-non-gating nice-to-haves. `pki-rotation-e2e` becomes a required check
-after 10 consecutive green runs (`mayor-bjuu2`, operator action).
+## Re-running the burst gate
 
-## Release gate (1 GiB / 1 vCPU, no swap)
+`scripts/release-gate/burst-gate.sh --confirm` (~1–2 h). "Quiet" means no
+other Lima VM, host CPU ≥ 70% idle, no cargo builds. Pattern that worked:
+put the dashboard on a dispatch hold, skip the hygiene loop (a remote branch
+delete triggers the pre-push hook's full cargo run), then ONE worker runs the
+gate and any measurement back to back. A noisy run counts as FAIL (no
+INVALID verdict yet, `6uez9`). The harness names VMs with an uppercase UTC
+stamp, which is also the only live test of uppercase-hostname installs.
 
-- Spec is option A (`mayor-f2gfd`): gate on the largest no-swap burst that
-  passes 3/3 on a quiet host, 50 else 40. Run
-  `scripts/release-gate/burst-gate.sh --confirm` (~1–2 h).
-- The 2026-10-20 `--confirm` FAILED on criterion (b) only, and the cause
-  was not the node: `kubectl get node -w` sends `watch?resourceVersion=0`,
-  and u7s replayed write history instead of current state, so the sampler
-  saw stale Unknown/False. Fixed in #1924 (`mayor-03hfx`). With the fix,
-  `--runs 3` passed (b) 3/3 at 50 pods on a busy host. Capacity itself
-  held: bursts 15–32 s, MemAvailable ≥ 120 MiB, peak PSS apiserver 29–31,
-  KCM 76–95, kubelet 78–83, CRI-O 72–78 MiB.
-- No INVALID verdict yet (`mayor-6uez9`): a noisy run counts as FAIL.
+## Memory measurement (`w898x`, feeds the Rust-rewrite go/no-go `vc844`)
 
-## Quiet-window protocol
+On the loaded 1 GiB node a rewrite would save at most ~22–34 MB (KCM) and
+~27–32 MB (kubelet); flags recover ~12 / ~8 MB today (trimmed `--controllers`
++ `GOMEMLIMIT`; `GOMEMLIMIT=40MiB` on the full controller set costs ~22% vCPU
+in GC). Findings: tag `archive/mayor-w898x-findings`.
 
-"Quiet" means no other Lima VM running and host CPU ≥ 70% idle, which
-includes no cargo builds from other workers (every `cargo test`/clippy and
-the pre-push hook peg the host). Pattern that worked: put the dashboard on
-a dispatch hold, let VM workers drain, then ONE worker runs the gate and
-any measurement back to back. Defer the hygiene script during the window:
-deleting a remote branch triggers the pre-push hook's full cargo run.
+## Working rules learned 2026-10-20/21
 
-`mayor-w898x` (KCM/kubelet Go memory, feeds the Rust-rewrite go/no-go
-`mayor-vc844`) is unblocked: KCM `/metrics` honours RBAC since #1923;
-scrape with `kubectl create token monitoring -n kube-system`. It needs the
-next quiet window.
-
-## Working rules learned this session
-
-- Match upstream behaviour unless incompatible with a deliberate u7s
-  choice; don't ask the operator to pick on taste (bd memory
-  `upstream-parity-default-unless-incompatible`).
-- Core-semantics PRs (watch, admission, PodSecurity) stay draft until a
-  full two-node Conformance run on the branch is green; the tick merges
-  any LGTM'd PR.
-- Command shape: a chained or redirected Bash command can be denied even
-  when each part is allowed; retry as bare single commands first (bd
-  memory `worker-classifier-denial-stop-not-reshape`).
-- A session that ends without its bookkeeping PR strands bead state in
-  the local DB; check `git log -1 origin/main -- .beads/issues.jsonl` at
-  bootstrap (bd memory
-  `verify-carried-over-dashboard-decisions-and-bead-export-lag`).
+- Match upstream unless incompatible with a deliberate u7s choice; check
+  bead notes and upstream source before surfacing a "decide" bead.
+- Any PR that narrows a component's identity (e.g. kubelet off admin), or
+  changes admission/watch/RBAC semantics, stays draft until a full two-node
+  Conformance run is green; focus specs missed 8 failures on #1932.
+- Live `install.sh` checks need an uppercase hostname.
+- `cargo audit` is non-blocking for PRs (operator decision); the hygiene
+  loop's STEP H flags a red main audit as exit bit 4.
+- The tick queues a PR the moment it has an LGTM(-with-suggestions) and
+  removes its worktree on merge: convert to draft before sending follow-ups,
+  and never leave commits unpushed in a queued worker's worktree.
+- The tick discards the regenerated `.beads/issues.jsonl` before each pull;
+  run `bd export -o .beads/issues.jsonl` and land it in the wrap PR, or bead
+  state stays only in the local DB.
