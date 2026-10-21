@@ -75,8 +75,6 @@ KUBE_PROXY_V=2
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
 
-# For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
-# instead — it skips VM provisioning and just reconnects the kubelet.
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 
 # No --network override: default to this VM's slot in the Phase-B worker-network
