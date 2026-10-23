@@ -361,14 +361,79 @@ pub(crate) struct ReclaimedHorizons {
     overflow: AtomicU64,
 }
 
+/// Number of pooled read connections. WAL lets readers run concurrently with each other and
+/// with the writer, so one tenant's long selector scan occupies one slot while other `get`s
+/// and LISTs use the rest. Three slots at `READ_CACHE_SIZE_KIB` cap the C-side page cache at
+/// ~11.7 MiB (it grows lazily; an idle store pays almost nothing).
+const READ_POOL_SIZE: usize = 3;
+
+/// Blocking checkout pool of read connections; `checkout` must run on a blocking thread
+/// (`spawn_blocking`). For `:memory:` databases the pool holds the single write connection
+/// (separate in-memory connections are distinct databases), so reads there serialize with
+/// writes. Production always uses a file database.
+struct ReadPool {
+    free: std::sync::Mutex<Vec<Arc<Mutex<Connection>>>>,
+    available: std::sync::Condvar,
+}
+
+struct ReadSlot {
+    pool: Arc<ReadPool>,
+    conn: Option<Arc<Mutex<Connection>>>,
+}
+
+impl ReadPool {
+    fn new(conns: Vec<Arc<Mutex<Connection>>>) -> Arc<Self> {
+        Arc::new(Self {
+            free: std::sync::Mutex::new(conns),
+            available: std::sync::Condvar::new(),
+        })
+    }
+
+    fn checkout(self: &Arc<Self>) -> ReadSlot {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = loop {
+            if let Some(conn) = free.pop() {
+                break conn;
+            }
+            free = self.available.wait(free).unwrap_or_else(|e| e.into_inner());
+        };
+        ReadSlot {
+            pool: Arc::clone(self),
+            conn: Some(conn),
+        }
+    }
+}
+
+impl ReadSlot {
+    fn conn(&self) -> &Arc<Mutex<Connection>> {
+        self.conn
+            .as_ref()
+            .expect("slot holds its connection until drop")
+    }
+}
+
+impl Drop for ReadSlot {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool
+                .free
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(conn);
+            self.pool.available.notify_one();
+        }
+    }
+}
+
 pub struct SqliteStore {
     /// Single write connection. Mutex ensures serial access across spawn_blocking calls.
     /// ALL rusqlite calls must go through spawn_blocking — rusqlite is synchronous.
     write_conn: Arc<Mutex<Connection>>,
-    /// Read connection (WAL allows concurrent readers).
-    /// For Phase 1 with one vCPU, a single read connection is sufficient.
-    /// For :memory: databases, this is the same connection as write_conn.
-    read_conn: Arc<Mutex<Connection>>,
+    /// Read connections for `get` and `list`. A LIST holds its slot for the whole scan (one
+    /// read transaction keeps items/revision/remainingItemCount consistent), so a long
+    /// selector scan only ever occupies one of `READ_POOL_SIZE` slots. A long read
+    /// transaction also pins WAL checkpoints (`wal_autocheckpoint`) until it ends.
+    read_pool: Arc<ReadPool>,
     /// Broadcast channel for live events after writes. Deliberately NOT sharded — every open
     /// watch stream already filters this one channel down to its own prefix; sharding delivery
     /// itself is a separate, larger fan-out axis tracked independently of the ring/deletion_log
@@ -452,13 +517,14 @@ impl SqliteStore {
 
         let write_conn = Arc::new(Mutex::new(write_conn));
 
-        // For :memory: databases (tests), share the write connection for reads.
-        // Separate in-memory connections are always distinct databases.
-        // For file databases, open a second connection for concurrent reads under WAL.
-        let read_conn = if db_path == ":memory:" {
-            Arc::clone(&write_conn)
+        // For :memory: databases (tests), the pool is the write connection alone.
+        let read_pool = if db_path == ":memory:" {
+            ReadPool::new(vec![Arc::clone(&write_conn)])
         } else {
-            Arc::new(Mutex::new(open_conn(db_path, READ_CACHE_SIZE_KIB)?))
+            let conns = (0..READ_POOL_SIZE)
+                .map(|_| open_conn(db_path, READ_CACHE_SIZE_KIB).map(|c| Arc::new(Mutex::new(c))))
+                .collect::<Result<Vec<_>>>()?;
+            ReadPool::new(conns)
         };
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -470,7 +536,7 @@ impl SqliteStore {
 
         Ok(Self {
             write_conn,
-            read_conn,
+            read_pool,
             tx,
             bookmark_tx,
             shards,
@@ -1108,15 +1174,12 @@ fn find_reclaimed_horizon(reclaimed_horizons: &ReclaimedHorizons, prefix: &str) 
 /// `PRAGMA cache_size` for the write connection: SQLite's own historical default (`-2000` is
 /// ~1.95 MiB — negative means kibibytes, not pages). The write connection only ever serves a
 /// single writer at a time (behind `write_conn`'s mutex), so it has far less to gain from a
-/// large page cache than the read connection, which backs every concurrent LIST scan — see
-/// `READ_CACHE_SIZE_KIB`'s doc for why the cut is made here rather than there.
+/// large page cache than the pooled read connections that serve LIST scans.
 const WRITE_CACHE_SIZE_KIB: i64 = -2000;
-/// `PRAGMA cache_size` for the read connection (and the single shared connection `:memory:`
-/// databases use for both roles — see `SqliteStore::new`): kept at SQLite's pre-existing
-/// `-8000` (~7.8 MiB) rather than cut like the write connection's, since this is the connection
-/// LIST scans and most other reads run against, and is therefore the one most likely to thrash
-/// on a smaller cache.
-const READ_CACHE_SIZE_KIB: i64 = -8000;
+/// `PRAGMA cache_size` for each pooled read connection (~3.9 MiB; `READ_POOL_SIZE` of them cap
+/// at ~11.7 MiB, below the former two connections at ~15.6 MiB). Scans larger than the cache
+/// fall through to the OS page cache.
+const READ_CACHE_SIZE_KIB: i64 = -4000;
 
 fn open_conn(path: &str, cache_size_kib: i64) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -1991,10 +2054,11 @@ fn paginate_in_memory(
 
 impl Store for SqliteStore {
     async fn get(&self, key: impl Into<String> + Send) -> Result<Option<StoreObject>> {
-        let conn = self.read_conn.clone();
+        let pool = self.read_pool.clone();
         let key_str: String = key.into();
         let (obj, key_str) = tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
+            let slot = pool.checkout();
+            let conn = slot.conn().blocking_lock();
             get_sync(&conn, &key_str).map(|obj| (obj, key_str))
         })
         .await??;
@@ -2021,24 +2085,26 @@ impl Store for SqliteStore {
         prefix: impl Into<String> + Send,
         opts: ListOptions,
     ) -> Result<ListResponse> {
-        let read_conn = self.read_conn.clone();
+        let pool = self.read_pool.clone();
         let prefix: String = prefix.into();
         let (resp, prefix, opts) = tokio::task::spawn_blocking(move || {
-            let conn = read_conn.blocking_lock();
+            let slot = pool.checkout();
+            let conn = slot.conn().blocking_lock();
             list_sync(&conn, &prefix, &opts).map(|resp| (resp, prefix, opts))
         })
         .await??;
 
-        // Guard: if the read snapshot is older than the most recently committed write,
-        // the WAL read connection returned a stale view. Retry via the write connection,
-        // which always reflects the latest committed state. This prevents the KCM informer
-        // from seeing a list resourceVersion that regresses below a revision it already
-        // observed from a watch event.
+        // Guard: if the read snapshot began before the most recently committed write, the
+        // list resourceVersion could regress below a revision the KCM informer already saw
+        // from a watch event. `last_written_revision` is bumped right after COMMIT, so a
+        // read transaction started now sees it. Retry on the pool, never on `write_conn`: a
+        // scan there would hold the writer mutex for its whole duration.
         let min_rev = self.last_written_revision.load(Ordering::Acquire);
         if resp.revision < min_rev {
-            let write_conn = self.write_conn.clone();
+            let pool = self.read_pool.clone();
             return tokio::task::spawn_blocking(move || {
-                let conn = write_conn.blocking_lock();
+                let slot = pool.checkout();
+                let conn = slot.conn().blocking_lock();
                 list_sync(&conn, &prefix, &opts)
             })
             .await?;
@@ -2867,8 +2933,9 @@ mod tests {
             .await
             .query_row("PRAGMA cache_size", [], |row| row.get(0))
             .expect("read write connection's cache_size");
-        let read_cache: i64 = store
-            .read_conn
+        let read_slot = store.read_pool.checkout();
+        let read_cache: i64 = read_slot
+            .conn()
             .lock()
             .await
             .query_row("PRAGMA cache_size", [], |row| row.get(0))
@@ -2882,15 +2949,139 @@ mod tests {
         );
         assert_eq!(
             read_cache, READ_CACHE_SIZE_KIB,
-            "the read connection must keep the larger cache_size — it backs every LIST scan \
-             and is the connection most likely to thrash if cut as aggressively as the write \
-             connection's"
+            "pooled read connections must use READ_CACHE_SIZE_KIB — it is what bounds the \
+             pool's total C-side page cache against the idle memory budget"
         );
 
         drop(store);
         let _ = std::fs::remove_file(&db_path_str);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    async fn file_store_with_one_object(tag: &str) -> (SqliteStore, String) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!("u7s-{tag}-{nanos}.db"));
+        let db_path_str = db_path.to_str().unwrap().to_string();
+        let store = SqliteStore::new(&db_path_str).expect("file-backed store");
+        store
+            .put("/registry/configmaps/a/x", Bytes::from_static(b"{}"), None)
+            .await
+            .expect("put");
+        (store, db_path_str)
+    }
+
+    fn remove_db(path: &str) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    /// Stand-in for an in-flight scan: owns a pool slot and its connection's mutex.
+    async fn hold_scan(
+        store: &SqliteStore,
+    ) -> (ReadSlot, tokio::sync::OwnedMutexGuard<Connection>) {
+        let slot = store.read_pool.checkout();
+        let guard = slot.conn().clone().lock_owned().await;
+        (slot, guard)
+    }
+
+    const STALL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// One tenant's long selector LIST must not stall other tenants' point `get`s (auth reads
+    /// through `get`) or their own LISTs, but the pool is bounded: with every slot held, a
+    /// further LIST waits.
+    ///
+    /// Fails on a pool of one slot (or a single shared list connection): the second LIST
+    /// waits behind the held scan and times out.
+    #[tokio::test]
+    async fn concurrent_lists_and_gets_progress_while_one_scan_is_held() {
+        let (store, path) = file_store_with_one_object("read-pool-parallel").await;
+
+        let scan = hold_scan(&store).await;
+        let got = tokio::time::timeout(STALL, store.get("/registry/configmaps/a/x"))
+            .await
+            .expect("get must not wait on another request's scan")
+            .expect("get");
+        assert!(got.is_some());
+        let listed = tokio::time::timeout(
+            STALL,
+            store.list("/registry/configmaps/", ListOptions::default()),
+        )
+        .await
+        .expect("a second LIST must not wait on another tenant's scan")
+        .expect("list");
+        assert_eq!(listed.items.len(), 1);
+
+        let mut all = vec![scan];
+        for _ in 1..READ_POOL_SIZE {
+            all.push(hold_scan(&store).await);
+        }
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            store.list("/registry/configmaps/", ListOptions::default()),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "list must check out from the pool, otherwise the isolation above proves nothing"
+        );
+        drop(all);
+
+        drop(store);
+        remove_db(&path);
+    }
+
+    /// Held scans must never delay writers: a scan occupies read slots only. Otherwise one
+    /// tenant's LIST would stall every create/update in the cluster.
+    #[tokio::test]
+    async fn writes_are_not_blocked_while_every_read_slot_is_held() {
+        let (store, path) = file_store_with_one_object("read-pool-writer").await;
+
+        let mut scans = Vec::new();
+        for _ in 0..READ_POOL_SIZE {
+            scans.push(hold_scan(&store).await);
+        }
+        tokio::time::timeout(
+            STALL,
+            store.put("/registry/configmaps/a/y", Bytes::from_static(b"{}"), None),
+        )
+        .await
+        .expect("a write must not wait on read scans")
+        .expect("put");
+        drop(scans);
+
+        drop(store);
+        remove_db(&path);
+    }
+
+    /// The stale-snapshot retry in `list` must rescan on a pooled read connection, never on
+    /// `write_conn`, where an unbounded selector scan would hold the writer mutex.
+    ///
+    /// Fails on revert to a retry on `write_conn`: the held writer lock makes the LIST time out.
+    #[tokio::test]
+    async fn list_stale_retry_does_not_take_the_writer_lock() {
+        let (store, path) = file_store_with_one_object("read-pool-retry").await;
+
+        store
+            .last_written_revision
+            .store(u64::MAX, Ordering::Release);
+        let writer = store.write_conn.lock().await;
+        let listed = tokio::time::timeout(
+            STALL,
+            store.list("/registry/configmaps/", ListOptions::default()),
+        )
+        .await
+        .expect("stale-read retry must not need the writer connection")
+        .expect("list");
+        assert_eq!(listed.items.len(), 1);
+        drop(writer);
+
+        drop(store);
+        remove_db(&path);
     }
 
     /// The ring's replay snapshot (`replayed` in `watch()`) must be released once its events
@@ -3251,7 +3442,7 @@ mod tests {
         let (bookmark_tx, _) = broadcast::channel(16);
         let store = SqliteStore {
             write_conn,
-            read_conn,
+            read_pool: ReadPool::new(vec![read_conn]),
             tx,
             bookmark_tx,
             shards: Arc::new(RwLock::new(BTreeMap::new())),
