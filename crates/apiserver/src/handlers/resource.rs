@@ -1594,6 +1594,17 @@ pub(crate) async fn do_patch<S: Store>(
             super::defaults::prepare_namespace_for_create(&mut obj.body)
                 .map_err(Status::internal)?;
         }
+        // NodeRestriction is a mutating-admission plugin upstream, so it runs before the
+        // strategy's validation on both POST and apply-create; validating first would give a
+        // wrong-node caller a 422 oracle instead of the 403.
+        if let (Some(namespace), "certificates.k8s.io", "podcertificaterequests") =
+            (ns, group, plural)
+        {
+            super::certificates::restrict_node_pod_certificate_request_create(
+                state, user, namespace, &obj.body,
+            )
+            .await?;
+        }
         super::defaults::validate_resource(group, plural, &obj.body)
             .map_err(Status::unprocessable_entity)?;
         let is_csr = super::csr::is_csr(group, plural);
@@ -1636,16 +1647,6 @@ pub(crate) async fn do_patch<S: Store>(
                 &obj.body,
             )
             .map_err(Status::forbidden)?;
-        }
-        // An SSA apply-create of a PodCertificateRequest is a create like the POST path, so it
-        // must pass the same NodeRestriction.
-        if let (Some(namespace), "certificates.k8s.io", "podcertificaterequests") =
-            (ns, group, plural)
-        {
-            super::certificates::restrict_node_pod_certificate_request_create(
-                state, user, namespace, &obj.body,
-            )
-            .await?;
         }
         // ResourceQuota: an SSA apply-create is a create just like create_resource /
         // create_namespaced_resource, so it must be checked against count/* and compute
