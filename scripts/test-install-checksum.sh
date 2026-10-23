@@ -39,7 +39,9 @@ write_fetch_tarball_runner() {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
     awk '/^mktemp_disk_dir\(\) \{/,/^\}/' "$install_script"
+    awk '/^verify_release_signature\(\) \{/,/^\}/' "$install_script"
     awk '/^fetch_tarball\(\) \{/,/^\}/' "$install_script"
+    echo 'RELEASE_PUBKEY_PEM="$TEST_PUBKEY_PEM"'
     echo 'DOWNLOAD_DIR=""; trap '"'"'rm -rf ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}'"'"' EXIT'
     echo 'fetch_tarball "$1"'
     echo 'echo "TARBALL_PATH=$TARBALL"'
@@ -53,6 +55,18 @@ trap 'rm -rf "$WORK"' EXIT
 TARBALL_SRC="$WORK/fake-release.tar.gz"
 printf 'not a real tarball, just stable bytes to hash\n' > "$TARBALL_SRC"
 sha256sum "$TARBALL_SRC" | cut -d' ' -f1 > "$TARBALL_SRC.sha256"
+
+# fetch_tarball also requires valid signatures; this suite isolates the
+# checksum comparison, so sign every fixture with a throwaway key.
+[ -d /opt/homebrew/bin ] && PATH="/opt/homebrew/bin:$PATH"
+openssl genpkey -algorithm ed25519 -out "$WORK/priv.pem" 2>/dev/null
+TEST_PUBKEY_PEM="$(openssl pkey -in "$WORK/priv.pem" -pubout)"
+export TEST_PUBKEY_PEM
+sign_fixture() {
+  openssl pkeyutl -sign -rawin -inkey "$WORK/priv.pem" -in "$1" -out "$1.sig"
+  openssl pkeyutl -sign -rawin -inkey "$WORK/priv.pem" -in "$1.sha256" -out "$1.sha256.sig"
+}
+sign_fixture "$TARBALL_SRC"
 
 RUNNER="$WORK/runner.sh"
 write_fetch_tarball_runner "$INSTALL" "$RUNNER"
@@ -79,6 +93,7 @@ CORRUPT_SRC="$WORK/corrupt-release.tar.gz"
 cp "$TARBALL_SRC" "$CORRUPT_SRC"
 printf 'x' >> "$CORRUPT_SRC"
 cp "$TARBALL_SRC.sha256" "$CORRUPT_SRC.sha256"
+sign_fixture "$CORRUPT_SRC"
 
 corrupt_status=0
 corrupt_out="$(bash "$RUNNER" "file://$CORRUPT_SRC" 2>&1)" || corrupt_status=$?

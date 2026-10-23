@@ -41,6 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Determine version and release kind
@@ -148,8 +149,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Protected Environment (required reviewers) holding RELEASE_SIGNING_KEY:
+    # nothing is signed or published without a manual approval.
+    environment: release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -169,6 +175,40 @@ jobs:
           [ "$(cat "$TARBALL.sha256")" = "$TARBALL_SHA256" ]
           [ "$(find . -type f | wc -l)" -eq 3 ]
 
+      - name: Sign tarball and checksum with Ed25519
+        # install.sh verifies these against the key embedded in the script.
+        # Fails if that key is unset or is not the public half of the signing
+        # key, so a release no installer could verify is never published.
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          [ -n "$RELEASE_SIGNING_KEY" ] || { echo "error: RELEASE_SIGNING_KEY is not set in the 'release' Environment" >&2; exit 1; }
+          openssl version
+          keydir="$(mktemp -d)"
+          trap 'rm -rf "$keydir"' EXIT
+          (umask 077; printf '%s\n' "$RELEASE_SIGNING_KEY" > "$keydir/priv.pem")
+          openssl pkey -in "$keydir/priv.pem" -pubout -out "$keydir/pub.pem"
+          if ! grep -qx 'RELEASE_PUBKEY_PEM="-----BEGIN PUBLIC KEY-----' dist/install.sh; then
+            echo "error: install.sh has no embedded RELEASE_PUBKEY_PEM -- paste the public key before releasing" >&2
+            exit 1
+          fi
+          embedded="$(awk '/^RELEASE_PUBKEY_PEM="-----BEGIN PUBLIC KEY-----$/{f=1} f{print} /-----END PUBLIC KEY-----"$/{f=0}' dist/install.sh)"
+          embedded="${embedded#RELEASE_PUBKEY_PEM=\"}"
+          embedded="${embedded%\"}"
+          if [ "$embedded" != "$(cat "$keydir/pub.pem")" ]; then
+            echo "error: install.sh's embedded public key does not match RELEASE_SIGNING_KEY" >&2
+            exit 1
+          fi
+          cd dist
+          for f in *.tar.gz *.tar.gz.sha256; do
+            openssl pkeyutl -sign -rawin -inkey "$keydir/priv.pem" -in "$f" -out "$f.sig"
+            openssl pkeyutl -verify -pubin -inkey "$keydir/pub.pem" -rawin -in "$f" -sigfile "$f.sig"
+          done
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -179,7 +219,8 @@ jobs:
           prerelease_flag=""
           [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
           # See docs/decisions/distribution-hosting-shape.md.
-          gh release create "$VERSION" dist/*.tar.gz dist/*.sha256 dist/install.sh \
+          gh release create "$VERSION" dist/* \
+            --target "$GITHUB_SHA" \
             --title "$VERSION" \
             --notes "u7s $VERSION for linux/amd64: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager, plus the matching install.sh" \
             $prerelease_flag

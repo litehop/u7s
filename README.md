@@ -29,6 +29,20 @@ and kube-controller-manager, and writes a systemd unit for each.
    calls are rate-limited; if it fails, set `TAG` by hand from
    <https://github.com/litehop/u7s/releases>).
 
+   `install.sh` verifies the release tarball and its `.sha256` against Ed25519
+   signatures (`.sig` assets) using the public key below, which is also
+   embedded in the script; it refuses to install if verification fails or
+   OpenSSL >= 3.0 is missing. To verify an artifact by hand:
+   `openssl pkeyutl -verify -pubin -inkey release.pub -rawin -in <file> -sigfile <file>.sig`.
+
+   Release signing public key (PLACEHOLDER until the first signed release):
+
+   ```
+   -----BEGIN PUBLIC KEY-----
+   <paste the Ed25519 public key PEM>
+   -----END PUBLIC KEY-----
+   ```
+
 2. With no flags, the node name defaults to the host's hostname and the
    cluster network binds to the first non-loopback interface. Override
    either with `--node-name` or `--iface` (see `scripts/install.sh --help`
