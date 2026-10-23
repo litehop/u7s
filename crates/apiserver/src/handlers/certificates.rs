@@ -531,7 +531,8 @@ enum KeyKind {
     Rsa,
 }
 
-/// Supported key types: Ed25519, ECDSA P-256/P-384/P-521, RSA 3072/4096 (upstream's set).
+/// Supported key types: Ed25519, ECDSA P-256/P-384/P-521, RSA 3072/4096 (upstream's set;
+/// release-1.37 `validation.go` has no ML-DSA case either, so rejecting it matches).
 fn validate_spki_key_type(
     spki: &x509_cert::spki::SubjectPublicKeyInfoOwned,
 ) -> Result<KeyKind, String> {
@@ -832,8 +833,6 @@ fn validate_pcr_condition_shape(cond: &serde_json::Value, idx: usize) -> Result<
 /// requested public key with timestamps matching the leaf. Otherwise a signer (or anyone
 /// holding `podcertificaterequests/status`) could hand a pod a certificate for someone
 /// else's key, or rewrite an already-issued certificate.
-///
-/// Not implemented: upstream's `mail.ParseAddress` check on leaf email SANs.
 pub(crate) fn validate_pod_certificate_request_status_update(
     old: &serde_json::Value,
     new: &serde_json::Value,
@@ -917,6 +916,42 @@ pub(crate) fn validate_pod_certificate_request_status_update(
     }
 }
 
+fn is_atext(c: char) -> bool {
+    c.is_alphanumeric() || !c.is_ascii() && !c.is_control() || "!#$%&'*+-/=?^_`{|}~".contains(c)
+}
+
+/// Go's `consumePhrase`: whitespace-separated words, each a quoted string or an atom that may
+/// contain dots. `@` is not atext, so `a@b <x@y>` is rejected.
+fn is_valid_display_phrase(display: &str) -> bool {
+    let mut rest = display.trim_start();
+    while !rest.is_empty() {
+        if let Some(q) = rest.strip_prefix('"') {
+            let mut chars = q.char_indices();
+            let end = loop {
+                match chars.next() {
+                    None => return false,
+                    Some((_, '\\')) if chars.next().is_none() => return false,
+                    Some((i, '"')) => break i + 1,
+                    Some(_) => {}
+                }
+            };
+            rest = &q[end..];
+        } else {
+            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+            let word = &rest[..end];
+            if !word.chars().all(|c| is_atext(c) || c == '.') {
+                return false;
+            }
+            rest = &rest[end..];
+        }
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return false;
+        }
+        rest = rest.trim_start();
+    }
+    true
+}
+
 /// Approximates Go's `mail.ParseAddress`: an RFC 5322 `addr-spec`, optionally wrapped as
 /// `[display-name] <addr-spec>`. The local part is a dot-atom or quoted string; the domain is
 /// a dot-atom or a bracketed literal. Non-ASCII is permitted like Go (SMTPUTF8).
@@ -924,16 +959,12 @@ fn is_valid_mail_address(s: &str) -> bool {
     let s = s.trim();
     let addr = match (s.rfind('<'), s.strip_suffix('>')) {
         (Some(i), Some(inner)) => {
-            let display = s[..i].trim();
-            if display.contains(['<', '>']) {
+            if !is_valid_display_phrase(s[..i].trim()) {
                 return false;
             }
             &inner[i + 1..]
         }
         _ => s,
-    };
-    let is_atext = |c: char| {
-        c.is_alphanumeric() || !c.is_ascii() && !c.is_control() || "!#$%&'*+-/=?^_`{|}~".contains(c)
     };
     let dot_atom = |a: &str| {
         !a.is_empty()
@@ -3305,11 +3336,28 @@ mod tests {
     }
 
     #[test]
+    fn stub_csr_whose_signature_oid_mismatches_the_key_kind_is_rejected_because_it_proves_nothing_about_the_key(
+    ) {
+        use x509_cert::der::Encode as _;
+        let der = csr_with_subject(&rcgen::PKCS_ECDSA_P256_SHA256, "AAAAAAAA");
+        let mut req = x509_cert::request::CertReq::from_der(&der).unwrap();
+        req.algorithm.oid = "1.2.840.113549.1.1.11".parse().unwrap();
+        let err = spec_error(
+            v1_csr_spec(&req.to_der().unwrap()),
+            "certificates.k8s.io/v1",
+        )
+        .expect("an RSA signature OID on an EC key must be rejected");
+        assert!(err.contains("invalid signature"), "got: {err}");
+    }
+
+    #[test]
     fn mail_address_check_matches_go_parseaddress_for_certificate_email_sans() {
         for ok in [
             "a@example.com",
             "first.last+tag@sub.example.com",
             "Bob <bob@example.com>",
+            "Bob Q. Public <bob@example.com>",
+            "\"Public, Bob\" <bob@example.com>",
             "\"quoted local\"@example.com",
             "ü@例え.jp",
         ] {
@@ -3328,6 +3376,9 @@ mod tests {
             "a@example.com.",
             "<a@example.com",
             "Bob <bob@example.com> junk>",
+            "a@b <x@y>",
+            "a b@c <x@y.z>",
+            "\"unterminated <x@y.z>",
         ] {
             assert!(!is_valid_mail_address(bad), "{bad:?} must be rejected");
         }
@@ -3384,30 +3435,7 @@ mod tests {
     ) {
         let state = node_restriction_state(serde_json::json!({})).await;
         let body = pcr_object("v1", "req-new", valid_pcr_spec());
-        let apply_as = |user: UserInfo| {
-            let state = state.clone();
-            let body = body.clone();
-            async move {
-                outcome(
-                    super::super::resource::patch_namespaced_resource(
-                        State(state),
-                        Path((
-                            GROUP.to_string(),
-                            "v1".to_string(),
-                            "default".to_string(),
-                            PCR_PLURAL.to_string(),
-                            "req-new".to_string(),
-                        )),
-                        Query(PatchQuery::default()),
-                        Extension(user),
-                        headers_for("apply-create"),
-                        Bytes::from(serde_json::to_vec(&body).unwrap()),
-                    )
-                    .await
-                    .map(IntoResponse::into_response),
-                )
-            }
-        };
+        let apply_as = |user: UserInfo| apply_pcr_as(&state, &body, user);
         let (status, message) = apply_as(node_user("node-2")).await;
         assert_eq!(
             status,
@@ -3419,6 +3447,48 @@ mod tests {
             status.is_success(),
             "the pod's own node must still be able to apply-create: {status} {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_create_of_an_invalid_podcertificaterequest_by_the_wrong_node_is_403_not_422_because_validation_must_not_be_an_oracle(
+    ) {
+        let state = node_restriction_state(serde_json::json!({})).await;
+        let mut spec = valid_pcr_spec();
+        spec["maxExpirationSeconds"] = 1.into();
+        let body = pcr_object("v1", "req-bad", spec);
+        let (status, message) = apply_pcr_as(&state, &body, node_user("node-2")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "got {message}");
+        let (status, message) = apply_pcr_as(&state, &body, node_user("node-1")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the body must be invalid for the ordering check to mean anything: {message}"
+        );
+    }
+
+    async fn apply_pcr_as(
+        state: &AppState,
+        body: &serde_json::Value,
+        user: UserInfo,
+    ) -> (StatusCode, String) {
+        outcome(
+            super::super::resource::patch_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    GROUP.to_string(),
+                    "v1".to_string(),
+                    "default".to_string(),
+                    PCR_PLURAL.to_string(),
+                    body["metadata"]["name"].as_str().unwrap().to_string(),
+                )),
+                Query(PatchQuery::default()),
+                Extension(user),
+                headers_for("apply-create"),
+                Bytes::from(serde_json::to_vec(body).unwrap()),
+            )
+            .await
+            .map(IntoResponse::into_response),
+        )
     }
 
     #[tokio::test]
