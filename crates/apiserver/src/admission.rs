@@ -1840,6 +1840,7 @@ pub(crate) fn eval_cel_apply_config(
     expr: &str,
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _scope = CelEvalScope::begin();
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let val = parse_cel_value(&tokens, &mut pos, object)?;
@@ -1876,6 +1877,7 @@ pub(crate) fn eval_cel_bool_expr(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<bool> {
+    let _scope = CelEvalScope::begin();
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
@@ -1906,6 +1908,7 @@ pub(crate) fn eval_cel_vap_value(
     namespace_object: &serde_json::Value,
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _scope = CelEvalScope::begin();
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
@@ -1975,12 +1978,94 @@ impl Drop for CelRecursionGuard {
     }
 }
 
+/// Per-expression runtime cost limit, the same figure as upstream's `PerCallLimit`
+/// (`k8s.io/apiserver/pkg/apis/cel/config.go`). One unit is one evaluated primary, one
+/// macro iteration, or a fixed fraction of the size of a JSON value cloned out of a root.
+/// Exhaustion is an eval error, exactly like upstream's "operation cancelled: actual cost
+/// limit exceeded".
+const CEL_CALL_COST_LIMIT: u64 = 1_000_000;
+
+/// JSON nodes cloned per cost unit.
+const CEL_NODES_PER_UNIT: u64 = 16;
+
+thread_local! {
+    static CEL_COST_LEFT: std::cell::Cell<u64> = const { std::cell::Cell::new(CEL_CALL_COST_LIMIT) };
+    /// Macro-bound variables (`x` in `list.all(x, ...)`), innermost last.
+    static CEL_LOCALS: std::cell::RefCell<Vec<(String, serde_json::Value)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Resets the cost meter and macro scope for one top-level `eval_cel_*` call, and clears
+/// both again on drop so a panic or early return never leaks bindings into the next call.
+struct CelEvalScope;
+
+impl CelEvalScope {
+    fn begin() -> Self {
+        CEL_COST_LEFT.with(|c| c.set(CEL_CALL_COST_LIMIT));
+        CEL_LOCALS.with(|l| l.borrow_mut().clear());
+        CelEvalScope
+    }
+}
+
+impl Drop for CelEvalScope {
+    fn drop(&mut self) {
+        CEL_LOCALS.with(|l| l.borrow_mut().clear());
+    }
+}
+
+/// Spends `units` of the current expression's cost budget; `None` once it is exhausted.
+/// A failed charge leaves the budget at zero, so no later charge can succeed and an error
+/// absorbed by a short-circuiting macro cannot be followed by more work.
+fn cel_charge(units: u64) -> Option<()> {
+    CEL_COST_LEFT.with(|c| match c.get().checked_sub(units) {
+        Some(left) => {
+            c.set(left);
+            Some(())
+        }
+        None => {
+            c.set(0);
+            None
+        }
+    })
+}
+
+/// Charges for cloning `v`, counting at most as many nodes as the remaining budget could
+/// pay for so an oversized value is refused without walking all of it.
+fn cel_charge_clone(v: &serde_json::Value) -> Option<()> {
+    fn count(v: &serde_json::Value, cap: u64, seen: &mut u64) {
+        *seen += 1;
+        if *seen > cap {
+            return;
+        }
+        match v {
+            serde_json::Value::Array(a) => a.iter().for_each(|e| count(e, cap, seen)),
+            serde_json::Value::Object(o) => o.values().for_each(|e| count(e, cap, seen)),
+            _ => {}
+        }
+    }
+    let cap = CEL_COST_LEFT
+        .with(|c| c.get())
+        .saturating_mul(CEL_NODES_PER_UNIT);
+    let mut seen = 0;
+    count(v, cap, &mut seen);
+    cel_charge(1 + seen / CEL_NODES_PER_UNIT)
+}
+
+fn cel_local(name: &str) -> Option<serde_json::Value> {
+    CEL_LOCALS.with(|l| {
+        l.borrow()
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    })
+}
+
 /// Parse a `?:` (ternary conditional) expression — the lowest-precedence CEL operator.
 ///
-/// Both branches are always evaluated (this evaluator has no side effects, so eager
-/// evaluation of the unchosen branch is observationally equivalent to real CEL's
-/// short-circuiting and keeps the recursive-descent parser simple, matching the
-/// existing non-short-circuit `&&`/`||` above).
+/// Only the chosen branch is evaluated, as in real CEL: the other is skipped
+/// token-wise, so an error there (e.g. a macro over an absent list guarded by
+/// `has()`) cannot fail the expression.
 fn parse_vap_ternary(
     tokens: &[CelToken],
     pos: &mut usize,
@@ -2003,15 +2088,24 @@ fn parse_vap_ternary(
     if *pos < tokens.len() {
         if let CelToken::Question = &tokens[*pos] {
             *pos += 1;
-            let true_val = parse_vap_ternary(
-                tokens,
-                pos,
-                object,
-                variables,
-                request,
-                namespace_object,
-                old_object,
-            )?;
+            let take_true = cond.as_bool()?;
+            let arm = |evaluate: bool, pos: &mut usize| {
+                if evaluate {
+                    parse_vap_ternary(
+                        tokens,
+                        pos,
+                        object,
+                        variables,
+                        request,
+                        namespace_object,
+                        old_object,
+                    )
+                } else {
+                    skip_vap_operand(tokens, pos, SkipUntil::Arm);
+                    Some(serde_json::Value::Null)
+                }
+            };
+            let true_val = arm(take_true, pos)?;
             if *pos >= tokens.len() {
                 return None;
             }
@@ -2020,22 +2114,19 @@ fn parse_vap_ternary(
             } else {
                 return None;
             }
-            let false_val = parse_vap_ternary(
-                tokens,
-                pos,
-                object,
-                variables,
-                request,
-                namespace_object,
-                old_object,
-            )?;
-            return Some(if cond.as_bool()? { true_val } else { false_val });
+            let false_val = arm(!take_true, pos)?;
+            return Some(if take_true { true_val } else { false_val });
         }
     }
     Some(cond)
 }
 
 /// Parse an `||` (logical OR) expression.
+///
+/// Matches cel-go's `evalOr`: a `true` operand wins over an error or non-bool operand on
+/// either side (`err || true` is `true`); with no `true`, any error or non-bool operand makes
+/// the result an error. An erroring operand is skipped token-wise so later operands still
+/// run.
 fn parse_vap_or(
     tokens: &[CelToken],
     pos: &mut usize,
@@ -2046,7 +2137,8 @@ fn parse_vap_or(
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let _depth_guard = CelRecursionGuard::enter()?;
-    let mut left = parse_vap_and(
+    let start = *pos;
+    let first = parse_vap_and(
         tokens,
         pos,
         object,
@@ -2054,29 +2146,50 @@ fn parse_vap_or(
         request,
         namespace_object,
         old_object,
-    )?;
-    while *pos < tokens.len() {
-        if let CelToken::Pipe = &tokens[*pos] {
-            *pos += 1;
-            let right = parse_vap_and(
-                tokens,
-                pos,
-                object,
-                variables,
-                request,
-                namespace_object,
-                old_object,
-            )?;
-            let result = left.as_bool().unwrap_or(false) || right.as_bool().unwrap_or(false);
-            left = serde_json::Value::Bool(result);
-        } else {
-            break;
-        }
+    );
+    if first.is_none() {
+        *pos = start;
+        skip_vap_operand(tokens, pos, SkipUntil::Or);
     }
-    Some(left)
+    if !matches!(tokens.get(*pos), Some(CelToken::Pipe)) {
+        return first;
+    }
+    // `None` is an error (or non-bool) operand.
+    let mut state = first.and_then(|v| v.as_bool());
+    while let Some(CelToken::Pipe) = tokens.get(*pos) {
+        *pos += 1;
+        if state == Some(true) {
+            skip_vap_operand(tokens, pos, SkipUntil::Or);
+            continue;
+        }
+        let operand_start = *pos;
+        let right = parse_vap_and(
+            tokens,
+            pos,
+            object,
+            variables,
+            request,
+            namespace_object,
+            old_object,
+        );
+        if right.is_none() {
+            *pos = operand_start;
+            skip_vap_operand(tokens, pos, SkipUntil::Or);
+        }
+        state = match right.and_then(|v| v.as_bool()) {
+            Some(true) => Some(true),
+            Some(false) => state,
+            None => None,
+        };
+    }
+    state.map(serde_json::Value::Bool)
 }
 
 /// Parse an `&&` (logical AND) expression.
+///
+/// Matches cel-go's `evalAnd`: a `false` operand wins over an error or non-bool operand on
+/// either side (`err && false` is `false`); with no `false`, any error or non-bool operand
+/// makes the result an error.
 fn parse_vap_and(
     tokens: &[CelToken],
     pos: &mut usize,
@@ -2087,7 +2200,8 @@ fn parse_vap_and(
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let _depth_guard = CelRecursionGuard::enter()?;
-    let mut left = parse_vap_cmp(
+    let start = *pos;
+    let first = parse_vap_cmp(
         tokens,
         pos,
         object,
@@ -2095,26 +2209,42 @@ fn parse_vap_and(
         request,
         namespace_object,
         old_object,
-    )?;
-    while *pos < tokens.len() {
-        if let CelToken::Ampersand = &tokens[*pos] {
-            *pos += 1;
-            let right = parse_vap_cmp(
-                tokens,
-                pos,
-                object,
-                variables,
-                request,
-                namespace_object,
-                old_object,
-            )?;
-            let result = left.as_bool().unwrap_or(false) && right.as_bool().unwrap_or(false);
-            left = serde_json::Value::Bool(result);
-        } else {
-            break;
-        }
+    );
+    if first.is_none() {
+        *pos = start;
+        skip_vap_operand(tokens, pos, SkipUntil::And);
     }
-    Some(left)
+    if !matches!(tokens.get(*pos), Some(CelToken::Ampersand)) {
+        return first;
+    }
+    let mut state = first.and_then(|v| v.as_bool());
+    while let Some(CelToken::Ampersand) = tokens.get(*pos) {
+        *pos += 1;
+        if state == Some(false) {
+            skip_vap_operand(tokens, pos, SkipUntil::And);
+            continue;
+        }
+        let operand_start = *pos;
+        let right = parse_vap_cmp(
+            tokens,
+            pos,
+            object,
+            variables,
+            request,
+            namespace_object,
+            old_object,
+        );
+        if right.is_none() {
+            *pos = operand_start;
+            skip_vap_operand(tokens, pos, SkipUntil::And);
+        }
+        state = match right.and_then(|v| v.as_bool()) {
+            Some(false) => Some(false),
+            Some(true) => state,
+            None => None,
+        };
+    }
+    state.map(serde_json::Value::Bool)
 }
 
 /// Parse a comparison expression (`==`, `!=`, `<`, `<=`, `>`, `>=`).
@@ -2412,6 +2542,7 @@ fn parse_vap_primary(
     old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let _depth_guard = CelRecursionGuard::enter()?;
+    cel_charge(1)?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -2485,16 +2616,32 @@ fn parse_vap_primary(
             // flows through this evaluator's `object` slot cannot collide with or shadow a
             // real `object` root, because no such root exists in the contexts a device
             // selector expression actually runs in.
-            let root = if name == "object" || name == "device" {
-                object.clone()
+            let bound = |v: &serde_json::Value| cel_charge_clone(v).map(|()| v.clone());
+            let root = if let Some(local) = cel_local(&name) {
+                cel_charge_clone(&local)?;
+                local
+            } else if name == "has" && matches!(tokens.get(*pos), Some(CelToken::LParen)) {
+                *pos += 1;
+                let present = eval_vap_has(
+                    tokens,
+                    pos,
+                    object,
+                    variables,
+                    request,
+                    namespace_object,
+                    old_object,
+                )?;
+                return Some(serde_json::Value::Bool(present));
+            } else if name == "object" || name == "device" {
+                bound(object)?
             } else if name == "variables" {
-                variables.clone()
+                bound(variables)?
             } else if name == "request" {
-                request.clone()
+                bound(request)?
             } else if name == "namespaceObject" {
-                namespace_object.clone()
+                bound(namespace_object)?
             } else if name == "oldObject" {
-                old_object.clone()
+                bound(old_object)?
             } else {
                 // Unknown identifier — return as string (struct constructor handled below)
                 // Check for struct constructor: TypeName{...}
@@ -2663,6 +2810,28 @@ fn parse_vap_field_chain(
                     // so a single table covers every method this evaluator supports.
                     if let Some(CelToken::LParen) = tokens.get(*pos) {
                         *pos += 1;
+                        if !optional && VAP_LIST_MACROS.contains(&field.as_str()) {
+                            if let (Some(CelToken::Ident(var)), Some(CelToken::Comma)) =
+                                (tokens.get(*pos), tokens.get(*pos + 1))
+                            {
+                                let var = var.clone();
+                                *pos += 2;
+                                current = eval_vap_list_macro(
+                                    &field,
+                                    var,
+                                    std::mem::take(&mut current),
+                                    tokens,
+                                    pos,
+                                    object,
+                                    variables,
+                                    request,
+                                    namespace_object,
+                                    old_object,
+                                )?;
+                                present = true;
+                                continue;
+                            }
+                        }
                         let args = parse_vap_call_args(
                             tokens,
                             pos,
@@ -2752,6 +2921,235 @@ fn parse_vap_field_chain(
         }
     }
     Some(current)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SkipUntil {
+    /// The right operand of `||`: stops at `||`, `?` or `:`.
+    Or,
+    /// The right operand of `&&`: also stops at `&&`.
+    And,
+    /// One arm of `?:`: stops at the `:` that closes it.
+    Arm,
+}
+
+/// Advances `pos` past one unevaluated operand, so a short-circuited `&&`/`||` or the
+/// unchosen `?:` arm cannot fail the expression. Stops at the end of the enclosing
+/// bracket or argument list.
+fn skip_vap_operand(tokens: &[CelToken], pos: &mut usize, until: SkipUntil) {
+    let mut depth = 0u32;
+    let mut nested_ternaries = 0u32;
+    while let Some(t) = tokens.get(*pos) {
+        let optional_chain =
+            *pos > 0 && matches!(tokens[*pos - 1], CelToken::Dot | CelToken::LBracket);
+        match t {
+            CelToken::LParen | CelToken::LBracket | CelToken::LBrace => depth += 1,
+            CelToken::RParen | CelToken::RBracket | CelToken::RBrace => {
+                if depth == 0 {
+                    return;
+                }
+                depth -= 1;
+            }
+            CelToken::Comma if depth == 0 => return,
+            CelToken::Question if depth == 0 && !optional_chain => {
+                if until != SkipUntil::Arm {
+                    return;
+                }
+                nested_ternaries += 1;
+            }
+            CelToken::Colon if depth == 0 => {
+                if nested_ternaries == 0 {
+                    return;
+                }
+                nested_ternaries -= 1;
+            }
+            CelToken::Pipe if depth == 0 && until != SkipUntil::Arm => return,
+            CelToken::Ampersand if depth == 0 && until == SkipUntil::And => return,
+            _ => {}
+        }
+        *pos += 1;
+    }
+}
+
+/// Receiver-style comprehension macros: `list.all(x, p)`, `exists`, `exists_one`,
+/// `filter(x, p)`, `map(x, e)` and `map(x, p, e)`.
+const VAP_LIST_MACROS: [&str; 5] = ["all", "exists", "exists_one", "filter", "map"];
+
+/// Splits the tokens after an already-consumed `(` into top-level comma-separated
+/// `(start, end)` ranges, returning them with the index just past the matching `)`.
+/// Macro arguments are re-evaluated once per element, so they are located by bracket
+/// depth rather than evaluated while scanning.
+fn split_call_args(tokens: &[CelToken], start: usize) -> Option<(Vec<(usize, usize)>, usize)> {
+    let mut depth = 0u32;
+    let mut ranges = Vec::new();
+    let mut seg = start;
+    for (i, t) in tokens.iter().enumerate().skip(start) {
+        match t {
+            CelToken::LParen | CelToken::LBracket | CelToken::LBrace => depth += 1,
+            CelToken::RBracket | CelToken::RBrace => depth = depth.checked_sub(1)?,
+            CelToken::RParen if depth == 0 => {
+                ranges.push((seg, i));
+                return Some((ranges, i + 1));
+            }
+            CelToken::RParen => depth -= 1,
+            CelToken::Comma if depth == 0 => {
+                ranges.push((seg, i));
+                seg = i + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Evaluates `tokens[start..end]` as one complete expression.
+#[allow(clippy::too_many_arguments)] // same 5 CEL-root params threaded through every parse_vap_* fn
+fn eval_vap_range(
+    tokens: &[CelToken],
+    (start, end): (usize, usize),
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+    request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut p = start;
+    let v = parse_vap_ternary(
+        &tokens[..end],
+        &mut p,
+        object,
+        variables,
+        request,
+        namespace_object,
+        old_object,
+    )?;
+    (p == end).then_some(v)
+}
+
+/// `has(operand.field)`; the caller has consumed `has(`. True when `field` exists on the
+/// operand object with a non-null value.
+///
+/// As in cel-go, only the last selection is a presence test; every earlier one is an
+/// ordinary select, so `has(a.b.c)` with `a.b` absent (or not an object) is a "no such key"
+/// error rather than `false`. An absent select evaluates to null here, so a null or
+/// non-object operand is the error case.
+#[allow(clippy::too_many_arguments)] // same 5 CEL-root params threaded through every parse_vap_* fn
+fn eval_vap_has(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+    request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
+) -> Option<bool> {
+    let (ranges, after) = split_call_args(tokens, *pos)?;
+    let [(start, end)] = ranges[..] else {
+        return None;
+    };
+    *pos = after;
+    if end < start + 3 || tokens[end - 2] != CelToken::Dot {
+        return None;
+    }
+    let CelToken::Ident(field) = &tokens[end - 1] else {
+        return None;
+    };
+    let operand = eval_vap_range(
+        tokens,
+        (start, end - 2),
+        object,
+        variables,
+        request,
+        namespace_object,
+        old_object,
+    )?;
+    match operand {
+        serde_json::Value::Object(map) => Some(map.get(field).is_some_and(|v| !v.is_null())),
+        _ => None,
+    }
+}
+
+/// Runs one of [`VAP_LIST_MACROS`] over `receiver` (a list, or a map's keys); the caller
+/// has consumed `name(var,`. Mirrors cel-go: `all`/`exists` stop at the first
+/// false/true and absorb an earlier per-element error, `exists_one`/`filter`/`map`
+/// propagate any error, and a non-bool predicate is an error. Every iteration is charged
+/// to the cost meter.
+#[allow(clippy::too_many_arguments)] // same 5 CEL-root params threaded through every parse_vap_* fn
+fn eval_vap_list_macro(
+    name: &str,
+    var: String,
+    receiver: serde_json::Value,
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+    request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    use serde_json::Value as J;
+    let (ranges, after) = split_call_args(tokens, *pos)?;
+    *pos = after;
+    let (pred, body) = match (name, ranges[..].as_ref()) {
+        ("map", [f, b]) => (Some(*f), *b),
+        (_, [b]) => (None, *b),
+        _ => return None,
+    };
+    let items: Vec<J> = match receiver {
+        J::Array(a) => a,
+        J::Object(o) => o.into_iter().map(|(k, _)| J::String(k)).collect(),
+        _ => return None,
+    };
+    let eval = |item: &J, range| {
+        CEL_LOCALS.with(|l| l.borrow_mut().push((var.clone(), item.clone())));
+        let r = eval_vap_range(
+            tokens,
+            range,
+            object,
+            variables,
+            request,
+            namespace_object,
+            old_object,
+        );
+        CEL_LOCALS.with(|l| l.borrow_mut().pop());
+        r
+    };
+    let mut errored = false;
+    let mut matched = 0usize;
+    let mut out = Vec::new();
+    for item in items {
+        cel_charge(1)?;
+        if let Some(pred) = pred {
+            if !eval(&item, pred)?.as_bool()? {
+                continue;
+            }
+        }
+        match name {
+            "map" => out.push(eval(&item, body)?),
+            "filter" => {
+                if eval(&item, body)?.as_bool()? {
+                    out.push(item);
+                }
+            }
+            "exists_one" => matched += usize::from(eval(&item, body)?.as_bool()?),
+            "all" => match eval(&item, body).and_then(|v| v.as_bool()) {
+                Some(false) => return Some(J::Bool(false)),
+                Some(true) => {}
+                None => errored = true,
+            },
+            _ => match eval(&item, body).and_then(|v| v.as_bool()) {
+                Some(true) => return Some(J::Bool(true)),
+                Some(false) => {}
+                None => errored = true,
+            },
+        }
+    }
+    match name {
+        "map" | "filter" => Some(J::Array(out)),
+        "exists_one" => Some(J::Bool(matched == 1)),
+        _ if errored => None,
+        _ => Some(J::Bool(name == "all")),
+    }
 }
 
 /// Parse a `(arg, arg, ...)` call argument list for a method or global function call.
@@ -3218,6 +3616,7 @@ fn parse_cel_primary(
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let _depth_guard = CelRecursionGuard::enter()?;
+    cel_charge(1)?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -3305,6 +3704,7 @@ fn parse_cel_primary(
                                 *pos += 1;
                                 // Build field access chain from name
                                 let base = if name == "object" {
+                                    cel_charge_clone(object)?;
                                     object.clone()
                                 } else {
                                     serde_json::Value::Null
@@ -3353,6 +3753,7 @@ fn parse_cel_primary(
 
             // Plain identifier: if it's "object", return the full admitted resource.
             if name == "object" {
+                cel_charge_clone(object)?;
                 return Some(object.clone());
             }
 
@@ -4203,12 +4604,18 @@ async fn run_validating_admission_policies<S: Store>(
                 let passed = match result {
                     Some(b) => b,
                     None => {
+                        let ignore = policy["spec"]["failurePolicy"].as_str() == Some("Ignore");
                         tracing::warn!(
-                            "admission: VAP \"{}\" validation expr eval failed: {}",
+                            "admission: VAP \"{}\" validation expr eval failed ({}): {}",
                             policy_name,
+                            if ignore {
+                                "failurePolicy=Ignore, admitting"
+                            } else {
+                                "denying"
+                            },
                             expr
                         );
-                        false // treat eval error as failure
+                        ignore
                     }
                 };
                 if !passed {
@@ -11549,6 +11956,492 @@ mod tests {
             result.is_ok(),
             "failurePolicy=Ignore must skip the binding when a matchCondition fails to \
              evaluate, not run the (denying) validations as if the condition had passed"
+        );
+    }
+
+    /// Runs one Pod CREATE through a Deny-bound VAP whose only validation cannot be evaluated
+    /// (`authorizer` is unsupported), under the given failurePolicy.
+    async fn admit_with_unevaluable_validation(failure_policy: &str) -> Result<(), StatusError> {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "unevaluable-validation"},
+            "spec": {
+                "failurePolicy": failure_policy,
+                "matchConstraints": {
+                    "resourceRules": [{"apiGroups": ["*"], "apiVersions": ["*"],
+                        "resources": ["*"], "operations": ["*"]}]
+                },
+                "validations": [{
+                    "expression": "authorizer.group('').resource('pods').check().allowed()"
+                }]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/unevaluable-validation",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()), None).await.unwrap();
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "unevaluable-validation-binding"},
+            "spec": {"policyName": "unevaluable-validation", "validationActions": ["Deny"]}
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/unevaluable-validation-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()), None).await.unwrap();
+        let pod = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "some-pod"}});
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "some-pod",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        run_validating_webhooks(&state, &pod, None, &ctx).await
+    }
+
+    /// Upstream admits when a validation fails to evaluate under `failurePolicy: Ignore`.
+    /// Denying instead turns every evaluator gap into an outage for any policy whose author
+    /// opted into fail-open.
+    #[tokio::test]
+    async fn vap_validation_eval_error_admits_under_ignore_policy() {
+        assert!(
+            admit_with_unevaluable_validation("Ignore").await.is_ok(),
+            "failurePolicy=Ignore must admit when a validation expression errors"
+        );
+    }
+
+    /// The default (Fail) must stay fail-closed: an unevaluable validation cannot be allowed
+    /// to wave a request through.
+    #[tokio::test]
+    async fn vap_validation_eval_error_denies_under_fail_policy() {
+        assert!(
+            admit_with_unevaluable_validation("Fail").await.is_err(),
+            "failurePolicy=Fail must deny when a validation expression errors"
+        );
+    }
+
+    fn vap_eval(expr: &str, object: serde_json::Value) -> Option<bool> {
+        eval_cel_bool_expr(
+            expr,
+            &object,
+            &serde_json::Map::new(),
+            &json!({}),
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+        )
+    }
+
+    /// Real-world VAPs guard optional fields with `has()`; without it every such policy
+    /// errors and denies (or, under Ignore, never enforces).
+    #[test]
+    fn vap_has_reports_field_presence_and_guards_deeper_access() {
+        let pod =
+            json!({"spec": {"hostNetwork": true, "empty": null, "sc": {"privileged": false}}});
+        assert_eq!(
+            vap_eval("has(object.spec.hostNetwork)", pod.clone()),
+            Some(true)
+        );
+        assert_eq!(
+            vap_eval("has(object.spec.missing)", pod.clone()),
+            Some(false)
+        );
+        assert_eq!(
+            vap_eval("has(object.spec.empty)", pod.clone()),
+            Some(false),
+            "an explicit null is unset, as for unstructured objects"
+        );
+        assert_eq!(
+            vap_eval(
+                "!has(object.spec.sc) || object.spec.sc.privileged != true",
+                pod.clone()
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            vap_eval(
+                "has(object.spec.nope) && has(object.spec.nope.deeper)",
+                pod.clone()
+            ),
+            Some(false),
+            "the has(a.b) && has(a.b.c) idiom must not error when a.b is absent"
+        );
+        assert_eq!(vap_eval("has(object.spec)", pod.clone()), Some(true));
+        assert_eq!(
+            vap_eval("has(object)", pod),
+            None,
+            "has() needs a field selection"
+        );
+    }
+
+    /// The reason to write `has(x) && x.all(...)` is that the right side must not run when x
+    /// is absent. Evaluating it anyway turns the guarded idiom into an error, which denies
+    /// every request under failurePolicy=Fail.
+    #[test]
+    fn vap_short_circuit_skips_the_unchosen_operand_instead_of_evaluating_it() {
+        let obj = json!({"spec": {"list": [1, 2], "m": {"k": "v"}}});
+        let t = |e: &str| vap_eval(e, obj.clone());
+        assert_eq!(
+            t("!has(object.spec.none) || object.spec.none.all(x, x > 0)"),
+            Some(true)
+        );
+        assert_eq!(
+            t("has(object.spec.none) && object.spec.none.all(x, x > 0)"),
+            Some(false)
+        );
+        assert_eq!(
+            t("has(object.spec.none) ? object.spec.none.all(x, true) : true"),
+            Some(true)
+        );
+        assert_eq!(
+            t("!has(object.spec.list) ? true : object.spec.list.all(x, x > 0)"),
+            Some(true)
+        );
+        assert_eq!(
+            t("true || false || object.spec.none.all(x, x) || object.spec.none.all(x, x)"),
+            Some(true),
+            "every operand after the deciding one is skipped"
+        );
+        assert_eq!(
+            t("false && object.spec.none.all(x, x) && true || object.spec.list.exists(x, x == 2)"),
+            Some(true),
+            "a skipped && operand ends at the next ||"
+        );
+        assert_eq!(
+            t("true ? (false ? 1 : 2) == 2 : object.spec.none.all(x, x)"),
+            Some(true),
+            "a nested ternary inside the chosen arm still parses"
+        );
+        assert_eq!(
+            t("false ? true ? 1 == 1 : 2 == 2 : object.spec.m[?'k'].orValue('') == 'v'"),
+            Some(true),
+            "nested ?: and [?] in a skipped arm do not end the skip early"
+        );
+        assert_eq!(
+            t("true || object.spec.m[?'zz'].orValue('') == 'v'"),
+            Some(true),
+            "the optional-index `[?` is not a ternary"
+        );
+        assert_eq!(
+            t("has(object.spec.list) && object.spec.none.all(x, x > 0)"),
+            None,
+            "an operand that is not skipped still errors"
+        );
+    }
+
+    #[test]
+    fn vap_list_macros_follow_cel_semantics() {
+        let obj = json!({"spec": {"ports": [80, 443, 8080], "names": ["a", "b"], "none": [],
+            "labels": {"app": "x"}, "mixed": [1, "s"]}});
+        let t = |e: &str| vap_eval(e, obj.clone());
+        assert_eq!(t("object.spec.ports.all(p, p > 0)"), Some(true));
+        assert_eq!(t("object.spec.ports.all(p, p < 1000)"), Some(false));
+        assert_eq!(t("object.spec.ports.exists(p, p == 443)"), Some(true));
+        assert_eq!(t("object.spec.ports.exists(p, p == 1)"), Some(false));
+        assert_eq!(t("object.spec.ports.exists_one(p, p > 100)"), Some(false));
+        assert_eq!(t("object.spec.ports.exists_one(p, p > 1000)"), Some(true));
+        assert_eq!(
+            t("object.spec.none.all(p, false)"),
+            Some(true),
+            "all over empty is true"
+        );
+        assert_eq!(
+            t("object.spec.none.exists(p, true)"),
+            Some(false),
+            "exists over empty is false"
+        );
+        assert_eq!(
+            t("object.spec.ports.filter(p, p > 100) == [443, 8080]"),
+            Some(true)
+        );
+        assert_eq!(
+            t("object.spec.ports.map(p, p + 1) == [81, 444, 8081]"),
+            Some(true)
+        );
+        assert_eq!(
+            t("object.spec.ports.map(p, p > 100, p) == [443, 8080]"),
+            Some(true)
+        );
+        assert_eq!(
+            t("object.spec.labels.exists(k, k == 'app')"),
+            Some(true),
+            "macros over a map iterate its keys"
+        );
+        assert_eq!(
+            t("object.spec.names.all(n, object.spec.ports.exists(p, p > 0))"),
+            Some(true),
+            "nested macros and roots stay visible inside the body"
+        );
+        assert_eq!(
+            t("object.spec.ports.all(p, object.spec.names.all(p, p == 'a' || p == 'b'))"),
+            Some(true),
+            "an inner binding shadows the outer one"
+        );
+        assert_eq!(
+            t("object.spec.mixed.exists(m, m > 0)"),
+            Some(true),
+            "exists absorbs a per-element error when another element is true"
+        );
+        assert_eq!(
+            t("object.spec.mixed.all(m, m > 5)"),
+            Some(false),
+            "all absorbs a per-element error when another element is false"
+        );
+        assert_eq!(
+            t("object.spec.mixed.all(m, m > 0)"),
+            None,
+            "an error with no deciding element stays an error"
+        );
+        assert_eq!(
+            t("object.spec.missing.all(p, true)"),
+            None,
+            "macros need a list or map"
+        );
+        assert_eq!(
+            t("object.spec.ports.all(p, 1)"),
+            None,
+            "non-bool predicate is an error"
+        );
+        assert_eq!(
+            t("object.spec.ports.all(p, p > 0"),
+            None,
+            "unterminated macro is an error"
+        );
+    }
+
+    /// Runs `expr` as the sole validation of a ConfigMap-create VAP with `failure_policy` and
+    /// reports whether the request was admitted.
+    async fn vap_admits(expr: &str, failure_policy: &str, object: serde_json::Value) -> bool {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "p"},
+            "spec": {
+                "failurePolicy": failure_policy,
+                "matchConstraints": {"resourceRules": [{
+                    "apiGroups": [""], "apiVersions": ["v1"],
+                    "resources": ["configmaps"], "operations": ["CREATE"]
+                }]},
+                "validations": [{"expression": expr}]
+            }
+        });
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "b"},
+            "spec": {"policyName": "p", "validationActions": ["Deny"]}
+        });
+        for (key, doc) in [
+            (
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/p",
+                policy,
+            ),
+            (
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/b",
+                binding,
+            ),
+        ] {
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "cm",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        run_validating_webhooks(&state, &object, None, &ctx)
+            .await
+            .is_ok()
+    }
+
+    /// Each case is a CEL error upstream, so `Fail` must deny and `Ignore` may admit; none may
+    /// be silently turned into a boolean that lets the request through under `Fail`.
+    #[tokio::test]
+    async fn vap_error_expressions_deny_under_fail_and_admit_only_under_ignore() {
+        let obj = json!({"kind": "ConfigMap",
+            "metadata": {"name": "cm", "namespace": "default"},
+            "spec": {"s": "str", "n": null, "x": {"present": 1}}});
+        let cases = [
+            (
+                "!has(object.spec.nope.y)",
+                "negated has() on an absent parent must not admit",
+            ),
+            (
+                "!has(object.spec.s.y)",
+                "negated has() through a non-object parent must not admit",
+            ),
+            (
+                "!(object.spec.n && true)",
+                "negating a non-bool && operand must not turn it into admit",
+            ),
+            (
+                "!(object.spec.n || false)",
+                "negating a non-bool || operand must not turn it into admit",
+            ),
+            (
+                "!(object.spec.x.present > 'a' || false)",
+                "an erroring || operand with no true must stay an error",
+            ),
+            (
+                "!(object.spec.x.present > 'a' && true)",
+                "an erroring && operand with no false must stay an error",
+            ),
+            ("object.spec.s ? true : true", "non-bool ?: condition"),
+            ("!object.spec.s", "non-bool ! operand"),
+        ];
+        for (expr, why) in cases {
+            assert!(
+                !vap_admits(expr, "Fail", obj.clone()).await,
+                "{why}: `{expr}` must deny under failurePolicy=Fail"
+            );
+            assert!(
+                vap_admits(expr, "Ignore", obj.clone()).await,
+                "{why}: `{expr}` is an eval error, which failurePolicy=Ignore admits"
+            );
+        }
+    }
+
+    /// The same idioms must keep admitting when upstream admits: a deciding operand absorbs the
+    /// error beside it, and a guarded has() chain never reaches the erroring select.
+    #[tokio::test]
+    async fn vap_absorbed_errors_and_guarded_has_still_admit_under_fail() {
+        let obj = json!({"kind": "ConfigMap",
+            "metadata": {"name": "cm", "namespace": "default"},
+            "spec": {"x": {"present": 1}}});
+        for expr in [
+            "object.spec.x.present > 'a' || true",
+            "true || object.spec.x.present > 'a'",
+            "!(object.spec.x.present > 'a' && false)",
+            "!(false && object.spec.x.present > 'a')",
+            "!has(object.spec.none) || !has(object.spec.none.y)",
+            "has(object.spec.x) && has(object.spec.x.present)",
+        ] {
+            assert!(
+                vap_admits(expr, "Fail", obj.clone()).await,
+                "`{expr}` evaluates to true upstream and must admit"
+            );
+        }
+    }
+
+    /// cel-go `evalOr`/`evalAnd`: a deciding bool beats an error on either side; otherwise any
+    /// error or non-bool operand is an error.
+    #[test]
+    fn vap_logical_operators_absorb_errors_like_cel_go() {
+        let obj = json!({"spec": {"s": "str", "p": 1}});
+        let t = |e: &str| vap_eval(e, obj.clone());
+        let err = "object.spec.p > 'a'";
+        assert_eq!(t(err), None, "fixture must be an eval error");
+        assert_eq!(t(&format!("{err} || true")), Some(true));
+        assert_eq!(t(&format!("true || {err}")), Some(true));
+        assert_eq!(t(&format!("{err} && false")), Some(false));
+        assert_eq!(t(&format!("false && {err}")), Some(false));
+        assert_eq!(t(&format!("{err} || false")), None);
+        assert_eq!(t(&format!("false || {err}")), None);
+        assert_eq!(t(&format!("{err} && true")), None);
+        assert_eq!(t(&format!("true && {err}")), None);
+        assert_eq!(t(&format!("{err} || {err} || true")), Some(true));
+        assert_eq!(t(&format!("{err} && true && false")), Some(false));
+        assert_eq!(t("object.spec.s || true"), Some(true));
+        assert_eq!(t("object.spec.s || false"), None);
+        assert_eq!(t("object.spec.s && true"), None);
+        assert_eq!(t("true && object.spec.s"), None);
+        assert_eq!(
+            t(&format!("{err} ? true : true")),
+            None,
+            "an erroring ?: condition is an error"
+        );
+    }
+
+    #[test]
+    fn vap_has_errors_when_a_parent_selection_is_absent() {
+        let obj = json!({"spec": {"x": {"y": 1}, "n": null, "s": "str"}});
+        let t = |e: &str| vap_eval(e, obj.clone());
+        assert_eq!(t("has(object.spec.x.y)"), Some(true));
+        assert_eq!(t("has(object.spec.x.z)"), Some(false));
+        assert_eq!(t("has(object.spec.nope.y)"), None);
+        assert_eq!(t("has(object.spec.n.y)"), None);
+        assert_eq!(t("has(object.spec.s.y)"), None);
+        assert_eq!(t("has(oldObject.spec)"), None);
+    }
+
+    /// A mutation expression that copies a large object field into many keys costs
+    /// (copies x size); the per-expression limit must bound that like any other CEL entry
+    /// point instead of letting one small expression clone megabytes repeatedly.
+    #[test]
+    fn apply_configuration_expression_is_metered_per_call() {
+        let object = json!({"big": vec![1; 200_000], "small": 1});
+        let copies = |n: usize| {
+            let fields = (0..n)
+                .map(|i| format!("k{i}: object.big"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eval_cel_apply_config(&format!("{{{fields}}}"), &object)
+        };
+        assert!(
+            copies(2).is_some(),
+            "a couple of copies is far below the limit"
+        );
+        assert_eq!(
+            copies(200),
+            None,
+            "200 copies of 200k nodes exceeds the cost limit"
+        );
+    }
+
+    /// Nested macros multiply, so a request-sized list can make one expression run for
+    /// minutes. The per-expression cost limit must turn that into an eval error quickly.
+    #[test]
+    fn vap_quadratic_macro_hits_the_cost_limit_instead_of_running_away() {
+        let items: Vec<i64> = (0..5000).collect();
+        let obj = json!({"spec": {"items": items}});
+        let started = std::time::Instant::now();
+        let result = vap_eval(
+            "object.spec.items.all(a, object.spec.items.all(b, a + b >= 0))",
+            obj.clone(),
+        );
+        assert_eq!(
+            result, None,
+            "25M inner steps must exceed the per-call cost limit"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "limit must abort evaluation early, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            vap_eval("object.spec.items.all(a, a >= 0)", obj),
+            Some(true),
+            "a linear pass over the same list stays within budget, and the meter resets per call"
         );
     }
 
