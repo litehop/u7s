@@ -98,6 +98,9 @@ kcm_exec_line="$(grep -F 'ExecStart=$BIN_DIR/kube-controller-manager' "$INSTALL"
 assert_false "u7s-kcm.service passes no --service-account-private-key-file: legacy service-account token Secrets are unsupported, so KCM's token controller must stay off" \
   grep -qF -- '--service-account-private-key-file' <<<"$kcm_exec_line"
 
+assert_true "u7s-kcm.service runs each controller as its own system:controller:* service account, so a stolen KCM credential is not one shared identity (CIS 5.1.3)" \
+  grep -qF -- '--use-service-account-credentials=true' <<<"$kcm_exec_line"
+
 assert_true "u7s-kcm.service reads --root-ca-file from the apiserver-published ca-bundle.pem, the file the restart hook watches" \
   grep -qF -- '--root-ca-file=$STATE_DIR/ca-bundle.pem' <<<"$kcm_exec_line"
 
