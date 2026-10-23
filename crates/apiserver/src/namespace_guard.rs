@@ -391,6 +391,92 @@ mod tests {
             );
         }
 
+        fn ld(field: u8, data: &[u8]) -> Vec<u8> {
+            let mut out = vec![(field << 3) | 2];
+            let mut n = data.len();
+            while n >= 0x80 {
+                out.push((n & 0x7f) as u8 | 0x80);
+                n >>= 7;
+            }
+            out.push(n as u8);
+            out.extend_from_slice(data);
+            out
+        }
+
+        fn envelope(kind: &str, raw: &[u8]) -> Vec<u8> {
+            let mut type_meta = ld(1, b"ex.io/v1");
+            type_meta.extend(ld(2, kind.as_bytes()));
+            let mut out = vec![0x6b, 0x38, 0x73, 0x00];
+            out.extend(ld(1, &type_meta));
+            out.extend(ld(2, raw));
+            out.extend(ld(4, b"application/json"));
+            out
+        }
+
+        /// The guard decodes a protobuf body once while the CR handler decodes again, so an
+        /// envelope nested in a JSON-typed envelope used to slip a foreign
+        /// `metadata.namespace` past the guard and into storage.
+        #[tokio::test]
+        async fn nested_protobuf_envelope_cannot_smuggle_foreign_namespace_into_cr_replace() {
+            let state = make_state();
+            seed_namespace(&state, "a").await;
+            install_namespaced_crd(&state, "ex.io", "v1", "widgets", "Widget").await;
+            let url = "/apis/ex.io/v1/namespaces/a/widgets";
+            let (status, body) = send(
+                &state,
+                "POST",
+                url,
+                "application/json",
+                json!({"apiVersion": "ex.io/v1", "kind": "Widget", "metadata": {"name": "w"}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+
+            let inner = envelope(
+                "Widget",
+                br#"{"apiVersion":"ex.io/v1","kind":"Widget","metadata":{"name":"w","namespace":"kube-system"}}"#,
+            );
+            let outer = envelope("Widget", &inner);
+            let app =
+                crate::build_router(state.clone()).layer(axum::Extension(crate::auth::UserInfo {
+                    username: "carol".into(),
+                    ..Default::default()
+                }));
+            use tower::ServiceExt as _;
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri(format!("{url}/w"))
+                        .header(
+                            axum::http::header::CONTENT_TYPE,
+                            "application/vnd.kubernetes.protobuf",
+                        )
+                        .body(Body::from(outer))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "a nested envelope must be refused, not unwrapped past the namespace guard"
+            );
+            let (status, got) = send(
+                &state,
+                "GET",
+                &format!("{url}/w"),
+                "application/json",
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{got}");
+            assert_eq!(
+                got["metadata"]["namespace"], "a",
+                "the stored CR must keep the URL namespace"
+            );
+        }
+
         #[tokio::test]
         async fn empty_or_matching_body_namespace_is_accepted_and_stamped_from_the_url() {
             let state = make_state();

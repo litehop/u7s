@@ -858,6 +858,44 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
 pub(crate) fn stamp_metadata(obj: &mut Object) {
     obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
     obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+    pin_server_owned_deletion_fields(&mut obj.body, None);
+}
+
+/// `metadata.deletionTimestamp` and `deletionGracePeriodSeconds` are server-owned: only the
+/// delete path may set them. On update they are overwritten with the stored values (or
+/// removed when the stored object has none); on create they are cleared (`stored` = `None`).
+/// Without this a caller holding only update/patch could hard-delete, terminate or
+/// un-terminate an object without the delete verb.
+pub(crate) fn pin_server_owned_deletion_fields(
+    body: &mut serde_json::Value,
+    stored: Option<&serde_json::Value>,
+) {
+    pin_deletion_fields(body, stored.map(|s| &s["metadata"]));
+}
+
+/// Cheap stand-in for the stored object when only its deletion fields are needed later
+/// (patch handlers mutate the stored body in place, so the originals must be copied out first).
+pub(crate) fn snapshot_deletion_fields(body: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"metadata": {
+        "deletionTimestamp": body["metadata"]["deletionTimestamp"],
+        "deletionGracePeriodSeconds": body["metadata"]["deletionGracePeriodSeconds"],
+    }})
+}
+
+fn pin_deletion_fields(body: &mut serde_json::Value, stored: Option<&serde_json::Value>) {
+    let Some(meta) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
+        return;
+    };
+    for field in ["deletionTimestamp", "deletionGracePeriodSeconds"] {
+        match stored.map(|m| &m[field]).filter(|v| !v.is_null()) {
+            Some(v) => {
+                meta.insert(field.to_string(), v.clone());
+            }
+            None => {
+                meta.remove(field);
+            }
+        }
+    }
 }
 
 /// Clears a newly-created built-in's client-supplied `status` before it is persisted.

@@ -978,6 +978,9 @@ pub struct AppState<S = SqliteStore> {
     /// overwrites it from `--admission-control-config-file`; every test gets upstream's
     /// default (everything privileged, nothing exempt).
     pub pod_security: Arc<crate::pod_security::Config>,
+    /// DenyServiceExternalIPs admission plugin switch. Not part of `AppStateConfig`: `run()`
+    /// sets it from `--deny-service-external-ips`; every test gets upstream's default (off).
+    pub deny_service_external_ips: bool,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -1053,6 +1056,7 @@ impl<S> Clone for AppState<S> {
             boot_ready: self.boot_ready.clone(),
             cert_watch: self.cert_watch.clone(),
             pod_security: self.pod_security.clone(),
+            deny_service_external_ips: self.deny_service_external_ips,
         }
     }
 }
@@ -1330,6 +1334,7 @@ impl<S: Store> AppState<S> {
             boot_ready: Arc::new(AtomicBool::new(true)),
             cert_watch: Default::default(),
             pod_security: Arc::new(crate::pod_security::Config::default()),
+            deny_service_external_ips: false,
         }
     }
 

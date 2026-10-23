@@ -1040,6 +1040,31 @@ fn default_service_ip_fields_spec(spec: &mut ServiceSpec) {
     }
 }
 
+/// DenyServiceExternalIPs: a Service may not gain a `spec.externalIPs` entry. `old_spec` is
+/// the stored `spec` on update (`None` on create); keeping or removing existing entries is
+/// allowed so already-stored Services stay editable.
+pub(crate) fn deny_service_external_ips(
+    old_spec: Option<&serde_json::Value>,
+    new_spec: &serde_json::Value,
+) -> Result<(), String> {
+    let ips = |spec: &serde_json::Value| -> Vec<String> {
+        spec["externalIPs"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let old_ips = old_spec.map(ips).unwrap_or_default();
+    if ips(new_spec).iter().all(|ip| old_ips.contains(ip)) {
+        Ok(())
+    } else {
+        Err("Use of external IPs is denied by admission control".to_owned())
+    }
+}
+
 /// Reject `ipFamilyPolicy`/`ipFamilies` combinations the cluster cannot actually satisfy.
 ///
 /// u7s's `ServiceIpAllocator` (state.rs) only ever allocates from a single, IPv4-only
@@ -1757,6 +1782,18 @@ fn default_exact_device_request_counts(requests: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Adding an externalIP is denied, but keeping or removing stored ones is allowed so a
+    /// Service that predates the plugin stays editable (upstream isSubset semantics).
+    #[test]
+    fn deny_service_external_ips_allows_only_subsets_of_stored_ips() {
+        let spec = |ips: &[&str]| serde_json::json!({ "externalIPs": ips });
+        let stored = spec(&["1.1.1.1", "2.2.2.2"]);
+        assert!(deny_service_external_ips(None, &spec(&[])).is_ok());
+        assert!(deny_service_external_ips(None, &spec(&["1.1.1.1"])).is_err());
+        assert!(deny_service_external_ips(Some(&stored), &spec(&["2.2.2.2"])).is_ok());
+        assert!(deny_service_external_ips(Some(&stored), &spec(&["1.1.1.1", "3.3.3.3"])).is_err());
+    }
 
     /// Deployment with no strategy/replicas must have all 6 defaults applied.
     /// This is the bug that caused kcm to crash: "unexpected deployment strategy type: \"\"".
