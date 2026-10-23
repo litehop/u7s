@@ -230,9 +230,6 @@ runs:
           sleep 1
         done
         nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$WORKDIR/apiserver.log"; exit 1; }
-        # Save the cert-based kubeconfig before overwriting with a token one
-        # below -- kube-controller-manager needs the cert-based identity.
-        cp "$WORKDIR/kubeconfig" "$WORKDIR/kubeconfig-cert"
         CA_FILE=$(awk '/certificate-authority:/ {print $2}' "$WORKDIR/kubeconfig")
         echo "E2E_TOKEN=$E2E_TOKEN" >> "$GITHUB_ENV"
         printf '%s\n' \
@@ -577,7 +574,7 @@ runs:
         # (10.244.0.0/16, substituted into the same literal above).
         setsid bash scripts/conformance/kcm-supervisor.sh \
           "$WORKDIR/kube-controller-manager" "$WORKDIR/kcm.log" \
-          --kubeconfig="$WORKDIR/kubeconfig-cert" \
+          --kubeconfig="$WORKDIR/kcm-kubeconfig" \
           --cluster-signing-cert-file="$WORKDIR/ca.pem" \
           --cluster-signing-key-file="$WORKDIR/ca.key" \
           --cluster-signing-duration=8760h \
@@ -586,7 +583,7 @@ runs:
           --allocate-node-cidrs=true \
           --cluster-cidr=10.244.0.0/16 \
           --node-cidr-mask-size=24 \
-          --use-service-account-credentials=false \
+          --use-service-account-credentials=true \
           --leader-elect=false \
           --bind-address=127.0.0.1 \
           --kube-api-content-type=application/json \

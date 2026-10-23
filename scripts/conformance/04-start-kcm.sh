@@ -174,7 +174,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --allocate-node-cidrs=true \\
   --node-cidr-mask-size=24 \\
   --concurrent-gc-syncs=5 \\
-  --use-service-account-credentials=false \\
+  --use-service-account-credentials=true \\
   --leader-elect=false \\
   --bind-address=127.0.0.1 \\
   --kube-api-content-type=application/json \\

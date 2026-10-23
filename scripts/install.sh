@@ -1592,7 +1592,7 @@ Environment=GOMAXPROCS=2
 # no longer knows about is a hard --controllers validation error ("is not
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=true --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 
