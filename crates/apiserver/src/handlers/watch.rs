@@ -3135,6 +3135,7 @@ mod tests {
             "system:node:lima-node-5",
             "system:kube-controller-manager",
             "system:kube-scheduler",
+            "system:serviceaccount:kube-system:deployment-controller",
         ] {
             held.push(
                 watch_generic(state.clone(), global_cap_cfg(system))
@@ -3147,11 +3148,11 @@ mod tests {
         assert!(
             watch_generic(
                 state.clone(),
-                global_cap_cfg("system:serviceaccount:kube-system:pretender")
+                global_cap_cfg("system:serviceaccount:kube-public:pretender")
             )
             .await
             .is_err(),
-            "a kube-system ServiceAccount is a tenant-mintable name and must not be exempt"
+            "only kube-system ServiceAccounts are exempt; any other namespace is tenant-mintable"
         );
     }
 
