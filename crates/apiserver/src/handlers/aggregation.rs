@@ -1543,7 +1543,6 @@ mod tests {
         let state = AppState::new(
             mock.clone(),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -1566,7 +1565,6 @@ mod tests {
         let mock = Arc::new(PanicsOnReadWhenArmedStore::new());
         let state = AppState::new(
             mock.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -1608,7 +1606,6 @@ mod tests {
         let mock = Arc::new(PanicsOnReadWhenArmedStore::new());
         let state = AppState::new(
             mock.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),

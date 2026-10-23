@@ -41,8 +41,7 @@ anyhow          = "1"
 async-stream    = "0.3"
 futures-core    = "0.3"
 futures-util    = "0.3"
-jsonwebtoken    = { version = "11", features = ["rust_crypto"] }
-rsa             = "0.9"
+jsonwebtoken    = { version = "11", features = ["aws_lc_rs"] }
 aws-lc-rs       = { version = "1", default-features = false, features = ["aws-lc-sys"] }
 x509-cert = { version = "0.3", features = ["pem"] }
 uuid        = { version = "1", features = ["v4"] }
