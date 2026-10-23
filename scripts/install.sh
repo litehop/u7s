@@ -1544,7 +1544,7 @@ WorkingDirectory=$STATE_DIR
 # process rather than a separate u7s-scheduler binary+unit -- never also
 # start u7s-scheduler against this same cluster (see the retirement
 # block above this section for why: uncoordinated double-preemption).
-ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --embedded-scheduler true
+ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --embedded-scheduler true --deny-service-external-ips
 # SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.

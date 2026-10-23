@@ -27,6 +27,11 @@ once: each keeps independent per-process preemption dedup state with no
 shared coordination, so both could decide to preempt the same node's pods
 (mayor-rzrfn).
 
+`u7s-apiserver.service` also passes `--deny-service-external-ips`: creating a
+Service or changing its `spec.externalIPs` to add a value is rejected
+(CVE-2020-8554 mitigation). Existing values keep working and can be removed.
+To allow externalIPs, remove the flag from the unit's ExecStart.
+
 If systemd is absent the install fails loudly rather than falling back to an
 unsupervised process. Initial scope is Ubuntu LTS, which always ships
 systemd, so no OpenRC path is designed yet.

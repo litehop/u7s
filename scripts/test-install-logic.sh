@@ -141,6 +141,9 @@ assert "a joined worker's kubeconfig names the CA, client cert and key files the
 assert_true "u7s-apiserver.service declares ExecReload=/bin/kill -HUP \$MAINPID so 'systemctl reload u7s-apiserver' actually delivers SIGHUP instead of failing outright" \
   grep -qF 'ExecReload=/bin/kill -HUP \$MAINPID' "$INSTALL"
 
+assert_true "u7s-apiserver.service's ExecStart passes --deny-service-external-ips, so installed nodes reject new/changed Service externalIPs (CVE-2020-8554 traffic hijack)" \
+  grep -qE '^ExecStart=.*u7s-apiserver .*--deny-service-external-ips' "$INSTALL"
+
 # ---------------------------------------------------------------------------
 # Consistency: every unit that reads a file u7s-apiserver's first run
 # generates (kubeconfig, ca.crt, sa.key, ...) must wait on it the same way.
