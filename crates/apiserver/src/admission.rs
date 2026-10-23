@@ -2063,10 +2063,9 @@ fn cel_local(name: &str) -> Option<serde_json::Value> {
 
 /// Parse a `?:` (ternary conditional) expression — the lowest-precedence CEL operator.
 ///
-/// Both branches are always evaluated (this evaluator has no side effects, so eager
-/// evaluation of the unchosen branch is observationally equivalent to real CEL's
-/// short-circuiting and keeps the recursive-descent parser simple, matching the
-/// existing non-short-circuit `&&`/`||` above).
+/// Only the chosen branch is evaluated, as in real CEL: the other is skipped
+/// token-wise, so an error there (e.g. a macro over an absent list guarded by
+/// `has()`) cannot fail the expression.
 fn parse_vap_ternary(
     tokens: &[CelToken],
     pos: &mut usize,
@@ -2089,15 +2088,24 @@ fn parse_vap_ternary(
     if *pos < tokens.len() {
         if let CelToken::Question = &tokens[*pos] {
             *pos += 1;
-            let true_val = parse_vap_ternary(
-                tokens,
-                pos,
-                object,
-                variables,
-                request,
-                namespace_object,
-                old_object,
-            )?;
+            let take_true = cond.as_bool()?;
+            let mut arm = |evaluate: bool, pos: &mut usize| {
+                if evaluate {
+                    parse_vap_ternary(
+                        tokens,
+                        pos,
+                        object,
+                        variables,
+                        request,
+                        namespace_object,
+                        old_object,
+                    )
+                } else {
+                    skip_vap_operand(tokens, pos, SkipUntil::Arm);
+                    Some(serde_json::Value::Null)
+                }
+            };
+            let true_val = arm(take_true, pos)?;
             if *pos >= tokens.len() {
                 return None;
             }
@@ -2106,16 +2114,8 @@ fn parse_vap_ternary(
             } else {
                 return None;
             }
-            let false_val = parse_vap_ternary(
-                tokens,
-                pos,
-                object,
-                variables,
-                request,
-                namespace_object,
-                old_object,
-            )?;
-            return Some(if cond.as_bool()? { true_val } else { false_val });
+            let false_val = arm(!take_true, pos)?;
+            return Some(if take_true { true_val } else { false_val });
         }
     }
     Some(cond)
@@ -2144,6 +2144,10 @@ fn parse_vap_or(
     while *pos < tokens.len() {
         if let CelToken::Pipe = &tokens[*pos] {
             *pos += 1;
+            if left.as_bool() == Some(true) {
+                skip_vap_operand(tokens, pos, SkipUntil::Or);
+                continue;
+            }
             let right = parse_vap_and(
                 tokens,
                 pos,
@@ -2185,6 +2189,11 @@ fn parse_vap_and(
     while *pos < tokens.len() {
         if let CelToken::Ampersand = &tokens[*pos] {
             *pos += 1;
+            if left.as_bool() != Some(true) {
+                skip_vap_operand(tokens, pos, SkipUntil::And);
+                left = serde_json::Value::Bool(false);
+                continue;
+            }
             let right = parse_vap_cmp(
                 tokens,
                 pos,
@@ -2877,6 +2886,54 @@ fn parse_vap_field_chain(
         }
     }
     Some(current)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SkipUntil {
+    /// The right operand of `||`: stops at `||`, `?` or `:`.
+    Or,
+    /// The right operand of `&&`: also stops at `&&`.
+    And,
+    /// One arm of `?:`: stops at the `:` that closes it.
+    Arm,
+}
+
+/// Advances `pos` past one unevaluated operand, so a short-circuited `&&`/`||` or the
+/// unchosen `?:` arm cannot fail the expression. Stops at the end of the enclosing
+/// bracket or argument list.
+fn skip_vap_operand(tokens: &[CelToken], pos: &mut usize, until: SkipUntil) {
+    let mut depth = 0u32;
+    let mut nested_ternaries = 0u32;
+    while let Some(t) = tokens.get(*pos) {
+        let optional_chain =
+            *pos > 0 && matches!(tokens[*pos - 1], CelToken::Dot | CelToken::LBracket);
+        match t {
+            CelToken::LParen | CelToken::LBracket | CelToken::LBrace => depth += 1,
+            CelToken::RParen | CelToken::RBracket | CelToken::RBrace => {
+                if depth == 0 {
+                    return;
+                }
+                depth -= 1;
+            }
+            CelToken::Comma if depth == 0 => return,
+            CelToken::Question if depth == 0 && !optional_chain => {
+                if until != SkipUntil::Arm {
+                    return;
+                }
+                nested_ternaries += 1;
+            }
+            CelToken::Colon if depth == 0 => {
+                if nested_ternaries == 0 {
+                    return;
+                }
+                nested_ternaries -= 1;
+            }
+            CelToken::Pipe if depth == 0 && until != SkipUntil::Arm => return,
+            CelToken::Ampersand if depth == 0 && until == SkipUntil::And => return,
+            _ => {}
+        }
+        *pos += 1;
+    }
 }
 
 /// Receiver-style comprehension macros: `list.all(x, p)`, `exists`, `exists_one`,
@@ -11990,6 +12047,61 @@ mod tests {
             vap_eval("has(object)", pod),
             None,
             "has() needs a field selection"
+        );
+    }
+
+    /// The reason to write `has(x) && x.all(...)` is that the right side must not run when x
+    /// is absent. Evaluating it anyway turns the guarded idiom into an error, which denies
+    /// every request under failurePolicy=Fail.
+    #[test]
+    fn vap_short_circuit_skips_the_unchosen_operand_instead_of_evaluating_it() {
+        let obj = json!({"spec": {"list": [1, 2], "m": {"k": "v"}}});
+        let t = |e: &str| vap_eval(e, obj.clone());
+        assert_eq!(
+            t("!has(object.spec.none) || object.spec.none.all(x, x > 0)"),
+            Some(true)
+        );
+        assert_eq!(
+            t("has(object.spec.none) && object.spec.none.all(x, x > 0)"),
+            Some(false)
+        );
+        assert_eq!(
+            t("has(object.spec.none) ? object.spec.none.all(x, true) : true"),
+            Some(true)
+        );
+        assert_eq!(
+            t("!has(object.spec.list) ? true : object.spec.list.all(x, x > 0)"),
+            Some(true)
+        );
+        assert_eq!(
+            t("true || false || object.spec.none.all(x, x) || object.spec.none.all(x, x)"),
+            Some(true),
+            "every operand after the deciding one is skipped"
+        );
+        assert_eq!(
+            t("false && object.spec.none.all(x, x) && true || object.spec.list.exists(x, x == 2)"),
+            Some(true),
+            "a skipped && operand ends at the next ||"
+        );
+        assert_eq!(
+            t("true ? (false ? 1 : 2) == 2 : object.spec.none.all(x, x)"),
+            Some(true),
+            "a nested ternary inside the chosen arm still parses"
+        );
+        assert_eq!(
+            t("false ? true ? 1 == 1 : 2 == 2 : object.spec.m[?'k'].orValue('') == 'v'"),
+            Some(true),
+            "nested ?: and [?] in a skipped arm do not end the skip early"
+        );
+        assert_eq!(
+            t("true || object.spec.m[?'zz'].orValue('') == 'v'"),
+            Some(true),
+            "the optional-index `[?` is not a ternary"
+        );
+        assert_eq!(
+            t("has(object.spec.list) && object.spec.none.all(x, x > 0)"),
+            None,
+            "an operand that is not skipped still errors"
         );
     }
 
