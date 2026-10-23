@@ -17,6 +17,7 @@
 #   webhook_ok=1|0           scripts/e2e-workload/webhook-smoke.sh passed
 #   cal_ref_ms / cal_ref_n   median / count of in-guest CPU calibration loops before install (baseline)
 #   cal_idle_ms / cal_idle_n same, at the idle boundary before the first burst (contention probe)
+#   marker_fail=TEXT         why the marker could not be written (set with marker_ok=0)
 #   harness_error=TEXT       the harness itself broke before the bursts (not a u7s verdict)
 # Ramp mode writes install_ok plus, per burst size N: ramp_N_secs (N|timeout),
 # ramp_N_oom_host, ramp_N_oom_kubesystem, ramp_N_notready, ramp_N_ready_final, ramp_N_wp_ok,
@@ -248,6 +249,24 @@ rg_run_status() {
   fi
 }
 
+# Records a failed pre-burst marker write into results file $1. $2 = mariadb-0 became Ready
+# (1|0), $3 = the API answered after the failure (1|0). Only a Ready pod behind a live API
+# makes the write failure a harness problem; a pod that never started or an API that went
+# away is u7s failing, so it is recorded as marker_ok=0 (a FAIL) with the reason.
+rg_record_marker_write_failure() {
+  local f="$1" ready="$2" api="$3"
+  if [ "$ready" = 1 ] && [ "$api" = 1 ]; then
+    echo "harness_error=marker write to MariaDB failed although mariadb-0 is Ready and the API answers" >> "$f"
+  else
+    echo "marker_ok=0" >> "$f"
+    if [ "$ready" != 1 ]; then
+      echo "marker_fail=mariadb-0 never became Ready, marker not written (u7s pod-start failure)" >> "$f"
+    else
+      echo "marker_fail=API did not answer after the marker write failed (u7s failure)" >> "$f"
+    fi
+  fi
+}
+
 # Forced-failure self-check: $1 results file, $2 the VM's phase file. OK (0) only when install
 # succeeded, the run got to the burst phases, and a burst criterion (a)-(c) FAILed there.
 rg_forced_failure_check() {
@@ -377,7 +396,7 @@ rg_verdict() {
   if [ "$(_burst_ok "$b20")" = 1 ] && [ "$(_burst_ok "$bn")" = 1 ] && _is_num "$np"; then c=1; fi
   _check "(c)" "$c" "each burst within ${cap}s (20-pod=${b20:-missing}$(_is_num "$b20" && echo s), ${np:-?}-pod=${bn:-missing}$(_is_num "$bn" && echo s))"
 
-  _check "(d)" "$([ "$wp" = 1 ] && [ "$mk" = 1 ] && echo 1 || echo 0)" "WordPress responds and the pre-burst DB marker survived (wp_ok=${wp:-missing} marker_ok=${mk:-missing})"
+  _check "(d)" "$([ "$wp" = 1 ] && [ "$mk" = 1 ] && echo 1 || echo 0)" "WordPress responds and the pre-burst DB marker survived (wp_ok=${wp:-missing} marker_ok=${mk:-missing}$(rg_get "$f" marker_fail | sed 's/^./; &/'))"
   _check "(e)" "$([ "$wh" = 1 ] && echo 1 || echo 0)" "webhook-smoke.sh passes (webhook_ok=${wh:-missing})"
 
   # Not a criterion: kubelet memory-pressure evictions delete pods without an OOM kill.

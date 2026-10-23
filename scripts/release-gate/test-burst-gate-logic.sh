@@ -371,9 +371,21 @@ rg_quiet_line 1 40 0 12 > "$TMP/q-own.log"
 assert "foreign load beyond the allowance still reads as contention" "$([ -n "$(rg_quiet_log_reasons "$TMP/q-own.log")" ] && echo 1 || echo 0)"
 
 # Marker write failure is a harness error.
-printf 'harness_error=marker write to MariaDB failed before the bursts\n' > "$TMP/harness.env"
-assert "harness error on a quiet host -> INVALID, not FAIL (the harness broke, not u7s)" \
+: > "$TMP/harness.env"
+rg_record_marker_write_failure "$TMP/harness.env" 1 1
+assert "marker write fails with mariadb-0 Ready and API up -> INVALID (the harness broke, not u7s)" \
   "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/harness.env")" = INVALID ] && echo 1 || echo 0)"
+: > "$TMP/nopod.env"
+rg_record_marker_write_failure "$TMP/nopod.env" 0 1
+assert "mariadb-0 never Ready -> FAIL, a pod-start regression must not be laundered into INVALID" \
+  "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/nopod.env")" = FAIL ] && echo 1 || echo 0)"
+verdict_of "$TMP/nopod.env"
+assert "pod-start FAIL names the reason in the verdict" \
+  "$([[ "$V_OUT" == *"never became Ready"* ]] && echo 1 || echo 0)"
+: > "$TMP/noapi.env"
+rg_record_marker_write_failure "$TMP/noapi.env" 1 0
+assert "API down after marker write failure -> FAIL, not INVALID" \
+  "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/noapi.env")" = FAIL ] && echo 1 || echo 0)"
 assert "a failed marker READ after the bursts (marker_ok=0, no harness error) stays FAIL" \
   "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$(mutate marker_ok 0)")" = FAIL ] && echo 1 || echo 0)"
 
