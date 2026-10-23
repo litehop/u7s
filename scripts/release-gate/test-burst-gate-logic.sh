@@ -323,19 +323,75 @@ assert "unmeasurable idle -> contended (quiet cannot be proven)" "$(rg_quiet_log
 rg_quiet_line 1 95 '' > "$q"
 assert "unmeasurable VM list -> contended" "$([ -n "$(rg_quiet_log_reasons "$q")" ] && echo 1 || echo 0)"
 assert "missing quiet log -> no reasons (nothing observed)" "$([ -z "$(rg_quiet_log_reasons "$TMP/nonexistent")" ] && echo 1 || echo 0)"
-printf 'cal_ref_ms=100\ncal_max_ms=150\n' > "$TMP/cal.env"
-assert "calibration exactly 1.5x the reference is not contention" "$([ -z "$(rg_cal_reason "$TMP/cal.env")" ] && echo 1 || echo 0)"
-printf 'cal_ref_ms=100\ncal_max_ms=151\n' > "$TMP/cal.env"
-assert "calibration over 1.5x the reference -> contention reason" "$(rg_cal_reason "$TMP/cal.env" | grep -q '151ms > 1.5x reference 100ms' && echo 1 || echo 0)"
-assert "missing calibration data is no evidence of contention" "$([ -z "$(rg_cal_reason "$TMP/empty.env")" ] && echo 1 || echo 0)"
 rg_quiet_line 1 95 0 > "$TMP/quiet.log"; rg_quiet_line 1 40 0 > "$TMP/noisy.log"
+cal_env() { printf 'cal_ref_ms=%s\ncal_ref_n=%s\ncal_idle_ms=%s\ncal_idle_n=%s\n' "$1" "$2" "$3" "$4" > "$TMP/cal.env"; }
+cal_env 100 3 150 3
+assert "idle calibration exactly 1.5x the baseline is not contention" "$([ -z "$(rg_cal_reason "$TMP/cal.env")" ] && echo 1 || echo 0)"
+cal_env 100 3 151 3
+assert "idle calibration over 1.5x the pre-install baseline -> contention reason" "$(rg_cal_reason "$TMP/cal.env" | grep -q '151ms > 1.5x pre-install baseline 100ms' && echo 1 || echo 0)"
+cal_env 100 3 400 3
+assert "uniform sustained contention (every idle sample slow vs the baseline) is detected; slowest-vs-fastest could not see it" \
+  "$([ -n "$(rg_cal_reason "$TMP/cal.env")" ] && echo 1 || echo 0)"
+cal_env 100 2 400 3
+assert "too few baseline samples -> unmeasured, judges nothing (a missing probe must not launder a FAIL into INVALID)" \
+  "$([ -z "$(rg_cal_reason "$TMP/cal.env")" ] && [ -n "$(rg_cal_unmeasured "$TMP/cal.env")" ] && echo 1 || echo 0)"
+cal_env 100 3 400 1
+assert "too few idle samples (a single slow sample) -> unmeasured, cannot trip INVALID alone" \
+  "$([ -z "$(rg_cal_reason "$TMP/cal.env")" ] && [ -n "$(rg_cal_unmeasured "$TMP/cal.env")" ] && echo 1 || echo 0)"
+assert "missing calibration data is unmeasured (loudly), not contention" \
+  "$([ -z "$(rg_cal_reason "$TMP/empty.env")" ] && [ -n "$(rg_cal_unmeasured "$TMP/empty.env")" ] && echo 1 || echo 0)"
+cal_env 100 3 120 3
+assert "measured calibration prints no unmeasured note" "$([ -z "$(rg_cal_unmeasured "$TMP/cal.env")" ] && echo 1 || echo 0)"
+
+# Only install (baseline) and idle samples feed the verdict; slow settle samples are u7s's own teardown load.
+: > "$TMP/cal.log"
+for ms in 100 102 98; do echo "1 install $ms" >> "$TMP/cal.log"; done
+for ms in 105 101 99; do echo "2 idle $ms" >> "$TMP/cal.log"; done
+for ms in 900 1200 800; do echo "3 settle20 $ms" >> "$TMP/cal.log"; echo "4 settlen $ms" >> "$TMP/cal.log"; done
+assert "cal summary of the baseline phase is the median and count" "$([ "$(rg_cal_summary "$TMP/cal.log" install)" = "100 3" ] && echo 1 || echo 0)"
+assert "cal summary of the idle phase ignores slow settle-phase samples" "$([ "$(rg_cal_summary "$TMP/cal.log" idle)" = "101 3" ] && echo 1 || echo 0)"
+read -r cm cn <<< "$(rg_cal_summary "$TMP/cal.log" install)"; read -r cim cin <<< "$(rg_cal_summary "$TMP/cal.log" idle)"
+cal_env "$cm" "$cn" "$cim" "$cin"
+assert "settle-phase slowdown after a burst stays FAIL, never INVALID (u7s thrash is the thing under test)" \
+  "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/cal.env")" = FAIL ] && echo 1 || echo 0)"
+: > "$TMP/cal-empty.log"
+assert "empty cal.log summarises to '- 0' (unmeasured)" "$([ "$(rg_cal_summary "$TMP/cal-empty.log" idle)" = "- 0" ] && echo 1 || echo 0)"
+cal_env - 0 - 0
+assert "empty cal.log: a real FAIL stays FAIL" "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/cal.env")" = FAIL ] && echo 1 || echo 0)"
+
+# Gate VM's own load.
+assert "VM allowance = vCPUs/host cores (1 of 8 -> 12)" "$([ "$(rg_vm_cpu_allow_pct 1 8)" = 12 ] && echo 1 || echo 0)"
+assert "unknown core count -> allowance 0 (stricter)" "$([ "$(rg_vm_cpu_allow_pct 1 '')" = 0 ] && echo 1 || echo 0)"
+rg_quiet_line 1 60 0 12 > "$TMP/q-own.log"
+assert "idle 60% with a 12% gate-VM allowance is not contention (the gate VM bursting must not make a FAIL INVALID)" \
+  "$([ -z "$(rg_quiet_log_reasons "$TMP/q-own.log")" ] && echo 1 || echo 0)"
+rg_quiet_line 1 60 0 0 > "$TMP/q-own.log"
+assert "same idle with no allowance (pre-flight, no VM) is contention" "$([ -n "$(rg_quiet_log_reasons "$TMP/q-own.log")" ] && echo 1 || echo 0)"
+rg_quiet_line 1 40 0 12 > "$TMP/q-own.log"
+assert "foreign load beyond the allowance still reads as contention" "$([ -n "$(rg_quiet_log_reasons "$TMP/q-own.log")" ] && echo 1 || echo 0)"
+
+# Marker write failure is a harness error.
+printf 'harness_error=marker write to MariaDB failed before the bursts\n' > "$TMP/harness.env"
+assert "harness error on a quiet host -> INVALID, not FAIL (the harness broke, not u7s)" \
+  "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/harness.env")" = INVALID ] && echo 1 || echo 0)"
+assert "a failed marker READ after the bursts (marker_ok=0, no harness error) stays FAIL" \
+  "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$(mutate marker_ok 0)")" = FAIL ] && echo 1 || echo 0)"
+
+# Quiet loop waits for the in-flight sample.
+slow_sample() { sleep 2; echo sampled >> "$1"; }
+rm -f "$TMP/qloop.stop" "$TMP/qloop.log"
+rg_quiet_loop "$TMP/qloop.stop" "$TMP/qloop.log" 0 slow_sample &
+qpid=$!
+sleep 1; touch "$TMP/qloop.stop"; wait "$qpid"
+assert "stopping the quiet loop waits for the in-flight sample so the verdict reads a complete quiet.log" \
+  "$([ "$(cat "$TMP/qloop.log" 2>/dev/null)" = sampled ] && echo 1 || echo 0)"
 assert "PASS under contention stays PASS (a green run on a noisy host is still evidence u7s survives)" \
   "$([ "$(rg_run_status 0 "$TMP/noisy.log" "$TMP/empty.env")" = PASS ] && echo 1 || echo 0)"
 assert "FAIL under contention -> INVALID (the failure cannot be blamed on u7s)" \
   "$([ "$(rg_run_status 1 "$TMP/noisy.log" "$TMP/empty.env")" = INVALID ] && echo 1 || echo 0)"
 assert "FAIL on a quiet host stays FAIL" "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/empty.env")" = FAIL ] && echo 1 || echo 0)"
-printf 'cal_ref_ms=100\ncal_max_ms=400\n' > "$TMP/cal.env"
-assert "FAIL with a slow in-guest calibration on a quiet-looking host -> INVALID (steal the host probe missed)" \
+cal_env 100 3 400 3
+assert "FAIL with a slow idle-boundary calibration on a quiet-looking host -> INVALID (steal the host probe missed)" \
   "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/cal.env")" = INVALID ] && echo 1 || echo 0)"
 
 # --- watchdog kills the in-VM workload ---

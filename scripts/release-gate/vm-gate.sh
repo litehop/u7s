@@ -68,8 +68,9 @@ oom_since() {
     | rg_oom_victims "$(rg_uids_cgroup "$OUT/ks-uids.txt")" | rg_oom_counts
 }
 
-# In-guest CPU speed probe, run only while the guest is idle: a slowdown against the fastest
-# sample is host steal, not u7s load. Also records CPU pressure (PSI).
+# In-guest CPU speed probe. Run only at true idle boundaries (before install, before the first
+# burst), never after a burst: u7s's own teardown load there is the thing under test. A
+# slowdown against the pre-install baseline is host steal. Also records CPU pressure (PSI).
 calibrate() {
   local s e i=0
   s="$(date +%s%N)"
@@ -77,6 +78,11 @@ calibrate() {
   e="$(date +%s%N)"
   echo "$(date +%s) $(cat "$OUT/phase" 2>/dev/null) $(( (e - s) / 1000000 ))" >> "$OUT/cal.log"
   echo "$(date +%s) $(cat "$OUT/phase" 2>/dev/null) $(head -1 /proc/pressure/cpu 2>/dev/null)" >> "$OUT/psi-cpu.log"
+}
+
+calibrate_boundary() {
+  local _
+  for _ in $(seq 1 "$RG_CAL_MIN_SAMPLES"); do calibrate; done
 }
 
 # Memory breakdown while a burst's pods are still running, for per-pod overhead:
@@ -136,7 +142,7 @@ if [ "$ZRAM_MIB" -gt 0 ]; then
 fi
 
 phase install
-calibrate
+calibrate_boundary
 log "zero-arg install.sh"
 if ! bash "$RG/install.sh" > "$OUT/install.log" 2>&1; then
   log "install.sh failed (tail of $OUT/install.log):"; tail -20 "$OUT/install.log" | tee -a "$OUT/run.log"
@@ -188,7 +194,7 @@ fi
 
 phase idle
 sleep "$SETTLE_IDLE"
-calibrate
+calibrate_boundary
 
 phase wordpress
 k apply -f "$RG/wordpress/mariadb-emptydir.yaml" -f "$RG/wordpress/wordpress.yaml" >> "$OUT/run.log" 2>&1
@@ -205,7 +211,7 @@ log "wordpress warm-up GET / -> $(wp_code)"
 MARKER="rg-$(date +%s)-$RANDOM"
 mysql_k() { k -n default exec mariadb-0 -- mariadb -uvalerauko -puserpw-phase3 valenet -N -B -e "$1"; }
 mysql_k "CREATE TABLE rg_marker (v VARCHAR(64) NOT NULL); INSERT INTO rg_marker VALUES ('$MARKER')" >> "$OUT/run.log" 2>&1 \
-  || log "marker write failed"
+  || { log "marker write failed: harness error, not a u7s verdict"; res harness_error "marker write to MariaDB failed before the bursts"; exit 1; }
 marker_ok() {
   local i v=""
   for i in $(seq 1 12); do
@@ -250,7 +256,6 @@ run_ramp() {
     snap "burst$n"
     burst_cleanup; phase "settle$n"; wait_node_ready || log "node not Ready after $n-pod burst"
     sleep "$SETTLE_STEP"
-    calibrate
     record_uids
     read -r oomh oomk <<< "$(oom_since "$t0")"
     res "ramp_${n}_secs" "$secs"
@@ -269,14 +274,12 @@ run_full() {
   b20="$(run_burst 20)"; res burst20_secs "$b20"; log "20-pod burst: $b20 s"
   snap burst20
   burst_cleanup; phase settle20; sleep "$SETTLE_STEP"
-  calibrate
   record_uids
 
   phase burstn
   bn="$(run_burst "$BURST_PODS")"; res burst_pods "$BURST_PODS"; res burst_secs "$bn"; log "$BURST_PODS-pod burst: $bn s"
   snap burstn
   burst_cleanup; phase settlen; sleep "$SETTLE_STEP"
-  calibrate
   record_uids
 
   phase wpcheck
@@ -314,8 +317,8 @@ rg_oom_victims "$(rg_uids_cgroup "$OUT/ks-uids.txt")" < "$OUT/kernel.log" > "$OU
 read -r oomh oomk <<< "$(rg_oom_counts < "$OUT/oom-victims.txt")"
 res oom_host "$oomh"
 res oom_kubesystem "$oomk"
-res cal_ref_ms "$(sort -n -k3 "$OUT/cal.log" | head -1 | cut -d' ' -f3)"
-res cal_max_ms "$(sort -n -k3 "$OUT/cal.log" | tail -1 | cut -d' ' -f3)"
+read -r cal_ms cal_n <<< "$(rg_cal_summary "$OUT/cal.log" install)"; res cal_ref_ms "$cal_ms"; res cal_ref_n "$cal_n"
+read -r cal_ms cal_n <<< "$(rg_cal_summary "$OUT/cal.log" idle)"; res cal_idle_ms "$cal_ms"; res cal_idle_n "$cal_n"
 res oom_victims "$(awk '{print $1":"$2}' "$OUT/oom-victims.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
 res notready_events "$(rg_notready_since "$OUT/node-ready.log" "$WATCH_T0")"
 res api_unreachable_polls "$(grep -c ' unreachable$' "$OUT/node-ready.log")"

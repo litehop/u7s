@@ -15,7 +15,9 @@
 #   wp_ok=1|0                WordPress page answered after the burst settled
 #   marker_ok=1|0            the marker row written to MariaDB before the bursts is still readable
 #   webhook_ok=1|0           scripts/e2e-workload/webhook-smoke.sh passed
-#   cal_ref_ms / cal_max_ms  fastest / slowest in-guest CPU calibration loop (contention probe)
+#   cal_ref_ms / cal_ref_n   median / count of in-guest CPU calibration loops before install (baseline)
+#   cal_idle_ms / cal_idle_n same, at the idle boundary before the first burst (contention probe)
+#   harness_error=TEXT       the harness itself broke before the bursts (not a u7s verdict)
 # Ramp mode writes install_ok plus, per burst size N: ramp_N_secs (N|timeout),
 # ramp_N_oom_host, ramp_N_oom_kubesystem, ramp_N_notready, ramp_N_ready_final, ramp_N_wp_ok,
 # ramp_N_marker_ok.
@@ -28,6 +30,7 @@
 BURST_CAP_SECS="${BURST_CAP_SECS:-300}"
 RG_IDLE_MIN_PCT=70
 RG_CAL_MAX_RATIO_X10=15
+RG_CAL_MIN_SAMPLES=3
 # Pattern for pkill -f inside the VM: every script the gate runs there is started as
 # `bash /var/tmp/rg/<name>.sh`. Anchored so the pkill's own wrapper shell never matches.
 RG_VM_KILL_PATTERN='^bash /var/tmp/rg/[a-z-]+\.sh'
@@ -159,28 +162,74 @@ rg_host_idle_pct() {
   fi
 }
 
-# One quiet.log line: "<epoch> <idle%|?> <other running VMs|?>". "?" = could not be measured.
+# Share of the host CPU (percentage points) the gate VM itself can take: its vCPUs over the
+# host's cores. Its own bursting must not read as foreign contention. $1 vCPUs, $2 host cores.
+rg_vm_cpu_allow_pct() {
+  _rg_is_num "$1" && _rg_is_num "$2" && [ "$2" -gt 0 ] || { echo 0; return; }
+  echo $((100 * $1 / $2))
+}
+
+# One quiet.log line: "<epoch> <idle%|?> <other running VMs|?> <gate VM CPU allowance %>".
+# "?" = could not be measured. The allowance is 0 before the VM exists.
 rg_quiet_line() {
-  printf '%s %s %s\n' "$1" "${2:-?}" "${3:-?}"
+  printf '%s %s %s %s\n' "$1" "${2:-?}" "${3:-?}" "${4:-0}"
 }
 
 # Prints a reason for every contended line of a quiet.log; an unmeasurable sample counts
-# as contended because quiet cannot be proven.
+# as contended because quiet cannot be proven. The idle floor is lowered by the gate VM's
+# own possible CPU share ($4).
 rg_quiet_log_reasons() {
   [ -f "$1" ] || return 0
   awk -v min="$RG_IDLE_MIN_PCT" '
     $2 !~ /^[0-9]+$/ {printf "host idle CPU not measurable at %s\n", $1; next}
-    $2 < min {printf "host idle CPU %d%% < %d%% at %s\n", $2, min, $1}
+    {floor = min - ($4 ~ /^[0-9]+$/ ? $4 : 0)}
+    $2 < floor {printf "host idle CPU %d%% < %d%% (gate VM allowance %d%%) at %s\n", $2, floor, min - floor, $1}
     $3 != 0 {printf "other Lima VMs running (%s) at %s\n", $3, $1}' "$1"
 }
 
-# Prints a reason when the slowest in-guest calibration loop exceeds 1.5x the fastest.
+# Runs `$4 $2` (a sampler appending to quiet.log $2) every $3 seconds until file $1 exists.
+# A sample in flight at stop time is finished and appended before this returns, so the
+# verdict never reads a half-written log and no probe leaks into the next attempt.
+rg_quiet_loop() {
+  local stop="$1" log="$2" every="$3" sampler="$4" t
+  while :; do
+    t=0
+    while [ "$t" -lt "$every" ] && [ ! -e "$stop" ]; do sleep 1; t=$((t + 1)); done
+    [ -e "$stop" ] && return 0
+    "$sampler" "$log"
+  done
+}
+
+# Reads cal.log ("<epoch> <phase> <ms>") for phase $2, prints "<median ms> <count>" or "- 0".
+rg_cal_summary() {
+  awk -v ph="$2" '$2 == ph && $3 ~ /^[0-9]+$/ {print $3}' "$1" 2>/dev/null | sort -n \
+    | awk '{v[NR] = $1} END {if (NR) print v[int(NR / 2) + 1], NR; else print "- 0"}'
+}
+
+# The CPU probe judges only when both the pre-install baseline and the idle-boundary phase
+# have at least RG_CAL_MIN_SAMPLES samples. Otherwise it is unmeasured and judges nothing:
+# a missing probe must not turn a u7s FAIL into INVALID, and host contention is still
+# covered by quiet.log. Prints the unmeasured note (empty when measured).
+rg_cal_unmeasured() {
+  local ref ref_n idle idle_n
+  ref="$(rg_get "$1" cal_ref_ms)"; ref_n="$(rg_get "$1" cal_ref_n)"
+  idle="$(rg_get "$1" cal_idle_ms)"; idle_n="$(rg_get "$1" cal_idle_n)"
+  if _rg_is_num "$ref" && _rg_is_num "$idle" && _rg_is_num "$ref_n" && _rg_is_num "$idle_n" \
+     && [ "$ref" -gt 0 ] && [ "$ref_n" -ge "$RG_CAL_MIN_SAMPLES" ] && [ "$idle_n" -ge "$RG_CAL_MIN_SAMPLES" ]; then
+    return 0
+  fi
+  echo "in-guest CPU calibration unmeasured (baseline n=${ref_n:-0}, idle n=${idle_n:-0}, need ${RG_CAL_MIN_SAMPLES} each): judging on the host checks alone"
+}
+
+# Prints a reason when the idle-boundary calibration median exceeds 1.5x the pre-install
+# baseline taken in the same VM. Only idle boundaries are sampled: u7s's own teardown load
+# after a burst is the thing under test and must never read as contention.
 rg_cal_reason() {
-  local ref max
-  ref="$(rg_get "$1" cal_ref_ms)"; max="$(rg_get "$1" cal_max_ms)"
-  _rg_is_num "$ref" && _rg_is_num "$max" && [ "$ref" -gt 0 ] || return 0
-  [ $((max * 10)) -le $((ref * RG_CAL_MAX_RATIO_X10)) ] \
-    || echo "in-guest CPU calibration ${max}ms > 1.5x reference ${ref}ms"
+  [ -z "$(rg_cal_unmeasured "$1")" ] || return 0
+  local ref idle
+  ref="$(rg_get "$1" cal_ref_ms)"; idle="$(rg_get "$1" cal_idle_ms)"
+  [ $((idle * 10)) -le $((ref * RG_CAL_MAX_RATIO_X10)) ] \
+    || echo "in-guest CPU calibration ${idle}ms > 1.5x pre-install baseline ${ref}ms"
 }
 
 # Contention evidence for a run: $1 quiet.log, $2 results file. Empty output = none.
@@ -193,6 +242,7 @@ rg_contention_reasons() {
 # PASS stays PASS under contention; a non-pass under contention is INVALID.
 rg_run_status() {
   if [ "$1" = 0 ]; then echo PASS
+  elif [ -n "$(rg_get "$3" harness_error)" ]; then echo INVALID
   elif [ -n "$(rg_contention_reasons "$2" "$3")" ]; then echo INVALID
   else echo FAIL
   fi

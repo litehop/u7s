@@ -16,9 +16,12 @@
 # Exit status: 0 PASS, 1 a valid run FAILed, 3 INVALID (not enough valid runs).
 #
 # INVALID: a run that did not pass while the host was not quiet is neither PASS nor FAIL. Quiet
-# means no other Lima VM running and host CPU idle >= 70% over 30 s, checked before the VM is
-# created and then every ~60 s, plus an in-guest CPU calibration loop at idle phase boundaries
-# (slowest > 1.5x fastest). INVALID runs are repeated (up to MAX_INVALID_RUNS, default 3, after
+# means no other Lima VM running and host CPU idle >= 70% over 30 s (the floor drops by the gate
+# VM's own vCPU share once it runs), checked before the VM is created and then every ~60 s, plus
+# an in-guest CPU calibration at the idle boundary before the first burst (median > 1.5x the
+# pre-install baseline of the same VM; never sampled after a burst, and with fewer than 3
+# samples it is unmeasured and judges nothing). A harness error (marker write failing before the
+# bursts) is INVALID too. INVALID runs are repeated (up to MAX_INVALID_RUNS, default 3, after
 # RG_RETRY_WAIT_SECS, default 300) and never counted; a PASS under contention stays a PASS.
 #
 # Usage: burst-gate.sh [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
@@ -159,8 +162,11 @@ quiet_sample() {
   local idle others list
   idle="$(rg_host_idle_pct)"
   if list="$(limactl list 2>/dev/null)"; then others="$(echo "$list" | rg_other_vms "$VM" | wc -l | tr -d ' ')"; else others="?"; fi
-  rg_quiet_line "$(date +%s)" "$idle" "$others" >> "$1"
+  rg_quiet_line "$(date +%s)" "$idle" "$others" "$VM_ALLOW_PCT" >> "$1"
 }
+VM_ALLOW_PCT=0
+VM_VCPUS="$(awk '/^cpus:/ {print $2}' "$HERE/u7s-vps-1g.yaml")"
+HOST_CORES="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 0)"
 host_state() { echo "$(date -u +%H:%M:%SZ) $1 loadavg=$(sysctl -n vm.loadavg 2>/dev/null || cut -d' ' -f1-3 /proc/loadavg) other-running-vms=$(limactl list 2>/dev/null | rg_other_vms "$VM" | tr '\n' ' ')"; }
 
 overall=0; passed=0; valid=0; invalid=0; attempt=0
@@ -171,6 +177,7 @@ while [ "$valid" -lt "$RUNS" ] && [ "$invalid" -lt "$MAX_INVALID_RUNS" ]; do
   echo "==== attempt $attempt (valid $valid/$RUNS, invalid $invalid/$MAX_INVALID_RUNS): VM $VM ===="
   host_state start | tee "$RUN_OUT/host.txt"
   status=""
+  VM_ALLOW_PCT=0
   quiet_sample "$RUN_OUT/quiet.log"
   if [ -n "$(rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null)" ]; then
     status=INVALID
@@ -182,7 +189,9 @@ while [ "$valid" -lt "$RUNS" ] && [ "$invalid" -lt "$MAX_INVALID_RUNS" ]; do
     :
   elif VMS="$VMS $VM"; limactl create "${create_args[@]}" "$HERE/u7s-vps-1g.yaml" >"$RUN_OUT/lima-create.log" 2>&1 \
      && limactl start "$VM" >"$RUN_OUT/lima-start.log" 2>&1; then
-    ( while :; do sleep "$QUIET_RECHECK_SECS"; quiet_sample "$RUN_OUT/quiet.log"; done ) &
+    VM_ALLOW_PCT="$(rg_vm_cpu_allow_pct "$VM_VCPUS" "$HOST_CORES")"
+    rm -f "$RUN_OUT/quiet.stop"
+    rg_quiet_loop "$RUN_OUT/quiet.stop" "$RUN_OUT/quiet.log" "$QUIET_RECHECK_SECS" quiet_sample &
     quiet_pid=$!
     limactl shell "$VM" sudo install -d -m 0777 /var/tmp/rg
     limactl shell "$VM" grep -E 'MemTotal|SwapTotal' /proc/meminfo | tee "$RUN_OUT/meminfo-total.txt"
@@ -198,7 +207,8 @@ while [ "$valid" -lt "$RUNS" ] && [ "$invalid" -lt "$MAX_INVALID_RUNS" ]; do
       kill "$gate_pid" 2>/dev/null ) &
     wd_pid=$!
     wait "$gate_pid" 2>/dev/null
-    kill "$wd_pid" "$tail_pid" "$quiet_pid" 2>/dev/null
+    kill "$wd_pid" "$tail_pid" 2>/dev/null
+    touch "$RUN_OUT/quiet.stop"; wait "$quiet_pid" 2>/dev/null
     limactl copy -r "$VM:/var/tmp/rg/out" "$RUN_OUT/out" >/dev/null 2>&1 \
       || echo "warning: could not copy results out of $VM" >&2
   else
@@ -221,6 +231,9 @@ while [ "$valid" -lt "$RUNS" ] && [ "$invalid" -lt "$MAX_INVALID_RUNS" ]; do
     fi
   fi
   rg_contention_reasons "$RUN_OUT/quiet.log" "$RUN_OUT/out/results.env" > "$RUN_OUT/contention.txt"
+  harness_error="$(rg_get "$RUN_OUT/out/results.env" harness_error)"
+  [ -z "$harness_error" ] || echo "HARNESS ERROR (run is INVALID, not a u7s FAIL): $harness_error"
+  [ ! -s "$RUN_OUT/out/results.env" ] || rg_cal_unmeasured "$RUN_OUT/out/results.env" | sed 's/^/warning: /'
   echo "run status: $status"
   [ "$status" = PASS ] || { [ ! -s "$RUN_OUT/contention.txt" ] || { echo "contention observed:"; cat "$RUN_OUT/contention.txt"; }; }
   case "$status" in
