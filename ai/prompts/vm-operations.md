@@ -50,12 +50,6 @@ gives a clean reprovision from `lima/kubelet.yaml`; use `limactl edit` instead
 when you want to keep disk state (certs, cached images). After any stop, the next
 `run-all.sh` restarts the VM and reconnects kubelet.
 
-**Testing `scripts/install.sh` on a rig VM**: the rig leaves
-`/etc/systemd/system/kubelet.service.d/u7s.conf` and `kube-proxy.service` behind, and the
-drop-in's `ExecStart=` overrides install.sh's kubelet. Run
-`scripts/conformance/lima-unrig.sh --vm <VM>` first (a reboot or the next `run-all.sh`
-re-creates them).
-
 ---
 
 ## Primary path — use run-all.sh
@@ -228,6 +222,18 @@ stderr) and the stack is brought up without sonobuoy. `--all-e2e` and `--stack-o
 compose the same way (`--all-e2e` ignored, warning printed to stderr).
 
 ---
+
+## Testing `scripts/install.sh` on a rig VM
+
+Never run install.sh on a rig VM by hand: the rig leaves
+`/etc/systemd/system/kubelet.service.d/u7s.conf` (re-written on every VM boot) and
+`kube-proxy.service` behind, and the drop-in's `ExecStart=` silently replaces install.sh's
+kubelet. Use
+```bash
+scripts/conformance/lima-install-test.sh --vm <VM> -- --tarball <path under ~> [install.sh args]
+```
+It unrigs, aborts if the drop-in is still present, then runs this checkout's install.sh as
+root. Afterwards `run-all.sh --stack-only` re-rigs the VM.
 
 ## Step 1 — Build (individual, for partial restarts only)
 
