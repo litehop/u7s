@@ -2462,7 +2462,7 @@ pub(crate) fn build_pod_proxy_client(
     client_identity_pem: Option<&[u8]>,
     insecure_https: bool,
 ) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if insecure_https {
         builder = builder.use_rustls_tls().danger_accept_invalid_certs(true);
     } else if let Some(der) = ca_der {
@@ -8327,6 +8327,93 @@ mod tests {
     fn build_pod_proxy_client_without_ca_succeeds() {
         let client = build_pod_proxy_client(None, None, false);
         drop(client); // just verify it was built
+    }
+
+    /// Spawn a plain-TCP backend answering every request with `307 Location: <location>`;
+    /// returns its address and a counter of connections accepted.
+    async fn spawn_redirecting_backend(
+        location: String,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let loc = location.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {loc}\r\n\
+                                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    /// A pod that answers 307 must not make the apiserver dial the Location: podIP
+    /// validation only covers the first hop, so following redirects lets a namespace user
+    /// reach loopback/metadata/kubelet endpoints from the apiserver host with the
+    /// kubelet client identity attached.
+    #[tokio::test]
+    async fn pod_proxy_client_does_not_follow_backend_redirects() {
+        let (internal, internal_hits) = spawn_redirecting_backend("/unused".into()).await;
+        let (backend, _) = spawn_redirecting_backend(format!("http://{internal}/internal")).await;
+
+        let client = build_pod_proxy_client(None, None, false);
+        let resp = client
+            .post(format!("http://{backend}/"))
+            .body("payload")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            307,
+            "the 3xx must be passed through to the caller, as upstream does"
+        );
+        assert_eq!(
+            internal_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "redirect target was contacted: pod proxy followed a backend redirect past \
+             target validation"
+        );
+    }
+
+    /// Same invariant for the node proxy's kubelet client: a redirect from the kubelet
+    /// port must not be followed with the apiserver's kubelet client identity attached.
+    #[tokio::test]
+    async fn kubelet_client_does_not_follow_redirects() {
+        let (internal, internal_hits) = spawn_redirecting_backend("/unused".into()).await;
+        let (backend, _) = spawn_redirecting_backend(format!("http://{internal}/internal")).await;
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let client =
+            AppState::<SqliteStore>::build_kubelet_client(Some(cert.cert.der()), None).unwrap();
+
+        let resp = client
+            .get(format!("http://{backend}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 307);
+        assert_eq!(
+            internal_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "kubelet client followed a redirect, presenting its identity to the target"
+        );
     }
 
     /// build_pod_proxy_client with `insecure_https=true` must accept a certificate no CA

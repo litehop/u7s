@@ -1207,6 +1207,7 @@ impl<S: Store> AppState<S> {
             .map_err(|e| tracing::error!("kubelet client: failed to parse cluster CA DER: {e}"))
             .ok()?;
         let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .use_rustls_tls()
             .tls_certs_only([cert]);
         if let Some(identity_pem) = client_identity_pem {
