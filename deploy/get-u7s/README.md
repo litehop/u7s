@@ -7,6 +7,7 @@ Implements `docs/decisions/distribution-hosting-shape.md`: a small nginx Deploym
 | Path             | Proxies to                                                   |
 |------------------|--------------------------------------------------------------|
 | `/install.sh`    | `github.com/litehop/u7s/releases/latest/download/install.sh` |
+| `/install.sh.sig` | `github.com/litehop/u7s/releases/latest/download/install.sh.sig` |
 | `/<tag>/<asset>` | `github.com/litehop/u7s/releases/download/<tag>/<asset>`     |
 
 Releases here are immutable -- assets freeze on publish and a used tag name can never be reused -- so no floating tag can carry rolling assets. The tag name is the channel selector, and these two fixed URLs are the whole channel design, with no GitHub API call to cache.

@@ -29,6 +29,39 @@ and kube-controller-manager, and writes a systemd unit for each.
    calls are rate-limited; if it fails, set `TAG` by hand from
    <https://github.com/litehop/u7s/releases>).
 
+   `install.sh` verifies the release tarball and its `.sha256` against Ed25519
+   signatures (`.sig` assets) using the public key below, which is also
+   embedded in the script; it refuses to install if verification fails or
+   OpenSSL >= 3.0 is missing. To verify an artifact by hand:
+   `openssl pkeyutl -verify -pubin -inkey release.pub -rawin -in <file> -sigfile <file>.sig`.
+
+   Release signing public key (PLACEHOLDER until the first signed release):
+
+   ```
+   -----BEGIN PUBLIC KEY-----
+   MCowBQYDK2VwAyEAQyJWAOZX5w4sMHM+w/dKPlR3rIHYzOPalQ2UXVJIK+8=
+   -----END PUBLIC KEY-----
+   ```
+
+   **The one-liner above trusts the download channel.** The key embedded in
+   `install.sh` arrives with the script, so it only protects against a
+   compromised release publisher, not against whoever controls the proxy or
+   your network path to it.
+
+   **Verify before running.** `install.sh` is itself signed with the same
+   key. Save the public key above (copied from GitHub, a different channel
+   from the proxy) as `release.pub`, then:
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
+   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh.sig"
+   openssl pkeyutl -verify -pubin -inkey release.pub -rawin -in install.sh -sigfile install.sh.sig
+   sudo bash install.sh
+   ```
+
+   Run it only if openssl prints `Signature Verified Successfully`
+   (OpenSSL >= 3.0; macOS's LibreSSL cannot verify Ed25519).
+
 2. With no flags, the node name defaults to the host's hostname and the
    cluster network binds to the first non-loopback interface. Override
    either with `--node-name` or `--iface` (see `scripts/install.sh --help`
