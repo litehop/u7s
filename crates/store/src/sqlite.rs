@@ -369,6 +369,11 @@ pub struct SqliteStore {
     /// For Phase 1 with one vCPU, a single read connection is sufficient.
     /// For :memory: databases, this is the same connection as write_conn.
     read_conn: Arc<Mutex<Connection>>,
+    /// Dedicated connection for LIST scans, so a long selector scan (which holds its mutex for
+    /// the whole scan to keep one snapshot) never delays point `get`s on `read_conn` — auth and
+    /// every handler read through those. Concurrent LISTs still serialize with each other.
+    /// Same connection as write_conn for :memory: databases.
+    list_conn: Arc<Mutex<Connection>>,
     /// Broadcast channel for live events after writes. Deliberately NOT sharded — every open
     /// watch stream already filters this one channel down to its own prefix; sharding delivery
     /// itself is a separate, larger fan-out axis tracked independently of the ring/deletion_log
@@ -461,6 +466,12 @@ impl SqliteStore {
             Arc::new(Mutex::new(open_conn(db_path, READ_CACHE_SIZE_KIB)?))
         };
 
+        let list_conn = if db_path == ":memory:" {
+            Arc::clone(&write_conn)
+        } else {
+            Arc::new(Mutex::new(open_conn(db_path, READ_CACHE_SIZE_KIB)?))
+        };
+
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (bookmark_tx, _) = broadcast::channel(BOOKMARK_BROADCAST_CAPACITY);
         let shards = Arc::new(RwLock::new(BTreeMap::new()));
@@ -471,6 +482,7 @@ impl SqliteStore {
         Ok(Self {
             write_conn,
             read_conn,
+            list_conn,
             tx,
             bookmark_tx,
             shards,
@@ -2021,10 +2033,10 @@ impl Store for SqliteStore {
         prefix: impl Into<String> + Send,
         opts: ListOptions,
     ) -> Result<ListResponse> {
-        let read_conn = self.read_conn.clone();
+        let list_conn = self.list_conn.clone();
         let prefix: String = prefix.into();
         let (resp, prefix, opts) = tokio::task::spawn_blocking(move || {
-            let conn = read_conn.blocking_lock();
+            let conn = list_conn.blocking_lock();
             list_sync(&conn, &prefix, &opts).map(|resp| (resp, prefix, opts))
         })
         .await??;
@@ -2893,6 +2905,56 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
     }
 
+    /// A LIST scan holds its connection's mutex for the whole scan, so point `get`s must run
+    /// on a different connection.
+    ///
+    /// Why it matters: a selector LIST that matches nothing scans its entire prefix; if `get`
+    /// shared that mutex, one tenant's LIST over a large collection would stall every
+    /// authenticated request (auth reads through `get`) for the duration of the scan.
+    ///
+    /// Fails on revert to a shared connection: holding `list_conn` (a stand-in for an in-flight
+    /// scan) makes the `get` time out.
+    #[tokio::test]
+    async fn get_is_not_blocked_while_a_list_scan_holds_its_connection() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!("u7s-list-conn-test-{nanos}.db"));
+        let db_path_str = db_path.to_str().unwrap().to_string();
+        let store = SqliteStore::new(&db_path_str).expect("file-backed store");
+        store
+            .put("/registry/configmaps/a/x", Bytes::from_static(b"{}"), None)
+            .await
+            .expect("put");
+
+        let scan_in_flight = store.list_conn.lock().await;
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.get("/registry/configmaps/a/x"),
+        )
+        .await
+        .expect("get must not wait on a LIST scan's connection")
+        .expect("get");
+        assert!(got.is_some());
+
+        let blocked_list = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            store.list("/registry/configmaps/", ListOptions::default()),
+        )
+        .await;
+        assert!(
+            blocked_list.is_err(),
+            "list must run on list_conn, otherwise the isolation above proves nothing"
+        );
+        drop(scan_in_flight);
+
+        drop(store);
+        let _ = std::fs::remove_file(&db_path_str);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
     /// The ring's replay snapshot (`replayed` in `watch()`) must be released once its events
     /// are yielded, not retained for the whole stream's lifetime.
     ///
@@ -3252,6 +3314,7 @@ mod tests {
         let store = SqliteStore {
             write_conn,
             read_conn,
+            list_conn: Arc::new(Mutex::new(Connection::open_in_memory().expect("list conn"))),
             tx,
             bookmark_tx,
             shards: Arc::new(RwLock::new(BTreeMap::new())),
