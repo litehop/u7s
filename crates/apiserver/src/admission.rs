@@ -485,36 +485,81 @@ pub(crate) fn webhook_match_conditions_pass(
     Ok(true)
 }
 
-/// Build the `request` JSON value exposed to webhook `matchConditions` CEL expressions.
+/// Build the `request` JSON value exposed to ValidatingAdmissionPolicy and webhook
+/// `matchConditions` CEL expressions.
 ///
-/// Mirrors the `request` shape already built for ValidatingAdmissionPolicy matchConditions
-/// (operation/name/namespace/dryRun/userInfo) so the same expressions work in both places.
-fn webhook_match_condition_request(ctx: &AdmissionContext<'_>) -> serde_json::Value {
+/// Upstream binds the `admission.k8s.io/v1` AdmissionRequest struct converted to unstructured
+/// (`CreateAdmissionRequest`, `SchemalessTypedToVal`), so a field tagged `omitempty` is absent
+/// when empty and selecting it is a "no such key" error unless guarded by `has()`:
+/// `subResource`, `requestSubResource`, `name` (a generateName create), `namespace` (cluster
+/// scope) and `userInfo.{username,uid,groups,extra}`. The remaining fields are always present.
+/// `object`/`oldObject` are separate root variables, and `uid` is not exposed.
+fn webhook_match_condition_request(
+    ctx: &AdmissionContext<'_>,
+    object: &serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let (kind, resource, sub_resource) = request_kind_resource(ctx, object);
+    let gvk = json!({"group": kind.group, "version": kind.version, "kind": kind.kind});
+    let gvr = json!({
+        "group": resource.group, "version": resource.version, "resource": resource.resource
+    });
     let mut req = serde_json::Map::new();
-    req.insert(
-        "operation".to_string(),
-        serde_json::Value::String(ctx.operation.to_string()),
-    );
-    req.insert(
-        "name".to_string(),
-        serde_json::Value::String(ctx.name.to_string()),
-    );
-    req.insert(
-        "namespace".to_string(),
-        ctx.namespace
-            .map(|ns| serde_json::Value::String(ns.to_string()))
-            .unwrap_or(serde_json::Value::Null),
-    );
-    req.insert("dryRun".to_string(), serde_json::Value::Bool(ctx.dry_run));
-    if let Some(ref ui) = ctx.user_info {
-        req.insert("userInfo".to_string(), ui.clone());
-    } else {
-        req.insert(
-            "userInfo".to_string(),
-            serde_json::json!({"username": "", "groups": []}),
-        );
+    req.insert("kind".into(), gvk.clone());
+    req.insert("resource".into(), gvr.clone());
+    req.insert("requestKind".into(), gvk);
+    req.insert("requestResource".into(), gvr);
+    let mut insert_non_empty = |key: &str, value: &str| {
+        if !value.is_empty() {
+            req.insert(key.into(), Value::String(value.into()));
+        }
+    };
+    insert_non_empty("subResource", sub_resource.unwrap_or_default());
+    insert_non_empty("requestSubResource", sub_resource.unwrap_or_default());
+    insert_non_empty("name", ctx.name);
+    insert_non_empty("namespace", ctx.namespace.unwrap_or_default());
+    req.insert("operation".into(), Value::String(ctx.operation.into()));
+    let mut user_info = serde_json::Map::new();
+    if let Some(Value::Object(ui)) = &ctx.user_info {
+        for key in ["username", "uid"] {
+            if let Some(s) = ui
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                user_info.insert(key.into(), Value::String(s.into()));
+            }
+        }
+        if let Some(groups) = ui
+            .get("groups")
+            .filter(|g| g.as_array().is_some_and(|a| !a.is_empty()))
+        {
+            user_info.insert("groups".into(), groups.clone());
+        }
+        if let Some(extra) = ui
+            .get("extra")
+            .filter(|e| e.as_object().is_some_and(|o| !o.is_empty()))
+        {
+            user_info.insert("extra".into(), extra.clone());
+        }
     }
-    serde_json::Value::Object(req)
+    req.insert("userInfo".into(), Value::Object(user_info));
+    req.insert("dryRun".into(), Value::Bool(ctx.dry_run));
+    // The operation's options object; connect options have no scheme kind to report.
+    let options_kind = match ctx.operation {
+        "CREATE" => Some("CreateOptions"),
+        "UPDATE" => Some("UpdateOptions"),
+        "DELETE" => Some("DeleteOptions"),
+        _ => None,
+    };
+    req.insert(
+        "options".into(),
+        options_kind.map_or(
+            Value::Null,
+            |k| json!({"apiVersion": "meta.k8s.io/v1", "kind": k}),
+        ),
+    );
+    Value::Object(req)
 }
 
 /// Fetch the namespace object labels from the store.
@@ -1069,25 +1114,11 @@ fn split_subresource(resource: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Must stay `pub` (not `pub(crate)`): the crate-root `pub use` re-export at
-/// `lib.rs:49` (needed so `benches/admission_review.rs`, a separate crate, can
-/// call it) requires the re-exported item itself to already be externally
-/// reachable. `mod admission` being private is irrelevant here — `pub use`
-/// cannot upgrade a `pub(crate)` item to external visibility; rustc rejects
-/// that re-export outright (E0364/E0365).
-pub fn build_review(
-    uid: &str,
-    ctx: &AdmissionContext<'_>,
-    object: &Arc<serde_json::Value>,
-    old_object: Option<&Arc<serde_json::Value>>,
-) -> AdmissionReview {
-    // Populate oldObject for UPDATE and DELETE so policy engines (Kyverno, OPA Gatekeeper)
-    // can enforce immutability rules and detect what changed. Without oldObject, immutability
-    // checks silently pass on every UPDATE because there is nothing to compare against.
-    let old_object = match ctx.operation {
-        "UPDATE" | "DELETE" => old_object.map(Arc::clone),
-        _ => None,
-    };
+/// The `kind`, `resource` and `subResource` of the admission request for `object`.
+fn request_kind_resource<'a>(
+    ctx: &'a AdmissionContext<'_>,
+    object: &'a serde_json::Value,
+) -> (GroupVersionKind, GroupVersionResource, Option<&'a str>) {
     let (base_resource, sub_resource) = split_subresource(ctx.resource);
     // The request kind is the object's own GVK, which differs from the resource's group for
     // objects like Scale (autoscaling/v1) and Eviction (policy/v1) written through a
@@ -1114,6 +1145,29 @@ pub fn build_review(
         version: ctx.version.to_string(),
         resource: base_resource.to_string(),
     };
+    (kind, resource, sub_resource)
+}
+
+/// Must stay `pub` (not `pub(crate)`): the crate-root `pub use` re-export at
+/// `lib.rs:49` (needed so `benches/admission_review.rs`, a separate crate, can
+/// call it) requires the re-exported item itself to already be externally
+/// reachable. `mod admission` being private is irrelevant here — `pub use`
+/// cannot upgrade a `pub(crate)` item to external visibility; rustc rejects
+/// that re-export outright (E0364/E0365).
+pub fn build_review(
+    uid: &str,
+    ctx: &AdmissionContext<'_>,
+    object: &Arc<serde_json::Value>,
+    old_object: Option<&Arc<serde_json::Value>>,
+) -> AdmissionReview {
+    // Populate oldObject for UPDATE and DELETE so policy engines (Kyverno, OPA Gatekeeper)
+    // can enforce immutability rules and detect what changed. Without oldObject, immutability
+    // checks silently pass on every UPDATE because there is nothing to compare against.
+    let old_object = match ctx.operation {
+        "UPDATE" | "DELETE" => old_object.map(Arc::clone),
+        _ => None,
+    };
+    let (kind, resource, sub_resource) = request_kind_resource(ctx, object);
     AdmissionReview {
         api_version: "admission.k8s.io/v1".to_string(),
         kind: "AdmissionReview".to_string(),
@@ -1617,7 +1671,7 @@ async fn invoke_mutating_webhook<S: Store>(
     // expression evaluates to false; deny/skip on eval error per failurePolicy — see
     // webhook_match_conditions_pass.
     if !webhook.match_conditions.is_empty() {
-        let request_val = webhook_match_condition_request(ctx);
+        let request_val = webhook_match_condition_request(ctx, object);
         if !webhook_match_conditions_pass(
             &webhook.match_conditions,
             object,
@@ -1879,6 +1933,7 @@ pub(crate) fn eval_cel_bool_expr(
 ) -> Option<bool> {
     let _scope = CelEvalScope::begin();
     let tokens = tokenize_cel(expr.trim())?;
+    check_cel_vap_syntax_cached(expr).ok()?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
     let val = parse_vap_ternary(
@@ -1910,6 +1965,7 @@ pub(crate) fn eval_cel_vap_value(
 ) -> Option<serde_json::Value> {
     let _scope = CelEvalScope::begin();
     let tokens = tokenize_cel(expr.trim())?;
+    check_cel_vap_syntax_cached(expr).ok()?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
     let val = parse_vap_ternary(
@@ -1927,6 +1983,206 @@ pub(crate) fn eval_cel_vap_value(
         return None;
     }
     Some(val)
+}
+
+/// Root variables a ValidatingAdmissionPolicy expression may reference (`device` is the
+/// DRA selector alias).
+pub(crate) const CEL_VAP_ROOTS: &[&str] = &[
+    "object",
+    "oldObject",
+    "request",
+    "params",
+    "namespaceObject",
+    "variables",
+    "authorizer",
+    "device",
+];
+
+/// Root variables a webhook `matchConditions` expression may reference.
+pub(crate) const CEL_WEBHOOK_ROOTS: &[&str] = &["object", "oldObject", "request", "authorizer"];
+
+/// Compile-step analogue: parses `expr` with the vendored `cel` crate (a cel-go port, so
+/// the grammar is upstream's) and rejects references to variables the context does not
+/// declare. Parse errors must stay distinct from eval errors: the evaluator absorbs eval
+/// errors in `a || true`, which a syntax error must never be.
+pub(crate) fn check_cel_syntax(expr: &str, roots: &[&str]) -> Result<(), String> {
+    check_cel_syntax_with_stack(expr, roots, 32 << 20)
+}
+
+const CEL_SYNTAX_CACHE_MAX: usize = 1024;
+
+/// Memoised [`check_cel_syntax`] against the VAP roots for the evaluation hot path: each
+/// distinct expression is parsed (and, when long, on a big-stack thread) once. A failure,
+/// including a failed thread spawn, is returned as `Err` so the caller denies under Fail.
+fn check_cel_vap_syntax_cached(expr: &str) -> Result<(), String> {
+    type Verdicts = HashMap<Box<str>, Result<(), String>>;
+    static CACHE: std::sync::Mutex<Option<Verdicts>> = std::sync::Mutex::new(None);
+    if let Some(r) = CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(expr))
+    {
+        return r.clone();
+    }
+    let r = check_cel_syntax(expr, CEL_VAP_ROOTS);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.get_or_insert_with(HashMap::new);
+    if m.len() >= CEL_SYNTAX_CACHE_MAX {
+        m.clear();
+    }
+    m.insert(expr.into(), r.clone());
+    r
+}
+
+#[cfg(test)]
+thread_local! {
+    static CEL_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn check_cel_syntax_with_stack(
+    expr: &str,
+    roots: &[&str],
+    stack_size: usize,
+) -> Result<(), String> {
+    #[cfg(test)]
+    CEL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
+    let parse = || {
+        cel::parser::Parser::new()
+            .enable_optional_syntax(true)
+            .enable_ident_escape_syntax(true)
+            .parse(expr)
+    };
+    // The generated parser recurses up to its 96-level cap on a request thread's small
+    // stack; an expression too short to nest deeply than ~50 levels parses in place.
+    let ast = if expr.len() <= 100 {
+        parse()
+    } else {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(stack_size)
+                .spawn_scoped(s, parse)
+                .map_err(|e| format!("compilation failed: {e}"))?
+                .join()
+                .map_err(|_| "compilation failed: parser panicked".to_string())
+        })?
+    }
+    .map_err(|e| format!("compilation failed: {e}"))?;
+    match first_undeclared_ref(&ast, &mut Vec::new(), roots) {
+        Some(name) => Err(format!(
+            "compilation failed: undeclared reference to '{name}' (in container '')"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// First identifier in `e` that is neither a declared root, a macro/`cel.bind` variable in
+/// scope, a type name, nor a macro accumulator (`@result`). The target of a call is
+/// skipped when it is a bare undeclared identifier: that is a function namespace
+/// (`math.greatest`, `sets.contains`), which this check does not declare.
+fn first_undeclared_ref(
+    e: &cel::common::ast::IdedExpr,
+    scope: &mut Vec<String>,
+    roots: &[&str],
+) -> Option<String> {
+    use cel::common::ast::{EntryExpr, Expr};
+    match &e.expr {
+        Expr::Ident(name) => {
+            let declared = name.starts_with('@')
+                || scope.contains(name)
+                || roots.contains(&name.as_str())
+                || ["net", "kubernetes"].contains(&name.as_str())
+                || crate::handlers::cel_rules::CEL_TYPE_IDENTS.contains(&name.as_str());
+            (!declared).then(|| name.clone())
+        }
+        Expr::Select(sel) => first_undeclared_ref(&sel.operand, scope, roots),
+        Expr::Call(call) => {
+            let is_cel_ns = matches!(call.target.as_deref(),
+                Some(t) if matches!(&t.expr, Expr::Ident(n) if n == "cel"));
+            if let (true, "bind", [var, init, body]) =
+                (is_cel_ns, call.func_name.as_str(), call.args.as_slice())
+            {
+                if let Expr::Ident(var) = &var.expr {
+                    if let Some(bad) = first_undeclared_ref(init, scope, roots) {
+                        return Some(bad);
+                    }
+                    scope.push(var.clone());
+                    let r = first_undeclared_ref(body, scope, roots);
+                    scope.pop();
+                    return r;
+                }
+            }
+            // Two-variable comprehensions are not expanded by the parser: `all(i, v, body)`.
+            if let (Some(target), true, [i, v, rest @ ..]) = (
+                &call.target,
+                matches!(
+                    call.func_name.as_str(),
+                    "all"
+                        | "exists"
+                        | "exists_one"
+                        | "existsOne"
+                        | "transformList"
+                        | "transformMap"
+                ),
+                call.args.as_slice(),
+            ) {
+                if let (Expr::Ident(i), Expr::Ident(v)) = (&i.expr, &v.expr) {
+                    if let Some(bad) = first_undeclared_ref(target, scope, roots) {
+                        return Some(bad);
+                    }
+                    let depth = scope.len();
+                    scope.extend([i.clone(), v.clone()]);
+                    let r = rest
+                        .iter()
+                        .find_map(|a| first_undeclared_ref(a, scope, roots));
+                    scope.truncate(depth);
+                    return r;
+                }
+            }
+            if let Some(target) = &call.target {
+                let namespace = matches!(&target.expr, Expr::Ident(n)
+                    if !scope.contains(n) && !roots.contains(&n.as_str()));
+                if !namespace {
+                    if let Some(bad) = first_undeclared_ref(target, scope, roots) {
+                        return Some(bad);
+                    }
+                }
+            }
+            call.args
+                .iter()
+                .find_map(|a| first_undeclared_ref(a, scope, roots))
+        }
+        Expr::Comprehension(c) => {
+            if let Some(bad) = first_undeclared_ref(&c.iter_range, scope, roots)
+                .or_else(|| first_undeclared_ref(&c.accu_init, scope, roots))
+            {
+                return Some(bad);
+            }
+            let depth = scope.len();
+            scope.push(c.accu_var.clone());
+            scope.push(c.iter_var.clone());
+            scope.extend(c.iter_var2.clone());
+            let r = [&c.loop_cond, &c.loop_step, &c.result]
+                .into_iter()
+                .find_map(|x| first_undeclared_ref(x, scope, roots));
+            scope.truncate(depth);
+            r
+        }
+        Expr::List(l) => l
+            .elements
+            .iter()
+            .find_map(|a| first_undeclared_ref(a, scope, roots)),
+        Expr::Map(m) => m.entries.iter().find_map(|entry| match &entry.expr {
+            EntryExpr::MapEntry(me) => first_undeclared_ref(&me.key, scope, roots)
+                .or_else(|| first_undeclared_ref(&me.value, scope, roots)),
+            EntryExpr::StructField(f) => first_undeclared_ref(&f.value, scope, roots),
+        }),
+        Expr::Struct(s) => s.entries.iter().find_map(|entry| match &entry.expr {
+            EntryExpr::StructField(f) => first_undeclared_ref(&f.value, scope, roots),
+            EntryExpr::MapEntry(me) => first_undeclared_ref(&me.value, scope, roots),
+        }),
+        Expr::Literal(_) | Expr::Unspecified => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1993,6 +2249,20 @@ thread_local! {
     /// Macro-bound variables (`x` in `list.all(x, ...)`), innermost last.
     static CEL_LOCALS: std::cell::RefCell<Vec<(String, serde_json::Value)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Text of the most recent eval error, for the denial message upstream builds from it.
+    static CEL_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn cel_record_error(msg: String) {
+    CEL_LAST_ERROR.with(|e| *e.borrow_mut() = Some(msg));
+}
+
+/// The error text of the last failed `eval_cel_*` call on this thread.
+fn cel_last_error() -> String {
+    CEL_LAST_ERROR
+        .with(|e| e.borrow().clone())
+        .unwrap_or_else(|| "evaluation failed".to_string())
 }
 
 /// Resets the cost meter and macro scope for one top-level `eval_cel_*` call, and clears
@@ -2003,6 +2273,7 @@ impl CelEvalScope {
     fn begin() -> Self {
         CEL_COST_LEFT.with(|c| c.set(CEL_CALL_COST_LIMIT));
         CEL_LOCALS.with(|l| l.borrow_mut().clear());
+        CEL_LAST_ERROR.with(|e| *e.borrow_mut() = None);
         CelEvalScope
     }
 }
@@ -2578,11 +2849,10 @@ fn parse_vap_primary(
                 namespace_object,
                 old_object,
             )?;
-            if *pos < tokens.len() {
-                if let CelToken::RParen = &tokens[*pos] {
-                    *pos += 1;
-                }
-            }
+            let Some(CelToken::RParen) = tokens.get(*pos) else {
+                return None;
+            };
+            *pos += 1;
             // A parenthesized expression is itself a primary — `(cond ? a : b).field` (the
             // ternary-then-oldObject pattern ValidatingAdmissionPolicy's node-restriction
             // rule uses) must support the same `.field`/`[idx]`/`.orValue(...)` postfix
@@ -2678,7 +2948,12 @@ fn parse_vap_primary(
                         return dispatch_vap_function(&name, &args);
                     }
                 }
-                return Some(serde_json::Value::String(name));
+                // A bare type name (`string`, `int`, ...) is a value of type `type`.
+                if crate::handlers::cel_rules::CEL_TYPE_IDENTS.contains(&name.as_str()) {
+                    return Some(cel_type_value(&name));
+                }
+                // An undeclared reference is a compile error upstream; never a string.
+                return None;
             };
 
             // Skip qualifier segments before LBrace (e.g. Object.metadata{...}).
@@ -2709,12 +2984,25 @@ fn parse_vap_primary(
         CelToken::LBracket => {
             *pos += 1;
             let mut arr = Vec::new();
-            while *pos < tokens.len() {
-                if let CelToken::RBracket = &tokens[*pos] {
-                    *pos += 1;
-                    break;
+            loop {
+                match tokens.get(*pos)? {
+                    CelToken::RBracket => {
+                        *pos += 1;
+                        break;
+                    }
+                    _ if !arr.is_empty() => {
+                        let CelToken::Comma = tokens[*pos] else {
+                            return None;
+                        };
+                        *pos += 1;
+                        if let Some(CelToken::RBracket) = tokens.get(*pos) {
+                            *pos += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
-                let val = parse_vap_ternary(
+                arr.push(parse_vap_ternary(
                     tokens,
                     pos,
                     object,
@@ -2722,13 +3010,7 @@ fn parse_vap_primary(
                     request,
                     namespace_object,
                     old_object,
-                )?;
-                arr.push(val);
-                if *pos < tokens.len() {
-                    if let CelToken::Comma = &tokens[*pos] {
-                        *pos += 1;
-                    }
-                }
+                )?);
             }
             Some(serde_json::Value::Array(arr))
         }
@@ -2869,8 +3151,19 @@ fn parse_vap_field_chain(
                         present = present && ok;
                         current = val;
                     } else {
-                        // Field navigation
-                        current = current[&field].clone();
+                        // cel-go: selecting an absent key (or selecting on a non-map) is an
+                        // eval error, never null; `has()` is the only presence test.
+                        // Past an absent optional (`.?a.b`) selection stays absent instead.
+                        if present {
+                            let serde_json::Value::Object(map) = &current else {
+                                return None;
+                            };
+                            let Some(v) = map.get(&field) else {
+                                cel_record_error(format!("no such key: {field}"));
+                                return None;
+                            };
+                            current = v.clone();
+                        }
                     }
                 } else {
                     break;
@@ -2914,6 +3207,8 @@ fn parse_vap_field_chain(
                 let (ok, val) = vap_index_get(&current, &idx_val);
                 if optional {
                     present = present && ok;
+                } else if present && !ok {
+                    return None;
                 }
                 current = val;
             }
@@ -3264,8 +3559,34 @@ fn dispatch_vap_function(name: &str, args: &[serde_json::Value]) -> Option<serde
             let milli = value_to_quantity_milli(&args[0])?;
             Some(serde_json::json!({ CEL_QUANTITY_MILLI_KEY: milli }))
         }
+        "type" => {
+            let [v] = args else {
+                return None;
+            };
+            Some(cel_type_value(match v {
+                serde_json::Value::Null => "null_type",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Number(n) if n.is_f64() => "double",
+                serde_json::Value::Number(n) if n.is_i64() => "int",
+                serde_json::Value::Number(_) => "uint",
+                serde_json::Value::Array(_) => "list",
+                serde_json::Value::Object(m) if m.contains_key(CEL_QUANTITY_MILLI_KEY) => {
+                    "kubernetes.Quantity"
+                }
+                serde_json::Value::Object(m) if m.contains_key(CEL_TYPE_KEY) => "type",
+                serde_json::Value::Object(_) => "map",
+            }))
+        }
         _ => None,
     }
+}
+
+/// Tag key of a CEL type value (`type(x)`, or a type name such as `string` used as a value).
+const CEL_TYPE_KEY: &str = "__cel_type__";
+
+fn cel_type_value(name: &str) -> serde_json::Value {
+    serde_json::json!({ CEL_TYPE_KEY: name })
 }
 
 /// Parse the body of a `{key: value, ...}` object literal (caller consumed `{`).
@@ -3358,6 +3679,23 @@ enum CelToken {
     Pipe,      // ||
 }
 
+fn ends_with_operand(tokens: &[CelToken]) -> bool {
+    match tokens.last() {
+        Some(CelToken::Ident(w)) => w != "in",
+        Some(
+            CelToken::Str(_)
+            | CelToken::Int(_)
+            | CelToken::Float(_)
+            | CelToken::Bool(_)
+            | CelToken::Null
+            | CelToken::RParen
+            | CelToken::RBracket
+            | CelToken::RBrace,
+        ) => true,
+        _ => false,
+    }
+}
+
 fn tokenize_cel(input: &str) -> Option<Vec<CelToken>> {
     let chars: Vec<char> = input.chars().collect();
     let mut tokens = Vec::new();
@@ -3401,9 +3739,11 @@ fn tokenize_cel(input: &str) -> Option<Vec<CelToken>> {
                 tokens.push(CelToken::Str(s));
             }
 
-            // Numbers
+            // Numbers. A `-` after an operand is binary minus (`x-1`), not a sign.
             c if c.is_ascii_digit()
-                || (c == '-' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) =>
+                || (c == '-'
+                    && chars.get(i + 1).is_some_and(char::is_ascii_digit)
+                    && !ends_with_operand(&tokens)) =>
             {
                 let neg = c == '-';
                 if neg {
@@ -3860,8 +4200,7 @@ fn parse_cel_object_body(
 /// Without this check, a POST with a malformed expression returns 200 OK instead
 /// of 422, which causes the admission webhook conformance test to fail.
 ///
-/// We validate that every expression is non-empty and tokenizes to at least one
-/// meaningful token — the same tokenizer used for MutatingAdmissionPolicy CEL.
+/// Every expression must be non-empty and pass [`check_cel_syntax`].
 pub(crate) fn validate_webhook_match_conditions_cel(obj: &serde_json::Value) -> Result<(), String> {
     let webhooks = match obj.get("webhooks").and_then(|v| v.as_array()) {
         Some(w) => w,
@@ -3883,34 +4222,37 @@ pub(crate) fn validate_webhook_match_conditions_cel(obj: &serde_json::Value) -> 
                      CEL expression must not be empty"
                 ));
             }
-            let tokens = tokenize_cel(expr.trim()).unwrap_or_default();
-            if tokens.is_empty() {
-                return Err(format!(
-                    "webhooks[{wi}].matchConditions[{ci}].expression: \
-                     invalid CEL expression: {expr:?}"
-                ));
-            }
-            let valid_start = matches!(
-                tokens[0],
-                CelToken::Ident(_)
-                    | CelToken::Str(_)
-                    | CelToken::Int(_)
-                    | CelToken::Float(_)
-                    | CelToken::Bool(_)
-                    | CelToken::Null
-                    | CelToken::LBrace
-                    | CelToken::LBracket
-                    | CelToken::LParen
-                    | CelToken::Bang
-                    | CelToken::Minus
-            );
-            if !valid_start {
-                return Err(format!(
-                    "webhooks[{wi}].matchConditions[{ci}].expression: \
-                     compilation failed: invalid CEL expression: {expr:?}"
-                ));
+            check_cel_syntax(expr, CEL_WEBHOOK_ROOTS)
+                .map_err(|e| format!("webhooks[{wi}].matchConditions[{ci}].expression: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Reject a ValidatingAdmissionPolicy whose CEL does not compile, as upstream does at
+/// create/update. Without it a malformed expression is stored and only fails at admission
+/// time, where an eval error can be absorbed (`... || true`) or ignored.
+pub(crate) fn validate_vap_cel(obj: &serde_json::Value) -> Result<(), String> {
+    let spec = &obj["spec"];
+    let mut exprs: Vec<(String, &str)> = Vec::new();
+    for (list, field) in [
+        ("matchConditions", "expression"),
+        ("variables", "expression"),
+        ("validations", "expression"),
+        ("validations", "messageExpression"),
+        ("auditAnnotations", "valueExpression"),
+    ] {
+        for (i, item) in spec[list].as_array().into_iter().flatten().enumerate() {
+            if let Some(e) = item[field].as_str() {
+                exprs.push((format!("spec.{list}[{i}].{field}"), e));
             }
         }
+    }
+    for (path, expr) in exprs {
+        if expr.trim().is_empty() {
+            return Err(format!("{path}: CEL expression must not be empty"));
+        }
+        check_cel_syntax(expr, CEL_VAP_ROOTS).map_err(|e| format!("{path}: {e}"))?;
     }
     Ok(())
 }
@@ -4456,33 +4798,7 @@ async fn run_validating_admission_policies<S: Store>(
         // Build a `request` JSON object from the admission context for CEL evaluation.
         // This allows VAP expressions to reference request.userInfo.username,
         // request.operation, request.name, request.namespace, and request.dryRun.
-        let request_val = {
-            let mut req = serde_json::Map::new();
-            req.insert(
-                "operation".to_string(),
-                serde_json::Value::String(ctx.operation.to_string()),
-            );
-            req.insert(
-                "name".to_string(),
-                serde_json::Value::String(ctx.name.to_string()),
-            );
-            req.insert(
-                "namespace".to_string(),
-                ctx.namespace
-                    .map(|ns| serde_json::Value::String(ns.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            req.insert("dryRun".to_string(), serde_json::Value::Bool(ctx.dry_run));
-            if let Some(ref ui) = ctx.user_info {
-                req.insert("userInfo".to_string(), ui.clone());
-            } else {
-                req.insert(
-                    "userInfo".to_string(),
-                    serde_json::json!({"username": "", "groups": []}),
-                );
-            }
-            serde_json::Value::Object(req)
-        };
+        let request_val = webhook_match_condition_request(ctx, object);
 
         // Evaluate matchConditions (pre-filter): any false → skip this binding, not deny.
         // An eval error is governed by the policy's failurePolicy (matching upstream
@@ -4619,12 +4935,25 @@ async fn run_validating_admission_policies<S: Store>(
                     }
                 };
                 if !passed {
-                    let reason = validation["reason"].as_str().unwrap_or("");
+                    // An eval error is never reported as a false result, and (as upstream)
+                    // overrides message/messageExpression/reason.
+                    let errored = result.is_none();
+                    let reason = if errored {
+                        ""
+                    } else {
+                        validation["reason"].as_str().unwrap_or("")
+                    };
                     // messageExpression takes precedence over the static `message` field
                     // (upstream contract) — it lets a validation report which specific
                     // value caused the denial (e.g. the mismatched node/object names).
                     let message_expr = validation["messageExpression"].as_str().unwrap_or("");
-                    let message = if !message_expr.is_empty() {
+                    let message = if errored {
+                        format!(
+                            "ValidatingAdmissionPolicy \"{policy_name}\" denied the request: \
+                             expression '{expr}' resulted in error: {}",
+                            cel_last_error()
+                        )
+                    } else if !message_expr.is_empty() {
                         eval_cel_vap_value(
                             message_expr,
                             object,
@@ -4779,7 +5108,7 @@ pub async fn run_validating_webhooks<S: Store>(
             // expression evaluates to false; deny/skip on eval error per failurePolicy — see
             // webhook_match_conditions_pass.
             if !webhook.match_conditions.is_empty() {
-                let request_val = webhook_match_condition_request(ctx);
+                let request_val = webhook_match_condition_request(ctx, object);
                 if !webhook_match_conditions_pass(
                     &webhook.match_conditions,
                     object,
@@ -12078,7 +12407,7 @@ mod tests {
             "a nested ternary inside the chosen arm still parses"
         );
         assert_eq!(
-            t("false ? true ? 1 == 1 : 2 == 2 : object.spec.m[?'k'].orValue('') == 'v'"),
+            t("true ? object.spec.m[?'k'].orValue('') == 'v' : false ? 1 == 1 : object.spec.none.all(x, x)"),
             Some(true),
             "nested ?: and [?] in a skipped arm do not end the skip early"
         );
@@ -12177,6 +12506,14 @@ mod tests {
     /// Runs `expr` as the sole validation of a ConfigMap-create VAP with `failure_policy` and
     /// reports whether the request was admitted.
     async fn vap_admits(expr: &str, failure_policy: &str, object: serde_json::Value) -> bool {
+        vap_verdict(expr, failure_policy, object).await.is_ok()
+    }
+
+    async fn vap_verdict(
+        expr: &str,
+        failure_policy: &str,
+        object: serde_json::Value,
+    ) -> Result<(), StatusError> {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new(
             store.clone(),
@@ -12232,9 +12569,418 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        run_validating_webhooks(&state, &object, None, &ctx)
+        run_validating_webhooks(&state, &object, None, &ctx).await
+    }
+
+    /// Selecting an absent key is a cel-go eval error, so `object.spec.x != 'bad'` on an object
+    /// without `spec.x` must DENY under Fail instead of reading the absent key as null (!= 'bad'
+    /// -> true). The same applies to every other missing-key / non-map select and to expressions
+    /// that do not compile, which the evaluator must not confuse with an absorbable eval error.
+    #[tokio::test]
+    async fn vap_missing_key_selects_and_uncompilable_expressions_deny_under_fail() {
+        let obj = json!({"kind": "ConfigMap",
+            "metadata": {"name": "cm", "namespace": "default"},
+            "spec": {"s": "str", "l": [1]}});
+        let cases = [
+            ("object.spec.x != 'bad'", "absent key select"),
+            ("object.spec.x.y == 1", "select through an absent key"),
+            ("object.spec.s.y == 1", "select on a string"),
+            ("object.spec.l.y == 1", "select on a list"),
+            (
+                "oldObject.spec.x != 'bad'",
+                "select on null oldObject (CREATE)",
+            ),
+            ("variables.nope != 'bad'", "variable that was never defined"),
+            ("object.spec.l[5] != 1", "list index out of range"),
+            ("object.spec['x'] != 'bad'", "map index with absent key"),
+            ("nope == 'nope'", "undeclared identifier is not a string"),
+            (
+                "(1 + ) || true",
+                "syntax error must not be absorbed by || true",
+            ),
+            ("(1 == 1", "unterminated parenthesis"),
+            ("true || (1 +", "truncated operand behind a deciding true"),
+            ("[1, 2 == 2", "unterminated list literal"),
+            ("true true", "trailing token"),
+        ];
+        for (expr, why) in cases {
+            assert!(
+                !vap_admits(expr, "Fail", obj.clone()).await,
+                "{why}: `{expr}` is an error upstream and must deny under failurePolicy=Fail"
+            );
+            assert!(
+                vap_admits(expr, "Ignore", obj.clone()).await,
+                "{why}: `{expr}` errors, which failurePolicy=Ignore admits"
+            );
+        }
+    }
+
+    /// Upstream converts its AdmissionRequest struct to unstructured, which drops `omitempty`
+    /// fields: a policy that selects an empty one errors (and `has()` is false), and the
+    /// denial text is `expression '<expr>' resulted in error: <cel error>`.
+    #[tokio::test]
+    async fn vap_selecting_an_omitted_request_field_denies_with_upstream_error_text() {
+        let obj = json!({"kind": "ConfigMap", "metadata": {"name": "cm"}});
+        let err = vap_verdict("request.userInfo.uid == ''", "Fail", obj)
             .await
-            .is_ok()
+            .expect_err("uid is omitted from the request when empty, so selecting it errors");
+        assert!(
+            err.1.message.ends_with(
+                "expression 'request.userInfo.uid == ''' resulted in error: no such key: uid"
+            ),
+            "got {}",
+            err.1.message
+        );
+    }
+
+    /// The `request` variable carries every field upstream declares, with upstream's
+    /// empty-value handling; a missing declared field turns `request.resource.resource ==
+    /// 'pods'` into an eval error that denies every pod create under failurePolicy=Fail.
+    #[test]
+    fn request_variable_exposes_every_upstream_field_with_omitempty_semantics() {
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods/status",
+            name: "p",
+            namespace: Some("ns"),
+            operation: "UPDATE",
+            user_info: Some(json!({"username": "alice", "uid": "", "groups": [],
+                "extra": {"k": ["v"]}})),
+            dry_run: true,
+        };
+        let pod = json!({"apiVersion": "v1", "kind": "Pod"});
+        assert_eq!(
+            webhook_match_condition_request(&ctx, &pod),
+            json!({
+                "kind": {"group": "", "version": "v1", "kind": "Pod"},
+                "resource": {"group": "", "version": "v1", "resource": "pods"},
+                "subResource": "status",
+                "requestKind": {"group": "", "version": "v1", "kind": "Pod"},
+                "requestResource": {"group": "", "version": "v1", "resource": "pods"},
+                "requestSubResource": "status",
+                "name": "p",
+                "namespace": "ns",
+                "operation": "UPDATE",
+                "userInfo": {"username": "alice", "extra": {"k": ["v"]}},
+                "dryRun": true,
+                "options": {"apiVersion": "meta.k8s.io/v1", "kind": "UpdateOptions"},
+            })
+        );
+        let cluster = AdmissionContext {
+            resource: "nodes",
+            name: "",
+            namespace: None,
+            operation: "CONNECT",
+            user_info: None,
+            dry_run: false,
+            ..ctx
+        };
+        let req = webhook_match_condition_request(&cluster, &json!({"kind": "Node"}));
+        for omitted in ["subResource", "requestSubResource", "name", "namespace"] {
+            assert!(
+                req.get(omitted).is_none(),
+                "{omitted} must be absent: {req}"
+            );
+        }
+        assert_eq!(
+            req["userInfo"],
+            json!({}),
+            "userInfo itself is always present"
+        );
+        assert_eq!(
+            req["dryRun"],
+            json!(false),
+            "dryRun is a non-nil pointer upstream"
+        );
+        assert_eq!(req["options"], json!(null));
+    }
+
+    /// `x-1` and `a -1` are subtraction; reading the `-1` as a literal left two adjacent
+    /// operands, so policies using them failed to evaluate at all.
+    #[test]
+    fn minus_after_an_operand_is_binary_subtraction() {
+        for expr in [
+            "object.n-1 == 2",
+            "object.n -1 == 2",
+            "(object.n)-1 == 2",
+            "3 - 1 == 2",
+        ] {
+            assert_eq!(
+                eval_cel_bool_expr(
+                    expr,
+                    &json!({"n": 3}),
+                    &serde_json::Map::new(),
+                    &json!({}),
+                    &json!(null),
+                    &json!(null)
+                ),
+                Some(true),
+                "{expr}"
+            );
+        }
+    }
+
+    /// `type(x) == string` is the documented guard before a typed use of a dyn value.
+    #[test]
+    fn type_function_and_type_names_evaluate() {
+        for (expr, want) in [
+            ("type(object.s) == string", true),
+            ("type(object.n) == int", true),
+            ("type(object.n) == string", false),
+            ("type(object.f) == double", true),
+            ("type(object.l) == list && type(object.m) == map", true),
+            (
+                "type(object.b) == bool && type(object.z) == null_type",
+                true,
+            ),
+            ("type(type(object.s)) == type", true),
+        ] {
+            assert_eq!(
+                eval_cel_bool_expr(
+                    expr,
+                    &json!({"s": "x", "n": 1, "f": 1.5, "l": [], "m": {}, "b": true, "z": null}),
+                    &serde_json::Map::new(),
+                    &json!({}),
+                    &json!(null),
+                    &json!(null)
+                ),
+                Some(want),
+                "{expr}"
+            );
+        }
+    }
+
+    /// Presence-guarded selects and always-present request fields must keep admitting.
+    #[tokio::test]
+    async fn vap_guarded_selects_and_declared_request_fields_still_admit_under_fail() {
+        let obj = json!({"kind": "ConfigMap",
+            "metadata": {"name": "cm", "namespace": "default"},
+            "spec": {"x": "ok", "l": [1]}});
+        for expr in [
+            "!has(object.spec.y) || object.spec.y != 'bad'",
+            "has(object.spec.x) && object.spec.x != 'bad'",
+            "object.spec.l[0] == 1 && object.spec['x'] == 'ok'",
+            "object.spec.l.all(v, v > 0)",
+            "!has(request.userInfo.uid) && !has(request.userInfo.extra)",
+            "request.namespace == 'default' && request.name == 'cm'",
+            "request.resource.resource == 'configmaps' && request.kind.kind == 'ConfigMap'",
+            "request.requestResource.resource == 'configmaps' && request.requestKind.group == ''",
+            "request.operation == 'CREATE' && request.dryRun == false && !has(request.subResource)",
+            "type(object.metadata.name) == string && request.resource.resource == 'configmaps'",
+            "request.options.kind == 'CreateOptions'",
+        ] {
+            assert!(
+                vap_admits(expr, "Fail", obj.clone()).await,
+                "`{expr}` is valid and true upstream and must admit"
+            );
+        }
+    }
+
+    /// An eval error must be reported as such, not as `evaluated to false`, and must win over
+    /// the policy's static message (upstream replaces the message on error).
+    #[tokio::test]
+    async fn vap_denial_message_says_resulted_in_error_when_expression_errored() {
+        let obj = json!({"kind": "ConfigMap", "spec": {}});
+        let err = vap_verdict("object.spec.x != 'bad'", "Fail", obj.clone())
+            .await
+            .expect_err("must deny");
+        assert!(
+            err.1.message.contains("resulted in error")
+                && !err.1.message.contains("evaluated to false"),
+            "got {}",
+            err.1.message
+        );
+        let err = vap_verdict("false", "Fail", obj)
+            .await
+            .expect_err("must deny");
+        assert!(
+            err.1.message.contains("evaluated to false"),
+            "got {}",
+            err.1.message
+        );
+    }
+
+    /// A policy whose CEL does not compile is rejected at create/update; storing it would
+    /// leave admission to guess whether the failure is absorbable.
+    #[test]
+    fn validate_vap_cel_rejects_uncompilable_expressions_in_every_expression_field() {
+        let mk =
+            |list: &str, field: &str, e: &str| json!({"spec": {list: [{"name": "n", field: e}]}});
+        for (list, field) in [
+            ("validations", "expression"),
+            ("validations", "messageExpression"),
+            ("matchConditions", "expression"),
+            ("variables", "expression"),
+            ("auditAnnotations", "valueExpression"),
+        ] {
+            for bad in ["(1 + ) || true", "", "foo.bar", "object.a ==", "object.a )"] {
+                assert!(
+                    validate_vap_cel(&mk(list, field, bad)).is_err(),
+                    "{list}[].{field} = {bad:?} must be rejected at create"
+                );
+            }
+            assert!(validate_vap_cel(&mk(list, field, "object.a == 1")).is_ok());
+        }
+    }
+
+    /// Every admission request re-evaluates the policy's expressions; re-parsing a long one
+    /// per request spawned a 32 MiB-stack thread each time.
+    #[test]
+    fn long_vap_expression_is_parsed_once_across_many_evaluations() {
+        let expr = format!("object.a == 1 && {}", "true && ".repeat(20) + "true");
+        assert!(expr.len() > 100);
+        let obj = serde_json::json!({"a": 1});
+        let eval = || {
+            eval_cel_bool_expr(
+                &expr,
+                &obj,
+                &serde_json::Map::new(),
+                &serde_json::Value::Null,
+                &serde_json::Value::Null,
+                &serde_json::Value::Null,
+            )
+        };
+        assert_eq!(eval(), Some(true));
+        let after_first = CEL_PARSE_COUNT.with(|c| c.get());
+        for _ in 0..50 {
+            assert_eq!(eval(), Some(true));
+        }
+        assert_eq!(
+            CEL_PARSE_COUNT.with(|c| c.get()),
+            after_first,
+            "cached expression must not be re-parsed per evaluation"
+        );
+    }
+
+    /// A failed parser-thread spawn must surface as a compile error (deny under Fail),
+    /// not as a value an `||` in the policy could absorb.
+    #[test]
+    fn parser_thread_spawn_failure_is_a_compilation_error() {
+        let long = format!("object.a == 1 && {}", "true && ".repeat(20) + "true");
+        let err = check_cel_syntax_with_stack(&long, CEL_VAP_ROOTS, usize::MAX >> 1)
+            .expect_err("spawn with an impossible stack must fail");
+        assert!(err.starts_with("compilation failed"), "{err}");
+    }
+
+    /// Timing probe: 1000 evaluations of a 300-char expression.
+    #[test]
+    #[ignore]
+    fn bench_1000_evals_of_300_char_expression() {
+        let expr = format!("object.a == 1 && {}", "true && ".repeat(36) + "true");
+        let obj = serde_json::json!({"a": 1});
+        let t = std::time::Instant::now();
+        for _ in 0..1000 {
+            eval_cel_bool_expr(
+                &expr,
+                &obj,
+                &serde_json::Map::new(),
+                &serde_json::Value::Null,
+                &serde_json::Value::Null,
+                &serde_json::Value::Null,
+            );
+        }
+        eprintln!("len={} 1000 evals: {:?}", expr.len(), t.elapsed());
+    }
+
+    /// Valid real-world syntax must not be rejected: macros bind their variable, optionals,
+    /// has(), struct/map literals, `in`, ternaries and namespaced calls.
+    #[test]
+    fn check_cel_syntax_accepts_the_supported_grammar() {
+        for ok in [
+            "object.spec.l.all(x, x > 0) && object.spec.l.exists(y, y in [1, 2,])",
+            "has(object.spec.a) ? object.spec.a : 'd'",
+            "request.userInfo.extra[?'k'][0].orValue('') == ''",
+            "object.metadata.labels.?app.orValue('') == 'x'",
+            "!(object.a == 1 || -object.b < 2) && variables.v % 2 == 0",
+            "Object{metadata: Object.metadata{name: 'x'}} == {'a': 1}",
+            "math.greatest(1, 2) == 2 && string(1) == '1'",
+            "object.l.map(x, x.filter(y, y > 1))",
+        ] {
+            assert_eq!(check_cel_syntax(ok, CEL_VAP_ROOTS), Ok(()), "{ok}");
+        }
+        assert!(check_cel_syntax(&"(".repeat(200), CEL_VAP_ROOTS).is_err());
+    }
+
+    /// Every literal form, type name and scoping construct cel-go accepts must pass the
+    /// create-time check: a false rejection blocks a user from creating a policy upstream
+    /// would admit.
+    #[test]
+    fn check_cel_syntax_accepts_every_upstream_literal_type_name_and_scope_form() {
+        for ok in [
+            r#"object.a == r"raw\n" && object.b == R'raw'"#,
+            r#"object.a == b"bytes" && object.b == B'\x00\xff'"#,
+            r#"object.a == """triple
+quoted""" && object.b == '''x'y'''"#,
+            "object.a == 1u && object.b == 0x10 && object.c == 0x1Fu",
+            "object.a == 1e3 && object.b == 1.5e-2 && object.c == .5 && object.d == 2E+3",
+            "object.a - 1 == 0 && object.a -1 == 0 && object.a-1 == 0 && -1 < object.a",
+            "type(object.metadata.name) == string && request.resource.resource == 'configmaps'",
+            "type(object.a) == int || type(object.a) == uint || type(object.a) == double",
+            "type(object.a) == bytes || type(object.a) == bool || type(object.a) == list",
+            "type(object.a) == map || type(object.a) == null_type || type(object.a) == type",
+            "cel.bind(x, object.a, x > 1 && cel.bind(y, x, y == x))",
+            "object.l.all(i, v, i < 3 && v > 0) && object.m.exists(k, v, k == v)",
+            "object.l.exists_one(i, v, i == v) && object.l.transformList(i, v, v)",
+            "object.l.transformMap(i, v, v) == {}",
+            "[?object.a, 1] == [1] && {?'a': object.?b} == {}",
+            "object.`odd.field` == 1",
+            "quantity('1Gi').isGreaterThan(quantity('1Mi')) && url('http://x').getHost() == 'x'",
+            "ip('1.2.3.4').isLoopback() && cidr('10.0.0.0/8').containsIP('10.1.1.1')",
+            "'abc'.matches('^a') && 'abc'.find('b') == 'b' && sets.contains([1], [1])",
+            "'%d'.format([1]) == '1' && format.dns1123Label().validate('a').hasValue()",
+            "authorizer.group('apps').resource('deployments').check('create').allowed()",
+            "authorizer.requestResource.check('get').allowed()",
+            "'a' in ['a'] && 1 in {1: 2} && object.l.size() > 0 && [1, 2].sum() == 3",
+            "has(object.a.b) && !has(object.c) && object.metadata.name.startsWith('x')",
+        ] {
+            assert_eq!(check_cel_syntax(ok, CEL_VAP_ROOTS), Ok(()), "{ok}");
+        }
+    }
+
+    /// The corpus is every expression in upstream's k8s CEL library tests (quantity, url,
+    /// ip, cidr, semver, format, compatibility); each compiles upstream, so each must pass
+    /// ours. The tests bind `self`-style variables, so those are declared here.
+    #[test]
+    fn check_cel_syntax_accepts_the_upstream_cel_library_test_corpus() {
+        let corpus = include_str!("../testdata/upstream_k8s_cel_library_exprs.txt");
+        let mut roots = CEL_VAP_ROOTS.to_vec();
+        roots.extend(["self", "oldSelf"]);
+        let mut checked = 0;
+        for expr in corpus.lines().filter(|l| !l.is_empty()) {
+            assert_eq!(check_cel_syntax(expr, &roots), Ok(()), "{expr}");
+            checked += 1;
+        }
+        assert!(checked > 100, "corpus unexpectedly small: {checked}");
+    }
+
+    /// Syntax errors and undeclared variables stay rejected, with upstream's wording.
+    #[test]
+    fn check_cel_syntax_rejects_what_upstream_rejects() {
+        for (bad, why) in [
+            ("object.a == 'x", "unterminated string"),
+            ("object.a ==", "dangling operator"),
+            ("object.a = 1", "single ="),
+            ("a.b == 1", "undeclared root"),
+            ("object.l.all(i, v, w > 0)", "undeclared inside macro"),
+            ("cel.bind(x, y, x)", "undeclared in bind initialiser"),
+            (
+                "cel.bind(x, 1, 2) && x == 1",
+                "bind var leaks out of its body",
+            ),
+            (
+                "object.l.all(x, true) && x == 1",
+                "macro var leaks out of macro",
+            ),
+            ("type(object) == strin", "misspelled type name"),
+        ] {
+            let err = check_cel_syntax(bad, CEL_VAP_ROOTS).expect_err(why);
+            assert!(err.starts_with("compilation failed: "), "{why}: {err}");
+        }
+        assert_eq!(
+            check_cel_syntax("a.b == 1", CEL_VAP_ROOTS),
+            Err("compilation failed: undeclared reference to 'a' (in container '')".to_string())
+        );
     }
 
     /// Each case is a CEL error upstream, so `Fail` must deny and `Ignore` may admit; none may
@@ -13045,7 +13791,7 @@ mod tests {
         let unbound_user = json!({
             "username": "system:serviceaccount:e2e-ns:default",
             "groups": ["system:serviceaccounts", "system:authenticated"],
-            "extra": {}
+            "extra": {"authentication.kubernetes.io/credential-id": ["JTI=abc"]}
         });
 
         let matching_cm = json!({
