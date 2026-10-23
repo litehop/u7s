@@ -1960,6 +1960,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn podcertificaterequest_v1_create_drops_v1beta1_only_key_fields_because_upstream_v1_has_no_such_spec_fields(
+    ) {
+        let state = make_state();
+        let mut spec = valid_pcr_spec();
+        spec["pkixPublicKey"] = "AAAA".into();
+        spec["proofOfPossession"] = "BBBB".into();
+        let body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "PodCertificateRequest",
+            "metadata": {"name": "req-prune"},
+            "spec": spec,
+        });
+
+        create_pod_certificate_request(
+            State(state.clone()),
+            Path(("v1".to_string(), "default".to_string())),
+            Query(CreateQuery::default()),
+            Extension(test_user()),
+            json_headers(),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create must succeed, got status {}", e.0));
+
+        let key = "/registry/certificates.k8s.io/podcertificaterequests/default/req-prune";
+        let stored = state.store.get(key).await.unwrap().expect("must persist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["spec"].get("pkixPublicKey").is_none()
+                && v["spec"].get("proofOfPossession").is_none(),
+            "JSON must drop the same fields protobuf skips, or the two encodings store \
+             different objects. Got: {}",
+            v["spec"]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // PodCertificateRequest: guard matrix
     // -----------------------------------------------------------------------
