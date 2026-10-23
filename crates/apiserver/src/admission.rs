@@ -1840,6 +1840,7 @@ pub(crate) fn eval_cel_apply_config(
     expr: &str,
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let _scope = CelEvalScope::begin();
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let val = parse_cel_value(&tokens, &mut pos, object)?;
@@ -3523,6 +3524,7 @@ fn parse_cel_primary(
     object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let _depth_guard = CelRecursionGuard::enter()?;
+    cel_charge(1)?;
     if *pos >= tokens.len() {
         return None;
     }
@@ -3610,6 +3612,7 @@ fn parse_cel_primary(
                                 *pos += 1;
                                 // Build field access chain from name
                                 let base = if name == "object" {
+                                    cel_charge_clone(object)?;
                                     object.clone()
                                 } else {
                                     serde_json::Value::Null
@@ -3658,6 +3661,7 @@ fn parse_cel_primary(
 
             // Plain identifier: if it's "object", return the full admitted resource.
             if name == "object" {
+                cel_charge_clone(object)?;
                 return Some(object.clone());
             }
 
@@ -12066,6 +12070,30 @@ mod tests {
             t("object.spec.ports.all(p, p > 0"),
             None,
             "unterminated macro is an error"
+        );
+    }
+
+    /// A mutation expression that copies a large object field into many keys costs
+    /// (copies x size); the per-expression limit must bound that like any other CEL entry
+    /// point instead of letting one small expression clone megabytes repeatedly.
+    #[test]
+    fn apply_configuration_expression_is_metered_per_call() {
+        let object = json!({"big": vec![1; 200_000], "small": 1});
+        let copies = |n: usize| {
+            let fields = (0..n)
+                .map(|i| format!("k{i}: object.big"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eval_cel_apply_config(&format!("{{{fields}}}"), &object)
+        };
+        assert!(
+            copies(2).is_some(),
+            "a couple of copies is far below the limit"
+        );
+        assert_eq!(
+            copies(200),
+            None,
+            "200 copies of 200k nodes exceeds the cost limit"
         );
     }
 

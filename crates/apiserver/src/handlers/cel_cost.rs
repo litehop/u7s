@@ -264,6 +264,8 @@ struct Coster<'a> {
     /// A comprehension stops iterating once its cost passes this: the caller only needs to
     /// know the limit was crossed.
     limit: u64,
+    /// Element count billed for a comprehension range whose size cannot be traced.
+    untraced_range_len: u64,
 }
 
 impl<'a> Coster<'a> {
@@ -299,6 +301,11 @@ impl<'a> Coster<'a> {
                         ),
                 ) {
                     let (head, _) = self.cost(&call.args[0], Some(ctx));
+                    // Resolving the head runs it for real: only do so once its counted
+                    // cost has shown it cheap.
+                    if head > self.limit {
+                        return (head, Node::Unknown);
+                    }
                     let head_value = ctx.resolve(&call.args[0]).ok();
                     let branch = match (func, head_value) {
                         (operators::LOGICAL_AND, Some(cel::Value::Bool(false)))
@@ -366,6 +373,11 @@ impl<'a> Coster<'a> {
                 let (range_cost, range) = self.cost(&c.iter_range, ctx);
                 let (init_cost, _) = self.cost(&c.accu_init, ctx);
                 let mut total = range_cost.saturating_add(init_cost);
+                // Iterating resolves the range, which runs it for real: not once its
+                // counted cost alone has crossed the limit.
+                if ctx.is_some() && total > self.limit {
+                    return (total, Node::Unknown);
+                }
                 let depth = self.scope.len();
                 self.scope.push((c.accu_var.clone(), Node::Unknown));
                 let mut accu = ctx.and_then(|ctx| ctx.resolve(&c.accu_init).ok());
@@ -410,6 +422,9 @@ impl<'a> Coster<'a> {
                             let pass_ctx = child.as_ref();
                             let (cond, _) = self.cost(&c.loop_cond, pass_ctx);
                             total = total.saturating_add(cond);
+                            if total > self.limit {
+                                break;
+                            }
                             if track_accu
                                 && pass_ctx.is_some_and(|ctx| {
                                     !matches!(ctx.resolve(&c.loop_cond), Ok(cel::Value::Bool(true)))
@@ -434,7 +449,10 @@ impl<'a> Coster<'a> {
                         ran
                     }
                     None => {
-                        let n = range.len();
+                        let n = match range {
+                            Node::Unknown => self.untraced_range_len,
+                            _ => range.len(),
+                        };
                         let elem = range.elem();
                         match &c.iter_var2 {
                             Some(v2) => {
@@ -468,7 +486,7 @@ impl<'a> Coster<'a> {
             }
             Expr::List(l) => (
                 self.sum(l.elements.iter(), ctx).saturating_add(10),
-                Node::Unknown,
+                Node::Sized(l.elements.len() as u64),
             ),
             Expr::Map(m) => {
                 let mut total = 0u64;
@@ -511,6 +529,36 @@ pub(crate) fn estimate(
     old_self_node: Option<Node<'_>>,
     ctx: Ctx<'_, '_>,
 ) -> u64 {
+    estimate_with(program, self_node, old_self_node, ctx, 0)
+}
+
+/// [`estimate`] for a rule about to run against a request: a comprehension over a range
+/// the walk cannot trace (`split()`, `a + b`, a ternary) is billed as if it held as many
+/// elements as fit in a request body, not zero. The result is only used to decide whether
+/// to replay the rule against the real values, so over-billing costs a replay but never
+/// rejects a rule; billing zero let a quadratic rule skip the replay and run unmetered.
+pub(crate) fn estimate_for_write(
+    program: &cel::Program,
+    self_node: Node<'_>,
+    old_self_node: Option<Node<'_>>,
+    ctx: Ctx<'_, '_>,
+) -> u64 {
+    estimate_with(
+        program,
+        self_node,
+        old_self_node,
+        ctx,
+        MAX_REQUEST_BYTES / 2,
+    )
+}
+
+fn estimate_with(
+    program: &cel::Program,
+    self_node: Node<'_>,
+    old_self_node: Option<Node<'_>>,
+    ctx: Ctx<'_, '_>,
+    untraced_range_len: u64,
+) -> u64 {
     let mut scope = vec![("self".to_string(), self_node)];
     if let Some(old) = old_self_node {
         scope.push(("oldSelf".to_string(), old));
@@ -518,6 +566,7 @@ pub(crate) fn estimate(
     Coster {
         scope,
         limit: CALL_COST_LIMIT,
+        untraced_range_len,
     }
     .cost(program.expression(), ctx)
     .0
