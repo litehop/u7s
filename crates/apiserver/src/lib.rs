@@ -227,6 +227,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // Open store.
     let store = Arc::new(SqliteStore::new(&args.db)?);
     seed_namespaces(&store).await?;
+    seed_priorityclasses(&store).await?;
     seed_rbac(&store).await?;
     seed_flowcontrol(&store).await?;
     seed_services(
@@ -407,6 +408,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
         sa_public_key_pem,
     });
+    state.deny_service_external_ips = args.deny_service_external_ips;
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
     state
         .proxy_client_identity_pem
@@ -1487,6 +1489,53 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
                 // Already exists — idempotent, ignore.
             }
             Err(e) => return Err(anyhow::anyhow!("seed namespace {name}: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Seed the two built-in PriorityClasses so `kubectl get priorityclass` lists them, as
+/// upstream's bootstrap hook does. Pod admission resolves these names to fixed values
+/// regardless of what is stored.
+async fn seed_priorityclasses(store: &SqliteStore) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+    const CLASSES: &[(&str, i64, &str, &str)] = &[
+        (
+            "system-node-critical",
+            handlers::pods::SYSTEM_NODE_CRITICAL_VALUE as i64,
+            "00000000-0000-0000-0000-0000000000a1",
+            "Used for system critical pods that must not be moved from their current node.",
+        ),
+        (
+            "system-cluster-critical",
+            handlers::pods::SYSTEM_CLUSTER_CRITICAL_VALUE as i64,
+            "00000000-0000-0000-0000-0000000000a2",
+            "Used for system critical pods that must run in the cluster, but can be moved to another node if necessary.",
+        ),
+    ];
+    for (name, value, uid, description) in CLASSES {
+        let key = keys::group_object_key("scheduling.k8s.io", "priorityclasses", None, name);
+        let body = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": {
+                "name": name,
+                "uid": uid,
+                "creationTimestamp": boot_timestamp(),
+            },
+            "value": value,
+            "globalDefault": false,
+            "description": description,
+            "preemptionPolicy": "PreemptLowerPriority",
+        });
+        match store
+            .put(&key, Bytes::from(body.to_string()), Some(0))
+            .await
+        {
+            Ok(_) => tracing::info!("seeded priorityclass: {name}"),
+            Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(anyhow::anyhow!("seed priorityclass {name}: {e}")),
         }
     }
     Ok(())
@@ -4271,6 +4320,27 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("second seed must not fail");
+    }
+
+    /// `kubectl get priorityclass` must list the two built-ins, and re-seeding must not error.
+    #[tokio::test]
+    async fn seed_priorityclasses_creates_builtins_idempotently() {
+        use u7s_store::Store;
+        let store = make_store();
+        seed_priorityclasses(&store).await.expect("first seed");
+        seed_priorityclasses(&store).await.expect("second seed");
+        let stored = store
+            .get("/registry/scheduling.k8s.io/priorityclasses/system-node-critical")
+            .await
+            .unwrap()
+            .expect("system-node-critical must be seeded");
+        let pc: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(pc["value"], 2000001000);
+        assert!(store
+            .get("/registry/scheduling.k8s.io/priorityclasses/system-cluster-critical")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// Regression: every connection accepted by the apiserver's HTTP(S) listener must have
@@ -12370,6 +12440,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            deny_service_external_ips: false,
             sa_sig_cache_size: None,
             manifest_dir: "/etc/u7s/manifests".into(),
             embedded_scheduler: false,
@@ -13187,6 +13258,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            deny_service_external_ips: false,
             sa_sig_cache_size: None,
             manifest_dir: manifest_dir.to_string_lossy().into_owned(),
             embedded_scheduler: false,
@@ -13385,6 +13457,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            deny_service_external_ips: false,
             sa_sig_cache_size: None,
             manifest_dir: manifest_dir.to_string_lossy().into_owned(),
             embedded_scheduler,

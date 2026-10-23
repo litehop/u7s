@@ -875,6 +875,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            deny_service_external_ips: false,
             sa_sig_cache_size: None,
             manifest_dir: dir.join("manifests").to_string_lossy().into_owned(),
             embedded_scheduler: false,
