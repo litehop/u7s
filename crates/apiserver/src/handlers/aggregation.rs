@@ -65,9 +65,9 @@ const REASON_FAILED_DISCOVERY_CHECK: &str = "FailedDiscoveryCheck";
 /// False when the raw (still percent-encoded) path tail contains a literal `\` or, once
 /// decoded and split on `/` like upstream's handler_proxy, a `.`/`..` segment. The url crate
 /// treats a literal `\` as `/` and collapses dot segments, which could land the request
-/// outside `/apis/{group}/{version}` with the caller's asserted identity. Encoded `%2F`/`%5C`
-/// are forwarded still encoded, so they stay data inside one outbound segment; authz decodes
-/// the path the same way, so it sees the separators the backend sees.
+/// outside `/apis/{group}/{version}` with the caller's asserted identity. The router has
+/// already turned `%2F` into `/` (matching authz's view), so it reaches here as a separator;
+/// an encoded `%5C` is forwarded still encoded and stays data inside one outbound segment.
 fn tail_stays_under_prefix(tail: &str) -> bool {
     !tail.contains('\\')
         && percent_decode(tail)

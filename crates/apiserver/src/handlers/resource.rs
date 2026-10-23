@@ -534,6 +534,10 @@ pub(crate) async fn create_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
+    let is_csr = super::csr::is_csr(&group, &plural);
+    if is_csr {
+        super::csr::validate_csr_spec(&obj.body)?;
+    }
 
     // NodeRestriction-equivalent admission: a `system:node:<name>` identity's own Node CREATE
     // has no name in the URL to scope against, so without this check node_authz's blanket
@@ -568,6 +572,9 @@ pub(crate) async fn create_resource<S: Store>(
         dry_run: create_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    if is_csr {
+        super::csr::finalize_csr_create(&mut obj.body, &user)?;
+    }
     // Re-clear status after mutating webhooks: a webhook's JSON patch can reinject a
     // forged/scalar status into the body the earlier clear_create_status already
     // stripped — matches upstream ordering (mutating admission runs BEFORE
@@ -3490,6 +3497,13 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         &mut obj.body,
     )?;
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
+    // NodeRestriction runs before the strategy's validation (see the apply-create path).
+    if group == "certificates.k8s.io" && plural == "podcertificaterequests" {
+        super::certificates::restrict_node_pod_certificate_request_create(
+            &state, &user, &ns, &obj.body,
+        )
+        .await?;
+    }
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
 
