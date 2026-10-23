@@ -80,6 +80,7 @@ fn protected_metadata(
         "generation",
         "finalizers",
         "deletionTimestamp",
+        "deletionGracePeriodSeconds",
         "labels",
     ];
     PROTECTED
