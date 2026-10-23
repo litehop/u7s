@@ -474,6 +474,11 @@ impl std::fmt::Display for EnvelopeDecodeError {
     }
 }
 
+/// Whether `body` starts with the k8s protobuf magic prefix.
+pub fn has_k8s_magic_prefix(body: &[u8]) -> bool {
+    body.starts_with(K8S_PROTO_MAGIC)
+}
+
 /// Attempt to decode the Kubernetes protobuf envelope and return both the raw payload and its
 /// declared content-type, with a precise reason on failure.
 ///

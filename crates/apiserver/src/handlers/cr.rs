@@ -3064,15 +3064,10 @@ pub async fn replace_cr<S: Store>(
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
+    crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
     let obj_meta: crate::types::ObjectMeta =
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&obj["metadata"])
             .unwrap_or_default();
-    let obj_name = obj_meta.name.as_deref().unwrap_or("").to_string();
-    if obj_name != name {
-        return Err(Status::bad_request(format!(
-            "the name of the object ({obj_name}) does not match the name on the URL ({name})"
-        )));
-    }
 
     let expected_revision = parse_resource_version(obj_meta.resource_version.as_deref())?;
 
@@ -4121,15 +4116,10 @@ pub async fn replace_cr_namespaced<S: Store>(
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
+    crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
     let obj_meta: crate::types::ObjectMeta =
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&obj["metadata"])
             .unwrap_or_default();
-    let obj_name = obj_meta.name.as_deref().unwrap_or("").to_string();
-    if obj_name != name {
-        return Err(Status::bad_request(format!(
-            "the name of the object ({obj_name}) does not match the name on the URL ({name})"
-        )));
-    }
 
     let expected_revision = parse_resource_version(obj_meta.resource_version.as_deref())?;
 
