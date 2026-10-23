@@ -14,7 +14,7 @@ decisions get made, and what "done" means in principle (changes rarely,
 needs operator sign-off). This file is current state and priorities.
 Figures: see `dashboard.md`.
 
-Priority: Conformance > security > perf > features. Target: Kubernetes 1.37.1.
+Priority: correctness (Conformance first) > security > perf > features. Target: Kubernetes 1.37.1.
 
 ---
 
@@ -44,9 +44,6 @@ State: **NATIVE** (u7s Rust) · **UPSTREAM** (real binary) · **HYBRID**
 lever remains; rewrite-only residual (2026-10-21, loaded 1 GiB node):
 ~10-22 MB KCM, ~19-24 MB kubelet.
 
-**k3s comparison:** resolved; methodology in
-`ai/perf/mayor-5x0kh-k3s-matched-comparison-2026-08-20.md`.
-
 ---
 
 ## Gates (horizontal cuts across the matrix)
@@ -54,13 +51,11 @@ lever remains; rewrite-only residual (2026-10-21, loaded 1 GiB node):
 ### Gate 1 — Conformance floor ✓ CLEARED, with known blind spots
 Full sonobuoy Conformance passes: single-node first green 2026-07-24;
 two-node 446/0/0/7133 2026-08-10. Latest recorded (1.37.1, two-node,
-iptables kube-proxy): 460/460 + 2/2 disruptive on 2026-10-14. Counts come
-from e2e.txt.
+iptables kube-proxy): 460/460 + 2/2 disruptive on 2026-10-14. These
+counts predate the 2026-10-23 merges; a re-run is pending.
 
 Green is necessary, not sufficient: single-node bias (Gate 5) and security
-surface (Gate 8) are not conformance-visible.
-
-Any regression preempts perf work (correctness-first).
+surface (Gate 8) are not conformance-visible. Any regression preempts perf.
 
 ### Gate 2 — Measurement baseline — DONE
 Per-process RSS for every component under a 2-node conformance run
@@ -73,9 +68,7 @@ InflightLayer bounded-wait backpressure is a deliberate minimal APF subset —
 guardrail: bd memory `u7s-inflight-backpressure-is-deliberate-minimal-apf-subset`.
 
 ### Gate 4 — Perf (ACTIVE since 2026-07-24)
-Method: audit → file bead → measure before/after → land; correctness and
-security gaps preempt. Wins landed are in `dashboard.md`. Follow-ons:
-protobuf watch-stream framing, wider decode-parity coverage.
+Method: audit → bead → measure before/after → land. Wins: `dashboard.md`.
 
 **Aspiration, blocks nothing:** host-level control-plane processes (pods
 excluded) under 128 MiB. Release-gate run 2026-10-15, peak PSS: kubelet
@@ -88,14 +81,16 @@ quiet host (`burst-gate.sh --confirm`; patch releases not gated).
 Harness: `scripts/release-gate/` (`mayor-6uez9`); noisy hosts yield an
 INVALID verdict that `--confirm` re-runs.
 
-Operator 2026-10-23: the authoritative gate runs on a real 1-vCPU VPS (GCP
-e2-micro, x86_64 tarball) via `mayor-p3ktl`; Mac Lima is an optional
-pre-check. No rush to cut a release; cert rotation must finish first.
+Decided (operator 2026-10-23): the authoritative gate runs on a real 1-vCPU
+VPS (GCP e2-micro, x86_64 tarball); Mac Lima is an optional pre-check. Not
+built: `mayor-p3ktl` is open and `mayor-6uez9` is open-partial, depending on
+it. Operator 2026-10-23: no rush to cut a release. Operator 2026-10-20:
+cert rotation (`mayor-xdw6u.11`) blocks a release; lifting that is not yet
+confirmed.
 
 ### Gate 5 — Correctness beyond Conformance (ongoing, opportunistic)
-Representative workloads (WordPress+MariaDB, GPU-request, Argo CD as a
-probe) and non-Conformance upstream e2e subsets (multi-node, CSI). Argo CD
-RBAC gap fix `mayor-j7to` is deferred until observed.
+Representative workloads (WordPress+MariaDB, GPU-request, Argo CD) and
+non-Conformance upstream e2e subsets (multi-node, CSI).
 
 ### Gate 6 — Packaging & distribution (local-install MVP shipped 2026-08-21)
 End-game: k3s-style one-shell-script install. Install UX, component shipping,
@@ -111,24 +106,23 @@ pre-built tarball to working `kubectl get nodes`/`logs`/`exec`. Decided
 - C5: agent-friendly install (`mayor-yxe9t`). C6: networking flags
   (`mayor-rv1aw`).
 
-Release authenticity (`mayor-pfykw`, decided 2026-10-23): openssl Ed25519
-signatures over the tarball, checksum and `install.sh`, plus a documented
-verify-then-run flow. C2 (`mayor-u251u`) still awaits operator confirmation.
+Release authenticity (`mayor-pfykw`, closed, PR #1952): the tarball,
+`.sha256` and `install.sh` are Ed25519-signed, and `install.sh` verifies.
+Open: operator-side Release Environment settings (`mayor-1gfa6`), follow-ups
+`mayor-b4guu`. C2 (`mayor-u251u`) still awaits operator confirmation.
 
 ### Gate 7 — Migration story (STARTED)
 MVP epic `mayor-te4sn`: single-node k3s → u7s via `u7s migrate`, API-based
 export/import (UID/resourceVersion loss accepted, PVs reused in place).
-Export dry-run landed. Decisions on `mayor-ffgal`. No u7s → k3s off-ramp in
-the MVP.
+Export dry-run landed. Decisions on `mayor-ffgal`.
 
 ### Gate 8 — Security (ACTIVE)
 Epic `mayor-qap3i`: audit run-1 (30 confirmed findings, 4 leads), filed
 2026-10-22. All four P1s landed (JSON Patch depth, mirror-pod references,
-encoded-route bypass, RoleBinding escalation) plus several P2s. Open P2s:
-`.43` (CEL absent-key fail-open), `.25`, `.23`, `.15`, `.4`, `.35`, `.40`, `mayor-fg6oo`
-(Service externalIPs), `mayor-d07ct` (KCM wildcard identity).
-
-Audit log (`mayor-0qjgc`, P3): `audit.k8s.io` file backend, later.
+encoded-route bypass, RoleBinding escalation) plus several P2s (`.5` closed). Open P2s as of 2026-10-23, in progress:
+`.43` (CEL absent-key fail-open), `.23`, `.15`, `.25`, `.4`, `mayor-fg6oo`
+(Service externalIPs), `mayor-d07ct` (KCM wildcard identity). Open, partial
+via #1963: `.19` (CEL gate metering). `.35` is claimed, `.40` unstarted.
 
 ---
 
@@ -139,14 +133,15 @@ Audit log (`mayor-0qjgc`, P3): `audit.k8s.io` file backend, later.
 | `mayor-qap3i` | P1 | OPEN | Security audit run-1 fixes; P1s done, P2s in flight |
 | `mayor-xdw6u` | P2 | OPEN | PKI rotation. Release-gating work left: `.11` e2e. `.8` two-tier and `.9` root succession do not gate a release |
 | `mayor-te4sn` | P2 | OPEN | Migration MVP: import, cutover, docs (`.3`-`.5`) |
-| `mayor-17nj7` | P2 | OPEN | Memory audit; 5 of 41 children left, mostly P4 |
-| `mayor-8qcaw` | P2 | OPEN | DRA claim allocation. Starts only after security and perf drain (operator 2026-10-23); not Conformance-gating. Blocks `mayor-57p8x` (DeviceTaintRule eviction spec) |
+| `mayor-17nj7` | P2 | OPEN | Memory audit; 5 of 42 children open, all P4 |
+| `mayor-8qcaw` | P2 | OPEN | DRA claim allocation. Starts only after security and perf drain (operator 2026-10-23); not Conformance-gating. Blocks `mayor-57p8x`: follow upstream feature gates (DeviceTaintRule eviction) |
 | `mayor-u6ju` | P3 | DEFERRED | Gate 5 probes demonstrate a real Server-Side Apply requirement |
 
 ## Follow-ons
 
 `mayor-9xsn3` (P3): DRA v1alpha3 registration, actionable since the 1.37
-bump (2026-09-30). P4 CRD CEL follow-ons: `mayor-90qvg`, `mayor-1y0h6`.
+bump (2026-09-30). Decided: stop serving `certificates.k8s.io/v1beta1`
+(`mayor-72l3k`, #1956). P4 CRD CEL follow-ons: `mayor-90qvg`, `mayor-1y0h6`.
 
 ---
 
