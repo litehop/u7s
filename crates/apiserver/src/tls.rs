@@ -2689,7 +2689,7 @@ mod tests {
         let inode = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino(); // lgtm[rust/path-injection]
         let before = inode(&ca_bundle_path(&args.ca_cert));
 
-        write_ca_bundle(&args.ca_cert, &[tls.ca_cert_der.clone()]).unwrap();
+        write_ca_bundle(&args.ca_cert, std::slice::from_ref(&tls.ca_cert_der)).unwrap();
         assert_eq!(inode(&ca_bundle_path(&args.ca_cert)), before);
 
         let other = CertificateParams::default()

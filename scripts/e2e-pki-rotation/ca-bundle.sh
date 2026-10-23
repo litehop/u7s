@@ -100,15 +100,17 @@ poll 60 k get --raw /readyz >/dev/null 2>&1 || fail "apiserver not ready"
 [ ! -e "$ABS_WORKDIR/ca-extra.pem" ] || fail "$ABS_WORKDIR/ca-extra.pem already exists: not a clean baseline"
 
 # The "future" CA and an admin-equivalent client cert it signs.
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+# Keys come from ecparam (named-curve encoding): `req -newkey ec` on LibreSSL emits explicit curve
+# parameters, which webpki rejects, and `x509 -req` needs -sha256 (its default is SHA-1).
+openssl ecparam -genkey -name prime256v1 -noout -out "$TMP/future-ca.key"
+openssl req -x509 -new -sha256 -key "$TMP/future-ca.key" -days 2 \
   -subj "/CN=u7s-future-ca" -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign" \
-  -keyout "$TMP/future-ca.key" -out "$TMP/future-ca.pem" 2>/dev/null
-openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-  -subj "/CN=future-admin/O=system:masters" -keyout "$TMP/future-client.key" \
-  -out "$TMP/future-client.csr" 2>/dev/null
+  -addext "keyUsage=critical,keyCertSign,cRLSign" -out "$TMP/future-ca.pem" 2>/dev/null
+openssl ecparam -genkey -name prime256v1 -noout -out "$TMP/future-client.key"
+openssl req -new -key "$TMP/future-client.key" \
+  -subj "/CN=future-admin/O=system:masters" -out "$TMP/future-client.csr" 2>/dev/null
 printf 'extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature\n' >"$TMP/client.ext"
-openssl x509 -req -in "$TMP/future-client.csr" -CA "$TMP/future-ca.pem" -CAkey "$TMP/future-ca.key" \
+openssl x509 -req -sha256 -in "$TMP/future-client.csr" -CA "$TMP/future-ca.pem" -CAkey "$TMP/future-ca.key" \
   -CAcreateserial -days 1 -extfile "$TMP/client.ext" -out "$TMP/future-client.pem" 2>/dev/null
 
 future_client_ok() {

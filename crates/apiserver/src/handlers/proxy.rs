@@ -7872,7 +7872,7 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let ca_der = cert.cert.der().to_vec();
 
-        let result = build_kubelet_tls_config(Some(&[ca_der.clone()]), None);
+        let result = build_kubelet_tls_config(Some(std::slice::from_ref(&ca_der)), None);
         assert!(
             result.is_ok(),
             "build_kubelet_tls_config must succeed with a valid CA DER cert — \
@@ -8006,7 +8006,10 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let ca_der = cert.cert.der().to_vec();
 
-        let client = AppState::<SqliteStore>::build_kubelet_client(Some(&[ca_der.clone()]), None);
+        let client = AppState::<SqliteStore>::build_kubelet_client(
+            Some(std::slice::from_ref(&ca_der)),
+            None,
+        );
         assert!(
             client.is_some(),
             "build_kubelet_client must return Some when CA DER is valid — \
@@ -8637,7 +8640,7 @@ mod tests {
             "/metrics",
             axum::http::Method::GET,
             bytes::Bytes::new(),
-            Some(&[cert_der.clone()]),
+            Some(std::slice::from_ref(&cert_der)),
             None,
             false,
         )
@@ -8754,7 +8757,7 @@ mod tests {
                 "/tls-check",
                 axum::http::Method::GET,
                 bytes::Bytes::new(),
-                Some(&[outer_cert_der.clone()]),
+                Some(std::slice::from_ref(&outer_cert_der)),
                 None,
                 true,
             ),

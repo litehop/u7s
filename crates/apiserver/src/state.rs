@@ -2615,9 +2615,12 @@ mod tests {
         let ca_der = cert.cert.der().to_vec();
 
         // Must succeed — if CA DER is valid, client construction returns Ok.
-        let _client =
-            AppState::<SqliteStore>::build_webhook_client(Some(&[ca_der.clone()]), None, None)
-                .expect("valid CA DER must produce Ok client");
+        let _client = AppState::<SqliteStore>::build_webhook_client(
+            Some(std::slice::from_ref(&ca_der)),
+            None,
+            None,
+        )
+        .expect("valid CA DER must produce Ok client");
     }
 
     /// build_webhook_client succeeds with no CA and no identity (test path).
@@ -2686,7 +2689,7 @@ mod tests {
 
         // Must succeed: valid CA DER + valid identity PEM.
         let _client = AppState::<SqliteStore>::build_webhook_client(
-            Some(&[ca_cert_der.clone()]),
+            Some(std::slice::from_ref(&ca_cert_der)),
             Some(&identity_pem),
             None,
         )
