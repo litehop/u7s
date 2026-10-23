@@ -66,15 +66,34 @@ pub trait Cluster {
     /// Returns the stored object.
     async fn create(&self, id: &ObjId, body: &Value) -> anyhow::Result<Value>;
     async fn merge_patch(&self, id: &ObjId, patch: &Value) -> anyhow::Result<()>;
-    /// Blocks until the (group, kind) pairs defined by just-created CRDs are
-    /// served, so their instances can be created.
-    async fn settle(&mut self, kinds: &[(String, String)]) -> anyhow::Result<()>;
+    /// Blocks until the just-created CRDs are Established and served, so
+    /// their instances can be created.
+    async fn settle(&mut self, crds: &[ServedCrd]) -> anyhow::Result<()>;
+    /// Blocks (bounded) until each (namespace, service) has a ready endpoint.
+    /// Admission webhooks created before their backend would reject every
+    /// later create.
+    async fn wait_backends(&self, services: &[(String, String)]) -> anyhow::Result<()>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedCrd {
+    pub name: String,
+    pub group: String,
+    pub kind: String,
+}
+
+/// Annotation written in pass 1 holding the source object's UID. It is the
+/// only proof that a same-named object on the target was created by this
+/// import rather than being someone else's.
+pub const SOURCE_UID_ANNOTATION: &str = "migrate.u7s.dev/source-uid";
+
 /// Creation order: what other objects need must exist first. Instances of
-/// custom resources and workloads come last, after the CRDs are served.
+/// custom resources and workloads come next, after the CRDs are served.
+/// Admission configuration is last: a webhook that exists before its backend
+/// rejects every later create.
 fn rank(id: &ObjId) -> u8 {
     match (id.group(), id.kind.as_str()) {
+        ("admissionregistration.k8s.io", _) => 9,
         ("apiextensions.k8s.io", "CustomResourceDefinition") => 0,
         ("", "Namespace") => 1,
         ("", "ServiceAccount") | ("rbac.authorization.k8s.io", _) => 2,
@@ -99,6 +118,10 @@ const SERVER_OWNED_METADATA: &[&str] = &[
     "deletionGracePeriodSeconds",
 ];
 
+fn source_uid(o: &Value) -> &str {
+    o["metadata"]["uid"].as_str().unwrap_or_default()
+}
+
 pub struct Pass1 {
     pub body: Value,
     pub removed_finalizers: Vec<String>,
@@ -118,7 +141,12 @@ pub fn pass1_body(obj: &Value, entry: &Entry, claims: &HashSet<(String, String)>
     let mut body = obj.clone();
     body.as_object_mut().map(|o| o.remove("status"));
     let mut removed = vec![];
+    let source_uid = source_uid(obj).to_string();
     if let Some(meta) = body["metadata"].as_object_mut() {
+        meta.entry("annotations")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .map(|a| a.insert(SOURCE_UID_ANNOTATION.into(), source_uid.into()));
         for k in SERVER_OWNED_METADATA {
             meta.remove(*k);
         }
@@ -215,6 +243,9 @@ pub struct Pass2 {
     /// the garbage collector delete this object.
     pub owner_refs_dropped: Vec<String>,
     pub claim_ref_remapped: bool,
+    /// The target object's reference points somewhere other than the
+    /// export's; nothing is patched.
+    pub conflict: Option<String>,
 }
 
 /// The patch that moves `current` (what the target stores now) to the
@@ -242,11 +273,28 @@ pub fn pass2(src: &Value, current: &Value, remap: &Remap) -> Pass2 {
             )),
         }
     }
-    if !desired.is_empty()
-        && current["metadata"]["ownerReferences"] != Value::Array(desired.clone())
-    {
-        out.owner_refs_remapped = desired.len();
-        patch["metadata"] = json!({ "ownerReferences": desired });
+    // Merge-patch replaces lists wholesale, so keep every reference already on
+    // the object and add only the ones from the export.
+    let existing = current["metadata"]["ownerReferences"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut merged = existing.clone();
+    for d in desired {
+        match merged.iter().position(|e| e["uid"] == d["uid"]) {
+            Some(i) if merged[i] == d => {}
+            Some(i) => {
+                merged[i] = d;
+                out.owner_refs_remapped += 1;
+            }
+            None => {
+                merged.push(d);
+                out.owner_refs_remapped += 1;
+            }
+        }
+    }
+    if merged != existing {
+        patch["metadata"] = json!({ "ownerReferences": merged });
     }
 
     let (group, k) = (group_of(src), kind(src));
@@ -263,7 +311,19 @@ pub fn pass2(src: &Value, current: &Value, remap: &Remap) -> Pass2 {
             .as_str()
             .and_then(|n| remap.lookup(owner_kind, r["namespace"].as_str(), n));
         if let Some(new) = new {
-            if current["spec"][field]["uid"].as_str() != Some(new.as_str()) {
+            let cur = &current["spec"][field];
+            if cur["name"] != r["name"] || cur["namespace"] != r["namespace"] {
+                out.conflict = Some(format!(
+                    "{field} is {}/{} on the target but {}/{} in the export",
+                    cur["namespace"].as_str().unwrap_or_default(),
+                    cur["name"].as_str().unwrap_or_default(),
+                    r["namespace"].as_str().unwrap_or_default(),
+                    r["name"].as_str().unwrap_or_default()
+                ));
+                out.patch = None;
+                return out;
+            }
+            if cur["uid"].as_str() != Some(new.as_str()) {
                 patch["spec"] = json!({ field: { "uid": new } });
                 out.claim_ref_remapped = true;
             }
@@ -375,18 +435,40 @@ pub async fn run<C: Cluster>(c: &mut C, plan: &Plan, objs: &[Value]) -> anyhow::
 
     let mut remap = Remap::default();
     let crds = items.iter().take_while(|i| rank(&i.id) == 0).count();
-    let crd_kinds: Vec<(String, String)> = items[..crds]
+    let served: Vec<ServedCrd> = items[..crds]
         .iter()
         .filter_map(|i| {
-            Some((
-                i.src["spec"]["group"].as_str()?.to_string(),
-                i.src["spec"]["names"]["kind"].as_str()?.to_string(),
-            ))
+            Some(ServedCrd {
+                name: i.id.name.clone(),
+                group: i.src["spec"]["group"].as_str()?.to_string(),
+                kind: i.src["spec"]["names"]["kind"].as_str()?.to_string(),
+            })
         })
         .collect();
+    let admission_start = items.iter().position(|i| rank(&i.id) == 9);
+    let imported_services: HashSet<(String, String)> = items
+        .iter()
+        .filter(|i| i.id.group().is_empty() && i.id.kind == "Service")
+        .map(|i| {
+            (
+                i.id.namespace.clone().unwrap_or_default(),
+                i.id.name.clone(),
+            )
+        })
+        .collect();
+    let backends = webhook_backends(items.iter().map(|i| i.src), &imported_services);
     for (n, item) in items.iter_mut().enumerate() {
         if n == crds && crds > 0 {
-            c.settle(&crd_kinds).await?;
+            c.settle(&served).await?;
+        }
+        if Some(n) == admission_start {
+            if let Err(e) = c.wait_backends(&backends).await {
+                report
+                    .failures
+                    .push(format!("admission configuration: {e:#}"));
+                report.pass2_skipped = true;
+                return Ok(report);
+            }
         }
         match import_one(c, item, &claims, &mut report).await {
             Ok(uid) => remap.record(item.src, &uid),
@@ -403,6 +485,10 @@ pub async fn run<C: Cluster>(c: &mut C, plan: &Plan, objs: &[Value]) -> anyhow::
             continue;
         };
         let p = pass2(item.src, current, &remap);
+        if let Some(why) = &p.conflict {
+            report.failures.push(format!("{}: {why}", item.id));
+            continue;
+        }
         for d in &p.owner_refs_dropped {
             report
                 .owner_refs_dropped
@@ -428,6 +514,36 @@ pub async fn run<C: Cluster>(c: &mut C, plan: &Plan, objs: &[Value]) -> anyhow::
     Ok(report)
 }
 
+/// Services backing the webhooks in `objs` that this import creates, sorted.
+/// Webhooks pointing elsewhere (URL, or a Service not imported) are not waited
+/// for.
+fn webhook_backends<'a>(
+    objs: impl Iterator<Item = &'a Value>,
+    imported: &HashSet<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = objs
+        .filter(|o| {
+            group_of(o) == "admissionregistration.k8s.io"
+                && matches!(
+                    kind(o),
+                    "ValidatingWebhookConfiguration" | "MutatingWebhookConfiguration"
+                )
+        })
+        .flat_map(|o| o["webhooks"].as_array().into_iter().flatten())
+        .filter_map(|w| {
+            let s = &w["clientConfig"]["service"];
+            Some((
+                s["namespace"].as_str()?.to_string(),
+                s["name"].as_str()?.to_string(),
+            ))
+        })
+        .filter(|k| imported.contains(k))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 async fn import_one<C: Cluster>(
     c: &C,
     item: &mut Item<'_>,
@@ -436,6 +552,13 @@ async fn import_one<C: Cluster>(
 ) -> anyhow::Result<String> {
     let cur = match c.get(&item.id).await? {
         Some(cur) => {
+            let marker = cur["metadata"]["annotations"][SOURCE_UID_ANNOTATION].as_str();
+            if marker != Some(source_uid(item.src)) {
+                bail!(
+                    "already exists on the target and was not created by this import \
+                     (no matching {SOURCE_UID_ANNOTATION} annotation); not touching it"
+                );
+            }
             report.existing.push(item.id.to_string());
             cur
         }
@@ -471,6 +594,22 @@ pub fn load(plan: &str, objects: &str) -> anyhow::Result<(Plan, Vec<Value>)> {
     )
     .with_context(|| format!("parsing {objects}"))?;
     Ok((plan, objs))
+}
+
+fn crd_established(crd: &Value) -> bool {
+    crd["status"]["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|c| c["type"] == "Established" && c["status"] == "True")
+}
+
+fn endpoints_ready(ep: &Value) -> bool {
+    ep["subsets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|s| s["addresses"].as_array().is_some_and(|a| !a.is_empty()))
 }
 
 /// A u7s apiserver reached over the Kubernetes API.
@@ -526,6 +665,20 @@ impl Live {
             p.push_str(&format!("/{}", id.name));
         }
         Ok(p)
+    }
+
+    async fn all_established(&self, crds: &[ServedCrd]) -> anyhow::Result<bool> {
+        for c in crds {
+            let path = format!(
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{}",
+                c.name
+            );
+            let (status, body) = self.src.client.request(Method::GET, &path, None).await?;
+            if status.as_u16() != 200 || !crd_established(&serde_json::from_str(&body)?) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn call(
@@ -586,15 +739,40 @@ impl Cluster for Live {
         Ok(())
     }
 
-    async fn settle(&mut self, kinds: &[(String, String)]) -> anyhow::Result<()> {
+    async fn settle(&mut self, crds: &[ServedCrd]) -> anyhow::Result<()> {
         for _ in 0..60 {
             self.refresh().await?;
-            if kinds.iter().all(|k| self.types.contains_key(k)) {
+            let served = crds
+                .iter()
+                .all(|c| self.types.contains_key(&(c.group.clone(), c.kind.clone())));
+            if served && self.all_established(crds).await? {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        bail!("target did not start serving the imported CRDs within 60s")
+        bail!("target did not establish and serve the imported CRDs within 60s")
+    }
+
+    async fn wait_backends(&self, services: &[(String, String)]) -> anyhow::Result<()> {
+        for (ns, name) in services {
+            let path = format!("/api/v1/namespaces/{ns}/endpoints/{name}");
+            let mut ready = false;
+            for _ in 0..60 {
+                let (status, body) = self.src.client.request(Method::GET, &path, None).await?;
+                if status.as_u16() == 200 {
+                    let v: Value = serde_json::from_str(&body)?;
+                    ready = endpoints_ready(&v);
+                }
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            if !ready {
+                bail!("Service {ns}/{name} has no ready endpoint after 60s; create the webhook configurations once its workload is running (re-run import)");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -605,13 +783,18 @@ mod tests {
     use crate::plan::Source;
     use std::cell::RefCell;
 
+    type Wait = (usize, Vec<(String, String)>);
+
     #[derive(Default)]
     struct Fake {
         store: RefCell<HashMap<ObjId, Value>>,
         next: RefCell<u32>,
         creates: RefCell<Vec<ObjId>>,
         patches: RefCell<Vec<(ObjId, Value)>>,
-        settled: Vec<Vec<(String, String)>>,
+        settled: Vec<Vec<ServedCrd>>,
+        /// (number of creates so far, services waited for)
+        waits: RefCell<Vec<Wait>>,
+        fail_create_kind: Option<&'static str>,
     }
 
     fn merge(dst: &mut Value, patch: &Value) {
@@ -630,6 +813,9 @@ mod tests {
             Ok(self.store.borrow().get(id).cloned())
         }
         async fn create(&self, id: &ObjId, body: &Value) -> anyhow::Result<Value> {
+            if self.fail_create_kind == Some(id.kind.as_str()) {
+                bail!("injected create failure");
+            }
             let mut b = body.clone();
             *self.next.borrow_mut() += 1;
             b["metadata"]["uid"] = format!("new-{}", self.next.borrow()).into();
@@ -642,8 +828,14 @@ mod tests {
             merge(self.store.borrow_mut().get_mut(id).unwrap(), patch);
             Ok(())
         }
-        async fn settle(&mut self, kinds: &[(String, String)]) -> anyhow::Result<()> {
-            self.settled.push(kinds.to_vec());
+        async fn settle(&mut self, crds: &[ServedCrd]) -> anyhow::Result<()> {
+            self.settled.push(crds.to_vec());
+            Ok(())
+        }
+        async fn wait_backends(&self, services: &[(String, String)]) -> anyhow::Result<()> {
+            self.waits
+                .borrow_mut()
+                .push((self.creates.borrow().len(), services.to_vec()));
             Ok(())
         }
     }
@@ -909,7 +1101,11 @@ mod tests {
         assert!(pos("PersistentVolume") < pos("PersistentVolumeClaim"));
         assert_eq!(
             c.settled,
-            [vec![("example.com".to_string(), "Widget".to_string())]],
+            [vec![ServedCrd {
+                name: "widgets.example.com".into(),
+                group: "example.com".into(),
+                kind: "Widget".into()
+            }]],
             "instances created before the CRD is served get 404"
         );
     }
@@ -927,5 +1123,147 @@ mod tests {
             .store
             .borrow()
             .contains_key(&id("ConfigMap", Some("app"), "cm")));
+    }
+
+    fn webhook_app() -> Vec<Value> {
+        vec![
+            // listed first on purpose: ordering must not depend on export order
+            json!({"apiVersion":"admissionregistration.k8s.io/v1","kind":"ValidatingWebhookConfiguration","metadata":{"name":"vwc","uid":"old-vwc"},
+                "webhooks":[{"name":"x.example.com","clientConfig":{"service":{"namespace":"app","name":"hook"}}},
+                            {"name":"y.example.com","clientConfig":{"url":"https://external/"}}]}),
+            json!({"apiVersion":"admissionregistration.k8s.io/v1","kind":"MutatingWebhookConfiguration","metadata":{"name":"mwc","uid":"old-mwc"},
+                "webhooks":[{"name":"m.example.com","clientConfig":{"service":{"namespace":"app","name":"hook"}}}]}),
+            json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"hook","namespace":"app","uid":"old-dep"}}),
+            json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"hook","namespace":"app","uid":"old-hsvc"}}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn webhook_configs_are_created_last_after_waiting_for_their_backends() {
+        let objs = webhook_app();
+        let mut c = Fake::default();
+        let r = run(&mut c, &plan_for(&objs), &objs).await.unwrap();
+        assert!(r.failures.is_empty());
+        let order = c.creates.borrow();
+        let kinds: Vec<&str> = order.iter().map(|i| i.kind.as_str()).collect();
+        assert!(
+            kinds[2..]
+                .iter()
+                .all(|k| k.ends_with("WebhookConfiguration"))
+                && kinds[..2]
+                    .iter()
+                    .all(|k| !k.ends_with("WebhookConfiguration")),
+            "a webhook created before its backend rejects every later create: {kinds:?}"
+        );
+        assert_eq!(
+            *c.waits.borrow(),
+            [(2, vec![("app".to_string(), "hook".to_string())])],
+            "the wait must come after the Deployment and Service exist and before any webhook, for the imported Service only"
+        );
+    }
+
+    #[tokio::test]
+    async fn pass_one_failure_skips_pass_two_so_no_reference_is_patched() {
+        let objs = app();
+        let mut c = Fake {
+            fail_create_kind: Some("Service"),
+            ..Fake::default()
+        };
+        let r = run(&mut c, &plan_for(&objs), &objs).await.unwrap();
+        assert_eq!(r.failures.len(), 1);
+        assert!(
+            r.pass2_skipped,
+            "patching references while objects are missing would point them at nothing"
+        );
+        assert!(c.patches.borrow().is_empty());
+        assert!(r.render().contains("pass 2 not run"));
+    }
+
+    #[tokio::test]
+    async fn created_objects_carry_the_source_uid_marker() {
+        let mut c = Fake::default();
+        import(&mut c).await;
+        assert_eq!(
+            c.store.borrow()[&id("ConfigMap", Some("app"), "cm")]["metadata"]["annotations"]
+                [SOURCE_UID_ANNOTATION],
+            "old-cm",
+            "the marker is how a re-run proves it created the object"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_named_object_not_created_by_this_import_is_a_conflict_and_untouched() {
+        let objs = app();
+        let mut c = Fake::default();
+        let foreign = json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"pv1","uid":"theirs"},
+            "spec":{"claimRef":{"namespace":"other","name":"db","uid":"their-pvc"}}});
+        c.store
+            .borrow_mut()
+            .insert(id("PersistentVolume", None, "pv1"), foreign.clone());
+        let r = run(&mut c, &plan_for(&objs), &objs).await.unwrap();
+        assert!(
+            r.failures
+                .iter()
+                .any(|f| f.starts_with("PersistentVolume pv1")),
+            "{:?}",
+            r.failures
+        );
+        assert!(r.pass2_skipped);
+        assert_eq!(
+            c.store.borrow()[&id("PersistentVolume", None, "pv1")],
+            foreign,
+            "patching a stranger's PV claimRef can hand its data to the wrong claim"
+        );
+        assert!(c.patches.borrow().is_empty());
+    }
+
+    #[test]
+    fn pv_whose_claimref_names_a_different_claim_is_never_patched() {
+        let objs = app();
+        let mut remap = Remap::default();
+        remap.record(&objs[4], "new-pvc");
+        let current = json!({"metadata":{"name":"pv1"},"spec":{"claimRef":{"namespace":"app","name":"other-claim","uid":"u"}}});
+        let p = pass2(&objs[3], &current, &remap);
+        assert!(p.patch.is_none());
+        assert!(p.conflict.unwrap().contains("app/other-claim"));
+    }
+
+    #[test]
+    fn owner_refs_merge_keeps_references_already_on_the_target_object() {
+        let objs = app();
+        let mut remap = Remap::default();
+        remap.record(&objs[1], "new-b");
+        let current = json!({"metadata":{"ownerReferences":[{"kind":"Deployment","name":"mine","uid":"theirs"}]}});
+        let p = pass2(&objs[0], &current, &remap);
+        let refs = p.patch.unwrap()["metadata"]["ownerReferences"].clone();
+        assert_eq!(
+            refs.as_array().unwrap().len(),
+            2,
+            "replacing the list drops the existing owner and lets the garbage collector delete the object"
+        );
+        assert_eq!(refs[0]["uid"], "theirs");
+        assert_eq!(refs[1]["uid"], "new-b");
+    }
+
+    #[test]
+    fn crd_is_ready_only_when_established_condition_is_true() {
+        assert!(!crd_established(&json!({})));
+        assert!(!crd_established(
+            &json!({"status":{"conditions":[{"type":"Established","status":"False"}]}})
+        ));
+        assert!(crd_established(
+            &json!({"status":{"conditions":[{"type":"NamesAccepted","status":"True"},{"type":"Established","status":"True"}]}})
+        ));
+    }
+
+    #[test]
+    fn endpoints_are_ready_only_with_a_ready_address() {
+        assert!(!endpoints_ready(&json!({})));
+        assert!(!endpoints_ready(
+            &json!({"subsets":[{"notReadyAddresses":[{"ip":"10.0.0.1"}]}]})
+        ));
+        assert!(endpoints_ready(
+            &json!({"subsets":[{"addresses":[{"ip":"10.0.0.1"}]}]})
+        ));
     }
 }

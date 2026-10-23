@@ -37,8 +37,9 @@ enum Migrate {
         /// nearest lower supported one.
         #[arg(long)]
         allow_unknown_k3s_version: bool,
-        /// Where a real export writes the source objects (mode 0600: it
-        /// contains Secrets).
+        /// Where a real export writes the source objects. Created with mode
+        /// 0600 and refused if the path exists; it contains Secrets in clear
+        /// text, delete it after the migration.
         #[arg(long, default_value = "u7s-migrate-objects.json")]
         objects: String,
     },
@@ -151,17 +152,12 @@ async fn export(
         );
     }
     if let Some(path) = objects {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .and_then(|mut f| f.write_all(serde_json::to_string(&objs)?.as_bytes()))
-            .with_context(|| format!("writing {path}"))?;
+        u7s_migrate::write_new_private(path, serde_json::to_string(&objs)?.as_bytes())?;
         println!("objects written to {path}");
+        println!(
+            "WARNING: {path} contains every exported object including Secrets in clear text \
+             (mode 0600). Keep it private and delete it after the migration is complete."
+        );
     }
     Ok(())
 }
