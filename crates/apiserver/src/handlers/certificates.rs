@@ -35,7 +35,7 @@ use crate::{
 };
 
 use super::generic::CollectionQuery;
-use super::json_patch::{CreateQuery, PatchQuery};
+use super::json_patch::CreateQuery;
 
 const GROUP: &str = "certificates.k8s.io";
 const CTB_PLURAL: &str = "clustertrustbundles";
@@ -1177,173 +1177,24 @@ fn pod_mounts_pod_certificate_for_signer(pod: &serde_json::Value, signer: &str) 
     })
 }
 
-/// POST /apis/certificates.k8s.io/{version}/namespaces/{ns}/podcertificaterequests
-///
-/// Applies NodeRestriction and strips any client-supplied `status` (the signer's exclusive
-/// right, written only via `/status`) before delegating to the generic namespaced create
-/// handler, which runs the spec validation. Mirrors `csr::create_csr`'s status-stripping.
-pub(crate) async fn create_pod_certificate_request<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((version, ns)): Path<(String, String)>,
-    Query(create_query): Query<CreateQuery>,
-    Extension(user): Extension<UserInfo>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, crate::status::StatusError> {
-    let decoded = extract_body(&body, content_type(&headers))?;
-    let mut obj = Object::from_bytes(&decoded)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
-
-    restrict_node_pod_certificate_request_create(&state, &user, &ns, &obj.body).await?;
-
-    if let Some(map) = obj.body.as_object_mut() {
-        map.remove("status");
+/// The `/status` write guard for `(group, plural)`, if that resource has one. Applied by the
+/// generic namespaced status handlers so no route to a PodCertificateRequest's status can
+/// skip it. A request with no authenticated user is refused: the signer check needs one.
+pub(crate) fn status_write_guard<'a, S: Store>(
+    state: &'a AppState<S>,
+    group: &str,
+    plural: &str,
+    user: Option<&'a UserInfo>,
+) -> Option<Box<super::status::StatusWriteGuard<'a>>> {
+    if group != GROUP || plural != PCR_PLURAL {
+        return None;
     }
-    obj.body["apiVersion"] = format!("{GROUP}/{version}").into();
-
-    // The body handed to the delegate below is the already-decoded-and-stripped JSON
-    // (not the original bytes, which may have been protobuf-encoded), so the Content-Type
-    // forwarded with it must say so — otherwise the generic handler would try to
-    // protobuf-decode plain JSON.
-    let mut forward_headers = headers;
-    forward_headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-
-    super::resource::create_namespaced_resource(
-        State(state),
-        Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string())),
-        Query(create_query),
-        Extension(user),
-        forward_headers,
-        obj.to_bytes(),
-    )
-    .await
-    .map(IntoResponse::into_response)
-}
-
-/// GET /apis/certificates.k8s.io/{version}/namespaces/{ns}/podcertificaterequests
-///
-/// Same reasoning as `list_cluster_trust_bundles`: the collection route is a literal
-/// path (for POST's validation), so GET/DELETE/PATCH must be registered alongside it.
-pub(crate) async fn list_pod_certificate_requests<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((version, ns)): Path<(String, String)>,
-    Query(query): Query<CollectionQuery>,
-    headers: HeaderMap,
-    Extension(user): Extension<UserInfo>,
-) -> Result<Response, crate::status::StatusError> {
-    super::resource::list_namespaced_resource(
-        State(state),
-        Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string())),
-        Query(query),
-        headers,
-        Extension(user),
-    )
-    .await
-}
-
-/// DELETE /apis/certificates.k8s.io/{version}/namespaces/{ns}/podcertificaterequests
-/// (DeleteCollection)
-pub(crate) async fn delete_collection_pod_certificate_requests<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((version, ns)): Path<(String, String)>,
-    Query(query): Query<CollectionQuery>,
-    Extension(user): Extension<UserInfo>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    super::resource::delete_collection_namespaced_resource(
-        State(state),
-        Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string())),
-        Query(query),
-        Extension(user),
-        headers,
-        body,
-    )
-    .await
-}
-
-/// PATCH /apis/certificates.k8s.io/{version}/namespaces/{ns}/podcertificaterequests
-/// (collection patch — matches the generic namespaced collection route's method set)
-pub(crate) async fn patch_collection_pod_certificate_requests<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((version, ns)): Path<(String, String)>,
-    Query(query): Query<CollectionQuery>,
-    Query(patch_query): Query<PatchQuery>,
-    Extension(user): Extension<UserInfo>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    super::resource::patch_collection_namespaced_resource(
-        State(state),
-        Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string())),
-        Query(query),
-        Query(patch_query),
-        Extension(user),
-        headers,
-        body,
-    )
-    .await
-}
-
-/// GET .../podcertificaterequests/{name}/status
-pub(crate) async fn get_pod_certificate_request_status<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((version, ns, name)): Path<(String, String, String)>,
-) -> Result<Response, crate::status::StatusError> {
-    super::status::get_namespaced_resource_status(
-        State(state),
-        Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string(), name)),
-    )
-    .await
-}
-
-/// PUT .../podcertificaterequests/{name}/status — the generic status PUT with the PCR guard
-/// (spec/metadata immutability, terminal-condition rules, issued-certificate checks, sign
-/// permission) applied just before the store write.
-pub(crate) async fn put_pod_certificate_request_status<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((version, ns, name)): Path<(String, String, String)>,
-    Extension(user): Extension<UserInfo>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, crate::status::StatusError> {
-    let guard = |old: &serde_json::Value, new: &serde_json::Value| {
-        guard_pod_certificate_request_status_write(&state, &user, old, new)
-    };
-    super::status::put_namespaced_resource_status_guarded(
-        State(state.clone()),
-        Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string(), name)),
-        Some(&user),
-        headers,
-        body,
-        Some(&guard),
-    )
-    .await
-}
-
-/// PATCH .../podcertificaterequests/{name}/status — see `put_pod_certificate_request_status`.
-pub(crate) async fn patch_pod_certificate_request_status<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((version, ns, name)): Path<(String, String, String)>,
-    Extension(user): Extension<UserInfo>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, crate::status::StatusError> {
-    let guard = |old: &serde_json::Value, new: &serde_json::Value| {
-        guard_pod_certificate_request_status_write(&state, &user, old, new)
-    };
-    super::status::patch_namespaced_resource_status_guarded(
-        State(state.clone()),
-        Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string(), name)),
-        Some(&user),
-        headers,
-        body,
-        Some(&guard),
-    )
-    .await
+    Some(Box::new(move |old, new| {
+        let user = user.ok_or_else(|| {
+            Status::forbidden("an authenticated user is required to write this status".to_string())
+        })?;
+        guard_pod_certificate_request_status_write(state, user, old, new)
+    }))
 }
 
 #[cfg(test)]
@@ -1352,6 +1203,7 @@ mod tests {
 
     use axum::http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
 
+    use crate::handlers::json_patch::PatchQuery;
     use crate::handlers::test_support::make_state;
 
     fn test_user() -> UserInfo {
@@ -1367,6 +1219,65 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers
+    }
+
+    /// PodCertificateRequest routes are the generic ones; these pin `(group, plural)` so the
+    /// tests below exercise exactly what `/apis/certificates.k8s.io/.../podcertificaterequests`
+    /// reaches.
+    async fn create_pod_certificate_request(
+        state: State<AppState<u7s_store::SqliteStore>>,
+        Path((version, ns)): Path<(String, String)>,
+        query: Query<CreateQuery>,
+        user: Extension<UserInfo>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<Response, crate::status::StatusError> {
+        super::super::resource::create_namespaced_resource(
+            state,
+            Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string())),
+            query,
+            user,
+            headers,
+            body,
+        )
+        .await
+        .map(IntoResponse::into_response)
+    }
+
+    async fn put_pod_certificate_request_status(
+        state: State<AppState<u7s_store::SqliteStore>>,
+        Path((version, ns, name)): Path<(String, String, String)>,
+        user: Extension<UserInfo>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<Response, crate::status::StatusError> {
+        super::super::status::put_namespaced_resource_status(
+            state,
+            Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string(), name)),
+            Some(user),
+            headers,
+            body,
+        )
+        .await
+        .map(IntoResponse::into_response)
+    }
+
+    async fn patch_pod_certificate_request_status(
+        state: State<AppState<u7s_store::SqliteStore>>,
+        Path((version, ns, name)): Path<(String, String, String)>,
+        user: Extension<UserInfo>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<Response, crate::status::StatusError> {
+        super::super::status::patch_namespaced_resource_status(
+            state,
+            Path((GROUP.to_string(), version, ns, PCR_PLURAL.to_string(), name)),
+            Some(user),
+            headers,
+            body,
+        )
+        .await
+        .map(IntoResponse::into_response)
     }
 
     /// A real, well-formed X.509 certificate PEM (not a CA, but `parse_trust_bundle_pem`
@@ -1957,6 +1868,43 @@ mod tests {
             "status must never be settable at create time -- a controller populates it \
              out-of-band via /status once (and if) it issues a certificate. Got: {:?}",
             v.get("status")
+        );
+    }
+
+    #[tokio::test]
+    async fn podcertificaterequest_v1_create_drops_v1beta1_only_key_fields_because_upstream_v1_has_no_such_spec_fields(
+    ) {
+        let state = make_state();
+        let mut spec = valid_pcr_spec();
+        spec["pkixPublicKey"] = "AAAA".into();
+        spec["proofOfPossession"] = "BBBB".into();
+        let body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "PodCertificateRequest",
+            "metadata": {"name": "req-prune"},
+            "spec": spec,
+        });
+
+        create_pod_certificate_request(
+            State(state.clone()),
+            Path(("v1".to_string(), "default".to_string())),
+            Query(CreateQuery::default()),
+            Extension(test_user()),
+            json_headers(),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create must succeed, got status {}", e.0));
+
+        let key = "/registry/certificates.k8s.io/podcertificaterequests/default/req-prune";
+        let stored = state.store.get(key).await.unwrap().expect("must persist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["spec"].get("pkixPublicKey").is_none()
+                && v["spec"].get("proofOfPossession").is_none(),
+            "JSON must drop the same fields protobuf skips, or the two encodings store \
+             different objects. Got: {}",
+            v["spec"]
         );
     }
 

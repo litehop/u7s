@@ -1292,8 +1292,14 @@ fn validate_network_policy_ports(obj: &serde_json::Value) -> Result<(), String> 
 /// `maxExpirationSeconds` verbatim into the request, so without this default every
 /// podCertificate volume that leaves it out is rejected as "must be set" and its pod never
 /// starts.
+///
+/// Also drops `pkixPublicKey`/`proofOfPossession`: they exist only in v1beta1's spec, and the
+/// v1 type upstream decodes into has no such fields, so JSON and protobuf (which skips the
+/// tags) must agree on storing neither.
 fn default_pod_certificate_request(obj: &mut serde_json::Value) {
     if let Some(spec) = obj["spec"].as_object_mut() {
+        spec.remove("pkixPublicKey");
+        spec.remove("proofOfPossession");
         if spec.get("maxExpirationSeconds").is_none_or(|v| v.is_null()) {
             spec.insert("maxExpirationSeconds".into(), 86400.into());
         }

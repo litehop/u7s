@@ -199,7 +199,8 @@ calibrate_boundary
 phase wordpress
 k apply -f "$RG/wordpress/mariadb-emptydir.yaml" -f "$RG/wordpress/wordpress.yaml" >> "$OUT/run.log" 2>&1
 for _ in $(seq 1 60); do k -n default get pod mariadb-0 >/dev/null 2>&1 && break; sleep 2; done
-kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s >> "$OUT/run.log" 2>&1 || log "mariadb-0 not Ready in 300s"
+MARIADB_READY=1
+kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s >> "$OUT/run.log" 2>&1 || { MARIADB_READY=0; log "mariadb-0 not Ready in 300s"; }
 kw -n default wait --for=condition=Available deployment/pehelypress --timeout=300s >> "$OUT/run.log" 2>&1 || log "pehelypress not Available in 300s"
 WP_IP="$(k get svc pehelypress -o jsonpath='{.spec.clusterIP}')"
 wp_code() { curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$WP_IP/"; }
@@ -211,7 +212,11 @@ log "wordpress warm-up GET / -> $(wp_code)"
 MARKER="rg-$(date +%s)-$RANDOM"
 mysql_k() { k -n default exec mariadb-0 -- mariadb -uvalerauko -puserpw-phase3 valenet -N -B -e "$1"; }
 mysql_k "CREATE TABLE rg_marker (v VARCHAR(64) NOT NULL); INSERT INTO rg_marker VALUES ('$MARKER')" >> "$OUT/run.log" 2>&1 \
-  || { log "marker write failed: harness error, not a u7s verdict"; res harness_error "marker write to MariaDB failed before the bursts"; exit 1; }
+  || {
+    log "marker write failed (was_ready=$MARIADB_READY)"
+    rg_probe_and_record_marker_failure "$OUT/results.env" "$MARIADB_READY"
+    exit 1
+  }
 marker_ok() {
   local i v=""
   for i in $(seq 1 12); do

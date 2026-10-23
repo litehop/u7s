@@ -286,6 +286,22 @@ impl Status {
         )
     }
 
+    pub fn request_entity_too_large(message: String) -> StatusError {
+        StatusError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "RequestEntityTooLarge",
+                code: 413,
+                metadata: None,
+                details: None,
+            },
+        )
+    }
+
     pub fn too_many_requests(message: String) -> StatusError {
         StatusError(
             StatusCode::TOO_MANY_REQUESTS,

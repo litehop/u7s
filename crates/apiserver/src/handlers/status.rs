@@ -539,6 +539,7 @@ pub async fn get_namespaced_resource_status<S: Store>(
 /// status-write rules that need the stored object, at the one point every PUT/PATCH flavor
 /// converges on.
 pub(crate) type StatusWriteGuard<'a> = dyn Fn(&serde_json::Value, &serde_json::Value) -> Result<(), crate::status::StatusError>
+    + Send
     + Sync
     + 'a;
 
@@ -549,13 +550,15 @@ pub async fn put_namespaced_resource_status<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let user = user.as_ref().map(|u| &u.0);
+    let guard = super::certificates::status_write_guard(&state, &path.0, &path.3, user);
     put_namespaced_resource_status_guarded(
-        State(state),
+        State(state.clone()),
         Path(path),
-        user.as_ref().map(|u| &u.0),
+        user,
         headers,
         body,
-        None,
+        guard.as_deref(),
     )
     .await
 }
@@ -684,13 +687,15 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let user = user.as_ref().map(|u| &u.0);
+    let guard = super::certificates::status_write_guard(&state, &path.0, &path.3, user);
     patch_namespaced_resource_status_guarded(
-        State(state),
+        State(state.clone()),
         Path(path),
-        user.as_ref().map(|u| &u.0),
+        user,
         headers,
         body,
-        None,
+        guard.as_deref(),
     )
     .await
 }
@@ -6210,13 +6215,12 @@ mod tests {
         // before ever assigning it back, so a scalar/array status is structurally impossible
         // to produce there — `to_value` on a struct always yields a JSON object.
         //
-        // put_namespaced_resource_status and put_pod_certificate_request_status are thin
-        // delegates to `put_namespaced_resource_status_guarded`, which is scanned itself.
+        // put_namespaced_resource_status is a thin delegate to
+        // `put_namespaced_resource_status_guarded`, which is scanned itself.
         const TYPED_SAFE: &[&str] = &[
             "put_namespace_status",
             "replace_pod_status",
             "put_namespaced_resource_status",
-            "put_pod_certificate_request_status",
         ];
 
         let handlers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");

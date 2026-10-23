@@ -1233,6 +1233,81 @@ mod tests {
         );
     }
 
+    /// The generic cluster-scoped create must apply the CSR guards itself: a request that
+    /// reaches it by any route would otherwise store an unvalidated spec carrying a forged
+    /// requester identity and a pre-set status.
+    #[tokio::test]
+    async fn generic_create_applies_csr_validation_and_identity_stamping_on_every_route() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let user = || crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let create = |body: serde_json::Value| {
+            super::super::resource::create_resource(
+                State(state.clone()),
+                Path((
+                    "certificates.k8s.io".to_string(),
+                    "v1".to_string(),
+                    "certificatesigningrequests".to_string(),
+                )),
+                Query(Default::default()),
+                axum::Extension(user()),
+                headers.clone(),
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+        };
+        let csr = |name: &str, request: &str| {
+            serde_json::json!({
+                "apiVersion": "certificates.k8s.io/v1",
+                "kind": "CertificateSigningRequest",
+                "metadata": {"name": name},
+                "spec": {
+                    "request": request,
+                    "signerName": "kubernetes.io/kube-apiserver-client",
+                    "usages": ["client auth"],
+                    "username": "forged"
+                },
+                "status": {"certificate": "Zm9yZ2Vk"}
+            })
+        };
+
+        match create(csr("bad", "not-a-csr")).await {
+            Err(e) => assert_eq!(e.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY),
+            Ok(_) => panic!("an invalid PKCS#10 request must be rejected on the generic route"),
+        }
+
+        create(csr("good", &valid_csr_b64()))
+            .await
+            .unwrap_or_else(|e| panic!("valid CSR must be created, got {}", e.0));
+        let stored = state
+            .store
+            .get("/registry/certificates.k8s.io/certificatesigningrequests/good")
+            .await
+            .unwrap()
+            .expect("persisted");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["username"], "alice",
+            "requester identity must come from the caller, never the body"
+        );
+        assert!(
+            v.get("status")
+                .is_none_or(|s| s.get("certificate").is_none()),
+            "a client must not pre-set the issued certificate. Got: {:?}",
+            v.get("status")
+        );
+    }
+
     /// stamp_csr_identity overwrites a client-supplied spec.username/uid/groups/extra
     /// with the authenticated caller's real identity.
     ///

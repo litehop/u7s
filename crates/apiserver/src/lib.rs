@@ -381,19 +381,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     };
 
     // 10. Build app state (shared with the auth layer).
-    // Combine admin cert PEM + admin key PEM for the webhook mTLS client identity.
-    // The webhook client will present this certificate when connecting to admission
-    // webhook servers, so they can verify they are talking to the apiserver.
-    let mut webhook_identity_pem = tls_material.admin_cert_pem.clone();
-    webhook_identity_pem.extend_from_slice(&tls_material.admin_key_pem);
+    let webhook_identity_pem = tls_material.webhook_client_identity_pem();
     // Combine kubelet client cert PEM + key PEM for the kubelet proxy client identity.
     // The apiserver presents this certificate when proxying log/exec/attach requests to
     // the kubelet. Kubelet accepts certs with O=system:masters signed by the cluster CA.
     let mut kubelet_client_identity_pem = tls_material.kubelet_client_cert_pem.clone();
     kubelet_client_identity_pem.extend_from_slice(&tls_material.kubelet_client_key_pem);
     // Combine proxy-client cert PEM + key PEM for the mTLS identity presented to
-    // AGGREGATED BACKENDS (see `TlsMaterial::proxy_client_cert_pem`'s doc) — distinct from
-    // webhook_identity_pem (the admin cert) above.
+    // AGGREGATED BACKENDS (see `TlsMaterial::proxy_client_cert_pem`'s doc).
     let mut proxy_client_identity_pem = tls_material.proxy_client_cert_pem.clone();
     proxy_client_identity_pem.extend_from_slice(&tls_material.proxy_client_key_pem);
     let mut state = state::AppState::new_with_config(state::AppStateConfig {
@@ -442,17 +437,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             let mut identity_pem = tls::pem_encode("CERTIFICATE", &leaf.cert_der);
             identity_pem.extend_from_slice(&leaf.key_pem);
             match name {
-                "admin" => {
+                "kubelet-client" => rotation_state.set_kubelet_identity(identity_pem),
+                "proxy-client" => {
+                    rotation_state
+                        .proxy_client_identity_pem
+                        .set(Some(Arc::new(identity_pem.clone())));
                     if let Err(e) = rotation_state.set_webhook_identity(identity_pem) {
                         rotation_inventory
                             .record_failure(name, format_args!("webhook client: {e}"));
                         tracing::error!("webhook client after rotating {name}: {e}");
                     }
                 }
-                "kubelet-client" => rotation_state.set_kubelet_identity(identity_pem),
-                "proxy-client" => rotation_state
-                    .proxy_client_identity_pem
-                    .set(Some(Arc::new(identity_pem))),
                 _ => {}
             }
         },
@@ -901,12 +896,23 @@ fn record_manifest_apply_outcome(
 /// but two segments to auth. Other escapes (including `%25`, so `%252F` stays a single segment
 /// holding the text `%2F`) stay encoded: axum percent-decodes captures exactly once, as auth's
 /// `parse_path` does.
+///
+/// A path holding a `%` that does not start a valid escape is left untouched: decoding the
+/// escapes around it could splice a new one together (`%%32F` -> `%2F`) that axum would then
+/// decode to `/` while auth reads the literal text `%2F`.
 fn normalize_path_escapes(uri: &axum::http::Uri) -> Option<axum::http::Uri> {
     let path = uri.path();
     if !path.contains('%') {
         return None;
     }
     let bytes = path.as_bytes();
+    let invalid_escape = bytes.iter().enumerate().any(|(i, b)| {
+        *b == b'%'
+            && !matches!(bytes.get(i + 1..i + 3), Some([h, l]) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit())
+    });
+    if invalid_escape {
+        return None;
+    }
     let mut out = String::with_capacity(path.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -1325,24 +1331,6 @@ fn build_routes(state: AppState) -> Router {
             get(handlers::certificates::list_cluster_trust_bundles)
                 .post(handlers::certificates::create_cluster_trust_bundle)
                 .delete(handlers::certificates::delete_collection_cluster_trust_bundles),
-        )
-        // PodCertificateRequest (certificates.k8s.io v1 and v1beta1) — dedicated POST handler
-        // applies NodeRestriction and strips any client-supplied status (status is the
-        // signer's exclusive right, written only via /status); the dedicated /status handlers
-        // add the signer/terminal-condition guard. Must be registered before the generic
-        // namespaced catch-alls.
-        .route(
-            "/apis/certificates.k8s.io/{version}/namespaces/{ns}/podcertificaterequests",
-            get(handlers::certificates::list_pod_certificate_requests)
-                .post(handlers::certificates::create_pod_certificate_request)
-                .delete(handlers::certificates::delete_collection_pod_certificate_requests)
-                .patch(handlers::certificates::patch_collection_pod_certificate_requests),
-        )
-        .route(
-            "/apis/certificates.k8s.io/{version}/namespaces/{ns}/podcertificaterequests/{name}/status",
-            get(handlers::certificates::get_pod_certificate_request_status)
-                .put(handlers::certificates::put_pod_certificate_request_status)
-                .patch(handlers::certificates::patch_pod_certificate_request_status),
         )
         // Generic cluster-scoped resources — collection
         .route(
@@ -9007,7 +8995,33 @@ mod tests {
     /// parsed tuple, the router via the response it produces.
     #[tokio::test]
     async fn router_and_auth_resolve_the_same_resource_for_every_encoded_segment_position() {
-        let (app, _state) = certificates_app().await;
+        let (app, state) = certificates_app().await;
+        {
+            // Seeded so a correctly routed request is a 2xx, which a mis-split namespace,
+            // name or subresource can never produce (they 404 on the reference and encoded
+            // path alike if nothing exists to find).
+            use u7s_store::Store as _;
+            for (key, body) in [
+                (
+                    "/registry/configmaps/default/x",
+                    serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"x","namespace":"default","uid":"c"}}),
+                ),
+                (
+                    "/registry/pods/default/x",
+                    serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"x","namespace":"default","uid":"p"},"spec":{"containers":[]}}),
+                ),
+            ] {
+                state
+                    .store
+                    .put(
+                        key.to_owned(),
+                        serde_json::to_vec(&body).unwrap().into(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
         let build = |segs: &[&str], i: usize, repl: &str, sep_before: &str| {
             let mut s = String::new();
             for (k, seg) in segs.iter().enumerate() {
@@ -9034,15 +9048,7 @@ mod tests {
                 ],
             ),
             (
-                &[
-                    "api",
-                    "v1",
-                    "namespaces",
-                    "default",
-                    "configmaps",
-                    "x",
-                    "zzz",
-                ],
+                &["api", "v1", "namespaces", "default", "pods", "x", "status"],
                 &[(6, "subresource")],
             ),
             (
@@ -9078,13 +9084,55 @@ mod tests {
                         build(segs, i, &format!("{seg}%252F"), "/"),
                         build(segs, i, &format!("{seg}Q"), "/"),
                     ),
+                    (
+                        "triple-encoded %25252F",
+                        build(segs, i, &format!("{seg}%25252F"), "/"),
+                        build(segs, i, &format!("{seg}Q"), "/"),
+                    ),
+                    (
+                        "spliced %%32F",
+                        build(segs, i, &format!("{seg}%%32F"), "/"),
+                        build(segs, i, &format!("{seg}Q"), "/"),
+                    ),
+                    (
+                        "spliced %2%46",
+                        build(segs, i, &format!("{seg}%2%46"), "/"),
+                        build(segs, i, &format!("{seg}Q"), "/"),
+                    ),
+                    (
+                        "invalid %zz",
+                        build(segs, i, &format!("{seg}%zz"), "/"),
+                        build(segs, i, &format!("{seg}Q"), "/"),
+                    ),
+                    (
+                        "truncated %2",
+                        build(segs, i, &format!("{seg}%2"), "/"),
+                        build(segs, i, &format!("{seg}Q"), "/"),
+                    ),
                 ];
                 for (enc, encoded, reference) in cells {
                     sites += 1;
-                    let double = enc.starts_with("double");
+                    // Cells whose decoded segment is the original text plus literal `%…`
+                    // characters: normalised to `Q` so they compare against one reference.
+                    let literal = match enc {
+                        "double-encoded %252F" | "spliced %%32F" | "spliced %2%46" => Some("%2F"),
+                        "triple-encoded %25252F" => Some("%252F"),
+                        "invalid %zz" => Some("%zz"),
+                        "truncated %2" => Some("%2"),
+                        _ => None,
+                    };
+                    let double = literal.is_some();
+                    if enc == "unreserved %XX" {
+                        let (status, _) = send_as(&app, "admin-token", "GET", &plain, "").await;
+                        assert!(
+                            status.is_success(),
+                            "reference {plain} must reach a real object or list, else a \
+                             mis-routed 404 is indistinguishable from the correct one"
+                        );
+                    }
                     let mut auth_view = auth::resolved_path_for_test(&encoded);
-                    if double {
-                        auth_view = auth_view.map(|f| f.replace("%2F", "Q"));
+                    if let Some(lit) = literal {
+                        auth_view = auth_view.map(|f| f.replace(lit, "Q"));
                     }
                     if auth_view != auth::resolved_path_for_test(&reference) {
                         failures.push(format!("auth {label} {enc}: {encoded} -> {auth_view:?}"));
@@ -9105,7 +9153,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(sites, 35, "7 segment positions x 5 encodings");
+        assert_eq!(sites, 70, "7 segment positions x 10 encodings");
         assert!(
             failures.is_empty(),
             "auth and router disagree at {}/{sites} sites:\n{}",
