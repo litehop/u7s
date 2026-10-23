@@ -1002,6 +1002,7 @@ fn apply_one_json_patch_op(
     let path = op["path"].as_str().ok_or_else(|| {
         Status::unprocessable_entity("each JSON patch operation must have a 'path' field".into())
     })?;
+    check_patch_depth(op, path)?;
 
     match op_str {
         "add" => {
@@ -1055,6 +1056,34 @@ fn apply_one_json_patch_op(
                 "unsupported JSON patch operation '{other}'; supported: add, remove, replace, test"
             )));
         }
+    }
+    Ok(())
+}
+
+fn value_depth(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Object(m) => 1 + m.values().map(value_depth).max().unwrap_or(0),
+        serde_json::Value::Array(a) => 1 + a.iter().map(value_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Rejects a path whose segment count, plus the depth of any value it inserts, exceeds
+/// `MAX_YAML_DEPTH`. `add` auto-vivifies one object per segment, so an unbounded path
+/// overflows the worker stack and aborts the process; past the same bound the stored
+/// document can no longer be re-parsed by serde_json (recursion limit 128).
+/// The patch body itself is already bounded by that parse limit, so `value_depth` is cheap.
+fn check_patch_depth(op: &serde_json::Value, path: &str) -> Result<(), crate::status::StatusError> {
+    let segs = if path.is_empty() {
+        0
+    } else {
+        path.bytes().filter(|&b| b == b'/').count()
+    };
+    let value = op.get("value").map_or(0, value_depth);
+    if segs + value > MAX_YAML_DEPTH {
+        return Err(Status::unprocessable_entity(format!(
+            "JSON patch path nesting exceeds the maximum depth of {MAX_YAML_DEPTH}"
+        )));
     }
     Ok(())
 }
@@ -1434,6 +1463,84 @@ pub(crate) fn json_patch_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- apply_json_patch: path depth bound --
+
+    fn deep_path(n: usize) -> String {
+        "/a".repeat(n)
+    }
+
+    /// Runs on a 512 KiB stack like the apiserver workers: without the depth bound a
+    /// 20000-segment `add` overflows it and aborts the whole test process (in production,
+    /// every in-flight connection).
+    #[test]
+    fn json_patch_add_with_huge_path_is_rejected_without_overflowing_worker_stack() {
+        let handle = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                for n in [129, 500, 20_000, 200_000] {
+                    let mut obj = serde_json::json!({"data": {}});
+                    let before = obj.clone();
+                    let patch =
+                        serde_json::json!([{"op": "add", "path": deep_path(n), "value": 1}]);
+                    let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+                    assert_eq!(err.1.code, 422, "depth {n} must be a 4xx, not a 500/abort");
+                    assert_eq!(obj, before, "rejected patch must not mutate the document");
+                }
+            })
+            .unwrap();
+        handle
+            .join()
+            .expect("deep-path patch must not crash the worker");
+    }
+
+    /// Every op that takes a path must be bounded, not just `add`; otherwise a
+    /// crafted path in remove/replace/test still reaches recursive code.
+    #[test]
+    fn json_patch_all_path_ops_reject_over_deep_path() {
+        for op in ["add", "replace", "remove", "test"] {
+            let mut obj = serde_json::json!({});
+            let patch =
+                serde_json::json!([{"op": op, "path": deep_path(MAX_YAML_DEPTH + 1), "value": 1}]);
+            let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+            assert_eq!(
+                err.1.code, 422,
+                "{op} with over-deep path must be rejected up front"
+            );
+            assert!(
+                err.1.message.contains("maximum depth"),
+                "{op} must fail on the depth bound, not an incidental missing-path error: {}",
+                err.1.message
+            );
+        }
+    }
+
+    /// A path at the limit must still work, and the stored result must round-trip
+    /// through serde_json, which is what every later read of the object does.
+    #[test]
+    fn json_patch_add_at_depth_limit_succeeds_and_result_reparses() {
+        let mut obj = serde_json::json!({});
+        let patch =
+            serde_json::json!([{"op": "add", "path": deep_path(MAX_YAML_DEPTH - 1), "value": 1}]);
+        apply_json_patch(&mut obj, &patch).unwrap();
+        let text = serde_json::to_string(&obj).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text)
+            .expect("document at the depth limit must stay readable");
+    }
+
+    /// A shallow path with a deeply nested value can also push the document past what
+    /// serde_json can re-read (500 on every later GET), so value depth counts too.
+    #[test]
+    fn json_patch_add_shallow_path_with_deep_value_is_rejected() {
+        let mut value = serde_json::json!(1);
+        for _ in 0..MAX_YAML_DEPTH {
+            value = serde_json::json!({ "a": value });
+        }
+        let mut obj = serde_json::json!({});
+        let patch = serde_json::json!([{"op": "add", "path": "/x/y", "value": value}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.1.code, 422);
+    }
 
     // -- apply_json_patch: undo-log atomicity --
     //

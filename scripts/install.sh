@@ -1595,12 +1595,8 @@ Environment=GOMAXPROCS=2
 # (no shipped ClusterRole uses it, no code reads it) so this controller has no
 # object to ever act on; the informer it shares (ClusterRoles) is already kept
 # warm by RBAC authorization itself.
-# -device-taint-eviction-controller: DRA is GA (DynamicResourceAllocation) and
-# u7s fully serves resource.k8s.io/v1 (DeviceClass/ResourceClaim/
-# ResourceClaimTemplate/ResourceSlice), but the DeviceTaintRule type this
-# controller acts on lives at resource.k8s.io/v1beta2, a version u7s does not
-# serve at all -- no DeviceTaintRule can ever exist, so device-taint-based
-# eviction is structurally unreachable regardless of this flag.
+# device-taint-eviction-controller stays enabled: u7s serves
+# resource.k8s.io/v1 DeviceTaintRule (GA, default-on in 1.37).
 # cloud-node-lifecycle-controller / node-route-controller / service-lb-controller
 # are deliberately NOT excluded, on any pinned KCM version: without
 # --cloud-provider set, KCM 1.35/1.36 already no-op all three at construction
@@ -1610,7 +1606,7 @@ Environment=GOMAXPROCS=2
 # no longer knows about is a hard --controllers validation error ("is not
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 

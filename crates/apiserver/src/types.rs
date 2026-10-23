@@ -793,7 +793,7 @@ pub struct CsrCondition {
 }
 
 // ---------------------------------------------------------------------------
-// ClusterTrustBundle typed fields (certificates.k8s.io/v1beta1)
+// ClusterTrustBundle typed fields (certificates.k8s.io/v1)
 // ---------------------------------------------------------------------------
 
 /// Typed `spec` for a ClusterTrustBundle.
@@ -816,7 +816,7 @@ pub struct ClusterTrustBundleSpec {
 }
 
 // ---------------------------------------------------------------------------
-// PodCertificateRequest typed fields (certificates.k8s.io/v1beta1)
+// PodCertificateRequest typed fields (certificates.k8s.io/v1)
 // ---------------------------------------------------------------------------
 
 /// Typed `spec` for a PodCertificateRequest. All fields below are `+required`
@@ -846,11 +846,7 @@ pub struct PodCertificateRequestSpec {
     /// error instead of the generic "required field" deserialization failure the other
     /// (string) fields above produce.
     pub max_expiration_seconds: Option<i64>,
-    /// Base64 (Go `[]byte`); `pkixPublicKey`/`proofOfPossession` exist on v1beta1 only.
-    #[serde(default)]
-    pub pkix_public_key: Option<String>,
-    #[serde(default)]
-    pub proof_of_possession: Option<String>,
+    /// Base64 (Go `[]byte`).
     #[serde(default, rename = "stubPKCS10Request")]
     pub stub_pkcs10_request: Option<String>,
     #[serde(default)]
@@ -1998,11 +1994,11 @@ pub struct DeviceTaintRuleStatus {
 }
 
 // ---------------------------------------------------------------------------
-// certificates.k8s.io/v1beta1 — PodCertificateRequest
+// certificates.k8s.io/v1 — PodCertificateRequest
 // ---------------------------------------------------------------------------
 
 /// Typed status for a PodCertificateRequest object. Source: upstream
-/// `staging/src/k8s.io/api/certificates/v1beta1/types.go`'s `PodCertificateRequestStatus`
+/// `staging/src/k8s.io/api/certificates/v1/types.go`'s `PodCertificateRequestStatus`
 /// (not vendored as a `.proto` in this repo). `conditions` is `[]metav1.Condition` upstream,
 /// so the generic `Condition` struct is the exact match. `certificateChain`/`notBefore`/
 /// `beginRefreshAt`/`notAfter` are upstream-documented as immutable once set by the signer
