@@ -79,7 +79,8 @@ Usage:
   install.sh --mint-join-token
   install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 
-  --tarball <path>     Path to an already-downloaded u7s release tarball.
+  --tarball <path>     Path to an already-downloaded u7s release tarball. NOT
+                         signature-verified: the file is trusted as supplied.
                          Overrides the release URL baked into this copy.
   --tarball-url <url>   Fetch the release tarball from <url> instead of the
                          one baked into this copy at release time.
@@ -295,7 +296,8 @@ RELEASE_PUBKEY_PEM=""
 
 # Verify <sig> is a valid Ed25519 signature of <file> under RELEASE_PUBKEY_PEM.
 # Exits non-zero with a message on any failure, including a missing or too-old
-# openssl: there is deliberately no way to skip verification.
+# openssl: no flag skips it for downloaded tarballs (a local --tarball is
+# trusted as supplied and never reaches this function).
 verify_release_signature() {
   local file="$1" sig="$2"
   if [ -z "$RELEASE_PUBKEY_PEM" ]; then

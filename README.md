@@ -43,6 +43,25 @@ and kube-controller-manager, and writes a systemd unit for each.
    -----END PUBLIC KEY-----
    ```
 
+   **The one-liner above trusts the download channel.** The key embedded in
+   `install.sh` arrives with the script, so it only protects against a
+   compromised release publisher, not against whoever controls the proxy or
+   your network path to it.
+
+   **Verify before running.** `install.sh` is itself signed with the same
+   key. Save the public key above (copied from GitHub, a different channel
+   from the proxy) as `release.pub`, then:
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
+   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh.sig"
+   openssl pkeyutl -verify -pubin -inkey release.pub -rawin -in install.sh -sigfile install.sh.sig
+   sudo bash install.sh
+   ```
+
+   Run it only if openssl prints `Signature Verified Successfully`
+   (OpenSSL >= 3.0; macOS's LibreSSL cannot verify Ed25519).
+
 2. With no flags, the node name defaults to the host's hostname and the
    cluster network binds to the first non-loopback interface. Override
    either with `--node-name` or `--iface` (see `scripts/install.sh --help`

