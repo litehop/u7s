@@ -27,7 +27,7 @@ enum Ty<'a> {
     Map(&'a J),
 }
 
-const CEL_TYPE_IDENTS: &[&str] = &[
+pub(crate) const CEL_TYPE_IDENTS: &[&str] = &[
     "bool",
     "int",
     "uint",
