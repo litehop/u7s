@@ -50,6 +50,12 @@ gives a clean reprovision from `lima/kubelet.yaml`; use `limactl edit` instead
 when you want to keep disk state (certs, cached images). After any stop, the next
 `run-all.sh` restarts the VM and reconnects kubelet.
 
+**Testing `scripts/install.sh` on a rig VM**: the rig leaves
+`/etc/systemd/system/kubelet.service.d/u7s.conf` and `kube-proxy.service` behind, and the
+drop-in's `ExecStart=` overrides install.sh's kubelet. Run
+`scripts/conformance/lima-unrig.sh --vm <VM>` first (a reboot or the next `run-all.sh`
+re-creates them).
+
 ---
 
 ## Primary path — use run-all.sh
