@@ -35,6 +35,8 @@ ALLOW=(
   'test-restart-kill-scope-logic.sh::.::asserts on and extracts the real scripts'"'"' lines; issues no pkill of its own pattern'
   'test-worktree-hygiene-logic.sh::.::asserts on dry-run output text; issues no real pkill'
   'test-kill-sites-logic.sh::.::extracts and drives the real scripts'"'"' lines against its own sleepers'
+  'release-gate/burst-gate.sh::pkill -KILL -f "\$RG_VM_KILL_PATTERN"::runs inside the gate'"'"'s dedicated VM against a line-anchored fixed /var/tmp/rg/*.sh pattern, no host workdir'
+  'release-gate/test-burst-gate-logic.sh::for cmd in .bash -c sudo pkill::fixture command strings fed to the kill pattern regex; no pkill is run'
   'test-kill-pattern-guard-logic.sh::.::fixtures for this guard'
 )
 
