@@ -79,8 +79,10 @@ Every release must pass `scripts/release-gate/burst-gate.sh` (operator decision 
 scripts/release-gate/burst-gate.sh                  # 3 runs, VMs deleted afterwards
 scripts/release-gate/burst-gate.sh --confirm        # release confirmation: 3x at 50, else 3x at 40; prints the gated ceiling (~1-2 h, quiet host)
 scripts/release-gate/burst-gate.sh --runs 1 --keep   # debug one run, keep the VM
-scripts/release-gate/burst-gate.sh --memory 0.625    # forced-failure check
+scripts/release-gate/burst-gate.sh --mem-hog-mib 400  # forced-failure check: pins memory after install; exits 0 only if the burst is what failed
 ```
+
+Exit status: 0 PASS, 1 FAIL, 3 INVALID. A run that does not pass while the host is not quiet (another Lima VM running, host CPU idle under 70% over 30 s, minus the gate VM's own vCPU share, or the in-guest CPU calibration at the pre-burst idle boundary over 1.5x the pre-install baseline of the same VM; fewer than 3 samples = unmeasured, judged on the host checks alone, so a missing probe never turns a FAIL into INVALID; a marker write failing before the bursts is a harness error, also INVALID) is INVALID: it is repeated (up to 3 times) and never counted, and `--confirm` does not drop to 40 pods on INVALID runs. A PASS under contention stays PASS. Criterion (d) also requires a marker row written to MariaDB before the bursts to survive (MariaDB is on emptyDir; a recreated pod would otherwise pass via WordPress's installer redirect).
 
 Needs `limactl` (vz), `cargo-zigbuild` + `zig`, and a quiet host (no other VM workloads: timings are part of the verdict). A run takes about 25 minutes. PASS requires all of, in every run: (a) no OOM kill of a control-plane host process or kube-system pod, (b) node Ready throughout, (c) each burst finished within 5 minutes, (d) WordPress still answers after the burst, (e) webhook-smoke passes. Exit status is non-zero on any FAIL; per-run verdicts, samples (`MemAvailable`, per-process PSS/RSS) and kernel logs land in `temp/release-gate/<timestamp>/` (gitignored, so copy numbers you need into the PR). `scripts/release-gate/test-burst-gate-logic.sh` covers the verdict logic without a VM.
 
