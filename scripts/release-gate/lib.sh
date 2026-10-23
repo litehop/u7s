@@ -17,7 +17,8 @@
 #   webhook_ok=1|0           scripts/e2e-workload/webhook-smoke.sh passed
 #   cal_ref_ms / cal_ref_n   median / count of in-guest CPU calibration loops before install (baseline)
 #   cal_idle_ms / cal_idle_n same, at the idle boundary before the first burst (contention probe)
-#   marker_fail=TEXT         why the marker could not be written (set with marker_ok=0)
+#   steal_idle_pct=N.N       in-guest steal time over the idle window (a shared-core host's noise)
+#   marker_fail=TEXT        why the marker could not be written (set with marker_ok=0)
 #   harness_error=TEXT       the harness itself broke before the bursts (not a u7s verdict)
 # Ramp mode writes install_ok plus, per burst size N: ramp_N_secs (N|timeout),
 # ramp_N_oom_host, ramp_N_oom_kubesystem, ramp_N_notready, ramp_N_ready_final, ramp_N_wp_ok,
@@ -32,6 +33,7 @@ BURST_CAP_SECS="${BURST_CAP_SECS:-300}"
 RG_IDLE_MIN_PCT=70
 RG_CAL_MAX_RATIO_X10=15
 RG_CAL_MIN_SAMPLES=3
+RG_STEAL_MAX_PCT=10
 # Pattern for pkill -f inside the VM: every script the gate runs there is started as
 # `bash /var/tmp/rg/<name>.sh`. Anchored so the pkill's own wrapper shell never matches.
 RG_VM_KILL_PATTERN='^bash /var/tmp/rg/[a-z-]+\.sh'
@@ -233,10 +235,44 @@ rg_cal_reason() {
     || echo "in-guest CPU calibration ${idle}ms > 1.5x pre-install baseline ${ref}ms"
 }
 
+# Steal time over a window, from two `cpu` lines of /proc/stat ($1 before, $2 after): percent
+# of all CPU time with one decimal. Prints nothing when the lines are unusable or no time passed.
+rg_steal_pct() {
+  printf '%s\n%s\n' "$1" "$2" | awk '
+    $1 == "cpu" && NF >= 9 {
+      t = 0; for (i = 2; i <= 9; i++) t += $i
+      n++; tot[n] = t; st[n] = $9
+    }
+    END {
+      if (n == 2 && tot[2] > tot[1] && st[2] >= st[1]) printf "%.1f\n", 100 * (st[2] - st[1]) / (tot[2] - tot[1])
+    }'
+}
+
+# Prints a reason when the idle-window steal time (results key steal_idle_pct, recorded in the
+# guest) exceeds RG_STEAL_MAX_PCT. Only idle windows are judged: throttling under the burst is
+# the shared-core host's behaviour under u7s's own load, which is what the gate measures. A
+# missing value judges nothing, like an unmeasured calibration.
+rg_steal_reason() {
+  local v
+  v="$(rg_get "$1" steal_idle_pct)"
+  [ -n "$v" ] || return 0
+  awk -v v="$v" -v max="$RG_STEAL_MAX_PCT" 'BEGIN {exit !(v ~ /^[0-9]+(\.[0-9]+)?$/ && v + 0 > max + 0)}' \
+    && echo "in-guest steal time ${v}% over the idle window > ${RG_STEAL_MAX_PCT}% (shared-core host contention)"
+  return 0
+}
+
 # Contention evidence for a run: $1 quiet.log, $2 results file. Empty output = none.
 rg_contention_reasons() {
   rg_quiet_log_reasons "$1"
   rg_cal_reason "$2"
+  rg_steal_reason "$2"
+}
+
+# Final status of one run on a Spot backend. $1 status from rg_run_status, $2 1 when the
+# instance was preempted. A PASS stays PASS; any other outcome of a reclaimed instance is
+# PREEMPTED, never FAIL or INVALID: the run was cut short by the platform, not judged.
+rg_apply_preemption() {
+  if [ "$1" != PASS ] && [ "$2" = 1 ]; then echo PREEMPTED; else echo "$1"; fi
 }
 
 # PASS / FAIL / INVALID for one run. $1 verdict exit code, $2 quiet.log, $3 results file.
