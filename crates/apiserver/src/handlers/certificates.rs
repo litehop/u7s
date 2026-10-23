@@ -1,5 +1,5 @@
-//! Dedicated create-validation for certificates.k8s.io ClusterTrustBundle (v1 and v1beta1)
-//! and PodCertificateRequest (v1 and v1beta1).
+//! Dedicated create-validation for certificates.k8s.io ClusterTrustBundle
+//! and PodCertificateRequest.
 //!
 //! Both types are pure CRUD surfaces here (no signer/controller logic — a real signer
 //! implementation is a separate, later piece of work). Validation on create matters
@@ -359,8 +359,6 @@ const MAX_CERTIFICATE_CHAIN_SIZE: usize = 100 * 1024;
 const MAX_USER_ANNOTATIONS_SIZE: usize = 256 * 1024;
 const MAX_UID_LENGTH: usize = 128;
 
-const API_VERSION_V1: &str = "certificates.k8s.io/v1";
-
 /// Validate a PodCertificateRequest `spec`, mirroring upstream's
 /// `ValidatePodCertificateRequestCreate` (pkg/apis/certificates/validation/validation.go),
 /// returning 422 on any violation. Run on every write path that can set `spec` (create, PUT,
@@ -448,78 +446,32 @@ pub(crate) fn validate_pod_certificate_request_spec(
 
     validate_max_expiration_seconds(&spec)?;
 
-    let v1 = body["apiVersion"].as_str() == Some(API_VERSION_V1);
-    validate_pod_certificate_request_keys(&spec, v1).map_err(Status::unprocessable_entity)
+    validate_pod_certificate_request_keys(&spec).map_err(Status::unprocessable_entity)
 }
 
-/// `spec` key material: exactly one of `stubPKCS10Request` or (v1beta1 only)
-/// `pkixPublicKey` + `proofOfPossession`, each within its size limit and using a supported
-/// key type. v1 dropped the deprecated pair, so a v1 body carrying either is rejected rather
-/// than silently stored.
-fn validate_pod_certificate_request_keys(
-    spec: &PodCertificateRequestSpec,
-    v1: bool,
-) -> Result<(), String> {
+/// `spec.stubPKCS10Request`: a valid, self-signed PKCS#10 CSR within its size limit using a
+/// supported key type. The CSR signature is the only proof the requester holds the key.
+fn validate_pod_certificate_request_keys(spec: &PodCertificateRequestSpec) -> Result<(), String> {
     use base64::Engine as _;
-    let decode = |field: &str, v: &Option<String>| -> Result<Vec<u8>, String> {
-        let raw = v.as_deref().unwrap_or("");
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(raw)
-            .map_err(|_| format!("spec.{field}: Invalid value: must be base64-encoded"))?;
-        if bytes.len() > MAX_KEY_MATERIAL_SIZE {
-            return Err(format!(
-                "spec.{field}: Too long: may not be more than {MAX_KEY_MATERIAL_SIZE} bytes"
-            ));
-        }
-        Ok(bytes)
-    };
-    let stub = decode("stubPKCS10Request", &spec.stub_pkcs10_request)?;
-    let pkix = decode("pkixPublicKey", &spec.pkix_public_key)?;
-    let pop = decode("proofOfPossession", &spec.proof_of_possession)?;
-
-    if v1 && (!pkix.is_empty() || !pop.is_empty()) {
-        return Err(
-            "spec: pkixPublicKey and proofOfPossession are not part of certificates.k8s.io/v1; \
-             use stubPKCS10Request"
-                .into(),
-        );
+    let stub = base64::engine::general_purpose::STANDARD
+        .decode(spec.stub_pkcs10_request.as_deref().unwrap_or(""))
+        .map_err(|_| "spec.stubPKCS10Request: Invalid value: must be base64-encoded".to_string())?;
+    if stub.len() > MAX_KEY_MATERIAL_SIZE {
+        return Err(format!(
+            "spec.stubPKCS10Request: Too long: may not be more than {MAX_KEY_MATERIAL_SIZE} bytes"
+        ));
     }
-
-    match (!stub.is_empty(), !pkix.is_empty(), !pop.is_empty()) {
-        (true, false, false) => {
-            let req = x509_cert::request::CertReq::from_der(&stub).map_err(|_| {
-                "spec.stubPKCS10Request: Invalid value: must be a valid PKCS#10 CSR".to_string()
-            })?;
-            let kind = validate_spki_key_type(&req.info.public_key)
-                .map_err(|e| format!("spec.stubPKCS10Request: Invalid value: {e}"))?;
-            verify_csr_signature(&req, kind)
-                .then_some(())
-                .ok_or_else(|| {
-                    "spec.stubPKCS10Request: Invalid value: invalid signature".to_string()
-                })
-        }
-        (false, true, true) => {
-            let spki =
-                x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(&pkix).map_err(|_| {
-                    "spec.pkixPublicKey: Invalid value: must be a valid PKIX-serialized public key"
-                        .to_string()
-                })?;
-            let kind = validate_spki_key_type(&spki)
-                .map_err(|e| format!("spec.pkixPublicKey: Invalid value: {e}"))?;
-            verify_pod_uid_proof_of_possession(&spki, kind, spec.pod_uid.as_bytes(), &pop)
-                .then_some(())
-                .ok_or_else(|| {
-                    "spec.proofOfPossession: Invalid value: could not verify \
-                     proof-of-possession signature"
-                        .to_string()
-                })
-        }
-        _ => Err(
-            "spec: Invalid value: exactly one of (stubPKCS10Request) or (pkixPublicKey, \
-             proofOfPossession) must be set"
-                .into(),
-        ),
+    if stub.is_empty() {
+        return Err("spec.stubPKCS10Request: Required value".to_string());
     }
+    let req = x509_cert::request::CertReq::from_der(&stub).map_err(|_| {
+        "spec.stubPKCS10Request: Invalid value: must be a valid PKCS#10 CSR".to_string()
+    })?;
+    let kind = validate_spki_key_type(&req.info.public_key)
+        .map_err(|e| format!("spec.stubPKCS10Request: Invalid value: {e}"))?;
+    verify_csr_signature(&req, kind)
+        .then_some(())
+        .ok_or_else(|| "spec.stubPKCS10Request: Invalid value: invalid signature".to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -569,87 +521,6 @@ fn validate_spki_key_type(
         }
         _ => Err("unknown public key type; supported types are Ed25519, ECDSA, and RSA".into()),
     }
-}
-
-/// v1beta1 proof of possession: the requester signs `spec.podUID` with the private key behind
-/// `pkixPublicKey` (Ed25519 pure; ECDSA over SHA-256 of the UID, ASN.1 signature; RSA-PSS
-/// SHA-256). Without it a requester could name a public key it does not hold.
-fn verify_pod_uid_proof_of_possession(
-    spki: &x509_cert::spki::SubjectPublicKeyInfoOwned,
-    kind: KeyKind,
-    pod_uid: &[u8],
-    signature: &[u8],
-) -> bool {
-    use aws_lc_rs::signature as sig;
-    let alg: &'static dyn sig::VerificationAlgorithm = match kind {
-        KeyKind::Ed25519 => &sig::ED25519,
-        KeyKind::EcP256 => &sig::ECDSA_P256_SHA256_ASN1,
-        KeyKind::EcP384 => &sig::ECDSA_P384_SHA256_ASN1,
-        KeyKind::EcP521 => &sig::ECDSA_P521_SHA256_ASN1,
-        KeyKind::Rsa => {
-            return verify_rsa_pss_sha256(spki.subject_public_key.raw_bytes(), pod_uid, signature)
-        }
-    };
-    sig::UnparsedPublicKey::new(alg, spki.subject_public_key.raw_bytes())
-        .verify(pod_uid, signature)
-        .is_ok()
-}
-
-/// RSASSA-PSS (SHA-256, MGF1-SHA-256) verification accepting any salt length, like Go's
-/// `rsa.VerifyPSS` with nil options. Go's `SignPSS` with nil options uses the largest salt,
-/// which fixed-salt verifiers (aws-lc-rs, ring) reject.
-fn verify_rsa_pss_sha256(pkcs1_public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
-    use rsa::{pkcs1::DecodeRsaPublicKey as _, traits::PublicKeyParts as _, BigUint};
-    use sha2::{Digest as _, Sha256};
-    const H_LEN: usize = 32;
-
-    let Ok(key) = rsa::RsaPublicKey::from_pkcs1_der(pkcs1_public_key) else {
-        return false;
-    };
-    let k = key.size();
-    let s = BigUint::from_bytes_be(signature);
-    if signature.len() != k || s >= *key.n() {
-        return false;
-    }
-    let m = s.modpow(key.e(), key.n()).to_bytes_be();
-    let mut em_full = vec![0u8; k - m.len()];
-    em_full.extend_from_slice(&m);
-
-    let em_bits = key.n().bits() - 1;
-    let em_len = em_bits.div_ceil(8);
-    let em = &em_full[k - em_len..];
-    if em_len < H_LEN + 2 || em[em_len - 1] != 0xbc {
-        return false;
-    }
-    let (masked_db, h) = em[..em_len - 1].split_at(em_len - H_LEN - 1);
-    let unused_bits = 8 * em_len - em_bits;
-    if masked_db[0] & 0xffu8.checked_shl(8 - unused_bits as u32).unwrap_or(0) != 0 {
-        return false;
-    }
-
-    let mut db = masked_db.to_vec();
-    for (counter, chunk) in db.chunks_mut(H_LEN).enumerate() {
-        let mask = Sha256::new()
-            .chain_update(h)
-            .chain_update((counter as u32).to_be_bytes())
-            .finalize();
-        chunk.iter_mut().zip(mask).for_each(|(b, m)| *b ^= m);
-    }
-    db[0] &= 0xffu8 >> unused_bits;
-
-    let Some(sep) = db.iter().position(|&b| b != 0) else {
-        return false;
-    };
-    if db[sep] != 0x01 {
-        return false;
-    }
-    let salt = &db[sep + 1..];
-    let expected = Sha256::new()
-        .chain_update([0u8; 8])
-        .chain_update(Sha256::digest(message))
-        .chain_update(salt)
-        .finalize();
-    expected.as_slice() == h
 }
 
 /// The stub CSR's self-signature must verify under its own public key, as upstream's
@@ -1016,23 +887,13 @@ fn validate_issued_pcr_status(
         }
     }
 
-    let spec = &old["spec"];
-    let b64 = |field: &str| {
-        base64::engine::general_purpose::STANDARD
-            .decode(spec[field].as_str().unwrap_or(""))
-            .unwrap_or_default()
-    };
-    let stub = b64("stubPKCS10Request");
-    let want_spki = if !stub.is_empty() {
-        x509_cert::request::CertReq::from_der(&stub)
-            .map_err(|_| "spec.stubPKCS10Request: Invalid value: must be a valid PKCS#10 CSR")?
-            .info
-            .public_key
-    } else {
-        x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(&b64("pkixPublicKey")).map_err(
-            |_| "spec.pkixPublicKey: Invalid value: must be a valid PKIX-serialized public key",
-        )?
-    };
+    let stub = base64::engine::general_purpose::STANDARD
+        .decode(old["spec"]["stubPKCS10Request"].as_str().unwrap_or(""))
+        .unwrap_or_default();
+    let want_spki = x509_cert::request::CertReq::from_der(&stub)
+        .map_err(|_| "spec.stubPKCS10Request: Invalid value: must be a valid PKCS#10 CSR")?
+        .info
+        .public_key;
     let spki_der = |s: &x509_cert::spki::SubjectPublicKeyInfoOwned| s.to_der().ok();
     if spki_der(&want_spki) != spki_der(leaf.tbs_certificate().subject_public_key_info()) {
         return Err(
@@ -1076,7 +937,7 @@ fn validate_issued_pcr_status(
             "status.certificateChain: Invalid value: {lifetime}s: leaf certificate lifetime must be >= 1 hour"
         ));
     }
-    let max = spec["maxExpirationSeconds"].as_i64().unwrap_or(0);
+    let max = old["spec"]["maxExpirationSeconds"].as_i64().unwrap_or(0);
     if lifetime > max {
         return Err(format!(
             "status.certificateChain: Invalid value: {lifetime}s: leaf certificate lifetime must be <= spec.maxExpirationSeconds ({max})"
@@ -1579,7 +1440,7 @@ mod tests {
         let state = make_state();
         let pem = valid_cert_pem();
         let body = serde_json::json!({
-            "apiVersion": "certificates.k8s.io/v1beta1",
+            "apiVersion": "certificates.k8s.io/v1",
             "kind": "ClusterTrustBundle",
             "metadata": {"name": "example-bundle"},
             "spec": {"trustBundle": pem}
@@ -1587,7 +1448,7 @@ mod tests {
 
         let result = create_cluster_trust_bundle(
             State(state.clone()),
-            Path("v1beta1".to_string()),
+            Path("v1".to_string()),
             Query(CreateQuery::default()),
             Extension(test_user()),
             json_headers(),
@@ -1627,14 +1488,14 @@ mod tests {
             ("example.com:b:bundle-b", "example.com/b"),
         ] {
             let body = serde_json::json!({
-                "apiVersion": "certificates.k8s.io/v1beta1",
+                "apiVersion": "certificates.k8s.io/v1",
                 "kind": "ClusterTrustBundle",
                 "metadata": {"name": name},
                 "spec": {"signerName": signer, "trustBundle": pem}
             });
             create_cluster_trust_bundle(
                 State(state.clone()),
-                Path("v1beta1".to_string()),
+                Path("v1".to_string()),
                 Query(CreateQuery::default()),
                 Extension(test_user()),
                 json_headers(),
@@ -1646,7 +1507,7 @@ mod tests {
 
         let resp = list_cluster_trust_bundles(
             State(state),
-            Path("v1beta1".to_string()),
+            Path("v1".to_string()),
             Query(CollectionQuery {
                 watch: None,
                 resource_version: None,
@@ -1772,25 +1633,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clustertrustbundle_v1_create_is_served_because_ga_clients_use_v1() {
+    async fn certificates_v1beta1_is_not_served_because_upstream_disables_it_by_default() {
         let state = make_state();
-        let body = serde_json::json!({
-            "apiVersion": "certificates.k8s.io/v1",
+        let ctb = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1beta1",
             "kind": "ClusterTrustBundle",
-            "metadata": {"name": "v1-bundle", "labels": {"k": "v"}},
+            "metadata": {"name": "beta-bundle"},
             "spec": {"trustBundle": valid_cert_pem()}
         });
-        let resp = create_cluster_trust_bundle(
+        let err = create_cluster_trust_bundle(
             State(state.clone()),
-            Path("v1".to_string()),
+            Path("v1beta1".to_string()),
             Query(CreateQuery::default()),
             Extension(test_user()),
             json_headers(),
-            Bytes::from(serde_json::to_vec(&body).unwrap()),
+            Bytes::from(serde_json::to_vec(&ctb).unwrap()),
         )
         .await
-        .unwrap_or_else(|e| panic!("v1 create must succeed, got status {}", e.0));
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        .expect_err("v1beta1 ClusterTrustBundle create must not be served");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let pcr = pcr_object("v1beta1", "beta-pcr", valid_pcr_spec());
+        let err = create_pod_certificate_request(
+            State(state),
+            Path(("v1beta1".to_string(), "default".to_string())),
+            Query(CreateQuery::default()),
+            Extension(test_user()),
+            json_headers(),
+            Bytes::from(serde_json::to_vec(&pcr).unwrap()),
+        )
+        .await
+        .expect_err("v1beta1 PodCertificateRequest create must not be served");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
     /// A name that carries the signer prefix but has a segment the by-name read path rejects
@@ -2016,7 +1890,7 @@ mod tests {
     ) {
         let state = make_state();
         let body = serde_json::json!({
-            "apiVersion": "certificates.k8s.io/v1beta1",
+            "apiVersion": "certificates.k8s.io/v1",
             "kind": "PodCertificateRequest",
             "metadata": {"name": "req-1"},
             "spec": valid_pcr_spec(),
@@ -2027,7 +1901,7 @@ mod tests {
 
         let result = create_pod_certificate_request(
             State(state.clone()),
-            Path(("v1beta1".to_string(), "default".to_string())),
+            Path(("v1".to_string(), "default".to_string())),
             Query(CreateQuery::default()),
             Extension(test_user()),
             json_headers(),
@@ -2769,40 +2643,16 @@ mod tests {
     }
 
     #[test]
-    fn spec_validation_requires_exactly_one_supported_key_source() {
+    fn spec_validation_requires_a_valid_stub_csr() {
         use base64::Engine as _;
         let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
         let v1 = "certificates.k8s.io/v1";
-        let beta = "certificates.k8s.io/v1beta1";
-        let (key, csr) = stub_csr();
-        let pkix = b64(&rcgen::PublicKeyData::subject_public_key_info(&key));
 
         let mut none = valid_pcr_spec();
         none.as_object_mut().unwrap().remove("stubPKCS10Request");
-        assert!(spec_error(none, v1).unwrap().contains("exactly one"));
-
-        let mut both = pcr_spec(&csr);
-        both["pkixPublicKey"] = pkix.clone().into();
-        both["proofOfPossession"] = b64(b"sig").into();
-        assert!(spec_error(both, beta).unwrap().contains("exactly one"));
-
-        let mut pkix_only = valid_pcr_spec();
-        pkix_only
-            .as_object_mut()
-            .unwrap()
-            .remove("stubPKCS10Request");
-        pkix_only["pkixPublicKey"] = pkix.clone().into();
         assert!(
-            spec_error(pkix_only, beta).unwrap().contains("exactly one"),
-            "pkixPublicKey without proofOfPossession proves nothing about key ownership"
-        );
-
-        let (ed_spki, ed_sig) = ed25519_pop(POP_UID);
-        let beta_pair = beta_pop_spec(&ed_spki, &ed_sig);
-        assert!(spec_error(beta_pair.clone(), beta).is_none());
-        assert!(
-            spec_error(beta_pair, v1).unwrap().contains("v1"),
-            "v1 dropped pkixPublicKey; accepting it would store a field the version does not define"
+            spec_error(none, v1).unwrap().contains("Required value"),
+            "v1 has no other key source, so a request without a CSR proves no key ownership"
         );
 
         let mut garbage = valid_pcr_spec();
@@ -3102,137 +2952,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PodCertificateRequest: CSR signature and proof of possession
+    // PodCertificateRequest: CSR signature
     // -----------------------------------------------------------------------
-
-    const POP_UID: &str = "0f5c9c7e-1d0a-4f7e-9d63-2f1f6a1b7c11";
-
-    // openssl-generated: SPKI plus a signature over SHA-256(POP_UID), the digest upstream's
-    // `ecdsa.VerifyASN1` / `rsa.VerifyPSS` receive. P-384/P-521 cannot be produced with
-    // aws-lc-rs signing (it pairs each curve with one fixed hash).
-    const P384_SPKI: &str = "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEj+FInaO73abswF2/W+HffIGNYlBPFDk1g3nCy48/Ro4mz/upDyi7WEXqmZ5nuSGxhd4R5BpYNbTFq7kH5SQjpv1qaSLIccDyFJao9kIFurMc5a1onxxgO4YRaKm1Az6c";
-    const P384_SIG: &str = "MGQCMHEJ/owwvc275m020AsYyBOz8Ws3DRZZ4DBg6QfHNzR/kQg6hcGT+NQIr/MVhZHQdgIwPRCt4rP87MwNueQomKISYWggzMcapxdvVXfWO1/amPWQht+qhkU4IV5Y1FLBKlvY";
-    const P521_SPKI: &str = "MIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQAZo3LFJWWPVUbRmrnaRy7Ckd6+MablNmUpZggZzyFamV4AT4a4WtSf0r6fbVuybFQy4Tw4pK25XAGb8/oDGpWygcBOW2ROZ575dB99xH97Qg2g1iVNxKQfxNDURklgCwZ7naX/5F3rbfMBcpRBuXNClmFVL2IivL1lj74H/Y3wAR9qN8=";
-    const P521_SIG: &str = "MIGHAkIBnDV+pWMVdHagYyvYZBrZDluKJSnVn1pCV3qOPuFjYQJoPtceF5sYNe4v/TuPpSNwH76SS+53o1qwazzG24SFIAICQQMRQKouljxHnM6MxHPgBP9V5nkGRuPTSq0sNUnuKiFVz5BxAnxDXMH/VZ0oebEC3LU+6mIetIRodj90IMRw+hsF";
-    const RSA_SPKI: &str = "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA0XYJKCc89ZG1adq4GpJ/e1ZMpQNQastWGPCQjsqibOte/fzd8hy1UQhdkU5OmRo8t6K47HKIO0kCl/s3vzHcYvXtHcFtX6umvyuNvl0XuCAqLH8HtG3goG/z8mrMsYkWK4++lnFN4bnGcYd/8TC/BPHaMFpcgiuhv0ZyLAIWHPpCz4+zp5MajOf2Pfl1P+EYxWMcsoMMkV4HLT4r/QSidGpx4ruRrN7/ZKcIJ8kZJK0av81ab2LyzbgHIDr583fEggZWLZLNduO3tZUoeMYJen5O799z/LbDCk2ENHSy7AYdgYjoRUyTPx+NHJrPHNCyMPVrzT9TfGvWnf1Uq2FfzV3QLAShsoU7XCPyzdOLv7ZQUyO0hsbzuVKXKLjnzVkcfncJZDn1fIzPG/A0eO+4qU2TZvABzz66zo7Nc4KPivMky3zpME1wEqn8h3k3BYbEZUfaguJVEZuAH2fF9mRZHUIJJZd/U8Bukb6/6054lVUAsRRSSaluBNj8wEW5cj0pAgMBAAE=";
-    const RSA_SIG_DIGEST_SALT: &str = "n9oykFoQz7o0ZIe9m8KydKhLw4e3o/o3aQuijpFZ18zLCGpwUbBzMBkTH2vqQCNn3cIiK2VoFIWCvrwZ77Vx1qRHM+KzcE5m112jCgICISxDQbtruLlj59kD1t0d03cQ+5CSs8unN3bfbVI1cSrRTeV+ztWAI+PYp80gs9uGTRLMzW9NQO0o14v6hQVytYhYIFKUTOYXPvMGwix73qcnXrdS/bTFcUKcId9LdfQ0ygIe5tgJGQGjiZAjMHtcPIW6oV8aezFCAAeiRy5Qsq10tQ9Nt73Bk56Lm+fCQyWVafv/mz+e7WLCkg/p3y1HUSe07ujyKVgRRep6FKa3jIFojMj3Xhfy8k6x487f7lcWKBGgFgGJ09mV70WmhkXGXWhJRBfHzjt0LHv/9jxB+zYoGuNiO+vl5Q1FgWt3475ZiYubj4+zSvdVMKXay+9iHmZncipX1dqtsLiJGlxDebwTYSqUoYqtTo5UtTHHQfE1mqV1sE3OfDffch2AuWcKn04g";
-    // Salt as large as the key allows: what Go's `rsa.SignPSS` with nil options (kubelet) emits.
-    const RSA_SIG_MAX_SALT: &str = "afPhAxRhCVd4jP5MkR4TBaiekjVrWE8pl0WWBxYrDNDBXet5tJM4R9AJEV4Z2Y1of7IQOK9EW3O7GPkG2I8nJmlPEkQxurvr1Sj7pw37NcS41vlf5FdF78XJU5dfRiIw1a8cwUoR4DYPj7lF2fGGyHMPmv3K7ovb19WX6S7I7CJ+acKd2A6F2sGzmomzLxiMolDkbRuo1Jfg5wqH3TlZCzaQYM65qIsl2rj3KTWSGfIuEYnJdF+mHnClqTbl4mH7o1eECrAAI4DIFxZ2zFMSkKWekQrhDrlEE0DQlwxHJ8bpjxd+ksYqujhgPIEJLilR/VVSdLXfdHC6kKaRoVyiQJgSoMKcEKFGBXUnp5326/19Wh+yiNYQGfdzwH2sSxi/FB1Sgi4KWqnrmz5J0cUlJol7Q6T85tmPoAjIUa7Gg5sBpyi1C9lAeHj1rvZRnoziHFeiqGTsnhGJsFD5DGcfSfY3WcyAejxMz5PTpDERhtfG7sSpJ6Szg9XsGeW3ha6g";
-
-    fn b64_decode(s: &str) -> Vec<u8> {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
-    }
 
     fn b64_encode(b: &[u8]) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(b)
-    }
-
-    /// A v1beta1 spec using `pkixPublicKey` + `proofOfPossession` for `POP_UID`.
-    fn beta_pop_spec(spki: &[u8], sig: &[u8]) -> serde_json::Value {
-        let mut spec = valid_pcr_spec();
-        let map = spec.as_object_mut().unwrap();
-        map.remove("stubPKCS10Request");
-        spec["podUID"] = POP_UID.into();
-        spec["pkixPublicKey"] = b64_encode(spki).into();
-        spec["proofOfPossession"] = b64_encode(sig).into();
-        spec
-    }
-
-    fn ed25519_pop(uid: &str) -> (Vec<u8>, Vec<u8>) {
-        use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
-        let pair = Ed25519KeyPair::generate().unwrap();
-        let mut spki = vec![
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ];
-        spki.extend_from_slice(pair.public_key().as_ref());
-        (spki, pair.sign(uid.as_bytes()).as_ref().to_vec())
-    }
-
-    fn p256_pop(uid: &str) -> (Vec<u8>, Vec<u8>) {
-        use aws_lc_rs::{
-            rand::SystemRandom,
-            signature::{EcdsaKeyPair, KeyPair as _, ECDSA_P256_SHA256_ASN1_SIGNING},
-        };
-        let pair = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING).unwrap();
-        let mut spki = vec![
-            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
-            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
-        ];
-        spki.extend_from_slice(pair.public_key().as_ref());
-        let sig = pair.sign(&SystemRandom::new(), uid.as_bytes()).unwrap();
-        (spki, sig.as_ref().to_vec())
-    }
-
-    #[test]
-    fn proof_of_possession_is_accepted_for_every_supported_key_type_because_kubelet_signs_with_any_of_them(
-    ) {
-        let beta = "certificates.k8s.io/v1beta1";
-        let (ed_spki, ed_sig) = ed25519_pop(POP_UID);
-        let (p256_spki, p256_sig) = p256_pop(POP_UID);
-        let cases: [(&str, Vec<u8>, Vec<u8>); 6] = [
-            ("Ed25519", ed_spki, ed_sig),
-            ("ECDSA P-256", p256_spki, p256_sig),
-            ("ECDSA P-384", b64_decode(P384_SPKI), b64_decode(P384_SIG)),
-            ("ECDSA P-521", b64_decode(P521_SPKI), b64_decode(P521_SIG)),
-            (
-                "RSA-3072 PSS, digest-length salt",
-                b64_decode(RSA_SPKI),
-                b64_decode(RSA_SIG_DIGEST_SALT),
-            ),
-            (
-                "RSA-3072 PSS, maximum salt (Go default)",
-                b64_decode(RSA_SPKI),
-                b64_decode(RSA_SIG_MAX_SALT),
-            ),
-        ];
-        for (label, spki, sig) in cases {
-            assert_eq!(
-                spec_error(beta_pop_spec(&spki, &sig), beta),
-                None,
-                "{label}: a genuine proof of possession must be accepted or kubelet's pod hangs"
-            );
-        }
-    }
-
-    #[test]
-    fn requester_cannot_obtain_a_pod_cert_for_a_key_it_does_not_hold_because_proof_of_possession_must_verify(
-    ) {
-        let beta = "certificates.k8s.io/v1beta1";
-        let (victim_spki, _) = p256_pop(POP_UID);
-        let (_, attacker_sig) = p256_pop(POP_UID);
-        let err = spec_error(beta_pop_spec(&victim_spki, &attacker_sig), beta)
-            .expect("a signature from a different key must be rejected");
-        assert!(
-            err.contains("spec.proofOfPossession") && err.contains("could not verify"),
-            "got: {err}"
-        );
-
-        let (spki, sig_for_other_pod) = p256_pop("another-pod-uid");
-        assert!(
-            spec_error(beta_pop_spec(&spki, &sig_for_other_pod), beta).is_some(),
-            "a signature over another pod's UID must not be replayable for this pod"
-        );
-
-        let (ed_spki, ed_sig) = ed25519_pop(POP_UID);
-        let mut truncated = ed_sig.clone();
-        truncated.pop();
-        assert!(spec_error(beta_pop_spec(&ed_spki, &truncated), beta).is_some());
-        let mut rsa_garbage = b64_decode(RSA_SIG_DIGEST_SALT);
-        rsa_garbage[0] ^= 1;
-        assert!(
-            spec_error(beta_pop_spec(&b64_decode(RSA_SPKI), &rsa_garbage), beta).is_some(),
-            "a corrupted RSA-PSS signature must be rejected"
-        );
-        assert!(
-            spec_error(
-                beta_pop_spec(&b64_decode(P384_SPKI), &b64_decode(P521_SIG)),
-                beta
-            )
-            .is_some(),
-            "a P-521 signature must not verify under a P-384 key"
-        );
     }
 
     fn csr_with_subject(alg: &'static rcgen::SignatureAlgorithm, cn: &str) -> Vec<u8> {

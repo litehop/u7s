@@ -16,7 +16,7 @@ mod bootstrap_rbac;
 mod bootstrap_rbac_upstream;
 mod bootstrap_token;
 mod cert_expiry;
-mod certificates_v1beta1_gen_adapter;
+mod certificates_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
 mod core_gen_adapter;

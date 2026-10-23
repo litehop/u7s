@@ -162,11 +162,6 @@ fn status_codecs() -> &'static HashMap<(&'static str, &'static str), StatusCodec
             ("certificates.k8s.io/v1", "PodCertificateRequest"),
             codec::<PodCertificateRequestStatus>,
         );
-        // certificates.k8s.io/v1beta1
-        m.insert(
-            ("certificates.k8s.io/v1beta1", "PodCertificateRequest"),
-            codec::<PodCertificateRequestStatus>,
-        );
         // policy/v1
         m.insert(
             ("policy/v1", "PodDisruptionBudget"),
@@ -671,7 +666,7 @@ mod tests {
     }
 
     /// admissionregistration.k8s.io/v1 (ValidatingAdmissionPolicy(+Binding)),
-    /// resource.k8s.io/v1 (ResourceClaim, DeviceClass), certificates.k8s.io/v1beta1
+    /// resource.k8s.io/v1 (ResourceClaim, DeviceClass), certificates.k8s.io/v1
     /// (PodCertificateRequest). Binding and DeviceClass have no status fields upstream at
     /// all — both structs are `rest`-only, so this proves an all-`rest` struct still
     /// round-trips an arbitrary object body rather than rejecting it.
@@ -739,7 +734,7 @@ mod tests {
             "someFutureField": "pcr-x"
         });
         let decoded = decode_status_put(
-            "certificates.k8s.io/v1beta1",
+            "certificates.k8s.io/v1",
             "PodCertificateRequest",
             &pod_cert_req,
         )
