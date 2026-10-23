@@ -75,7 +75,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>]
+  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>] [--allow-service-external-ips]
   install.sh --mint-join-token
   install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 
@@ -93,6 +93,9 @@ Usage:
                          well-known auto-applied folder). An alternate path
                          leaves the well-known folder empty, for GitOps to
                          manage instead.
+  --allow-service-external-ips
+                         Omit the apiserver's --deny-service-external-ips, which
+                         by default rejects new/changed Service externalIPs.
   --mint-join-token     Run on an existing control-plane node: create a 24h
                          single-use join token and print the join command.
   --join <url>          Join an existing cluster at <url> (e.g. https://1.2.3.4:6443).
@@ -128,6 +131,7 @@ TARBALL_URL_EXPLICIT=0
 # Set by fetch_tarball; removed by the same EXIT trap as STAGE_DIR.
 DOWNLOAD_DIR=""
 MINT_JOIN_TOKEN=0
+ALLOW_SERVICE_EXTERNAL_IPS=0
 JOIN_SERVER=""
 JOIN_TOKEN=""
 CA_CERT_HASH=""
@@ -146,6 +150,7 @@ while [ $# -gt 0 ]; do
     --manifest-output-dir) MANIFEST_OUTPUT_DIR="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
     --tarball-url) TARBALL_URL="$2"; TARBALL_URL_EXPLICIT=1; shift 2 ;;
+    --allow-service-external-ips) ALLOW_SERVICE_EXTERNAL_IPS=1; shift ;;
     --mint-join-token) MINT_JOIN_TOKEN=1; shift ;;
     --join) JOIN_SERVER="$2"; shift 2 ;;
     --token) JOIN_TOKEN="$2"; shift 2 ;;
@@ -1544,7 +1549,7 @@ WorkingDirectory=$STATE_DIR
 # process rather than a separate u7s-scheduler binary+unit -- never also
 # start u7s-scheduler against this same cluster (see the retirement
 # block above this section for why: uncoordinated double-preemption).
-ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --embedded-scheduler true --deny-service-external-ips
+ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
 # SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.
