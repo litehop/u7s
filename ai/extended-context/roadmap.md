@@ -125,8 +125,7 @@ the MVP.
 Epic `mayor-qap3i`: audit run-1 (30 confirmed findings, 4 leads), filed
 2026-10-22. All four P1s landed (JSON Patch depth, mirror-pod references,
 encoded-route bypass, RoleBinding escalation) plus several P2s. Open P2s:
-`.43` (CEL absent-key fail-open), `.5` (read pool; per-scan budget is
-`.39`), `.25`, `.23`, `.15`, `.4`, `.35`, `.40`, `mayor-fg6oo`
+`.43` (CEL absent-key fail-open), `.25`, `.23`, `.15`, `.4`, `.35`, `.40`, `mayor-fg6oo`
 (Service externalIPs), `mayor-d07ct` (KCM wildcard identity).
 
 Audit log (`mayor-0qjgc`, P3): `audit.k8s.io` file backend, later.
