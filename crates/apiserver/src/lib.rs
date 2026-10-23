@@ -15,6 +15,7 @@ mod bootstrap_rbac;
 #[cfg(test)]
 mod bootstrap_rbac_upstream;
 mod bootstrap_token;
+mod cel_runtime;
 mod cert_expiry;
 mod certificates_gen_adapter;
 mod content_type;

@@ -745,7 +745,7 @@ fn go_printable(c: char) -> bool {
 }
 
 /// Go's `strconv.Quote`, which upstream's error messages use for string values.
-fn go_quote(s: &str) -> String {
+pub(crate) fn go_quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {
