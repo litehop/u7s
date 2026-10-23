@@ -820,22 +820,9 @@ pub(crate) async fn replace_pod<S: Store>(
         }
     }
 
-    // deletionTimestamp is server-owned, exactly like generation above: a protobuf-encoded PUT
-    // never round-trips this field (the wire decoder drops it — see the equivalent restoration
-    // in replace_resource/replace_namespaced_resource) and a JSON PUT built from a stale local
-    // copy can omit it too. Without restoring it here, the finalizer-drain check below would see
-    // a blank deletionTimestamp on an already-terminating pod and treat this PUT as a plain
-    // update, silently un-terminating it.
-    if obj.body["metadata"]["deletionTimestamp"].is_null() {
-        let stored_ts = stored_obj.body["metadata"]["deletionTimestamp"].clone();
-        if !stored_ts.is_null() {
-            obj.body["metadata"]["deletionTimestamp"] = stored_ts;
-            let stored_grace = stored_obj.body["metadata"]["deletionGracePeriodSeconds"].clone();
-            if !stored_grace.is_null() {
-                obj.body["metadata"]["deletionGracePeriodSeconds"] = stored_grace;
-            }
-        }
-    }
+    // deletionTimestamp/deletionGracePeriodSeconds are server-owned: pinned to the stored
+    // values so a PUT can neither un-terminate nor hard-delete a pod without the delete verb.
+    super::generic::pin_server_owned_deletion_fields(&mut obj.body, Some(&stored_obj.body));
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -1599,6 +1586,7 @@ pub(crate) async fn patch_pod<S: Store>(
         // cascade-GC decision for ReplicaSet/Job/DaemonSet controllers, for ANY patch type
         // (Merge, StrategicMerge, JSON Patch).
         let stored_uid = current_obj.body["metadata"]["uid"].clone();
+        let stored_deletion = super::generic::snapshot_deletion_fields(&current_obj.body);
 
         match patch_type {
             super::json_patch::PatchType::StrategicMerge => {
@@ -1622,6 +1610,10 @@ pub(crate) async fn patch_pod<S: Store>(
         }
         current_obj.body["status"] = stored_status.clone();
         current_obj.body["metadata"]["uid"] = stored_uid;
+        super::generic::pin_server_owned_deletion_fields(
+            &mut current_obj.body,
+            Some(&stored_deletion),
+        );
         super::json_patch::enforce_patch_identity(&mut current_obj.body, &name, Some(ns.as_str()))?;
 
         // Admission webhook pipeline (mutating then validating), threading the pre-patch

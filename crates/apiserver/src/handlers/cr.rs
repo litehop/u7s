@@ -798,6 +798,7 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     meta.generation = Some(1);
     meta.creation_timestamp = Some(utc_now_rfc3339());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
+    crate::handlers::generic::pin_server_owned_deletion_fields(obj, None);
 }
 
 /// Upstream `customResourceStrategy.PrepareForCreate`, run after mutating admission: forces
@@ -941,6 +942,7 @@ fn resolve_cr_metadata(
         incoming_meta.creation_timestamp = stored_meta.creation_timestamp;
     }
     incoming["metadata"] = serde_json::to_value(incoming_meta).unwrap_or_default();
+    crate::handlers::generic::pin_server_owned_deletion_fields(incoming, Some(stored));
     Ok(())
 }
 
@@ -3062,15 +3064,10 @@ pub async fn replace_cr<S: Store>(
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
+    crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
     let obj_meta: crate::types::ObjectMeta =
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&obj["metadata"])
             .unwrap_or_default();
-    let obj_name = obj_meta.name.as_deref().unwrap_or("").to_string();
-    if obj_name != name {
-        return Err(Status::bad_request(format!(
-            "the name of the object ({obj_name}) does not match the name on the URL ({name})"
-        )));
-    }
 
     let expected_revision = parse_resource_version(obj_meta.resource_version.as_deref())?;
 
@@ -4119,15 +4116,10 @@ pub async fn replace_cr_namespaced<S: Store>(
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
+    crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
     let obj_meta: crate::types::ObjectMeta =
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&obj["metadata"])
             .unwrap_or_default();
-    let obj_name = obj_meta.name.as_deref().unwrap_or("").to_string();
-    if obj_name != name {
-        return Err(Status::bad_request(format!(
-            "the name of the object ({obj_name}) does not match the name on the URL ({name})"
-        )));
-    }
 
     let expected_revision = parse_resource_version(obj_meta.resource_version.as_deref())?;
 
@@ -4908,6 +4900,7 @@ pub async fn patch_cr<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
+    crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj, Some(&old));
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
@@ -5251,6 +5244,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
+    crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj, Some(&old));
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
@@ -10558,6 +10552,39 @@ mod tests {
             incoming["metadata"]["creationTimestamp"], "2024-06-01T00:00:00Z",
             "creationTimestamp must be copied from stored into incoming"
         );
+    }
+
+    /// A CR PUT from a caller with only `update` must not carry its own deletionTimestamp onto
+    /// a live CR (hard-delete/terminate without the delete verb), nor erase the stored one.
+    #[test]
+    fn resolve_cr_metadata_pins_deletion_fields_to_stored() {
+        let stored = serde_json::json!({ "metadata": { "uid": "u" } });
+        let mut incoming = serde_json::json!({ "metadata": {
+            "deletionTimestamp": "2026-05-22T00:00:00Z", "deletionGracePeriodSeconds": 0 } });
+        resolve_cr_metadata(&stored, &mut incoming, "w", "Widget").unwrap();
+        assert!(incoming["metadata"]["deletionTimestamp"].is_null());
+        assert!(incoming["metadata"]["deletionGracePeriodSeconds"].is_null());
+
+        let stored = serde_json::json!({ "metadata": { "uid": "u",
+            "deletionTimestamp": "2026-01-01T00:00:00Z", "deletionGracePeriodSeconds": 5 } });
+        let mut incoming = serde_json::json!({ "metadata": {} });
+        resolve_cr_metadata(&stored, &mut incoming, "w", "Widget").unwrap();
+        assert_eq!(
+            incoming["metadata"]["deletionTimestamp"],
+            "2026-01-01T00:00:00Z"
+        );
+        assert_eq!(incoming["metadata"]["deletionGracePeriodSeconds"], 5);
+    }
+
+    /// A CR created with a client deletionTimestamp would be born Terminating (or, with no
+    /// finalizers, linger undeletable by the normal flow).
+    #[test]
+    fn stamp_cr_fields_clears_client_deletion_timestamp_on_create() {
+        let mut obj = serde_json::json!({ "metadata": {
+            "deletionTimestamp": "2026-05-22T00:00:00Z", "deletionGracePeriodSeconds": 0 } });
+        stamp_cr_fields(&mut obj, "example.io", "v1", "Widget");
+        assert!(obj["metadata"]["deletionTimestamp"].is_null());
+        assert!(obj["metadata"]["deletionGracePeriodSeconds"].is_null());
     }
 
     /// A PUT that carries a non-blank uid mismatching the stored one is identity forgery,

@@ -24,9 +24,9 @@ use super::field_selector::FieldSelector;
 use super::generic::{
     apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
     check_crb_escalation, check_rb_escalation, check_role_escalation, clear_create_status,
-    decode_continue, generate_name, lookup, parse_label_selector, resolve_valid_name,
-    stamp_metadata, store_err, validate_path_segment, wants_generate_name, CollectionQuery,
-    LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
+    decode_continue, generate_name, lookup, parse_label_selector, pin_server_owned_deletion_fields,
+    resolve_valid_name, stamp_metadata, store_err, validate_path_segment, wants_generate_name,
+    CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, is_dry_run_header,
@@ -844,10 +844,6 @@ pub(crate) async fn replace_resource<S: Store>(
         .as_str()
         .map(str::is_empty)
         .unwrap_or(true);
-    // deletionTimestamp is also server-owned (see stored_deletion_timestamp below): a client
-    // whose PUT body omits it — including a protobuf-content-type PUT, since the wire decoder
-    // never emits this field — must not be trusted as "not being deleted".
-    let incoming_deletion_timestamp_blank = obj.body["metadata"]["deletionTimestamp"].is_null();
     // Always read the stored object on a PUT: even when the incoming uid is non-blank, it
     // must be compared against the stored uid below (see stored_uid mismatch check) —
     // metadata.uid is immutable identity, not just something to fill in when absent.
@@ -855,8 +851,6 @@ pub(crate) async fn replace_resource<S: Store>(
     let (
         stored_status,
         stored_uid,
-        stored_deletion_timestamp,
-        stored_deletion_grace,
         pv_spec_before_replace,
         storageclass_before_replace,
         node_before_replace,
@@ -903,12 +897,6 @@ pub(crate) async fn replace_resource<S: Store>(
         // stored object in hand so a blind PUT that omits it can be defended against,
         // mirroring replace_namespaced_resource's restoration of a blank incoming UID.
         let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
-        let deletion_timestamp = parsed
-            .as_ref()
-            .map(|v| v["metadata"]["deletionTimestamp"].clone());
-        let deletion_grace = parsed
-            .as_ref()
-            .map(|v| v["metadata"]["deletionGracePeriodSeconds"].clone());
         // Captured pre-`apply_defaults` (below), mirroring pvc_spec_before_replace in
         // replace_namespaced_resource: the stored spec was defaulted at create time, so the
         // comparison below (after apply_defaults runs on the incoming body) must compare two
@@ -930,15 +918,13 @@ pub(crate) async fn replace_resource<S: Store>(
         (
             status,
             uid,
-            deletion_timestamp,
-            deletion_grace,
             pv_spec_before_replace,
             storageclass_before_replace,
             node_before_replace,
             parsed,
         )
     } else {
-        (None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None)
     };
 
     // UID is immutable; a client's blind PUT (built from a locally-held copy that never
@@ -981,14 +967,7 @@ pub(crate) async fn replace_resource<S: Store>(
     // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
     // of completing the delete — persisting the object with deletionTimestamp gone and
     // finalizers empty, i.e. silently resurrecting it as a normal live object.
-    if incoming_deletion_timestamp_blank {
-        if let Some(ts) = stored_deletion_timestamp.as_ref().filter(|v| !v.is_null()) {
-            obj.body["metadata"]["deletionTimestamp"] = ts.clone();
-            if let Some(grace) = stored_deletion_grace.as_ref().filter(|v| !v.is_null()) {
-                obj.body["metadata"]["deletionGracePeriodSeconds"] = grace.clone();
-            }
-        }
-    }
+    pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
 
     if old_object.is_none() && !allows_create_on_update(&group, &plural) {
         return Err(Status::not_found(&group, &plural, &name));
@@ -1790,9 +1769,11 @@ pub(crate) async fn do_patch<S: Store>(
                 } else {
                     None
                 };
+                let stored_deletion = super::generic::snapshot_deletion_fields(&current.body);
                 crate::patch::strategic_merge_patch_ssa(&mut current.body, &patch)
                     .map_err(Status::patch_error)?;
                 race_plan.remove_dropped_fields(&mut current.body);
+                pin_server_owned_deletion_fields(&mut current.body, Some(&stored_deletion));
                 super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
                 restore_or_strip_status(
                     meta.has_status_subresource,
@@ -2169,6 +2150,7 @@ pub(crate) async fn do_patch<S: Store>(
         // different uid ⇒ different object" recreate-detection — see stamp_metadata (create)
         // and replace_resource's uid-mismatch check (PUT) for the other two mutation paths.
         let stored_uid = current.body["metadata"]["uid"].clone();
+        let stored_deletion = super::generic::snapshot_deletion_fields(&current.body);
 
         match patch_type {
             PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
@@ -2189,6 +2171,7 @@ pub(crate) async fn do_patch<S: Store>(
             plan.remove_dropped_fields(&mut current.body);
         }
         current.body["metadata"]["uid"] = stored_uid;
+        pin_server_owned_deletion_fields(&mut current.body, Some(&stored_deletion));
         super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
 
         restore_or_strip_status(
@@ -4001,10 +3984,6 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // Secrets/ConfigMaps, (b) generation tracking on workload resources and EndpointSlice,
     // (c) status restoration when the resource has a dedicated status subresource, and
     // (d) UID restoration (see stored_uid below) whenever we already have this object in hand.
-    // deletionTimestamp is also server-owned (see stored_deletion_timestamp below): a client
-    // whose PUT body omits it — including a protobuf-content-type PUT, since the wire decoder
-    // never emits this field — must not be trusted as "not being deleted".
-    let incoming_deletion_timestamp_blank = obj.body["metadata"]["deletionTimestamp"].is_null();
     let is_pvc = group.is_empty() && plural == "persistentvolumeclaims";
     let is_service = group.is_empty() && plural == "services";
     // Always read the stored object on a PUT: even when the incoming uid is non-blank, it
@@ -4019,8 +3998,6 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         stored_generation,
         stored_uid,
         eps_before_replace,
-        stored_deletion_timestamp,
-        stored_deletion_grace,
         object_existed,
         old_object,
     ) = if needs_stored_read {
@@ -4135,12 +4112,6 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         } else {
             None
         };
-        let deletion_timestamp = parsed
-            .as_ref()
-            .map(|v| v["metadata"]["deletionTimestamp"].clone());
-        let deletion_grace = parsed
-            .as_ref()
-            .map(|v| v["metadata"]["deletionGracePeriodSeconds"].clone());
         (
             spec,
             pvc_spec_before_replace,
@@ -4149,15 +4120,11 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             generation,
             uid,
             eps_before,
-            deletion_timestamp,
-            deletion_grace,
             parsed.is_some(),
             parsed,
         )
     } else {
-        (
-            None, None, None, None, None, None, None, None, None, false, None,
-        )
+        (None, None, None, None, None, None, None, false, None)
     };
 
     if !object_existed && !allows_create_on_update(&group, &plural) {
@@ -4223,14 +4190,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
     // of completing the delete — persisting the object with deletionTimestamp gone and
     // finalizers empty, i.e. silently resurrecting it as a normal live object.
-    if incoming_deletion_timestamp_blank {
-        if let Some(ts) = stored_deletion_timestamp.as_ref().filter(|v| !v.is_null()) {
-            obj.body["metadata"]["deletionTimestamp"] = ts.clone();
-            if let Some(grace) = stored_deletion_grace.as_ref().filter(|v| !v.is_null()) {
-                obj.body["metadata"]["deletionGracePeriodSeconds"] = grace.clone();
-            }
-        }
-    }
+    pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
 
     // Allocate a clusterIP when a Service transitions away from ExternalName to a
     // cluster-routed type (ClusterIP, NodePort, LoadBalancer).  The create path
@@ -13046,6 +13006,179 @@ mod tests {
              leaves a PVC/VAC-style finalizer-drain PUT stuck as a live object with no \
              deletionTimestamp whenever the request used protobuf content-type"
         );
+    }
+
+    async fn deletion_guard_state() -> (
+        std::sync::Arc<u7s_store::SqliteStore>,
+        crate::state::AppState<u7s_store::SqliteStore>,
+    ) {
+        let store = std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").expect("store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        (store, state)
+    }
+
+    async fn seed_lease(
+        store: &u7s_store::SqliteStore,
+        name: &str,
+        metadata_extra: serde_json::Value,
+    ) -> String {
+        let mut meta = serde_json::json!({"name": name, "namespace": "default"});
+        meta.as_object_mut()
+            .unwrap()
+            .extend(metadata_extra.as_object().unwrap().clone());
+        let obj = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+            "metadata": meta, "spec": {"holderIdentity": "h"}
+        });
+        let key = format!("/registry/coordination.k8s.io/leases/default/{name}");
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        key
+    }
+
+    async fn put_lease(
+        state: crate::state::AppState<u7s_store::SqliteStore>,
+        name: &str,
+        metadata: serde_json::Value,
+    ) {
+        use axum::extract::{Path, State};
+        let body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+            "metadata": metadata, "spec": {"holderIdentity": "h"}
+        });
+        replace_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "default".into(),
+                "leases".into(),
+                name.into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .expect("PUT must succeed (the server ignores the client's deletion fields)");
+    }
+
+    async fn patch_lease(
+        state: crate::state::AppState<u7s_store::SqliteStore>,
+        name: &str,
+        patch: serde_json::Value,
+    ) {
+        use axum::extract::{Path, State};
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        patch_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "default".into(),
+                "leases".into(),
+                name.into(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .expect("PATCH must succeed (the server ignores the client's deletion fields)");
+    }
+
+    /// A caller holding only `update` must not be able to hard-delete a finalizer-free object
+    /// by PUTting a deletionTimestamp: that would skip the delete verb, its admission
+    /// webhooks, preconditions and propagation policy.
+    #[tokio::test]
+    async fn put_with_client_deletion_timestamp_does_not_hard_delete_live_object() {
+        let (store, state) = deletion_guard_state().await;
+        let key = seed_lease(&store, "live", serde_json::json!({})).await;
+        put_lease(
+            state,
+            "live",
+            serde_json::json!({"name": "live", "namespace": "default",
+                "deletionTimestamp": "2026-05-22T00:00:00Z", "deletionGracePeriodSeconds": 0}),
+        )
+        .await;
+        let stored = store
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("an update-only PUT must never delete the object");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_null()
+                && v["metadata"]["deletionGracePeriodSeconds"].is_null(),
+            "a client-set deletionTimestamp must not be persisted on a live object: {v}"
+        );
+    }
+
+    /// A PATCH must not be able to un-terminate an object: a controller waiting on the
+    /// finalizer would otherwise see its deletion silently cancelled by any patcher.
+    #[tokio::test]
+    async fn patch_null_deletion_timestamp_does_not_un_terminate_object() {
+        let (store, state) = deletion_guard_state().await;
+        let key = seed_lease(
+            &store,
+            "dying",
+            serde_json::json!({"deletionTimestamp": "2026-05-22T00:00:00Z",
+                "deletionGracePeriodSeconds": 30, "finalizers": ["example.com/f"]}),
+        )
+        .await;
+        patch_lease(
+            state,
+            "dying",
+            serde_json::json!({"metadata": {"deletionTimestamp": null,
+                "deletionGracePeriodSeconds": null}}),
+        )
+        .await;
+        let v: serde_json::Value =
+            serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
+        assert_eq!(v["metadata"]["deletionTimestamp"], "2026-05-22T00:00:00Z");
+        assert_eq!(v["metadata"]["deletionGracePeriodSeconds"], 30);
+    }
+
+    /// A PATCH must not be able to start termination (or hard-delete when finalizers are
+    /// empty) without the delete verb.
+    #[tokio::test]
+    async fn patch_with_client_deletion_timestamp_does_not_terminate_or_delete_live_object() {
+        let (store, state) = deletion_guard_state().await;
+        let key = seed_lease(&store, "live2", serde_json::json!({})).await;
+        patch_lease(
+            state,
+            "live2",
+            serde_json::json!({"metadata": {"deletionTimestamp": "2026-05-22T00:00:00Z"}}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(
+            &store
+                .get(&key)
+                .await
+                .unwrap()
+                .expect("an update-only PATCH must never delete the object")
+                .value,
+        )
+        .unwrap();
+        assert!(v["metadata"]["deletionTimestamp"].is_null(), "{v}");
     }
 
     /// get_resource follows the CR fallback path for unregistered groups.
