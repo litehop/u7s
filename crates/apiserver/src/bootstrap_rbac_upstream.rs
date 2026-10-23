@@ -231,6 +231,8 @@ async fn every_service_account_kcm_runs_a_controller_as_is_bound_to_its_controll
 }
 
 /// Service accounts KCM 1.37 authenticates controllers as under the u7s `--controllers` set.
+/// `selinux-warning-controller` is absent on purpose: it is disabled by default and needs the
+/// SELinuxChangePolicy gate, so `--controllers=*` never starts it.
 const KCM_CONTROLLER_SERVICE_ACCOUNTS: &[&str] = &[
     "attachdetach-controller",
     "certificate-controller",

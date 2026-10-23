@@ -230,9 +230,6 @@ runs:
           sleep 1
         done
         nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$WORKDIR/apiserver.log"; exit 1; }
-        # Save the cert-based kubeconfig before overwriting with a token one
-        # below -- kube-controller-manager needs the cert-based identity.
-        cp "$WORKDIR/kubeconfig" "$WORKDIR/kubeconfig-cert"
         CA_FILE=$(awk '/certificate-authority:/ {print $2}' "$WORKDIR/kubeconfig")
         echo "E2E_TOKEN=$E2E_TOKEN" >> "$GITHUB_ENV"
         printf '%s\n' \

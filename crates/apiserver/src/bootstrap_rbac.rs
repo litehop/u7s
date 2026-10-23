@@ -295,6 +295,17 @@ fn legacy_rules(role: &str) -> Vec<Value> {
     }
 }
 
+/// A stored rule using `*` in groups, resources or verbs that the policy does not grant. The
+/// controller-manager's shared-identity role carried such a wildcard write; releases between
+/// the original and the current seed may have stored it in a slightly different shape than
+/// `legacy_rules` lists, so exact equality alone would leave it behind.
+fn is_wildcard_beyond(policy: &[Value], rule: &Value) -> bool {
+    ["apiGroups", "resources", "verbs"]
+        .iter()
+        .any(|k| strs(rule, k).contains(&"*"))
+        && !rules_cover(policy, rule)
+}
+
 /// Bootstrap ClusterRoles earlier releases seeded that the current policy no longer has.
 pub(crate) const LEGACY_CLUSTER_ROLES: &[&str] =
     &["system:controller:storage-version-garbage-collector"];
@@ -357,9 +368,13 @@ pub(crate) fn reconcile(existing: &Value, expected: &Value) -> Reconciled {
         } else {
             vec![]
         };
+        let kcm_drift_check = bootstrap
+            && expected["kind"] == "ClusterRole"
+            && expected["metadata"]["name"] == "system:kube-controller-manager";
         let have: Vec<Value> = list(existing, "rules")
             .iter()
             .filter(|r| !legacy.contains(r))
+            .filter(|r| !(kcm_drift_check && is_wildcard_beyond(list(expected, "rules"), r)))
             .cloned()
             .collect();
         let removed = list(existing, "rules").len() - have.len();
@@ -800,6 +815,46 @@ mod tests {
             if name != "system:kube-controller-manager" {
                 assert!(!grants(&obj["rules"], "bind") && !grants(&obj["rules"], "escalate"));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn drifted_kcm_wildcard_write_rule_is_removed_but_upstream_wildcard_read_stays() {
+        // A release between the original and current seed may have stored the wildcard write
+        // with different verbs; exact matching would leave KCM holding write-everything.
+        let store = SqliteStore::new(":memory:").unwrap();
+        crate::seed_rbac(&store).await.unwrap();
+        let name = "system:kube-controller-manager";
+        let (fresh, _) = stored(&store, &key("clusterroles", name)).await;
+        let drifted = [
+            json!({"apiGroups": ["*"], "resources": ["*"], "verbs": ["get","list","watch","patch","update","delete"]}),
+            json!({"apiGroups": ["apps"], "resources": ["*"], "verbs": ["*"]}),
+        ];
+        let operator =
+            json!({"apiGroups": ["example.com"], "resources": ["widgets"], "verbs": ["delete"]});
+        rewrite_role(&store, name, |o| {
+            let rules = o["rules"].as_array_mut().unwrap();
+            rules.extend(drifted.clone());
+            rules.push(operator.clone());
+        })
+        .await;
+
+        crate::seed_rbac(&store).await.unwrap();
+
+        let (obj, _) = stored(&store, &key("clusterroles", name)).await;
+        let got = obj["rules"].as_array().unwrap();
+        for rule in &drifted {
+            assert!(!got.contains(rule), "drifted wildcard {rule} survived");
+        }
+        assert!(
+            got.contains(&operator),
+            "non-wildcard operator rule must be kept"
+        );
+        for rule in fresh["rules"].as_array().unwrap() {
+            assert!(
+                got.contains(rule),
+                "upstream rule {rule} must not be stripped"
+            );
         }
     }
 
