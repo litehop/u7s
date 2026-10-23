@@ -371,21 +371,44 @@ rg_quiet_line 1 40 0 12 > "$TMP/q-own.log"
 assert "foreign load beyond the allowance still reads as contention" "$([ -n "$(rg_quiet_log_reasons "$TMP/q-own.log")" ] && echo 1 || echo 0)"
 
 # Marker write failure is a harness error.
-: > "$TMP/harness.env"
-rg_record_marker_write_failure "$TMP/harness.env" 1 1
-assert "marker write fails with mariadb-0 Ready and API up -> INVALID (the harness broke, not u7s)" \
-  "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/harness.env")" = INVALID ] && echo 1 || echo 0)"
-: > "$TMP/nopod.env"
-rg_record_marker_write_failure "$TMP/nopod.env" 0 1
-assert "mariadb-0 never Ready -> FAIL, a pod-start regression must not be laundered into INVALID" \
-  "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/nopod.env")" = FAIL ] && echo 1 || echo 0)"
-verdict_of "$TMP/nopod.env"
-assert "pod-start FAIL names the reason in the verdict" \
-  "$([[ "$V_OUT" == *"never became Ready"* ]] && echo 1 || echo 0)"
-: > "$TMP/noapi.env"
-rg_record_marker_write_failure "$TMP/noapi.env" 1 0
-assert "API down after marker write failure -> FAIL, not INVALID" \
-  "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/noapi.env")" = FAIL ] && echo 1 || echo 0)"
+# The vm-gate call site: fake `k` answers the two failure-time probes (API_MODE, POD_MODE).
+k() {
+  if [ "$1" = get ]; then   # /readyz
+    case "$API_MODE" in
+      ok) echo ok; return 0 ;;
+      unhealthy) echo 'Error from server (InternalError): an error on the server ("[-]etcd failed") has prevented the request from succeeding' >&2; return 1 ;;
+      down) echo 'The connection to the server 127.0.0.1:6443 was refused' >&2; return 1 ;;
+      cmderr) echo 'error: stat /nonexistent: no such file or directory' >&2; return 1 ;;
+    esac
+  else
+    case "$POD_MODE" in
+      True) echo True; return 0 ;;
+      False) echo False; return 0 ;;
+      cmderr) echo 'error: stat /nonexistent: no such file or directory' >&2; return 1 ;;
+    esac
+  fi
+}
+marker_case() { # name was_ready api_mode pod_mode expected-status expected-reason-substring why
+  : > "$TMP/$1.env"
+  API_MODE="$3" POD_MODE="$4" rg_probe_and_record_marker_failure "$TMP/$1.env" "$2" 2>/dev/null
+  assert "$7" "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/$1.env")" = "$5" ] && echo 1 || echo 0)"
+  verdict_of "$TMP/$1.env"
+  assert "$1: reports its reason ($6)" "$([[ "$V_OUT$(rg_get "$TMP/$1.env" harness_error)" == *"$6"* ]] && echo 1 || echo 0)"
+}
+marker_case harness 1 ok True INVALID "mariadb-0 is Ready and the API answers" \
+  "marker write fails with mariadb-0 Ready and API up -> INVALID (the harness broke, not u7s)"
+marker_case nopod 0 ok False FAIL "never became Ready" \
+  "mariadb-0 never Ready -> FAIL, a pod-start regression must not be laundered into INVALID"
+marker_case unready 1 ok False FAIL "became not Ready" \
+  "mariadb-0 Ready at the wait but not at write time -> FAIL (re-probed, not the stale snapshot)"
+marker_case apidown 1 down True FAIL "API unreachable" \
+  "API unreachable after marker write failure -> FAIL, not INVALID"
+marker_case apibad 1 unhealthy True FAIL "answered /readyz with an error" \
+  "API answering unhealthy (non-2xx) -> FAIL with its own reason, distinct from unreachable"
+marker_case cmderr 1 cmderr cmderr INVALID "probe command errored" \
+  "kubectl command error (bad kubeconfig) -> INVALID: the harness broke, nothing says u7s failed"
+marker_case podgone 1 cmderr False FAIL "became not Ready" \
+  "a probe command error never hides a u7s failure seen by the other probe -> FAIL"
 assert "a failed marker READ after the bursts (marker_ok=0, no harness error) stays FAIL" \
   "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$(mutate marker_ok 0)")" = FAIL ] && echo 1 || echo 0)"
 

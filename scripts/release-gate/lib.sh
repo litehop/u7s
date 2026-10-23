@@ -249,22 +249,63 @@ rg_run_status() {
   fi
 }
 
-# Records a failed pre-burst marker write into results file $1. $2 = mariadb-0 became Ready
-# (1|0), $3 = the API answered after the failure (1|0). Only a Ready pod behind a live API
-# makes the write failure a harness problem; a pod that never started or an API that went
-# away is u7s failing, so it is recorded as marker_ok=0 (a FAIL) with the reason.
-rg_record_marker_write_failure() {
-  local f="$1" ready="$2" api="$3"
-  if [ "$ready" = 1 ] && [ "$api" = 1 ]; then
-    echo "harness_error=marker write to MariaDB failed although mariadb-0 is Ready and the API answers" >> "$f"
-  else
-    echo "marker_ok=0" >> "$f"
-    if [ "$ready" != 1 ]; then
-      echo "marker_fail=mariadb-0 never became Ready, marker not written (u7s pod-start failure)" >> "$f"
-    else
-      echo "marker_fail=API did not answer after the marker write failed (u7s failure)" >> "$f"
-    fi
+# Classifies a kubectl probe: $1 exit code, $2 combined output. Echoes
+#   ok          the probe ran and succeeded
+#   answered    the API answered with an error (non-2xx, NotFound): a u7s answer
+#   unreachable refused / timeout / hang: the API is not answering (u7s)
+#   error       anything else (bad kubeconfig, missing binary): a harness problem
+rg_probe_kind() {
+  local rc="$1" out="$2"
+  if [ "$rc" = 0 ]; then echo ok
+  elif [[ "$out" == *"Error from server"* ]]; then echo answered
+  elif [ "$rc" = 124 ] || [[ "$out" == *refused* || "$out" == *"Unable to connect"* || "$out" == *timeout* || "$out" == *EOF* || "$out" == *"no route"* ]]; then echo unreachable
+  else echo error
   fi
+}
+
+# Records a failed pre-burst marker write into results file $1. $2 = mariadb-0 was Ready at the
+# earlier wait (1|0). Probes taken now, at failure time: $3/$4 = exit code/output of
+# `kubectl get --raw /readyz`, $5/$6 = exit code/output of the mariadb-0 Ready-condition status.
+# Mapping: any probe showing u7s misbehaving (API unreachable or answering an error, pod not
+# Ready) is marker_ok=0 (FAIL), checked first so ambiguity goes to FAIL. Only when no probe shows
+# u7s failing is it harness_error (INVALID): a probe command that itself errored, or everything
+# healthy while the write still failed.
+rg_record_marker_write_failure() {
+  local f="$1" was_ready="$2" ak rk pod=ready
+  ak="$(rg_probe_kind "$3" "$4")"
+  rk="$(rg_probe_kind "$5" "$6")"
+  case "$rk" in
+    ok) [ "$(echo "$6" | tr -d '[:space:]')" = True ] || pod=notready ;;
+    answered | unreachable) pod=notready ;;
+    error) pod=error ;;
+  esac
+  if [ "$ak" = unreachable ]; then
+    echo "marker_ok=0" >> "$f"
+    echo "marker_fail=API unreachable after the marker write failed (u7s failure)" >> "$f"
+  elif [ "$ak" = answered ]; then
+    echo "marker_ok=0" >> "$f"
+    echo "marker_fail=API answered /readyz with an error after the marker write failed (u7s failure)" >> "$f"
+  elif [ "$pod" = notready ] && [ "$was_ready" = 1 ]; then
+    echo "marker_ok=0" >> "$f"
+    echo "marker_fail=mariadb-0 became not Ready before the marker write, marker not written (u7s failure)" >> "$f"
+  elif [ "$pod" = notready ]; then
+    echo "marker_ok=0" >> "$f"
+    echo "marker_fail=mariadb-0 never became Ready, marker not written (u7s pod-start failure)" >> "$f"
+  elif [ "$ak" = error ] || [ "$pod" = error ]; then
+    echo "harness_error=marker write failed and a probe command errored (kubectl/kubeconfig), cannot attribute to u7s" >> "$f"
+  else
+    echo "harness_error=marker write to MariaDB failed although mariadb-0 is Ready and the API answers" >> "$f"
+  fi
+}
+
+# Call-site decision for a failed marker write: runs the failure-time probes via the caller's
+# `k` (timeout-wrapped kubectl) and records the classification into results file $1. $2 = was Ready.
+rg_probe_and_record_marker_failure() {
+  local f="$1" was_ready="$2" aout arc pout prc
+  arc=0 prc=0
+  aout="$(k get --raw /readyz 2>&1)" || arc=$?
+  pout="$(k -n default get pod mariadb-0 -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>&1)" || prc=$?
+  rg_record_marker_write_failure "$f" "$was_ready" "$arc" "$aout" "$prc" "$pout"
 }
 
 # Forced-failure self-check: $1 results file, $2 the VM's phase file. OK (0) only when install

@@ -213,9 +213,8 @@ MARKER="rg-$(date +%s)-$RANDOM"
 mysql_k() { k -n default exec mariadb-0 -- mariadb -uvalerauko -puserpw-phase3 valenet -N -B -e "$1"; }
 mysql_k "CREATE TABLE rg_marker (v VARCHAR(64) NOT NULL); INSERT INTO rg_marker VALUES ('$MARKER')" >> "$OUT/run.log" 2>&1 \
   || {
-    api_ok=0; k get --raw /readyz >/dev/null 2>&1 && api_ok=1
-    log "marker write failed (mariadb_ready=$MARIADB_READY api_ok=$api_ok)"
-    rg_record_marker_write_failure "$OUT/results.env" "$MARIADB_READY" "$api_ok"
+    log "marker write failed (was_ready=$MARIADB_READY)"
+    rg_probe_and_record_marker_failure "$OUT/results.env" "$MARIADB_READY"
     exit 1
   }
 marker_ok() {
