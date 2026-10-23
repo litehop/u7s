@@ -876,20 +876,11 @@ pub fn decode_proto_by_kind_and_version(
                 crate::autoscaling_gen_adapter::decode_hpa_v1_proto_gen(raw)
             }
         }
-        // Same wire layout in v1 and v1beta1 (PodCertificateRequest v1 merely lacks the
-        // v1beta1-only tags 9/10); only the apiVersion differs.
-        "ClusterTrustBundle" | "PodCertificateRequest" => {
-            let decoded = if kind == "ClusterTrustBundle" {
-                crate::certificates_v1beta1_gen_adapter::decode_clustertrustbundle_proto_gen(raw)
-            } else {
-                crate::certificates_v1beta1_gen_adapter::decode_podcertificaterequest_proto_gen(raw)
-            };
-            decoded.map(|mut v| {
-                if !api_version.is_empty() {
-                    v["apiVersion"] = api_version.into();
-                }
-                v
-            })
+        "ClusterTrustBundle" => {
+            crate::certificates_gen_adapter::decode_clustertrustbundle_proto_gen(raw)
+        }
+        "PodCertificateRequest" => {
+            crate::certificates_gen_adapter::decode_podcertificaterequest_proto_gen(raw)
         }
         _ => decoders().get(kind).and_then(|f| f(raw)),
     }
@@ -11020,8 +11011,8 @@ mod tests {
         );
     }
 
-    /// v1 and v1beta1 ClusterTrustBundle share one wire layout; a protobuf create against the
-    /// v1 endpoint must not come back stamped v1beta1 or the stored object lies about its version.
+    /// A protobuf ClusterTrustBundle create must be stored as certificates.k8s.io/v1 or clients
+    /// reading it back see the wrong apiVersion.
     #[test]
     fn cluster_trust_bundle_proto_decode_keeps_envelope_api_version() {
         let name = encode_length_delimited(1, b"ctb");
@@ -11030,16 +11021,14 @@ mod tests {
             2,
             &encode_length_delimited(2, b"pem"),
         ));
-        for av in ["certificates.k8s.io/v1", "certificates.k8s.io/v1beta1"] {
-            let v = decode_proto_by_kind_and_version("ClusterTrustBundle", av, &wire)
-                .expect("ClusterTrustBundle must decode");
-            assert_eq!(v["apiVersion"], av);
-            assert_eq!(v["spec"]["trustBundle"], "pem");
-        }
+        let av = "certificates.k8s.io/v1";
+        let v = decode_proto_by_kind_and_version("ClusterTrustBundle", av, &wire)
+            .expect("ClusterTrustBundle must decode");
+        assert_eq!(v["apiVersion"], av);
+        assert_eq!(v["spec"]["trustBundle"], "pem");
     }
 
-    /// Same as the ClusterTrustBundle case: a kubelet's protobuf create against the v1
-    /// endpoint must be stored as v1, not stamped with the decoder's v1beta1 default.
+    /// Same as the ClusterTrustBundle case, for a kubelet protobuf PodCertificateRequest create.
     #[test]
     fn pod_certificate_request_proto_decode_keeps_envelope_api_version() {
         let name = encode_length_delimited(1, b"pcr");
@@ -11048,12 +11037,11 @@ mod tests {
             2,
             &encode_length_delimited(1, b"example.com/signer"),
         ));
-        for av in ["certificates.k8s.io/v1", "certificates.k8s.io/v1beta1"] {
-            let v = decode_proto_by_kind_and_version("PodCertificateRequest", av, &wire)
-                .expect("PodCertificateRequest must decode");
-            assert_eq!(v["apiVersion"], av);
-            assert_eq!(v["spec"]["signerName"], "example.com/signer");
-        }
+        let av = "certificates.k8s.io/v1";
+        let v = decode_proto_by_kind_and_version("PodCertificateRequest", av, &wire)
+            .expect("PodCertificateRequest must decode");
+        assert_eq!(v["apiVersion"], av);
+        assert_eq!(v["spec"]["signerName"], "example.com/signer");
     }
 
     /// `state::build_registry()` is production code's real GVK routing table: every kind it

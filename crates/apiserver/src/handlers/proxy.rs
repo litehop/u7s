@@ -2094,6 +2094,26 @@ pub async fn resolve_node_proxy_target<S: Store>(
     Ok((kubelet_url, client))
 }
 
+/// Buffer a proxied request body, capped at `MAX_BODY_BYTES`. Proxy subresources are
+/// long-running and skip `DefaultBodyLimit`/the inflight body deadline, so the cap must be
+/// enforced here or one request can hold unbounded memory before the upstream dial.
+async fn read_proxy_request_body(body: Body) -> Result<bytes::Bytes, crate::status::StatusError> {
+    axum::body::to_bytes(body, crate::MAX_BODY_BYTES)
+        .await
+        .map_err(|e| {
+            if std::error::Error::source(&e)
+                .is_some_and(|s| s.is::<http_body_util::LengthLimitError>())
+            {
+                Status::request_entity_too_large(format!(
+                    "request body exceeds the {} byte limit",
+                    crate::MAX_BODY_BYTES
+                ))
+            } else {
+                Status::internal(format!("failed to read request body: {e}"))
+            }
+        })
+}
+
 /// Proxy a request to the kubelet node proxy endpoint.
 ///
 /// GET /api/v1/nodes/{name}/proxy/{*path} → https://<node-ip>:10250/<path>
@@ -2109,9 +2129,7 @@ pub async fn node_proxy<S: Store>(
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
-    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
+    let body_bytes = read_proxy_request_body(req.into_body()).await?;
 
     let kubelet_resp = client
         .request(method, &kubelet_url)
@@ -2462,7 +2480,7 @@ pub(crate) fn build_pod_proxy_client(
     client_identity_pem: Option<&[u8]>,
     insecure_https: bool,
 ) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if insecure_https {
         builder = builder.use_rustls_tls().danger_accept_invalid_certs(true);
     } else if let Some(der) = ca_der {
@@ -2784,9 +2802,7 @@ async fn pod_proxy_dispatch<S: Store>(
 
     let method = req.method().clone();
     let query = req.uri().query().map(str::to_owned);
-    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
+    let body_bytes = read_proxy_request_body(req.into_body()).await?;
     let path_with_query = append_query(&encode_proxy_tail(path_suffix)?, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
@@ -3125,9 +3141,7 @@ async fn service_proxy_dispatch<S: Store>(
     // when configured, or directly otherwise.
     let method = req.method().clone();
     let query = req.uri().query().map(str::to_owned);
-    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
+    let body_bytes = read_proxy_request_body(req.into_body()).await?;
     let path_with_query = append_query(&encode_proxy_tail(path_suffix)?, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
@@ -8329,6 +8343,93 @@ mod tests {
         drop(client); // just verify it was built
     }
 
+    /// Spawn a plain-TCP backend answering every request with `307 Location: <location>`;
+    /// returns its address and a counter of connections accepted.
+    async fn spawn_redirecting_backend(
+        location: String,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let loc = location.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {loc}\r\n\
+                                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    /// A pod that answers 307 must not make the apiserver dial the Location: podIP
+    /// validation only covers the first hop, so following redirects lets a namespace user
+    /// reach loopback/metadata/kubelet endpoints from the apiserver host with the
+    /// kubelet client identity attached.
+    #[tokio::test]
+    async fn pod_proxy_client_does_not_follow_backend_redirects() {
+        let (internal, internal_hits) = spawn_redirecting_backend("/unused".into()).await;
+        let (backend, _) = spawn_redirecting_backend(format!("http://{internal}/internal")).await;
+
+        let client = build_pod_proxy_client(None, None, false);
+        let resp = client
+            .post(format!("http://{backend}/"))
+            .body("payload")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            307,
+            "the 3xx must be passed through to the caller, as upstream does"
+        );
+        assert_eq!(
+            internal_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "redirect target was contacted: pod proxy followed a backend redirect past \
+             target validation"
+        );
+    }
+
+    /// Same invariant for the node proxy's kubelet client: a redirect from the kubelet
+    /// port must not be followed with the apiserver's kubelet client identity attached.
+    #[tokio::test]
+    async fn kubelet_client_does_not_follow_redirects() {
+        let (internal, internal_hits) = spawn_redirecting_backend("/unused".into()).await;
+        let (backend, _) = spawn_redirecting_backend(format!("http://{internal}/internal")).await;
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let client =
+            AppState::<SqliteStore>::build_kubelet_client(Some(cert.cert.der()), None).unwrap();
+
+        let resp = client
+            .get(format!("http://{backend}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 307);
+        assert_eq!(
+            internal_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "kubelet client followed a redirect, presenting its identity to the target"
+        );
+    }
+
     /// build_pod_proxy_client with `insecure_https=true` must accept a certificate no CA
     /// trusts, matching upstream kube-apiserver's `InsecureSkipVerify` for pod-proxy TLS
     /// targets — pod/workload TLS certs are self-signed, so pinning to any CA (or using
@@ -11606,6 +11707,105 @@ mod tests {
         state.cluster_ca_der = Some(Arc::new(cert.cert.der().to_vec()));
         seed_kubelet_pod(&state).await;
         state
+    }
+
+    /// Every proxy entry point must reject a request body over `MAX_BODY_BYTES` with 413
+    /// before dialing the backend. Proxy subresources are long-running requests that skip
+    /// `DefaultBodyLimit` and the inflight body deadline, so without a cap in the handler
+    /// any user with pods/proxy, services/proxy or nodes/proxy can force the apiserver to
+    /// buffer an unbounded body in RAM.
+    #[tokio::test]
+    async fn proxy_routes_reject_oversized_request_bodies_with_413() {
+        let state = make_state_with_ca().await;
+        state
+            .kubelet_client
+            .set(AppState::<SqliteStore>::build_kubelet_client(
+                state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+                None,
+            ));
+        let put = |key: String, v: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                state
+                    .store
+                    .put(&key, bytes::Bytes::from(v.to_string()), Some(0))
+                    .await
+                    .expect("seed");
+            }
+        };
+        put(
+            crate::keys::object_key("pods", "default", "mypod"),
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+                "spec": {"containers": [{"name": "app", "image": "x", "ports": [{"containerPort": 80}]}],
+                         "hostNetwork": true},
+                "status": {"podIP": "10.0.0.1", "hostIP": "10.0.0.1"}
+            }),
+        )
+        .await;
+        put(
+            crate::keys::cluster_object_key("nodes", "mynode"),
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": "mynode", "resourceVersion": "1"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+            }),
+        )
+        .await;
+        put(
+            crate::keys::object_key("services", "default", "my-svc"),
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+                "spec": {"ports": [{"port": 80}]}
+            }),
+        )
+        .await;
+        put(
+            crate::keys::group_object_key(
+                "discovery.k8s.io",
+                "endpointslices",
+                Some("default"),
+                "my-svc-abc",
+            ),
+            serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSlice",
+                "metadata": {"name": "my-svc-abc", "namespace": "default", "resourceVersion": "1",
+                             "labels": {"kubernetes.io/service-name": "my-svc"}},
+                "addressType": "IPv4",
+                "endpoints": [{"addresses": ["10.0.0.2"], "conditions": {"ready": true}}],
+                "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}]
+            }),
+        )
+        .await;
+
+        let uris = [
+            "/api/v1/namespaces/default/pods/mypod/proxy",
+            "/api/v1/namespaces/default/pods/mypod/proxy/",
+            "/api/v1/namespaces/default/pods/mypod/proxy/x",
+            "/api/v1/nodes/mynode/proxy/x",
+            "/api/v1/namespaces/default/services/my-svc/proxy",
+            "/api/v1/namespaces/default/services/my-svc/proxy/",
+            "/api/v1/namespaces/default/services/my-svc/proxy/x",
+        ];
+        let mut router = make_router(state);
+        for uri in uris {
+            for method in ["POST", "PUT", "DELETE"] {
+                let req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(axum::body::Body::from(vec![0u8; crate::MAX_BODY_BYTES + 1]))
+                    .unwrap();
+                let resp = router.call(req).await.unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "{method} {uri}: oversized proxy body must be rejected with 413 before \
+                     any upstream dial, or one request can hold unbounded apiserver memory"
+                );
+            }
+        }
     }
 
     fn log_query(container: &str) -> LogQuery {

@@ -222,9 +222,14 @@ pub fn sets_generation_on_create(group: &str, plural: &str) -> bool {
 /// `sets_generation_on_create`. Unlike `initialize_workload_generation` this must only run on
 /// create paths: controllers compare `status.observedGeneration` to `metadata.generation`, so a
 /// client-chosen starting value (e.g. 7) would make them wait on generations that never exist.
+/// Also stamps the DeviceTaintRule `taint.timeAdded` default: it must happen on writes only, so
+/// reads of stored objects never mutate.
 pub fn force_generation_on_create(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if sets_generation_on_create(group, plural) {
         obj["metadata"]["generation"] = serde_json::json!(1i64);
+    }
+    if let ("resource.k8s.io", "devicetaintrules") = (group, plural) {
+        super::device_taint_rule::default_taint_time_added(obj);
     }
 }
 
@@ -1287,8 +1292,14 @@ fn validate_network_policy_ports(obj: &serde_json::Value) -> Result<(), String> 
 /// `maxExpirationSeconds` verbatim into the request, so without this default every
 /// podCertificate volume that leaves it out is rejected as "must be set" and its pod never
 /// starts.
+///
+/// Also drops `pkixPublicKey`/`proofOfPossession`: they exist only in v1beta1's spec, and the
+/// v1 type upstream decodes into has no such fields, so JSON and protobuf (which skips the
+/// tags) must agree on storing neither.
 fn default_pod_certificate_request(obj: &mut serde_json::Value) {
     if let Some(spec) = obj["spec"].as_object_mut() {
+        spec.remove("pkixPublicKey");
+        spec.remove("proofOfPossession");
         if spec.get("maxExpirationSeconds").is_none_or(|v| v.is_null()) {
             spec.insert("maxExpirationSeconds".into(), 86400.into());
         }
