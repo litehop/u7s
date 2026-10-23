@@ -960,12 +960,12 @@ wait_for_upgraded_worker() {
 }
 
 # Control-plane upgrades keep the cluster identity: the apiserver only generates
-# ca.*/sa.* when absent, and join tokens are Secrets in the store. The restart
-# below must leave all four files byte-identical, or every node's identity and
-# every issued service-account token is invalid.
+# ca.* when absent. The restart below must leave both files byte-identical, or
+# every node's identity is invalid. sa.key is excluded: the apiserver rotates it
+# on its own schedule and keeps the previous key verifying until its tokens expire.
 cp_identity_fingerprint() {
   local f
-  for f in ca.key ca.crt sa.key sa.pub; do
+  for f in ca.key ca.crt; do
     if [ -f "$STATE_DIR/$f" ]; then
       printf '%s ' "$f"
       openssl dgst -sha256 -r "$STATE_DIR/$f" | cut -d' ' -f1
@@ -977,10 +977,10 @@ verify_cp_identity_preserved() {
   local before="$1" after
   after="$(cp_identity_fingerprint)"
   if [ "$before" != "$after" ]; then
-    echo "error: the control-plane CA / service-account keys under $STATE_DIR changed during the upgrade -- every node's client identity and every issued token is now invalid. Restore ca.key, ca.crt, sa.key and sa.pub from backup." >&2
+    echo "error: the control-plane CA under $STATE_DIR changed during the upgrade -- every node's client identity is now invalid. Restore ca.key and ca.crt from backup." >&2
     return 1
   fi
-  echo "Control-plane identity preserved (ca.key, ca.crt, sa.key, sa.pub unchanged); no CA or tokens re-minted."
+  echo "Control-plane identity preserved (ca.key, ca.crt unchanged); no CA re-minted."
 }
 
 if [ "$MINT_JOIN_TOKEN" -eq 1 ]; then

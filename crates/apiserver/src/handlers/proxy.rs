@@ -4144,8 +4144,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4156,7 +4155,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -4237,8 +4235,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4249,7 +4246,6 @@ mod tests {
             kubelet_port: 10260,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let node = serde_json::json!({
@@ -4322,8 +4318,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
         let mut state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4334,7 +4329,6 @@ mod tests {
             kubelet_port: 10250, // primary's forward
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
         state
             .node_kubelet_ports
@@ -4549,8 +4543,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4561,7 +4554,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -4760,8 +4752,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4772,7 +4763,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -4885,8 +4875,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4897,7 +4886,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -5098,8 +5086,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -5110,7 +5097,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5166,8 +5152,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -5178,7 +5163,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5228,8 +5212,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -5240,7 +5223,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5289,8 +5271,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -5301,7 +5282,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5454,8 +5434,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -5466,7 +5445,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5568,8 +5546,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -5580,7 +5557,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5689,8 +5665,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -5701,7 +5676,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -6481,8 +6455,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: None,
@@ -6493,7 +6466,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: Some("127.0.0.1:8132".to_owned()),
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -6868,8 +6840,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -6880,7 +6851,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -6967,8 +6937,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -6979,7 +6948,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -7034,8 +7002,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -7046,7 +7013,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -7376,8 +7342,7 @@ mod tests {
         seed_exec_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -7388,7 +7353,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -7591,8 +7555,7 @@ mod tests {
         seed_exec_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -7603,7 +7566,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -7787,8 +7749,7 @@ mod tests {
         seed_attach_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -7799,7 +7760,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -7992,8 +7952,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -8004,7 +7963,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
         assert!(
             state.kubelet_client.get().is_some(),
@@ -8108,8 +8066,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store: store.clone(),
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -8120,7 +8077,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -9070,8 +9026,7 @@ mod tests {
 
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -9082,7 +9037,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: Some(proxy_addr),
-            sa_public_key_pem: None,
         });
 
         let mut router = make_router(state);
@@ -9310,8 +9264,7 @@ mod tests {
 
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -9322,7 +9275,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let mut router = make_router(state);
@@ -9608,8 +9560,7 @@ mod tests {
 
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -9620,7 +9571,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: Some(proxy_addr),
-            sa_public_key_pem: None,
         });
 
         let mut router = make_router(state);
@@ -9695,7 +9645,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new(
             store.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -9842,8 +9791,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store: store.clone(),
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -9854,7 +9802,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let vwc = serde_json::json!({
@@ -10004,7 +9951,6 @@ mod tests {
         let state = AppState::new(
             store.clone(),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10144,7 +10090,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new(
             store.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10287,7 +10232,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new(
             store.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),

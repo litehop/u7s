@@ -719,7 +719,7 @@ pub async fn token_review<S: Store>(
     let user_info = crate::auth::authenticate_token_with_audiences(
         &token,
         &state.token_map,
-        state.sa_decoding_key.as_deref(),
+        state.sa_keys.as_ref(),
         &req.spec.audiences,
         state.store.as_ref(),
         state.sa_sig_cache.as_ref(),
@@ -2128,13 +2128,7 @@ mod handler_tests {
                 extra: Default::default(),
             },
         );
-        let state = AppState::new(
-            store,
-            None,
-            None,
-            token_map,
-            "https://localhost:6443".into(),
-        );
+        let state = AppState::new(store, None, token_map, "https://localhost:6443".into());
 
         let app = Router::new()
             .route(

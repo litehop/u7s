@@ -1299,7 +1299,6 @@ fn test_state() -> AppState {
     AppState::new(
         store,
         None,
-        None,
         std::collections::HashMap::new(),
         "https://localhost:6443".into(),
     )

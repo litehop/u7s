@@ -181,6 +181,11 @@
 #             cert and its kubelet-client/proxy-client identities live <secs> seconds
 #             and rotate at 2/3 of that. For scripts/e2e-pki-rotation/leaf-rotation.sh;
 #             use with --stack-only. Mutually exclusive with --binary and --profile.
+#   --pki-test-sa-rotation <secs>  As --pki-test-lifetime (same rebuild, same exclusions) but
+#             starts the apiserver with U7S_PKI_TEST_SA_ROTATION_SECS=<secs>: the SA signing
+#             key rotates every <secs> seconds, a successor is published <secs>/4 before it
+#             signs, and tokens live at most <secs>/6 (so projected tokens refresh every
+#             <secs>/6). For scripts/e2e-pki-rotation/sa-key-rotation.sh; use with --stack-only.
 #   --sample-interval  Cadence in seconds for scripts/conformance/sample-run-metrics.sh,
 #             which starts once the node topology is final (after step 5 and any
 #             --extra-node join) and reaps at the same point run-all.sh's own
@@ -217,6 +222,7 @@ NETWORK=""
 PROFILE=0
 DHAT_DEPTH=""
 PKI_TEST_LIFETIME=""
+PKI_TEST_SA_ROTATION=""
 SAMPLE_INTERVAL=""
 PROCS=""
 K8S_VERSION=""
@@ -245,6 +251,7 @@ while [[ $# -gt 0 ]]; do
     --profile) PROFILE=1; shift ;;
     --dhat-depth) DHAT_DEPTH="$2"; shift 2 ;;
     --pki-test-lifetime) PKI_TEST_LIFETIME="$2"; shift 2 ;;
+    --pki-test-sa-rotation) PKI_TEST_SA_ROTATION="$2"; shift 2 ;;
     --sample-interval) SAMPLE_INTERVAL="$2"; shift 2 ;;
     --procs) PROCS="$2"; shift 2 ;;
     --k8s-version) K8S_VERSION="$2"; shift 2 ;;
@@ -294,10 +301,14 @@ if [ -n "$PKI_TEST_LIFETIME" ]; then
     echo "error: --pki-test-lifetime must be an integer >= 24 seconds, got '$PKI_TEST_LIFETIME'" >&2
     exit 1
   fi
-  if [ -n "$BINARY" ] || [ "$PROFILE" -eq 1 ]; then
-    echo "error: --pki-test-lifetime rebuilds u7s-apiserver with --features pki-test-knobs and is mutually exclusive with --binary and --profile" >&2
-    exit 1
-  fi
+fi
+if [ -n "$PKI_TEST_SA_ROTATION" ] && { ! [[ "$PKI_TEST_SA_ROTATION" =~ ^[0-9]+$ ]] || [ "$PKI_TEST_SA_ROTATION" -lt 60 ]; }; then
+  echo "error: --pki-test-sa-rotation must be an integer >= 60 seconds, got '$PKI_TEST_SA_ROTATION'" >&2
+  exit 1
+fi
+if [ -n "$PKI_TEST_LIFETIME$PKI_TEST_SA_ROTATION" ] && { [ -n "$BINARY" ] || [ "$PROFILE" -eq 1 ]; }; then
+  echo "error: --pki-test-lifetime/--pki-test-sa-rotation rebuild u7s-apiserver with --features pki-test-knobs and are mutually exclusive with --binary and --profile" >&2
+  exit 1
 fi
 
 # Both flags are required together: a 2nd node needs its own kubelet port, and a
@@ -438,10 +449,11 @@ if [ "$PROFILE" -eq 1 ]; then
   export U7S_DHAT_HEAP_FILE="$DHAT_HEAP_FILE"
 fi
 
-if [ -n "$PKI_TEST_LIFETIME" ]; then
+if [ -n "$PKI_TEST_LIFETIME$PKI_TEST_SA_ROTATION" ]; then
   banner "PKI test knobs: rebuilding u7s-apiserver with --features pki-test-knobs"
   cargo build --release -p u7s-apiserver --features pki-test-knobs --manifest-path "$REPO/Cargo.toml"
-  export U7S_PKI_TEST_LIFETIME_SECS="$PKI_TEST_LIFETIME"
+  [ -z "$PKI_TEST_LIFETIME" ] || export U7S_PKI_TEST_LIFETIME_SECS="$PKI_TEST_LIFETIME"
+  [ -z "$PKI_TEST_SA_ROTATION" ] || export U7S_PKI_TEST_SA_ROTATION_SECS="$PKI_TEST_SA_ROTATION"
 fi
 
 # Step 02: Start apiserver — source so KUBECONFIG export propagates.

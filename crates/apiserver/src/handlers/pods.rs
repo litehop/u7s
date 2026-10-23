@@ -10222,7 +10222,6 @@ mod handler_tests {
         let state = AppState::new(
             store.clone(),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11007,7 +11006,6 @@ mod handler_tests {
 
         let state = AppState::new(
             Arc::clone(&collision_store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -19956,7 +19954,6 @@ mod handler_tests {
         let state = AppState::new(
             Arc::clone(&conflict_store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -20200,7 +20197,6 @@ mod handler_tests {
         let state = AppState::new(
             Arc::clone(&racing_store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -20313,7 +20309,6 @@ mod handler_tests {
 
         let state = AppState::new(
             Arc::clone(&racing_store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -21727,7 +21722,6 @@ mod ephemeral_containers_route_tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new(
             store.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),

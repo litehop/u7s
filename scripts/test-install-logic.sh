@@ -1769,17 +1769,21 @@ behind_status=0; BASE_HB=2026-10-17T01:00:00Z NOW_HB=2026-10-17T01:00:10Z FP_BEF
 assert "with the worker clock behind the API server, a fresh Ready heartbeat is still accepted (a server-clock comparison would fail every upgrade on such a node)" \
   "$([ "$behind_status" -eq 0 ] && echo 1 || echo 0)"
 
-# Control plane: CA / SA keys survive the re-run untouched, or the run fails.
+# Control plane: the CA survives the re-run untouched, or the run fails. sa.key is not
+# fingerprinted: the apiserver rotates it on its own.
 CP_RUNNER="$UPG_WORK/cp.sh"
 write_upgrade_runner "$CP_RUNNER" 'before="$(cp_identity_fingerprint)"; if [ -n "${MUTATE:-}" ]; then echo regenerated > "$STATE_DIR/$MUTATE"; fi; verify_cp_identity_preserved "$before"'
 cp_state="$UPG_WORK/cp-state"; mkdir -p "$cp_state"
 for f in ca.key ca.crt sa.key sa.pub; do echo "original $f" > "$cp_state/$f"; done
 cp_ok_out="$(bash "$CP_RUNNER" "$cp_state" 2>&1)" && cp_ok_status=0 || cp_ok_status=$?
-assert "a control-plane re-run that leaves ca.*/sa.* alone succeeds and says no CA or tokens were re-minted" \
-  "$([ "$cp_ok_status" -eq 0 ] && printf '%s' "$cp_ok_out" | grep -q 'no CA or tokens re-minted' && echo 1 || echo 0)"
-for f in ca.key sa.key; do
+assert "a control-plane re-run that leaves ca.* alone succeeds and says no CA was re-minted" \
+  "$([ "$cp_ok_status" -eq 0 ] && printf '%s' "$cp_ok_out" | grep -q 'no CA re-minted' && echo 1 || echo 0)"
+cp_rot_status=0; MUTATE=sa.key bash "$CP_RUNNER" "$cp_state" >/dev/null 2>&1 || cp_rot_status=$?
+assert "a rotated sa.key does not fail a control-plane upgrade (the apiserver rotates it on its own)" \
+  "$([ "$cp_rot_status" -eq 0 ] && echo 1 || echo 0)"
+for f in ca.key ca.crt; do
   cp_bad_status=0; MUTATE="$f" bash "$CP_RUNNER" "$cp_state" >/dev/null 2>&1 || cp_bad_status=$?
-  assert "a control-plane upgrade that re-mints $f fails loud (every node's identity and every issued token would silently die)" \
+  assert "a control-plane upgrade that re-mints $f fails loud (every node's identity would silently die)" \
     "$([ "$cp_bad_status" -ne 0 ] && echo 1 || echo 0)"
   echo "original $f" > "$cp_state/$f"
 done

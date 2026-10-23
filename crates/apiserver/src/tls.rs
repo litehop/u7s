@@ -61,81 +61,6 @@ fn sync_parent_dir(path: &str) -> std::io::Result<()> {
 const CA_REMEDY: &str = "restore from backup, or delete both files to deliberately start a new CA";
 
 // ---------------------------------------------------------------------------
-// SA signing key — RSA 2048, persisted across restarts
-// ---------------------------------------------------------------------------
-
-/// RSA key pair used for signing service-account JWTs.
-pub struct SaKeys {
-    /// PEM-encoded PKCS#1 RSA private key (`-----BEGIN RSA PRIVATE KEY-----`).
-    /// KCM requires this format; PKCS#8 (`-----BEGIN PRIVATE KEY-----`) causes
-    /// "invalid serviceaccount key" and prevents token issuance.
-    pub private_key_pem: Vec<u8>,
-    /// PEM-encoded RSA public key — used to construct a DecodingKey.
-    pub public_key_pem: Vec<u8>,
-}
-
-/// Load `sa.key` from disk, or generate a fresh RSA-2048 key and write it.
-///
-/// The public key (`sa.pub`) is derived from the private key; we write it
-/// for operator convenience but never read it back (we re-derive it from
-/// the private key at startup).
-///
-/// Design: load-or-generate ensures tokens minted before a restart remain
-/// valid after restart, because the signing key stays constant.
-pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow::Result<SaKeys> {
-    use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
-    use rsa::RsaPrivateKey;
-
-    // If the private key already exists, load it and re-derive the public key.
-    if std::path::Path::new(sa_key_path).exists() {
-        use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
-        let pem = std::fs::read(validate_cli_path(std::path::Path::new(sa_key_path))?)?;
-        let pem_str = std::str::from_utf8(&pem)
-            .map_err(|e| anyhow::anyhow!("SA key file is not valid UTF-8: {e}"))?;
-        let private_key = RsaPrivateKey::from_pkcs1_pem(pem_str)
-            .map_err(|e| anyhow::anyhow!("failed to parse SA private key: {e}"))?;
-        let public_pem = private_key
-            .to_public_key()
-            .to_pkcs1_pem(LineEnding::LF)
-            .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
-        tracing::info!("loaded SA signing key from {sa_key_path}");
-        return Ok(SaKeys {
-            private_key_pem: pem,
-            public_key_pem: public_pem.into_bytes(),
-        });
-    }
-
-    // Generate a new 2048-bit RSA key.
-    tracing::info!("generating new SA signing key → {sa_key_path}");
-    let mut rng = rsa::rand_core::OsRng;
-    let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
-
-    let private_pem = private_key
-        .to_pkcs1_pem(LineEnding::LF)
-        .map_err(|e| anyhow::anyhow!("PKCS#1 encode error: {e}"))?;
-
-    let public_pem = private_key
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
-
-    write_private_key(
-        validate_cli_path(std::path::Path::new(sa_key_path))?,
-        private_pem.as_bytes(),
-    )?;
-    std::fs::write(
-        validate_cli_path(std::path::Path::new(sa_pub_path))?,
-        public_pem.as_bytes(),
-    )?;
-    tracing::info!("SA signing key written to {sa_key_path}");
-
-    Ok(SaKeys {
-        private_key_pem: private_pem.as_bytes().to_vec(),
-        public_key_pem: public_pem.into_bytes(),
-    })
-}
-
-// ---------------------------------------------------------------------------
 // CA key+cert — persisted across restarts
 // ---------------------------------------------------------------------------
 
@@ -1037,7 +962,7 @@ pub(crate) fn leaf_files(args: &Args, stem: &str) -> LeafFiles {
 
 /// Atomically replace `path` with `bytes` (mode 0o600 when `private`), so a reader never
 /// sees a half-written file.
-fn replace_file(path: &str, bytes: &[u8], private: bool) -> anyhow::Result<()> {
+pub(crate) fn replace_file(path: &str, bytes: &[u8], private: bool) -> anyhow::Result<()> {
     let tmp = format!("{path}.tmp");
     let tmp_path = validate_cli_path(std::path::Path::new(&tmp))?;
     if private {
@@ -2179,78 +2104,6 @@ mod tests {
              world-readable CA keys allow anyone to sign rogue certs",
             mode
         );
-        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
-    }
-
-    /// load_or_generate_sa_keys must reload the same key material on a second call
-    /// rather than generating a new key pair. This is the core correctness property:
-    /// tokens minted before a restart must remain valid after restart because the
-    /// signing key is loaded from disk, not regenerated.
-    #[test]
-    fn sa_keys_load_from_disk_returns_same_private_key() {
-        let dir = test_temp_dir("sa-keys-load");
-        let key_path = dir.join("sa.key").to_string_lossy().into_owned();
-        let pub_path = dir.join("sa.pub").to_string_lossy().into_owned();
-
-        // First call: generates and writes sa.key / sa.pub.
-        let first = load_or_generate_sa_keys(&key_path, &pub_path)
-            .expect("first load_or_generate_sa_keys must succeed");
-        assert!(
-            std::path::Path::new(&key_path).exists(),
-            "sa.key must exist after first call"
-        );
-
-        // Second call: must load from disk, not generate a new key.
-        let second = load_or_generate_sa_keys(&key_path, &pub_path)
-            .expect("second load_or_generate_sa_keys must succeed");
-
-        assert_eq!(
-            first.private_key_pem, second.private_key_pem,
-            "private key PEM must be identical on load — \
-             generating a new key would invalidate tokens minted before restart"
-        );
-        assert_eq!(
-            first.public_key_pem, second.public_key_pem,
-            "public key PEM must be identical on load"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
-    }
-
-    /// sa.key must be written in PKCS#1 PEM format so KCM can parse it.
-    ///
-    /// KCM's token controller calls crypto.ParseRSAPrivateKeyFromPEM which expects
-    /// the `-----BEGIN RSA PRIVATE KEY-----` header (PKCS#1). Writing PKCS#8
-    /// (`-----BEGIN PRIVATE KEY-----`) causes "invalid serviceaccount key" in KCM logs
-    /// and prevents any SA token from being issued, so pods never get a mounted token.
-    #[test]
-    fn sa_key_is_written_in_pkcs1_pem_format_for_kcm_compatibility() {
-        let dir = test_temp_dir("sa-key-pkcs1");
-        let key_path = dir.join("sa.key").to_string_lossy().into_owned();
-        let pub_path = dir.join("sa.pub").to_string_lossy().into_owned();
-
-        let keys = load_or_generate_sa_keys(&key_path, &pub_path)
-            .expect("load_or_generate_sa_keys must succeed");
-
-        let priv_pem = std::str::from_utf8(&keys.private_key_pem)
-            .expect("private_key_pem must be valid UTF-8");
-        assert!(
-            priv_pem.contains("-----BEGIN RSA PRIVATE KEY-----"),
-            "sa.key must use PKCS#1 PEM header '-----BEGIN RSA PRIVATE KEY-----' \
-             so KCM can parse it; reverting to PKCS#8 breaks SA token issuance and \
-             prevents pods from getting a mounted token file. Got: {}",
-            priv_pem.lines().next().unwrap_or("<empty>")
-        );
-
-        let pub_pem =
-            std::str::from_utf8(&keys.public_key_pem).expect("public_key_pem must be valid UTF-8");
-        assert!(
-            pub_pem.contains("-----BEGIN RSA PUBLIC KEY-----"),
-            "sa.pub must use PKCS#1 PEM header '-----BEGIN RSA PUBLIC KEY-----'; \
-             got: {}",
-            pub_pem.lines().next().unwrap_or("<empty>")
-        );
-
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
