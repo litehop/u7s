@@ -1108,6 +1108,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     {
         crate::admission::validate_webhook_match_conditions_cel(obj)?;
     }
+    if group == "admissionregistration.k8s.io" && plural == "validatingadmissionpolicies" {
+        crate::admission::validate_vap_cel(obj)?;
+    }
     if group.is_empty() && (plural == "configmaps" || plural == "secrets") {
         validate_data_keys(obj, plural)?;
     }
@@ -4492,6 +4495,23 @@ mod tests {
             "ValidatingWebhookConfiguration with empty matchConditions expression must be rejected; \
              without this check the apiserver returns 200 OK and the conformance test fails"
         );
+    }
+
+    /// create/PUT/PATCH all converge on validate_resource, so an uncompilable VAP expression
+    /// (which could otherwise be absorbed at admission by `|| true`) is rejected at write time.
+    #[test]
+    fn validating_admission_policy_with_uncompilable_cel_is_rejected_at_write_time() {
+        let policy =
+            |expr: &str| serde_json::json!({"spec": {"validations": [{"expression": expr}]}});
+        let check = |expr: &str| {
+            validate_resource(
+                "admissionregistration.k8s.io",
+                "validatingadmissionpolicies",
+                &policy(expr),
+            )
+        };
+        assert!(check("(1 + ) || true").is_err());
+        assert!(check("object.spec.x != 'bad'").is_ok());
     }
 
     /// A ValidatingWebhookConfiguration with a valid CEL expression must be accepted.

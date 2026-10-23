@@ -22197,7 +22197,7 @@ mod ephemeral_containers_route_tests {
                         "operations": ["UPDATE"], "resources": ["pods/ephemeralcontainers"]
                     }]},
                     "validations": [{
-                        "expression": "object.spec.ephemeralContainers[0].securityContext.privileged != true",
+                        "expression": "!has(object.spec.ephemeralContainers[0].securityContext) || !has(object.spec.ephemeralContainers[0].securityContext.privileged) || object.spec.ephemeralContainers[0].securityContext.privileged != true",
                         "message": "privileged ephemeral containers are not allowed"
                     }]
                 }
