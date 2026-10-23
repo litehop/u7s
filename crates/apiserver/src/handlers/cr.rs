@@ -1603,7 +1603,10 @@ fn replay_within_budget(
 
 enum RuntimeCost {
     Within,
+    /// The replay finished and counted more than the limit.
     OverLimit,
+    /// The replay hit its wall-clock backstop and was abandoned.
+    ReplayAbandoned,
     TooManyInFlight,
 }
 
@@ -1650,9 +1653,14 @@ fn check_runtime_cost(
             Some(&replay_ctx),
         ) <= crate::handlers::cel_cost::CALL_COST_LIMIT
     });
+    classify_replay(within_limit)
+}
+
+fn classify_replay(within_limit: Result<bool, CelEvalOverBudget>) -> RuntimeCost {
     match within_limit {
         Ok(true) => RuntimeCost::Within,
-        Ok(false) | Err(CelEvalOverBudget::TimedOut) => RuntimeCost::OverLimit,
+        Ok(false) => RuntimeCost::OverLimit,
+        Err(CelEvalOverBudget::TimedOut) => RuntimeCost::ReplayAbandoned,
         Err(CelEvalOverBudget::TooManyInFlight) => RuntimeCost::TooManyInFlight,
     }
 }
@@ -1719,6 +1727,13 @@ fn evaluate_cel_rule(
                 "{field_path}: Invalid value: operation cancelled: actual cost limit \
                  exceeded: {CEL_NO_FURTHER_RULES} due to call cost exceeds limit for rule: \
                  {rule_text}"
+            ))));
+        }
+        RuntimeCost::ReplayAbandoned => {
+            return Err(RuleFailure::halting(Status::unprocessable_entity(format!(
+                "{field_path}: x-kubernetes-validations rule cost replay exceeded its \
+                 evaluation time budget of {CEL_COST_REPLAY_BUDGET:?} — rejecting to bound \
+                 CEL evaluation cost, {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
             ))));
         }
         RuntimeCost::TooManyInFlight => return Err(RuleFailure::halting(too_many_in_flight())),
@@ -14043,6 +14058,27 @@ mod tests {
              generic validation failure or an abandoned timed-out thread (got: {})",
             err.1.message
         );
+    }
+
+    /// A replay abandoned at its wall-clock backstop is not evidence the rule counted over the
+    /// limit; it must be reported separately so the two rejections can be told apart.
+    #[test]
+    fn abandoned_cost_replay_is_not_reported_as_a_counted_cost_rejection() {
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
+        let stuck = run_within_budget(std::time::Duration::from_millis(20), &GATE, || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            true
+        });
+        assert!(matches!(
+            classify_replay(stuck),
+            RuntimeCost::ReplayAbandoned
+        ));
+        assert!(matches!(classify_replay(Ok(false)), RuntimeCost::OverLimit));
+        assert!(matches!(classify_replay(Ok(true)), RuntimeCost::Within));
+        assert!(matches!(
+            classify_replay(Err(CelEvalOverBudget::TooManyInFlight)),
+            RuntimeCost::TooManyInFlight
+        ));
     }
 
     // Before this fix, `execute_cel_with_budget` spawned a brand-new OS thread for every
