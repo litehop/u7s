@@ -914,9 +914,8 @@ pub struct AppState<S = SqliteStore> {
     pub webhook_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
     /// Concatenated PEM (cert + key) presented to AGGREGATED BACKENDS (not to u7s itself)
     /// by `handlers::aggregation::build_backend_client`. Signed by the dedicated front-proxy
-    /// CA (`TlsMaterial::proxy_client_cert_pem`'s doc), NOT the same identity as
-    /// `webhook_identity_pem` (which is the admin cert, signed by the main cluster CA) —
-    /// an aggregated backend trusts this one specifically via `requestheader-client-ca-file`
+    /// CA (`TlsMaterial::proxy_client_cert_pem`'s doc), the same identity
+    /// `webhook_identity_pem` presents (never the admin cert). An aggregated backend trusts this one specifically via `requestheader-client-ca-file`
     /// to assert X-Remote-User/-Group identity. Not part of `AppStateConfig`: no test caller
     /// needs a non-default value at construction time, so `run()` sets this field directly
     /// after construction, same pattern as `node_kubelet_ports`/`sa_sig_cache`.
@@ -993,7 +992,7 @@ pub struct AppStateConfig<S> {
     pub server_address: String,
     pub cluster_ca_der: Option<Vec<u8>>,
     /// Concatenated PEM bytes of (cert, key) for admission webhook mTLS.
-    /// In production: `admin_cert_pem + admin_key_pem` from `TlsMaterial`.
+    /// In production: `TlsMaterial::webhook_client_identity_pem`.
     pub webhook_identity_pem: Option<Vec<u8>>,
     pub service_ip_allocator: Option<ServiceIpAllocator>,
     /// Concatenated PEM bytes of (cert, key) for the kubelet proxy client cert.
@@ -1208,6 +1207,7 @@ impl<S: Store> AppState<S> {
             .map_err(|e| tracing::error!("kubelet client: failed to parse cluster CA DER: {e}"))
             .ok()?;
         let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .use_rustls_tls()
             .tls_certs_only([cert]);
         if let Some(identity_pem) = client_identity_pem {
@@ -2614,7 +2614,7 @@ mod tests {
 
     /// build_webhook_client succeeds when given a valid PEM identity (cert + key).
     ///
-    /// The production path concatenates admin_cert_pem + admin_key_pem. This test
+    /// The production path uses the front-proxy-client cert + key. This test
     /// verifies that a real PEM cert+key pair produced by rcgen is accepted by
     /// reqwest::Identity::from_pem. Without mTLS identity, webhook servers cannot
     /// verify the caller is the apiserver.

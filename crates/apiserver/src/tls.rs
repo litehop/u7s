@@ -537,9 +537,8 @@ pub struct TlsMaterial {
     /// DER-encoded admin client certificate.
     #[cfg_attr(not(test), allow(dead_code))]
     pub admin_cert_der: Vec<u8>,
-    /// PEM-encoded admin client certificate (concatenate with admin_key_pem for reqwest::Identity).
-    pub admin_cert_pem: Vec<u8>,
     /// PEM-encoded admin private key.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub admin_key_pem: Vec<u8>,
     /// PEM-encoded kubelet client certificate (CN=kube-apiserver-kubelet-client, O=system:masters).
     pub kubelet_client_cert_pem: Vec<u8>,
@@ -579,6 +578,17 @@ pub struct TlsMaterial {
     /// Re-issues every apiserver-owned leaf before it expires. The fields above are the
     /// leaves as of startup; consumers learn of later ones through the rotator.
     pub rotator: Arc<Rotator>,
+}
+
+impl TlsMaterial {
+    /// Cert + key PEM that outbound webhook callouts present. It is the front-proxy-client
+    /// identity: signed by a CA the apiserver does not accept for its own client auth, so a
+    /// webhook pointed at the apiserver itself is never authenticated as `system:masters`.
+    pub fn webhook_client_identity_pem(&self) -> Vec<u8> {
+        let mut pem = self.proxy_client_cert_pem.clone();
+        pem.extend_from_slice(&self.proxy_client_key_pem);
+        pem
+    }
 }
 
 /// Split an advertise address ("https://host:6443", "[fd00::1]:6443", "myhost") into its
@@ -892,7 +902,6 @@ fn generate_tls_with(
     Ok(TlsMaterial {
         ca_cert_der,
         server_cert_der: leaf(SERVING_LEAF).cert_der,
-        admin_cert_pem: pem_encode("CERTIFICATE", &admin.cert_der),
         admin_cert_der: admin.cert_der,
         admin_key_pem: admin.key_pem,
         kubelet_client_cert_pem: pem_encode("CERTIFICATE", &kubelet_client.cert_der),
@@ -1751,6 +1760,57 @@ mod tests {
         assert_eq!(
             proxy_client_id.username, "front-proxy-client",
             "proxy-client cert's CN must be 'front-proxy-client' (kubeadm's own convention)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Security test: the identity presented on webhook callouts must not carry
+    /// `system:masters`. A webhook (or CRD conversion) clientConfig can name the apiserver's
+    /// own Service, and an admin-cert callout would be authenticated as cluster-admin.
+    #[test]
+    fn webhook_client_identity_is_not_cluster_admin() {
+        let dir = test_temp_dir("webhook-identity-not-admin");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls failed");
+        let pem = tls.webhook_client_identity_pem();
+        let text = std::str::from_utf8(&pem).expect("utf8 pem");
+        let cert_end = text
+            .find("-----END CERTIFICATE-----")
+            .expect("identity must start with a certificate")
+            + "-----END CERTIFICATE-----".len();
+        let id =
+            crate::auth::extract_client_cert_identity(&der_from_pem(&text.as_bytes()[..cert_end]))
+                .expect("webhook identity cert must parse");
+        assert_ne!(
+            id.username, "admin",
+            "webhook callouts must not present the admin cert"
+        );
+        assert!(
+            !id.groups.iter().any(|g| g == "system:masters"),
+            "webhook callouts must not carry system:masters; got {:?}",
+            id.groups
+        );
+        assert_eq!(
+            pem,
+            {
+                let mut p = tls.proxy_client_cert_pem.clone();
+                p.extend_from_slice(&tls.proxy_client_key_pem);
+                p
+            },
+            "webhook identity must be the front-proxy-client cert+key"
         );
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
