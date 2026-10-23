@@ -291,7 +291,9 @@ mktemp_disk_dir() {
 # in the protected `release` GitHub Environment; the same key is published in
 # README.md. PLACEHOLDER: empty until the operator generates the key, and the
 # release workflow refuses to publish while it is empty.
-RELEASE_PUBKEY_PEM=""
+RELEASE_PUBKEY_PEM="-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAQyJWAOZX5w4sMHM+w/dKPlR3rIHYzOPalQ2UXVJIK+8=
+-----END PUBLIC KEY-----"
 
 # Verify <sig> is a valid Ed25519 signature of <file> under RELEASE_PUBKEY_PEM.
 # Exits non-zero with a message on any failure, including a missing or too-old
