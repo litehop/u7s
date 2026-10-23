@@ -539,7 +539,7 @@ runs:
         WORKDIR="$PWD/temp/u7s"
         # The wildcard controller set matches scripts/install.sh's u7s-kcm.service
         # --controllers set exactly (see its rationale there for
-        # -clusterrole-aggregation-controller / -device-taint-eviction-controller,
+        # -clusterrole-aggregation-controller,
         # and for why cloud-node-lifecycle-controller / node-route-controller /
         # service-lb-controller are deliberately NOT excluded)
         # -- real upstream e2e specs depend on controllers this workflow's
@@ -561,7 +561,7 @@ runs:
           --cluster-signing-cert-file="$WORKDIR/ca.pem" \
           --cluster-signing-key-file="$WORKDIR/ca.key" \
           --root-ca-file="$WORKDIR/ca.pem" \
-          --controllers='*,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller' \
+          --controllers='*,-clusterrole-aggregation-controller,-service-cidr-controller' \
           --allocate-node-cidrs=true \
           --cluster-cidr=10.244.0.0/16 \
           --node-cidr-mask-size=24 \

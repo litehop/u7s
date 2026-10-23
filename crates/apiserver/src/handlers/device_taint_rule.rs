@@ -105,11 +105,21 @@ pub(crate) fn validate_device_taint_rule(obj: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// `taint.timeAdded` is server-defaulted when the client leaves it unset: the
+/// device-taint eviction controller computes toleration deadlines from it.
+pub(crate) fn default_taint_time_added(obj: &mut Value) {
+    if obj["spec"]["taint"].is_object() && obj["spec"]["taint"]["timeAdded"].is_null() {
+        obj["spec"]["taint"]["timeAdded"] = Value::String(crate::util::utc_now_rfc3339());
+    }
+}
+
 /// Upstream `deviceTaintRuleStrategy.PrepareForUpdate`: `taint.timeAdded` tracks when the
 /// *effect* was set (toleration durations are computed from it), so it is refreshed when the
 /// effect changes and the client did not move it itself; `metadata.generation` is
-/// server-owned and advances only when `spec` changes.
+/// server-owned and advances only when `spec` changes. As in upstream, a request body that
+/// omits `timeAdded` is defaulted to now on update as well as create.
 pub(crate) fn prepare_device_taint_rule_update(old: &Value, new: &mut Value) {
+    default_taint_time_added(new);
     if new["spec"]["taint"]["effect"] != old["spec"]["taint"]["effect"]
         && new["spec"]["taint"]["timeAdded"] == old["spec"]["taint"]["timeAdded"]
     {
@@ -220,6 +230,83 @@ mod tests {
     }
 
     #[test]
+    fn create_defaults_time_added_so_eviction_controller_can_compute_toleration_deadlines() {
+        let mut r = json!({"metadata": {"name": "r"}, "spec": {"taint": ok_taint()}});
+        super::super::defaults::force_generation_on_create(
+            "resource.k8s.io",
+            "devicetaintrules",
+            &mut r,
+        );
+        assert!(r["spec"]["taint"]["timeAdded"].is_string());
+        let mut set = json!({"spec": {"taint": {"key": "k", "effect": "None", "timeAdded": "2020-01-01T00:00:00Z"}}});
+        super::super::defaults::force_generation_on_create(
+            "resource.k8s.io",
+            "devicetaintrules",
+            &mut set,
+        );
+        assert_eq!(set["spec"]["taint"]["timeAdded"], "2020-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn reads_never_invent_time_added_so_stored_rules_do_not_get_a_fresh_deadline_per_get() {
+        let mut stored = json!({"metadata": {"name": "r"}, "spec": {"taint": ok_taint()}});
+        super::super::defaults::apply_defaults("resource.k8s.io", "devicetaintrules", &mut stored);
+        assert!(stored["spec"]["taint"]["timeAdded"].is_null());
+    }
+
+    #[test]
+    fn put_omitting_time_added_gets_now_like_upstream_defaulting_on_update() {
+        let mut old = rule(ok_taint(), json!({}));
+        old["spec"]["taint"]["timeAdded"] = json!("2020-01-01T00:00:00Z");
+        let mut new = rule(ok_taint(), json!({}));
+        prepare_device_taint_rule_update(&old, &mut new);
+        let t = new["spec"]["taint"]["timeAdded"].as_str().unwrap();
+        assert_ne!(
+            t, "2020-01-01T00:00:00Z",
+            "kubectl-compatible clients rely on upstream's decode-time default of now"
+        );
+    }
+
+    #[test]
+    fn put_echoing_old_time_added_with_effect_unchanged_keeps_it() {
+        let mut old = rule(ok_taint(), json!({}));
+        old["spec"]["taint"]["timeAdded"] = json!("2020-01-01T00:00:00Z");
+        let mut new = old.clone();
+        new["spec"]["taint"]["value"] = json!("v");
+        prepare_device_taint_rule_update(&old, &mut new);
+        assert_eq!(
+            new["spec"]["taint"]["timeAdded"], "2020-01-01T00:00:00Z",
+            "a read-modify-write PUT must not shift toleration deadlines"
+        );
+    }
+
+    #[test]
+    fn put_echoing_old_time_added_with_effect_changed_is_bumped() {
+        let mut old = rule(ok_taint(), json!({}));
+        old["spec"]["taint"]["timeAdded"] = json!("2020-01-01T00:00:00Z");
+        let mut new = old.clone();
+        new["spec"]["taint"]["effect"] = json!("NoExecute");
+        prepare_device_taint_rule_update(&old, &mut new);
+        assert_ne!(
+            new["spec"]["taint"]["timeAdded"], "2020-01-01T00:00:00Z",
+            "an effect change must restart toleration durations"
+        );
+    }
+
+    #[test]
+    fn put_omitting_time_added_with_effect_change_stamps_now() {
+        let mut old = rule(ok_taint(), json!({}));
+        old["spec"]["taint"]["timeAdded"] = json!("2020-01-01T00:00:00Z");
+        let mut new = rule(
+            json!({"key": "example.com/unhealthy", "effect": "NoExecute"}),
+            json!({}),
+        );
+        prepare_device_taint_rule_update(&old, &mut new);
+        let t = new["spec"]["taint"]["timeAdded"].as_str().unwrap();
+        assert_ne!(t, "2020-01-01T00:00:00Z");
+    }
+
+    #[test]
     fn effect_change_refreshes_time_added_so_toleration_durations_restart() {
         let mut old = rule(ok_taint(), json!({}));
         old["spec"]["taint"]["timeAdded"] = json!("2020-01-01T00:00:00Z");
@@ -247,17 +334,9 @@ mod tests {
     }
 
     #[test]
-    fn time_added_untouched_when_effect_unchanged() {
-        let old = rule(ok_taint(), json!({}));
-        let mut new = old.clone();
-        new["spec"]["taint"]["value"] = json!("v");
-        prepare_device_taint_rule_update(&old, &mut new);
-        assert!(new["spec"]["taint"]["timeAdded"].is_null());
-    }
-
-    #[test]
     fn generation_advances_only_on_spec_change_and_ignores_client_value() {
-        let old = rule(ok_taint(), json!({}));
+        let mut old = rule(ok_taint(), json!({}));
+        old["spec"]["taint"]["timeAdded"] = json!("2020-01-01T00:00:00Z");
         let mut spec_changed = old.clone();
         spec_changed["spec"]["taint"]["effect"] = json!("NoExecute");
         spec_changed["metadata"]["generation"] = json!(99);
