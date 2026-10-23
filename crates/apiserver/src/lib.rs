@@ -893,12 +893,15 @@ fn record_manifest_apply_outcome(
     }
 }
 
-/// Rewrites percent-encoded RFC 3986 unreserved characters (`%63` -> `c`) in the request
-/// path. axum matches the raw path while auth and upstream (Go `net/http`) route on the
-/// decoded one, so without this an encoded literal segment (`%63ertificatesigningrequests`)
-/// misses its bespoke route and lands on a generic handler that skips the bespoke guards.
-/// Reserved characters stay encoded so an encoded `/` never becomes a path separator.
-fn normalize_unreserved_escapes(uri: &axum::http::Uri) -> Option<axum::http::Uri> {
+/// Rewrites percent-encoded RFC 3986 unreserved characters (`%63` -> `c`) and `%2F`/`%2f`
+/// (-> `/`) in the request path. axum matches the raw path while auth and upstream (Go
+/// `net/http`) route on the decoded one, so without this an encoded literal segment
+/// (`%63ertificatesigningrequests`) misses its bespoke route and lands on a generic handler
+/// that skips the bespoke guards, and `ns%2Fconfigmaps` is one namespace segment to the router
+/// but two segments to auth. Other escapes (including `%25`, so `%252F` stays a single segment
+/// holding the text `%2F`) stay encoded: axum percent-decodes captures exactly once, as auth's
+/// `parse_path` does.
+fn normalize_path_escapes(uri: &axum::http::Uri) -> Option<axum::http::Uri> {
     let path = uri.path();
     if !path.contains('%') {
         return None;
@@ -913,7 +916,7 @@ fn normalize_unreserved_escapes(uri: &axum::http::Uri) -> Option<axum::http::Uri
                 bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
             ) {
                 let b = (h * 16 + l) as u8;
-                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
                     out.push(b as char);
                     i += 3;
                     continue;
@@ -935,7 +938,7 @@ fn normalize_unreserved_escapes(uri: &axum::http::Uri) -> Option<axum::http::Uri
     axum::http::Uri::from_parts(parts).ok()
 }
 
-/// Routes on the unreserved-decoded path; see [`normalize_unreserved_escapes`]. The wrapping
+/// Routes on the normalized path; see [`normalize_path_escapes`]. The wrapping
 /// has to sit in front of the inner router's matching, which `Router::layer` cannot do.
 fn build_router(state: AppState) -> Router {
     use tower_service::Service as _;
@@ -943,7 +946,7 @@ fn build_router(state: AppState) -> Router {
     Router::new().fallback(move |mut req: axum::extract::Request| {
         let mut routes = routes.clone();
         async move {
-            if let Some(uri) = normalize_unreserved_escapes(req.uri()) {
+            if let Some(uri) = normalize_path_escapes(req.uri()) {
                 *req.uri_mut() = uri;
             }
             routes.call(req).await.unwrap_or_else(|e| match e {})
@@ -8750,112 +8753,363 @@ mod tests {
     }
 
     #[test]
-    fn unreserved_escapes_decode_but_reserved_stay_encoded() {
-        let norm =
-            |p: &str| normalize_unreserved_escapes(&p.parse().unwrap()).map(|u| u.to_string());
+    fn unreserved_and_slash_escapes_decode_but_other_reserved_stay_encoded() {
+        let norm = |p: &str| normalize_path_escapes(&p.parse().unwrap()).map(|u| u.to_string());
         assert_eq!(
             norm("/apis/certificates.k8s.io/v1/%63ertificatesigningrequests?a=%63").as_deref(),
             Some("/apis/certificates.k8s.io/v1/certificatesigningrequests?a=%63"),
         );
         assert_eq!(norm("/x/%43%2e%7E").as_deref(), Some("/x/C.~"));
         assert_eq!(
-            norm("/api/v1/namespaces/ns/pods/%2Fn"),
-            None,
-            "an encoded slash must not become a path separator"
+            norm("/api/v1/namespaces/ns%2Fpods/a%2fb").as_deref(),
+            Some("/api/v1/namespaces/ns/pods/a/b"),
+            "an encoded slash is a separator for routing exactly as it is for authorization"
         );
         assert_eq!(
-            norm("/x/%zz/%3A"),
+            norm("/x/%zz/%3A/a%252Fb"),
             None,
-            "invalid or reserved escapes stay as sent"
+            "invalid escapes, other reserved escapes and double-encoding stay as sent"
         );
     }
 
-    /// Every literal-segment route with a bespoke handler must be reached identically when a
-    /// literal segment is percent-encoded: otherwise the request lands on a generic handler
-    /// that skips the bespoke guards (CSR identity stamping/validation, PCR status signer
-    /// guard) while RBAC, which decodes first, still authorizes it.
-    #[tokio::test]
-    async fn encoded_literal_segments_reach_the_same_handler_as_literal_ones() {
-        use tower::ServiceExt as _;
+    /// Real `AuthLayer` over the router with users whose RBAC reaches the certificates
+    /// handlers, so a response differs between a bespoke handler and the generic one it would
+    /// otherwise fall to.
+    async fn certificates_app() -> (axum::Router, state::AppState) {
         let store = std::sync::Arc::new(make_store());
+        let mut tokens = std::collections::HashMap::new();
+        for (token, user) in [
+            ("admin-token", "admin"),
+            ("node-token", "system:node:node-1"),
+            ("updater-token", "updater"),
+        ] {
+            tokens.insert(
+                token.to_owned(),
+                auth::UserInfo {
+                    username: user.into(),
+                    uid: String::new(),
+                    groups: if user.starts_with("system:node:") {
+                        vec!["system:nodes".to_owned()]
+                    } else {
+                        vec![]
+                    },
+                    extra: Default::default(),
+                },
+            );
+        }
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
             None,
-            Default::default(),
+            tokens,
             "https://localhost:6443".into(),
         );
         state.init().await;
-        let app = build_router(state);
-        let send = |method: &'static str, path: &'static str, body: &'static str| {
-            let app = app.clone();
-            async move {
-                let req = axum::http::Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(body))
-                    .unwrap();
-                app.oneshot(req).await.unwrap().status()
-            }
-        };
-        let garbage_csr = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"CertificateSigningRequest","metadata":{"name":"x"},"spec":{"request":"","signerName":"","username":"forged"}}"#;
-        let routes: [(&str, &str, &str, &str); 6] = [
+        for (user, rule) in [
             (
+                "admin",
+                serde_json::json!({"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}),
+            ),
+            (
+                "system:node:node-1",
+                serde_json::json!({"apiGroups": ["certificates.k8s.io"], "resources": ["podcertificaterequests"], "verbs": ["create"]}),
+            ),
+            (
+                "updater",
+                serde_json::json!({"apiGroups": ["certificates.k8s.io"], "resources": ["podcertificaterequests/status", "certificatesigningrequests/approval"], "verbs": ["update"]}),
+            ),
+        ] {
+            state.rbac_index.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{user}"),
+                &serde_json::json!({"rules": [rule]}),
+            );
+            state.rbac_index.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{user}"),
+                &serde_json::json!({
+                    "subjects": [{"kind": "User", "name": user}],
+                    "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": user}
+                }),
+            );
+        }
+        let app = build_router(state.clone()).layer(AuthLayer::new(
+            std::sync::Arc::clone(&state.rbac_index),
+            (*state.token_map).clone(),
+            state.sa_decoding_key.clone(),
+            std::sync::Arc::clone(&state.store),
+            std::sync::Arc::clone(&state.sa_sig_cache),
+            std::sync::Arc::clone(&state.flowcontrol_cache),
+            std::sync::Arc::clone(&state.node_graph),
+            std::sync::Arc::clone(&state.resource_registry),
+            std::sync::Arc::clone(&state.discovery_cache),
+        ));
+        (app, state)
+    }
+
+    async fn send_as(
+        app: &axum::Router,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt as _;
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Every literal-segment route with a bespoke handler must be reached identically when a
+    /// literal segment is percent-encoded: otherwise the request lands on a generic handler
+    /// that skips the bespoke guards (CSR identity stamping/validation, PCR create
+    /// NodeRestriction, PCR status signer guard) while RBAC, which decodes first, still
+    /// authorizes it. Each case's literal outcome is also pinned to the bespoke handler's
+    /// own answer so that a bespoke and a generic handler that happened to agree could not
+    /// make the comparison vacuous.
+    #[tokio::test]
+    async fn encoded_literal_segments_reach_the_same_handler_as_literal_ones() {
+        let (app, state) = certificates_app().await;
+        use u7s_store::Store as _;
+        state
+            .store
+            .put(
+                "/registry/certificates.k8s.io/podcertificaterequests/default/x".to_owned(),
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "certificates.k8s.io/v1",
+                    "kind": "PodCertificateRequest",
+                    "metadata": {"name": "x", "namespace": "default", "uid": "u"},
+                    "spec": {"signerName": "example.com/s", "podName": "p", "nodeName": "node-1"}
+                }))
+                .unwrap()
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .put(
+                "/registry/certificates.k8s.io/certificatesigningrequests/x".to_owned(),
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "certificates.k8s.io/v1",
+                    "kind": "CertificateSigningRequest",
+                    "metadata": {"name": "x", "uid": "u"},
+                    "spec": {"request": "dGVzdA==", "signerName": "example.com/s", "usages": ["client auth"]}
+                }))
+                .unwrap()
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let garbage_csr = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"CertificateSigningRequest","metadata":{"name":"x"},"spec":{"request":"","signerName":"","username":"forged"}}"#;
+        let approve_csr = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"CertificateSigningRequest","metadata":{"name":"x"},"status":{"conditions":[{"type":"Approved","status":"True","reason":"r","message":"m"}]}}"#;
+        let stub_csr = {
+            use base64::Engine as _;
+            let key = rcgen::KeyPair::generate().unwrap();
+            let csr = rcgen::CertificateParams::default()
+                .serialize_request(&key)
+                .unwrap();
+            base64::engine::general_purpose::STANDARD.encode(csr.der())
+        };
+        let pcr_create = format!(
+            r#"{{"apiVersion":"certificates.k8s.io/v1","kind":"PodCertificateRequest","metadata":{{"name":"y"}},"status":{{"certificateChain":"forged"}},"spec":{{"signerName":"example.com/s","podName":"p","podUID":"pu","serviceAccountName":"sa","serviceAccountUID":"su","nodeName":"node-1","nodeUID":"nu","maxExpirationSeconds":3600,"stubPKCS10Request":"{stub_csr}"}}}}"#
+        );
+        let pcr_status = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"PodCertificateRequest","metadata":{"name":"x","namespace":"default"},"status":{"conditions":[{"type":"Denied","status":"True","reason":"r","message":"m","lastTransitionTime":"2026-01-01T00:00:00Z"}]}}"#;
+        let v1 = "/apis/certificates.k8s.io/v1";
+        let b1 = "/apis/certificates.k8s.io/v1";
+        let cases: [(&str, &str, &str, &str, &str); 6] = [
+            (
+                "admin-token",
                 "POST",
-                "/apis/certificates.k8s.io/v1/certificatesigningrequests",
-                "/apis/certificates.k8s.io/v1/%63ertificatesigningrequests",
+                &format!("{v1}/certificatesigningrequests"),
+                &format!("{v1}/%63ertificatesigningrequests"),
                 garbage_csr,
             ),
             (
+                "admin-token",
                 "POST",
-                "/apis/certificates.k8s.io/v1/certificatesigningrequests",
+                &format!("{v1}/certificatesigningrequests"),
                 "/apis/%63ertificates.k8s.io/v1/certificatesigningrequests",
                 garbage_csr,
             ),
             (
+                "updater-token",
                 "PUT",
-                "/apis/certificates.k8s.io/v1/certificatesigningrequests/x/approval",
-                "/apis/certificates.k8s.io/v1/certificatesigningrequests/x/%61pproval",
-                garbage_csr,
+                &format!("{v1}/certificatesigningrequests/x/approval"),
+                &format!("{v1}/certificatesigningrequests/x/%61pproval"),
+                approve_csr,
             ),
             (
+                "admin-token",
                 "POST",
-                "/apis/certificates.k8s.io/v1/clustertrustbundles",
-                "/apis/certificates.k8s.io/v1/%63lustertrustbundles",
-                r#"{"metadata":{"name":"x"},"spec":{"trustBundle":"junk"}}"#,
+                &format!("{v1}/clustertrustbundles"),
+                &format!("{v1}/%63lustertrustbundles"),
+                r#"{"metadata":{"x":0},"spec":{"trustBundle":"junk"}}"#,
             ),
             (
+                "node-token",
                 "POST",
-                "/apis/certificates.k8s.io/v1beta1/namespaces/default/podcertificaterequests",
-                "/apis/certificates.k8s.io/v1beta1/namespaces/default/%70odcertificaterequests",
-                "{}",
+                &format!("{b1}/namespaces/default/podcertificaterequests?dryRun=All"),
+                &format!("{b1}/namespaces/default/%70odcertificaterequests?dryRun=All"),
+                &pcr_create,
             ),
             (
+                "updater-token",
                 "PUT",
-                "/apis/certificates.k8s.io/v1beta1/namespaces/default/podcertificaterequests/x/status",
-                "/apis/certificates.k8s.io/v1beta1/namespaces/default/podcertificaterequests/x/%73tatus",
-                "{}",
+                &format!("{b1}/namespaces/default/podcertificaterequests/x/status"),
+                &format!("{b1}/namespaces/default/podcertificaterequests/x/%73tatus"),
+                pcr_status,
             ),
         ];
-        for (method, literal, encoded, body) in routes {
-            let want = send(method, literal, body).await;
-            assert_eq!(
-                send(method, encoded, body).await,
-                want,
-                "{method} {encoded} must hit the same handler as {literal}; a generic handler \
-                 would skip the bespoke guards"
-            );
+        // A created object carries per-request uid/timestamps; what separates the bespoke PCR
+        // create from the generic one is whether the client-supplied status survived.
+        let shape = |(status, body): (axum::http::StatusCode, String)| {
+            if status.is_success() {
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                (
+                    status,
+                    format!("status kept: {}", v.get("status").is_some()),
+                )
+            } else {
+                (status, body)
+            }
+        };
+        let mut mismatches = Vec::new();
+        for (token, method, literal, encoded, body) in cases {
+            let want = shape(send_as(&app, token, method, literal, body).await);
+            let got = shape(send_as(&app, token, method, encoded, body).await);
+            if got != want {
+                mismatches.push(format!("{method} {encoded}: {got:?} != {want:?}"));
+            }
         }
         assert!(
-            !send(
-                "POST",
-                "/apis/certificates.k8s.io/v1/%63ertificatesigningrequests",
-                garbage_csr
-            )
-            .await
-            .is_success(),
-            "an empty-signerName CSR must be rejected on the encoded route"
+            mismatches.is_empty(),
+            "an encoded segment must hit the same bespoke handler as the literal path; a generic \
+             handler would skip the guards:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// Authorization and routing must resolve the same (group, version, resource, namespace,
+    /// name, subresource) for any encoding of any segment; otherwise RBAC grants one request
+    /// while a handler with different guards serves another. Every cell compares the encoded
+    /// path against a plain reference path that spells the intended decoded view: auth via its
+    /// parsed tuple, the router via the response it produces.
+    #[tokio::test]
+    async fn router_and_auth_resolve_the_same_resource_for_every_encoded_segment_position() {
+        let (app, _state) = certificates_app().await;
+        let build = |segs: &[&str], i: usize, repl: &str, sep_before: &str| {
+            let mut s = String::new();
+            for (k, seg) in segs.iter().enumerate() {
+                s.push_str(if k == 0 {
+                    "/"
+                } else if k == i {
+                    sep_before
+                } else {
+                    "/"
+                });
+                s.push_str(if k == i { repl } else { seg });
+            }
+            s
+        };
+        let bases: [(&[&str], &[(usize, &str)]); 3] = [
+            (
+                &["api", "v1", "namespaces", "default", "configmaps", "x"],
+                &[
+                    (1, "version"),
+                    (3, "namespace"),
+                    (4, "resource"),
+                    (5, "name"),
+                ],
+            ),
+            (
+                &[
+                    "api",
+                    "v1",
+                    "namespaces",
+                    "default",
+                    "configmaps",
+                    "x",
+                    "zzz",
+                ],
+                &[(6, "subresource")],
+            ),
+            (
+                &["apis", "apps", "v1", "namespaces", "default", "deployments"],
+                &[(1, "group"), (2, "version")],
+            ),
+        ];
+        let outcome = |(status, body): (axum::http::StatusCode, String)| {
+            if status.is_success() {
+                (status, String::new())
+            } else {
+                (status, body)
+            }
+        };
+        let mut sites = 0;
+        let mut failures = Vec::new();
+        for (segs, positions) in bases {
+            for &(i, label) in positions {
+                let seg = segs[i];
+                let first = format!("%{:02X}{}", seg.as_bytes()[0], &seg[1..]);
+                let plain = build(segs, i, seg, "/");
+                let cells = [
+                    ("unreserved %XX", build(segs, i, &first, "/"), plain.clone()),
+                    ("%2F", build(segs, i, seg, "%2F"), plain.clone()),
+                    ("%2f", build(segs, i, seg, "%2f"), plain.clone()),
+                    (
+                        "other reserved %3A",
+                        build(segs, i, &format!("{seg}%3A"), "/"),
+                        build(segs, i, &format!("{seg}:"), "/"),
+                    ),
+                    (
+                        "double-encoded %252F",
+                        build(segs, i, &format!("{seg}%252F"), "/"),
+                        build(segs, i, &format!("{seg}Q"), "/"),
+                    ),
+                ];
+                for (enc, encoded, reference) in cells {
+                    sites += 1;
+                    let double = enc.starts_with("double");
+                    let mut auth_view = auth::resolved_path_for_test(&encoded);
+                    if double {
+                        auth_view = auth_view.map(|f| f.replace("%2F", "Q"));
+                    }
+                    if auth_view != auth::resolved_path_for_test(&reference) {
+                        failures.push(format!("auth {label} {enc}: {encoded} -> {auth_view:?}"));
+                    }
+                    let got = send_as(&app, "admin-token", "GET", &encoded, "").await;
+                    let want = send_as(&app, "admin-token", "GET", &reference, "").await;
+                    let same = if double {
+                        // One segment holding the literal text `%2F`: either the same
+                        // not-found as any unknown segment, or the name validator rejecting
+                        // the `%`; never a split into two segments.
+                        got.0 == want.0 || (got.0 == 400 && got.1.contains("may not contain '%'"))
+                    } else {
+                        outcome(got.clone()) == outcome(want.clone())
+                    };
+                    if !same {
+                        failures.push(format!("router {label} {enc}: {encoded} -> {got:?}"));
+                    }
+                }
+            }
+        }
+        assert_eq!(sites, 35, "7 segment positions x 5 encodings");
+        assert!(
+            failures.is_empty(),
+            "auth and router disagree at {}/{sites} sites:\n{}",
+            failures.len(),
+            failures.join("\n")
         );
     }
 

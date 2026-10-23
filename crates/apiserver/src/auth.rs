@@ -1044,6 +1044,20 @@ fn parse_path(path: &str) -> ParsedPath {
     }
 }
 
+/// (group, version, resource, namespace, name, subresource) authorization sees for `path`.
+#[cfg(test)]
+pub(crate) fn resolved_path_for_test(path: &str) -> [String; 6] {
+    let p = parse_path(path);
+    [
+        p.api_group,
+        p.version,
+        p.resource,
+        p.namespace.unwrap_or_default(),
+        p.name.unwrap_or_default(),
+        p.subresource,
+    ]
+}
+
 fn unknown_path() -> ParsedPath {
     ParsedPath {
         api_group: String::new(),
