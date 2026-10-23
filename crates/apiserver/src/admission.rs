@@ -8681,7 +8681,6 @@ mod tests {
         let state = AppState::new(
             store.clone(),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
