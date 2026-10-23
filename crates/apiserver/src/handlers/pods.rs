@@ -360,12 +360,26 @@ async fn create_pod_from_object<S: Store>(
     // is the only place a mirror-pod-bound-to-self is distinguished from an arbitrary pod. A
     // non-node identity is a no-op here (`node_identity` returns `None`) and hits none of the
     // existing create_pod behavior below.
-    if crate::node_authz::node_identity(&user.username, &user.groups).is_some()
-        && !crate::node_authz::authorize_pod_create(&user.username, &user.groups, &obj.body)
-    {
-        return Err(Status::forbidden(
-            "a node may only create a mirror pod bound to itself".to_owned(),
-        ));
+    if let Some(node_name) = crate::node_authz::node_identity(&user.username, &user.groups) {
+        let node_key = group_object_key("", "nodes", None, node_name);
+        let node_uid = match state.store.get(&node_key).await {
+            Ok(Some(stored)) => serde_json::from_slice::<serde_json::Value>(&stored.value)
+                .ok()
+                .and_then(|n| n["metadata"]["uid"].as_str().map(str::to_owned)),
+            Ok(None) => None,
+            Err(e) => {
+                return Err(Status::forbidden(format!(
+                    "error looking up node {node_name} to verify uid: {e}"
+                )));
+            }
+        };
+        crate::node_authz::authorize_pod_create(
+            &user.username,
+            &user.groups,
+            &obj.body,
+            node_uid.as_deref(),
+        )
+        .map_err(Status::forbidden)?;
     }
 
     // Captured before resolve_name mutates metadata.name, so a store collision below
@@ -10649,23 +10663,71 @@ mod handler_tests {
     async fn create_pod_allows_node_to_create_mirror_pod_bound_to_itself() {
         let (state, store) = make_state();
         seed_namespace(&store, "default").await;
+        seed_node_a(&store).await;
 
-        let pod = serde_json::json!({
+        let resp = post_pod_as(state, node_user("node-a"), &node_a_mirror_pod()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "node-a must be able to register its own mirror pod"
+        );
+    }
+
+    async fn seed_node_a(store: &Arc<SqliteStore>) {
+        let val =
+            serde_json::json!({"kind": "Node", "metadata": {"name": "node-a", "uid": "uid-a"}});
+        store
+            .put(
+                "/registry/nodes/node-a",
+                Bytes::from(serde_json::to_vec(&val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed node");
+    }
+
+    fn node_a_mirror_pod() -> serde_json::Value {
+        serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
                 "name": "mirror-pod",
                 "namespace": "default",
-                "annotations": {"kubernetes.io/config.mirror": "abc123"}
+                "annotations": {"kubernetes.io/config.mirror": "abc123"},
+                "ownerReferences": [{
+                    "apiVersion": "v1", "kind": "Node", "name": "node-a",
+                    "uid": "uid-a", "controller": true
+                }]
             },
             "spec": {"nodeName": "node-a", "containers": [{"name": "app", "image": "nginx"}]}
-        });
+        })
+    }
 
+    /// A kubelet credential must not be able to widen its own NodeGraph reach by naming a
+    /// foreign Secret/ServiceAccount in a mirror pod.
+    #[tokio::test]
+    async fn create_pod_denies_node_mirror_pod_referencing_foreign_secret_and_stores_nothing() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_node_a(&store).await;
+
+        let mut pod = node_a_mirror_pod();
+        pod["spec"]["serviceAccountName"] = "victim-sa".into();
+        pod["spec"]["volumes"] =
+            serde_json::json!([{"name": "v", "secret": {"secretName": "victim-secret"}}]);
         let resp = post_pod_as(state, node_user("node-a"), &pod).await;
         assert_eq!(
             resp.status(),
-            StatusCode::CREATED,
-            "node-a must be able to register its own mirror pod"
+            StatusCode::FORBIDDEN,
+            "mirror pod referencing a Secret/SA must be rejected"
+        );
+        assert!(
+            store
+                .get("/registry/pods/default/mirror-pod")
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected mirror pod must not be persisted (it would feed the NodeGraph)"
         );
     }
 
