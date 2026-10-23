@@ -905,7 +905,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1958,8 +1958,8 @@ dependencies = [
 
 [[package]]
 name = "politeia"
-version = "0.3.0"
-source = "git+https://github.com/litehop/politeia?tag=v0.3.0#b2d7b0a668a4730b5825ba7ac9f4f8b6ecd5efbe"
+version = "0.3.1"
+source = "git+https://github.com/litehop/politeia?tag=v0.3.1#e2f787e8fd621a779db2ab89f7a03b43488ceb7a"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2559,7 +2559,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2617,7 +2617,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3030,7 +3030,7 @@ dependencies = [
  "fastrand",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3841,7 +3841,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

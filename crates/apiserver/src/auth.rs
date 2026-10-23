@@ -1023,22 +1023,24 @@ fn parse_path(path: &str) -> ParsedPath {
     // /api/v1/namespaces/{name} would be mis-classified as namespaced operations
     // with resource="" instead of cluster-scoped operations on the "namespaces"
     // resource, causing RBAC wildcard rules to never match.
-    let (namespace, resource, name, subresource) =
-        if rest.first().copied() == Some("namespaces") && rest.len() >= 3 {
-            // /namespaces/<ns>/<resource>[/<name>[/<sub>]]
-            let ns = rest.get(1).copied().unwrap_or("").to_owned();
-            let resource = rest.get(2).copied().unwrap_or("").to_owned();
-            let name = rest.get(3).map(|s| s.to_string());
-            let subresource = rest.get(4).copied().unwrap_or("").to_owned();
-            (Some(ns), resource, name, subresource)
-        } else {
-            // cluster-scoped: <resource>[/<name>[/<sub>]]
-            // Handles /namespaces, /namespaces/<name>, /nodes/<name>, etc.
-            let resource = rest.first().copied().unwrap_or("").to_owned();
-            let name = rest.get(1).map(|s| s.to_string());
-            let subresource = rest.get(2).copied().unwrap_or("").to_owned();
-            (None, resource, name, subresource)
-        };
+    let (namespace, resource, name, subresource) = if rest.first().copied() == Some("namespaces")
+        && rest.len() >= 3
+        && !(rest.len() == 3 && matches!(rest[2], "status" | "finalize"))
+    {
+        // /namespaces/<ns>/<resource>[/<name>[/<sub>]]
+        let ns = rest.get(1).copied().unwrap_or("").to_owned();
+        let resource = rest.get(2).copied().unwrap_or("").to_owned();
+        let name = rest.get(3).map(|s| s.to_string());
+        let subresource = rest.get(4).copied().unwrap_or("").to_owned();
+        (Some(ns), resource, name, subresource)
+    } else {
+        // cluster-scoped: <resource>[/<name>[/<sub>]]
+        // Handles /namespaces, /namespaces/<name>, /nodes/<name>, etc.
+        let resource = rest.first().copied().unwrap_or("").to_owned();
+        let name = rest.get(1).map(|s| s.to_string());
+        let subresource = rest.get(2).copied().unwrap_or("").to_owned();
+        (None, resource, name, subresource)
+    };
 
     ParsedPath {
         api_group,
@@ -2194,6 +2196,23 @@ mod tests {
         assert_eq!(p.resource, "pods");
         assert_eq!(p.subresource, "status");
         assert_eq!(p.name.as_deref(), Some("mypod"));
+    }
+
+    /// `/namespaces/<name>/status|finalize` are subresources of the Namespace, not a
+    /// collection named "status" inside it (upstream's namespace-subresource special case).
+    /// Misparsed, the namespace controller's `update namespaces/finalize` grant never
+    /// matches and every namespace deletion hangs in Terminating.
+    #[test]
+    fn parse_path_treats_namespace_status_and_finalize_as_subresources() {
+        for sub in ["status", "finalize"] {
+            let p = parse_path(&format!("/api/v1/namespaces/ns1/{sub}"));
+            assert_eq!(p.resource, "namespaces", "{sub}");
+            assert_eq!(p.name.as_deref(), Some("ns1"), "{sub}");
+            assert_eq!(p.subresource, sub);
+        }
+        let p = parse_path("/api/v1/namespaces/ns1/pods");
+        assert_eq!(p.resource, "pods");
+        assert_eq!(p.namespace.as_deref(), Some("ns1"));
     }
 
     /// An encoded `/` becomes a segment boundary for the router's decoded names, so authz

@@ -47,10 +47,20 @@ struct TokenRequest {
 struct TokenRequestSpec {
     #[serde(default = "default_expiration")]
     expiration_seconds: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     audiences: Vec<String>,
     #[serde(default)]
     bound_object_ref: Option<serde_json::Value>,
+}
+
+/// Go clients marshal a nil slice as `null` (client-go's TokenRequest carries
+/// `"audiences":null` when none are requested).
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 fn default_expiration() -> u64 {
@@ -886,6 +896,34 @@ mod handler_tests {
         assert_eq!(
             claims["aud"][0], "https://kubernetes.default.svc",
             "empty audiences must default to https://kubernetes.default.svc"
+        );
+    }
+
+    /// kube-controller-manager with --use-service-account-credentials=true requests each
+    /// controller's token with `"audiences":null` (Go nil slice). Rejecting that body leaves
+    /// every controller without credentials, so none of them can list or write anything.
+    #[tokio::test]
+    async fn create_token_accepts_go_client_null_audiences() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "kube-system").await;
+        seed_serviceaccount(&store, "kube-system", "node-controller", "uid-6").await;
+
+        let req_body = br#"{"kind":"TokenRequest","apiVersion":"authentication.k8s.io/v1","metadata":{"creationTimestamp":null},"spec":{"audiences":null,"expirationSeconds":3600,"boundObjectRef":null},"status":{"token":"","expirationTimestamp":null}}"#;
+
+        let result = create_token(
+            State(state),
+            Path(("kube-system".to_owned(), "node-controller".to_owned())),
+            Bytes::from_static(req_body),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!("null-audiences token request must succeed: status={}", e.0),
+        };
+        let claims = decode_jwt_claims(resp_body["status"]["token"].as_str().unwrap());
+        assert_eq!(
+            claims["aud"][0], "https://kubernetes.default.svc",
+            "null audiences mean the default audience"
         );
     }
 

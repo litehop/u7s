@@ -229,7 +229,7 @@ fn legacy_rules(role: &str) -> Vec<Value> {
             let write_no_collection = [
                 "get", "list", "watch", "create", "update", "patch", "delete",
             ];
-            vec![
+            let mut rules = vec![
                 json!({
                     "apiGroups": [""],
                     "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"],
@@ -250,7 +250,33 @@ fn legacy_rules(role: &str) -> Vec<Value> {
                     "resources": ["clusterroles","clusterrolebindings","roles","rolebindings"],
                     "verbs": ["get","list","watch","create","update","patch","escalate","bind"]
                 }),
-            ]
+            ];
+            // The single shared identity of --use-service-account-credentials=false: the union
+            // of what every controller needed, including a wildcard write.
+            rules.extend([
+                json!({ "apiGroups": [""], "resources": ["endpoints","pods","serviceaccounts","configmaps","secrets","persistentvolumes","persistentvolumeclaims"], "verbs": ["create"] }),
+                json!({ "apiGroups": [""], "resources": ["endpoints/restricted","pods/binding","serviceaccounts/token"], "verbs": ["create"] }),
+                json!({ "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": ["create"] }),
+                json!({ "apiGroups": [""], "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"], "verbs": ["get","list","watch","update","patch","delete"] }),
+                json!({ "apiGroups": [""], "resources": ["resourcequotas/status"], "verbs": ["get","update","patch"] }),
+                json!({ "apiGroups": ["apps"], "resources": ["replicasets","controllerrevisions"], "verbs": ["create"] }),
+                json!({ "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","update","patch","delete"] }),
+                json!({ "apiGroups": ["apps"], "resources": ["daemonsets/status","deployments/status","replicasets/status","statefulsets/status"], "verbs": ["get","update","patch"] }),
+                json!({ "apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create"] }),
+                json!({ "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","update","patch","delete"] }),
+                json!({ "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","update","patch"] }),
+                json!({ "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] }),
+                json!({ "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch","create","update","patch","delete"] }),
+                json!({ "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] }),
+                json!({ "apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments"], "verbs": ["get","list","watch","create","delete"] }),
+                json!({ "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "verbs": ["attest"] }),
+                json!({ "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create","update","delete","list","watch"] }),
+                json!({ "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-client-kubelet"], "verbs": ["approve"] }),
+                json!({ "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kubelet-serving","kubernetes.io/kube-apiserver-client-kubelet","kubernetes.io/kube-apiserver-client","kubernetes.io/legacy-unknown"], "verbs": ["sign"] }),
+                json!({ "apiGroups": [""], "resources": ["namespaces/status","namespaces/finalize"], "verbs": ["get","update","patch"] }),
+                json!({ "apiGroups": ["*"], "resources": ["*"], "verbs": ["get","list","watch","patch","update","delete","deletecollection"] }),
+            ]);
+            rules
         }
         "system:node" => {
             let rule = |group: &str, resource: &str, verbs: &[&str]| json!({ "apiGroups": [group], "resources": [resource], "verbs": verbs });
@@ -267,6 +293,17 @@ fn legacy_rules(role: &str) -> Vec<Value> {
         }
         _ => vec![],
     }
+}
+
+/// A stored rule using `*` in groups, resources or verbs that the policy does not grant. The
+/// controller-manager's shared-identity role carried such a wildcard write; releases between
+/// the original and the current seed may have stored it in a slightly different shape than
+/// `legacy_rules` lists, so exact equality alone would leave it behind.
+fn is_wildcard_beyond(policy: &[Value], rule: &Value) -> bool {
+    ["apiGroups", "resources", "verbs"]
+        .iter()
+        .any(|k| strs(rule, k).contains(&"*"))
+        && !rules_cover(policy, rule)
 }
 
 /// Bootstrap ClusterRoles earlier releases seeded that the current policy no longer has.
@@ -331,9 +368,13 @@ pub(crate) fn reconcile(existing: &Value, expected: &Value) -> Reconciled {
         } else {
             vec![]
         };
+        let kcm_drift_check = bootstrap
+            && expected["kind"] == "ClusterRole"
+            && expected["metadata"]["name"] == "system:kube-controller-manager";
         let have: Vec<Value> = list(existing, "rules")
             .iter()
             .filter(|r| !legacy.contains(r))
+            .filter(|r| !(kcm_drift_check && is_wildcard_beyond(list(expected, "rules"), r)))
             .cloned()
             .collect();
         let removed = list(existing, "rules").len() - have.len();
@@ -774,6 +815,46 @@ mod tests {
             if name != "system:kube-controller-manager" {
                 assert!(!grants(&obj["rules"], "bind") && !grants(&obj["rules"], "escalate"));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn drifted_kcm_wildcard_write_rule_is_removed_but_upstream_wildcard_read_stays() {
+        // A release between the original and current seed may have stored the wildcard write
+        // with different verbs; exact matching would leave KCM holding write-everything.
+        let store = SqliteStore::new(":memory:").unwrap();
+        crate::seed_rbac(&store).await.unwrap();
+        let name = "system:kube-controller-manager";
+        let (fresh, _) = stored(&store, &key("clusterroles", name)).await;
+        let drifted = [
+            json!({"apiGroups": ["*"], "resources": ["*"], "verbs": ["get","list","watch","patch","update","delete"]}),
+            json!({"apiGroups": ["apps"], "resources": ["*"], "verbs": ["*"]}),
+        ];
+        let operator =
+            json!({"apiGroups": ["example.com"], "resources": ["widgets"], "verbs": ["delete"]});
+        rewrite_role(&store, name, |o| {
+            let rules = o["rules"].as_array_mut().unwrap();
+            rules.extend(drifted.clone());
+            rules.push(operator.clone());
+        })
+        .await;
+
+        crate::seed_rbac(&store).await.unwrap();
+
+        let (obj, _) = stored(&store, &key("clusterroles", name)).await;
+        let got = obj["rules"].as_array().unwrap();
+        for rule in &drifted {
+            assert!(!got.contains(rule), "drifted wildcard {rule} survived");
+        }
+        assert!(
+            got.contains(&operator),
+            "non-wildcard operator rule must be kept"
+        );
+        for rule in fresh["rules"].as_array().unwrap() {
+            assert!(
+                got.contains(rule),
+                "upstream rule {rule} must not be stripped"
+            );
         }
     }
 

@@ -1145,13 +1145,31 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "setup: the shared part of the pool must be full"
         );
-        for system in ["system:node:n1", "admin", "system:kube-scheduler"] {
+        for system in [
+            "system:node:n1",
+            "admin",
+            "system:kube-scheduler",
+            "system:serviceaccount:kube-system:replicaset-controller",
+        ] {
             assert_eq!(
                 status_of(&layer, request_as(Method::GET, "/api/v1/nodes", system)).await,
                 StatusCode::OK,
                 "{system} must use the reserved seats while tenants hold the pool"
             );
         }
+        assert_eq!(
+            status_of(
+                &layer,
+                request_as(
+                    Method::GET,
+                    "/api/v1/nodes",
+                    "system:serviceaccount:default:replicaset-controller"
+                )
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a same-named ServiceAccount outside kube-system is a tenant and gets no reserved seats"
+        );
         open.send(true).unwrap();
     }
 
