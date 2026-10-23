@@ -56,6 +56,13 @@ data:
             proxy_pass https://github.com/litehop/u7s/releases/latest/download/install.sh;
         }
 
+        # Detached Ed25519 signature of the install.sh served above.
+        location = /install.sh.sig {
+            error_page 301 302 303 307 308 = @follow_hop1;
+            error_page 404 = @not_found;
+            proxy_pass https://github.com/litehop/u7s/releases/latest/download/install.sh.sig;
+        }
+
         # Pinned. The caller names the release tag, which is the only way to
         # reach a pre-release build. install.sh re-enters here to fetch its
         # own tarball, so this single route serves both the script and the
