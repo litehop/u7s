@@ -455,12 +455,13 @@ fn authorize_pod(
     }
 }
 
-/// Authorizes a pod CREATE for a `system:node:<name>` identity, mirroring upstream's
-/// NodeRestriction admission-plugin semantics (`plugin/pkg/admission/noderestriction`): only
-/// a mirror pod (carries the `kubernetes.io/config.mirror` annotation) bound to the
-/// requesting node's own `spec.nodeName` may be created this way — kubelet's mechanism for
-/// registering one of its own locally-run static pods. Anything else (a non-mirror pod, or a
-/// mirror pod claiming a different node) is denied.
+/// Authorizes a pod CREATE for a `system:node:<name>` identity, porting upstream's
+/// NodeRestriction `admitPodCreate` (`plugin/pkg/admission/noderestriction`): only a mirror
+/// pod (carries the `kubernetes.io/config.mirror` annotation) bound to the requesting node,
+/// with a single controller owner reference to that Node (matching `node_uid`), and without
+/// any reference to other API objects (`HasAPIObjectReference`), may be created this way.
+/// Referenced Secrets/ConfigMaps/ServiceAccounts/PVCs become `NodeGraph` edges that widen the
+/// node's read access, so a body that names any of them must never reach the store.
 ///
 /// Not reachable from `authorize()`/`authorize_pod` above — see the `"create"` arm's comment
 /// for why the pod body can't reach that layer. Called directly by `create_pod`
@@ -469,14 +470,195 @@ pub fn authorize_pod_create(
     username: &str,
     groups: &[String],
     pod_body: &serde_json::Value,
-) -> bool {
+    node_uid: Option<&str>,
+) -> Result<(), String> {
     let Some(node_name) = node_identity(username, groups) else {
-        return false;
+        return Err("only a node identity may create mirror pods".to_owned());
     };
-    let is_mirror_pod = pod_body["metadata"]["annotations"]
+    if pod_body["metadata"]["annotations"]
         .get(MIRROR_POD_ANNOTATION)
-        .is_some();
-    is_mirror_pod && pod_body["spec"]["nodeName"].as_str() == Some(node_name)
+        .is_none()
+    {
+        return Err(format!(
+            "pod does not have \"{MIRROR_POD_ANNOTATION}\" annotation, node \"{node_name}\" can only create mirror pods"
+        ));
+    }
+    if pod_body["spec"]["nodeName"].as_str() != Some(node_name) {
+        return Err(format!(
+            "node \"{node_name}\" can only create pods with spec.nodeName set to itself"
+        ));
+    }
+    let owners = pod_body["metadata"]["ownerReferences"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    let [owner] = owners else {
+        return Err(if owners.is_empty() {
+            format!(
+                "node \"{node_name}\" can only create pods with an owner reference set to itself"
+            )
+        } else {
+            format!(
+                "node \"{node_name}\" can only create pods with a single owner reference set to itself"
+            )
+        });
+    };
+    if owner["apiVersion"].as_str() != Some("v1")
+        || owner["kind"].as_str() != Some("Node")
+        || owner["name"].as_str() != Some(node_name)
+    {
+        return Err(format!(
+            "node \"{node_name}\" can only create pods with an owner reference set to itself"
+        ));
+    }
+    if owner["controller"].as_bool() != Some(true) {
+        return Err(format!(
+            "node \"{node_name}\" can only create pods with a controller owner reference set to itself"
+        ));
+    }
+    if owner["blockOwnerDeletion"].as_bool() == Some(true) {
+        return Err(format!(
+            "node \"{node_name}\" must not set blockOwnerDeletion on an owner reference"
+        ));
+    }
+    let owner_uid = owner["uid"].as_str().unwrap_or_default();
+    match node_uid.filter(|u| !u.is_empty()) {
+        Some(node_uid) if node_uid == owner_uid => {}
+        Some(node_uid) => {
+            return Err(format!(
+                "node {node_name} UID mismatch: expected {owner_uid} got {node_uid}"
+            ));
+        }
+        None => return Err(format!("node {node_name} has no uid to verify against")),
+    }
+    if let Some(resource) = pod_api_object_reference(pod_body) {
+        return Err(format!(
+            "node \"{node_name}\" can not create pods that reference {resource}"
+        ));
+    }
+    Ok(())
+}
+
+/// Port of upstream `podutil.HasAPIObjectReference`: names the API resource a pod spec
+/// depends on, if any. Volume types outside upstream's allow-list are rejected, as upstream
+/// rejects unknown ones.
+fn pod_api_object_reference(pod: &serde_json::Value) -> Option<&'static str> {
+    const ALLOWED_VOLUMES: &[&str] = &[
+        "awsElasticBlockStore",
+        "azureDisk",
+        "cephfs",
+        "cinder",
+        "downwardAPI",
+        "emptyDir",
+        "fc",
+        "flexVolume",
+        "flocker",
+        "gcePersistentDisk",
+        "gitRepo",
+        "hostPath",
+        "image",
+        "iscsi",
+        "nfs",
+        "photonPersistentDisk",
+        "portworxVolume",
+        "quobyte",
+        "rbd",
+        "scaleIO",
+        "storageos",
+        "vsphereVolume",
+    ];
+    let spec = &pod["spec"];
+    let non_empty = |v: &serde_json::Value| v.as_array().is_some_and(|a| !a.is_empty());
+    if spec["serviceAccountName"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty())
+    {
+        return Some("serviceaccounts");
+    }
+    if non_empty(&spec["imagePullSecrets"]) {
+        return Some("secrets");
+    }
+    let containers = ["containers", "initContainers", "ephemeralContainers"]
+        .into_iter()
+        .flat_map(|k| spec[k].as_array().into_iter().flatten());
+    let mut has_config_map = false;
+    for c in containers {
+        for e in c["env"].as_array().into_iter().flatten() {
+            if !e["valueFrom"]["secretKeyRef"].is_null() {
+                return Some("secrets");
+            }
+            has_config_map |= !e["valueFrom"]["configMapKeyRef"].is_null();
+        }
+        for e in c["envFrom"].as_array().into_iter().flatten() {
+            if !e["secretRef"].is_null() {
+                return Some("secrets");
+            }
+            has_config_map |= !e["configMapRef"].is_null();
+        }
+    }
+    let volumes = spec["volumes"].as_array().map_or(&[][..], Vec::as_slice);
+    // A volume plugin's `secretRef` (rbd, cephfs, iscsi, flexVolume, ...) is a Secret
+    // reference even on the types upstream otherwise allows.
+    if volumes.iter().any(contains_secret_ref) {
+        return Some("secrets");
+    }
+    if has_config_map {
+        return Some("configmaps");
+    }
+    if non_empty(&spec["resourceClaims"]) {
+        return Some("resourceclaims");
+    }
+    for v in volumes {
+        let Some(obj) = v.as_object() else {
+            return Some("volumes of unknown type");
+        };
+        for (key, val) in obj {
+            match key.as_str() {
+                "name" => {}
+                "configMap" => return Some("configmaps (via configmap volumes)"),
+                "secret" => return Some("secrets (via secret volumes)"),
+                "csi" => return Some("csidrivers (via CSI volumes)"),
+                "glusterfs" => return Some("endpoints (via glusterFS volumes)"),
+                "persistentVolumeClaim" => return Some("persistentvolumeclaims"),
+                "ephemeral" => return Some("persistentvolumeclaims (via ephemeral volumes)"),
+                "azureFile" => return Some("secrets (via azureFile volumes)"),
+                "projected" => {
+                    for s in val["sources"].as_array().into_iter().flatten() {
+                        if !s["configMap"].is_null() {
+                            return Some("configmaps (via projected volumes)");
+                        }
+                        if !s["secret"].is_null() {
+                            return Some("secrets (via projected volumes)");
+                        }
+                        if !s["serviceAccountToken"].is_null() {
+                            return Some("serviceaccounts (via projected volumes)");
+                        }
+                        if !s["clusterTrustBundle"].is_null() {
+                            return Some("clustertrustbundles");
+                        }
+                        if !s["podCertificate"].is_null() {
+                            return Some("podcertificates");
+                        }
+                        if s["downwardAPI"].is_null() {
+                            return Some("projected volume sources of unknown type");
+                        }
+                    }
+                }
+                k if ALLOWED_VOLUMES.contains(&k) => {}
+                _ => return Some("volumes of unknown type"),
+            }
+        }
+    }
+    None
+}
+
+fn contains_secret_ref(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(m) => m
+            .iter()
+            .any(|(k, v)| (k == "secretRef" && !v.is_null()) || contains_secret_ref(v)),
+        serde_json::Value::Array(a) => a.iter().any(contains_secret_ref),
+        _ => false,
+    }
 }
 
 const NODE_RESTRICTION_LABEL_NAMESPACE: &str = "node-restriction.kubernetes.io";
@@ -1070,16 +1252,30 @@ mod tests {
 
     fn mirror_pod_body(node_name: &str) -> serde_json::Value {
         serde_json::json!({
-            "metadata": { "annotations": { "kubernetes.io/config.mirror": "abc123" } },
+            "metadata": {
+                "annotations": { "kubernetes.io/config.mirror": "abc123" },
+                "ownerReferences": [{
+                    "apiVersion": "v1", "kind": "Node", "name": node_name,
+                    "uid": "uid-1", "controller": true,
+                }],
+            },
             "spec": { "nodeName": node_name },
         })
     }
 
+    fn create_result(body: &serde_json::Value) -> Result<(), String> {
+        authorize_pod_create(
+            "system:node:node-a",
+            &[NODES_GROUP.to_owned()],
+            body,
+            Some("uid-1"),
+        )
+    }
+
     #[test]
     fn node_can_create_a_mirror_pod_bound_to_itself() {
-        let groups = vec![NODES_GROUP.to_owned()];
         assert!(
-            authorize_pod_create("system:node:node-a", &groups, &mirror_pod_body("node-a")),
+            create_result(&mirror_pod_body("node-a")).is_ok(),
             "a kubelet registering its own static pod as a mirror pod must be allowed to \
              create it — denying this breaks static pod support entirely"
         );
@@ -1087,10 +1283,9 @@ mod tests {
 
     #[test]
     fn node_cannot_create_a_non_mirror_pod() {
-        let groups = vec![NODES_GROUP.to_owned()];
         let body = serde_json::json!({"spec": {"nodeName": "node-a"}});
         assert!(
-            !authorize_pod_create("system:node:node-a", &groups, &body),
+            create_result(&body).is_err(),
             "a node must NOT be able to create an ordinary (non-mirror) pod — that would let \
              a compromised kubelet directly schedule arbitrary pods onto itself, bypassing \
              the scheduler entirely"
@@ -1099,11 +1294,178 @@ mod tests {
 
     #[test]
     fn node_cannot_create_a_mirror_pod_bound_to_a_different_node() {
-        let groups = vec![NODES_GROUP.to_owned()];
         assert!(
-            !authorize_pod_create("system:node:node-a", &groups, &mirror_pod_body("node-b")),
+            create_result(&mirror_pod_body("node-b")).is_err(),
             "node-a must NOT be able to register a mirror pod claiming node-b — that would \
              let one compromised kubelet forge another node's static-pod mirror"
+        );
+    }
+
+    #[test]
+    fn mirror_pod_owner_reference_must_be_a_single_controller_ref_to_own_node_uid() {
+        let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+        let with_owners = |owners: serde_json::Value| {
+            let mut b = mirror_pod_body("node-a");
+            b["metadata"]["ownerReferences"] = owners;
+            b
+        };
+        let own = mirror_pod_body("node-a")["metadata"]["ownerReferences"][0].clone();
+        let mut foreign_kind = own.clone();
+        foreign_kind["kind"] = "ConfigMap".into();
+        let mut other_node = own.clone();
+        other_node["name"] = "node-b".into();
+        let mut stale_uid = own.clone();
+        stale_uid["uid"] = "other".into();
+        let mut not_controller = own.clone();
+        not_controller["controller"] = false.into();
+        let mut blocks = own.clone();
+        blocks["blockOwnerDeletion"] = true.into();
+        cases.push(("none", with_owners(serde_json::json!([]))));
+        cases.push(("two", with_owners(serde_json::json!([own.clone(), own]))));
+        cases.push((
+            "foreign kind",
+            with_owners(serde_json::json!([foreign_kind])),
+        ));
+        cases.push(("other node", with_owners(serde_json::json!([other_node]))));
+        cases.push(("uid mismatch", with_owners(serde_json::json!([stale_uid]))));
+        cases.push((
+            "not controller",
+            with_owners(serde_json::json!([not_controller])),
+        ));
+        cases.push((
+            "blockOwnerDeletion",
+            with_owners(serde_json::json!([blocks])),
+        ));
+        for (name, body) in cases {
+            assert!(
+                create_result(&body).is_err(),
+                "owner reference case {name:?} must be rejected — a mirror pod owned by \
+                 anything but its own Node would let a kubelet attach pods to foreign owners \
+                 or survive Node deletion GC"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_pod_referencing_any_api_object_is_rejected_before_it_can_reach_the_graph() {
+        let sites: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "serviceAccountName",
+                serde_json::json!({"serviceAccountName": "victim"}),
+            ),
+            (
+                "volume secret",
+                serde_json::json!({"volumes": [{"name": "v", "secret": {"secretName": "s"}}]}),
+            ),
+            (
+                "volume configMap",
+                serde_json::json!({"volumes": [{"name": "v", "configMap": {"name": "c"}}]}),
+            ),
+            (
+                "volume pvc",
+                serde_json::json!({"volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": "p"}}]}),
+            ),
+            (
+                "volume ephemeral",
+                serde_json::json!({"volumes": [{"name": "v", "ephemeral": {"volumeClaimTemplate": {}}}]}),
+            ),
+            (
+                "volume csi",
+                serde_json::json!({"volumes": [{"name": "v", "csi": {"driver": "d"}}]}),
+            ),
+            (
+                "volume azureFile",
+                serde_json::json!({"volumes": [{"name": "v", "azureFile": {"secretName": "s", "shareName": "x"}}]}),
+            ),
+            (
+                "volume rbd secretRef",
+                serde_json::json!({"volumes": [{"name": "v", "rbd": {"secretRef": {"name": "s"}}}]}),
+            ),
+            (
+                "projected secret",
+                serde_json::json!({"volumes": [{"name": "v", "projected": {"sources": [{"secret": {"name": "s"}}]}}]}),
+            ),
+            (
+                "projected configMap",
+                serde_json::json!({"volumes": [{"name": "v", "projected": {"sources": [{"configMap": {"name": "c"}}]}}]}),
+            ),
+            (
+                "projected serviceAccountToken",
+                serde_json::json!({"volumes": [{"name": "v", "projected": {"sources": [{"serviceAccountToken": {"path": "t"}}]}}]}),
+            ),
+            (
+                "env secretKeyRef",
+                serde_json::json!({"containers": [{"name": "c", "env": [{"name": "A", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}}]}]}),
+            ),
+            (
+                "env configMapKeyRef",
+                serde_json::json!({"containers": [{"name": "c", "env": [{"name": "A", "valueFrom": {"configMapKeyRef": {"name": "c", "key": "k"}}}]}]}),
+            ),
+            (
+                "envFrom secretRef",
+                serde_json::json!({"containers": [{"name": "c", "envFrom": [{"secretRef": {"name": "s"}}]}]}),
+            ),
+            (
+                "envFrom configMapRef",
+                serde_json::json!({"containers": [{"name": "c", "envFrom": [{"configMapRef": {"name": "c"}}]}]}),
+            ),
+            (
+                "initContainer env secretKeyRef",
+                serde_json::json!({"initContainers": [{"name": "c", "env": [{"name": "A", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}}]}]}),
+            ),
+            (
+                "initContainer envFrom configMapRef",
+                serde_json::json!({"initContainers": [{"name": "c", "envFrom": [{"configMapRef": {"name": "c"}}]}]}),
+            ),
+            (
+                "ephemeralContainer env secretKeyRef",
+                serde_json::json!({"ephemeralContainers": [{"name": "c", "env": [{"name": "A", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}}]}]}),
+            ),
+            (
+                "ephemeralContainer envFrom secretRef",
+                serde_json::json!({"ephemeralContainers": [{"name": "c", "envFrom": [{"secretRef": {"name": "s"}}]}]}),
+            ),
+            (
+                "imagePullSecrets",
+                serde_json::json!({"imagePullSecrets": [{"name": "s"}]}),
+            ),
+            (
+                "resourceClaims",
+                serde_json::json!({"resourceClaims": [{"name": "rc"}]}),
+            ),
+        ];
+        let mut rejected = 0;
+        for (site, extra) in &sites {
+            let mut body = mirror_pod_body("node-a");
+            for (k, v) in extra.as_object().unwrap() {
+                body["spec"][k] = v.clone();
+            }
+            let result = create_result(&body);
+            assert!(
+                result.is_err(),
+                "mirror pod with {site} must be rejected: an accepted reference becomes a \
+                 NodeGraph edge granting the node that Secret/ConfigMap/ServiceAccount token"
+            );
+            rejected += 1;
+        }
+        assert_eq!(rejected, sites.len());
+    }
+
+    #[test]
+    fn mirror_pod_with_non_api_volumes_is_still_admitted() {
+        let mut body = mirror_pod_body("node-a");
+        body["spec"]["volumes"] = serde_json::json!([
+            {"name": "a", "hostPath": {"path": "/x"}},
+            {"name": "b", "emptyDir": {}},
+            {"name": "c", "projected": {"sources": [{"downwardAPI": {}}]}},
+        ]);
+        body["spec"]["containers"] = serde_json::json!([
+            {"name": "c", "env": [{"name": "A", "value": "1"}]}
+        ]);
+        assert!(
+            create_result(&body).is_ok(),
+            "static pods using hostPath/emptyDir/downwardAPI must still mirror — over-rejecting \
+             breaks every static pod"
         );
     }
 
