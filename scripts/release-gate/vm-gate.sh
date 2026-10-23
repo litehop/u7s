@@ -18,7 +18,7 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
-COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50
+COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50; HOG_MIB=0
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
 
@@ -56,16 +56,27 @@ run_burst() {
 # new UID, and the kernel OOM log can only be mapped back to a pod through the UID in its
 # cgroup path; evicted pods stay listed, so sampling between bursts is enough.
 record_uids() {
-  k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.uid}{"\n"}{end}' 2>/dev/null \
-    | awk '$1 == "kube-system" || $1 == "kube-flannel" {print $2}' >> "$OUT/ks-uids.txt"
+  local pods
+  pods="$(k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.uid}{"\n"}{end}' 2>/dev/null)" \
+    || { log "WARNING: pod UID snapshot failed (API unreachable); OOM victims of pods created since the last snapshot are classed by comm only"; return; }
+  echo "$pods" | rg_kubesystem_uids >> "$OUT/ks-uids.txt"
 }
 
 # Kernel-log OOM victims since epoch $1, as "<host count> <kube-system count>".
 oom_since() {
-  local victims
-  victims="$(journalctl -k --no-pager --since "$(date -d "@$1" '+%Y-%m-%d %H:%M:%S')" 2>/dev/null \
-    | rg_oom_victims "$(sort -u "$OUT/ks-uids.txt" | tr - _ | tr '\n' ' ')")"
-  echo "$(echo "$victims" | grep -c '^host ') $(echo "$victims" | grep -c '^kube-system ')"
+  journalctl -k --no-pager --since "$(date -d "@$1" '+%Y-%m-%d %H:%M:%S')" 2>/dev/null \
+    | rg_oom_victims "$(rg_uids_cgroup "$OUT/ks-uids.txt")" | rg_oom_counts
+}
+
+# In-guest CPU speed probe, run only while the guest is idle: a slowdown against the fastest
+# sample is host steal, not u7s load. Also records CPU pressure (PSI).
+calibrate() {
+  local s e i=0
+  s="$(date +%s%N)"
+  while [ "$i" -lt 200000 ]; do i=$((i + 1)); done
+  e="$(date +%s%N)"
+  echo "$(date +%s) $(cat "$OUT/phase" 2>/dev/null) $(( (e - s) / 1000000 ))" >> "$OUT/cal.log"
+  echo "$(date +%s) $(cat "$OUT/phase" 2>/dev/null) $(head -1 /proc/pressure/cpu 2>/dev/null)" >> "$OUT/psi-cpu.log"
 }
 
 # Memory breakdown while a burst's pods are still running, for per-pod overhead:
@@ -125,6 +136,7 @@ if [ "$ZRAM_MIB" -gt 0 ]; then
 fi
 
 phase install
+calibrate
 log "zero-arg install.sh"
 if ! bash "$RG/install.sh" > "$OUT/install.log" 2>&1; then
   log "install.sh failed (tail of $OUT/install.log):"; tail -20 "$OUT/install.log" | tee -a "$OUT/run.log"
@@ -146,15 +158,15 @@ record_uids
 # One long-lived node watch instead of a get every 10 s. The watch replays the node's
 # condition history on (re)connect, so each line is stamped with the condition's own
 # lastTransitionTime, not the read time; callers count transitions at/after WATCH_T0, which
-# leaves the replay of install-time Unknown/False flaps out. A broken watch is logged as
-# "unreachable" and re-established.
+# leaves the replay of install-time Unknown/False flaps out. A watch that ends while the API
+# does not answer is logged as "unreachable" (counted by criterion (b)) and re-established.
 WATCH_T0="$(date +%s)"
 ( while :; do
     kubectl --kubeconfig "$KCFG" get node "$NODE" -w \
       -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}' 2>/dev/null \
       | rg_node_watch_stamp >> "$OUT/node-ready.log"
     [ -e "$OUT/watch-stop" ] && break
-    printf '%(%s)T unreachable\n' -1 >> "$OUT/node-ready.log"
+    k get node "$NODE" -o name >/dev/null 2>&1 || printf '%(%s)T unreachable\n' -1 >> "$OUT/node-ready.log"
     sleep 5
   done ) &
 WATCH_PID=$!
@@ -176,6 +188,7 @@ fi
 
 phase idle
 sleep "$SETTLE_IDLE"
+calibrate
 
 phase wordpress
 k apply -f "$RG/wordpress/mariadb-emptydir.yaml" -f "$RG/wordpress/wordpress.yaml" >> "$OUT/run.log" 2>&1
@@ -186,11 +199,36 @@ WP_IP="$(k get svc pehelypress -o jsonpath='{.spec.clusterIP}')"
 wp_code() { curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$WP_IP/"; }
 for _ in $(seq 1 100); do wp_code >/dev/null; done
 log "wordpress warm-up GET / -> $(wp_code)"
+
+# MariaDB is on emptyDir: a recreated pod is an empty DB that WordPress answers with a 302 to
+# its installer. The marker row must read back after the bursts.
+MARKER="rg-$(date +%s)-$RANDOM"
+mysql_k() { k -n default exec mariadb-0 -- mariadb -uvalerauko -puserpw-phase3 valenet -N -B -e "$1"; }
+mysql_k "CREATE TABLE rg_marker (v VARCHAR(64) NOT NULL); INSERT INTO rg_marker VALUES ('$MARKER')" >> "$OUT/run.log" 2>&1 \
+  || log "marker write failed"
+marker_ok() {
+  local i v=""
+  for i in $(seq 1 12); do
+    v="$(mysql_k 'SELECT v FROM rg_marker' 2>/dev/null)" && [ -n "$v" ] && break
+    sleep 5
+  done
+  rg_marker_ok "$MARKER" "$v"
+}
 sleep "$SETTLE_STEP"
 
 phase warmup
 k create deployment rg-burst --image="$PAUSE_IMAGE" --replicas=1 >> "$OUT/run.log" 2>&1
 kw wait --for=condition=Available deployment/rg-burst --timeout=300s >> "$OUT/run.log" 2>&1 || log "warm-up pod not Available"
+
+# Forced-failure lever applied after install: pinned tmpfs pages (no swap) squeeze the burst
+# instead of the install.
+if [ "$HOG_MIB" -gt 0 ]; then
+  phase hog
+  mkdir -p /mnt/rg-hog && mount -t tmpfs -o "size=${HOG_MIB}m" tmpfs /mnt/rg-hog \
+    && dd if=/dev/zero of=/mnt/rg-hog/hog bs=1M count="$HOG_MIB" 2>/dev/null \
+    || { log "memory hog setup failed"; res hog_ok 0; exit 1; }
+  res hog_ok 1; log "memory hog: ${HOG_MIB} MiB pinned"
+fi
 
 wp_ok_poll() {
   local _
@@ -212,6 +250,7 @@ run_ramp() {
     snap "burst$n"
     burst_cleanup; phase "settle$n"; wait_node_ready || log "node not Ready after $n-pod burst"
     sleep "$SETTLE_STEP"
+    calibrate
     record_uids
     read -r oomh oomk <<< "$(oom_since "$t0")"
     res "ramp_${n}_secs" "$secs"
@@ -220,6 +259,7 @@ run_ramp() {
     res "ramp_${n}_notready" "$(rg_notready_since "$OUT/node-ready.log" "$t0")"
     res "ramp_${n}_ready_final" "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
     res "ramp_${n}_wp_ok" "$(wp_ok_poll)"
+    res "ramp_${n}_marker_ok" "$(marker_ok)"
     if ! rg_ramp_step "$OUT/results.env" "$n" >/dev/null; then log "ramp stopped: $n-pod burst failed"; break; fi
   done
 }
@@ -229,17 +269,20 @@ run_full() {
   b20="$(run_burst 20)"; res burst20_secs "$b20"; log "20-pod burst: $b20 s"
   snap burst20
   burst_cleanup; phase settle20; sleep "$SETTLE_STEP"
+  calibrate
   record_uids
 
   phase burstn
   bn="$(run_burst "$BURST_PODS")"; res burst_pods "$BURST_PODS"; res burst_secs "$bn"; log "$BURST_PODS-pod burst: $bn s"
   snap burstn
   burst_cleanup; phase settlen; sleep "$SETTLE_STEP"
+  calibrate
   record_uids
 
   phase wpcheck
   wp_ok="$(wp_ok_poll)"
   res wp_ok "$wp_ok"; log "WordPress after settle: ok=$wp_ok"
+  res marker_ok "$(marker_ok)"; log "DB marker after settle: marker_ok=$(rg_get "$OUT/results.env" marker_ok)"
 
   phase webhook
   if timeout 900 bash "$RG/webhook-smoke.sh" --kubeconfig "$KCFG" > "$OUT/webhook-smoke.log" 2>&1; then
@@ -267,10 +310,12 @@ journalctl -u kubelet --no-pager -o short-iso 2>&1 | grep -iE 'evict|PLEG is not
 k get pods -A -o wide > "$OUT/pods.txt" 2>&1
 k get events -A --field-selector reason=Evicted -o custom-columns=NS:.metadata.namespace,OBJ:.involvedObject.name --no-headers > "$OUT/evictions.txt" 2>/dev/null
 k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} restarts={.status.containerStatuses[*].restartCount} last={.status.containerStatuses[*].lastState.terminated.reason}{"\n"}{end}' > "$OUT/pod-restarts.txt" 2>&1
-KS_UIDS="$(sort -u "$OUT/ks-uids.txt" | tr - _ | tr '\n' ' ')"
-rg_oom_victims "$KS_UIDS" < "$OUT/kernel.log" > "$OUT/oom-victims.txt"
-res oom_host "$(grep -c '^host ' "$OUT/oom-victims.txt")"
-res oom_kubesystem "$(grep -c '^kube-system ' "$OUT/oom-victims.txt")"
+rg_oom_victims "$(rg_uids_cgroup "$OUT/ks-uids.txt")" < "$OUT/kernel.log" > "$OUT/oom-victims.txt"
+read -r oomh oomk <<< "$(rg_oom_counts < "$OUT/oom-victims.txt")"
+res oom_host "$oomh"
+res oom_kubesystem "$oomk"
+res cal_ref_ms "$(sort -n -k3 "$OUT/cal.log" | head -1 | cut -d' ' -f3)"
+res cal_max_ms "$(sort -n -k3 "$OUT/cal.log" | tail -1 | cut -d' ' -f3)"
 res oom_victims "$(awk '{print $1":"$2}' "$OUT/oom-victims.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
 res notready_events "$(rg_notready_since "$OUT/node-ready.log" "$WATCH_T0")"
 res api_unreachable_polls "$(grep -c ' unreachable$' "$OUT/node-ready.log")"

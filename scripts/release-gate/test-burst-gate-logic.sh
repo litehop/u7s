@@ -30,6 +30,7 @@ burst20_secs=12
 burst_pods=50
 burst_secs=140
 wp_ok=1
+marker_ok=1
 webhook_ok=1
 EOF
 }
@@ -64,6 +65,7 @@ expect_fail "(b) node not Ready at the end -> FAIL even with no recorded flap" n
 expect_fail "(c) 20-pod burst over the cap -> FAIL: pods stuck Pending is the user-visible symptom of thrash" burst20_secs 301 '(c)'
 expect_fail "(c) 50-pod burst hit the hard kill -> FAIL" burst_secs timeout '(c)'
 expect_fail "(d) WordPress dead after the burst -> FAIL: the workload the node exists to serve" wp_ok 0 '(d)'
+expect_fail "(d) DB marker gone (recreated emptyDir MariaDB) -> FAIL even though WordPress still answers: its installer 302 is not a healthy site" marker_ok 0 '(d)'
 expect_fail "(e) webhook smoke failed -> FAIL: only gate for the shipped webhook dial path" webhook_ok 0 '(e)'
 expect_fail "install failed -> FAIL" install_ok 0 install
 
@@ -71,7 +73,7 @@ verdict_of "$(mutate burst20_secs 300)"
 assert "burst exactly at the 300 s cap passes (cap is inclusive: 'within 5 min')" "$([ "$V_RC" = 0 ] && echo 1 || echo 0)"
 
 # Missing data must never pass.
-for key in oom_host oom_kubesystem notready_events node_ready_final burst20_secs burst_pods burst_secs wp_ok webhook_ok install_ok; do
+for key in oom_host oom_kubesystem notready_events node_ready_final burst20_secs burst_pods burst_secs wp_ok marker_ok webhook_ok install_ok; do
   verdict_of "$(mutate "$key" -)"
   assert "missing $key -> FAIL: a run that died before producing it must not look green" "$([ "$V_RC" != 0 ] && echo 1 || echo 0)"
 done
@@ -102,7 +104,9 @@ assert "host process classified by cgroup even if comm is unknown (e.g. renamed 
 # Experiment-flag parsing, with a stub limactl that fails every call so no VM is ever created;
 # gate.env is staged before the first VM and shows what the VM would receive.
 mkdir -p "$TMP/tb" "$TMP/bin"
-printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/limactl"; chmod +x "$TMP/bin/limactl"
+printf '#!/bin/sh\n[ "$1" = list ] && exit 0\nexit 1\n' > "$TMP/bin/limactl"; chmod +x "$TMP/bin/limactl"
+printf '#!/bin/sh\necho 100\n' > "$TMP/bin/idle100"; chmod +x "$TMP/bin/idle100"
+export RG_IDLE_PROBE="$TMP/bin/idle100" QUIET_RECHECK_SECS=1 RG_RETRY_WAIT_SECS=0
 PATH="$TMP/bin:$PATH"
 gate_env() { "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-$1" "${@:2}" >/dev/null 2>&1; cat "$TMP/out-$1/stage/gate.env"; }
 assert "--zram-mib 512 reaches the VM env" "$(gate_env z512 --zram-mib 512 | grep -qx 'ZRAM_MIB=512' && echo 1 || echo 0)"
@@ -117,7 +121,7 @@ for bad in abc -5 1.5 ""; do
 done
 
 # --runs validation: BSD `seq 1 0` counts down, so --runs 0 once created a real VM.
-printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\nexit 1\n' > "$TMP/bin/limactl"
+printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\n[ "$1" = list ] && exit 0\nexit 1\n' > "$TMP/bin/limactl"
 export LIMA_CALLS="$TMP/lima-calls"
 for bad in 0 00 -1 abc 1.5 ""; do
   : > "$LIMA_CALLS"; rm -rf "$TMP/out-runs"
@@ -141,8 +145,8 @@ assert "rg_wait_ready does not match 2 against 20 (prefix) or an empty line" \
   "$(printf '20\n\n' | rg_wait_ready 2 && echo 0 || echo 1)"
 
 printf '100 True\n200 False\n300 Unknown\n400 unreachable\n500 True\n' > "$TMP/nr.log"
-assert "rg_notready_since counts only observations at/after the burst start" "$([ "$(rg_notready_since "$TMP/nr.log" 300)" = 1 ] && echo 1 || echo 0)"
-assert "rg_notready_since counts False and Unknown but not unreachable" "$([ "$(rg_notready_since "$TMP/nr.log" 0)" = 2 ] && echo 1 || echo 0)"
+assert "rg_notready_since counts only observations at/after the burst start" "$([ "$(rg_notready_since "$TMP/nr.log" 300)" = 2 ] && echo 1 || echo 0)"
+assert "rg_notready_since counts False, Unknown and unreachable: a dead API is the worst not-Ready and must fail (b)" "$([ "$(rg_notready_since "$TMP/nr.log" 0)" = 3 ] && echo 1 || echo 0)"
 
 # Node-watch stamping: the watch replays install-time flaps on (re)connect.
 T0=$(( $(date +%s) - 3600 ))
@@ -158,7 +162,7 @@ printf 'False %s\nFalse %s\nFalse %s\n' "$POST" "$POST" "$POST" | rg_node_watch_
 assert "duplicate watch lines are deduped: one flap is one observation" \
   "$([ "$(wc -l < "$TMP/w3.log" | tr -d ' ')" = 1 ] && [ "$(rg_notready_since "$TMP/w3.log" "$T0")" = 1 ] && echo 1 || echo 0)"
 printf 'False %s\n' "$PRE" | rg_node_watch_stamp > "$TMP/w4.log"
-ramp_env_stuck="$(printf 'ramp_30_secs=20\nramp_30_oom_host=0\nramp_30_oom_kubesystem=0\nramp_30_notready=%s\nramp_30_ready_final=False\nramp_30_wp_ok=1\n' "$(rg_notready_since "$TMP/w4.log" "$T0")")"
+ramp_env_stuck="$(printf 'ramp_30_secs=20\nramp_30_oom_host=0\nramp_30_oom_kubesystem=0\nramp_30_notready=%s\nramp_30_ready_final=False\nramp_30_wp_ok=1\nramp_30_marker_ok=1\n' "$(rg_notready_since "$TMP/w4.log" "$T0")")"
 printf '%s\n' "$ramp_env_stuck" > "$TMP/stuck.env"
 assert "node still False from before the burst is not counted as a flap but fails (b) via the final-Ready check" \
   "$([ "$(rg_ramp_step "$TMP/stuck.env" 30)" = "PASS FAIL PASS PASS" ] && echo 1 || echo 0)"
@@ -179,8 +183,8 @@ ramp_env() {
   local n
   for n in "$@"; do
     case "$n" in
-      *:bad) n="${n%:bad}"; printf 'ramp_%s_secs=timeout\nramp_%s_oom_host=0\nramp_%s_oom_kubesystem=0\nramp_%s_notready=1\nramp_%s_ready_final=False\nramp_%s_wp_ok=0\n' "$n" "$n" "$n" "$n" "$n" "$n" ;;
-      *) printf 'ramp_%s_secs=20\nramp_%s_oom_host=0\nramp_%s_oom_kubesystem=0\nramp_%s_notready=0\nramp_%s_ready_final=True\nramp_%s_wp_ok=1\n' "$n" "$n" "$n" "$n" "$n" "$n" ;;
+      *:bad) n="${n%:bad}"; printf 'ramp_%s_secs=timeout\nramp_%s_oom_host=0\nramp_%s_oom_kubesystem=0\nramp_%s_notready=1\nramp_%s_ready_final=False\nramp_%s_wp_ok=0\nramp_%s_marker_ok=0\n' "$n" "$n" "$n" "$n" "$n" "$n" "$n" ;;
+      *) printf 'ramp_%s_secs=20\nramp_%s_oom_host=0\nramp_%s_oom_kubesystem=0\nramp_%s_notready=0\nramp_%s_ready_final=True\nramp_%s_wp_ok=1\nramp_%s_marker_ok=1\n' "$n" "$n" "$n" "$n" "$n" "$n" "$n" ;;
     esac
   done
 }
@@ -205,7 +209,7 @@ assert "ramp step with no node status (API unreachable) is reported as unreachab
 ramp_env 30:bad > "$TMP/ramp0.env"
 out="$(rg_ramp_verdict "$TMP/ramp0.env" "30 40" "$TMP/s.tsv")" && rrc=0 || rrc=$?
 assert "ramp with a failing first size has no candidate and exits non-zero" "$([ "$rrc" != 0 ] && echo "$out" | grep -q 'no size passed' && echo 1 || echo 0)"
-for key in secs oom_host oom_kubesystem notready ready_final wp_ok; do
+for key in secs oom_host oom_kubesystem notready ready_final wp_ok marker_ok; do
   ramp_env 30 | grep -v "^ramp_30_$key=" > "$TMP/rampm.env"
   assert "ramp step missing ramp_30_$key is not a pass (a step that died midway must not become the candidate)" \
     "$(rg_ramp_step "$TMP/rampm.env" 30 >/dev/null && echo 0 || echo 1)"
@@ -223,17 +227,23 @@ verdict_of "$(mutate burst_pods -)"
 assert "missing burst_pods fails (c): a verdict that cannot name its pod count is not citable" "$([ "$V_RC" != 0 ] && echo 1 || echo 0)"
 
 # Confirm mode: ceiling is the first size (50, then 40) passing every run.
-out="$(rg_confirm_verdict 50:3:3)" && crc=0 || crc=$?
+out="$(rg_confirm_verdict 50:3:3:3)" && crc=0 || crc=$?
 assert "50 passes 3/3 -> gated ceiling 50 (the highest tried size wins)" \
   "$([ "$crc" = 0 ] && echo "$out" | grep -q 'gated no-swap burst ceiling = 50 pods' && echo 1 || echo 0)"
-out="$(rg_confirm_verdict 50:2:3 40:3:3)" && crc=0 || crc=$?
+out="$(rg_confirm_verdict 50:2:3:3 40:3:3:3)" && crc=0 || crc=$?
 assert "50 fails once -> falls to 40 and gates at 40: one flaky run at 50 must not ship a 50-pod claim" \
   "$([ "$crc" = 0 ] && echo "$out" | grep -q 'gated no-swap burst ceiling = 40 pods' && ! echo "$out" | grep -q 'ceiling = 50' && echo 1 || echo 0)"
-out="$(rg_confirm_verdict 50:1:3 40:2:3)" && crc=0 || crc=$?
+out="$(rg_confirm_verdict 50:1:3:3 40:2:3:3)" && crc=0 || crc=$?
 assert "40 also fails -> FAIL with no ceiling: the release must not claim a burst size it did not confirm" \
   "$([ "$crc" != 0 ] && echo "$out" | grep -q '^CONFIRM: FAIL' && ! echo "$out" | grep -q 'ceiling =' && echo 1 || echo 0)"
-rg_confirm_verdict 50:0:0 >/dev/null && crc=0 || crc=$?
+rg_confirm_verdict 50:0:0:0 >/dev/null && crc=0 || crc=$?
 assert "0/0 runs is not a pass (a gate that ran nothing must not confirm a ceiling)" "$([ "$crc" != 0 ] && echo 1 || echo 0)"
+out="$(rg_confirm_verdict 50:2:2:3 40:3:3:3)" && crc=0 || crc=$?
+assert "50 ran out of valid runs (noise, no FAIL) -> INVALID exit 3, never falls to 40: noise must not lower the gated ceiling" \
+  "$([ "$crc" = 3 ] && echo "$out" | grep -q '^CONFIRM: INVALID' && ! echo "$out" | grep -q 'ceiling =' && echo 1 || echo 0)"
+out="$(rg_confirm_verdict 50:1:2:3 40:3:3:3)" && crc=0 || crc=$?
+assert "a valid FAIL at 50 is final even when other runs were INVALID -> falls to 40" \
+  "$([ "$crc" = 0 ] && echo "$out" | grep -q 'ceiling = 40 pods' && echo 1 || echo 0)"
 
 rc=0; "$HERE/burst-gate.sh" --burst-pods 0 --tarball-dir "$TMP/tb" --out "$TMP/out-bp" >/dev/null 2>&1 || rc=$?
 assert "--burst-pods 0 rejected" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
@@ -263,6 +273,116 @@ rm -rf "$TMP/out-conf"
 rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-conf" 2>/dev/null)" || rc=$?
 assert "--confirm with every run failing tries 50 then falls to 40 and ends FAIL (exit non-zero)" \
   "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=50' "$TMP/out-conf/burst-50/stage/gate.env" && grep -qx 'BURST_PODS=40' "$TMP/out-conf/burst-40/stage/gate.env" && echo "$out" | grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
+
+# --- marker (item: criterion (d) false pass) ---
+assert "marker read back equal -> ok" "$([ "$(rg_marker_ok rg-1 rg-1)" = 1 ] && echo 1 || echo 0)"
+assert "empty read (recreated DB, table missing) -> not ok: the false-PASS path through the installer 302" \
+  "$([ "$(rg_marker_ok rg-1 '')" = 0 ] && echo 1 || echo 0)"
+assert "empty expected never matches an empty read (failed marker write must not pass)" \
+  "$([ "$(rg_marker_ok '' '')" = 0 ] && echo 1 || echo 0)"
+assert "a different marker (DB re-seeded by another pod) -> not ok" "$([ "$(rg_marker_ok rg-1 rg-2)" = 0 ] && echo 1 || echo 0)"
+
+# --- vm-gate collectors ---
+UIDLIST="$(printf 'kube-system 11-aa\ndefault 22-bb\nkube-flannel 33-cc\nkube-system-extra 44-dd\n' | rg_kubesystem_uids | tr '\n' ' ')"
+assert "UID map keeps kube-system and kube-flannel pods only (workload pods must not be classed kube-system)" \
+  "$([ "$UIDLIST" = '11-aa 33-cc ' ] && echo 1 || echo 0)"
+printf '11-aa\n11-aa\n33-cc\n' > "$TMP/uids.txt"
+assert "UID file -> cgroup spelling, deduped (kernel cgroup paths use underscores)" \
+  "$([ "$(rg_uids_cgroup "$TMP/uids.txt")" = '11_aa 33_cc ' ] && echo 1 || echo 0)"
+printf 'host u7s-apiserver\nhost kubelet\nkube-system coredns\nother php-fpm\nkube-systemx y\n' > "$TMP/victims.txt"
+assert "OOM counts: host and kube-system tallied separately, other ignored, prefix lookalikes not counted" \
+  "$([ "$(rg_oom_counts < "$TMP/victims.txt")" = '2 1' ] && echo 1 || echo 0)"
+assert "OOM counts of an empty victim list are 0 0 (a clean run reports zeros, not blanks)" \
+  "$([ "$(rg_oom_counts < /dev/null)" = '0 0' ] && echo 1 || echo 0)"
+assert "coredns killed with a UID never recorded (pod died between snapshots / API outage) is still kube-system by comm" \
+  "$([ "$(rg_classify_oom coredns /kubepods.slice/kubepods-besteffort-podffff_9999.slice/crio-z.scope '')" = kube-system ] && echo 1 || echo 0)"
+assert "an unrecorded workload pod stays other" \
+  "$([ "$(rg_classify_oom php-fpm /kubepods.slice/kubepods-besteffort-podffff_9999.slice/crio-z.scope "$UIDS")" = other ] && echo 1 || echo 0)"
+out="$({ klog coredns /kubepods.slice/x.slice/crio-a.scope; klog kubelet /system.slice/kubelet.service; } | rg_oom_victims "" | rg_oom_counts)"
+assert "kernel log -> victims -> counts end to end with an empty UID map" "$([ "$out" = '1 1' ] && echo 1 || echo 0)"
+
+# --- host contention / INVALID ---
+LIST="$(printf 'NAME STATUS SSH\nu7s-rg-1 Running 127.0.0.1:1\nother Running 127.0.0.1:2\nstopped Stopped -\n')"
+assert "rg_other_vms excludes the gate's own VM and stopped VMs (own VM was listed as 'running' in host_state end)" \
+  "$([ "$(echo "$LIST" | rg_other_vms u7s-rg-1)" = other ] && echo 1 || echo 0)"
+assert "rg_other_vms is empty when only the gate's own VM runs" \
+  "$([ -z "$(echo "$LIST" | grep -v '^other' | rg_other_vms u7s-rg-1)" ] && echo 1 || echo 0)"
+assert "idle % parsed from the LAST top sample (the first is since-boot)" \
+  "$([ "$(printf 'CPU usage: 1.0%% user, 1.0%% sys, 98.0%% idle\nCPU usage: 20.1%% user, 10.0%% sys, 69.9%% idle\n' | rg_idle_from_top)" = 69 ] && echo 1 || echo 0)"
+assert "idle % parsed from the last vmstat row" \
+  "$([ "$(printf 'procs\n r b swpd\n 1 0 0 1 2 3 4 5 6 7 8 9 10 11 99\n 1 0 0 1 2 3 4 5 6 7 8 9 10 11 55\n' | rg_idle_from_vmstat)" = 55 ] && echo 1 || echo 0)"
+q="$TMP/q.log"
+rg_quiet_line 1 95 0 > "$q"; rg_quiet_line 2 70 0 >> "$q"
+assert "quiet log at/above 70% idle with no other VMs -> no reasons (70 is inclusive)" "$([ -z "$(rg_quiet_log_reasons "$q")" ] && echo 1 || echo 0)"
+rg_quiet_line 3 69 0 >> "$q"
+assert "idle below 70% -> contended (load average is not a usable threshold; idle is)" "$(rg_quiet_log_reasons "$q" | grep -q '69% < 70%' && echo 1 || echo 0)"
+rg_quiet_line 1 95 1 > "$q"
+assert "another running VM -> contended" "$(rg_quiet_log_reasons "$q" | grep -q 'other Lima VMs' && echo 1 || echo 0)"
+rg_quiet_line 1 '' 0 > "$q"
+assert "unmeasurable idle -> contended (quiet cannot be proven)" "$(rg_quiet_log_reasons "$q" | grep -q 'not measurable' && echo 1 || echo 0)"
+rg_quiet_line 1 95 '' > "$q"
+assert "unmeasurable VM list -> contended" "$([ -n "$(rg_quiet_log_reasons "$q")" ] && echo 1 || echo 0)"
+assert "missing quiet log -> no reasons (nothing observed)" "$([ -z "$(rg_quiet_log_reasons "$TMP/nonexistent")" ] && echo 1 || echo 0)"
+printf 'cal_ref_ms=100\ncal_max_ms=150\n' > "$TMP/cal.env"
+assert "calibration exactly 1.5x the reference is not contention" "$([ -z "$(rg_cal_reason "$TMP/cal.env")" ] && echo 1 || echo 0)"
+printf 'cal_ref_ms=100\ncal_max_ms=151\n' > "$TMP/cal.env"
+assert "calibration over 1.5x the reference -> contention reason" "$(rg_cal_reason "$TMP/cal.env" | grep -q '151ms > 1.5x reference 100ms' && echo 1 || echo 0)"
+assert "missing calibration data is no evidence of contention" "$([ -z "$(rg_cal_reason "$TMP/empty.env")" ] && echo 1 || echo 0)"
+rg_quiet_line 1 95 0 > "$TMP/quiet.log"; rg_quiet_line 1 40 0 > "$TMP/noisy.log"
+assert "PASS under contention stays PASS (a green run on a noisy host is still evidence u7s survives)" \
+  "$([ "$(rg_run_status 0 "$TMP/noisy.log" "$TMP/empty.env")" = PASS ] && echo 1 || echo 0)"
+assert "FAIL under contention -> INVALID (the failure cannot be blamed on u7s)" \
+  "$([ "$(rg_run_status 1 "$TMP/noisy.log" "$TMP/empty.env")" = INVALID ] && echo 1 || echo 0)"
+assert "FAIL on a quiet host stays FAIL" "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/empty.env")" = FAIL ] && echo 1 || echo 0)"
+printf 'cal_ref_ms=100\ncal_max_ms=400\n' > "$TMP/cal.env"
+assert "FAIL with a slow in-guest calibration on a quiet-looking host -> INVALID (steal the host probe missed)" \
+  "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/cal.env")" = INVALID ] && echo 1 || echo 0)"
+
+# --- watchdog kills the in-VM workload ---
+for cmd in 'bash /var/tmp/rg/vm-gate.sh' 'bash /var/tmp/rg/vm-sampler.sh /var/tmp/rg/out 5' 'bash /var/tmp/rg/webhook-smoke.sh --kubeconfig x' 'bash /var/tmp/rg/install.sh'; do
+  assert "kill pattern matches '$cmd' (a surviving in-VM workload keeps loading the host after the cap)" \
+    "$(echo "$cmd" | grep -qE "$RG_VM_KILL_PATTERN" && echo 1 || echo 0)"
+done
+for cmd in 'bash -c sudo pkill -KILL -f ^bash /var/tmp/rg/vm-gate.sh' 'pkill -KILL -f x /var/tmp/rg/vm-gate.sh' 'kubectl get node'; do
+  assert "kill pattern does not match '$cmd' (the killer must not kill itself or unrelated processes)" \
+    "$(echo "$cmd" | grep -qE "$RG_VM_KILL_PATTERN" && echo 0 || echo 1)"
+done
+
+# --- forced failure must fail in the burst, not the install ---
+good | sed 's/^burst_secs=.*/burst_secs=timeout/' > "$TMP/ff-burst.env"
+printf 'burst20\n' > "$TMP/ph-burst"; printf 'idle\n' > "$TMP/ph-idle"
+assert "forced failure that failed (c) in the burst phase -> OK" \
+  "$(rg_forced_failure_check "$TMP/ff-burst.env" "$TMP/ph-burst" >/dev/null && echo 1 || echo 0)"
+assert "forced failure that never left the idle phase is NOT OK (it proved nothing about the burst)" \
+  "$(rg_forced_failure_check "$TMP/ff-burst.env" "$TMP/ph-idle" >/dev/null && echo 0 || echo 1)"
+assert "forced failure with a failed install is NOT OK (the earlier 640 MiB run died in tar, not in the burst)" \
+  "$(good | sed 's/^install_ok=.*/install_ok=0/' > "$TMP/ff-inst.env"; rg_forced_failure_check "$TMP/ff-inst.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
+assert "forced failure whose run passed is NOT OK (the gate failed to fail)" \
+  "$(rg_forced_failure_check "$TMP/good.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
+assert "forced failure failing only (e) webhook is NOT OK (not a burst/OOM criterion)" \
+  "$(good | sed 's/^webhook_ok=.*/webhook_ok=0/' > "$TMP/ff-wh.env"; rg_forced_failure_check "$TMP/ff-wh.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
+
+# --- burst-gate.sh end to end with stubs ---
+assert "--mem-hog-mib reaches the VM env" "$("$HERE/burst-gate.sh" --runs 1 --mem-hog-mib 400 --tarball-dir "$TMP/tb" --out "$TMP/out-hog" >/dev/null 2>&1; grep -qx 'HOG_MIB=400' "$TMP/out-hog/stage/gate.env" && echo 1 || echo 0)"
+assert "HOG_MIB defaults to 0" "$(grep -qx 'HOG_MIB=0' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
+rc=0; "$HERE/burst-gate.sh" --mem-hog-mib x --tarball-dir "$TMP/tb" --out "$TMP/out-bad" >/dev/null 2>&1 || rc=$?
+assert "--mem-hog-mib x rejected with exit 2" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
+
+printf '#!/bin/sh\necho 30\n' > "$TMP/bin/idle30"; chmod +x "$TMP/bin/idle30"
+: > "$LIMA_CALLS"; rm -rf "$TMP/out-noisy"
+rc=0; RG_IDLE_PROBE="$TMP/bin/idle30" "$HERE/burst-gate.sh" --runs 2 --tarball-dir "$TMP/tb" --out "$TMP/out-noisy" >/dev/null 2>&1 || rc=$?
+assert "noisy host at pre-flight: exit 3 INVALID, no VM created (a noisy host must neither pass nor fail the release)" \
+  "$([ "$rc" = 3 ] && ! grep -q '^create ' "$LIMA_CALLS" && [ "$(cat "$TMP/out-noisy/valid")" = 0 ] && [ "$(cat "$TMP/out-noisy/passed")" = 0 ] && echo 1 || echo 0)"
+assert "INVALID attempts are retried up to MAX_INVALID_RUNS (3) and never counted toward RUNS" \
+  "$([ "$(ls -d "$TMP"/out-noisy/run-* | wc -l | tr -d ' ')" = 3 ] && echo 1 || echo 0)"
+: > "$LIMA_CALLS"; rm -rf "$TMP/out-quiet"
+rc=0; "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-quiet" >/dev/null 2>&1 || rc=$?
+assert "quiet host + VM that cannot start -> FAIL exit 1 (not INVALID: no contention was observed)" \
+  "$([ "$rc" = 1 ] && [ "$(cat "$TMP/out-quiet/valid")" = 1 ] && echo 1 || echo 0)"
+rm -rf "$TMP/out-conf2"
+rc=0; out="$(RG_IDLE_PROBE="$TMP/bin/idle30" "$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-conf2" 2>/dev/null)" || rc=$?
+assert "--confirm on a noisy host: INVALID exit 3, and it never falls through to 40 pods" \
+  "$([ "$rc" = 3 ] && echo "$out" | grep -q '^CONFIRM: INVALID' && [ ! -e "$TMP/out-conf2/burst-40" ] && echo 1 || echo 0)"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
