@@ -2089,7 +2089,7 @@ fn parse_vap_ternary(
         if let CelToken::Question = &tokens[*pos] {
             *pos += 1;
             let take_true = cond.as_bool()?;
-            let mut arm = |evaluate: bool, pos: &mut usize| {
+            let arm = |evaluate: bool, pos: &mut usize| {
                 if evaluate {
                     parse_vap_ternary(
                         tokens,
