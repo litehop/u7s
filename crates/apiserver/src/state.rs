@@ -910,9 +910,10 @@ pub struct AppState<S = SqliteStore> {
     pub konnectivity_proxy_addr: Option<String>,
     /// Concatenated PEM (cert + key) presented to AGGREGATED BACKENDS (not to u7s itself)
     /// by `handlers::aggregation::build_backend_client`. Signed by the dedicated front-proxy
-    /// CA (`TlsMaterial::proxy_client_cert_pem`'s doc), (never the admin cert). An aggregated backend trusts this one specifically via
-    /// `requestheader-client-ca-file`
-    /// to assert X-Remote-User/-Group identity. Not part of `AppStateConfig`: no test caller
+    /// CA (`TlsMaterial::proxy_client_cert_pem`'s doc), never the admin cert. An aggregated backend
+    /// trusts this one specifically via `requestheader-client-ca-file` to assert
+    /// X-Remote-User/-Group identity. Webhook callouts present it only to konnectivity-server, and
+    /// only when konnectivity is configured. Not part of `AppStateConfig`: no test caller
     /// needs a non-default value at construction time, so `run()` sets this field directly
     /// after construction, same pattern as `node_kubelet_ports`/`sa_sig_cache`.
     pub proxy_client_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
