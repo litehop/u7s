@@ -97,9 +97,12 @@ pub const WATCH_RETRY_AFTER_SECONDS: u64 = 1;
 /// Identities whose watches bypass both the per-client and global caps, so a tenant
 /// exhausting the pool cannot lock out the control plane (and the controller-manager's
 /// 100+ watches fit): the provisioned admin (CN=admin, O=system:masters), kubelets
-/// (`system:node:<name>`, O=system:nodes), the controller-manager and the scheduler.
-/// Mirrors upstream APF's exempt (system:masters), system-nodes and system-leader-election
-/// flow schemas. Matched on username, which is only as trustworthy as the cluster CA's
+/// (`system:node:<name>`, O=system:nodes), the controller-manager, the scheduler and the
+/// kube-system ServiceAccounts the controller-manager runs its controllers as.
+/// Mirrors upstream APF's exempt (system:masters), system-nodes, system-leader-election and
+/// kube-system-service-accounts (workload-high) flow schemas. Minting a kube-system
+/// ServiceAccount (or its token) needs write access to kube-system, which is already a
+/// control-plane grant. Matched on username, which is only as trustworthy as the cluster CA's
 /// issuance: a principal allowed to approve and sign `kubernetes.io/kube-apiserver-client`
 /// CSRs can mint a certificate with any CN here (upstream's signer likewise forbids only
 /// O=system:masters), so that RBAC grant is effectively a control-plane grant.
@@ -108,6 +111,7 @@ pub fn is_system_priority_username(username: &str) -> bool {
         username,
         "admin" | "system:kube-controller-manager" | "system:kube-scheduler"
     ) || username.starts_with("system:node:")
+        || username.starts_with("system:serviceaccount:kube-system:")
 }
 
 /// Watch stream concurrency limiter: a semaphore per authenticated username plus one
@@ -2075,6 +2079,27 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priority_is_limited_to_kube_system_service_accounts() {
+        for u in [
+            "system:serviceaccount:kube-system:deployment-controller",
+            "system:kube-controller-manager",
+        ] {
+            assert!(
+                is_system_priority_username(u),
+                "{u} runs control-plane controllers"
+            );
+        }
+        for u in [
+            "system:serviceaccount:default:deployment-controller",
+            "system:serviceaccount:kube-system-evil:x",
+            "system:serviceaccount:kube-system",
+            "kube-system:x",
+        ] {
+            assert!(!is_system_priority_username(u), "{u} is tenant-mintable");
+        }
+    }
 
     // Regression test for the other half of the CrConversionCache memory-growth bug (the
     // namespace-cascade eviction gap has its own regression test in handlers/namespaces.rs):
