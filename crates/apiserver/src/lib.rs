@@ -381,19 +381,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     };
 
     // 10. Build app state (shared with the auth layer).
-    // Combine admin cert PEM + admin key PEM for the webhook mTLS client identity.
-    // The webhook client will present this certificate when connecting to admission
-    // webhook servers, so they can verify they are talking to the apiserver.
-    let mut webhook_identity_pem = tls_material.admin_cert_pem.clone();
-    webhook_identity_pem.extend_from_slice(&tls_material.admin_key_pem);
+    let webhook_identity_pem = tls_material.webhook_client_identity_pem();
     // Combine kubelet client cert PEM + key PEM for the kubelet proxy client identity.
     // The apiserver presents this certificate when proxying log/exec/attach requests to
     // the kubelet. Kubelet accepts certs with O=system:masters signed by the cluster CA.
     let mut kubelet_client_identity_pem = tls_material.kubelet_client_cert_pem.clone();
     kubelet_client_identity_pem.extend_from_slice(&tls_material.kubelet_client_key_pem);
     // Combine proxy-client cert PEM + key PEM for the mTLS identity presented to
-    // AGGREGATED BACKENDS (see `TlsMaterial::proxy_client_cert_pem`'s doc) — distinct from
-    // webhook_identity_pem (the admin cert) above.
+    // AGGREGATED BACKENDS (see `TlsMaterial::proxy_client_cert_pem`'s doc).
     let mut proxy_client_identity_pem = tls_material.proxy_client_cert_pem.clone();
     proxy_client_identity_pem.extend_from_slice(&tls_material.proxy_client_key_pem);
     let mut state = state::AppState::new_with_config(state::AppStateConfig {
@@ -442,17 +437,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             let mut identity_pem = tls::pem_encode("CERTIFICATE", &leaf.cert_der);
             identity_pem.extend_from_slice(&leaf.key_pem);
             match name {
-                "admin" => {
+                "kubelet-client" => rotation_state.set_kubelet_identity(identity_pem),
+                "proxy-client" => {
+                    rotation_state
+                        .proxy_client_identity_pem
+                        .set(Some(Arc::new(identity_pem.clone())));
                     if let Err(e) = rotation_state.set_webhook_identity(identity_pem) {
                         rotation_inventory
                             .record_failure(name, format_args!("webhook client: {e}"));
                         tracing::error!("webhook client after rotating {name}: {e}");
                     }
                 }
-                "kubelet-client" => rotation_state.set_kubelet_identity(identity_pem),
-                "proxy-client" => rotation_state
-                    .proxy_client_identity_pem
-                    .set(Some(Arc::new(identity_pem))),
                 _ => {}
             }
         },
