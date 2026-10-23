@@ -495,16 +495,18 @@ KCEOF
   limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
   limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml < "$(dirname "$0")/../set-kubelet-rotate-certificates.sh"
 
-  # Generate a kubelet serving cert signed by the cluster CA so the apiserver can
-  # verify the kubelet's TLS cert on exec/log/attach connections (closes the MITM
-  # vector that existed when AcceptAnyCert was used).
-  CERT_DIR="$(dirname "$KUBECONFIG_PATH")"
-  KUBELET_TLS_KEY="$CERT_DIR/kubelet-serving${NODE_SUFFIX}.key"
-  KUBELET_TLS_CRT="$CERT_DIR/kubelet-serving${NODE_SUFFIX}.crt"
-  KUBELET_TLS_CSR="$CERT_DIR/kubelet-serving${NODE_SUFFIX}.csr"
+  # The kubelet requests its own serving cert through the CSR API (serverTLSBootstrap) so
+  # the apiserver can verify it on exec/log/attach connections and the kubelet renews it
+  # before expiry. The apiserver's approver admits the CSR only for the node's own
+  # addresses; the apiserver verifies the cert against the node's InternalIP although it
+  # dials the host port-forward on 127.0.0.1.
+  limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml < "$(dirname "$0")/../set-kubelet-server-tls-bootstrap.sh"
+  # A serving cert issued by an earlier CA (workdir wiped, VM kept) is reused by the
+  # kubelet while unexpired; drop it so the kubelet files a fresh CSR.
+  limactl shell "$VM_NAME" sudo bash -c 'f=/var/lib/kubelet/pki/kubelet-server-current.pem; if [ -e "$f" ] && ! openssl verify -CAfile /etc/kubelet-ca.crt "$f" >/dev/null 2>&1; then rm -f /var/lib/kubelet/pki/kubelet-server-*; fi'
 
-  # Get the lima VM IP so it can be included as a SAN (needed if kubelet-preferred-address
-  # is not set and the apiserver connects via the VM's InternalIP instead of 127.0.0.1).
+  # The VM IP is the kubelet's --node-ip, and so the address the serving CSR is approved
+  # against.
   # The user-v2 network in lima/kubelet.yaml gives the VM a sole non-loopback interface;
   # select by "scope global" rather than a hardcoded interface name since Ubuntu 26.04's
   # first-boot NIC rename to eth0 can fail (LP: #2136392), leaving it as e.g. enp0s1.
@@ -512,7 +514,7 @@ KCEOF
   # loud instead of silently signing a cert for an address the node doesn't have.
   LIMA_VM_IP=$(limactl shell "$VM_NAME" ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
   if [ -z "$LIMA_VM_IP" ]; then
-    echo "error: could not determine ${VM_NAME}'s IP for the kubelet serving cert SAN" >&2
+    echo "error: could not determine ${VM_NAME}'s IP for the kubelet --node-ip" >&2
     exit 1
   fi
   # Same "scope global" selection as LIMA_VM_IP above (not a hardcoded "eth0") —
@@ -537,29 +539,6 @@ KCEOF
   NODE_IPV6="fd85:${POD_SUBNET_OCTET}::1"
   limactl shell "$VM_NAME" sudo ip -6 addr replace "${NODE_IPV6}/64" dev "$LIMA_VM_IFACE"
 
-  if [ ! -f "$KUBELET_TLS_KEY" ] || [ ! -f "$KUBELET_TLS_CRT" ]; then
-    openssl ecparam -genkey -name prime256v1 -noout -out "$KUBELET_TLS_KEY"
-    openssl req -new -key "$KUBELET_TLS_KEY" \
-      -subj "/CN=${VM_NAME}" -sha256 \
-      -out "$KUBELET_TLS_CSR"
-    openssl x509 -req -in "$KUBELET_TLS_CSR" \
-      -CA "$CA_PEM" -CAkey "$CERT_DIR/ca.key" \
-      -CAcreateserial -CAserial "$CERT_DIR/ca.srl" \
-      -days 365 -sha256 \
-      -extfile <(printf 'subjectAltName=IP:127.0.0.1,IP:%s\nextendedKeyUsage=serverAuth\n' "$LIMA_VM_IP") \
-      -out "$KUBELET_TLS_CRT"
-    rm -f "$KUBELET_TLS_CSR"
-    echo "Kubelet serving cert generated (SANs: 127.0.0.1, ${LIMA_VM_IP})."
-  else
-    echo "Kubelet serving cert already exists, reusing."
-  fi
-  limactl copy "$KUBELET_TLS_CRT" "${VM_NAME}:/tmp/kubelet-tls.crt"
-  limactl copy "$KUBELET_TLS_KEY" "${VM_NAME}:/tmp/kubelet-tls.key"
-  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-tls.crt /etc/kubelet-tls.crt
-  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-tls.key /etc/kubelet-tls.key
-  limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-tls.crt
-  limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-tls.key
-
   # A golden baked before lima/kubelet.yaml set a kubeadm-style resolvConf still carries
   # `resolvConf: ""`, which gives CoreDNS nameserver 127.0.0.1 (self-forward loop). Idempotent.
   limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml < "$(dirname "$0")/../set-kubelet-resolvconf.sh"
@@ -568,7 +547,7 @@ KCEOF
   # lacks it, and without it kubelet ignores projected defaultUser/user. Idempotent.
   limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml AtomicWriteVolumeUserFields < "$(dirname "$0")/../set-kubelet-featuregate.sh"
 
-  # Write --client-ca-file and --tls-cert-file into the kubelet drop-in (idempotent: overwrite each run).
+  # Write --client-ca-file into the kubelet drop-in (idempotent: overwrite each run).
   limactl shell "$VM_NAME" sudo bash -c "mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
 [Service]
 # klog has no --utc flag, so kubelet's embedded klog lines render whatever local
@@ -589,12 +568,10 @@ ExecStart=/usr/bin/kubelet \\\\
   --config=/etc/kubelet-config.yaml \\\\
   --kubeconfig=/etc/kubelet-kubeconfig \\\\
   --client-ca-file=/etc/kubelet-ca.crt \\\\
-  --tls-cert-file=/etc/kubelet-tls.crt \\\\
-  --tls-private-key-file=/etc/kubelet-tls.key \\\\
   --hostname-override=${VM_NAME} \\\\
   --node-ip=${LIMA_VM_IP},${NODE_IPV6} \\\\
   --v=${KUBELET_V} \\\\
-  --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,PodLevelResourcesFixDefaulting=false,PodLevelResourcesFixKubeletQOSClass=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false,RotateKubeletServerCertificate=false
+  --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,PodLevelResourcesFixDefaulting=false,PodLevelResourcesFixKubeletQOSClass=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false
 # Round-2 tuning: feature-gate audit -- see the matching kubelet.service
 # comment in scripts/install.sh for the full per-gate rationale (mirrored
 # here so the conformance run exercises what production ships), including
@@ -617,7 +594,7 @@ ExecStart=/usr/bin/kubelet \\\\
 LimitNOFILE=1048576
 EOF"
   limactl shell "$VM_NAME" sudo systemctl daemon-reload
-  echo "Kubelet client-ca-file and TLS serving cert configured."
+  echo "Kubelet client-ca-file configured; serving cert comes from its serverTLSBootstrap CSR."
 else
   echo "WARNING: $CA_CERT not found — kubelet client auth will not work (logs/exec will return 401)" >&2
 fi

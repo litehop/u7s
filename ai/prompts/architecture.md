@@ -174,8 +174,9 @@ u7s's job is limited to what an operator would otherwise do by hand to join a no
 - Rewrite and inject the kubeconfig kubelet uses to reach the apiserver
 - Copy the cluster CA (converted DER→PEM) into the VM so kubelet can verify the apiserver's
   mTLS client cert on exec/log/attach proxy connections
-- Generate and sign a kubelet serving cert against that same CA so the apiserver can in turn
-  verify kubelet's TLS on those proxied connections
+- Enable `serverTLSBootstrap` so kubelet requests its own serving cert (CSR approved by the
+  apiserver, signed by KCM, renewed by kubelet) that the apiserver verifies on those proxied
+  connections
 - Rewrite the CRI-O bridge CNI's pod subnet per node and program static inter-node routes
 
 All of this lives in `scripts/conformance/lima-start.sh`, not in a u7s crate — there is no
@@ -439,8 +440,9 @@ does it end to end:
 - Rewrites and injects the kubeconfig kubelet uses to reach the apiserver, and copies the
   cluster CA (DER→PEM) so kubelet can verify the apiserver's mTLS client cert on
   exec/log/attach proxy connections.
-- Generates and signs a kubelet serving cert against that same CA so the apiserver can in
-  turn verify kubelet's TLS on those proxied connections.
+- Enables `serverTLSBootstrap` so kubelet requests its own serving cert (CSR approved by the
+  apiserver, signed by KCM, renewed by kubelet) that the apiserver verifies on those proxied
+  connections.
 - Rewrites the CRI-O bridge CNI's pod subnet per node (each node gets a disjoint /24 out of
   CRI-O's default /16) and programs static inter-node routes, since nothing else in this
   arrangement runs a CNI/BGP control plane of its own.

@@ -179,7 +179,8 @@
 #   --pki-test-lifetime <secs>  Rebuild u7s-apiserver with --features pki-test-knobs and
 #             start it with U7S_PKI_TEST_LIFETIME_SECS=<secs>, so the apiserver serving
 #             cert and its kubelet-client/proxy-client identities live <secs> seconds
-#             and rotate at 2/3 of that. For scripts/e2e-pki-rotation/leaf-rotation.sh;
+#             and rotate at 2/3 of that; KCM signs with --cluster-signing-duration=<secs>s,
+#             so the kubelet's serving cert (a CSR) is short-lived too. For scripts/e2e-pki-rotation/leaf-rotation.sh;
 #             use with --stack-only. Mutually exclusive with --binary and --profile.
 #   --sample-interval  Cadence in seconds for scripts/conformance/sample-run-metrics.sh,
 #             which starts once the node topology is final (after step 5 and any
@@ -382,6 +383,10 @@ _UNSAFE_FOCUS_ARG=""
 # call sites exist). Unlike RUST_LOG, this isn't tiered further at -vv/-vvv: KCM's
 # own klog verbosity has no third-party-noise problem to scope away from.
 [ "$VERBOSE" -ge 1 ] && _KCM_V_ARG="--kcm-v 5"
+# KCM signs the kubelet-serving certs: with --pki-test-lifetime they live as long as the
+# apiserver leaves, so the kubelet renews its serving cert inside the rotation run.
+_KCM_SIGNING_ARG=""
+[ -n "$PKI_TEST_LIFETIME" ] && _KCM_SIGNING_ARG="--signing-duration ${PKI_TEST_LIFETIME}s"
 # Forwarded to lima-start.sh (and, via add-node.sh, to a 2nd node's lima-start.sh),
 # which raises kubelet to --v=5 (PLEG relist detail) and flips CRI-O's crio.conf.d
 # drop-in to log_level=debug — see lima-start.sh for why both live behind one flag.
@@ -499,7 +504,7 @@ bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERV
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"
 # shellcheck disable=SC2086
-bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG}
+bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG}
 
 # Step 05: Start the standalone u7s-scheduler binary — skipped when --embedded-scheduler
 # true already made the apiserver itself schedule: starting both would
