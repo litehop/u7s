@@ -3,4 +3,5 @@
 
 pub mod classify;
 pub mod discover;
+pub mod import;
 pub mod plan;

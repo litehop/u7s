@@ -37,30 +37,69 @@ enum Migrate {
         /// nearest lower supported one.
         #[arg(long)]
         allow_unknown_k3s_version: bool,
+        /// Where a real export writes the source objects (mode 0600: it
+        /// contains Secrets).
+        #[arg(long, default_value = "u7s-migrate-objects.json")]
+        objects: String,
+    },
+    /// Recreate the plan's included objects on a u7s apiserver. Re-runnable.
+    Import {
+        /// Target u7s kubeconfig (client-certificate auth).
+        #[arg(long)]
+        kubeconfig: String,
+        /// The (possibly edited) plan written by `export`.
+        #[arg(long, default_value = "u7s-migrate-plan.json")]
+        plan: String,
+        /// The objects file written by `export`.
+        #[arg(long, default_value = "u7s-migrate-objects.json")]
+        objects: String,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let Command::Migrate {
-        command:
-            Migrate::Export {
-                dry_run,
-                kubeconfig,
-                plan,
+    let Command::Migrate { command } = Cli::parse().command;
+    match command {
+        Migrate::Export {
+            dry_run,
+            kubeconfig,
+            plan,
+            allow_unknown_k3s_version,
+            objects,
+        } => {
+            export(
+                &kubeconfig,
+                &plan,
                 allow_unknown_k3s_version,
-            },
-    } = Cli::parse().command;
-    if !dry_run {
-        bail!("only `export --dry-run` is implemented; it changes nothing on the source");
+                (!dry_run).then_some(objects.as_str()),
+            )
+            .await
+        }
+        Migrate::Import {
+            kubeconfig,
+            plan,
+            objects,
+        } => import(&kubeconfig, &plan, &objects).await,
     }
-    dry_run_export(&kubeconfig, &plan, allow_unknown_k3s_version).await
 }
 
-async fn dry_run_export(
+async fn import(kubeconfig: &str, plan: &str, objects: &str) -> anyhow::Result<()> {
+    let (plan, objs) = u7s_migrate::import::load(plan, objects)?;
+    let mut target = u7s_migrate::import::Live::connect(kubeconfig).await?;
+    let report = u7s_migrate::import::run(&mut target, &plan, &objs).await?;
+    print!("{}", report.render());
+    if !report.failures.is_empty() {
+        bail!("{} step(s) failed; re-run to resume", report.failures.len());
+    }
+    Ok(())
+}
+
+/// With `objects` set, also writes the source objects for `import`.
+async fn export(
     kubeconfig: &str,
     plan_path: &str,
     allow_unknown: bool,
+    objects: Option<&str>,
 ) -> anyhow::Result<()> {
     let src = discover::Source::connect(kubeconfig)?;
     let (types, mut failures) = src.resource_types().await?;
@@ -110,6 +149,19 @@ async fn dry_run_export(
             "{} resource list(s) failed; the plan is incomplete",
             failures.len()
         );
+    }
+    if let Some(path) = objects {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| f.write_all(serde_json::to_string(&objs)?.as_bytes()))
+            .with_context(|| format!("writing {path}"))?;
+        println!("objects written to {path}");
     }
     Ok(())
 }
