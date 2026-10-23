@@ -229,7 +229,7 @@ fn legacy_rules(role: &str) -> Vec<Value> {
             let write_no_collection = [
                 "get", "list", "watch", "create", "update", "patch", "delete",
             ];
-            vec![
+            let mut rules = vec![
                 json!({
                     "apiGroups": [""],
                     "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"],
@@ -250,7 +250,33 @@ fn legacy_rules(role: &str) -> Vec<Value> {
                     "resources": ["clusterroles","clusterrolebindings","roles","rolebindings"],
                     "verbs": ["get","list","watch","create","update","patch","escalate","bind"]
                 }),
-            ]
+            ];
+            // The single shared identity of --use-service-account-credentials=false: the union
+            // of what every controller needed, including a wildcard write.
+            rules.extend([
+                json!({ "apiGroups": [""], "resources": ["endpoints","pods","serviceaccounts","configmaps","secrets","persistentvolumes","persistentvolumeclaims"], "verbs": ["create"] }),
+                json!({ "apiGroups": [""], "resources": ["endpoints/restricted","pods/binding","serviceaccounts/token"], "verbs": ["create"] }),
+                json!({ "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": ["create"] }),
+                json!({ "apiGroups": [""], "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"], "verbs": ["get","list","watch","update","patch","delete"] }),
+                json!({ "apiGroups": [""], "resources": ["resourcequotas/status"], "verbs": ["get","update","patch"] }),
+                json!({ "apiGroups": ["apps"], "resources": ["replicasets","controllerrevisions"], "verbs": ["create"] }),
+                json!({ "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","update","patch","delete"] }),
+                json!({ "apiGroups": ["apps"], "resources": ["daemonsets/status","deployments/status","replicasets/status","statefulsets/status"], "verbs": ["get","update","patch"] }),
+                json!({ "apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create"] }),
+                json!({ "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","update","patch","delete"] }),
+                json!({ "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","update","patch"] }),
+                json!({ "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] }),
+                json!({ "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch","create","update","patch","delete"] }),
+                json!({ "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] }),
+                json!({ "apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments"], "verbs": ["get","list","watch","create","delete"] }),
+                json!({ "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "verbs": ["attest"] }),
+                json!({ "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create","update","delete","list","watch"] }),
+                json!({ "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-client-kubelet"], "verbs": ["approve"] }),
+                json!({ "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kubelet-serving","kubernetes.io/kube-apiserver-client-kubelet","kubernetes.io/kube-apiserver-client","kubernetes.io/legacy-unknown"], "verbs": ["sign"] }),
+                json!({ "apiGroups": [""], "resources": ["namespaces/status","namespaces/finalize"], "verbs": ["get","update","patch"] }),
+                json!({ "apiGroups": ["*"], "resources": ["*"], "verbs": ["get","list","watch","patch","update","delete","deletecollection"] }),
+            ]);
+            rules
         }
         "system:node" => {
             let rule = |group: &str, resource: &str, verbs: &[&str]| json!({ "apiGroups": [group], "resources": [resource], "verbs": verbs });

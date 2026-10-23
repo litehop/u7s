@@ -557,7 +557,7 @@ runs:
         # (10.244.0.0/16, substituted into the same literal above).
         setsid bash scripts/conformance/kcm-supervisor.sh \
           "$WORKDIR/kube-controller-manager" "$WORKDIR/kcm.log" \
-          --kubeconfig="$WORKDIR/kubeconfig-cert" \
+          --kubeconfig="$WORKDIR/kcm-kubeconfig" \
           --cluster-signing-cert-file="$WORKDIR/ca.pem" \
           --cluster-signing-key-file="$WORKDIR/ca.key" \
           --root-ca-file="$WORKDIR/ca.pem" \
@@ -565,7 +565,7 @@ runs:
           --allocate-node-cidrs=true \
           --cluster-cidr=10.244.0.0/16 \
           --node-cidr-mask-size=24 \
-          --use-service-account-credentials=false \
+          --use-service-account-credentials=true \
           --leader-elect=false \
           --bind-address=127.0.0.1 \
           --kube-api-content-type=application/json \

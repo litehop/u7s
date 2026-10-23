@@ -182,39 +182,93 @@ async fn seeded_view_edit_admin_grant_exactly_what_upstream_aggregation_resolves
 }
 
 #[tokio::test]
-async fn seeded_kcm_identity_holds_exactly_the_union_of_upstream_controller_permissions() {
-    // With --use-service-account-credentials=false one identity runs every controller, so it
-    // must hold the union of upstream's per-controller roles -- missing a create stalls that
-    // controller (e.g. daemonset pods never bind), and any surplus is blast radius for a
-    // compromised KCM.
+async fn seeded_kcm_identity_is_upstreams_narrow_role_with_no_write_wildcard() {
+    // KCM runs with --use-service-account-credentials=true, so its own identity only mints
+    // the per-controller service accounts and tokens. A wildcard write here would make a
+    // stolen KCM credential able to modify or delete anything (CIS 5.1.3).
     let seeded = seeded_roles().await;
     let cr = upstream_roles(include_str!(
         "../testdata/rbac-upstream-1.37/cluster-roles.yaml"
     ));
-    let ctl = upstream_roles(include_str!(
-        "../testdata/rbac-upstream-1.37/controller-roles.yaml"
-    ));
-    let mut upstream = cr["system:kube-controller-manager"].clone();
-    for (name, rules) in &ctl {
-        if name.starts_with("system:controller:") {
-            upstream.extend(rules.clone());
-        }
-    }
-    let upstream = without_extensions(&upstream);
     let have = &seeded["system:kube-controller-manager"];
-    assert_eq!(
-        uncovered(&upstream, have),
-        // clusterrole-aggregation-controller is the only consumer and the u7s KCM runs with it
-        // disabled (the seeded admin/edit/view are pre-resolved).
-        set(&["rbac.authorization.k8s.io/clusterroles: escalate"]),
-        "KCM lacks permissions its controllers need"
-    );
-    assert_eq!(
-        uncovered(have, &upstream),
-        set(&[]),
-        "KCM holds permissions no upstream controller needs"
-    );
+    let upstream = &cr["system:kube-controller-manager"];
+    assert_eq!(uncovered(upstream, have), set(&[]), "KCM under-grants");
+    assert_eq!(uncovered(have, upstream), set(&[]), "KCM over-grants");
+    for (group, resource, verb) in [
+        ("apps", "deployments", "create"),
+        ("apps", "deployments", "update"),
+        ("", "pods", "delete"),
+        ("", "secrets", "patch"),
+        ("*", "*", "delete"),
+    ] {
+        let probe = json!({ "apiGroups": [group], "resources": [resource], "verbs": [verb] });
+        assert!(
+            !rules_cover(have, &probe),
+            "KCM root identity must not {verb} {group}/{resource}: controllers hold that, not KCM"
+        );
+    }
 }
+
+#[tokio::test]
+async fn every_service_account_kcm_runs_a_controller_as_is_bound_to_its_controller_role() {
+    // With per-controller credentials a controller whose system:controller:* binding is
+    // missing runs with no permissions at all and silently stalls.
+    let roles = seeded_cluster_scoped("clusterroles").await;
+    let bindings = seeded_cluster_scoped("clusterrolebindings").await;
+    for sa in KCM_CONTROLLER_SERVICE_ACCOUNTS {
+        let name = format!("system:controller:{sa}");
+        assert!(roles.contains_key(&name), "ClusterRole {name} missing");
+        let b = bindings
+            .get(&name)
+            .unwrap_or_else(|| panic!("ClusterRoleBinding {name} missing"));
+        assert_eq!(b["roleRef"]["name"], name.as_str());
+        assert_eq!(
+            subject_set(b),
+            set(&[&format!("ServiceAccount:kube-system/{sa}")]),
+            "{name} must bind exactly the kube-system service account KCM authenticates as"
+        );
+    }
+}
+
+/// Service accounts KCM 1.37 authenticates controllers as under the u7s `--controllers` set.
+const KCM_CONTROLLER_SERVICE_ACCOUNTS: &[&str] = &[
+    "attachdetach-controller",
+    "certificate-controller",
+    "cronjob-controller",
+    "daemon-set-controller",
+    "deployment-controller",
+    "device-taint-eviction-controller",
+    "disruption-controller",
+    "endpoint-controller",
+    "endpointslice-controller",
+    "endpointslicemirroring-controller",
+    "ephemeral-volume-controller",
+    "expand-controller",
+    "generic-garbage-collector",
+    "horizontal-pod-autoscaler",
+    "job-controller",
+    "kube-apiserver-serving-clustertrustbundle-publisher",
+    "legacy-service-account-token-cleaner",
+    "namespace-controller",
+    "node-controller",
+    "persistent-volume-binder",
+    "pod-garbage-collector",
+    "podcertificaterequestcleaner",
+    "pv-protection-controller",
+    "pvc-protection-controller",
+    "replicaset-controller",
+    "replication-controller",
+    "resource-claim-controller",
+    "resourcequota-controller",
+    "root-ca-cert-publisher",
+    "service-account-controller",
+    "statefulset-controller",
+    "storage-version-migrator-controller",
+    "ttl-after-finished-controller",
+    "ttl-controller",
+    "validatingadmissionpolicy-status-controller",
+    "volumeattributesclass-protection-controller",
+];
 
 fn upstream_cluster_objects(yamls: &[&str]) -> BTreeMap<String, Value> {
     yamls
@@ -301,7 +355,7 @@ async fn seeded_cluster_roles_match_upstream_except_listed_deviations() {
             ),
         ),
     ]);
-    // admin/edit/view: aggregation test. KCM: union test.
+    // admin/edit/view: aggregation test. KCM: its own test.
     let covered_elsewhere = ["admin", "edit", "view", "system:kube-controller-manager"];
     for (name, up) in upstream.iter().filter(|(n, _)| seeded.contains_key(*n)) {
         if covered_elsewhere.contains(&name.as_str()) {
