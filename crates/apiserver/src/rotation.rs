@@ -207,7 +207,6 @@ impl Rotator {
 
     /// Replace the CAs that client certificates are verified against. Connections accepted
     /// from now on use the new store; open ones keep the one they were accepted with.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_client_cas(&self, client_cas: Vec<Vec<u8>>) -> anyhow::Result<()> {
         let mut state = self.lock();
         let serving = &state.leaves[SERVING_LEAF];

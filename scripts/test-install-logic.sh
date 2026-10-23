@@ -279,8 +279,8 @@ assert_true "kubelet.service mints that serving cert (ExecStartPre) with an IP S
 assert_true "the minted kubelet serving cert declares extendedKeyUsage=serverAuth, matching lima-start.sh's existing pattern for the same kind of cert rather than relying on webpki's lenient absent-EKU handling" \
   grep -qF 'extendedKeyUsage=serverAuth' "$INSTALL"
 
-assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cluster CA, so kubelet can authenticate apiserver's client cert instead of treating proxied requests as anonymous" \
-  grep -qF 'clientCAFile: $STATE_DIR/ca.pem' "$INSTALL"
+assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the CA bundle (apiserver-published ca-bundle.pem on the control plane, joined ca.pem on a worker; kubelet live-reloads it), so kubelet can authenticate apiserver's client cert instead of treating proxied requests as anonymous" \
+  bash -c 'grep -qF "clientCAFile: \$client_ca" "$1" && grep -qF "local client_ca=\"\$STATE_DIR/ca-bundle.pem\"" "$1" && grep -qF "client_ca=\"\$STATE_DIR/ca.pem\"" "$1"' _ "$INSTALL"
 
 # ---------------------------------------------------------------------------
 # Regression guard: install.sh's own documented reset procedure ("stop the
@@ -1559,6 +1559,31 @@ ok_status=0
 TOKEN_SECRET=0123456789abcdef CA_CERT_HASH="$EXPECTED_CA_HASH" bash "$DISCOVER_RUNNER" "$worker_state" >/dev/null 2>&1 || ok_status=$?
 assert "discovery with a validly signed cluster-info and the right CA hash trusts and stores the CA" \
   "$([ "$ok_status" -eq 0 ] && cmp -s "$worker_state/ca.pem" "$JOIN_CA_DIR/ca.pem" && echo 1 || echo 0)"
+
+# CA succession: cluster-info carries a bundle. The pin may match any cert in it
+# (kubeadm semantics) and the joiner must store ALL of them, or a node joined during
+# the overlap would reject leaves issued by the successor CA.
+openssl ecparam -name prime256v1 -genkey -noout -out "$JOIN_WORK/ca2.key"
+openssl req -x509 -new -key "$JOIN_WORK/ca2.key" -subj "/CN=u7s-test-ca-2" -days 2 -out "$JOIN_WORK/ca2.pem" 2>/dev/null
+cat "$JOIN_CA_DIR/ca.pem" "$JOIN_WORK/ca2.pem" > "$JOIN_WORK/bundle.pem"
+CA2_HASH="sha256:$(openssl x509 -in "$JOIN_WORK/ca2.pem" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 | sed 's/^.* //')"
+SINGLE_CA_KUBECONFIG="$DISCOVER_KUBECONFIG"
+DISCOVER_KUBECONFIG="$(printf 'apiVersion: v1\nclusters:\n- cluster:\n    certificate-authority-data: %s\n    server: https://cp.example:6443\n  name: ""\n' "$(openssl base64 -A -in "$JOIN_WORK/bundle.pem")")"
+write_cluster_info "$(sign_cluster_info 0123456789abcdef)"
+for pin in "$EXPECTED_CA_HASH" "$CA2_HASH"; do
+  bundle_state="$JOIN_WORK/worker-bundle-${pin##*:}"; mkdir -p "$bundle_state"
+  bundle_status=0
+  TOKEN_SECRET=0123456789abcdef CA_CERT_HASH="$pin" bash "$DISCOVER_RUNNER" "$bundle_state" >/dev/null 2>&1 || bundle_status=$?
+  assert "discovery of a two-CA bundle pinned to ${pin:7:12}... stores both CAs, so a joined node verifies leaves from either" \
+    "$([ "$bundle_status" -eq 0 ] && cmp -s "$bundle_state/ca.pem" "$JOIN_WORK/bundle.pem" && echo 1 || echo 0)"
+done
+bundle_wrong_state="$JOIN_WORK/worker-bundle-wrong"; mkdir -p "$bundle_wrong_state"
+bundle_wrong_status=0
+TOKEN_SECRET=0123456789abcdef CA_CERT_HASH="sha256:$(printf '0%.0s' $(seq 1 64))" bash "$DISCOVER_RUNNER" "$bundle_wrong_state" >/dev/null 2>&1 || bundle_wrong_status=$?
+assert "discovery refuses a bundle none of whose certs match --ca-cert-hash" \
+  "$([ "$bundle_wrong_status" -ne 0 ] && [ ! -e "$bundle_wrong_state/ca.pem" ] && echo 1 || echo 0)"
+DISCOVER_KUBECONFIG="$SINGLE_CA_KUBECONFIG"
+write_cluster_info "$(sign_cluster_info 0123456789abcdef)"
 
 wrong_sig_state="$JOIN_WORK/worker-wrong-sig"; mkdir -p "$wrong_sig_state"
 wrong_sig_status=0

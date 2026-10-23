@@ -287,12 +287,12 @@ async fn build_backend_client<S: Store>(
             if let Ok(pem) =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, ca_b64)
             {
-                if let Ok(cert) = reqwest::Certificate::from_pem(&pem) {
-                    certs.push(cert);
+                if let Ok(bundle) = reqwest::Certificate::from_pem_bundle(&pem) {
+                    certs.extend(bundle);
                 }
             }
         }
-        if let Some(der) = state.cluster_ca_der.as_deref() {
+        for der in state.cluster_ca_ders.get().iter().flat_map(|b| b.iter()) {
             if let Ok(cluster_cert) = reqwest::Certificate::from_der(der) {
                 certs.push(cluster_cert);
             }

@@ -580,7 +580,7 @@ pub async fn resolve_attach_target<S: Store>(
     run_validating_webhooks(state, &attach_options, None, &admission_ctx).await?;
 
     let tls_config = build_kubelet_tls_config(
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
             .get()
@@ -670,22 +670,22 @@ pub async fn pod_attach_post<S: Store>(
 /// Build a rustls `ClientConfig` that pins trust to the cluster CA and optionally
 /// presents a client certificate to the kubelet.
 ///
-/// When `ca_der` is `Some`, the kubelet's serving certificate is verified against
-/// the cluster CA — closing the MITM vector on exec/log/attach paths. When `ca_der`
-/// is `None`, returns `Err` so callers can return 503 instead of establishing a
-/// connection without certificate verification.
+/// When `ca_ders` is `Some`, the kubelet's serving certificate is verified against
+/// every CA in the bundle — closing the MITM vector on exec/log/attach paths. When
+/// `ca_ders` is `None` (or empty), returns `Err` so callers can return 503 instead of
+/// establishing a connection without certificate verification.
 ///
 /// The `client_identity_pem` is the mTLS client cert+key used so the kubelet can
 /// authenticate the apiserver via `--client-ca-file`.
 fn build_kubelet_tls_config(
-    ca_der: Option<&[u8]>,
+    ca_ders: Option<&[Vec<u8>]>,
     client_identity_pem: Option<&[u8]>,
 ) -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::RootCertStore;
 
-    let der = ca_der.ok_or_else(|| {
+    let ders = ca_ders.filter(|d| !d.is_empty()).ok_or_else(|| {
         anyhow::anyhow!(
             "no cluster CA configured — kubelet TLS cannot be verified; \
              refusing connection to prevent MITM"
@@ -693,9 +693,11 @@ fn build_kubelet_tls_config(
     })?;
 
     let mut root_store = RootCertStore::empty();
-    root_store
-        .add(CertificateDer::from(der.to_vec()))
-        .map_err(|e| anyhow::anyhow!("add kubelet CA to root store: {e}"))?;
+    for der in ders {
+        root_store
+            .add(CertificateDer::from(der.clone()))
+            .map_err(|e| anyhow::anyhow!("add kubelet CA to root store: {e}"))?;
+    }
     let verifier = rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(root_store))
         .build()
         .map_err(|e| anyhow::anyhow!("build kubelet server verifier: {e}"))?;
@@ -1091,7 +1093,7 @@ pub async fn resolve_exec_target<S: Store>(
     run_validating_webhooks(state, &pod, None, &admission_ctx).await?;
 
     let tls_config = build_kubelet_tls_config(
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
             .get()
@@ -1424,7 +1426,7 @@ pub struct PortforwardQuery {
 #[derive(Debug)]
 pub(crate) struct PortforwardParams {
     pub kubelet_url: String,
-    pub cluster_ca_der: Option<Vec<u8>>,
+    pub cluster_ca_ders: Option<Vec<Vec<u8>>>,
     pub client_identity_pem: Option<Vec<u8>>,
 }
 
@@ -1532,7 +1534,7 @@ pub(crate) async fn validate_portforward<S: Store>(
     })?;
 
     // 4. Require cluster CA — refuse to connect without TLS verification.
-    if state.cluster_ca_der.is_none() {
+    if state.cluster_ca_ders.get().is_none() {
         return Err(Status::service_unavailable(
             "no cluster CA configured — kubelet TLS cannot be verified; \
              refusing portforward connection to prevent MITM"
@@ -1554,7 +1556,7 @@ pub(crate) async fn validate_portforward<S: Store>(
 
     Ok(PortforwardParams {
         kubelet_url,
-        cluster_ca_der: state.cluster_ca_der.as_deref().map(|v| v.to_vec()),
+        cluster_ca_ders: state.cluster_ca_ders.get().as_deref().cloned(),
         client_identity_pem: state
             .kubelet_client_identity_pem
             .get()
@@ -1766,7 +1768,7 @@ async fn dial_kubelet_portforward(
     use tokio_rustls::TlsConnector;
 
     let tls_config = build_kubelet_tls_config(
-        params.cluster_ca_der.as_deref(),
+        params.cluster_ca_ders.as_deref(),
         params.client_identity_pem.as_deref(),
     )?;
 
@@ -1859,7 +1861,7 @@ async fn dial_kubelet_portforward_v4(
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
     let tls_config = build_kubelet_tls_config(
-        params.cluster_ca_der.as_deref(),
+        params.cluster_ca_ders.as_deref(),
         params.client_identity_pem.as_deref(),
     )?;
     let connector = tokio_tungstenite::Connector::Rustls(tls_config);
@@ -2476,16 +2478,20 @@ pub async fn resolve_pod_proxy_target<S: Store>(
 /// targets, since pod/workload TLS certs are self-signed or issued by a CA the cluster
 /// has no way to know (unlike the kubelet, which is signed by the cluster CA).
 pub(crate) fn build_pod_proxy_client(
-    ca_der: Option<&[u8]>,
+    ca_ders: Option<&[Vec<u8>]>,
     client_identity_pem: Option<&[u8]>,
     insecure_https: bool,
 ) -> reqwest::Client {
     let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if insecure_https {
         builder = builder.use_rustls_tls().danger_accept_invalid_certs(true);
-    } else if let Some(der) = ca_der {
-        if let Ok(cert) = reqwest::Certificate::from_der(der) {
-            builder = builder.use_rustls_tls().tls_certs_only([cert]);
+    } else if let Some(ders) = ca_ders {
+        if let Ok(certs) = ders
+            .iter()
+            .map(|der| reqwest::Certificate::from_der(der))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            builder = builder.use_rustls_tls().tls_certs_only(certs);
         }
     }
     if let Some(pem) = client_identity_pem {
@@ -2520,7 +2526,7 @@ async fn pod_proxy_via_connect_tunnel(
     path: &str,
     method: axum::http::Method,
     body_bytes: bytes::Bytes,
-    ca_der: Option<&[u8]>,
+    ca_ders: Option<&[Vec<u8>]>,
     client_identity_pem: Option<&[u8]>,
     is_https: bool,
 ) -> Result<(u16, axum::http::HeaderMap, bytes::Bytes), String> {
@@ -2545,7 +2551,7 @@ async fn pod_proxy_via_connect_tunnel(
     };
 
     // 2. Build a TLS client config pinned to the cluster CA.
-    let tls_config = build_kubelet_tls_config(ca_der, client_identity_pem)
+    let tls_config = build_kubelet_tls_config(ca_ders, client_identity_pem)
         .map_err(|e| format!("konnectivity TLS config: {e}"))?;
     let connector = TlsConnector::from(tls_config);
 
@@ -2815,7 +2821,7 @@ async fn pod_proxy_dispatch<S: Store>(
             &path_with_query,
             method,
             body_bytes,
-            state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
             state
                 .kubelet_client_identity_pem
                 .get()
@@ -2858,7 +2864,7 @@ async fn pod_proxy_dispatch<S: Store>(
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
     let client = build_pod_proxy_client(
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
             .get()
@@ -3152,7 +3158,7 @@ async fn service_proxy_dispatch<S: Store>(
             &path_with_query,
             method,
             body_bytes,
-            state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
             state
                 .kubelet_client_identity_pem
                 .get()
@@ -3194,7 +3200,7 @@ async fn service_proxy_dispatch<S: Store>(
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
     let client = build_pod_proxy_client(
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
             .get()
@@ -4014,7 +4020,7 @@ mod tests {
     /// or silently connecting to the kubelet without cert verification).
     #[tokio::test]
     async fn pod_log_without_cluster_ca_returns_503() {
-        let state = make_state(); // cluster_ca_der is None
+        let state = make_state(); // cluster_ca_ders is None
 
         let pod = serde_json::json!({
             "apiVersion": "v1",
@@ -4148,7 +4154,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -4241,7 +4247,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -4326,7 +4332,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -4473,7 +4479,7 @@ mod tests {
     /// connecting over unverified TLS.
     #[tokio::test]
     async fn pod_attach_without_cluster_ca_returns_503() {
-        let state = make_state(); // cluster_ca_der is None, kubelet_client_identity_pem is None
+        let state = make_state(); // cluster_ca_ders is None, kubelet_client_identity_pem is None
 
         let pod = serde_json::json!({
             "apiVersion": "v1",
@@ -4553,7 +4559,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -4697,7 +4703,7 @@ mod tests {
     /// proxy silently connecting over unverified TLS.
     #[tokio::test]
     async fn portforward_validation_without_cluster_ca_returns_503() {
-        let state = make_state(); // cluster_ca_der is None
+        let state = make_state(); // cluster_ca_ders is None
 
         let pod = serde_json::json!({
             "apiVersion": "v1",
@@ -4764,7 +4770,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -4889,7 +4895,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -5102,7 +5108,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -5170,7 +5176,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -5232,7 +5238,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -5293,7 +5299,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -5458,7 +5464,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -5572,7 +5578,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -5693,7 +5699,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -5839,7 +5845,7 @@ mod tests {
             kubelet_url: format!(
                 "https://127.0.0.1:{kubelet_port}/portForward/default/mypod?ports=8080"
             ),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             client_identity_pem: None,
         };
 
@@ -5912,7 +5918,7 @@ mod tests {
             kubelet_url: format!(
                 "https://127.0.0.1:{kubelet_port}/portForward/default/mypod?ports=8080"
             ),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             client_identity_pem: None,
         };
 
@@ -6485,7 +6491,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -6872,7 +6878,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -6971,7 +6977,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -7038,7 +7044,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -7380,7 +7386,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -7595,7 +7601,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -7791,7 +7797,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -7866,13 +7872,59 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let ca_der = cert.cert.der().to_vec();
 
-        let result = build_kubelet_tls_config(Some(&ca_der), None);
+        let result = build_kubelet_tls_config(Some(&[ca_der.clone()]), None);
         assert!(
             result.is_ok(),
             "build_kubelet_tls_config must succeed with a valid CA DER cert — \
              if it fails, exec/log/attach will be broken in production where the CA is always present: {:?}",
             result.err()
         );
+    }
+
+    fn server_config_for(
+        cert: &rcgen::CertifiedKey<rcgen::KeyPair>,
+    ) -> std::sync::Arc<rustls::ServerConfig> {
+        rustls_post_quantum::provider().install_default().ok();
+        std::sync::Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
+                        .unwrap(),
+                )
+                .unwrap(),
+        )
+    }
+
+    /// While a CA is being succeeded the trust bundle holds the old and the new CA, and the
+    /// apiserver must verify a kubelet serving cert from either: a verifier that pins only
+    /// the first CA breaks logs/exec on every node already re-issued by the other one.
+    #[test]
+    fn kubelet_verifier_accepts_serving_cert_from_any_ca_in_the_bundle() {
+        let old = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let new = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let stranger = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let bundle = [old.cert.der().to_vec(), new.cert.der().to_vec()];
+        let client = build_kubelet_tls_config(Some(&bundle), None).unwrap();
+
+        assert!(crate::test_tls::handshake_completes(
+            client.clone(),
+            server_config_for(&old)
+        ));
+        assert!(
+            crate::test_tls::handshake_completes(client.clone(), server_config_for(&new)),
+            "a serving cert chained to the second CA of the bundle must verify"
+        );
+        assert!(
+            !crate::test_tls::handshake_completes(client, server_config_for(&stranger)),
+            "a cert from a CA outside the bundle must still be rejected (MITM guard)"
+        );
+    }
+
+    #[test]
+    fn build_kubelet_tls_config_rejects_an_empty_bundle() {
+        assert!(build_kubelet_tls_config(Some(&[]), None).is_err());
     }
 
     #[test]
@@ -7887,7 +7939,8 @@ mod tests {
             leaf.signing_key.serialize_pem()
         );
 
-        let result = build_kubelet_tls_config(Some(ca.cert.der()), Some(pem.as_bytes()));
+        let result =
+            build_kubelet_tls_config(Some(&[ca.cert.der().to_vec()]), Some(pem.as_bytes()));
         assert!(
             result.is_ok(),
             "a cert chain followed by a key must parse — otherwise mTLS to the kubelet \
@@ -7901,11 +7954,11 @@ mod tests {
         let ca = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let bad = b"-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n-----END CERTIFICATE-----\n";
         assert!(
-            build_kubelet_tls_config(Some(ca.cert.der()), Some(bad)).is_err(),
+            build_kubelet_tls_config(Some(&[ca.cert.der().to_vec()]), Some(bad)).is_err(),
             "malformed identity PEM must surface a clear error, not a panic or silent no-auth"
         );
         assert!(
-            build_kubelet_tls_config(Some(ca.cert.der()), Some(b"")).is_err(),
+            build_kubelet_tls_config(Some(&[ca.cert.der().to_vec()]), Some(b"")).is_err(),
             "an identity PEM with no key must be rejected"
         );
     }
@@ -7915,10 +7968,11 @@ mod tests {
         let ca = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let leaf = rcgen::generate_simple_self_signed(vec!["leaf".to_string()]).unwrap();
         let key_only = leaf.signing_key.serialize_pem();
-        let err = build_kubelet_tls_config(Some(ca.cert.der()), Some(key_only.as_bytes()))
-            .expect_err(
-                "a key-only identity must be rejected: the kubelet would see no client cert",
-            );
+        let err =
+            build_kubelet_tls_config(Some(&[ca.cert.der().to_vec()]), Some(key_only.as_bytes()))
+                .expect_err(
+                    "a key-only identity must be rejected: the kubelet would see no client cert",
+                );
         assert!(
             err.to_string().contains("no certificates"),
             "error must name the missing certificates, got: {err}"
@@ -7952,7 +8006,7 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let ca_der = cert.cert.der().to_vec();
 
-        let client = AppState::<SqliteStore>::build_kubelet_client(Some(&ca_der), None);
+        let client = AppState::<SqliteStore>::build_kubelet_client(Some(&[ca_der.clone()]), None);
         assert!(
             client.is_some(),
             "build_kubelet_client must return Some when CA DER is valid — \
@@ -7996,7 +8050,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -8112,7 +8166,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -8415,7 +8469,8 @@ mod tests {
         let (backend, _) = spawn_redirecting_backend(format!("http://{internal}/internal")).await;
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let client =
-            AppState::<SqliteStore>::build_kubelet_client(Some(cert.cert.der()), None).unwrap();
+            AppState::<SqliteStore>::build_kubelet_client(Some(&[cert.cert.der().to_vec()]), None)
+                .unwrap();
 
         let resp = client
             .get(format!("http://{backend}/"))
@@ -8582,7 +8637,7 @@ mod tests {
             "/metrics",
             axum::http::Method::GET,
             bytes::Bytes::new(),
-            Some(&cert_der),
+            Some(&[cert_der.clone()]),
             None,
             false,
         )
@@ -8699,7 +8754,7 @@ mod tests {
                 "/tls-check",
                 axum::http::Method::GET,
                 bytes::Bytes::new(),
-                Some(&outer_cert_der),
+                Some(&[outer_cert_der.clone()]),
                 None,
                 true,
             ),
@@ -9074,7 +9129,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -9314,7 +9369,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -9612,7 +9667,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cert_der),
+            cluster_ca_ders: Some(vec![cert_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -9846,7 +9901,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der),
+            cluster_ca_ders: Some(vec![ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -11704,7 +11759,8 @@ mod tests {
     async fn make_state_with_ca() -> AppState {
         let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
         let mut state = make_state();
-        state.cluster_ca_der = Some(Arc::new(cert.cert.der().to_vec()));
+        state.cluster_ca_ders =
+            crate::pki::Swap::new(Some(Arc::new(vec![cert.cert.der().to_vec()])));
         seed_kubelet_pod(&state).await;
         state
     }
@@ -11720,7 +11776,7 @@ mod tests {
         state
             .kubelet_client
             .set(AppState::<SqliteStore>::build_kubelet_client(
-                state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+                state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
                 None,
             ));
         let put = |key: String, v: serde_json::Value| {

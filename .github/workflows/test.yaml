@@ -183,6 +183,11 @@ jobs:
             --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443 --iterations 3 \
             --scheduler --lifetime 120
 
+      - name: CA bundle tolerance e2e
+        run: |
+          scripts/e2e-pki-rotation/ca-bundle.sh \
+            --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443
+
       - name: Upload apiserver log
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

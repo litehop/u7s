@@ -529,8 +529,11 @@ pub(crate) fn persist_leaf(
 }
 
 pub struct TlsMaterial {
-    /// DER-encoded CA certificate (written into kubeconfig).
+    /// DER-encoded signing CA certificate.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub ca_cert_der: Vec<u8>,
+    /// Every CA peers are verified against: the signing CA first, then the extras.
+    pub ca_bundle_ders: Vec<Vec<u8>>,
     /// DER-encoded server leaf certificate (the single cert in the TLS chain).
     #[cfg_attr(not(test), allow(dead_code))]
     pub server_cert_der: Vec<u8>,
@@ -890,7 +893,9 @@ fn generate_tls_with(
 
     // Kubeconfigs reference these files, so they must exist before any of them is written
     // and track the persisted leaf even when a crash left them stale.
-    write_ca_bundle(args, &ca_cert_der)?;
+    let ca_bundle_ders = load_trust_bundle(&args.ca_cert, &ca_cert_der)?;
+    rotator.set_client_cas(ca_bundle_ders.clone())?;
+    write_ca_bundle(&args.ca_cert, &ca_bundle_ders)?;
     for (stem, leaf) in [
         ("admin", &admin),
         ("kcm", &kcm),
@@ -901,6 +906,7 @@ fn generate_tls_with(
     }
     Ok(TlsMaterial {
         ca_cert_der,
+        ca_bundle_ders,
         server_cert_der: leaf(SERVING_LEAF).cert_der,
         admin_cert_der: admin.cert_der,
         admin_key_pem: admin.key_pem,
@@ -1023,8 +1029,8 @@ fn kubeconfig_server_url(args: &Args) -> &str {
 
 /// Where the cluster CA is published as PEM for kubeconfigs and components that read the
 /// trust anchor from a file.
-pub(crate) fn ca_bundle_path(args: &Args) -> std::path::PathBuf {
-    std::path::Path::new(&args.ca_cert).with_file_name("ca-bundle.pem")
+pub(crate) fn ca_bundle_path(ca_cert_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(ca_cert_path).with_file_name("ca-bundle.pem")
 }
 
 /// Files of a persisted leaf, next to ca.crt.
@@ -1049,12 +1055,73 @@ fn replace_file(path: &str, bytes: &[u8], private: bool) -> anyhow::Result<()> {
     sync_parent_dir(path).map_err(|e| anyhow::anyhow!("fsync dir of {path}: {e}"))
 }
 
-/// Publish the cluster CA as PEM at [`ca_bundle_path`]. Left untouched when the content is
+/// Operator-supplied PEM of additional trusted CAs (a successor or predecessor of the
+/// signing CA), next to ca.crt. Absent means the signing CA is the whole trust bundle.
+pub(crate) fn ca_extra_path(ca_cert_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(ca_cert_path).with_file_name("ca-extra.pem")
+}
+
+/// DER certificates of every CERTIFICATE block in `pem`. An empty or unparseable bundle is an
+/// error: trusting nothing (or silently dropping a CA) breaks every peer verification.
+pub(crate) fn parse_ca_bundle_pem(pem: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+    use rustls::pki_types::pem::PemObject;
+    let ders = CertificateDer::pem_slice_iter(pem)
+        .map(|c| c.map(|c| c.to_vec()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("CA bundle is not valid PEM: {e}"))?;
+    anyhow::ensure!(!ders.is_empty(), "CA bundle contains no certificates");
+    for der in &ders {
+        cert_validity(der).map_err(|e| anyhow::anyhow!("CA bundle holds an invalid cert: {e}"))?;
+    }
+    Ok(ders)
+}
+
+/// The signing CA followed by every distinct extra CA from [`ca_extra_path`]. A present but
+/// empty or garbage extra file is an error rather than being ignored.
+pub(crate) fn load_trust_bundle(
+    ca_cert_path: &str,
+    signing_ca_der: &[u8],
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut bundle = vec![signing_ca_der.to_vec()];
+    let path = ca_extra_path(ca_cert_path);
+    match std::fs::read(&path) {
+        Ok(pem) => {
+            for der in
+                parse_ca_bundle_pem(&pem).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?
+            {
+                if !bundle.contains(&der) {
+                    bundle.push(der);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("read {}: {e}", path.display()),
+    }
+    Ok(bundle)
+}
+
+/// The bundle to switch to when [`ca_extra_path`] changed `current`, else `None`. A broken
+/// extra file is an error so the caller keeps trusting `current`.
+pub(crate) fn changed_trust_bundle(
+    ca_cert_path: &str,
+    current: &[Vec<u8>],
+) -> anyhow::Result<Option<Vec<Vec<u8>>>> {
+    let next = load_trust_bundle(ca_cert_path, &current[0])?;
+    Ok((next != current).then_some(next))
+}
+
+pub(crate) fn pem_encode_bundle(ders: &[Vec<u8>]) -> Vec<u8> {
+    ders.iter()
+        .flat_map(|der| pem_encode("CERTIFICATE", der))
+        .collect()
+}
+
+/// Publish the trust bundle as PEM at [`ca_bundle_path`]. Left untouched when the content is
 /// unchanged: watchers of the file (the KCM restart hook) must fire only when trust changes,
 /// not on every apiserver start.
-pub(crate) fn write_ca_bundle(args: &Args, ca_cert_der: &[u8]) -> anyhow::Result<()> {
-    let path = ca_bundle_path(args);
-    let pem = pem_encode("CERTIFICATE", ca_cert_der);
+pub(crate) fn write_ca_bundle(ca_cert_path: &str, ca_ders: &[Vec<u8>]) -> anyhow::Result<()> {
+    let path = ca_bundle_path(ca_cert_path);
+    let pem = pem_encode_bundle(ca_ders);
     if std::fs::read(&path).is_ok_and(|current| current == pem) {
         return Ok(());
     }
@@ -1108,7 +1175,7 @@ pub fn write_component_kubeconfig(
         path,
         kubeconfig_server_url(args),
         &KubeconfigCreds::Files {
-            ca: &ca_bundle_path(args),
+            ca: &ca_bundle_path(&args.ca_cert),
             identity: &leaf_files(args, stem).pem(),
         },
         username,
@@ -2361,7 +2428,7 @@ mod tests {
         };
         generate_tls(&args).expect("generate_tls must succeed");
         let server_url = "https://127.0.0.1:6443";
-        let ca = ca_bundle_path(&args);
+        let ca = ca_bundle_path(&args.ca_cert);
         let identity = leaf_files(&args, "admin").pem();
         let yaml = Kubeconfig::new(
             server_url,
@@ -2485,6 +2552,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
+    fn extra_ca(cn: &str) -> (Issuer<'static, KeyPair>, Vec<u8>) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        (Issuer::new(params, key), der)
+    }
+
+    fn client_config_with_identity_from(
+        trusted_server_ca: &[u8],
+        issuer: &Issuer<'static, KeyPair>,
+    ) -> Arc<rustls::ClientConfig> {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "admin");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let leaf = params.signed_by(&key, issuer).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(trusted_server_ca.to_vec()))
+            .unwrap();
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(
+                    vec![leaf.der().clone()],
+                    PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+                )
+                .unwrap(),
+        )
+    }
+
+    /// A CA listed in ca-extra.pem (the successor or predecessor of the signing CA) must be
+    /// trusted for client certs, published in ca-bundle.pem (what every kubeconfig, KCM and
+    /// kubelet read) and carried in the TlsMaterial bundle. Dropping any of the three leaves a
+    /// component rejecting certs the apiserver itself accepts.
+    #[test]
+    fn extra_ca_is_trusted_for_clients_and_published_in_the_bundle() {
+        let dir = test_temp_dir("extra-ca");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let (extra_issuer, extra_der) = extra_ca("extra-ca");
+        std::fs::write(
+            ca_extra_path(&args.ca_cert),
+            pem_encode("CERTIFICATE", &extra_der),
+        )
+        .unwrap(); // lgtm[rust/path-injection]
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+
+        assert_eq!(
+            tls.ca_bundle_ders,
+            vec![tls.ca_cert_der.clone(), extra_der.clone()]
+        );
+        assert_eq!(
+            parse_ca_bundle_pem(&std::fs::read(ca_bundle_path(&args.ca_cert)).unwrap()) // lgtm[rust/path-injection]
+                .unwrap(),
+            tls.ca_bundle_ders,
+            "ca-bundle.pem is what kubeconfigs and KCM trust: it must hold every CA"
+        );
+        let client = client_config_with_identity_from(&tls.ca_cert_der, &extra_issuer);
+        assert!(
+            crate::test_tls::handshake_completes(client, tls.server_config.get()),
+            "a client cert from the extra CA must authenticate against the serving config"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn trust_bundle_rejects_empty_or_garbage_extra_file() {
+        let dir = test_temp_dir("bad-extra-ca");
+        let ca_cert = dir.join("ca.crt").to_string_lossy().into_owned();
+        for (label, content) in [
+            ("empty", ""),
+            ("garbage", "not a certificate"),
+            (
+                "valid PEM wrapper around garbage DER",
+                "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+            ),
+        ] {
+            std::fs::write(ca_extra_path(&ca_cert), content).unwrap(); // lgtm[rust/path-injection]
+            assert!(
+                load_trust_bundle(&ca_cert, b"signing").is_err(),
+                "{label} extra CA file must fail loudly, not silently shrink the trust bundle"
+            );
+        }
+        std::fs::remove_file(ca_extra_path(&ca_cert)).unwrap(); // lgtm[rust/path-injection]
+        assert_eq!(
+            load_trust_bundle(&ca_cert, b"signing").unwrap(),
+            vec![b"signing".to_vec()],
+            "no extra file means the signing CA alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn changed_trust_bundle_reports_only_real_changes() {
+        let dir = test_temp_dir("changed-bundle");
+        let ca_cert = dir.join("ca.crt").to_string_lossy().into_owned();
+        let (_, extra) = extra_ca("extra");
+        let current = vec![b"signing".to_vec()];
+        assert_eq!(changed_trust_bundle(&ca_cert, &current).unwrap(), None);
+        std::fs::write(ca_extra_path(&ca_cert), pem_encode("CERTIFICATE", &extra)).unwrap(); // lgtm[rust/path-injection]
+        assert_eq!(
+            changed_trust_bundle(&ca_cert, &current).unwrap(),
+            Some(vec![b"signing".to_vec(), extra.clone()]),
+        );
+        assert_eq!(
+            changed_trust_bundle(&ca_cert, &[b"signing".to_vec(), extra]).unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
     /// KCM is restarted when ca-bundle.pem changes (its --root-ca-file is read once), so an
     /// apiserver restart that publishes the same CA must not touch the file, or every
     /// apiserver start would bounce KCM.
@@ -2499,17 +2687,17 @@ mod tests {
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
         let inode = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino(); // lgtm[rust/path-injection]
-        let before = inode(&ca_bundle_path(&args));
+        let before = inode(&ca_bundle_path(&args.ca_cert));
 
-        write_ca_bundle(&args, &tls.ca_cert_der).unwrap();
-        assert_eq!(inode(&ca_bundle_path(&args)), before);
+        write_ca_bundle(&args.ca_cert, &[tls.ca_cert_der.clone()]).unwrap();
+        assert_eq!(inode(&ca_bundle_path(&args.ca_cert)), before);
 
         let other = CertificateParams::default()
             .self_signed(&KeyPair::generate().unwrap())
             .unwrap();
-        write_ca_bundle(&args, other.der()).unwrap();
+        write_ca_bundle(&args.ca_cert, &[other.der().to_vec()]).unwrap();
         assert_ne!(
-            inode(&ca_bundle_path(&args)),
+            inode(&ca_bundle_path(&args.ca_cert)),
             before,
             "a changed CA must be republished"
         );

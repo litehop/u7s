@@ -17491,7 +17491,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(cluster_ca_der),
+            cluster_ca_ders: Some(vec![cluster_ca_der]),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,

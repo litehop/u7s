@@ -23,7 +23,7 @@ fn state() -> AppState<SqliteStore> {
         sa_decoding_key: None,
         token_map: std::collections::HashMap::new(),
         server_address: "https://localhost:6443".into(),
-        cluster_ca_der: None,
+        cluster_ca_ders: None,
         webhook_identity_pem: None,
         service_ip_allocator: Some(ServiceIpAllocator::from_cidr(RANGE).unwrap()),
         kubelet_client_identity_pem: None,

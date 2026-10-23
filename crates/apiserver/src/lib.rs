@@ -55,6 +55,8 @@ mod status_dispatch;
 mod storage_node_flow_gen_adapter;
 mod storagemigration_gen_adapter;
 #[cfg(test)]
+mod test_tls;
+#[cfg(test)]
 mod test_utils;
 mod tls;
 mod types;
@@ -253,8 +255,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // server starts accepting requests, closes that race for every namespace that exists
     // at boot. KCM's publisher still POSTs its own copy later — that becomes a 409 which
     // the generic create-conflict path already handles.
-    seed_kube_root_ca(&store, &tls_material.ca_cert_der).await?;
-    seed_cluster_info(&store, &server_address_early, &tls_material.ca_cert_der).await?;
+    seed_kube_root_ca(&store, &tls_material.ca_bundle_ders).await?;
+    seed_cluster_info(&store, &server_address_early, &tls_material.ca_bundle_ders).await?;
 
     // 5. Write kubeconfig.
     write_kubeconfig(&args.kubeconfig, &args)?;
@@ -398,7 +400,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         sa_decoding_key,
         token_map,
         server_address,
-        cluster_ca_der: Some(tls_material.ca_cert_der.clone()),
+        cluster_ca_ders: Some(tls_material.ca_bundle_ders.clone()),
         webhook_identity_pem: Some(webhook_identity_pem),
         service_ip_allocator,
         kubelet_client_identity_pem: Some(kubelet_client_identity_pem),
@@ -454,6 +456,39 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             }
         },
     )));
+    {
+        let (ca_cert_path, rotator, trust_state, trust_store) = (
+            args.ca_cert.clone(),
+            Arc::clone(&tls_material.rotator),
+            state.clone(),
+            Arc::clone(&store),
+        );
+        let mut current = tls_material.ca_bundle_ders.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CA_TRUST_POLL).await;
+                match tls::changed_trust_bundle(&ca_cert_path, &current) {
+                    Ok(Some(next)) => match apply_trust_bundle(
+                        &ca_cert_path,
+                        &next,
+                        &rotator,
+                        &trust_state,
+                        &trust_store,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!("cluster CA trust bundle reloaded: {} CAs", next.len());
+                            current = next;
+                        }
+                        Err(e) => tracing::error!("reload cluster CA trust bundle: {e:#}"),
+                    },
+                    Ok(None) => {}
+                    Err(e) => tracing::error!("cluster CA trust bundle unchanged: {e:#}"),
+                }
+            }
+        });
+    }
     state.node_kubelet_ports = parse_node_kubelet_ports(&args.node_kubelet_port)?;
     if let Some(path) = &args.admission_control_config_file {
         state.pod_security = Arc::new(
@@ -3155,8 +3190,13 @@ pub async fn reconcile_extension_apiserver_authentication(
             return false;
         }
     };
-    let ca_pem =
-        String::from_utf8_lossy(&tls::pem_encode("CERTIFICATE", &ca_cert_der)).into_owned();
+    let ca_pem = match tls::load_trust_bundle(ca_cert_path, &ca_cert_der) {
+        Ok(ders) => String::from_utf8_lossy(&tls::pem_encode_bundle(&ders)).into_owned(),
+        Err(e) => {
+            tracing::warn!("extension-apiserver-authentication reconciler: {e:#}");
+            return false;
+        }
+    };
 
     let proxy_client_ca_der = match std::fs::read(proxy_client_ca_cert_path) {
         Ok(bytes) => bytes,
@@ -3303,35 +3343,96 @@ async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+const CA_TRUST_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Make `ca_ders` the trust bundle everywhere the apiserver itself holds one: inbound
+/// client-cert verification, outbound kubelet/webhook/aggregation clients, the published
+/// `ca-bundle.pem`, and the in-store ConfigMaps. Already-open connections keep the config
+/// they were accepted with.
+async fn apply_trust_bundle(
+    ca_cert_path: &str,
+    ca_ders: &[Vec<u8>],
+    rotator: &rotation::Rotator,
+    state: &state::AppState<SqliteStore>,
+    store: &SqliteStore,
+) -> anyhow::Result<()> {
+    rotator.set_client_cas(ca_ders.to_vec())?;
+    state
+        .set_cluster_ca_bundle(ca_ders.to_vec())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    tls::write_ca_bundle(ca_cert_path, ca_ders)?;
+    seed_kube_root_ca(store, ca_ders).await?;
+    seed_cluster_info(store, &state.server_address, ca_ders).await
+}
+
 /// Seed the `kube-root-ca.crt` ConfigMap (data: `ca.crt` = the cluster CA bundle) into
-/// every namespace that exists at boot. See the call site in `main` for why this must
-/// happen before the server starts accepting requests.
-async fn seed_kube_root_ca(store: &SqliteStore, ca_cert_der: &[u8]) -> anyhow::Result<()> {
+/// every namespace that exists at boot, and rewrite a stale one in place. See the call site
+/// in `main` for why this must happen before the server starts accepting requests; the
+/// rewrite is what lets a changed trust bundle reach pods in namespaces that already hold
+/// the ConfigMap.
+async fn seed_kube_root_ca(store: &SqliteStore, ca_ders: &[Vec<u8>]) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
 
-    const NAMESPACES: &[&str] = &["default", "kube-system", "kube-node-lease", "kube-public"];
-    let ca_pem = String::from_utf8_lossy(&tls::pem_encode("CERTIFICATE", ca_cert_der)).into_owned();
+    let mut namespaces: Vec<String> = ["default", "kube-system", "kube-node-lease", "kube-public"]
+        .map(String::from)
+        .into();
+    let listed = store
+        .list(
+            keys::cluster_list_prefix("namespaces"),
+            u7s_store::ListOptions::default(),
+        )
+        .await?;
+    for obj in listed.items {
+        let ns: serde_json::Value = serde_json::from_slice(&obj.value)?;
+        if let Some(name) = ns["metadata"]["name"].as_str() {
+            if !namespaces.iter().any(|n| n == name) {
+                namespaces.push(name.to_owned());
+            }
+        }
+    }
+    let ca_pem = String::from_utf8_lossy(&tls::pem_encode_bundle(ca_ders)).into_owned();
 
-    for ns in NAMESPACES {
+    for ns in &namespaces {
         let key = keys::object_key("configmaps", ns, "kube-root-ca.crt");
-        let body = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": "kube-root-ca.crt",
-                "namespace": ns,
-                "creationTimestamp": "2024-01-01T00:00:00Z"
-            },
-            "data": { "ca.crt": ca_pem }
-        });
-        match store
-            .put(&key, Bytes::from(body.to_string()), Some(0))
-            .await
-        {
-            Ok(_) => tracing::info!("seeded ConfigMap: {ns}/kube-root-ca.crt"),
-            Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
-            Err(e) => return Err(anyhow::anyhow!("seed ConfigMap {ns}/kube-root-ca.crt: {e}")),
+        for _ in 0..5 {
+            let res = match store.get(&key).await? {
+                None => {
+                    let body = serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "kube-root-ca.crt",
+                            "namespace": ns,
+                            "creationTimestamp": "2024-01-01T00:00:00Z"
+                        },
+                        "data": { "ca.crt": ca_pem }
+                    });
+                    store
+                        .put(&key, Bytes::from(body.to_string()), Some(0))
+                        .await
+                        .map(|_| tracing::info!("seeded ConfigMap: {ns}/kube-root-ca.crt"))
+                }
+                Some(stored) => {
+                    let mut cm: serde_json::Value = serde_json::from_slice(&stored.value)?;
+                    if cm["data"]["ca.crt"].as_str() == Some(ca_pem.as_str()) {
+                        break;
+                    }
+                    cm["data"]["ca.crt"] = serde_json::Value::String(ca_pem.clone());
+                    store
+                        .put(&key, Bytes::from(cm.to_string()), Some(stored.revision))
+                        .await
+                        .map(|_| tracing::info!("updated ConfigMap {ns}/kube-root-ca.crt"))
+                }
+            };
+            match res {
+                Ok(()) => break,
+                Err(
+                    u7s_store::StoreError::AlreadyExists { .. }
+                    | u7s_store::StoreError::RevisionMismatch { .. },
+                ) => {}
+                Err(e) => return Err(anyhow::anyhow!("seed ConfigMap {ns}/kube-root-ca.crt: {e}")),
+            }
         }
     }
     Ok(())
@@ -3344,14 +3445,14 @@ async fn seed_kube_root_ca(store: &SqliteStore, ca_cert_der: &[u8]) -> anyhow::R
 async fn seed_cluster_info(
     store: &SqliteStore,
     server: &str,
-    ca_cert_der: &[u8],
+    ca_ders: &[Vec<u8>],
 ) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
 
     let ca_pem_b64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
-        tls::pem_encode("CERTIFICATE", ca_cert_der),
+        tls::pem_encode_bundle(ca_ders),
     );
     let kubeconfig = format!(
         "apiVersion: v1\nclusters:\n- cluster:\n    certificate-authority-data: {ca_pem_b64}\n    server: {server}\n  name: \"\"\ncontexts: null\ncurrent-context: \"\"\nkind: Config\npreferences: {{}}\nusers: null\n"
@@ -8564,7 +8665,7 @@ mod tests {
         // must not wipe the jws-kubeconfig-<id> entries it wrote or joining nodes lose
         // their ability to verify the discovery document until the next signer resync.
         let store = make_store();
-        seed_cluster_info(&store, "https://10.0.0.1:6443", b"fake-ca-der")
+        seed_cluster_info(&store, "https://10.0.0.1:6443", &[b"fake-ca-der".to_vec()])
             .await
             .expect("seed must not fail");
         let key = keys::object_key("configmaps", "kube-public", "cluster-info");
@@ -8587,14 +8688,14 @@ mod tests {
             .await
             .unwrap();
 
-        seed_cluster_info(&store, "https://10.0.0.1:6443", b"fake-ca-der")
+        seed_cluster_info(&store, "https://10.0.0.1:6443", &[b"fake-ca-der".to_vec()])
             .await
             .expect("reseed must not fail");
         let after: serde_json::Value =
             serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
         assert_eq!(after["data"]["jws-kubeconfig-abcdef"], "sig");
 
-        seed_cluster_info(&store, "https://10.0.0.2:6443", b"other-ca-der")
+        seed_cluster_info(&store, "https://10.0.0.2:6443", &[b"other-ca-der".to_vec()])
             .await
             .expect("reseed with new server/CA must not fail");
         let after: serde_json::Value =
@@ -8647,7 +8748,7 @@ mod tests {
         // check before this fix, because KCM's root-ca-cert-publisher hadn't reconciled
         // "default" yet when the smoke pod was admitted. Seeding it at boot removes the race.
         let store = make_store();
-        seed_kube_root_ca(&store, b"fake-ca-der-bytes")
+        seed_kube_root_ca(&store, &[b"fake-ca-der-bytes".to_vec()])
             .await
             .expect("seed must not fail");
 
@@ -8676,12 +8777,90 @@ mod tests {
         // POSTs this ConfigMap) must not error — CAS rv=0 returns AlreadyExists which is
         // silently ignored.
         let store = make_store();
-        seed_kube_root_ca(&store, b"fake-ca-der-bytes")
+        seed_kube_root_ca(&store, &[b"fake-ca-der-bytes".to_vec()])
             .await
             .expect("first seed must not fail");
-        seed_kube_root_ca(&store, b"fake-ca-der-bytes")
+        seed_kube_root_ca(&store, &[b"fake-ca-der-bytes".to_vec()])
             .await
             .expect("second seed must not fail");
+    }
+
+    /// Every pod's /var/run/secrets/.../ca.crt comes from kube-root-ca.crt. A create-only seed
+    /// leaves it holding the old CA forever after the trust bundle changes, so in-cluster
+    /// clients keep verifying against a stale root.
+    #[tokio::test]
+    async fn seed_kube_root_ca_rewrites_a_stale_configmap_with_the_full_bundle() {
+        let store = make_store();
+        seed_kube_root_ca(&store, &[b"old-ca".to_vec()])
+            .await
+            .unwrap();
+        let bundle = [b"old-ca".to_vec(), b"new-ca".to_vec()];
+        seed_kube_root_ca(&store, &bundle).await.unwrap();
+
+        let want = String::from_utf8(tls::pem_encode_bundle(&bundle)).unwrap();
+        for ns in ["default", "kube-system", "kube-node-lease", "kube-public"] {
+            let key = keys::object_key("configmaps", ns, "kube-root-ca.crt");
+            let cm: serde_json::Value =
+                serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
+            assert_eq!(
+                cm["data"]["ca.crt"].as_str(),
+                Some(want.as_str()),
+                "{ns}/kube-root-ca.crt must carry both CAs"
+            );
+        }
+    }
+
+    /// aggregated backends mirror client-ca-file into their own client trust: it must hold the
+    /// extra CAs next to the signing one or they reject certs from the successor.
+    #[tokio::test]
+    async fn reconcile_extension_apiserver_authentication_publishes_the_extra_cas() {
+        let store = make_store();
+        let dir = write_temp_ca_certs("bundle", b"fake-ca-der-bytes-v1", b"fake-proxy-ca-v1");
+        let extra = rcgen::CertificateParams::new(vec![])
+            .unwrap()
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .der()
+            .to_vec();
+        std::fs::write(
+            dir.join("ca-extra.pem"),
+            tls::pem_encode("CERTIFICATE", &extra),
+        )
+        .unwrap(); // lgtm[rust/path-injection]
+
+        assert!(
+            reconcile_extension_apiserver_authentication(
+                &store,
+                &dir.join("ca.crt").to_string_lossy(),
+                &dir.join("proxy-client-ca.crt").to_string_lossy(),
+            )
+            .await
+        );
+        let key = keys::object_key(
+            "configmaps",
+            "kube-system",
+            "extension-apiserver-authentication",
+        );
+        let cm: serde_json::Value =
+            serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
+        let want = String::from_utf8(tls::pem_encode_bundle(&[
+            b"fake-ca-der-bytes-v1".to_vec(),
+            extra,
+        ]))
+        .unwrap();
+        assert_eq!(cm["data"]["client-ca-file"].as_str(), Some(want.as_str()));
+
+        std::fs::write(dir.join("ca-extra.pem"), "garbage").unwrap(); // lgtm[rust/path-injection]
+        assert!(
+            !reconcile_extension_apiserver_authentication(
+                &store,
+                &dir.join("ca.crt").to_string_lossy(),
+                &dir.join("proxy-client-ca.crt").to_string_lossy(),
+            )
+            .await,
+            "a broken extra CA file must fail the tick, not publish a shrunken bundle"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     #[tokio::test]
@@ -11166,7 +11345,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             webhook_identity_pem: None,
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,

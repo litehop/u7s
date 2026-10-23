@@ -450,10 +450,14 @@ write_kubelet_config_yaml() {
   fi
   # A worker's kubelet files its own kubelet-serving CSR once its Node exists
   # (serverTLSBootstrap); the control-plane kubelet keeps the minted cert file.
+  # ca-bundle.pem (every CA the apiserver trusts) on the control plane; the joined
+  # bundle on a worker. The kubelet re-reads clientCAFile on change.
+  local client_ca="$STATE_DIR/ca-bundle.pem"
   local serving="tlsCertFile: $STATE_DIR/kubelet-serving.crt
 tlsPrivateKeyFile: $STATE_DIR/kubelet-serving.key"
   if [ "$worker" -eq 1 ]; then
     serving="serverTLSBootstrap: true"
+    client_ca="$STATE_DIR/ca.pem"
   fi
   cat > "$STATE_DIR/kubelet-config.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -469,7 +473,7 @@ clusterDomain: cluster.local
 $serving
 authentication:
   x509:
-    clientCAFile: $STATE_DIR/ca.pem
+    clientCAFile: $client_ca
 rotateCertificates: true
 EOF
 }
@@ -581,12 +585,26 @@ discover_cluster_ca() {
     exit 1
   fi
 
-  local ca_pem actual_hash
+  # The CA data is a bundle (several CERTIFICATE blocks while a CA is being succeeded):
+  # the pin must match one of its certs, and the whole bundle is then trusted.
+  local ca_pem pinned=0 hashes=""
   ca_pem="$(sed -n 's/^ *certificate-authority-data: *//p' "$work/kubeconfig.yaml" | head -n1 | base64 -d)"
   rm -rf "$work"
-  actual_hash="sha256:$(printf '%s\n' "$ca_pem" | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 | sed 's/^.* //')"
-  if [ "$actual_hash" != "$CA_CERT_HASH" ]; then
-    echo "error: cluster CA hash $actual_hash does not match --ca-cert-hash $CA_CERT_HASH -- refusing to join" >&2
+  if ! printf '%s\n' "$ca_pem" | grep -q '^-----BEGIN CERTIFICATE-----$'; then
+    echo "error: cluster-info carries no CA certificate -- refusing to join" >&2
+    exit 1
+  fi
+  local pem_file cert_hash
+  pem_file="$(mktemp)"
+  printf '%s\n' "$ca_pem" | awk -v dir="$pem_file." '/-----BEGIN CERTIFICATE-----/{n++} n{print > (dir n)}'
+  for f in "$pem_file".*; do
+    cert_hash="sha256:$(openssl x509 -in "$f" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 | sed 's/^.* //')"
+    hashes="$hashes $cert_hash"
+    [ "$cert_hash" = "$CA_CERT_HASH" ] && pinned=1
+  done
+  rm -f "$pem_file" "$pem_file".*
+  if [ "$pinned" -ne 1 ]; then
+    echo "error: none of the cluster CA hashes ($hashes ) matches --ca-cert-hash $CA_CERT_HASH -- refusing to join" >&2
     exit 1
   fi
   printf '%s\n' "$ca_pem" > "$STATE_DIR/ca.pem"

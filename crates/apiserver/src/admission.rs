@@ -1355,7 +1355,7 @@ pub(crate) const DEFAULT_WEBHOOK_TIMEOUT_SECS: u64 = 10;
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     proxy_addr: Option<&str>,
-    cluster_ca_der: Option<&[u8]>,
+    cluster_ca_ders: Option<&[Vec<u8>]>,
     webhook_identity_pem: Option<&[u8]>,
     dial: Option<(&str, std::net::SocketAddr)>,
     fallback: &reqwest::Client,
@@ -1369,7 +1369,7 @@ fn build_webhook_call_client(
     // Resolve the webhook CA certificate from caBundle. Failures are non-fatal:
     // we fall back to the cluster CA (or no pinned CA) rather than refusing the
     // call, but we always apply the proxy and timeout regardless.
-    let webhook_cert: Option<reqwest::Certificate> = ca_bundle_b64.and_then(|b64| {
+    let webhook_certs: Option<Vec<reqwest::Certificate>> = ca_bundle_b64.and_then(|b64| {
         let pem_bytes = match base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             b64,
@@ -1382,9 +1382,9 @@ fn build_webhook_call_client(
                 return None;
             }
         };
-        match reqwest::Certificate::from_pem(&pem_bytes) {
-            Ok(c) => Some(c),
-            Err(_) => {
+        match reqwest::Certificate::from_pem_bundle(&pem_bytes) {
+            Ok(c) if !c.is_empty() => Some(c),
+            _ => {
                 tracing::warn!(
                     "webhook client: caBundle PEM parse failed for webhook — using cluster CA fallback"
                 );
@@ -1397,9 +1397,8 @@ fn build_webhook_call_client(
     // tls_certs_only bypasses the macOS platform verifier so EKU is not enforced.
     // The proxy and timeout are applied regardless of whether a CA bundle is present:
     // without the proxy, service-based webhook calls never reach the in-cluster pod.
-    let mut builder = if let Some(cert) = webhook_cert {
-        let mut certs = vec![cert];
-        if let Some(der) = cluster_ca_der {
+    let mut builder = if let Some(mut certs) = webhook_certs {
+        for der in cluster_ca_ders.unwrap_or_default() {
             if let Ok(cluster_cert) = reqwest::Certificate::from_der(der) {
                 certs.push(cluster_cert);
             }
@@ -1454,7 +1453,7 @@ pub(crate) async fn prepare_webhook_call<S: Store>(
     let client = build_webhook_call_client(
         config.ca_bundle.as_deref(),
         effective_proxy,
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
         effective_identity.as_deref().map(|v| v.as_slice()),
         dial,
         &state.webhook_client.get(),
@@ -1686,7 +1685,7 @@ async fn invoke_mutating_webhook<S: Store>(
     let wh_client = build_webhook_call_client(
         webhook.client_config.ca_bundle.as_deref(),
         effective_proxy,
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
         effective_identity.as_deref().map(|v| v.as_slice()),
         dial,
         &state.webhook_client.get(),
@@ -4854,7 +4853,7 @@ pub async fn run_validating_webhooks<S: Store>(
             let wh_client = build_webhook_call_client(
                 webhook.client_config.ca_bundle.as_deref(),
                 effective_proxy,
-                state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+                state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
                 effective_identity.as_deref().map(|v| v.as_slice()),
                 dial,
                 &state.webhook_client.get(),
@@ -8933,7 +8932,7 @@ mod tests {
         let client = build_webhook_call_client(
             None, // no caBundle
             None, // effective_proxy = None (the fix)
-            None, // cluster_ca_der
+            None, // cluster_ca_ders
             None, // effective_identity = None (the fix)
             None, // dial
             &fallback, None, // timeout_seconds — use default 10s

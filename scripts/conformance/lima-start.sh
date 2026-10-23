@@ -436,6 +436,8 @@ CA_PEM=$(mktemp)
 trap 'rm -f "$CA_PEM"' EXIT
 if [ -f "$CA_CERT" ]; then
   openssl x509 -in "$CA_CERT" -inform DER -out "$CA_PEM" -outform PEM
+  # Extra trusted CAs (successor/predecessor) join the kubelet's trust bundle.
+  if [ -f "$(dirname "$CA_CERT")/ca-extra.pem" ]; then cat "$(dirname "$CA_CERT")/ca-extra.pem" >> "$CA_PEM"; fi
   limactl copy "$CA_PEM" "${VM_NAME}:/tmp/kubelet-ca.crt"
   limactl shell "$VM_NAME" sudo cp /tmp/kubelet-ca.crt /etc/kubelet-ca.crt
   limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-ca.crt

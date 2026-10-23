@@ -880,8 +880,8 @@ pub struct AppState<S = SqliteStore> {
     /// pool — avoids per-request TLS handshakes that kubelet resets under concurrent load.
     /// None when no cluster CA is configured (tests / no-CA deployments); handlers return 503.
     pub kubelet_client: Swap<Option<reqwest::Client>>,
-    /// DER-encoded cluster CA certificate used to verify kubelet TLS. None in tests.
-    pub cluster_ca_der: Option<Arc<Vec<u8>>>,
+    /// DER-encoded cluster CA bundle (every trusted CA) used to verify kubelet, webhook and aggregated-backend TLS. None in tests.
+    pub cluster_ca_ders: Swap<Option<Arc<Vec<Vec<u8>>>>>,
     /// Concatenated PEM (cert + key) for the kubelet proxy client certificate.
     /// Kubelet accepts clients with O=system:masters when --client-ca-file is our cluster CA.
     pub kubelet_client_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
@@ -993,7 +993,7 @@ pub struct AppStateConfig<S> {
     pub sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
     pub token_map: HashMap<String, UserInfo>,
     pub server_address: String,
-    pub cluster_ca_der: Option<Vec<u8>>,
+    pub cluster_ca_ders: Option<Vec<Vec<u8>>>,
     /// Concatenated PEM bytes of (cert, key) for admission webhook mTLS.
     /// In production: `TlsMaterial::webhook_client_identity_pem`.
     pub webhook_identity_pem: Option<Vec<u8>>,
@@ -1032,7 +1032,7 @@ impl<S> Clone for AppState<S> {
             watch_limit: self.watch_limit.clone(),
             webhook_client: self.webhook_client.clone(),
             kubelet_client: self.kubelet_client.clone(),
-            cluster_ca_der: self.cluster_ca_der.clone(),
+            cluster_ca_ders: self.cluster_ca_ders.clone(),
             kubelet_client_identity_pem: self.kubelet_client_identity_pem.clone(),
             kubelet_preferred_address: self.kubelet_preferred_address.clone(),
             kubelet_port: self.kubelet_port,
@@ -1116,7 +1116,7 @@ impl<S: Store> AppState<S> {
             sa_decoding_key,
             token_map,
             server_address,
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -1130,7 +1130,7 @@ impl<S: Store> AppState<S> {
 
     /// Build a pinned `reqwest::Client` for admission webhook calls.
     ///
-    /// When `cluster_ca_der` is `Some`, the client trusts only that CA (not the system
+    /// When `cluster_ca_ders` is `Some`, the client trusts only those CAs (not the system
     /// root store). This closes the SSRF/exfiltration vector where any user with webhook
     /// RBAC could route admission traffic to an arbitrary HTTPS server.
     ///
@@ -1146,21 +1146,24 @@ impl<S: Store> AppState<S> {
     /// plain client with a 10-second timeout and no CA pinning — acceptable for unit tests
     /// that never make real HTTPS connections.
     fn build_webhook_client(
-        cluster_ca_der: Option<&[u8]>,
+        cluster_ca_ders: Option<&[Vec<u8>]>,
         webhook_identity_pem: Option<&[u8]>,
         konnectivity_proxy_addr: Option<&str>,
     ) -> Result<reqwest::Client, String> {
         let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
 
-        if let Some(ca_der) = cluster_ca_der {
+        if let Some(ca_ders) = cluster_ca_ders {
             // tls_certs_only disables the system/Mozilla root store and trusts only
-            // the cluster CA. This closes the SSRF/exfiltration vector: a user with
+            // the cluster CAs. This closes the SSRF/exfiltration vector: a user with
             // webhook RBAC can only reach servers that present a cert signed by our CA.
             // A corrupt CA file is a configuration error — fail hard rather than falling
             // back to the system trust store (which would re-open the SSRF vector).
-            let cert = reqwest::Certificate::from_der(ca_der)
+            let certs = ca_ders
+                .iter()
+                .map(|der| reqwest::Certificate::from_der(der))
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("webhook client: failed to parse cluster CA DER: {e}"))?;
-            builder = builder.tls_certs_only([cert]);
+            builder = builder.tls_certs_only(certs);
         }
 
         if let Some(identity_pem) = webhook_identity_pem {
@@ -1203,17 +1206,19 @@ impl<S: Store> AppState<S> {
     /// Uses rustls and `tls_certs_only` to trust only the cluster CA, not the system
     /// root store. Presents an mTLS client cert when `client_identity_pem` is `Some`.
     pub fn build_kubelet_client(
-        ca_der: Option<&[u8]>,
+        ca_ders: Option<&[Vec<u8>]>,
         client_identity_pem: Option<&[u8]>,
     ) -> Option<reqwest::Client> {
-        let der = ca_der?;
-        let cert = reqwest::Certificate::from_der(der)
+        let certs = ca_ders?
+            .iter()
+            .map(|der| reqwest::Certificate::from_der(der))
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| tracing::error!("kubelet client: failed to parse cluster CA DER: {e}"))
             .ok()?;
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .use_rustls_tls()
-            .tls_certs_only([cert]);
+            .tls_certs_only(certs);
         if let Some(identity_pem) = client_identity_pem {
             match reqwest::Identity::from_pem(identity_pem) {
                 Ok(identity) => {
@@ -1236,7 +1241,7 @@ impl<S: Store> AppState<S> {
     /// finish on the old client.
     pub fn set_webhook_identity(&self, pem: Vec<u8>) -> Result<(), String> {
         let client = Self::build_webhook_client(
-            self.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            self.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
             Some(&pem),
             self.konnectivity_proxy_addr.as_deref(),
         )?;
@@ -1248,10 +1253,31 @@ impl<S: Store> AppState<S> {
     /// Present `pem` (cert + key) to kubelets from now on.
     pub fn set_kubelet_identity(&self, pem: Vec<u8>) {
         self.kubelet_client.set(Self::build_kubelet_client(
-            self.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            self.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
             Some(&pem),
         ));
         self.kubelet_client_identity_pem.set(Some(Arc::new(pem)));
+    }
+
+    /// Trust `ca_ders` from now on for kubelet, webhook and aggregated-backend calls; the
+    /// previous bundle stays in force if either client fails to build.
+    pub fn set_cluster_ca_bundle(&self, ca_ders: Vec<Vec<u8>>) -> Result<(), String> {
+        let webhook_identity = self.webhook_identity_pem.get();
+        let webhook = Self::build_webhook_client(
+            Some(&ca_ders),
+            webhook_identity.as_deref().map(|v| v.as_slice()),
+            self.konnectivity_proxy_addr.as_deref(),
+        )?;
+        let kubelet_identity = self.kubelet_client_identity_pem.get();
+        let kubelet = Self::build_kubelet_client(
+            Some(&ca_ders),
+            kubelet_identity.as_deref().map(|v| v.as_slice()),
+        )
+        .ok_or_else(|| "kubelet client failed to build with the new CA bundle".to_owned())?;
+        self.cluster_ca_ders.set(Some(Arc::new(ca_ders)));
+        self.webhook_client.set(webhook);
+        self.kubelet_client.set(Some(kubelet));
+        Ok(())
     }
 
     /// Construct an `AppState` from an [`AppStateConfig`].
@@ -1264,13 +1290,13 @@ impl<S: Store> AppState<S> {
         seed_immortal_namespaces(&cfg.store);
         let registry = build_registry();
         let webhook_client = Self::build_webhook_client(
-            cfg.cluster_ca_der.as_deref(),
+            cfg.cluster_ca_ders.as_deref(),
             cfg.webhook_identity_pem.as_deref(),
             cfg.konnectivity_proxy_addr.as_deref(),
         )
         .expect("corrupt cluster CA or invalid webhook client configuration — cannot start");
         let kubelet_client = Self::build_kubelet_client(
-            cfg.cluster_ca_der.as_deref(),
+            cfg.cluster_ca_ders.as_deref(),
             cfg.kubelet_client_identity_pem.as_deref(),
         );
         // If no key is supplied, generate a fresh random 32-byte key from the OS CSPRNG.
@@ -1295,7 +1321,7 @@ impl<S: Store> AppState<S> {
             watch_limit: WatchLimitState::new(),
             webhook_client: Swap::new(webhook_client),
             kubelet_client: Swap::new(kubelet_client),
-            cluster_ca_der: cfg.cluster_ca_der.map(Arc::new),
+            cluster_ca_ders: Swap::new(cfg.cluster_ca_ders.map(Arc::new)),
             kubelet_client_identity_pem: Swap::new(cfg.kubelet_client_identity_pem.map(Arc::new)),
             kubelet_preferred_address: cfg.kubelet_preferred_address.map(Arc::new),
             kubelet_port: cfg.kubelet_port,
@@ -2589,8 +2615,9 @@ mod tests {
         let ca_der = cert.cert.der().to_vec();
 
         // Must succeed — if CA DER is valid, client construction returns Ok.
-        let _client = AppState::<SqliteStore>::build_webhook_client(Some(&ca_der), None, None)
-            .expect("valid CA DER must produce Ok client");
+        let _client =
+            AppState::<SqliteStore>::build_webhook_client(Some(&[ca_der.clone()]), None, None)
+                .expect("valid CA DER must produce Ok client");
     }
 
     /// build_webhook_client succeeds with no CA and no identity (test path).
@@ -2659,7 +2686,7 @@ mod tests {
 
         // Must succeed: valid CA DER + valid identity PEM.
         let _client = AppState::<SqliteStore>::build_webhook_client(
-            Some(&ca_cert_der),
+            Some(&[ca_cert_der.clone()]),
             Some(&identity_pem),
             None,
         )
@@ -2678,11 +2705,61 @@ mod tests {
     fn build_webhook_client_fails_with_invalid_ca_der() {
         // Garbage bytes are not valid DER — Certificate::from_der must return Err.
         let bad_der: &[u8] = b"this is not valid DER";
-        let result = AppState::<SqliteStore>::build_webhook_client(Some(bad_der), None, None);
+        let result =
+            AppState::<SqliteStore>::build_webhook_client(Some(&[bad_der.to_vec()]), None, None);
         assert!(
             result.is_err(),
             "invalid CA DER must cause Err so the server fails at startup \
              rather than falling back to the system trust store"
+        );
+    }
+
+    /// A bundle swap reaches the shared trust used by kubelet, webhook and aggregation calls,
+    /// and a bundle that cannot build leaves the previous one in force, never an empty or
+    /// half-applied trust store.
+    #[tokio::test]
+    async fn set_cluster_ca_bundle_swaps_trust_atomically() {
+        let ca = |cn: &str| {
+            rcgen::generate_simple_self_signed(vec![cn.to_string()])
+                .unwrap()
+                .cert
+                .der()
+                .to_vec()
+        };
+        let (old, new) = (ca("old"), ca("new"));
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new_with_config(AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_ders: Some(vec![old.clone()]),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        state
+            .set_cluster_ca_bundle(vec![old.clone(), new.clone()])
+            .unwrap();
+        assert_eq!(
+            state.cluster_ca_ders.get().as_deref(),
+            Some(&vec![old.clone(), new])
+        );
+
+        assert!(state
+            .set_cluster_ca_bundle(vec![old.clone(), b"not der".to_vec()])
+            .is_err());
+        assert_eq!(
+            state.cluster_ca_ders.get().as_deref().map(Vec::len),
+            Some(2),
+            "a failed swap must keep the previous bundle"
         );
     }
 
@@ -2713,7 +2790,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             webhook_identity_pem: None,
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
@@ -2858,7 +2935,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             webhook_identity_pem: None,
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
