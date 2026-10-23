@@ -9022,7 +9022,8 @@ mod tests {
             }
             s
         };
-        let bases: [(&[&str], &[(usize, &str)]); 3] = [
+        type Base<'a> = (&'a [&'a str], &'a [(usize, &'a str)]);
+        let bases: [Base; 3] = [
             (
                 &["api", "v1", "namespaces", "default", "configmaps", "x"],
                 &[
