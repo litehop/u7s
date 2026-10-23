@@ -509,9 +509,16 @@ fn validate_spki_key_type(
             }
         }
         RSA_ENCRYPTION => {
-            let key = rsa::pkcs1::RsaPublicKey::try_from(spki.subject_public_key.raw_bytes())
+            use x509_cert::der::{asn1::UintRef, Reader as _, SliceReader};
+            let bits = SliceReader::new(spki.subject_public_key.raw_bytes())
+                .and_then(|mut r| {
+                    r.sequence(|seq| {
+                        let n = UintRef::decode(seq)?;
+                        UintRef::decode(seq)?;
+                        Ok(n.as_bytes().len() * 8)
+                    })
+                })
                 .map_err(|_| "invalid RSA public key".to_string())?;
-            let bits = key.modulus.as_bytes().len() * 8;
             if bits == 3072 || bits == 4096 {
                 Ok(KeyKind::Rsa)
             } else {

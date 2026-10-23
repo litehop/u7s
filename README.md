@@ -94,9 +94,10 @@ node. It needs no token and mints nothing. Upgrade the control plane first,
 then the workers.
 
 - **Control plane**: re-run with no flags. The binaries and unit files are
-  replaced and the services restarted; the CA and service-account keys
-  (`/var/lib/u7s/ca.key`, `ca.crt`, `sa.key`, `sa.pub`) and the cluster
-  state are kept, and the script fails if those keys changed.
+  replaced and the services restarted; the CA (`/var/lib/u7s/ca.key`,
+  `ca.crt`), the service-account keyring (`sa.key`, `sa.pub`) and the cluster
+  state are kept, and the script fails if the CA changed. The keyring rotates
+  on its own, so `sa.key` changing between runs is expected.
 - **Joined worker**: re-run with no flags (no `--join`, no token). The script
   recognises the node's identity (`/var/lib/u7s/kubeconfig`, `ca.pem`,
   `kubelet-client.crt` and `.key`, plus the kubelet's rotated client cert in
