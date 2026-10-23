@@ -909,6 +909,38 @@ pub(crate) const CLUSTER_ROLES: &str = "clusterroles";
 const ROLES: &str = "roles";
 const ROLE_BINDINGS: &str = "rolebindings";
 
+/// roleRef of a binding body with the same apiGroup defaulting that `apply_defaults`
+/// applies later (missing or empty means `rbac.authorization.k8s.io`), so the escalation
+/// check judges the binding that will actually be stored. Fails closed with 422: an
+/// unusable roleRef must never read as "check not applicable".
+fn binding_role_ref(
+    body: &serde_json::Value,
+    allowed_kinds: &[&str],
+) -> Result<(String, String), crate::status::StatusError> {
+    let field = |key: &str| body["roleRef"][key].as_str().unwrap_or("");
+    let invalid = |msg: String| Status::unprocessable_entity(format!("roleRef: {msg}"));
+    let api_group = match field("apiGroup") {
+        "" => RBAC_GROUP,
+        g => g,
+    };
+    if api_group != RBAC_GROUP {
+        return Err(invalid(format!(
+            "Unsupported value: \"{api_group}\": supported values: \"{RBAC_GROUP}\""
+        )));
+    }
+    let kind = field("kind");
+    if !allowed_kinds.contains(&kind) {
+        return Err(invalid(format!(
+            "Unsupported value: \"{kind}\": supported values: {allowed_kinds:?}"
+        )));
+    }
+    let name = field("name");
+    if name.is_empty() {
+        return Err(invalid("Required value: name".to_string()));
+    }
+    Ok((kind.to_string(), name.to_string()))
+}
+
 /// Escalation prevention for ClusterRoleBinding writes.
 ///
 /// A user may only create or update a ClusterRoleBinding if they already hold
@@ -927,12 +959,7 @@ pub(crate) fn check_crb_escalation<S: Store>(
     if group != RBAC_GROUP || plural != CLUSTER_ROLE_BINDINGS {
         return Ok(());
     }
-    let role_ref_name = crate::rbac::RbacBinding::deserialize(body)
-        .map(|b| b.role_ref.name)
-        .unwrap_or_default();
-    if role_ref_name.is_empty() {
-        return Ok(());
-    }
+    let (_, role_ref_name) = binding_role_ref(body, &["ClusterRole"])?;
     // Kubernetes upstream (BindingAuthorized): a user who holds the `bind` verb on
     // clusterroles in rbac.authorization.k8s.io may create a CRB to any ClusterRole
     // without personally holding all of its rules.  `bind` is distinct from `escalate`
@@ -1144,31 +1171,16 @@ pub(crate) fn check_rb_escalation<S: Store>(
     if group != RBAC_GROUP || plural != ROLE_BINDINGS {
         return Ok(());
     }
-    let binding = match crate::rbac::RbacBinding::deserialize(body) {
-        Ok(b) => b,
-        Err(_) => return Ok(()),
-    };
-    let role_ref = &binding.role_ref;
-    if role_ref.api_group != RBAC_GROUP {
-        return Ok(());
-    }
-    if role_ref.name.is_empty() {
-        return Ok(());
-    }
-    let (role_rules, not_found_resource) = match role_ref.kind.as_str() {
+    let (kind, name) = binding_role_ref(body, &["Role", "ClusterRole"])?;
+    let (role_rules, not_found_resource) = match kind.as_str() {
         "Role" => (
-            state
-                .rbac_index
-                .role_rules_if_exists(namespace, &role_ref.name),
+            state.rbac_index.role_rules_if_exists(namespace, &name),
             ROLES,
         ),
-        "ClusterRole" => (
-            state
-                .rbac_index
-                .cluster_role_rules_if_exists(&role_ref.name),
+        _ => (
+            state.rbac_index.cluster_role_rules_if_exists(&name),
             CLUSTER_ROLES,
         ),
-        _ => return Ok(()),
     };
     // Kubernetes upstream (BindingAuthorized): a user who holds the `bind` verb on the
     // role resource in rbac.authorization.k8s.io may create a RoleBinding without
@@ -1178,7 +1190,7 @@ pub(crate) fn check_rb_escalation<S: Store>(
     // granting cluster-wide bind. The resource follows the roleRef kind:
     //   - Role        → resource "roles"
     //   - ClusterRole → resource "clusterroles"
-    let bind_resource = match role_ref.kind.as_str() {
+    let bind_resource = match kind.as_str() {
         "Role" => ROLES,
         _ => CLUSTER_ROLES,
     };
@@ -1190,18 +1202,14 @@ pub(crate) fn check_rb_escalation<S: Store>(
         resource: bind_resource,
         subresource: "",
         namespace: Some(namespace),
-        name: Some(&role_ref.name),
+        name: Some(&name),
         non_resource_url: None,
     };
     if state.rbac_index.is_allowed(&bind_req) {
         return Ok(());
     }
     let Some(role_rules) = role_rules else {
-        return Err(Status::not_found(
-            RBAC_GROUP,
-            not_found_resource,
-            &role_ref.name,
-        ));
+        return Err(Status::not_found(RBAC_GROUP, not_found_resource, &name));
     };
     if !user_holds_all_rules_in_namespace(
         &user.username,
@@ -3475,6 +3483,142 @@ mod escalation_tests {
             &state,
         )
         .is_ok());
+    }
+
+    fn binding_with_role_ref(role_ref: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {"name": "b", "namespace": "ns-a"},
+            "subjects": [{"kind": "User", "name": "mallory"}],
+            "roleRef": role_ref
+        })
+    }
+
+    fn secrets_role() -> serde_json::Value {
+        serde_json::json!({"rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}]})
+    }
+
+    /// The stored binding gets roleRef.apiGroup defaulted after this check; if a missing or
+    /// empty apiGroup made the check skip, a caller without the role's rules could bind
+    /// themselves to cluster-admin.
+    #[test]
+    fn binding_escalation_check_judges_roleref_after_apigroup_defaulting() {
+        let state = make_state();
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/secret-reader",
+            &secrets_role(),
+        );
+        let mallory = rbac_user("mallory", &[]);
+        let group_variants = [
+            serde_json::json!({"kind": "ClusterRole", "name": "secret-reader"}),
+            serde_json::json!({"apiGroup": "", "kind": "ClusterRole", "name": "secret-reader"}),
+            serde_json::json!({"apiGroup": super::RBAC_GROUP, "kind": "ClusterRole", "name": "secret-reader"}),
+        ];
+        for role_ref in group_variants {
+            let body = binding_with_role_ref(role_ref.clone());
+            let err = super::check_crb_escalation(
+                "clusterrolebindings",
+                super::RBAC_GROUP,
+                &mallory,
+                &body,
+                &state,
+            )
+            .expect_err(&format!("CRB {role_ref} must be forbidden"));
+            assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN, "CRB {role_ref}");
+            let err = super::check_rb_escalation(
+                "rolebindings",
+                super::RBAC_GROUP,
+                "ns-a",
+                &mallory,
+                &body,
+                &state,
+            )
+            .expect_err(&format!("RB {role_ref} must be forbidden"));
+            assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN, "RB {role_ref}");
+        }
+    }
+
+    /// Defaulting must not turn the check into a blanket denial: a holder of the rules
+    /// still binds with the apiGroup omitted.
+    #[test]
+    fn binding_with_omitted_apigroup_is_allowed_for_caller_holding_the_rules() {
+        let state = make_state();
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/secret-reader",
+            &secrets_role(),
+        );
+        grant_cluster_rules(
+            &state,
+            "carol",
+            serde_json::json!([{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}]),
+        );
+        let carol = rbac_user("carol", &[]);
+        let body = binding_with_role_ref(
+            serde_json::json!({"kind": "ClusterRole", "name": "secret-reader"}),
+        );
+        assert!(super::check_crb_escalation(
+            "clusterrolebindings",
+            super::RBAC_GROUP,
+            &carol,
+            &body,
+            &state
+        )
+        .is_ok());
+        assert!(super::check_rb_escalation(
+            "rolebindings",
+            super::RBAC_GROUP,
+            "ns-a",
+            &carol,
+            &body,
+            &state
+        )
+        .is_ok());
+    }
+
+    /// An unusable roleRef must be rejected (422), not treated as "check not applicable",
+    /// since "not applicable" lets the write proceed unchecked.
+    #[test]
+    fn binding_escalation_check_fails_closed_on_unusable_roleref() {
+        let state = make_state();
+        let mallory = rbac_user("mallory", &[]);
+        let bad = [
+            serde_json::json!(null),
+            serde_json::json!("cluster-admin"),
+            serde_json::json!({"kind": "ClusterRole"}),
+            serde_json::json!({"kind": "Bogus", "name": "x"}),
+            serde_json::json!({"apiGroup": "other.io", "kind": "ClusterRole", "name": "x"}),
+        ];
+        for role_ref in bad {
+            let body = binding_with_role_ref(role_ref.clone());
+            let err = super::check_crb_escalation(
+                "clusterrolebindings",
+                super::RBAC_GROUP,
+                &mallory,
+                &body,
+                &state,
+            )
+            .expect_err(&format!("CRB {role_ref} must fail closed"));
+            assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            let err = super::check_rb_escalation(
+                "rolebindings",
+                super::RBAC_GROUP,
+                "ns-a",
+                &mallory,
+                &body,
+                &state,
+            )
+            .expect_err(&format!("RB {role_ref} must fail closed"));
+            assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let role_kind = binding_with_role_ref(serde_json::json!({"kind": "Role", "name": "x"}));
+        let err = super::check_crb_escalation(
+            "clusterrolebindings",
+            super::RBAC_GROUP,
+            &mallory,
+            &role_kind,
+            &state,
+        )
+        .expect_err("a ClusterRoleBinding may only reference a ClusterRole");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     // -- bind-verb bypass (Kubernetes RBAC semantics) --
