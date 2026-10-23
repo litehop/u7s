@@ -183,11 +183,6 @@ async fn core_and_crd_groups<S: Store>(state: &AppState<S>) -> Vec<APIGroup> {
             // autoscaling advertises both v2 (preferred) and v1.
             if *name == "autoscaling" {
                 make_group(name, version, &["v2", "v1"])
-            } else if *name == "certificates.k8s.io" {
-                // v1 (GA, CertificateSigningRequest) stays preferred over v1beta1
-                // (ClusterTrustBundle, PodCertificateRequest) — same GA-over-beta
-                // preference upstream kube-apiserver applies.
-                make_group(name, version, &["v1", "v1beta1"])
             } else if *name == "coordination.k8s.io" {
                 // v1 (GA, Lease) stays preferred over v1alpha2 (LeaseCandidate,
                 // CoordinatedLeaderElection) — same GA-over-alpha preference upstream applies.
@@ -843,7 +838,6 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("autoscaling", "v2") => Some(autoscaling_v2_resources()),
         ("batch", "v1") => Some(batch_v1_resources()),
         ("certificates.k8s.io", "v1") => Some(certificates_v1_resources()),
-        ("certificates.k8s.io", "v1beta1") => Some(certificates_v1beta1_resources()),
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
         ("coordination.k8s.io", "v1alpha2") => Some(coordination_v1alpha2_resources()),
         ("discovery.k8s.io", "v1") => Some(discovery_v1_resources()),
@@ -1347,37 +1341,6 @@ fn certificates_v1_resources() -> serde_json::Value {
                 "singularName": "",
                 "namespaced": false,
                 "kind": "CertificateSigningRequest",
-                "verbs": ["get", "patch", "update"]
-            }
-        ]
-    })
-}
-
-fn certificates_v1beta1_resources() -> serde_json::Value {
-    serde_json::json!({
-        "kind": "APIResourceList",
-        "apiVersion": "v1",
-        "groupVersion": "certificates.k8s.io/v1beta1",
-        "resources": [
-            {
-                "name": "clustertrustbundles",
-                "singularName": "clustertrustbundle",
-                "namespaced": false,
-                "kind": "ClusterTrustBundle",
-                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-            },
-            {
-                "name": "podcertificaterequests",
-                "singularName": "podcertificaterequest",
-                "namespaced": true,
-                "kind": "PodCertificateRequest",
-                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-            },
-            {
-                "name": "podcertificaterequests/status",
-                "singularName": "",
-                "namespaced": true,
-                "kind": "PodCertificateRequest",
                 "verbs": ["get", "patch", "update"]
             }
         ]
@@ -2885,6 +2848,20 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn certificates_group_advertises_only_v1_because_upstream_disables_v1beta1_by_default() {
+        let state = make_state();
+        let list = api_group_list_inner(&state).await;
+        let group = list
+            .groups
+            .iter()
+            .find(|g| g.name == "certificates.k8s.io")
+            .expect("certificates.k8s.io must be advertised");
+        let versions: Vec<_> = group.versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(versions, ["v1"]);
+        assert!(static_group_resources("certificates.k8s.io", "v1beta1").is_none());
+    }
+
     // After inserting a CRD, api_group_list must include its group.
     // This verifies that discovery is live — not baked in at startup.
     #[tokio::test]
@@ -3368,11 +3345,7 @@ mod tests {
     fn every_served_builtin_has_a_storage_version_entry_or_is_declared_not_persisted() {
         let mut lists = vec![("", api_v1_resource_list_value())];
         let mut gvs: Vec<(&str, &str)> = STATIC_GROUPS.to_vec();
-        gvs.extend([
-            ("autoscaling", "v1"),
-            ("certificates.k8s.io", "v1beta1"),
-            ("coordination.k8s.io", "v1alpha2"),
-        ]);
+        gvs.extend([("autoscaling", "v1"), ("coordination.k8s.io", "v1alpha2")]);
         for (g, v) in gvs {
             lists.push((g, static_group_resources(g, v).unwrap()));
         }
