@@ -10,18 +10,31 @@
 #   (a) no OOM kill of any control-plane host process or kube-system pod
 #   (b) the node stays Ready throughout
 #   (c) each burst completes within 5 minutes (hard-killed and recorded as timeout at 10)
-#   (d) after the burst settles, the WordPress page still responds
+#   (d) after the burst settles, the WordPress page still responds and a marker row written to
+#       MariaDB before the bursts is still readable (a recreated emptyDir DB must not pass)
 #   (e) scripts/e2e-workload/webhook-smoke.sh passes on the shipped-install VM
-# Exits non-zero if any criterion of any run FAILs.
+# Exit status: 0 PASS, 1 a valid run FAILed, 3 INVALID (not enough valid runs).
 #
-# Usage: burst-gate.sh [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--zram-mib N] [--coredns-requests]
+# INVALID: a run that did not pass while the host was not quiet is neither PASS nor FAIL. Quiet
+# means no other Lima VM running and host CPU idle >= 70% over 30 s (the floor drops by the gate
+# VM's own vCPU share once it runs), checked before the VM is created and then every ~60 s, plus
+# an in-guest CPU calibration at the idle boundary before the first burst (median > 1.5x the
+# pre-install baseline of the same VM; never sampled after a burst, and with fewer than 3
+# samples it is unmeasured and judges nothing). A harness error (marker write failing before the
+# bursts) is INVALID too. INVALID runs are repeated (up to MAX_INVALID_RUNS, default 3, after
+# RG_RETRY_WAIT_SECS, default 300) and never counted; a PASS under contention stays a PASS.
+#
+# Usage: burst-gate.sh [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --burst-pods N    size of the large burst (default 50); the verdict names it
 #   --confirm         release-gate mode, run on a QUIET host (~1 h): --runs (default 3) full runs at
 #                     50 pods, and only if any fails 3 at 40. Reports the gated no-swap ceiling or FAIL.
 #   --keep            do not delete the VMs afterwards
-#   --memory GiB      override the template's VM memory (forced-failure checks, e.g. 0.625)
+#   --memory GiB      override the template's VM memory (applies from boot, so it can break the install)
+#   --mem-hog-mib N   forced-failure check: after install, pin N MiB (tmpfs, no swap) so the burst
+#                     is what fails. The run is then judged by whether it failed in the burst,
+#                     and exits 0 only if so (e.g. 400)
 #   --coredns-requests experiment: set CoreDNS cpu/memory requests after install
 #   --zram-mib N      experiment: give the VM an N MiB zram swap device before install
 #   --capture         also run vm-capture.sh (PSI/CPU/refault diagnostics; its kubectl probes
@@ -42,9 +55,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
 BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
-RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
+RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""; HOG_MIB=0
 BURST_CAP_SECS=300
 RUN_WALL_SECS=3300
+MAX_INVALID_RUNS="${MAX_INVALID_RUNS:-3}"
+RG_RETRY_WAIT_SECS="${RG_RETRY_WAIT_SECS:-300}"
+QUIET_RECHECK_SECS="${QUIET_RECHECK_SECS:-30}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -58,6 +74,7 @@ while [ $# -gt 0 ]; do
     --confirm) CONFIRM=1; shift ;;
     --probe-kill) PROBE_KILL_SECS="$2"; shift 2 ;;
     --memory) MEMORY="$2"; shift 2 ;;
+    --mem-hog-mib) HOG_MIB="$2"; shift 2 ;;
     --burst-cap) BURST_CAP_SECS="$2"; shift 2 ;;
     --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
@@ -68,6 +85,9 @@ done
 export BURST_CAP_SECS
 case "$ZRAM_MIB" in
   ''|*[!0-9]*) echo "--zram-mib must be a non-negative integer (MiB), got '$ZRAM_MIB'" >&2; exit 2 ;;
+esac
+case "$HOG_MIB" in
+  ''|*[!0-9]*) echo "--mem-hog-mib must be a non-negative integer (MiB), got '$HOG_MIB'" >&2; exit 2 ;;
 esac
 case "$RUNS" in
   ''|*[!0-9]*) echo "--runs must be a positive integer, got '$RUNS'" >&2; exit 2 ;;
@@ -113,8 +133,10 @@ if [ "$CONFIRM" = 1 ]; then
   for size in $CONFIRM_SIZES; do
     "$0" --runs "$RUNS" --burst-pods "$size" --burst-cap "$BURST_CAP_SECS" --tarball-dir "$TARBALL_DIR" --out "$OUT/burst-$size" >&2 || true
     n_passed="$(cat "$OUT/burst-$size/passed" 2>/dev/null || echo 0)"
-    tried+=("$size:$n_passed:$RUNS")
+    n_valid="$(cat "$OUT/burst-$size/valid" 2>/dev/null || echo 0)"
+    tried+=("$size:$n_passed:$n_valid:$RUNS")
     [ "$n_passed" = "$RUNS" ] && break
+    [ "$n_passed" = "$n_valid" ] && break
   done
   rg_confirm_verdict "${tried[@]}"; exit $?
 fi
@@ -123,8 +145,8 @@ STAGE="$OUT/stage"
 mkdir -p "$STAGE/wordpress"
 cp "$TARBALL_DIR"/u7s-gate-*.tar.gz "$TARBALL_DIR"/u7s-gate-*.tar.gz.sha256 "$TARBALL_DIR/install.sh" "$STAGE/"
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
-printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\n' \
-  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" > "$STAGE/gate.env"
+printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nHOG_MIB=%s\n' \
+  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$HOG_MIB" > "$STAGE/gate.env"
 cp "$ROOT/examples/e2e/wordpress/wordpress.yaml" "$STAGE/wordpress/"
 # MariaDB data on emptyDir: the gate VM has no csi-hostpath, and the PVC is not what is under test.
 awk '
@@ -135,19 +157,42 @@ awk '
 ' "$ROOT/examples/e2e/wordpress/mariadb.yaml" > "$STAGE/wordpress/mariadb-emptydir.yaml"
 grep -q 'name: data' "$STAGE/wordpress/mariadb-emptydir.yaml" || { echo "mariadb emptyDir rewrite failed" >&2; exit 2; }
 
-overall=0; passed=0
-i=0
-while [ "$i" -lt "$RUNS" ]; do
-  i=$((i + 1))
-  VM="u7s-rg-$STAMP-$i"; VMS="$VMS $VM"
-  RUN_OUT="$OUT/run-$i"; mkdir -p "$RUN_OUT"
-  echo "==== run $i/$RUNS: VM $VM ===="
-  host_state() { echo "$(date -u +%H:%M:%SZ) $1 loadavg=$(sysctl -n vm.loadavg 2>/dev/null || cut -d' ' -f1-3 /proc/loadavg) running-vms=$(limactl list 2>/dev/null | awk '$2 == "Running" {printf "%s ", $1}')"; }
+# Appends one "<epoch> <host idle %> <other running VMs>" line to $1 (blocks for the CPU sample).
+quiet_sample() {
+  local idle others list
+  idle="$(rg_host_idle_pct)"
+  if list="$(limactl list 2>/dev/null)"; then others="$(echo "$list" | rg_other_vms "$VM" | wc -l | tr -d ' ')"; else others="?"; fi
+  rg_quiet_line "$(date +%s)" "$idle" "$others" "$VM_ALLOW_PCT" >> "$1"
+}
+VM_ALLOW_PCT=0
+VM_VCPUS="$(awk '/^cpus:/ {print $2}' "$HERE/u7s-vps-1g.yaml")"
+HOST_CORES="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 0)"
+host_state() { echo "$(date -u +%H:%M:%SZ) $1 loadavg=$(sysctl -n vm.loadavg 2>/dev/null || cut -d' ' -f1-3 /proc/loadavg) other-running-vms=$(limactl list 2>/dev/null | rg_other_vms "$VM" | tr '\n' ' ')"; }
+
+overall=0; passed=0; valid=0; invalid=0; attempt=0
+while [ "$valid" -lt "$RUNS" ] && [ "$invalid" -lt "$MAX_INVALID_RUNS" ]; do
+  attempt=$((attempt + 1))
+  VM="u7s-rg-$STAMP-$attempt"
+  RUN_OUT="$OUT/run-$attempt"; mkdir -p "$RUN_OUT"
+  echo "==== attempt $attempt (valid $valid/$RUNS, invalid $invalid/$MAX_INVALID_RUNS): VM $VM ===="
   host_state start | tee "$RUN_OUT/host.txt"
+  status=""
+  VM_ALLOW_PCT=0
+  quiet_sample "$RUN_OUT/quiet.log"
+  if [ -n "$(rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null)" ]; then
+    status=INVALID
+    echo "pre-flight: host not quiet, no VM created:"; rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null
+  fi
   create_args=(--name "$VM" --tty=false)
   [ -n "$MEMORY" ] && create_args+=(--memory "$MEMORY")
-  if limactl create "${create_args[@]}" "$HERE/u7s-vps-1g.yaml" >"$RUN_OUT/lima-create.log" 2>&1 \
+  if [ -n "$status" ]; then
+    :
+  elif VMS="$VMS $VM"; limactl create "${create_args[@]}" "$HERE/u7s-vps-1g.yaml" >"$RUN_OUT/lima-create.log" 2>&1 \
      && limactl start "$VM" >"$RUN_OUT/lima-start.log" 2>&1; then
+    VM_ALLOW_PCT="$(rg_vm_cpu_allow_pct "$VM_VCPUS" "$HOST_CORES")"
+    rm -f "$RUN_OUT/quiet.stop"
+    rg_quiet_loop "$RUN_OUT/quiet.stop" "$RUN_OUT/quiet.log" "$QUIET_RECHECK_SECS" quiet_sample &
+    quiet_pid=$!
     limactl shell "$VM" sudo install -d -m 0777 /var/tmp/rg
     limactl shell "$VM" grep -E 'MemTotal|SwapTotal' /proc/meminfo | tee "$RUN_OUT/meminfo-total.txt"
     for f in "$STAGE"/*.tar.gz "$STAGE"/*.sha256 "$STAGE"/*.sh "$STAGE"/*.env "$STAGE/wordpress"; do
@@ -156,10 +201,14 @@ while [ "$i" -lt "$RUNS" ]; do
     limactl shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh >"$RUN_OUT/vm-gate.log" 2>&1 &
     gate_pid=$!
     tail -n +1 -f "$RUN_OUT/vm-gate.log" & tail_pid=$!
-    ( sleep "$RUN_WALL_SECS"; echo "run wall-clock cap ${RUN_WALL_SECS}s hit; killing" >&2; kill "$gate_pid" 2>/dev/null ) &
+    # The host-side client dying leaves the workload running in the VM, so kill it there first.
+    ( sleep "$RUN_WALL_SECS"; echo "run wall-clock cap ${RUN_WALL_SECS}s hit; killing" >&2
+      limactl shell "$VM" sudo pkill -KILL -f "$RG_VM_KILL_PATTERN" 2>/dev/null
+      kill "$gate_pid" 2>/dev/null ) &
     wd_pid=$!
     wait "$gate_pid" 2>/dev/null
     kill "$wd_pid" "$tail_pid" 2>/dev/null
+    touch "$RUN_OUT/quiet.stop"; wait "$quiet_pid" 2>/dev/null
     limactl copy -r "$VM:/var/tmp/rg/out" "$RUN_OUT/out" >/dev/null 2>&1 \
       || echo "warning: could not copy results out of $VM" >&2
   else
@@ -167,18 +216,39 @@ while [ "$i" -lt "$RUNS" ]; do
   fi
   host_state end | tee -a "$RUN_OUT/host.txt"
   mkdir -p "$RUN_OUT/out"; touch "$RUN_OUT/out/results.env"
-  echo "---- run $i verdict ----"
-  if [ -n "$RAMP" ]; then
-    rg_ramp_verdict "$RUN_OUT/out/results.env" "$RAMP_SIZES" "$RUN_OUT/out/samples.tsv" > "$RUN_OUT/verdict.txt"; rc=$?
-  else
-    rg_verdict "$RUN_OUT/out/results.env" > "$RUN_OUT/verdict.txt"; rc=$?
+  if [ -z "$status" ]; then
+    echo "---- attempt $attempt verdict ----"
+    if [ -n "$RAMP" ]; then
+      rg_ramp_verdict "$RUN_OUT/out/results.env" "$RAMP_SIZES" "$RUN_OUT/out/samples.tsv" > "$RUN_OUT/verdict.txt"; rc=$?
+    else
+      rg_verdict "$RUN_OUT/out/results.env" > "$RUN_OUT/verdict.txt"; rc=$?
+    fi
+    cat "$RUN_OUT/verdict.txt"
+    status="$(rg_run_status "$rc" "$RUN_OUT/quiet.log" "$RUN_OUT/out/results.env")"
+    if [ "$status" != INVALID ] && [ "$HOG_MIB" -gt 0 ]; then
+      rg_forced_failure_check "$RUN_OUT/out/results.env" "$RUN_OUT/out/phase" | tee -a "$RUN_OUT/verdict.txt"; rc=${PIPESTATUS[0]}
+      [ "$rc" -eq 0 ] && status=PASS || status=FAIL
+    fi
   fi
-  cat "$RUN_OUT/verdict.txt"
-  if [ "$rc" -eq 0 ]; then passed=$((passed + 1)); else overall=1; fi
+  rg_contention_reasons "$RUN_OUT/quiet.log" "$RUN_OUT/out/results.env" > "$RUN_OUT/contention.txt"
+  harness_error="$(rg_get "$RUN_OUT/out/results.env" harness_error)"
+  [ -z "$harness_error" ] || echo "HARNESS ERROR (run is INVALID, not a u7s FAIL): $harness_error"
+  [ ! -s "$RUN_OUT/out/results.env" ] || rg_cal_unmeasured "$RUN_OUT/out/results.env" | sed 's/^/warning: /'
+  echo "run status: $status"
+  [ "$status" = PASS ] || { [ ! -s "$RUN_OUT/contention.txt" ] || { echo "contention observed:"; cat "$RUN_OUT/contention.txt"; }; }
+  case "$status" in
+    PASS) passed=$((passed + 1)); valid=$((valid + 1)) ;;
+    FAIL) overall=1; valid=$((valid + 1)) ;;
+    INVALID) invalid=$((invalid + 1)); [ "$invalid" -lt "$MAX_INVALID_RUNS" ] && sleep "$RG_RETRY_WAIT_SECS" ;;
+  esac
   [ -s "$RUN_OUT/out/samples.tsv" ] && "$HERE/summarize.sh" "$RUN_OUT/out" | tee "$RUN_OUT/summary.md"
   [ "$KEEP" = 1 ] || { limactl delete -f "$VM" >/dev/null 2>&1; VMS="${VMS/ $VM/}"; }
 done
 
 echo "$passed" > "$OUT/passed"
-echo "==== GATE: $passed/$RUNS runs passed at $BURST_PODS pods -> $([ "$overall" = 0 ] && echo PASS || echo FAIL) (results in $OUT) ===="
-exit "$overall"
+echo "$valid" > "$OUT/valid"
+if [ "$overall" != 0 ]; then verdict=FAIL; rc=1
+elif [ "$valid" -lt "$RUNS" ]; then verdict="INVALID (only $valid/$RUNS valid runs; host contention)"; rc=3
+else verdict=PASS; rc=0; fi
+echo "==== GATE: $passed/$RUNS runs passed at $BURST_PODS pods -> $verdict (results in $OUT) ===="
+exit "$rc"
