@@ -94,10 +94,6 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
         default_resourceclaimtemplate(obj);
     }
 
-    if let ("resource.k8s.io", "devicetaintrules") = (group, plural) {
-        super::device_taint_rule::default_taint_time_added(obj);
-    }
-
     if is_workload_resource(group, plural)
         || is_endpointslice(group, plural)
         || (group == "resource.k8s.io" && plural == "devicetaintrules")
@@ -226,9 +222,14 @@ pub fn sets_generation_on_create(group: &str, plural: &str) -> bool {
 /// `sets_generation_on_create`. Unlike `initialize_workload_generation` this must only run on
 /// create paths: controllers compare `status.observedGeneration` to `metadata.generation`, so a
 /// client-chosen starting value (e.g. 7) would make them wait on generations that never exist.
+/// Also stamps the DeviceTaintRule `taint.timeAdded` default: it must happen on writes only, so
+/// reads of stored objects never mutate.
 pub fn force_generation_on_create(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if sets_generation_on_create(group, plural) {
         obj["metadata"]["generation"] = serde_json::json!(1i64);
+    }
+    if let ("resource.k8s.io", "devicetaintrules") = (group, plural) {
+        super::device_taint_rule::default_taint_time_added(obj);
     }
 }
 
