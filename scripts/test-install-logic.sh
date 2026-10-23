@@ -144,6 +144,19 @@ assert "a joined worker's kubeconfig names the CA, client cert and key files the
 assert_true "u7s-apiserver.service declares ExecReload=/bin/kill -HUP \$MAINPID so 'systemctl reload u7s-apiserver' actually delivers SIGHUP instead of failing outright" \
   grep -qF 'ExecReload=/bin/kill -HUP \$MAINPID' "$INSTALL"
 
+apiserver_exec_tmpl="$(grep -E '^ExecStart=.*u7s-apiserver ' "$INSTALL")"
+render_apiserver_exec() {
+  ALLOW_SERVICE_EXTERNAL_IPS="$1" BIN_DIR=/usr/local/bin IFACE_IP=10.0.0.1 bash -c "cat <<EOF
+$apiserver_exec_tmpl
+EOF"
+}
+assert_true "u7s-apiserver.service's ExecStart passes --deny-service-external-ips by default, so installed nodes reject new/changed Service externalIPs (CVE-2020-8554 traffic hijack)" \
+  grep -qF -- ' --deny-service-external-ips' <<<"$(render_apiserver_exec 0)"
+assert_false "--allow-service-external-ips omits --deny-service-external-ips: install.sh rewrites the unit on every run, so this is the only durable opt-out" \
+  grep -qF -- '--deny-service-external-ips' <<<"$(render_apiserver_exec 1)"
+assert_true "install.sh parses --allow-service-external-ips (an unknown flag would abort the install)" \
+  grep -qF -- '--allow-service-external-ips) ALLOW_SERVICE_EXTERNAL_IPS=1' "$INSTALL"
+
 # ---------------------------------------------------------------------------
 # Consistency: every unit that reads a file u7s-apiserver's first run
 # generates (kubeconfig, ca.crt, sa.key, ...) must wait on it the same way.
