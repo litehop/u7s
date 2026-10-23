@@ -100,6 +100,12 @@ pub struct Args {
     #[arg(long)]
     pub(crate) konnectivity_proxy_addr: Option<String>,
 
+    /// Enable the DenyServiceExternalIPs admission plugin: reject any Service create or
+    /// update that adds a `spec.externalIPs` entry (CIS 1.2.3, CVE-2020-8554). Off by
+    /// default, matching upstream kube-apiserver. Removing or keeping existing entries stays allowed.
+    #[arg(long, default_value_t = false)]
+    pub(crate) deny_service_external_ips: bool,
+
     /// Max number of distinct SA-JWT signatures cached to skip the RSA verify (modular
     /// exponentiation) on repeat presentation of the same token. Falls back to the
     /// U7S_SA_SIG_CACHE_SIZE env var, then 512, when unset — see `sa_sig_cache` module doc.

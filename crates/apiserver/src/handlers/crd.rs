@@ -360,6 +360,7 @@ fn stamp_server_fields(crd: &mut CustomResourceDefinition) {
         crd.metadata.uid = new_uid();
     }
     crd.metadata.creation_timestamp = utc_now_rfc3339();
+    crd.metadata.deletion_timestamp = None;
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
 }

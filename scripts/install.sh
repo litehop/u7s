@@ -79,7 +79,8 @@ Usage:
   install.sh --mint-join-token
   install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 
-  --tarball <path>     Path to an already-downloaded u7s release tarball.
+  --tarball <path>     Path to an already-downloaded u7s release tarball. NOT
+                         signature-verified: the file is trusted as supplied.
                          Overrides the release URL baked into this copy.
   --tarball-url <url>   Fetch the release tarball from <url> instead of the
                          one baked into this copy at release time.
@@ -287,7 +288,52 @@ mktemp_disk_dir() {
   mktemp -d /var/tmp/u7s-install.XXXXXX
 }
 
-# Download the release tarball and its .sha256 sidecar, verify the sidecar's
+# Ed25519 release-signing public key (PEM). The matching private key lives only
+# in the protected `release` GitHub Environment; the same key is published in
+# README.md. PLACEHOLDER: empty until the operator generates the key, and the
+# release workflow refuses to publish while it is empty.
+RELEASE_PUBKEY_PEM="-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAQyJWAOZX5w4sMHM+w/dKPlR3rIHYzOPalQ2UXVJIK+8=
+-----END PUBLIC KEY-----"
+
+# Verify <sig> is a valid Ed25519 signature of <file> under RELEASE_PUBKEY_PEM.
+# Exits non-zero with a message on any failure, including a missing or too-old
+# openssl: no flag skips it for downloaded tarballs (a local --tarball is
+# trusted as supplied and never reaches this function).
+verify_release_signature() {
+  local file="$1" sig="$2"
+  if [ -z "$RELEASE_PUBKEY_PEM" ]; then
+    echo "error: this install.sh has no release signing key embedded; refusing to install unverified binaries" >&2
+    exit 1
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "error: openssl is required to verify the release signature but was not found (apt-get install openssl)" >&2
+    exit 1
+  fi
+  local ver_line ver major
+  ver_line="$(openssl version)"
+  ver="$(printf '%s' "$ver_line" | cut -d' ' -f2)"
+  major="${ver%%.*}"
+  case "$major" in
+    ''|*[!0-9]*) major=0 ;;
+  esac
+  if [ "${ver_line%% *}" != "OpenSSL" ] || [ "$major" -lt 3 ]; then
+    echo "error: OpenSSL >= 3.0 is required to verify the Ed25519 release signature (found: $ver_line)" >&2
+    exit 1
+  fi
+  local keydir
+  keydir="$(mktemp_disk_dir)"
+  printf '%s\n' "$RELEASE_PUBKEY_PEM" > "$keydir/pub.pem"
+  if ! openssl pkeyutl -verify -pubin -inkey "$keydir/pub.pem" -rawin -in "$file" -sigfile "$sig" >/dev/null 2>&1; then
+    rm -rf "$keydir"
+    echo "error: release signature verification FAILED for $(basename "$file") -- refusing to install" >&2
+    exit 1
+  fi
+  rm -rf "$keydir"
+}
+
+# Download the release tarball, its .sha256 sidecar and their Ed25519
+# signatures, verify both signatures, then the sidecar's
 # hash against the downloaded bytes, and point $TARBALL at it. The caller
 # sets the EXIT trap that removes $DOWNLOAD_DIR. A sidecar fetch failure
 # (including a 404, e.g. a pre-checksum release) fails the same as any other
@@ -306,6 +352,12 @@ fetch_tarball() {
 
   echo "Downloading checksum sidecar from $checksum_url..."
   curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$checksum_file" "$checksum_url"
+
+  echo "Downloading signatures..."
+  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$TARBALL.sig" "$url.sig"
+  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$checksum_file.sig" "$checksum_url.sig"
+  verify_release_signature "$TARBALL" "$TARBALL.sig"
+  verify_release_signature "$checksum_file" "$checksum_file.sig"
 
   local expected actual
   expected="$(cut -d' ' -f1 "$checksum_file")"

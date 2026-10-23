@@ -183,6 +183,18 @@ fn extract_body_impl(
     };
     // When contentType is explicitly JSON, raw is JSON — return as-is.
     if env.content_type == "application/json" {
+        // A nested envelope is never legitimate: no handler decodes twice with strict
+        // semantics, so the next (recheck) decode would unwrap it after the namespace guard
+        // already judged the outer body.
+        if proto::has_k8s_magic_prefix(&env.raw) {
+            return Err(undecodable_proto_body(
+                "nested-envelope",
+                "JSON-typed Unknown.raw is itself a k8s protobuf envelope",
+                bytes,
+                content_type,
+                warn,
+            ));
+        }
         return Ok(Bytes::from(env.raw));
     }
     // For all other cases (empty or explicit protobuf contentType), raw bytes are proto-encoded.
@@ -1656,6 +1668,37 @@ mod tests {
             format!("{err:?}").contains("no-magic-prefix"),
             "must reject via the no-magic-prefix stage, not silently accept the JSON"
         );
+    }
+
+    /// A JSON-typed envelope whose raw bytes are another k8s envelope would be unwrapped by the
+    /// second (recheck) decode after the namespace guard (which decodes once) judged the
+    /// outer body, letting a PUT in namespace `a` smuggle `metadata.namespace=kube-system`.
+    #[test]
+    fn nested_json_typed_envelope_is_rejected_by_every_decode_variant() {
+        let inner = build_kubectl_proto_body(
+            b"example.io/v1",
+            b"Widget",
+            br#"{"metadata":{"name":"w","namespace":"kube-system"}}"#,
+            Some(b"application/json"),
+        );
+        let outer = Bytes::from(build_kubectl_proto_body(
+            b"example.io/v1",
+            b"Widget",
+            &inner,
+            Some(b"application/json"),
+        ));
+        let ct = "application/vnd.kubernetes.protobuf";
+        for (name, result) in [
+            ("extract_body", extract_body(&outer, ct)),
+            ("extract_body_recheck", extract_body_recheck(&outer, ct)),
+            ("extract_body_quiet", extract_body_quiet(&outer, ct)),
+        ] {
+            let err = result.expect_err("nested envelope must not decode");
+            assert!(
+                format!("{err:?}").contains("nested-envelope"),
+                "{name}: wrong rejection: {err:?}"
+            );
+        }
     }
 
     /// test_extract_body_recheck_allows_already_decoded_json_under_stale_protobuf_content_type

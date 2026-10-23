@@ -648,30 +648,45 @@ const ALIAS_RATIO_HIGH: u64 = 4_000_000;
 /// Event receiver that counts expanded nodes (aliases counted at their anchor's full
 /// subtree size) without building any tree, so a "billion laughs" body is rejected in
 /// time linear in its length. `yaml_rust2::YamlLoader` deep-clones on every alias.
+///
+/// The node ratio alone misses a large anchored scalar (one node, megabytes), so the
+/// expanded scalar bytes are also capped at `MAX_EXPANDED_YAML_BYTES`.
 #[derive(Default)]
 struct AliasBudget {
-    /// (anchor id, expanded node count so far) per open collection.
-    stack: Vec<(usize, u64)>,
-    anchor_sizes: std::collections::HashMap<usize, u64>,
+    /// (anchor id, expanded node count so far, expanded scalar bytes so far) per open
+    /// collection.
+    stack: Vec<(usize, u64, u64)>,
+    anchor_sizes: std::collections::HashMap<usize, (u64, u64)>,
     decoded: u64,
+    expanded_bytes: u64,
     from_aliases: u64,
     excessive: bool,
 }
 
+/// Cap on scalar bytes after alias expansion; equal to the request body cap so an
+/// alias-free document that fits the body limit is never rejected.
+const MAX_EXPANDED_YAML_BYTES: u64 = crate::MAX_BODY_BYTES as u64;
+
 impl AliasBudget {
-    /// Record a finished leaf or alias node of `size` expanded nodes.
-    fn add_node(&mut self, anchor: usize, size: u64) {
+    /// Record a finished leaf or alias node of `size` expanded nodes and `bytes` scalar
+    /// bytes.
+    fn add_node(&mut self, anchor: usize, size: u64, bytes: u64) {
         if anchor > 0 {
-            self.anchor_sizes.insert(anchor, size);
+            self.anchor_sizes.insert(anchor, (size, bytes));
         }
         self.decoded = self.decoded.saturating_add(size);
+        self.expanded_bytes = self.expanded_bytes.saturating_add(bytes);
         if let Some(parent) = self.stack.last_mut() {
             parent.1 = parent.1.saturating_add(size);
+            parent.2 = parent.2.saturating_add(bytes);
         }
     }
 
     /// Mirrors go-yaml's `excessive aliasing` check in `decoder.unmarshal`.
     fn over_budget(&self) -> bool {
+        if self.expanded_bytes > MAX_EXPANDED_YAML_BYTES {
+            return true;
+        }
         if self.from_aliases <= 100 || self.decoded <= 1000 {
             return false;
         }
@@ -695,25 +710,29 @@ impl yaml_rust2::parser::MarkedEventReceiver for AliasBudget {
             return;
         }
         match ev {
-            Event::Scalar(_, _, aid, _) => self.add_node(aid, 1),
+            Event::Scalar(s, _, aid, _) => {
+                self.add_node(aid, 1, s.len() as u64);
+                self.excessive = self.over_budget();
+            }
             Event::SequenceStart(aid, _) | Event::MappingStart(aid, _) => {
                 self.decoded = self.decoded.saturating_add(1);
-                self.stack.push((aid, 1));
+                self.stack.push((aid, 1, 0));
             }
             Event::SequenceEnd | Event::MappingEnd => {
-                if let Some((aid, size)) = self.stack.pop() {
+                if let Some((aid, size, bytes)) = self.stack.pop() {
                     if aid > 0 {
-                        self.anchor_sizes.insert(aid, size);
+                        self.anchor_sizes.insert(aid, (size, bytes));
                     }
                     if let Some(parent) = self.stack.last_mut() {
                         parent.1 = parent.1.saturating_add(size);
+                        parent.2 = parent.2.saturating_add(bytes);
                     }
                 }
             }
             Event::Alias(id) => {
-                let size = self.anchor_sizes.get(&id).copied().unwrap_or(1);
+                let (size, bytes) = self.anchor_sizes.get(&id).copied().unwrap_or((1, 0));
                 self.from_aliases = self.from_aliases.saturating_add(size);
-                self.add_node(0, size);
+                self.add_node(0, size, bytes);
                 self.excessive = self.over_budget();
             }
             _ => {}
@@ -1766,6 +1785,21 @@ mod tests {
             format!("{err:?}").contains("excessive aliasing"),
             "message must match upstream go-yaml wording"
         );
+    }
+
+    /// One anchored scalar aliased many times is a handful of nodes, so the node-ratio
+    /// check passes while yaml-rust2 and yaml_to_json each clone the scalar per alias
+    /// (~1000x amplification from a small body). The expanded-byte cap must reject it.
+    #[test]
+    fn ssa_body_to_json_rejects_large_scalar_alias_bomb() {
+        let mut body = format!("a: &x \"{}\"\n", "A".repeat(64 * 1024));
+        for i in 0..100 {
+            body.push_str(&format!("k{i}: *x\n"));
+        }
+        assert!(body.len() < 70 * 1024, "body must be tiny: {}", body.len());
+        let err = ssa_body_to_json(body.as_bytes()).expect_err("byte bomb must be rejected");
+        assert_eq!(err.0.as_u16(), 400);
+        assert!(format!("{err:?}").contains("excessive aliasing"));
     }
 
     /// A deeper bomb must cost the same: the budget check is linear in input size.
