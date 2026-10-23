@@ -153,7 +153,7 @@ fi
 echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
 SUPERVISOR_LOG="/tmp/kcm-supervisor.log"
 chmod +x /tmp/kcm-supervisor.sh
-# -clusterrole-aggregation-controller / -device-taint-eviction-controller,
+# -clusterrole-aggregation-controller,
 # and the deliberate absence of cloud-node-lifecycle-controller /
 # node-route-controller / service-lb-controller from this exclusion list:
 # see scripts/install.sh's u7s-kcm.service for why -- mirrored here so the
@@ -166,7 +166,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --cluster-signing-cert-file="\$CA_CERT" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
   --root-ca-file="\$WORKDIR/ca-bundle.pem" \\
-  --controllers='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-device-taint-eviction-controller,-service-cidr-controller' \\
+  --controllers='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller' \\
   --cluster-cidr=10.244.0.0/16 \\
   --allocate-node-cidrs=true \\
   --node-cidr-mask-size=24 \\
