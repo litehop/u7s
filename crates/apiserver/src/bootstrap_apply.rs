@@ -378,7 +378,7 @@ struct KubeconfigCreds {
     server: String,
     ca_pem: Vec<u8>,
     /// Concatenated client-certificate PEM + client-key PEM, the shape `reqwest::Identity`
-    /// expects (same convention as `state.rs`'s `webhook_identity_pem`).
+    /// expects (same shape as `kubelet_client_identity_pem`).
     identity_pem: Vec<u8>,
 }
 

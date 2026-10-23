@@ -603,31 +603,22 @@ enum WebhookTarget {
     },
 }
 
-type TargetRouting<'a> = (
-    Option<&'a str>,
-    Option<std::sync::Arc<Vec<u8>>>,
-    Option<(&'a str, std::net::SocketAddr)>,
-);
+type TargetRouting<'a> = (Option<&'a str>, Option<(&'a str, std::net::SocketAddr)>);
 
 impl WebhookTarget {
-    /// (konnectivity proxy, mTLS identity, DNS override) for this target.
+    /// (konnectivity proxy, DNS override) for this target.
     ///
     /// DirectUrl webhooks go to an external endpoint: no konnectivity proxy (which only
-    /// reaches the cluster network) and no apiserver mTLS identity (which would leak it to an
-    /// external host). Service webhooks dial the resolved ClusterIP directly, relying on
+    /// reaches the cluster network). Service webhooks dial the resolved ClusterIP directly, relying on
     /// kube-proxy's NAT of host-originated traffic; when konnectivity is configured the
     /// proxy dials the Service DNS name instead, since an HTTP CONNECT target and the TLS
     /// server name cannot differ in the client.
     fn routing<'a, S: Store>(&'a self, state: &'a AppState<S>) -> TargetRouting<'a> {
         match self {
-            WebhookTarget::DirectUrl(_) => (None, None, None),
+            WebhookTarget::DirectUrl(_) => (None, None),
             WebhookTarget::ServiceResolved { host, dial, .. } => {
                 let proxy = state.konnectivity_proxy_addr.as_deref();
-                (
-                    proxy,
-                    state.webhook_identity_pem.get(),
-                    proxy.is_none().then_some((host.as_str(), *dial)),
-                )
+                (proxy, proxy.is_none().then_some((host.as_str(), *dial)))
             }
         }
     }
@@ -1356,7 +1347,6 @@ fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     proxy_addr: Option<&str>,
     cluster_ca_der: Option<&[u8]>,
-    webhook_identity_pem: Option<&[u8]>,
     dial: Option<(&str, std::net::SocketAddr)>,
     fallback: &reqwest::Client,
     timeout_seconds: Option<i64>,
@@ -1414,11 +1404,6 @@ fn build_webhook_call_client(
             .connect_timeout(connect_timeout)
     };
 
-    if let Some(pem) = webhook_identity_pem {
-        if let Ok(identity) = reqwest::Identity::from_pem(pem) {
-            builder = builder.identity(identity);
-        }
-    }
     if let Some(addr) = proxy_addr {
         let proxy_url = format!("https://{addr}");
         if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
@@ -1450,12 +1435,11 @@ pub(crate) async fn prepare_webhook_call<S: Store>(
     let config: WebhookClientConfig = WebhookClientConfig::deserialize(client_config)
         .map_err(|e| format!("invalid clientConfig: {e}"))?;
     let target = webhook_url(state, &config, webhook_name).await?;
-    let (effective_proxy, effective_identity, dial) = target.routing(state);
+    let (effective_proxy, dial) = target.routing(state);
     let client = build_webhook_call_client(
         config.ca_bundle.as_deref(),
         effective_proxy,
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-        effective_identity.as_deref().map(|v| v.as_slice()),
         dial,
         &state.webhook_client.get(),
         None,
@@ -1681,13 +1665,12 @@ async fn invoke_mutating_webhook<S: Store>(
     let (review, seen) =
         build_webhook_review(state, &uid, ctx, &matched, object, old_object).await?;
 
-    let (effective_proxy, effective_identity, dial) = target.routing(state);
+    let (effective_proxy, dial) = target.routing(state);
 
     let wh_client = build_webhook_call_client(
         webhook.client_config.ca_bundle.as_deref(),
         effective_proxy,
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-        effective_identity.as_deref().map(|v| v.as_slice()),
         dial,
         &state.webhook_client.get(),
         webhook.timeout_seconds,
@@ -4849,13 +4832,12 @@ pub async fn run_validating_webhooks<S: Store>(
             )
             .await?;
 
-            let (effective_proxy, effective_identity, dial) = target.routing(state);
+            let (effective_proxy, dial) = target.routing(state);
 
             let wh_client = build_webhook_call_client(
                 webhook.client_config.ca_bundle.as_deref(),
                 effective_proxy,
                 state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-                effective_identity.as_deref().map(|v| v.as_slice()),
                 dial,
                 &state.webhook_client.get(),
                 webhook.timeout_seconds,
@@ -6902,7 +6884,7 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         let client =
-            build_webhook_call_client(Some(&wrong_ca_b64), None, None, None, None, &fallback, None);
+            build_webhook_call_client(Some(&wrong_ca_b64), None, None, None, &fallback, None);
 
         let err = client
             .get(format!("https://{addr}/"))
@@ -8631,8 +8613,7 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         // Must not panic and must not return the fallback clone (cert was valid).
-        let client =
-            build_webhook_call_client(Some(&ca_b64), None, None, None, None, &fallback, None);
+        let client = build_webhook_call_client(Some(&ca_b64), None, None, None, &fallback, None);
         drop(client);
     }
 
@@ -8662,7 +8643,6 @@ mod tests {
             Some("127.0.0.1:8135"),
             None,
             None,
-            None,
             &fallback,
             None,
         );
@@ -8674,7 +8654,7 @@ mod tests {
     #[test]
     fn build_webhook_call_client_no_bundle_does_not_panic() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(None, None, None, None, None, &fallback, None);
+        let client = build_webhook_call_client(None, None, None, None, &fallback, None);
         drop(client);
     }
 
@@ -8688,7 +8668,6 @@ mod tests {
         // Invalid base64 must return a usable client (not panic) so the apiserver keeps running.
         let client = build_webhook_call_client(
             Some("!!!not-valid-base64!!!"),
-            None,
             None,
             None,
             None,
@@ -8910,36 +8889,6 @@ mod tests {
             "pod IP selection must distribute across multiple addresses, not pin to index 0; \
              always using first() means a single pod failure takes down all webhook calls"
         );
-    }
-
-    /// For DirectUrl webhooks, build_webhook_call_client must be called without proxy or
-    /// identity — verified by checking that passing None for both does not panic and
-    /// produces a usable client.
-    ///
-    /// If DirectUrl targets were to receive proxy_addr or webhook_identity_pem:
-    /// - The konnectivity proxy only routes to service DNS names inside the VM, so external
-    ///   URLs would fail to connect entirely.
-    /// - The apiserver mTLS identity would be leaked to an operator-supplied external host.
-    ///
-    /// Reverting the fix (always passing state.konnectivity_proxy_addr) would mean
-    /// DirectUrl webhooks always attempt to CONNECT through the konnectivity proxy,
-    /// breaking any external webhook endpoint.
-    #[test]
-    fn direct_url_webhook_client_built_without_proxy_or_identity() {
-        // Simulate what the code does for WebhookTarget::DirectUrl:
-        // effective_proxy = None, effective_identity = None.
-        let fallback = reqwest::Client::new();
-        // Must build successfully with no proxy and no identity pem.
-        let client = build_webhook_call_client(
-            None, // no caBundle
-            None, // effective_proxy = None (the fix)
-            None, // cluster_ca_der
-            None, // effective_identity = None (the fix)
-            None, // dial
-            &fallback, None, // timeout_seconds — use default 10s
-        );
-        // Client is usable — no panic during build.
-        drop(client);
     }
 
     // -- objectSelector regression tests --
@@ -9633,7 +9582,7 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        let (proxy, _, dial) = target.routing(&state);
+        let (proxy, dial) = target.routing(&state);
         assert_eq!(
             (proxy, dial),
             (
@@ -9643,8 +9592,112 @@ mod tests {
         );
 
         state.konnectivity_proxy_addr = Some("127.0.0.1:8132".to_owned());
-        let (proxy, _, dial) = target.routing(&state);
+        let (proxy, dial) = target.routing(&state);
         assert_eq!((proxy, dial), (Some("127.0.0.1:8132"), None));
+    }
+
+    /// Upstream presents no client certificate to a webhook unless the admission
+    /// configuration's kubeconfig names one. A Service-resolved callout built exactly as
+    /// production builds it (state from `AppStateConfig`, `routing`, then
+    /// `build_webhook_call_client`) must complete the handshake with no client cert even
+    /// though the server asks for one; otherwise a webhook Service pointing back at the
+    /// apiserver would be handed an identity it never configured.
+    #[tokio::test]
+    async fn service_webhook_callout_presents_no_client_certificate() {
+        use rcgen::generate_simple_self_signed;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::server::WebPkiClientVerifier;
+        use rustls::{RootCertStore, ServerConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        rustls_post_quantum::provider().install_default().ok();
+
+        let server_cert = generate_simple_self_signed(vec!["hook.ns.svc".to_string()])
+            .expect("generate self-signed server cert");
+        let server_cert_der = server_cert.cert.der().to_vec();
+        let server_key_der = server_cert.signing_key.serialize_der();
+
+        // Optional client auth: the server requests a client cert but accepts none, so
+        // `peer_certificates()` reveals whether the client volunteered one.
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(server_cert_der.clone()))
+            .expect("add root");
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .allow_unauthenticated()
+            .build()
+            .expect("client verifier");
+        let server_config = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![CertificateDer::from(server_cert_der.clone())],
+                PrivateKeyDer::try_from(server_key_der).expect("valid PKCS8 key"),
+            )
+            .expect("build server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.expect("handshake");
+            let presented = tls.get_ref().1.peer_certificates().is_some();
+            let mut buf = [0u8; 1024];
+            let _ = tls.read(&mut buf).await;
+            let _ = tls
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+            let _ = tls.shutdown().await;
+            let _ = seen_tx.send(presented);
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(server_cert_der),
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+        let ca_bundle_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            server_cert.cert.pem().as_bytes(),
+        );
+        let target = WebhookTarget::ServiceResolved {
+            url: format!("https://hook.ns.svc:{}/x", addr.port()),
+            host: "hook.ns.svc".to_owned(),
+            dial: addr,
+        };
+        let (proxy, dial) = target.routing(&state);
+        let client = build_webhook_call_client(
+            Some(&ca_bundle_b64),
+            proxy,
+            state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            dial,
+            &state.webhook_client.get(),
+            Some(5),
+        );
+        client
+            .get(format!("https://hook.ns.svc:{}/x", addr.port()))
+            .send()
+            .await
+            .expect("callout must succeed without a client certificate");
+
+        assert!(
+            !seen_rx.await.expect("server task result"),
+            "webhook callouts must present no client certificate by default"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -11693,11 +11746,10 @@ mod tests {
         let fallback = reqwest::Client::new();
         // With timeout_seconds=30, the request timeout must be 30s (verified by building
         // without panic — reqwest validates Duration).
-        let client = build_webhook_call_client(None, None, None, None, None, &fallback, Some(30));
+        let client = build_webhook_call_client(None, None, None, None, &fallback, Some(30));
         drop(client);
 
-        let client_default =
-            build_webhook_call_client(None, None, None, None, None, &fallback, None);
+        let client_default = build_webhook_call_client(None, None, None, None, &fallback, None);
         drop(client_default);
     }
 
@@ -14105,7 +14157,6 @@ mod tests {
         let client = build_webhook_call_client(
             None,                // no caBundle — the pre-fix bug dropped the proxy here
             Some("127.0.0.1:1"), // unreachable proxy
-            None,
             None,
             None,
             &fallback,

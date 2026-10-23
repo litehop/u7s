@@ -382,7 +382,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     };
 
     // 10. Build app state (shared with the auth layer).
-    let webhook_identity_pem = tls_material.webhook_client_identity_pem();
     // Combine kubelet client cert PEM + key PEM for the kubelet proxy client identity.
     // The apiserver presents this certificate when proxying log/exec/attach requests to
     // the kubelet. Kubelet accepts certs with O=system:masters signed by the cluster CA.
@@ -399,7 +398,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         token_map,
         server_address,
         cluster_ca_der: Some(tls_material.ca_cert_der.clone()),
-        webhook_identity_pem: Some(webhook_identity_pem),
         service_ip_allocator,
         kubelet_client_identity_pem: Some(kubelet_client_identity_pem),
         kubelet_preferred_address: args.kubelet_preferred_address,
@@ -443,12 +441,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 "proxy-client" => {
                     rotation_state
                         .proxy_client_identity_pem
-                        .set(Some(Arc::new(identity_pem.clone())));
-                    if let Err(e) = rotation_state.set_webhook_identity(identity_pem) {
-                        rotation_inventory
-                            .record_failure(name, format_args!("webhook client: {e}"));
-                        tracing::error!("webhook client after rotating {name}: {e}");
-                    }
+                        .set(Some(Arc::new(identity_pem)));
                 }
                 _ => {}
             }
@@ -11167,7 +11160,6 @@ mod tests {
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: None,
-            webhook_identity_pem: None,
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
