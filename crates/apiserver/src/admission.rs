@@ -1933,7 +1933,7 @@ pub(crate) fn eval_cel_bool_expr(
 ) -> Option<bool> {
     let _scope = CelEvalScope::begin();
     let tokens = tokenize_cel(expr.trim())?;
-    check_cel_syntax(expr, CEL_VAP_ROOTS).ok()?;
+    check_cel_vap_syntax_cached(expr).ok()?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
     let val = parse_vap_ternary(
@@ -1965,7 +1965,7 @@ pub(crate) fn eval_cel_vap_value(
 ) -> Option<serde_json::Value> {
     let _scope = CelEvalScope::begin();
     let tokens = tokenize_cel(expr.trim())?;
-    check_cel_syntax(expr, CEL_VAP_ROOTS).ok()?;
+    check_cel_vap_syntax_cached(expr).ok()?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
     let val = parse_vap_ternary(
@@ -2006,6 +2006,47 @@ pub(crate) const CEL_WEBHOOK_ROOTS: &[&str] = &["object", "oldObject", "request"
 /// declare. Parse errors must stay distinct from eval errors: the evaluator absorbs eval
 /// errors in `a || true`, which a syntax error must never be.
 pub(crate) fn check_cel_syntax(expr: &str, roots: &[&str]) -> Result<(), String> {
+    check_cel_syntax_with_stack(expr, roots, 32 << 20)
+}
+
+const CEL_SYNTAX_CACHE_MAX: usize = 1024;
+
+/// Memoised [`check_cel_syntax`] against the VAP roots for the evaluation hot path: each
+/// distinct expression is parsed (and, when long, on a big-stack thread) once. A failure,
+/// including a failed thread spawn, is returned as `Err` so the caller denies under Fail.
+fn check_cel_vap_syntax_cached(expr: &str) -> Result<(), String> {
+    type Verdicts = HashMap<Box<str>, Result<(), String>>;
+    static CACHE: std::sync::Mutex<Option<Verdicts>> = std::sync::Mutex::new(None);
+    if let Some(r) = CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(expr))
+    {
+        return r.clone();
+    }
+    let r = check_cel_syntax(expr, CEL_VAP_ROOTS);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.get_or_insert_with(HashMap::new);
+    if m.len() >= CEL_SYNTAX_CACHE_MAX {
+        m.clear();
+    }
+    m.insert(expr.into(), r.clone());
+    r
+}
+
+#[cfg(test)]
+thread_local! {
+    static CEL_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn check_cel_syntax_with_stack(
+    expr: &str,
+    roots: &[&str],
+    stack_size: usize,
+) -> Result<(), String> {
+    #[cfg(test)]
+    CEL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
     let parse = || {
         cel::parser::Parser::new()
             .enable_optional_syntax(true)
@@ -2019,7 +2060,7 @@ pub(crate) fn check_cel_syntax(expr: &str, roots: &[&str]) -> Result<(), String>
     } else {
         std::thread::scope(|s| {
             std::thread::Builder::new()
-                .stack_size(32 << 20)
+                .stack_size(stack_size)
                 .spawn_scoped(s, parse)
                 .map_err(|e| format!("compilation failed: {e}"))?
                 .join()
@@ -12828,6 +12869,65 @@ mod tests {
             }
             assert!(validate_vap_cel(&mk(list, field, "object.a == 1")).is_ok());
         }
+    }
+
+    /// Every admission request re-evaluates the policy's expressions; re-parsing a long one
+    /// per request spawned a 32 MiB-stack thread each time.
+    #[test]
+    fn long_vap_expression_is_parsed_once_across_many_evaluations() {
+        let expr = format!("object.a == 1 && {}", "true && ".repeat(20) + "true");
+        assert!(expr.len() > 100);
+        let obj = serde_json::json!({"a": 1});
+        let eval = || {
+            eval_cel_bool_expr(
+                &expr,
+                &obj,
+                &serde_json::Map::new(),
+                &serde_json::Value::Null,
+                &serde_json::Value::Null,
+                &serde_json::Value::Null,
+            )
+        };
+        assert_eq!(eval(), Some(true));
+        let after_first = CEL_PARSE_COUNT.with(|c| c.get());
+        for _ in 0..50 {
+            assert_eq!(eval(), Some(true));
+        }
+        assert_eq!(
+            CEL_PARSE_COUNT.with(|c| c.get()),
+            after_first,
+            "cached expression must not be re-parsed per evaluation"
+        );
+    }
+
+    /// A failed parser-thread spawn must surface as a compile error (deny under Fail),
+    /// not as a value an `||` in the policy could absorb.
+    #[test]
+    fn parser_thread_spawn_failure_is_a_compilation_error() {
+        let long = format!("object.a == 1 && {}", "true && ".repeat(20) + "true");
+        let err = check_cel_syntax_with_stack(&long, CEL_VAP_ROOTS, usize::MAX >> 1)
+            .expect_err("spawn with an impossible stack must fail");
+        assert!(err.starts_with("compilation failed"), "{err}");
+    }
+
+    /// Timing probe: 1000 evaluations of a 300-char expression.
+    #[test]
+    #[ignore]
+    fn bench_1000_evals_of_300_char_expression() {
+        let expr = format!("object.a == 1 && {}", "true && ".repeat(36) + "true");
+        let obj = serde_json::json!({"a": 1});
+        let t = std::time::Instant::now();
+        for _ in 0..1000 {
+            eval_cel_bool_expr(
+                &expr,
+                &obj,
+                &serde_json::Map::new(),
+                &serde_json::Value::Null,
+                &serde_json::Value::Null,
+                &serde_json::Value::Null,
+            );
+        }
+        eprintln!("len={} 1000 evals: {:?}", expr.len(), t.elapsed());
     }
 
     /// Valid real-world syntax must not be rejected: macros bind their variable, optionals,
