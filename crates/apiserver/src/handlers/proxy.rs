@@ -89,6 +89,13 @@ pub fn resolve_kubelet_address(
     node_address(node)
 }
 
+fn preferred_address<S: Store>(state: &AppState<S>) -> Option<&str> {
+    state
+        .kubelet_preferred_address
+        .as_deref()
+        .map(|s| s.as_str())
+}
+
 pub fn node_address(node: &serde_json::Value) -> Option<String> {
     let addresses = node["status"]["addresses"].as_array()?;
     // Prefer InternalIP — it's guaranteed routable inside the cluster.
@@ -226,7 +233,7 @@ async fn resolve_log_target<S: Store>(
     raw_ns: &str,
     pod_name: &str,
     query: &LogQuery,
-) -> Result<String, crate::status::StatusError> {
+) -> Result<(String, Option<String>), crate::status::StatusError> {
     validate_path_segment("namespace", raw_ns)?;
     validate_path_segment("name", pod_name)?;
     // 1. Look up the pod.
@@ -320,13 +327,43 @@ async fn resolve_log_target<S: Store>(
         .collect::<Vec<_>>()
         .join("&");
 
-    kubelet_endpoint_url(
+    let url = kubelet_endpoint_url(
         "https",
         &node_ip,
         kp,
         &["containerLogs", raw_ns, pod_name, &container],
         Some(&qs),
+    )?;
+    Ok((url, kubelet_verify_name(&node, preferred_address(state))))
+}
+
+/// The shared kubelet client, or, when serving certs are verified against a name other
+/// than the dial host, a client bound to that name.
+fn kubelet_http_client<S: Store>(
+    state: &AppState<S>,
+    verify_name: Option<&str>,
+) -> Result<reqwest::Client, crate::status::StatusError> {
+    let unavailable = || {
+        Status::service_unavailable("kubelet TLS unavailable: no cluster CA configured".to_string())
+    };
+    let Some(name) = verify_name else {
+        return state.kubelet_client.get().ok_or_else(unavailable);
+    };
+    let tls = build_kubelet_tls_config_for(
+        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state
+            .kubelet_client_identity_pem
+            .get()
+            .as_deref()
+            .map(|v| v.as_slice()),
+        Some(name),
     )
+    .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .use_preconfigured_tls((*tls).clone())
+        .build()
+        .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))
 }
 
 /// Fetch the kubelet log stream and forward each chunk as a WebSocket binary message.
@@ -365,12 +402,9 @@ pub async fn pod_log<S: Store>(
     Query(query): Query<LogQuery>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    let kubelet_url = resolve_log_target(&state, &raw_ns, &pod_name, &query).await?;
+    let (kubelet_url, verify_name) = resolve_log_target(&state, &raw_ns, &pod_name, &query).await?;
 
-    // Proxy via reqwest using the shared kubelet client (built once at startup).
-    let client = state.kubelet_client.get().ok_or_else(|| {
-        Status::service_unavailable("kubelet TLS unavailable: no cluster CA configured".to_string())
-    })?;
+    let client = kubelet_http_client(&state, verify_name.as_deref())?;
 
     if is_websocket_upgrade_request(&req) {
         let (mut parts, _body) = req.into_parts();
@@ -579,13 +613,14 @@ pub async fn resolve_attach_target<S: Store>(
     });
     run_validating_webhooks(state, &attach_options, None, &admission_ctx).await?;
 
-    let tls_config = build_kubelet_tls_config(
+    let tls_config = build_kubelet_tls_config_for(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
             .get()
             .as_deref()
             .map(|v| v.as_slice()),
+        kubelet_verify_name(&node, preferred_address(state)).as_deref(),
     )
     .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
 
@@ -681,8 +716,72 @@ fn build_kubelet_tls_config(
     ca_der: Option<&[u8]>,
     client_identity_pem: Option<&[u8]>,
 ) -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
+    build_kubelet_tls_config_for(ca_der, client_identity_pem, None)
+}
+
+/// The name the kubelet's serving cert must be valid for when the dial host is only a
+/// route to it. `--kubelet-preferred-address` redirects the dial (a host port-forward to
+/// 127.0.0.1 for a VM kubelet), and a CSR-issued serving cert never carries loopback, so
+/// verification must use the node's own address instead of the dial host. `None` when
+/// nothing is redirected: the URL host is then the node's address and rustls checks it.
+pub fn kubelet_verify_name(node: &serde_json::Value, preferred: Option<&str>) -> Option<String> {
+    preferred?;
+    node_address(node)
+}
+
+/// Verifies the chain normally but checks the leaf against a fixed name instead of the
+/// connection's server name.
+#[derive(Debug)]
+struct FixedNameVerifier {
+    inner: std::sync::Arc<rustls::client::WebPkiServerVerifier>,
+    name: rustls::pki_types::ServerName<'static>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for FixedNameVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.inner
+            .verify_server_cert(end_entity, intermediates, &self.name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// [`build_kubelet_tls_config`] with the serving cert verified against `verify_name`
+/// rather than the dial host (see [`kubelet_verify_name`]).
+pub(crate) fn build_kubelet_tls_config_for(
+    ca_der: Option<&[u8]>,
+    client_identity_pem: Option<&[u8]>,
+    verify_name: Option<&str>,
+) -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
     use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
     use rustls::RootCertStore;
 
     let der = ca_der.ok_or_else(|| {
@@ -699,7 +798,19 @@ fn build_kubelet_tls_config(
     let verifier = rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(root_store))
         .build()
         .map_err(|e| anyhow::anyhow!("build kubelet server verifier: {e}"))?;
-    let builder = rustls::ClientConfig::builder().with_webpki_verifier(verifier);
+    let builder = match verify_name {
+        None => rustls::ClientConfig::builder().with_webpki_verifier(verifier),
+        Some(name) => {
+            let name = ServerName::try_from(name.to_owned())
+                .map_err(|e| anyhow::anyhow!("invalid kubelet verify name '{name}': {e}"))?;
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(FixedNameVerifier {
+                    inner: verifier,
+                    name,
+                }))
+        }
+    };
 
     let config = if let Some(pem) = client_identity_pem {
         let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
@@ -1090,13 +1201,14 @@ pub async fn resolve_exec_target<S: Store>(
     };
     run_validating_webhooks(state, &pod, None, &admission_ctx).await?;
 
-    let tls_config = build_kubelet_tls_config(
+    let tls_config = build_kubelet_tls_config_for(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
             .get()
             .as_deref()
             .map(|v| v.as_slice()),
+        kubelet_verify_name(&node, preferred_address(state)).as_deref(),
     )
     .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
 
@@ -1426,6 +1538,7 @@ pub(crate) struct PortforwardParams {
     pub kubelet_url: String,
     pub cluster_ca_der: Option<Vec<u8>>,
     pub client_identity_pem: Option<Vec<u8>>,
+    pub verify_name: Option<String>,
 }
 
 /// Enforce kubectl's own `ports` grammar: a comma-separated list of 1-65535
@@ -1560,6 +1673,7 @@ pub(crate) async fn validate_portforward<S: Store>(
             .get()
             .as_deref()
             .map(|v| v.to_vec()),
+        verify_name: kubelet_verify_name(&node, preferred_address(state)),
     })
 }
 
@@ -1765,9 +1879,10 @@ async fn dial_kubelet_portforward(
     use tokio::net::TcpStream;
     use tokio_rustls::TlsConnector;
 
-    let tls_config = build_kubelet_tls_config(
+    let tls_config = build_kubelet_tls_config_for(
         params.cluster_ca_der.as_deref(),
         params.client_identity_pem.as_deref(),
+        params.verify_name.as_deref(),
     )?;
 
     let (host, port, path) = parse_https_url(&params.kubelet_url)?;
@@ -1858,9 +1973,10 @@ async fn dial_kubelet_portforward_v4(
 ) -> anyhow::Result<TungsteniteWs<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
-    let tls_config = build_kubelet_tls_config(
+    let tls_config = build_kubelet_tls_config_for(
         params.cluster_ca_der.as_deref(),
         params.client_identity_pem.as_deref(),
+        params.verify_name.as_deref(),
     )?;
     let connector = tokio_tungstenite::Connector::Rustls(tls_config);
 
@@ -2085,9 +2201,10 @@ pub async fn resolve_node_proxy_target<S: Store>(
         ))
     })?;
 
-    let client = state.kubelet_client.get().ok_or_else(|| {
-        Status::service_unavailable("kubelet TLS unavailable: no cluster CA configured".to_string())
-    })?;
+    let client = kubelet_http_client(
+        state,
+        kubelet_verify_name(&node, preferred_address(state)).as_deref(),
+    )?;
 
     let kp = kubelet_port_for_node(bare_name, &state.node_kubelet_ports, state.kubelet_port);
     let kubelet_url = format!("https://{node_ip}:{kp}/{}", encode_proxy_tail(path_suffix)?);
@@ -4144,8 +4261,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4155,7 +4271,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -4236,8 +4351,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4247,7 +4361,6 @@ mod tests {
             kubelet_port: 10260,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let node = serde_json::json!({
@@ -4320,8 +4433,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
         let mut state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4331,7 +4443,6 @@ mod tests {
             kubelet_port: 10250, // primary's forward
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
         state
             .node_kubelet_ports
@@ -4546,8 +4657,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4557,7 +4667,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -4756,8 +4865,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4767,7 +4875,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -4880,8 +4987,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -4891,7 +4997,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -5092,8 +5197,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -5103,7 +5207,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5159,8 +5262,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -5170,7 +5272,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5220,8 +5321,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -5231,7 +5331,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5280,8 +5379,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -5291,7 +5389,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5444,8 +5541,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -5455,7 +5551,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5557,8 +5652,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -5568,7 +5662,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5677,8 +5770,7 @@ mod tests {
         seed_portforward_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -5688,7 +5780,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -5828,6 +5919,7 @@ mod tests {
             ),
             cluster_ca_der: Some(cert_der),
             client_identity_pem: None,
+            verify_name: None,
         };
 
         let result = dial_kubelet_portforward_v4(&params).await;
@@ -5901,6 +5993,7 @@ mod tests {
             ),
             cluster_ca_der: Some(cert_der),
             client_identity_pem: None,
+            verify_name: None,
         };
 
         let result = dial_kubelet_portforward(&params).await;
@@ -6468,8 +6561,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: None,
@@ -6479,7 +6571,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: Some("127.0.0.1:8132".to_owned()),
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -6854,8 +6945,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -6865,7 +6955,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -6952,8 +7041,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -6963,7 +7051,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -7018,8 +7105,7 @@ mod tests {
         let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -7029,7 +7115,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -7359,8 +7444,7 @@ mod tests {
         seed_exec_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -7370,7 +7454,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -7573,8 +7656,7 @@ mod tests {
         seed_exec_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -7584,7 +7666,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -7768,8 +7849,7 @@ mod tests {
         seed_attach_pod(&store).await;
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -7779,7 +7859,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let addr = spawn_upgradeable_server(make_router(state));
@@ -7921,6 +8000,80 @@ mod tests {
         );
     }
 
+    /// TLS handshake from a client built by `build_kubelet_tls_config_for` against a
+    /// kubelet-like server presenting a cert valid only for 10.0.0.9, dialed on loopback.
+    async fn handshake_to_node_cert(verify_name: Option<&str>) -> bool {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+        use tokio::net::TcpListener;
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.9".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert_der.clone())],
+                PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(tcp).await;
+        });
+
+        let config = build_kubelet_tls_config_for(Some(&cert_der), None, verify_name).unwrap();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        TlsConnector::from(config)
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+            .await
+            .is_ok()
+    }
+
+    /// A CSR-issued kubelet serving cert never carries 127.0.0.1, so with the dial
+    /// redirected to a loopback port-forward the apiserver must verify the node's own
+    /// address; otherwise kubectl logs/exec to a rig node break.
+    #[tokio::test]
+    async fn kubelet_tls_verifies_node_address_when_dial_is_redirected() {
+        assert!(
+            handshake_to_node_cert(Some("10.0.0.9")).await,
+            "a cert valid for the node address must verify although the dial host is 127.0.0.1"
+        );
+    }
+
+    /// The redirect must not weaken verification: a cert for another node, or any cert when
+    /// no override name is given and the dial host is not in it, must be refused.
+    #[tokio::test]
+    async fn kubelet_tls_rejects_cert_for_a_different_node_address() {
+        assert!(
+            !handshake_to_node_cert(Some("10.0.0.8")).await,
+            "a cert for 10.0.0.9 must not satisfy a node whose address is 10.0.0.8"
+        );
+        assert!(
+            !handshake_to_node_cert(None).await,
+            "without a verify name the dial host (127.0.0.1) is checked and is not in the cert"
+        );
+    }
+
+    /// The verify name is the node address only when the dial is redirected; otherwise the
+    /// URL host already is that address and rustls checks it.
+    #[test]
+    fn kubelet_verify_name_only_set_when_dial_is_redirected() {
+        let node = serde_json::json!({"status": {"addresses": [
+            {"type": "Hostname", "address": "n1"},
+            {"type": "InternalIP", "address": "10.0.0.9"},
+        ]}});
+        assert_eq!(kubelet_verify_name(&node, None), None);
+        assert_eq!(
+            kubelet_verify_name(&node, Some("127.0.0.1")),
+            Some("10.0.0.9".to_string())
+        );
+    }
+
     /// AppState::build_kubelet_client with a cluster CA must return Some(client).
     ///
     /// The shared kubelet client is built once at startup. If it fails to build when a
@@ -7972,8 +8125,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -7983,7 +8135,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
         assert!(
             state.kubelet_client.get().is_some(),
@@ -8087,8 +8238,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store: store.clone(),
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -8098,7 +8248,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -9048,8 +9197,7 @@ mod tests {
 
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -9059,7 +9207,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: Some(proxy_addr),
-            sa_public_key_pem: None,
         });
 
         let mut router = make_router(state);
@@ -9287,8 +9434,7 @@ mod tests {
 
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -9298,7 +9444,6 @@ mod tests {
             kubelet_port,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let mut router = make_router(state);
@@ -9584,8 +9729,7 @@ mod tests {
 
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(cert_der),
@@ -9595,7 +9739,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: Some(proxy_addr),
-            sa_public_key_pem: None,
         });
 
         let mut router = make_router(state);
@@ -9670,7 +9813,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new(
             store.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -9817,8 +9959,7 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store: store.clone(),
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: Some(ca_der),
@@ -9828,7 +9969,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let vwc = serde_json::json!({
@@ -9978,7 +10118,6 @@ mod tests {
         let state = AppState::new(
             store.clone(),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10118,7 +10257,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new(
             store.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10261,7 +10399,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new(
             store.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -11842,7 +11979,7 @@ mod tests {
     async fn valid_container_names_still_resolve_for_log() {
         let state = make_state_with_ca().await;
         for ok in ["app", "a", "my-app-2", "0abc"] {
-            let url = resolve_log_target(&state, "ns1", "p", &log_query(ok))
+            let (url, _) = resolve_log_target(&state, "ns1", "p", &log_query(ok))
                 .await
                 .unwrap_or_else(|e| panic!("valid container {ok:?} rejected: {}", e.0));
             assert_eq!(

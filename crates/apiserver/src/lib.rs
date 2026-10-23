@@ -45,6 +45,7 @@ mod rbac;
 mod rbac_gen_adapter;
 mod resource_gen_adapter;
 mod rotation;
+pub(crate) mod sa_keys;
 mod sa_sig_cache;
 mod serve;
 mod service_alloc;
@@ -78,7 +79,7 @@ use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
 pub use metrics::record_request_total;
 use state::AppState;
-use tls::{generate_tls, load_or_generate_sa_keys, write_component_kubeconfig, write_kubeconfig};
+use tls::{generate_tls, write_component_kubeconfig, write_kubeconfig};
 pub use util::resolve_dhat_backtrace_depth;
 
 /// Maximum request body size in bytes. Applied as the outermost layer so
@@ -318,29 +319,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         None => std::collections::HashMap::new(),
     };
 
-    // 7. Load or generate the SA signing key.
-    let (sa_encoding_key, sa_decoding_key, sa_public_key_pem) =
-        match load_or_generate_sa_keys(&args.sa_key, &args.sa_pub) {
-            Ok(sa_keys) => {
-                let enc = jsonwebtoken::EncodingKey::from_rsa_pem(&sa_keys.private_key_pem)
-                    .map_err(|e| {
-                        tracing::error!("failed to load SA signing key: {e}");
-                        e
-                    })
-                    .ok();
-                let dec = jsonwebtoken::DecodingKey::from_rsa_pem(&sa_keys.public_key_pem)
-                    .map_err(|e| {
-                        tracing::error!("failed to load SA public key: {e}");
-                        e
-                    })
-                    .ok();
-                (enc, dec, Some(sa_keys.public_key_pem))
-            }
-            Err(e) => {
-                tracing::error!("SA key gen/load failed: {e}");
-                (None, None, None)
-            }
-        };
+    // 7. Load or generate the SA keyring (ES256, rotated automatically).
+    let sa_knob = sa_keys::RotationPolicy::test_knob();
+    let sa_tick = std::time::Duration::from_secs(if sa_knob.is_some() { 1 } else { 60 });
+    let sa_keys = sa_keys::SaKeyring::load_or_generate(
+        &args.sa_key,
+        &args.sa_pub,
+        sa_knob.unwrap_or_default(),
+        pki::Clock::default(),
+    )?;
+    tokio::spawn(sa_keys.clone().run(sa_tick));
 
     // 8. Compute advertised server address.
     let server_address = match args.advertise_address {
@@ -393,8 +381,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     proxy_client_identity_pem.extend_from_slice(&tls_material.proxy_client_key_pem);
     let mut state = state::AppState::new_with_config(state::AppStateConfig {
         store: Arc::clone(&store),
-        sa_key: sa_encoding_key,
-        sa_decoding_key,
+        sa_keys: Some(sa_keys),
         token_map,
         server_address,
         cluster_ca_der: Some(tls_material.ca_cert_der.clone()),
@@ -404,7 +391,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         kubelet_port: args.kubelet_port,
         continue_token_key: None, // fresh random key generated at startup
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
-        sa_public_key_pem,
     });
     state.deny_service_external_ips = args.deny_service_external_ips;
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
@@ -726,7 +712,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .layer(AuthLayer::new(
             Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
-            state.sa_decoding_key.clone(),
+            state.sa_keys.clone(),
             Arc::clone(&state.store),
             Arc::clone(&state.sa_sig_cache),
             Arc::clone(&state.flowcontrol_cache),
@@ -5609,7 +5595,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -5820,7 +5805,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -5973,7 +5957,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -6039,7 +6022,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -6118,7 +6100,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -6195,7 +6176,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -6297,7 +6277,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -6467,7 +6446,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -6690,7 +6668,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -6755,7 +6732,6 @@ mod tests {
         seed_rbac(&store).await.expect("seed must not fail");
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -6896,7 +6872,6 @@ mod tests {
         seed_rbac(&store).await.expect("seed must not fail");
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -7044,7 +7019,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -7124,7 +7098,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -7163,7 +7136,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -7201,7 +7173,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -7238,7 +7209,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -7278,7 +7248,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -8143,7 +8112,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -8205,7 +8173,6 @@ mod tests {
         seed_rbac(&store).await.expect("seed must not fail");
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -8474,7 +8441,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(store),
             None,
-            None,
             tokens,
             "https://localhost:6443".into(),
         );
@@ -8482,7 +8448,7 @@ mod tests {
         build_router(state.clone()).layer(AuthLayer::new(
             std::sync::Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
-            state.sa_decoding_key.clone(),
+            state.sa_keys.clone(),
             std::sync::Arc::clone(&state.store),
             std::sync::Arc::clone(&state.sa_sig_cache),
             std::sync::Arc::clone(&state.flowcontrol_cache),
@@ -8557,7 +8523,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             tokens,
             "https://localhost:6443".into(),
         );
@@ -8591,7 +8556,7 @@ mod tests {
         let app = build_router(state.clone()).layer(AuthLayer::new(
             std::sync::Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
-            state.sa_decoding_key.clone(),
+            state.sa_keys.clone(),
             std::sync::Arc::clone(&state.store),
             std::sync::Arc::clone(&state.sa_sig_cache),
             std::sync::Arc::clone(&state.flowcontrol_cache),
@@ -8953,7 +8918,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             tokens,
             "https://localhost:6443".into(),
         );
@@ -8983,7 +8947,7 @@ mod tests {
         let app = build_router(state.clone()).layer(AuthLayer::new(
             std::sync::Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
-            state.sa_decoding_key.clone(),
+            state.sa_keys.clone(),
             std::sync::Arc::clone(&state.store),
             std::sync::Arc::clone(&state.sa_sig_cache),
             std::sync::Arc::clone(&state.flowcontrol_cache),
@@ -9159,7 +9123,6 @@ mod tests {
         let state = state::AppState::new(
             store,
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -9199,7 +9162,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -9257,7 +9219,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::new(make_store()),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -9456,7 +9417,6 @@ mod tests {
         let state = state::AppState::new(
             Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -9584,7 +9544,6 @@ mod tests {
         let state = state::AppState::new(
             Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -9673,7 +9632,6 @@ mod tests {
         let state = state::AppState::new(
             Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -9726,7 +9684,6 @@ mod tests {
         let store = Arc::new(make_store());
         let state = state::AppState::new(
             Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -9816,29 +9773,9 @@ mod tests {
     #[tokio::test]
     async fn sa_token_request_to_auth_round_trip() {
         use axum::response::IntoResponse as _;
-        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-        use std::sync::Arc;
-
-        // 1. Generate a fresh RSA key pair for this test — the same key must be used
-        //    for minting (handler) and verification (auth middleware).
-        let mut rng = rsa::rand_core::OsRng;
-        let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
-        let priv_pem = rsa_key
-            .to_pkcs8_pem(LineEnding::LF)
-            .expect("priv pem")
-            .as_bytes()
-            .to_vec();
-        let pub_pem = rsa_key
-            .to_public_key()
-            .to_public_key_pem(LineEnding::LF)
-            .expect("pub pem")
-            .into_bytes();
-        let enc_key =
-            jsonwebtoken::EncodingKey::from_rsa_pem(&priv_pem).expect("encoding key from pem");
-        let dec_key =
-            jsonwebtoken::DecodingKey::from_rsa_pem(&pub_pem).expect("decoding key from pem");
 
         // 2. Build AppState with the SA key pair and seed the store.
+        let sa_keys = sa_keys::SaKeyring::for_test();
         let store = Arc::new(make_store());
         seed_namespaces(&store)
             .await
@@ -9849,8 +9786,7 @@ mod tests {
 
         let state = state::AppState::new(
             Arc::clone(&store),
-            Some(enc_key),
-            Some(dec_key.clone()),
+            Some(sa_keys.clone()),
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -9908,7 +9844,7 @@ mod tests {
         let user = auth::authenticate_token_with_audiences(
             token,
             &std::collections::HashMap::new(),
-            Some(&dec_key),
+            Some(&sa_keys),
             &[],
             store.as_ref(),
             &sig_cache,
@@ -9964,7 +9900,6 @@ mod tests {
         let store = Arc::new(make_store());
         let state = state::AppState::new(
             Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10235,7 +10170,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10300,7 +10234,6 @@ mod tests {
         seed_namespaces(&store).await.expect("seed namespaces");
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10391,7 +10324,6 @@ mod tests {
         seed_namespaces(&store).await.expect("seed namespaces");
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10498,7 +10430,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10579,7 +10510,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10653,7 +10583,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10761,7 +10690,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10861,8 +10789,7 @@ mod tests {
         let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
         state::AppState::new_with_config(state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: None,
@@ -10872,7 +10799,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         })
     }
 
@@ -11032,7 +10958,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11154,7 +11079,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11247,7 +11171,6 @@ mod tests {
         let state = state::AppState::new(
             store,
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11329,7 +11252,6 @@ mod tests {
         let state = state::AppState::new(
             store,
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11389,7 +11311,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -11459,7 +11380,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -11558,7 +11478,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -11677,7 +11596,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11738,7 +11656,6 @@ mod tests {
             let state = state::AppState::new(
                 std::sync::Arc::clone(&store),
                 None,
-                None,
                 std::collections::HashMap::new(),
                 "https://localhost:6443".into(),
             );
@@ -11795,7 +11712,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -12273,7 +12189,6 @@ mod tests {
         let state = state::AppState::new(
             store,
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -12334,7 +12249,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -12402,7 +12316,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),

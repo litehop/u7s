@@ -19,8 +19,7 @@ const RANGE: &str = "10.96.0.0/24";
 fn state() -> AppState<SqliteStore> {
     AppState::new_with_config(AppStateConfig {
         store: std::sync::Arc::new(SqliteStore::new(":memory:").expect("in-memory store")),
-        sa_key: None,
-        sa_decoding_key: None,
+        sa_keys: None,
         token_map: std::collections::HashMap::new(),
         server_address: "https://localhost:6443".into(),
         cluster_ca_der: None,
@@ -30,7 +29,6 @@ fn state() -> AppState<SqliteStore> {
         kubelet_port: 10250,
         continue_token_key: None,
         konnectivity_proxy_addr: None,
-        sa_public_key_pem: None,
     })
 }
 

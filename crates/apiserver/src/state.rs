@@ -867,10 +867,8 @@ pub struct AppState<S = SqliteStore> {
     /// docs for the freshness model. Populated at startup by `init_node_graph` and kept
     /// current by hooks in `handlers::pods` and `handlers::resource`'s owner-cascade deletes.
     pub node_graph: Arc<NodeGraph>,
-    /// RSA signing key for service-account JWTs. None when SA key is unavailable.
-    pub sa_key: Option<Arc<jsonwebtoken::EncodingKey>>,
-    /// RSA public key for verifying inbound SA JWTs. None when SA key is unavailable.
-    pub sa_decoding_key: Option<Arc<jsonwebtoken::DecodingKey>>,
+    /// Service-account signing and verification keys (ES256, rotated). None when unavailable.
+    pub sa_keys: Option<crate::sa_keys::SaKeyring>,
     /// Static bearer-token map loaded from --token-auth-file. Empty when not configured.
     pub token_map: Arc<HashMap<String, UserInfo>>,
     /// Advertised server address returned in /api discovery (e.g. "https://1.2.3.4:6443").
@@ -921,10 +919,6 @@ pub struct AppState<S = SqliteStore> {
     /// needs a non-default value at construction time, so `run()` sets this field directly
     /// after construction, same pattern as `node_kubelet_ports`/`sa_sig_cache`.
     pub proxy_client_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
-    /// PEM-encoded RSA public key for the SA signing key.
-    /// Stored so the OIDC JWKS endpoint can serve the public key material without
-    /// holding a reference to the private key. None when SA key is unavailable.
-    pub sa_public_key_pem: Option<Arc<Vec<u8>>>,
     /// In-memory cache for the 5 admission configuration object sets.
     /// See `AdmissionConfigCache` for the invalidation strategy.
     pub admission_cache: Arc<AdmissionConfigCache>,
@@ -990,8 +984,7 @@ pub struct AppState<S = SqliteStore> {
 /// on the old `new_with_ca_and_kubelet_identity_and_address` constructor.
 pub struct AppStateConfig<S> {
     pub store: Arc<S>,
-    pub sa_key: Option<jsonwebtoken::EncodingKey>,
-    pub sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+    pub sa_keys: Option<crate::sa_keys::SaKeyring>,
     pub token_map: HashMap<String, UserInfo>,
     pub server_address: String,
     pub cluster_ca_der: Option<Vec<u8>>,
@@ -1010,9 +1003,6 @@ pub struct AppStateConfig<S> {
     /// konnectivity so that pod IPs inside the VM are reachable from the Mac host.
     /// Format: "host:port" (e.g. "127.0.0.1:8135"). None disables the proxy.
     pub konnectivity_proxy_addr: Option<String>,
-    /// PEM-encoded RSA public key companion to `sa_key`.
-    /// Passed here so `AppState` can serve it via the OIDC JWKS endpoint.
-    pub sa_public_key_pem: Option<Vec<u8>>,
 }
 
 // Manual Clone so we don't impose S: Clone (Arc<S> is always Clone).
@@ -1023,8 +1013,7 @@ impl<S> Clone for AppState<S> {
             resource_registry: self.resource_registry.clone(),
             rbac_index: self.rbac_index.clone(),
             node_graph: self.node_graph.clone(),
-            sa_key: self.sa_key.clone(),
-            sa_decoding_key: self.sa_decoding_key.clone(),
+            sa_keys: self.sa_keys.clone(),
             token_map: self.token_map.clone(),
             server_address: self.server_address.clone(),
             watch_limit: self.watch_limit.clone(),
@@ -1039,7 +1028,6 @@ impl<S> Clone for AppState<S> {
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
             proxy_client_identity_pem: self.proxy_client_identity_pem.clone(),
-            sa_public_key_pem: self.sa_public_key_pem.clone(),
             admission_cache: self.admission_cache.clone(),
             apiservice_cache: self.apiservice_cache.clone(),
             discovery_cache: self.discovery_cache.clone(),
@@ -1102,15 +1090,13 @@ impl<S: Store> AppState<S> {
     #[cfg(test)]
     pub fn new(
         store: Arc<S>,
-        sa_key: Option<jsonwebtoken::EncodingKey>,
-        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+        sa_keys: Option<crate::sa_keys::SaKeyring>,
         token_map: HashMap<String, UserInfo>,
         server_address: String,
     ) -> Self {
         Self::new_with_config(AppStateConfig {
             store,
-            sa_key,
-            sa_decoding_key,
+            sa_keys,
             token_map,
             server_address,
             cluster_ca_der: None,
@@ -1120,7 +1106,6 @@ impl<S: Store> AppState<S> {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         })
     }
 
@@ -1255,8 +1240,7 @@ impl<S: Store> AppState<S> {
             resource_registry: Arc::new(registry),
             rbac_index: Arc::new(RbacIndex::new()),
             node_graph: Arc::new(NodeGraph::new()),
-            sa_key: cfg.sa_key.map(Arc::new),
-            sa_decoding_key: cfg.sa_decoding_key.map(Arc::new),
+            sa_keys: cfg.sa_keys,
             token_map: Arc::new(cfg.token_map),
             server_address: cfg.server_address,
             watch_limit: WatchLimitState::new(),
@@ -1278,7 +1262,6 @@ impl<S: Store> AppState<S> {
             // Not part of AppStateConfig: see the field's own doc — run() sets this
             // directly after construction, same pattern as node_kubelet_ports above.
             proxy_client_identity_pem: Swap::new(None),
-            sa_public_key_pem: cfg.sa_public_key_pem.map(Arc::new),
             admission_cache: Arc::new(AdmissionConfigCache::new()),
             apiservice_cache: Arc::new(ApiServiceCache::new()),
             discovery_cache: Arc::new(DiscoveryCache::new()),
@@ -2632,8 +2615,7 @@ mod tests {
         let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
         AppState::new_with_config(AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: None,
@@ -2643,7 +2625,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         })
     }
 
@@ -2776,8 +2757,7 @@ mod tests {
         let alloc = ServiceIpAllocator::from_cidr("10.96.0.0/12").expect("valid CIDR");
         let state = AppState::new_with_config(AppStateConfig {
             store: Arc::new(store),
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: None,
@@ -2787,7 +2767,6 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let kube_dns_ip: Ipv4Addr = "10.96.0.10".parse().unwrap();
@@ -2880,7 +2859,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let state: AppState<SqliteStore> = AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),

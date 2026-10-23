@@ -1439,7 +1439,6 @@ mod tests {
         let state = AppState::new(
             store.clone(),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -1534,7 +1533,6 @@ mod tests {
         let state = AppState::new(
             store,
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -1583,7 +1581,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new(
             store.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -1705,7 +1702,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new(
             store.clone(),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -1953,7 +1949,6 @@ mod tests {
         let collision_store = std::sync::Arc::new(FirstPutAlreadyExistsStore::new(inner));
         let state = AppState::new(
             collision_store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),

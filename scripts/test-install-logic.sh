@@ -144,6 +144,19 @@ assert "a joined worker's kubeconfig names the CA, client cert and key files the
 assert_true "u7s-apiserver.service declares ExecReload=/bin/kill -HUP \$MAINPID so 'systemctl reload u7s-apiserver' actually delivers SIGHUP instead of failing outright" \
   grep -qF 'ExecReload=/bin/kill -HUP \$MAINPID' "$INSTALL"
 
+apiserver_exec_tmpl="$(grep -E '^ExecStart=.*u7s-apiserver ' "$INSTALL")"
+render_apiserver_exec() {
+  ALLOW_SERVICE_EXTERNAL_IPS="$1" BIN_DIR=/usr/local/bin IFACE_IP=10.0.0.1 bash -c "cat <<EOF
+$apiserver_exec_tmpl
+EOF"
+}
+assert_true "u7s-apiserver.service's ExecStart passes --deny-service-external-ips by default, so installed nodes reject new/changed Service externalIPs (CVE-2020-8554 traffic hijack)" \
+  grep -qF -- ' --deny-service-external-ips' <<<"$(render_apiserver_exec 0)"
+assert_false "--allow-service-external-ips omits --deny-service-external-ips: install.sh rewrites the unit on every run, so this is the only durable opt-out" \
+  grep -qF -- '--deny-service-external-ips' <<<"$(render_apiserver_exec 1)"
+assert_true "install.sh parses --allow-service-external-ips (an unknown flag would abort the install)" \
+  grep -qF -- '--allow-service-external-ips) ALLOW_SERVICE_EXTERNAL_IPS=1' "$INSTALL"
+
 # ---------------------------------------------------------------------------
 # Consistency: every unit that reads a file u7s-apiserver's first run
 # generates (kubeconfig, ca.crt, sa.key, ...) must wait on it the same way.
@@ -268,19 +281,11 @@ assert_true "install.sh installs kubernetes-cni (the actual /opt/cni/bin/ plugin
 #      the (now-TLS-trusted) request as anonymous and 401s it -- confirmed
 #      via a direct unauthenticated curl to kubelet's /containerLogs.
 # ---------------------------------------------------------------------------
-assert_true "kubelet-config.yaml points tlsCertFile/tlsPrivateKeyFile at a serving cert signed by the cluster CA, not kubelet's own default self-signed fallback" \
-  grep -qF 'tlsCertFile: $STATE_DIR/kubelet-serving.crt' "$INSTALL"
+assert_false "install.sh mints no self-signed-by-script kubelet serving cert: a 10-year file nothing renews outlives the 1-year cluster certs and breaks kubectl logs/exec on expiry" \
+  grep -qE 'days 3650|kubelet-serving\.(crt|key)' <(grep -v '^ *#' "$INSTALL" | grep -v 'rm -f')
 
-assert_true "kubelet.service mints that serving cert (ExecStartPre) with an IP SAN matching the node's own cluster-traffic address, since apiserver dials kubelet by IP" \
-  grep -qF 'subjectAltName=IP:$IFACE_IP' "$INSTALL"
-
-# extendedKeyUsage=serverAuth: rustls-webpki's EKU check is currently
-# required_if_present (an absent EKU still passes), so this isn't fixing a
-# live failure -- it matches the more defensive pattern scripts/conformance/
-# lima-start.sh already uses for the same kind of cert, so this cert doesn't
-# silently rely on one TLS library's lenient-by-default EKU handling.
-assert_true "the minted kubelet serving cert declares extendedKeyUsage=serverAuth, matching lima-start.sh's existing pattern for the same kind of cert rather than relying on webpki's lenient absent-EKU handling" \
-  grep -qF 'extendedKeyUsage=serverAuth' "$INSTALL"
+assert_true "the KCM unit sets --cluster-signing-duration explicitly so kubelet serving and client cert lifetimes are a decision, not upstream's default" \
+  grep -qF -- '--cluster-signing-duration=8760h' "$INSTALL"
 
 assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cluster CA, so kubelet can authenticate apiserver's client cert instead of treating proxied requests as anonymous" \
   grep -qF 'clientCAFile: $STATE_DIR/ca.pem' "$INSTALL"
@@ -1399,7 +1404,7 @@ WORKER_CFG_RUNNER="$JOIN_WORK/cfg.sh"
   echo 'STATE_DIR="$1"'
   echo 'systemctl() { return 3; }'
   awk '/^write_kubelet_config_yaml\(\) \{$/,/^}$/' "$INSTALL"
-  echo 'write_kubelet_config_yaml "$2"'
+  echo 'write_kubelet_config_yaml'
 } > "$WORKER_CFG_RUNNER"
 mkdir -p "$JOIN_WORK/cfg-worker" "$JOIN_WORK/cfg-cp"
 bash "$WORKER_CFG_RUNNER" "$JOIN_WORK/cfg-worker" 1
@@ -1408,10 +1413,10 @@ assert_true "a worker's kubelet sets serverTLSBootstrap so it files its own serv
   grep -qxF 'serverTLSBootstrap: true' "$JOIN_WORK/cfg-worker/kubelet-config.yaml"
 assert_false "a worker's kubelet config has no tlsCertFile/tlsPrivateKeyFile (a missing file stops the kubelet from starting, and a stale one would be served instead of the issued cert)" \
   grep -qE '^tls(Cert|PrivateKey)File:' "$JOIN_WORK/cfg-worker/kubelet-config.yaml"
-assert_true "the control-plane kubelet keeps its minted CA-signed serving cert" \
-  grep -qxF "tlsCertFile: $JOIN_WORK/cfg-cp/kubelet-serving.crt" "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
-assert_false "the control-plane kubelet does not enable serverTLSBootstrap (its CSR would sit beside the minted cert)" \
-  grep -q '^serverTLSBootstrap' "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
+assert_true "the control-plane kubelet also requests its serving cert by CSR (a static file is never renewed, so kubectl logs/exec would die when it expires)" \
+  grep -qxF 'serverTLSBootstrap: true' "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
+assert_false "the control-plane kubelet config has no static tlsCertFile/tlsPrivateKeyFile" \
+  grep -qE '^tls(Cert|PrivateKey)File:' "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
 assert_true "the control-plane kubelet rotates its own client cert (a node identity that never renews is a time bomb at cert expiry)" \
   grep -qxF 'rotateCertificates: true' "$JOIN_WORK/cfg-cp/kubelet-config.yaml"
 
@@ -1470,10 +1475,8 @@ FLAGS_RUNNER="$JOIN_WORK/flags.sh"
   awk '/^kubelet_round2_flags\(\) \{$/,/^}$/' "$INSTALL"
   echo 'kubelet_round2_flags "$@"'
 } > "$FLAGS_RUNNER"
-assert_false "a worker must not disable RotateKubeletServerCertificate, which serverTLSBootstrap needs" \
-  bash -c 'bash "$1" 1.37 worker | grep -q RotateKubeletServerCertificate' _ "$FLAGS_RUNNER"
-assert_true "the control-plane kubelet still disables RotateKubeletServerCertificate (unchanged)" \
-  bash -c 'bash "$1" 1.37 | grep -q RotateKubeletServerCertificate=false' _ "$FLAGS_RUNNER"
+assert_false "no kubelet may disable RotateKubeletServerCertificate, which serverTLSBootstrap needs to rotate its serving cert" \
+  bash -c 'bash "$1" 1.37 | grep -q RotateKubeletServerCertificate' _ "$FLAGS_RUNNER"
 
 # The join succeeds only when the Node is Ready AND the kubelet-filed serving
 # CSR is approved and issued.
@@ -1772,17 +1775,21 @@ behind_status=0; BASE_HB=2026-10-17T01:00:00Z NOW_HB=2026-10-17T01:00:10Z FP_BEF
 assert "with the worker clock behind the API server, a fresh Ready heartbeat is still accepted (a server-clock comparison would fail every upgrade on such a node)" \
   "$([ "$behind_status" -eq 0 ] && echo 1 || echo 0)"
 
-# Control plane: CA / SA keys survive the re-run untouched, or the run fails.
+# Control plane: the CA survives the re-run untouched, or the run fails. sa.key is not
+# fingerprinted: the apiserver rotates it on its own.
 CP_RUNNER="$UPG_WORK/cp.sh"
 write_upgrade_runner "$CP_RUNNER" 'before="$(cp_identity_fingerprint)"; if [ -n "${MUTATE:-}" ]; then echo regenerated > "$STATE_DIR/$MUTATE"; fi; verify_cp_identity_preserved "$before"'
 cp_state="$UPG_WORK/cp-state"; mkdir -p "$cp_state"
 for f in ca.key ca.crt sa.key sa.pub; do echo "original $f" > "$cp_state/$f"; done
 cp_ok_out="$(bash "$CP_RUNNER" "$cp_state" 2>&1)" && cp_ok_status=0 || cp_ok_status=$?
-assert "a control-plane re-run that leaves ca.*/sa.* alone succeeds and says no CA or tokens were re-minted" \
-  "$([ "$cp_ok_status" -eq 0 ] && printf '%s' "$cp_ok_out" | grep -q 'no CA or tokens re-minted' && echo 1 || echo 0)"
-for f in ca.key sa.key; do
+assert "a control-plane re-run that leaves ca.* alone succeeds and says no CA was re-minted" \
+  "$([ "$cp_ok_status" -eq 0 ] && printf '%s' "$cp_ok_out" | grep -q 'no CA re-minted' && echo 1 || echo 0)"
+cp_rot_status=0; MUTATE=sa.key bash "$CP_RUNNER" "$cp_state" >/dev/null 2>&1 || cp_rot_status=$?
+assert "a rotated sa.key does not fail a control-plane upgrade (the apiserver rotates it on its own)" \
+  "$([ "$cp_rot_status" -eq 0 ] && echo 1 || echo 0)"
+for f in ca.key ca.crt; do
   cp_bad_status=0; MUTATE="$f" bash "$CP_RUNNER" "$cp_state" >/dev/null 2>&1 || cp_bad_status=$?
-  assert "a control-plane upgrade that re-mints $f fails loud (every node's identity and every issued token would silently die)" \
+  assert "a control-plane upgrade that re-mints $f fails loud (every node's identity would silently die)" \
     "$([ "$cp_bad_status" -ne 0 ] && echo 1 || echo 0)"
   echo "original $f" > "$cp_state/$f"
 done
