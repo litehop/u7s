@@ -39,7 +39,7 @@ and kube-controller-manager, and writes a systemd unit for each.
 
    ```
    -----BEGIN PUBLIC KEY-----
-   <paste the Ed25519 public key PEM>
+   MCowBQYDK2VwAyEAQyJWAOZX5w4sMHM+w/dKPlR3rIHYzOPalQ2UXVJIK+8=
    -----END PUBLIC KEY-----
    ```
 
