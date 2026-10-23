@@ -105,6 +105,14 @@ pub(crate) fn validate_device_taint_rule(obj: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// `taint.timeAdded` is server-defaulted when the client leaves it unset: the
+/// device-taint eviction controller computes toleration deadlines from it.
+pub(crate) fn default_taint_time_added(obj: &mut Value) {
+    if obj["spec"]["taint"].is_object() && obj["spec"]["taint"]["timeAdded"].is_null() {
+        obj["spec"]["taint"]["timeAdded"] = Value::String(crate::util::utc_now_rfc3339());
+    }
+}
+
 /// Upstream `deviceTaintRuleStrategy.PrepareForUpdate`: `taint.timeAdded` tracks when the
 /// *effect* was set (toleration durations are computed from it), so it is refreshed when the
 /// effect changes and the client did not move it itself; `metadata.generation` is
@@ -217,6 +225,16 @@ mod tests {
         let mut r = json!({"metadata": {"name": "r"}, "spec": {"taint": ok_taint()}});
         super::super::defaults::apply_defaults("resource.k8s.io", "devicetaintrules", &mut r);
         assert_eq!(r["metadata"]["generation"], 1);
+    }
+
+    #[test]
+    fn create_defaults_time_added_so_eviction_controller_can_compute_toleration_deadlines() {
+        let mut r = json!({"metadata": {"name": "r"}, "spec": {"taint": ok_taint()}});
+        super::super::defaults::apply_defaults("resource.k8s.io", "devicetaintrules", &mut r);
+        assert!(r["spec"]["taint"]["timeAdded"].is_string());
+        let mut set = json!({"spec": {"taint": {"key": "k", "effect": "None", "timeAdded": "2020-01-01T00:00:00Z"}}});
+        super::super::defaults::apply_defaults("resource.k8s.io", "devicetaintrules", &mut set);
+        assert_eq!(set["spec"]["taint"]["timeAdded"], "2020-01-01T00:00:00Z");
     }
 
     #[test]

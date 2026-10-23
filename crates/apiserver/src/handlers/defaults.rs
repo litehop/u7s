@@ -94,6 +94,10 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
         default_resourceclaimtemplate(obj);
     }
 
+    if let ("resource.k8s.io", "devicetaintrules") = (group, plural) {
+        super::device_taint_rule::default_taint_time_added(obj);
+    }
+
     if is_workload_resource(group, plural)
         || is_endpointslice(group, plural)
         || (group == "resource.k8s.io" && plural == "devicetaintrules")
