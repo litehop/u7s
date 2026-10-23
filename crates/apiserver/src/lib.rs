@@ -408,6 +408,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
         sa_public_key_pem,
     });
+    state.deny_service_external_ips = args.deny_service_external_ips;
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
     state
         .proxy_client_identity_pem
@@ -12439,6 +12440,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            deny_service_external_ips: false,
             sa_sig_cache_size: None,
             manifest_dir: "/etc/u7s/manifests".into(),
             embedded_scheduler: false,
@@ -13256,6 +13258,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            deny_service_external_ips: false,
             sa_sig_cache_size: None,
             manifest_dir: manifest_dir.to_string_lossy().into_owned(),
             embedded_scheduler: false,
@@ -13454,6 +13457,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            deny_service_external_ips: false,
             sa_sig_cache_size: None,
             manifest_dir: manifest_dir.to_string_lossy().into_owned(),
             embedded_scheduler,

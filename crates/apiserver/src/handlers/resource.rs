@@ -1585,6 +1585,10 @@ pub(crate) async fn do_patch<S: Store>(
         )?;
         let mut auto_cluster_ip = None;
         if group.is_empty() && plural == "services" {
+            if state.deny_service_external_ips {
+                super::defaults::deny_service_external_ips(None, &obj.body["spec"])
+                    .map_err(Status::forbidden)?;
+            }
             super::defaults::validate_service_ip_family_fields(&obj.body)
                 .map_err(Status::unprocessable_entity)?;
             auto_cluster_ip = maybe_allocate_cluster_ip(
@@ -2278,6 +2282,13 @@ pub(crate) async fn do_patch<S: Store>(
 
         let mut auto_cluster_ip = None;
         if group.is_empty() && plural == "services" {
+            if state.deny_service_external_ips {
+                super::defaults::deny_service_external_ips(
+                    svc_spec_before_patch.as_ref(),
+                    &current.body["spec"],
+                )
+                .map_err(Status::forbidden)?;
+            }
             super::defaults::validate_service_ip_family_fields(&current.body)
                 .map_err(Status::unprocessable_entity)?;
             auto_cluster_ip = maybe_allocate_cluster_ip(
@@ -3478,6 +3489,10 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     // ever taken from the pool — rejecting after allocation would leak it.
     let mut auto_cluster_ip = None;
     if group.is_empty() && plural == "services" {
+        if state.deny_service_external_ips {
+            super::defaults::deny_service_external_ips(None, &obj.body["spec"])
+                .map_err(Status::forbidden)?;
+        }
         super::defaults::validate_service_ip_family_fields(&obj.body)
             .map_err(Status::unprocessable_entity)?;
         auto_cluster_ip =
@@ -4243,6 +4258,13 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // leak-avoidance reason as the create path above.
     let mut auto_cluster_ip = None;
     if group.is_empty() && plural == "services" {
+        if state.deny_service_external_ips {
+            super::defaults::deny_service_external_ips(
+                svc_spec_before_replace.as_ref(),
+                &obj.body["spec"],
+            )
+            .map_err(Status::forbidden)?;
+        }
         super::defaults::validate_service_ip_family_fields(&obj.body)
             .map_err(Status::unprocessable_entity)?;
         auto_cluster_ip = maybe_allocate_cluster_ip(
@@ -14857,6 +14879,44 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Service IP field defaulting — integration tests
     // ---------------------------------------------------------------------------
+
+    /// With --deny-service-external-ips, creating a Service that claims an external IP must
+    /// be 403 (a namespaced creator could otherwise hijack arbitrary cluster traffic); with
+    /// the flag off (upstream default) the same body is accepted.
+    #[tokio::test]
+    async fn service_create_with_external_ips_denied_only_when_flag_set() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let svc = |name: &str| {
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": { "name": name, "namespace": "default" },
+                "spec": { "externalIPs": ["1.2.3.4"], "ports": [{ "port": 80 }] }
+            })
+        };
+        let mut state = make_state();
+        for (deny, name, expected) in [
+            (false, "open", axum::http::StatusCode::CREATED),
+            (true, "closed", axum::http::StatusCode::FORBIDDEN),
+        ] {
+            state.deny_service_external_ips = deny;
+            let resp = match create_namespaced_resource(
+                State(state.clone()),
+                Path(("".into(), "v1".into(), "default".into(), "services".into())),
+                axum::extract::Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&svc(name)).unwrap()),
+            )
+            .await
+            {
+                Ok(r) => r.into_response(),
+                Err(e) => e.into_response(),
+            };
+            assert_eq!(resp.status(), expected, "deny_service_external_ips={deny}");
+        }
+    }
 
     /// POSTing a Service with only spec.clusterIP must cause the GET response to include
     /// ipFamilies, ipFamilyPolicy, and clusterIPs.
