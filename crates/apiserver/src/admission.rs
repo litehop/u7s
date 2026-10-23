@@ -1877,38 +1877,6 @@ pub(crate) fn matches_match_constraints(
         .any(|rule| matches_rule(rule, group, version, resource, None, operation))
 }
 
-/// Evaluate a CEL expression for an `ApplyConfiguration` mutation.
-///
-/// Supports the subset of CEL used by Kubernetes MutatingAdmissionPolicy:
-/// - Object construction: `Type{field: expr, ...}` → JSON object
-/// - Map literals: `{key: value, ...}` → JSON object
-/// - String literals: `"value"`
-/// - Integer and float literals
-/// - Boolean literals: `true`, `false`
-/// - Null: `null`
-/// - Field access on `object`: `object.metadata.name`, `object.spec.replicas`
-///
-/// The `object` variable is bound to the admitted resource. Type names (like `Object`,
-/// `Object.metadata`) are treated as anonymous struct constructors — the type name is
-/// discarded, only the field assignments matter.
-///
-/// Returns `None` if the expression cannot be parsed or evaluated.
-pub(crate) fn eval_cel_apply_config(
-    expr: &str,
-    object: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let _scope = CelEvalScope::begin();
-    let tokens = tokenize_cel(expr.trim())?;
-    let mut pos = 0usize;
-    let val = parse_cel_value(&tokens, &mut pos, object)?;
-    // See eval_cel_bool_expr: a valid prefix followed by unconsumed trailing tokens
-    // must be a hard parse error, not a silent truncation to the prefix's value.
-    if pos != tokens.len() {
-        return None;
-    }
-    Some(val)
-}
-
 /// The roots a ValidatingAdmissionPolicy or `matchConditions` expression is evaluated
 /// against. `device` is the DRA selector alias: selectors never reference `object`, so
 /// callers evaluating one pass the device in the `object` slot.
@@ -2043,67 +2011,7 @@ fn check_cel_syntax_with_stack(
     cel_runtime::check_syntax_with_stack(expr, roots, stack_size)
 }
 
-// ---------------------------------------------------------------------------
-// ApplyConfiguration expression evaluator (MutatingAdmissionPolicy)
-// ---------------------------------------------------------------------------
-
-/// Maximum recursion depth for the hand-rolled recursive-descent CEL parsers below
-/// (`parse_cel_*`) — mirrors the vendored `cel` crate's own
-/// `Parser::max_recursion_depth` (default 96, `cel-0.14.3/src/parser/parser.rs`), which this
-/// evaluator has no equivalent of. Every layer of `(...)` nesting, a chained unary `-`/`!`, a
-/// chained `?:`, or a nested `{...}`/`[...]` literal recurses through this call chain again
-/// with no bound but the native call stack; a Rust stack overflow isn't catchable with
-/// `panic::catch_unwind`, so an attacker-controlled CRD/VAP/matchCondition CEL expression deep
-/// enough to exhaust the stack SIGSEGVs the whole apiserver process, not just one request.
-const CEL_MAX_RECURSION_DEPTH: u32 = 96;
-
 thread_local! {
-    /// Current live recursion depth of the parser call chain on this thread. Each top-level
-    /// `eval_cel_*` entry point starts a fresh, self-contained parse that always returns this
-    /// to 0 by the time it returns (via `CelRecursionGuard`'s `Drop`), so a wide-but-shallow
-    /// expression (e.g. a long `a + b + c + ...` chain, parsed by a `while` loop rather than
-    /// recursion) never approaches the cap — only actual call-stack *depth* does.
-    static CEL_RECURSION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// RAII guard: increments [`CEL_RECURSION_DEPTH`] on construction, decrements on drop.
-/// `enter()` returns `None` instead of incrementing past [`CEL_MAX_RECURSION_DEPTH`], which
-/// every recursive parser function below propagates with `?` — turning excessive nesting into
-/// a normal parse error (the same "eval error" outcome as any other malformed expression)
-/// instead of a stack overflow.
-struct CelRecursionGuard;
-
-impl CelRecursionGuard {
-    fn enter() -> Option<Self> {
-        CEL_RECURSION_DEPTH.with(|depth| {
-            let current = depth.get();
-            if current >= CEL_MAX_RECURSION_DEPTH {
-                return None;
-            }
-            depth.set(current + 1);
-            Some(CelRecursionGuard)
-        })
-    }
-}
-
-impl Drop for CelRecursionGuard {
-    fn drop(&mut self) {
-        CEL_RECURSION_DEPTH.with(|depth| depth.set(depth.get() - 1));
-    }
-}
-
-/// Per-expression runtime cost limit, the same figure as upstream's `PerCallLimit`
-/// (`k8s.io/apiserver/pkg/apis/cel/config.go`). One unit is one evaluated primary, one
-/// macro iteration, or a fixed fraction of the size of a JSON value cloned out of a root.
-/// Exhaustion is an eval error, exactly like upstream's "operation cancelled: actual cost
-/// limit exceeded".
-const CEL_CALL_COST_LIMIT: u64 = 1_000_000;
-
-/// JSON nodes cloned per cost unit.
-const CEL_NODES_PER_UNIT: u64 = 16;
-
-thread_local! {
-    static CEL_COST_LEFT: std::cell::Cell<u64> = const { std::cell::Cell::new(CEL_CALL_COST_LIMIT) };
     /// Text of the most recent eval error, for the denial message upstream builds from it.
     static CEL_LAST_ERROR: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
@@ -2118,605 +2026,6 @@ fn cel_last_error() -> String {
     CEL_LAST_ERROR
         .with(|e| e.borrow().clone())
         .unwrap_or_else(|| "evaluation failed".to_string())
-}
-
-/// both again on drop so a panic or early return never leaks bindings into the next call.
-struct CelEvalScope;
-
-impl CelEvalScope {
-    fn begin() -> Self {
-        CEL_COST_LEFT.with(|c| c.set(CEL_CALL_COST_LIMIT));
-        CEL_LAST_ERROR.with(|e| *e.borrow_mut() = None);
-        CelEvalScope
-    }
-}
-
-/// Spends `units` of the current expression's cost budget; `None` once it is exhausted.
-/// A failed charge leaves the budget at zero, so no later charge can succeed and an error
-/// absorbed by a short-circuiting macro cannot be followed by more work.
-fn cel_charge(units: u64) -> Option<()> {
-    CEL_COST_LEFT.with(|c| match c.get().checked_sub(units) {
-        Some(left) => {
-            c.set(left);
-            Some(())
-        }
-        None => {
-            c.set(0);
-            None
-        }
-    })
-}
-
-/// Charges for cloning `v`, counting at most as many nodes as the remaining budget could
-/// pay for so an oversized value is refused without walking all of it.
-fn cel_charge_clone(v: &serde_json::Value) -> Option<()> {
-    fn count(v: &serde_json::Value, cap: u64, seen: &mut u64) {
-        *seen += 1;
-        if *seen > cap {
-            return;
-        }
-        match v {
-            serde_json::Value::Array(a) => a.iter().for_each(|e| count(e, cap, seen)),
-            serde_json::Value::Object(o) => o.values().for_each(|e| count(e, cap, seen)),
-            _ => {}
-        }
-    }
-    let cap = CEL_COST_LEFT
-        .with(|c| c.get())
-        .saturating_mul(CEL_NODES_PER_UNIT);
-    let mut seen = 0;
-    count(v, cap, &mut seen);
-    cel_charge(1 + seen / CEL_NODES_PER_UNIT)
-}
-
-/// A minimal CEL token.
-#[derive(Debug, PartialEq, Clone)]
-enum CelToken {
-    Ident(String), // identifiers and keywords
-    Str(String),   // string literal value (already unescaped)
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-    Null,
-    Dot,       // .
-    Colon,     // :
-    Comma,     // ,
-    LBrace,    // {
-    RBrace,    // }
-    LBracket,  // [
-    RBracket,  // ]
-    LParen,    // (
-    RParen,    // )
-    Plus,      // +
-    Minus,     // -
-    Star,      // *
-    Slash,     // /
-    Percent,   // %
-    Eq,        // ==
-    Neq,       // !=
-    Lt,        // <
-    Lte,       // <=
-    Gt,        // >
-    Gte,       // >=
-    Bang,      // !
-    Question,  // ?
-    Ampersand, // &&
-    Pipe,      // ||
-}
-
-fn ends_with_operand(tokens: &[CelToken]) -> bool {
-    match tokens.last() {
-        Some(CelToken::Ident(w)) => w != "in",
-        Some(
-            CelToken::Str(_)
-            | CelToken::Int(_)
-            | CelToken::Float(_)
-            | CelToken::Bool(_)
-            | CelToken::Null
-            | CelToken::RParen
-            | CelToken::RBracket
-            | CelToken::RBrace,
-        ) => true,
-        _ => false,
-    }
-}
-
-fn tokenize_cel(input: &str) -> Option<Vec<CelToken>> {
-    let chars: Vec<char> = input.chars().collect();
-    let mut tokens = Vec::new();
-    let mut i = 0;
-
-    while i < chars.len() {
-        match chars[i] {
-            // Whitespace
-            c if c.is_whitespace() => {
-                i += 1;
-            }
-
-            // String literals (double or single quoted)
-            '"' | '\'' => {
-                let quote = chars[i];
-                i += 1;
-                let mut s = String::new();
-                while i < chars.len() && chars[i] != quote {
-                    if chars[i] == '\\' && i + 1 < chars.len() {
-                        i += 1;
-                        match chars[i] {
-                            'n' => s.push('\n'),
-                            't' => s.push('\t'),
-                            'r' => s.push('\r'),
-                            '"' => s.push('"'),
-                            '\'' => s.push('\''),
-                            '\\' => s.push('\\'),
-                            c => {
-                                s.push('\\');
-                                s.push(c);
-                            }
-                        }
-                    } else {
-                        s.push(chars[i]);
-                    }
-                    i += 1;
-                }
-                if i < chars.len() {
-                    i += 1;
-                } // closing quote
-                tokens.push(CelToken::Str(s));
-            }
-
-            // Numbers. A `-` after an operand is binary minus (`x-1`), not a sign.
-            c if c.is_ascii_digit()
-                || (c == '-'
-                    && chars.get(i + 1).is_some_and(char::is_ascii_digit)
-                    && !ends_with_operand(&tokens)) =>
-            {
-                let neg = c == '-';
-                if neg {
-                    i += 1;
-                }
-                let start = i;
-                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
-                    i += 1;
-                }
-                let num_str: String = chars[start..i].iter().collect();
-                if num_str.contains('.') {
-                    let f: f64 = num_str.parse().ok()?;
-                    tokens.push(CelToken::Float(if neg { -f } else { f }));
-                } else {
-                    let n: i64 = num_str.parse().ok()?;
-                    tokens.push(CelToken::Int(if neg { -n } else { n }));
-                }
-            }
-
-            // Identifiers and keywords
-            c if c.is_alphabetic() || c == '_' => {
-                let start = i;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                    i += 1;
-                }
-                let word: String = chars[start..i].iter().collect();
-                tokens.push(match word.as_str() {
-                    "true" => CelToken::Bool(true),
-                    "false" => CelToken::Bool(false),
-                    "null" => CelToken::Null,
-                    _ => CelToken::Ident(word),
-                });
-            }
-
-            '.' => {
-                tokens.push(CelToken::Dot);
-                i += 1;
-            }
-            ':' => {
-                tokens.push(CelToken::Colon);
-                i += 1;
-            }
-            ',' => {
-                tokens.push(CelToken::Comma);
-                i += 1;
-            }
-            '{' => {
-                tokens.push(CelToken::LBrace);
-                i += 1;
-            }
-            '}' => {
-                tokens.push(CelToken::RBrace);
-                i += 1;
-            }
-            '[' => {
-                tokens.push(CelToken::LBracket);
-                i += 1;
-            }
-            ']' => {
-                tokens.push(CelToken::RBracket);
-                i += 1;
-            }
-            '(' => {
-                tokens.push(CelToken::LParen);
-                i += 1;
-            }
-            ')' => {
-                tokens.push(CelToken::RParen);
-                i += 1;
-            }
-            '+' => {
-                tokens.push(CelToken::Plus);
-                i += 1;
-            }
-            '!' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(CelToken::Neq);
-                    i += 2;
-                } else {
-                    tokens.push(CelToken::Bang);
-                    i += 1;
-                }
-            }
-            '<' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(CelToken::Lte);
-                    i += 2;
-                } else {
-                    tokens.push(CelToken::Lt);
-                    i += 1;
-                }
-            }
-            '>' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(CelToken::Gte);
-                    i += 2;
-                } else {
-                    tokens.push(CelToken::Gt);
-                    i += 1;
-                }
-            }
-            '=' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(CelToken::Eq);
-                    i += 2;
-                } else {
-                    i += 1; // skip lone '='
-                }
-            }
-            '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
-                tokens.push(CelToken::Ampersand);
-                i += 2;
-            }
-            '&' => {
-                return None;
-            }
-            '|' if i + 1 < chars.len() && chars[i + 1] == '|' => {
-                tokens.push(CelToken::Pipe);
-                i += 2;
-            }
-            '|' => {
-                return None;
-            }
-            '?' => {
-                tokens.push(CelToken::Question);
-                i += 1;
-            }
-            '*' => {
-                tokens.push(CelToken::Star);
-                i += 1;
-            }
-            '/' if !(i + 1 < chars.len() && chars[i + 1] == '/') => {
-                tokens.push(CelToken::Slash);
-                i += 1;
-            }
-            '%' => {
-                tokens.push(CelToken::Percent);
-                i += 1;
-            }
-            '-' => {
-                // Standalone minus (already handled numbers with leading -)
-                tokens.push(CelToken::Minus);
-                i += 1;
-            }
-
-            // Skip comments (// ...) and unknown characters
-            '/' if i + 1 < chars.len() && chars[i + 1] == '/' => {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-            }
-            _ => {
-                i += 1;
-            } // skip unknown
-        }
-    }
-    Some(tokens)
-}
-
-/// Parse a CEL value from the token stream.
-///
-/// Handles:
-/// - Object/struct construction: `TypeName{...}` or `TypeName.qualifier{...}`
-/// - Map literals: `{"key": value, ...}`
-/// - String, int, float, bool, null literals
-/// - Identifier chains (field access): `object.metadata.name`
-/// - Additive expressions: `a + b` (string concat or numeric add)
-fn parse_cel_value(
-    tokens: &[CelToken],
-    pos: &mut usize,
-    object: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let _depth_guard = CelRecursionGuard::enter()?;
-    if *pos >= tokens.len() {
-        return None;
-    }
-
-    let value = parse_cel_primary(tokens, pos, object)?;
-
-    // Handle additive operators (for string concat and numeric add used in some policies).
-    if *pos < tokens.len() {
-        if let CelToken::Plus = &tokens[*pos] {
-            *pos += 1;
-            let right = parse_cel_primary(tokens, pos, object)?;
-            let result = match (&value, &right) {
-                (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
-                    if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
-                        serde_json::Value::Number((ai + bi).into())
-                    } else {
-                        let af = a.as_f64().unwrap_or(0.0);
-                        let bf = b.as_f64().unwrap_or(0.0);
-                        serde_json::json!(af + bf)
-                    }
-                }
-                (serde_json::Value::String(a), serde_json::Value::String(b)) => {
-                    serde_json::Value::String(format!("{a}{b}"))
-                }
-                _ => return None, // type mismatch
-            };
-            return Some(result);
-        }
-    }
-
-    Some(value)
-}
-
-fn parse_cel_primary(
-    tokens: &[CelToken],
-    pos: &mut usize,
-    object: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let _depth_guard = CelRecursionGuard::enter()?;
-    cel_charge(1)?;
-    if *pos >= tokens.len() {
-        return None;
-    }
-
-    match &tokens[*pos].clone() {
-        // String literal
-        CelToken::Str(s) => {
-            *pos += 1;
-            Some(serde_json::Value::String(s.clone()))
-        }
-
-        // Integer literal
-        CelToken::Int(n) => {
-            *pos += 1;
-            Some(serde_json::Value::Number((*n).into()))
-        }
-
-        // Float literal
-        CelToken::Float(f) => {
-            *pos += 1;
-            Some(serde_json::json!(f))
-        }
-
-        // Boolean literal
-        CelToken::Bool(b) => {
-            *pos += 1;
-            Some(serde_json::Value::Bool(*b))
-        }
-
-        // Null literal
-        CelToken::Null => {
-            *pos += 1;
-            Some(serde_json::Value::Null)
-        }
-
-        // Negative number (unary minus)
-        CelToken::Minus => {
-            *pos += 1;
-            let inner = parse_cel_primary(tokens, pos, object)?;
-            match inner {
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        Some(serde_json::Value::Number((-i).into()))
-                    } else {
-                        n.as_f64().map(|f| serde_json::json!(-f))
-                    }
-                }
-                _ => None,
-            }
-        }
-
-        // Map literal: {"key": value, ...}
-        CelToken::LBrace => {
-            *pos += 1;
-            parse_cel_object_body(tokens, pos, object)
-        }
-
-        // Identifier: could be:
-        //   - "object" (the admitted resource)
-        //   - "TypeName{...}" (struct constructor)
-        //   - "TypeName.qualifier{...}" (qualified struct constructor)
-        //   - Other identifier (treat as string key in some contexts)
-        CelToken::Ident(name) => {
-            let name = name.clone();
-            *pos += 1;
-
-            // Consume any ".qualifier" segments before the brace.
-            // E.g., "Object.metadata{...}" — skip ".metadata" and treat as Object{...}
-            while *pos < tokens.len() {
-                if let CelToken::Dot = &tokens[*pos] {
-                    // peek next: if it's an Ident followed by LBrace, consume the chain
-                    if *pos + 1 < tokens.len() {
-                        if let CelToken::Ident(_) = &tokens[*pos + 1] {
-                            // Check if after the ident there's a LBrace
-                            if *pos + 2 < tokens.len() {
-                                if let CelToken::LBrace = &tokens[*pos + 2] {
-                                    *pos += 2; // consume dot and ident, leaving at LBrace
-                                    continue;
-                                }
-                            }
-                            // Dot-access for field navigation
-                            *pos += 1; // consume dot
-                            if let CelToken::Ident(field) = &tokens[*pos].clone() {
-                                let field = field.clone();
-                                *pos += 1;
-                                // Build field access chain from name
-                                let base = if name == "object" {
-                                    cel_charge_clone(object)?;
-                                    object.clone()
-                                } else {
-                                    serde_json::Value::Null
-                                };
-                                // Continue chaining field accesses
-                                let mut cur = base[&field].clone();
-                                // Continue reading more .field accesses
-                                while *pos < tokens.len() {
-                                    if let CelToken::Dot = &tokens[*pos] {
-                                        if *pos + 1 < tokens.len() {
-                                            if let CelToken::Ident(f2) = &tokens[*pos + 1].clone() {
-                                                let f2 = f2.clone();
-                                                // Check it's not followed by LBrace (would be constructor)
-                                                if *pos + 2 < tokens.len() {
-                                                    if let CelToken::LBrace = &tokens[*pos + 2] {
-                                                        break;
-                                                    }
-                                                }
-                                                *pos += 2;
-                                                cur = cur[&f2].clone();
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    break;
-                                }
-                                return Some(cur);
-                            }
-                        } else if let CelToken::Dot = &tokens[*pos + 1] {
-                            // Another dot — continue chain
-                            break;
-                        }
-                    }
-                    break;
-                }
-                break;
-            }
-
-            // If next token is LBrace, it's a struct constructor: TypeName{field: val, ...}
-            if *pos < tokens.len() {
-                if let CelToken::LBrace = &tokens[*pos] {
-                    *pos += 1;
-                    return parse_cel_object_body(tokens, pos, object);
-                }
-            }
-
-            // Plain identifier: if it's "object", return the full admitted resource.
-            if name == "object" {
-                cel_charge_clone(object)?;
-                return Some(object.clone());
-            }
-
-            // Other identifiers — treat as string value (for map key contexts handled by caller)
-            Some(serde_json::Value::String(name))
-        }
-
-        // Parenthesized expression
-        CelToken::LParen => {
-            *pos += 1;
-            let val = parse_cel_value(tokens, pos, object)?;
-            // consume RParen if present
-            if *pos < tokens.len() {
-                if let CelToken::RParen = &tokens[*pos] {
-                    *pos += 1;
-                }
-            }
-            Some(val)
-        }
-
-        // Array literal: [val, val, ...]
-        CelToken::LBracket => {
-            *pos += 1;
-            let mut arr = Vec::new();
-            while *pos < tokens.len() {
-                if let CelToken::RBracket = &tokens[*pos] {
-                    *pos += 1;
-                    break;
-                }
-                let val = parse_cel_value(tokens, pos, object)?;
-                arr.push(val);
-                if *pos < tokens.len() {
-                    if let CelToken::Comma = &tokens[*pos] {
-                        *pos += 1;
-                    }
-                }
-            }
-            Some(serde_json::Value::Array(arr))
-        }
-
-        _ => None,
-    }
-}
-
-/// Parse `field: value, field: value, ...}` (the body of a brace-enclosed object).
-/// Caller has already consumed the opening `{`.
-/// Both identifier keys and string keys are supported.
-fn parse_cel_object_body(
-    tokens: &[CelToken],
-    pos: &mut usize,
-    object: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let _depth_guard = CelRecursionGuard::enter()?;
-    let mut map = serde_json::Map::new();
-
-    while *pos < tokens.len() {
-        // Closing brace
-        if let CelToken::RBrace = &tokens[*pos] {
-            *pos += 1;
-            break;
-        }
-
-        // Parse key (string or ident)
-        let key = match &tokens[*pos].clone() {
-            CelToken::Str(s) => {
-                *pos += 1;
-                s.clone()
-            }
-            CelToken::Ident(s) => {
-                *pos += 1;
-                s.clone()
-            }
-            _ => return None, // unexpected token
-        };
-
-        // Expect ':'
-        if *pos >= tokens.len() {
-            return None;
-        }
-        if let CelToken::Colon = &tokens[*pos] {
-            *pos += 1;
-        } else {
-            return None;
-        }
-
-        // Parse value
-        let val = parse_cel_value(tokens, pos, object)?;
-        map.insert(key, val);
-
-        // Optional comma
-        if *pos < tokens.len() {
-            if let CelToken::Comma = &tokens[*pos] {
-                *pos += 1;
-            }
-        }
-    }
-
-    Some(serde_json::Value::Object(map))
 }
 
 /// Validate the CEL expressions in `webhooks[*].matchConditions[*].expression`.
@@ -2773,11 +2082,54 @@ pub(crate) fn validate_vap_cel(obj: &serde_json::Value) -> Result<(), String> {
             }
         }
     }
+    check_policy_expressions(exprs, CEL_VAP_ROOTS)
+}
+
+/// Root variables a MutatingAdmissionPolicy expression may reference.
+pub(crate) const CEL_MAP_ROOTS: &[&str] = &[
+    "object",
+    "oldObject",
+    "request",
+    "params",
+    "namespaceObject",
+    "variables",
+    "authorizer",
+];
+
+/// Reject a MutatingAdmissionPolicy whose CEL does not compile, as upstream does at
+/// create/update. A mutation that fails to compile would otherwise be stored and then
+/// fail (or be ignored) on every request.
+pub(crate) fn validate_map_cel(obj: &serde_json::Value) -> Result<(), String> {
+    let spec = &obj["spec"];
+    let mut exprs: Vec<(String, &str)> = Vec::new();
+    for list in ["matchConditions", "variables"] {
+        for (i, item) in spec[list].as_array().into_iter().flatten().enumerate() {
+            if let Some(e) = item["expression"].as_str() {
+                exprs.push((format!("spec.{list}[{i}].expression"), e));
+            }
+        }
+    }
+    for (i, m) in spec["mutations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for field in ["applyConfiguration", "jsonPatch"] {
+            if let Some(e) = m[field]["expression"].as_str() {
+                exprs.push((format!("spec.mutations[{i}].{field}.expression"), e));
+            }
+        }
+    }
+    check_policy_expressions(exprs, CEL_MAP_ROOTS)
+}
+
+fn check_policy_expressions(exprs: Vec<(String, &str)>, roots: &[&str]) -> Result<(), String> {
     for (path, expr) in exprs {
         if expr.trim().is_empty() {
             return Err(format!("{path}: CEL expression must not be empty"));
         }
-        check_cel_syntax(expr, CEL_VAP_ROOTS).map_err(|e| format!("{path}: {e}"))?;
+        check_cel_syntax(expr, roots).map_err(|e| format!("{path}: {e}"))?;
     }
     Ok(())
 }
@@ -2845,25 +2197,37 @@ async fn fetch_mutating_policy_bindings<S: Store>(
 /// This is the CEL-based analog to the webhook-based `run_mutating_webhooks`.
 /// It runs before the webhook chain so that webhook admission sees the already-mutated object.
 ///
+/// A mutation that fails to evaluate (a missing key, a type error, an uncompilable or
+/// unsupported expression) is governed by the policy's `failurePolicy`, as upstream's policy
+/// dispatcher does: `Fail` (the default) denies the request, `Ignore` drops the error and
+/// carries on with the remaining mutations.
+///
 /// Returns the (possibly mutated) object.
 pub async fn run_cel_mutating_policies<S: Store>(
     state: &AppState<S>,
     mut object: serde_json::Value,
+    old_object: Option<&serde_json::Value>,
     ctx: &AdmissionContext<'_>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, StatusError> {
     // Policy resources are never evaluated against themselves (same exemption as webhooks).
     if is_webhook_configuration_resource(ctx) {
-        return object;
+        return Ok(object);
     }
 
     let policies = fetch_mutating_policies(state).await;
     if policies.is_empty() {
-        return object;
+        return Ok(object);
     }
     let bindings = fetch_mutating_policy_bindings(state).await;
     if bindings.is_empty() {
-        return object;
+        return Ok(object);
     }
+
+    let namespace_object_val = match ctx.namespace {
+        Some(ns) => fetch_namespace_object(state, ns).await,
+        None => serde_json::Value::Null,
+    };
+    let old_object_val = old_object.cloned().unwrap_or(serde_json::Value::Null);
 
     // Index policies by name once so the binding loop below is O(N+M) instead of
     // re-scanning the full policy list (O(N*M)) for every binding.
@@ -2949,52 +2313,170 @@ pub async fn run_cel_mutating_policies<S: Store>(
             }
         }
 
-        // Apply each mutation in order.
-        let mutations = policy["spec"]["mutations"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-
-        for mutation in &mutations {
-            let patch_type = mutation["patchType"].as_str().unwrap_or("");
-            if patch_type != "ApplyConfiguration" {
+        let request_val = webhook_match_condition_request(ctx, &object);
+        let errors = apply_map_mutations(
+            policy,
+            &mut object,
+            &MapInputs {
+                request: &request_val,
+                namespace_object: &namespace_object_val,
+                old_object: &old_object_val,
+            },
+        );
+        // Upstream drops every error of an `Ignore` policy and otherwise denies with the
+        // first one, after the remaining mutations have run.
+        if policy["spec"]["failurePolicy"].as_str() == Some("Ignore") {
+            for e in &errors {
                 tracing::warn!(
-                    "admission: MutatingAdmissionPolicy mutation patchType '{}' is not implemented, skipping",
-                    patch_type
+                    "admission: MutatingAdmissionPolicy \"{policy_name}\" failed, ignoring \
+                     (failurePolicy=Ignore): {e}"
                 );
-                continue;
             }
-
-            let expr = mutation["applyConfiguration"]["expression"]
-                .as_str()
-                .unwrap_or("")
-                .trim();
-            if expr.is_empty() {
-                continue;
-            }
-
-            match eval_cel_apply_config(expr, &object) {
-                Some(patch) => {
-                    tracing::debug!(
-                        "admission: MutatingAdmissionPolicy applying CEL patch to {}/{}",
-                        ctx.resource,
-                        ctx.name
-                    );
-                    apply_cel_patch(&mut object, &patch);
-                }
-                None => {
-                    tracing::warn!(
-                        "admission: MutatingAdmissionPolicy CEL expression evaluation failed for \
-                         policy '{}', expression: {}",
-                        policy["metadata"]["name"].as_str().unwrap_or("unknown"),
-                        expr
-                    );
-                }
-            }
+        } else if let Some(first) = errors.into_iter().next() {
+            let binding_name = binding["metadata"]["name"].as_str().unwrap_or("");
+            tracing::warn!(
+                "admission: MutatingAdmissionPolicy \"{policy_name}\" failed, denying \
+                 (failurePolicy=Fail): {first}"
+            );
+            return Err(Status::unprocessable_entity(format!(
+                "policy '{policy_name}' with binding '{binding_name}' denied request: {first}"
+            )));
         }
     }
 
-    object
+    Ok(object)
+}
+
+/// The request-scoped CEL roots a MutatingAdmissionPolicy sees besides `object`.
+struct MapInputs<'a> {
+    request: &'a serde_json::Value,
+    namespace_object: &'a serde_json::Value,
+    old_object: &'a serde_json::Value,
+}
+
+/// Evaluate `policy`'s matchConditions and, when they hold, apply its mutations to `object`
+/// in order. Returns the evaluation errors, in order: a failed matchCondition ends the
+/// policy, a failed mutation does not stop the ones after it.
+///
+/// No `Env` outlives this call, so none is held across an await by the async caller.
+fn apply_map_mutations(
+    policy: &serde_json::Value,
+    object: &mut serde_json::Value,
+    inputs: &MapInputs<'_>,
+) -> Vec<String> {
+    let variable_defs: Vec<(String, String)> = policy["spec"]["variables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let name = v["name"].as_str().filter(|n| !n.is_empty())?;
+            let expr = v["expression"].as_str().filter(|e| !e.is_empty())?;
+            Some((name.to_string(), expr.to_string()))
+        })
+        .collect();
+    let mut errors = Vec::new();
+
+    // Upstream does not call patchers when there is no object to patch (DELETE).
+    if object.is_null() {
+        return errors;
+    }
+
+    let match_env = map_env(object, inputs, variable_defs.clone());
+    for cond in policy["spec"]["matchConditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let expr = cond["expression"].as_str().unwrap_or("");
+        if expr.is_empty() {
+            continue;
+        }
+        match cel_runtime::eval_bool(&match_env, expr) {
+            Ok(true) => {}
+            Ok(false) => return errors,
+            Err(e) => {
+                errors.push(format!(
+                    "matchCondition '{}' expression '{expr}' resulted in error: {e}",
+                    cond["name"].as_str().unwrap_or("")
+                ));
+                return errors;
+            }
+        }
+    }
+    drop(match_env);
+
+    for mutation in policy["spec"]["mutations"].as_array().into_iter().flatten() {
+        let patch_type = mutation["patchType"].as_str().unwrap_or("");
+        if patch_type != "ApplyConfiguration" {
+            errors.push(format!("unsupported patchType '{patch_type}'"));
+            continue;
+        }
+        let expr = mutation["applyConfiguration"]["expression"]
+            .as_str()
+            .unwrap_or("")
+            .trim();
+        if expr.is_empty() {
+            continue;
+        }
+        // Each mutation sees the object as the previous ones left it.
+        let patch = eval_apply_configuration(&map_env(object, inputs, variable_defs.clone()), expr);
+        match patch {
+            Ok(patch) => apply_cel_patch(object, &patch),
+            Err(e) => errors.push(format!("expression '{expr}' resulted in error: {e}")),
+        }
+    }
+    errors
+}
+
+fn map_env<'a>(
+    object: &'a serde_json::Value,
+    inputs: &MapInputs<'a>,
+    variables: Vec<(String, String)>,
+) -> cel_runtime::Env<'a> {
+    use cel_runtime::Value;
+    cel_runtime::Env::new(vec![
+        ("object", Value::from_json(object)),
+        ("oldObject", Value::from_json(inputs.old_object)),
+        ("request", Value::from_json(inputs.request)),
+        ("namespaceObject", Value::from_json(inputs.namespace_object)),
+    ])
+    .with_variables(variables)
+}
+
+/// Evaluate an `applyConfiguration` expression, which must produce an object.
+fn eval_apply_configuration(
+    env: &cel_runtime::Env<'_>,
+    expr: &str,
+) -> Result<serde_json::Value, String> {
+    match cel_runtime::eval_json(env, expr)? {
+        v @ serde_json::Value::Object(_) => Ok(v),
+        other => Err(format!(
+            "unsupported return type from ApplyConfiguration expression: {}",
+            match other {
+                serde_json::Value::Null => "null_type",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                _ => "list",
+            }
+        )),
+    }
+}
+
+/// [`eval_apply_configuration`] against just an `object` root, for tests.
+#[cfg(test)]
+pub(crate) fn eval_cel_apply_config(
+    expr: &str,
+    object: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let env = cel_runtime::Env::new(vec![("object", cel_runtime::Value::from_json(object))]);
+    match eval_apply_configuration(&env, expr) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            cel_record_error(e);
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3043,7 +2525,8 @@ pub async fn load_old_object_for_admission<S: Store>(
     }
     let needed = !fetch_mutating_configs(state).await.is_empty()
         || !fetch_validating_configs(state).await.is_empty()
-        || !fetch_validating_policies(state).await.is_empty();
+        || !fetch_validating_policies(state).await.is_empty()
+        || !fetch_mutating_policies(state).await.is_empty();
     if !needed {
         return Ok(None);
     }
@@ -3075,7 +2558,7 @@ pub async fn run_mutating_webhooks<S: Store>(
     let start = std::time::Instant::now();
 
     // CEL-based MutatingAdmissionPolicy runs before the webhook chain (Kubernetes ordering).
-    object = run_cel_mutating_policies(state, object, ctx).await;
+    object = run_cel_mutating_policies(state, object, old_object, ctx).await?;
 
     // Already-flattened, typed webhook entries — the cache holds the parsed form so
     // this never re-serializes/re-parses a config per request (see parse_webhook_entries).
@@ -9047,11 +8530,11 @@ mod tests {
     #[test]
     fn eval_cel_apply_config_field_access_on_object() {
         let object = json!({"metadata": {"name": "my-deploy", "namespace": "default"}});
-        let result = eval_cel_apply_config("object.metadata.name", &object);
+        let result = eval_cel_apply_config("{'n': object.metadata.name}", &object);
         assert!(result.is_some(), "field access on object must succeed");
         assert_eq!(
             result.unwrap(),
-            "my-deploy",
+            json!({"n": "my-deploy"}),
             "field access must return the correct value from the admitted object"
         );
     }
@@ -9223,151 +8706,299 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Tests — tokenize_cel edge cases
-    //
-    // A mis-tokenized CEL expression returns None from eval_cel_apply_config,
-    // which silently drops the MAP mutation. The policy appears to work but
-    // the mutation is never applied to the resource.
+    // MutatingAdmissionPolicy evaluation: same engine and error semantics as VAP
     // ---------------------------------------------------------------------------
 
-    /// tokenize_cel must handle single-quoted strings.
-    /// Single-quoted strings are valid CEL syntax; mis-tokenizing them means
-    /// string values in CEL policies fail to parse and mutations are silently dropped.
-    #[test]
-    fn tokenize_cel_single_quoted_string_parsed_correctly() {
-        let object = json!({"metadata": {"name": "x"}});
-        // Single-quoted string as a map value
-        let result = eval_cel_apply_config(r#"{"key": 'hello'}"#, &object);
+    /// Runs one MutatingAdmissionPolicy (`spec` merged over a match-all-deployments base)
+    /// against `object`, the way the mutating chain does.
+    async fn run_map(
+        spec: serde_json::Value,
+        object: serde_json::Value,
+        old_object: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, StatusError> {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut full = json!({"matchConstraints": {"resourceRules": [{
+            "apiGroups": ["apps"], "apiVersions": ["v1"],
+            "resources": ["deployments"], "operations": ["CREATE", "UPDATE"]
+        }]}});
+        for (k, v) in spec.as_object().expect("spec object") {
+            full[k] = v.clone();
+        }
+        let policy = json!({"apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicy", "metadata": {"name": "p"}, "spec": full});
+        let binding = json!({"apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicyBinding", "metadata": {"name": "b"},
+            "spec": {"policyName": "p"}});
+        for (key, doc) in [
+            (
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicies/p",
+                policy,
+            ),
+            (
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicybindings/b",
+                binding,
+            ),
+        ] {
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "d",
+            namespace: Some("default"),
+            operation: if old_object.is_some() {
+                "UPDATE"
+            } else {
+                "CREATE"
+            },
+            user_info: None,
+            dry_run: false,
+        };
+        run_mutating_webhooks(&state, object, old_object.as_ref(), &ctx).await
+    }
+
+    fn deploy() -> serde_json::Value {
+        json!({"apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "d", "namespace": "default"}, "spec": {"replicas": 2}})
+    }
+
+    fn mutation(expr: &str) -> serde_json::Value {
+        json!({"patchType": "ApplyConfiguration", "applyConfiguration": {"expression": expr}})
+    }
+
+    /// An applyConfiguration that selects a key the object does not have is an evaluation
+    /// error; under failurePolicy=Fail it must deny the request. Reading the absent key as
+    /// null instead skipped the mutation and admitted the object unmutated, so a policy
+    /// meant to force a setting silently stopped enforcing it.
+    #[tokio::test]
+    async fn map_missing_key_select_denies_under_fail() {
+        for fp in [None, Some("Fail")] {
+            let mut spec = json!({"mutations": [mutation(
+                "Object{metadata: Object.metadata{labels: {'tier': object.metadata.labels.tier}}}")]});
+            if let Some(fp) = fp {
+                spec["failurePolicy"] = json!(fp);
+            }
+            let err = run_map(spec, deploy(), None)
+                .await
+                .expect_err("a missing-key select must deny under Fail");
+            assert!(
+                err.1.message.contains("no such key: labels")
+                    && err
+                        .1
+                        .message
+                        .contains("policy 'p' with binding 'b' denied request"),
+                "got {}",
+                err.1.message
+            );
+        }
+    }
+
+    /// Under Ignore the error is dropped, and the mutations after the failing one still run.
+    #[tokio::test]
+    async fn map_missing_key_is_ignored_under_ignore_and_later_mutations_apply() {
+        let spec = json!({"failurePolicy": "Ignore", "mutations": [
+            mutation("Object{metadata: Object.metadata{labels: {'a': object.nope}}}"),
+            mutation("Object{metadata: Object.metadata{labels: {'b': 'ok'}}}"),
+        ]});
+        let out = run_map(spec, deploy(), None).await.expect("Ignore admits");
+        assert_eq!(out["metadata"]["labels"], json!({"b": "ok"}));
+    }
+
+    /// `has()` guards a possibly-absent field exactly as it does in VAP.
+    #[tokio::test]
+    async fn map_has_guards_optional_fields() {
+        let spec = json!({"mutations": [mutation(
+            "has(object.metadata.labels) ? Object{} : Object{metadata: Object.metadata{labels: {'defaulted': 'yes'}}}")]});
+        let out = run_map(spec.clone(), deploy(), None).await.unwrap();
+        assert_eq!(out["metadata"]["labels"]["defaulted"], "yes");
+        let mut labelled = deploy();
+        labelled["metadata"]["labels"] = json!({"k": "v"});
+        let out = run_map(spec, labelled, None).await.unwrap();
+        assert_eq!(out["metadata"]["labels"], json!({"k": "v"}));
+    }
+
+    /// A mutation sees the object as earlier mutations left it, and can read the request,
+    /// the old object and policy variables.
+    #[tokio::test]
+    async fn map_expressions_see_prior_mutations_request_old_object_and_variables() {
+        let spec = json!({
+        "variables": [{"name": "base", "expression": "object.spec.replicas * 10"}],
+        "mutations": [
+            mutation("Object{spec: Object.spec{replicas: variables.base + 1}}"),
+            mutation("Object{metadata: Object.metadata{annotations: {\
+                'sum': string(object.spec.replicas + oldObject.spec.replicas), \
+                'op': request.operation}}}"),
+        ]});
+        let mut old = deploy();
+        old["spec"]["replicas"] = json!(3);
+        let out = run_map(spec, deploy(), Some(old)).await.unwrap();
+        assert_eq!(out["spec"]["replicas"], 21);
+        assert_eq!(
+            out["metadata"]["annotations"],
+            json!({"sum": "24", "op": "UPDATE"})
+        );
+    }
+
+    /// matchConditions gate the policy: false skips it, an error follows failurePolicy.
+    #[tokio::test]
+    async fn map_match_conditions_gate_the_mutations() {
+        let m = mutation("Object{metadata: Object.metadata{labels: {'hit': 'yes'}}}");
+        let cond = |e: &str| json!([{"name": "c", "expression": e}]);
+        let out = run_map(
+            json!({"matchConditions": cond("object.spec.replicas > 5"), "mutations": [m.clone()]}),
+            deploy(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
-            result.is_some(),
-            "single-quoted string in CEL must parse without panicking; \
-             failure means MAP mutations using single-quoted strings are silently dropped"
+            out["metadata"].get("labels").is_none(),
+            "false condition must skip"
+        );
+        let out = run_map(
+            json!({"matchConditions": cond("object.spec.replicas == 2"), "mutations": [m.clone()]}),
+            deploy(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["metadata"]["labels"]["hit"], "yes");
+        let err = run_map(
+            json!({"matchConditions": cond("object.spec.nope == 2"), "mutations": [m.clone()]}),
+            deploy(),
+            None,
+        )
+        .await
+        .expect_err("an erroring matchCondition denies under Fail");
+        assert!(
+            err.1.message.contains("no such key: nope"),
+            "{}",
+            err.1.message
+        );
+        let out = run_map(
+            json!({"failurePolicy": "Ignore", "matchConditions": cond("object.spec.nope == 2"),
+                "mutations": [m]}),
+            deploy(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out["metadata"].get("labels").is_none());
+    }
+
+    /// A mutation this server cannot run must not be skipped silently under Fail: the
+    /// request would be admitted without the mutation the policy author required.
+    #[tokio::test]
+    async fn map_unsupported_patch_type_denies_under_fail() {
+        let spec = json!({"mutations": [{"patchType": "JSONPatch",
+            "jsonPatch": {"expression": "[JSONPatch{op: 'add', path: '/x', value: 1}]"}}]});
+        let err = run_map(spec, deploy(), None).await.expect_err("must deny");
+        assert!(
+            err.1.message.contains("unsupported patchType 'JSONPatch'"),
+            "{}",
+            err.1.message
+        );
+    }
+
+    /// An applyConfiguration must produce an object.
+    #[tokio::test]
+    async fn map_non_object_result_is_an_error() {
+        let err = run_map(json!({"mutations": [mutation("'str'")]}), deploy(), None)
+            .await
+            .expect_err("a string is not an apply configuration");
+        assert!(
+            err.1.message.contains("unsupported return type"),
+            "{}",
+            err.1.message
+        );
+    }
+
+    /// The create-time check rejects an uncompilable MAP expression in any expression field,
+    /// and accepts the shapes the conformance suite posts.
+    #[test]
+    fn validate_map_cel_checks_every_expression_field() {
+        let ok = |m: &str| json!({"spec": {"mutations": [mutation(m)]}});
+        assert!(validate_map_cel(&ok("Object{spec: Object.spec{replicas: 1337}}")).is_ok());
+        assert!(validate_map_cel(&ok(
+            "Object{metadata: Object.metadata{annotations: {'mutated-by': 'admission-policy'}}}"
+        ))
+        .is_ok());
+        for bad in ["Object{spec:", "Object{spec: nope}", "", "object.a )"] {
+            assert!(validate_map_cel(&ok(bad)).is_err(), "{bad:?}");
+        }
+        for (list, field) in [
+            ("matchConditions", "expression"),
+            ("variables", "expression"),
+        ] {
+            let spec = json!({"spec": {list: [{"name": "n", field: "1 +"}]}});
+            assert!(validate_map_cel(&spec).is_err(), "{list}");
+        }
+        let jp = json!({"spec": {"mutations": [{"patchType": "JSONPatch",
+            "jsonPatch": {"expression": "[1"}}]}});
+        assert!(validate_map_cel(&jp).is_err());
+    }
+
+    /// Reading an absent key of `object` is an error, like cel-go's, not null.
+    #[test]
+    fn eval_cel_apply_config_errors_on_a_missing_key_instead_of_reading_null() {
+        let object = json!({"metadata": {"name": "x"}});
+        assert_eq!(
+            eval_cel_apply_config("{'k': object.nonexistent}", &object),
+            None
+        );
+        assert_eq!(cel_last_error(), "no such key: nonexistent");
+        assert_eq!(
+            eval_cel_apply_config("{'k': has(object.nonexistent)}", &object),
+            Some(json!({"k": false}))
         );
         assert_eq!(
-            result.unwrap()["key"],
-            "hello",
-            "single-quoted string must produce the same value as a double-quoted string"
+            eval_cel_apply_config("{'k': object.metadata.labels['a']}", &object),
+            None,
+            "an absent parent is an error, not a null to index into"
         );
     }
 
-    /// tokenize_cel must expand escape sequences inside strings.
-    /// Escape sequences (\n, \t, \r) inside CEL strings must be decoded to their
-    /// character values. Without this, policies embedding newlines are mis-tokenized.
     #[test]
-    fn tokenize_cel_escape_sequences_decoded() {
+    fn eval_cel_apply_config_evaluates_the_full_expression_surface() {
         let object = json!({"metadata": {"name": "x"}});
-        // The escape sequences should be decoded inside the string
-        let result = eval_cel_apply_config(r#"{"key": "a\nb\tc\rd"}"#, &object);
-        assert!(
-            result.is_some(),
-            "CEL string with escape sequences must parse without panicking"
-        );
-        let val = result.unwrap();
-        let s = val["key"].as_str().expect("key must be a string");
-        assert!(
-            s.contains('\n') && s.contains('\t') && s.contains('\r'),
-            "escape sequences \\n, \\t, \\r must be decoded to their character values; \
-             got: {:?}",
-            s
-        );
-    }
-
-    /// parse_cel_primary: unary negation applied to a non-numeric value returns None.
-    /// The caller (eval_cel_apply_config) returns None, which causes the MAP mutation
-    /// to be silently dropped. This test ensures the None path does not panic.
-    #[test]
-    fn tokenize_cel_unary_negation_of_non_numeric_returns_none() {
-        let object = json!({"metadata": {"name": "x"}});
-        // Unary minus applied to a string produces None without panicking
-        let result = eval_cel_apply_config(r#"-"hello""#, &object);
-        assert!(
-            result.is_none(),
-            "unary negation of a non-numeric value must return None, not panic; \
-             the MAP mutation should be dropped gracefully rather than crashing the admission handler"
-        );
-    }
-
-    /// tokenize_cel: `map()` style macro call tokenizes without panicking.
-    /// CEL expressions with method-call syntax (identifier followed by parentheses)
-    /// are tokenized as Ident + LParen + ... + RParen. This test ensures the
-    /// tokenizer and evaluator handle this without panicking; degrading to None is acceptable.
-    #[test]
-    fn tokenize_cel_map_macro_call_does_not_panic() {
-        let object = json!({"metadata": {"name": "x"}});
-        // map() is a valid CEL macro but our evaluator doesn't implement it fully.
-        // It must not panic — returning None is acceptable.
-        let result = eval_cel_apply_config(r#"[1, 2, 3].map(x, x + 1)"#, &object);
-        // We don't assert a specific value — only that it doesn't panic.
-        let _ = result;
-    }
-
-    /// parse_cel_primary: field access on `object` for an unknown field returns null.
-    /// When a CEL expression accesses a field that doesn't exist on the admitted resource,
-    /// serde_json returns Null. The evaluator must not panic; it should produce Null,
-    /// allowing callers to handle the missing field gracefully.
-    #[test]
-    fn tokenize_cel_unknown_field_on_object_returns_null() {
-        let object = json!({"metadata": {"name": "x"}});
-        // object.nonexistent is not in the object above
-        let result = eval_cel_apply_config("object.nonexistent", &object);
-        // Field access on object returns the serde_json Null (absent key)
-        assert!(
-            result.is_some(),
-            "field access on a missing key must return Some(Null), not None — \
-             returning None would silently drop MAP mutations that reference absent fields"
+        assert_eq!(
+            eval_cel_apply_config(r#"{"key": 'hello'}"#, &object),
+            Some(json!({"key": "hello"})),
+            "single-quoted strings are valid CEL"
         );
         assert_eq!(
-            result.unwrap(),
-            serde_json::Value::Null,
-            "missing field access on `object` must evaluate to Null, not panic"
+            eval_cel_apply_config(r#"{"key": "a\nb"}"#, &object),
+            Some(json!({"key": "a\nb"})),
+            "escape sequences are decoded"
         );
-    }
-
-    /// A lone & in a CEL expression must cause tokenize_cel to return None.
-    /// A silent skip would allow "a & always_true" to evaluate only "always_true",
-    /// bypassing the intended conjunction and defeating matchCondition policy checks.
-    #[test]
-    fn tokenize_cel_single_ampersand_returns_none() {
-        assert!(
-            tokenize_cel("a & b").is_none(),
-            "lone & must be a tokenizer error, not silently skipped; \
-             silent skip allows policy bypass via crafted matchCondition expressions"
+        assert_eq!(
+            eval_cel_apply_config(
+                "{'k': [1, 2, 3].map(x, x + 1), 'u': 1u, 'n': 0x10}",
+                &object
+            ),
+            Some(json!({"k": [2, 3, 4], "u": 1, "n": 16})),
         );
-    }
-
-    /// A lone | in a CEL expression must cause tokenize_cel to return None.
-    /// A silent skip would allow "false | always_false" to evaluate only "false",
-    /// producing incorrect disjunction semantics and defeating matchCondition policy checks.
-    #[test]
-    fn tokenize_cel_single_pipe_returns_none() {
+        assert_eq!(eval_cel_apply_config("-'hello'", &object), None);
+        assert_eq!(eval_cel_apply_config("{'a': 1} & {'b': 2}", &object), None);
         assert!(
-            tokenize_cel("a | b").is_none(),
-            "lone | must be a tokenizer error, not silently skipped; \
-             silent skip causes incorrect disjunction semantics in matchCondition expressions"
-        );
-    }
-
-    /// Double-ampersand && is valid CEL and must tokenize successfully.
-    /// Rejecting && would break all conjunction matchCondition expressions.
-    #[test]
-    fn tokenize_cel_double_ampersand_is_valid() {
-        let tokens = tokenize_cel("a && b");
-        assert!(
-            tokens.is_some(),
-            "&& is valid CEL conjunction and must tokenize successfully; \
-             rejecting it would break all conjunction-based matchCondition expressions"
-        );
-    }
-
-    /// Double-pipe || is valid CEL and must tokenize successfully.
-    /// Rejecting || would break all disjunction matchCondition expressions.
-    #[test]
-    fn tokenize_cel_double_pipe_is_valid() {
-        let tokens = tokenize_cel("a || b");
-        assert!(
-            tokens.is_some(),
-            "|| is valid CEL disjunction and must tokenize successfully; \
-             rejecting it would break all disjunction-based matchCondition expressions"
+            cel_last_error().starts_with("compilation failed"),
+            "{}",
+            cel_last_error()
         );
     }
 
@@ -11573,7 +11204,7 @@ quoted""" && object.b == '''x'y'''"#,
                 .map(|i| format!("k{i}: object.big"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            eval_cel_apply_config(&format!("{{{fields}}}"), &object)
+            eval_cel_apply_config(&format!("Object{{{fields}}}"), &object)
         };
         assert!(
             copies(2).is_some(),

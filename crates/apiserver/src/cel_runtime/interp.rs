@@ -129,6 +129,14 @@ impl<'a, 'p> Evaluator<'a, 'p> {
         self.charge(1 + (n as u64) / 32)
     }
 
+    /// Cost of walking or copying `v`: one unit per 16 nodes, measured within the budget
+    /// that remains so an oversized value is refused without being walked to the end.
+    pub(crate) fn charge_nodes(&self, v: &Value<'_>) -> R<()> {
+        const NODES_PER_UNIT: u64 = 16;
+        let cap = self.cost.get().saturating_mul(NODES_PER_UNIT);
+        self.charge(1 + v.weight(cap) / NODES_PER_UNIT)
+    }
+
     /// Cost of producing `n` list or map elements: one unit each, since an element is far
     /// larger than a byte and the budget bounds memory as much as time.
     pub(crate) fn charge_elems(&self, n: usize) -> R<()> {

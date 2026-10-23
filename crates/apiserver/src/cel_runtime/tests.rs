@@ -535,19 +535,18 @@ fn allocation_amplifying_calls_are_refused_before_building_the_result() {
     }
 }
 
+/// A policy reading a large string field once per list element would copy it that many
+/// times if selection materialised strings; it must hand back the request's own bytes.
 #[test]
-fn reading_a_large_string_field_does_not_copy_it_per_use() {
-    let object = json!({"s": "x".repeat(2_000_000), "l": (0..50_000).collect::<Vec<_>>()});
+fn reading_a_large_string_field_borrows_it_instead_of_copying() {
+    use super::value::Text;
+    let object = json!({"s": "x".repeat(2_000_000)});
     let env = Env::new(vec![("object", Value::from_json(&object))]);
-    let started = std::time::Instant::now();
-    assert_eq!(
-        eval_with("object.l.all(i, object.s.size() == 2000000)", &env),
-        "true"
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "50k reads of a 2MB string must borrow it (copying is ~100GB of memcpy)"
-    );
+    let v = Evaluator::new(&env).eval_str("object.s").unwrap();
+    let Value::Str(Text::Borrowed(s)) = v else {
+        panic!("selecting a string field must borrow it");
+    };
+    assert_eq!(s.as_ptr(), object["s"].as_str().unwrap().as_ptr());
 }
 
 #[test]

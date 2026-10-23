@@ -45,6 +45,8 @@ pub(crate) fn call_global<'a>(
 
 fn charge_pairs(ev: &Evaluator<'_, '_>, a: &V<'_>, b: &V<'_>) -> R<()> {
     let n = a.list_len().unwrap_or(0) * b.list_len().unwrap_or(0);
+    ev.charge_nodes(a)?;
+    ev.charge_nodes(b)?;
     ev.charge_size(n)
 }
 
@@ -82,14 +84,14 @@ pub(crate) fn call_method<'a>(
         ("max", []) => ev
             .charge_size(n)
             .and_then(|()| extremum(elems(), "max", Ordering::Less)),
-        ("indexOf", [item]) => ev.charge_size(n).map(|()| {
+        ("indexOf", [item]) => ev.charge_nodes(recv).map(|()| {
             V::Int(
                 elems()
                     .position(|e| e.equals(item))
                     .map_or(-1, |i| i as i64),
             )
         }),
-        ("lastIndexOf", [item]) => ev.charge_size(n).map(|()| {
+        ("lastIndexOf", [item]) => ev.charge_nodes(recv).map(|()| {
             let items: Vec<V<'a>> = elems().collect();
             V::Int(
                 items
@@ -99,7 +101,7 @@ pub(crate) fn call_method<'a>(
             )
         }),
         ("includes", [item]) => ev
-            .charge_size(n)
+            .charge_nodes(recv)
             .map(|()| V::Bool(elems().any(|e| e.equals(item)))),
         ("slice", [V::Int(start), V::Int(end)]) => slice(ev, recv, *start, *end),
         ("flatten", []) => flatten_to(ev, recv, 1),
@@ -243,6 +245,7 @@ fn flatten_to<'a>(ev: &Evaluator<'a, '_>, list: &V<'a>, depth: i64) -> R<V<'a>> 
 fn distinct<'a>(ev: &Evaluator<'a, '_>, list: &V<'a>) -> R<V<'a>> {
     let n = list.list_len().unwrap_or(0);
     ev.charge_size(n.saturating_mul(n) / 2)?;
+    ev.charge_nodes(list)?;
     let mut out: Vec<V<'a>> = Vec::new();
     for v in list.list_iter().into_iter().flatten() {
         if !out.iter().any(|o| v.equals(o)) {

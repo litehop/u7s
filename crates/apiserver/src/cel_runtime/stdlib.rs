@@ -211,8 +211,14 @@ fn call_global<'a>(ev: &Evaluator<'a, '_>, name: &str, args: Vec<V<'a>>) -> R<V<
         (op::MULTIPLY, [a, b]) => mul(a, b),
         (op::DIVIDE, [a, b]) => div(a, b),
         (op::MODULO, [a, b]) => rem(a, b),
-        (op::EQUALS, [a, b]) => Ok(V::Bool(a.equals(b))),
-        (op::NOT_EQUALS, [a, b]) => Ok(V::Bool(!a.equals(b))),
+        (op::EQUALS, [a, b]) => ev
+            .charge_nodes(a)
+            .and_then(|()| ev.charge_nodes(b))
+            .map(|()| V::Bool(a.equals(b))),
+        (op::NOT_EQUALS, [a, b]) => ev
+            .charge_nodes(a)
+            .and_then(|()| ev.charge_nodes(b))
+            .map(|()| V::Bool(!a.equals(b))),
         (op::LESS, [a, b]) => Ok(V::Bool(a.compare(b)? == Ordering::Less)),
         (op::LESS_EQUALS, [a, b]) => Ok(V::Bool(a.compare(b)? != Ordering::Greater)),
         (op::GREATER, [a, b]) => Ok(V::Bool(a.compare(b)? == Ordering::Greater)),
@@ -287,16 +293,9 @@ pub(crate) fn size<'a>(v: &V<'a>) -> R<V<'a>> {
 
 fn contains_in<'a>(ev: &Evaluator<'a, '_>, needle: &V<'a>, haystack: &V<'a>) -> R<V<'a>> {
     if let Some(items) = haystack.list_iter() {
-        let mut n = 0usize;
-        for item in items {
-            n += 1;
-            if item.equals(needle) {
-                ev.charge_size(n)?;
-                return Ok(V::Bool(true));
-            }
-        }
-        ev.charge_size(n)?;
-        return Ok(V::Bool(false));
+        ev.charge_nodes(haystack)?;
+        ev.charge_nodes(needle)?;
+        return Ok(V::Bool(items.into_iter().any(|item| item.equals(needle))));
     }
     if haystack.is_map() {
         return Ok(V::Bool(

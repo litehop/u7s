@@ -38,9 +38,9 @@ pub(crate) fn eval_bool(env: &Env<'_>, expr: &str) -> Result<bool, String> {
 
 /// Evaluates `expr` with a fresh cost budget and converts the result to JSON.
 pub(crate) fn eval_json(env: &Env<'_>, expr: &str) -> Result<serde_json::Value, String> {
-    Evaluator::new(env)
-        .eval_str(expr)
-        .and_then(|v| v.to_json())
+    let ev = Evaluator::new(env);
+    ev.eval_str(expr)
+        .and_then(|v| ev.charge_nodes(&v).and_then(|()| v.to_json()))
         .map_err(|e| e.msg)
 }
 

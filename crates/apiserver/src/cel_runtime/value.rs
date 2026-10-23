@@ -385,6 +385,41 @@ impl<'a> Value<'a> {
     }
 }
 
+impl Value<'_> {
+    /// Nodes in this value's tree, counted only up to `cap` (so measuring an oversized
+    /// value is itself bounded). Borrowed request data counts as the nodes it holds.
+    pub(crate) fn weight(&self, cap: u64) -> u64 {
+        fn json(v: &J, cap: u64, n: &mut u64) {
+            *n += 1;
+            if *n > cap {
+                return;
+            }
+            match v {
+                J::Array(a) => a.iter().for_each(|e| json(e, cap, n)),
+                J::Object(o) => o.values().for_each(|e| json(e, cap, n)),
+                _ => {}
+            }
+        }
+        fn go(v: &Value<'_>, cap: u64, n: &mut u64) {
+            *n += 1;
+            if *n > cap {
+                return;
+            }
+            match v {
+                Value::List(l) => l.iter().for_each(|e| go(e, cap, n)),
+                Value::Map(m) => m.values().for_each(|e| go(e, cap, n)),
+                Value::JList(l) => l.iter().for_each(|e| json(e, cap, n)),
+                Value::JMap(m) => m.values().for_each(|e| json(e, cap, n)),
+                Value::Optional(Some(inner)) => go(inner, cap, n),
+                _ => {}
+            }
+        }
+        let mut n = 0;
+        go(self, cap, &mut n);
+        n
+    }
+}
+
 const TWO_63: f64 = 9_223_372_036_854_775_808.0;
 const TWO_64: f64 = 18_446_744_073_709_551_616.0;
 
