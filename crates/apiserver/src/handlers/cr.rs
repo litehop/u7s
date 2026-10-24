@@ -1961,7 +1961,7 @@ fn evaluate_message_expression(
 /// (`self.split("/")[0].size() < 253`, `gateway.networking.k8s.io_gateways.yaml` L262) or
 /// Crossplane's `self.plural == self.plural.lowerAscii()` would fail every CR write with an
 /// "undeclared reference" CEL error instead of evaluating as the CRD author intended.
-fn register_cel_extensions(ctx: &mut cel::Context) {
+pub(crate) fn register_cel_extensions(ctx: &mut cel::Context) {
     ctx.add_function("matches", crate::handlers::cel_regex::cel_matches)
         .expect("regex extension name must not collide with a cel builtin");
     ctx.add_function("split", cel_split)
