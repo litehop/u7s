@@ -2936,7 +2936,18 @@ pub(crate) async fn patch_pod_status<S: Store>(
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
         let before_write = current_obj.body.clone();
+        let ssa_plan = super::status::plan_status_apply(
+            &headers,
+            content_type.contains("apply-patch+yaml"),
+            &before_write,
+            &patch,
+            "",
+            "v1",
+        )?;
         current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
+        if let Some(plan) = &ssa_plan {
+            plan.remove_dropped_fields(&mut current_obj.body);
+        }
         current_obj.body = admit_pod_status_update(
             &state,
             ns.as_str(),
@@ -2947,12 +2958,13 @@ pub(crate) async fn patch_pod_status<S: Store>(
             current_obj.body,
         )
         .await?;
-        crate::field_manager::WriteIdentity::new(None, &headers).record(
+        super::status::record_status_write(
+            &headers,
+            ssa_plan.as_ref(),
             &before_write,
             &mut current_obj.body,
+            "",
             "v1",
-            Some("status"),
-            None,
         );
 
         // Dry-run: validation passed; return the would-be patched status without
