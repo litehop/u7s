@@ -949,6 +949,20 @@ fn field_selector_name(query: Option<&str>) -> Option<String> {
     Some(value.to_owned())
 }
 
+/// The first `%` in `path` that does not start a valid escape, with the characters that
+/// follow it. Go's `net/http` answers such a path with 400 before any handler runs. Rejecting
+/// it here, ahead of authentication, keeps the one decode the router and authorization both
+/// perform unambiguous: a stray `%` next to a decodable escape could otherwise splice a new
+/// one together (`%%32F` -> `%2F`) in whichever side decodes first.
+pub(crate) fn invalid_path_escape(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let at = (0..bytes.len()).find(|&i| {
+        bytes[i] == b'%'
+            && !matches!(bytes.get(i + 1..i + 3), Some([h, l]) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit())
+    })?;
+    Some(path[at..].chars().take(3).collect())
+}
+
 /// Single percent-decode of a URL path (`+` stays literal). `None` when the result is not
 /// valid UTF-8.
 fn decode_path(path: &str) -> Option<std::borrow::Cow<'_, str>> {
@@ -1408,6 +1422,21 @@ where
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let path = req.uri().path();
+
+        if let Some(escape) = invalid_path_escape(path) {
+            let peer = req.extensions().get::<PeerAddr>().copied();
+            let verb = method_to_verb(req.method());
+            return Box::pin(async move {
+                Ok(log_denial(
+                    bad_request_response(format!("invalid URL escape {escape:?}")),
+                    "invalid_path_escape",
+                    None,
+                    verb,
+                    "",
+                    peer,
+                ))
+            });
+        }
 
         // parse_path and the non-resource-URL check are pure functions of the borrowed
         // path — run them here, on the borrow, before `req` (and the borrow) moves into
@@ -2321,6 +2350,20 @@ mod tests {
             assert_eq!(p.name.as_deref(), Some("n"), "{raw}");
             assert_eq!(p.subresource, "status", "{raw}");
         }
+    }
+
+    /// Only well-formed `%XX` escapes may reach the decoders: a stray `%` beside a decodable
+    /// escape is how `%%32F` splices into `%2F`, which one decoder turns into `/` and another
+    /// leaves as text.
+    #[test]
+    fn invalid_path_escape_flags_every_stray_percent_and_accepts_wellformed_paths() {
+        for bad in ["/a/%zz", "/a/%%32F", "/a/%2", "/a/%", "/a/%2%46", "/a/%é"] {
+            assert!(invalid_path_escape(bad).is_some(), "{bad}");
+        }
+        for ok in ["/a/b", "/a/%2F", "/a/%252F", "/a/%63%2f%5C"] {
+            assert_eq!(invalid_path_escape(ok), None, "{ok}");
+        }
+        assert_eq!(invalid_path_escape("/a/%%32F").as_deref(), Some("%%3"));
     }
 
     /// Double-encoding decodes exactly once (as upstream/axum do), so `%252F` is a literal
