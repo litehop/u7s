@@ -369,6 +369,95 @@ pub static CERT_ROTATION_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
+/// Requests rejected with 429 by the in-flight pools, by pool (`inflight`, `mutating`). Upstream's
+/// closest names (`apiserver_dropped_requests_total`, `apiserver_flowcontrol_rejected_requests_total`)
+/// are gone or carry flow-schema labels these pools do not have.
+pub static INFLIGHT_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "u7s_inflight_rejected_total",
+            "Requests rejected with 429 because an in-flight pool had no seat, by pool.",
+        ),
+        &["kind"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_inflight_rejected_total is registered exactly once per process");
+    counter
+});
+
+/// Admission rejections by plugin. Upstream only counts webhook rejections
+/// (`apiserver_admission_webhook_rejection_count`); this covers every plugin.
+pub static ADMISSION_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "u7s_admission_rejected_total",
+            "Requests rejected by an admission plugin, by plugin.",
+        ),
+        &["plugin"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_admission_rejected_total is registered exactly once per process");
+    counter
+});
+
+/// Same name and `result` label (`success`, `failure`, `error`) as upstream's
+/// `authentication_attempts`.
+pub static AUTHENTICATION_ATTEMPTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "authentication_attempts",
+            "Counter of authenticated attempts.",
+        ),
+        &["result"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("authentication_attempts is registered exactly once per process");
+    counter
+});
+
+/// Authentication failures by cause; upstream has no per-reason counter.
+pub static AUTHENTICATION_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "u7s_authentication_failures_total",
+            "Requests that presented a credential that failed authentication, by reason.",
+        ),
+        &["reason"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_authentication_failures_total is registered exactly once per process");
+    counter
+});
+
+/// Same name and `result` label (`allowed`, `denied`) as upstream's
+/// `authorization_attempts_total`.
+pub static AUTHORIZATION_ATTEMPTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "authorization_attempts_total",
+            "Counter of authorization attempts broken down by result.",
+        ),
+        &["result"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("authorization_attempts_total is registered exactly once per process");
+    counter
+});
+
+pub fn record_admission_rejected(plugin: &str) {
+    ADMISSION_REJECTED_TOTAL.with_label_values(&[plugin]).inc();
+}
+
 #[cfg(test)]
 mod tests {
     use prometheus::core::Collector;

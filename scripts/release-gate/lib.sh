@@ -38,6 +38,20 @@ RG_STEAL_MAX_PCT=10
 # `bash /var/tmp/rg/<name>.sh`. Anchored so the pkill's own wrapper shell never matches.
 RG_VM_KILL_PATTERN='^bash /var/tmp/rg/[a-z-]+\.sh'
 
+# Kills PID and every descendant (the ssh client sits several processes below a backgrounded
+# shell function); descendants are listed first because killing the parent reparents them.
+rg_kill_tree() {
+  local pids="$1" p i=1
+  while [ "$i" -le "$(wc -w <<<"$pids")" ]; do
+    p="$(cut -d' ' -f"$i" <<<"$pids")"
+    pids="$pids $(pgrep -P "$p" 2>/dev/null | tr '\n' ' ')"
+    i=$((i + 1))
+  done
+  # shellcheck disable=SC2086
+  kill $pids 2>/dev/null
+  return 0
+}
+
 rg_get() {
   local file="$1" key="$2"
   grep -m1 "^${key}=" "$file" 2>/dev/null | cut -d= -f2-
