@@ -343,7 +343,7 @@ fn too_many_requests_response(req: &Request<Body>, limit_kind: &str) -> Response
         .with_label_values(&[limit_kind])
         .inc();
     let peer = req.extensions().get::<PeerAddr>().map(|p| p.0);
-    if !crate::log_limit::admit("inflight_429", peer.map(|p| p.ip())) {
+    if !crate::log_limit::admit("inflight_429", peer.map(|p| p.ip()), limit_kind) {
         return Status::too_many_requests_retry_after("Too many requests".to_owned(), 1)
             .into_response();
     }

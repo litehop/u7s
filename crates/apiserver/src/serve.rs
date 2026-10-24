@@ -208,6 +208,7 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
         .http2()
         .timer(hyper_util::rt::TokioTimer::new());
 
+    crate::log_limit::spawn_flush();
     let permits = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip = PerIpLimiter::new(limits.max_connections_per_ip);
     let mut last_error_log: Option<Instant> = None;
@@ -261,13 +262,15 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
             {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    if crate::log_limit::admit("tls_accept_error", Some(peer_addr.ip())) {
+                    if crate::log_limit::admit("tls_accept_error", Some(peer_addr.ip()), "") {
                         tracing::warn!(peer = %peer_addr, "TLS accept error: {e}");
                     }
                     return;
                 }
                 Err(_) => {
-                    tracing::debug!("TLS handshake timed out");
+                    if crate::log_limit::admit("tls_handshake_timeout", Some(peer_addr.ip()), "") {
+                        tracing::debug!(peer = %peer_addr, "TLS handshake timed out");
+                    }
                     return;
                 }
             };
