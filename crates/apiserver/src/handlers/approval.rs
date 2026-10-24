@@ -47,14 +47,40 @@ fn record_approval_write(
     headers: &HeaderMap,
     before: &serde_json::Value,
     after: &mut serde_json::Value,
+    plan: Option<&crate::field_manager::ApplyPlan>,
 ) {
-    crate::field_manager::WriteIdentity::new(None, headers).record(
+    crate::field_manager::WriteIdentity::new(None, headers).record_subresource_write(
+        plan,
         before,
         after,
         "certificates.k8s.io/v1",
-        Some("approval"),
+        "approval",
         None,
     );
+}
+
+/// An apply to `/approval` owns the conditions it names; the rest of `status` and `spec`
+/// belong to other subresources.
+fn plan_approval_apply(
+    headers: &HeaderMap,
+    live: &serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<crate::field_manager::ApplyPlan, crate::status::StatusError> {
+    let mut applied = serde_json::Map::new();
+    if let Some(conditions) = patch.get("status").and_then(|s| s.get("conditions")) {
+        applied.insert(
+            "status".into(),
+            serde_json::json!({ "conditions": conditions }),
+        );
+    }
+    crate::field_manager::WriteIdentity::new(None, headers).plan_subresource_apply(
+        live,
+        &serde_json::Value::Object(applied),
+        &["status"],
+        "certificates.k8s.io/v1",
+        "approval",
+        None,
+    )
 }
 
 /// Admission for an UPDATE of `certificatesigningrequests/approval`. After mutation only
@@ -142,7 +168,7 @@ pub async fn put_approval<S: Store>(
     );
     merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
     current.body = admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
-    record_approval_write(&headers, &old_body, &mut current.body);
+    record_approval_write(&headers, &old_body, &mut current.body, None);
 
     // Dry-run: return the would-be approval object without persisting — mirrors
     // put_resource_status's dry-run early-return.
@@ -213,6 +239,9 @@ pub async fn patch_approval<S: Store>(
                 rest: serde_json::Value::Object(Default::default()),
             },
         );
+    let ssa_plan = is_ssa
+        .then(|| plan_approval_apply(&headers, &old_body, &patch))
+        .transpose()?;
 
     match patch_type {
         PatchType::Json => {
@@ -239,6 +268,10 @@ pub async fn patch_approval<S: Store>(
             // approve/deny and this conformance test also patch annotations via /approval.
             merge_incoming_metadata(&mut current.body, &patch, KIND);
         }
+    }
+
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut current.body);
     }
 
     super::csr::populate_condition_timestamps(
@@ -272,7 +305,7 @@ pub async fn patch_approval<S: Store>(
     }
 
     current.body = admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
-    record_approval_write(&headers, &old_body, &mut current.body);
+    record_approval_write(&headers, &old_body, &mut current.body, ssa_plan.as_ref());
 
     // Dry-run: return the would-be patched approval object without persisting —
     // mirrors put_approval's dry-run early-return above.

@@ -1730,6 +1730,7 @@ pub async fn put_crd_status<S: Store>(
     .await?;
     crate::handlers::status::record_status_write(
         &headers,
+        None,
         &before_write,
         &mut current.body,
         GROUP,
@@ -1789,6 +1790,14 @@ pub async fn patch_crd_status<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, None)?;
+    let ssa_plan = crate::handlers::status::plan_status_apply(
+        &headers,
+        is_ssa,
+        &current.body,
+        &patch,
+        GROUP,
+        "v1",
+    )?;
 
     match patch_type {
         PatchType::Json => {
@@ -1818,6 +1827,9 @@ pub async fn patch_crd_status<S: Store>(
             crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch, KIND);
         }
     }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut current.body);
+    }
     // Convergence point for every patch content-type above (JSON Patch, merge, strategic
     // merge): guard once here, right before the store write, instead of per-branch. A
     // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
@@ -1835,6 +1847,7 @@ pub async fn patch_crd_status<S: Store>(
     .await?;
     crate::handlers::status::record_status_write(
         &headers,
+        ssa_plan.as_ref(),
         &before_write,
         &mut current.body,
         GROUP,

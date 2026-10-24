@@ -224,7 +224,7 @@ mod cases {
             body: Value,
         ) -> (StatusCode, Value) {
             let uri = if content_type.contains("apply-patch") && !uri.contains('?') {
-                format!("{uri}?fieldManager=tests")
+                format!("{uri}?fieldManager=tests&force=true")
             } else {
                 uri.to_owned()
             };
