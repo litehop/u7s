@@ -6,6 +6,9 @@
 #   U7S_PKI_TEST_LIFETIME_SECS=30 scripts/e2e-pki-rotation/start-stack.sh --workdir temp/pki-e2e [--scheduler]
 set -euo pipefail
 
+# shellcheck source=scripts/_kill-pattern.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../_kill-pattern.sh"
+
 WORKDIR=""
 WITH_SCHED=0
 BIN="${U7S_BIN_DIR:-target/release}"
@@ -41,7 +44,7 @@ nc -z 127.0.0.1 6443 2>/dev/null || {
 if [ "$WITH_SCHED" = 1 ]; then
   "$BIN/u7s-scheduler" --kubeconfig "$W/kubeconfig-scheduler" >"$W/scheduler.log" 2>&1 &
   sleep 2
-  pgrep -f "u7s-scheduler.*$W/kubeconfig" >/dev/null || {
+  pgrep -f "$(workdir_kill_pattern scheduler "$W")" >/dev/null || {
     cat "$W/scheduler.log"
     exit 1
   }
