@@ -43,9 +43,9 @@
 #      by the kubelet without a restart, chains to the cluster CA, and `kubectl exec/logs`
 #      keep working after the original kubelet serving cert expired.
 #
-# Pending (need other beads, not asserted here): kubelet client-cert reload, intermediate
-# rotation, root succession. proxy-client rotation is checked by log only:
-# no aggregated backend in this harness verifies the identity.
+# Pending (need other beads, not asserted here): kubelet client-cert reload, root
+# succession. Intermediate rotation is intermediate-rotation.sh. proxy-client rotation is
+# checked by log only: no aggregated backend in this harness verifies the identity.
 #
 # On failure the script dumps the served cert, the rotation log lines and component logs.
 set -euo pipefail
@@ -134,6 +134,11 @@ kubelet_pem() {
   openssl x509 <<<"$out"
 }
 
+kubelet_chain() {
+  { openssl s_client -connect "127.0.0.1:$KUBELET_PORT" -showcerts </dev/null 2>/dev/null || true; } |
+    sed -n '/^-----BEGIN CERTIFICATE-----$/,/^-----END CERTIFICATE-----$/p'
+}
+
 dump_diagnostics() {
   echo "=== diagnostics ===" >&2
   echo "--- served cert ---" >&2
@@ -210,7 +215,10 @@ sched_start() {
 }
 sched_reloads() { grep -c "TLS material changed on disk" "$WORKDIR/scheduler.log" || true; }
 kubelet_cert_from_ca() {
-  kubelet_pem >"$TMP/kubelet.cur.pem" && openssl verify -CAfile "$ABS_WORKDIR/ca.pem" "$TMP/kubelet.cur.pem" >/dev/null 2>&1
+  # The kubelet presents its leaf and the signing intermediate; ca.pem holds only roots.
+  kubelet_chain >"$TMP/kubelet.chain.pem" && [ -s "$TMP/kubelet.chain.pem" ] &&
+    awk '{print} /^-----END CERTIFICATE-----$/ {exit}' "$TMP/kubelet.chain.pem" >"$TMP/kubelet.cur.pem" &&
+    openssl verify -CAfile "$ABS_WORKDIR/ca.pem" -untrusted "$TMP/kubelet.chain.pem" "$TMP/kubelet.cur.pem" >/dev/null 2>&1
 }
 kubelet_serial_differs() {
   kubelet_cert_from_ca && [ "$(pem_file_serial "$TMP/kubelet.cur.pem")" != "$1" ]

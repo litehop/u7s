@@ -575,8 +575,8 @@ runs:
         setsid bash scripts/conformance/kcm-supervisor.sh \
           "$WORKDIR/kube-controller-manager" "$WORKDIR/kcm.log" \
           --kubeconfig="$WORKDIR/kcm-kubeconfig" \
-          --cluster-signing-cert-file="$WORKDIR/ca.pem" \
-          --cluster-signing-key-file="$WORKDIR/ca.key" \
+          --cluster-signing-cert-file="$WORKDIR/intermediate-cert.pem" \
+          --cluster-signing-key-file="$WORKDIR/intermediate.key" \
           --cluster-signing-duration=8760h \
           --root-ca-file="$WORKDIR/ca.pem" \
           --controllers='*,-clusterrole-aggregation-controller,-service-cidr-controller' \

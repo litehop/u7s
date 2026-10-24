@@ -1,5 +1,5 @@
 use super::*;
-use crate::pki::{Clock, CLIENT_CERT_LIFETIME, ROOT_CA_LIFETIME};
+use crate::pki::{Clock, CLIENT_CERT_LIFETIME, INTERMEDIATE_CA_LIFETIME, ROOT_CA_LIFETIME};
 use crate::tls::leaf_cert_chain_validates_at;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -73,6 +73,7 @@ impl Harness {
         let (nb, na) = cert_validity(&cert_der).unwrap();
         CaSigner {
             issuer: Issuer::new(self.pki.params(&spec, nb, na), key),
+            anchor_der: cert_der.clone(),
             cert_der,
             not_after: na,
         }
@@ -122,12 +123,29 @@ impl Harness {
         }
     }
 
+    fn intermediate_files(&self) -> LeafFiles {
+        LeafFiles {
+            cert: self.dir.join("intermediate.crt"),
+            key: self.dir.join("intermediate.key"),
+        }
+    }
+
     fn start(&self, admin: Duration) -> anyhow::Result<Rotator> {
+        self.start_with_intermediate(admin, INTERMEDIATE_CA_LIFETIME)
+    }
+
+    fn start_with_intermediate(
+        &self,
+        admin: Duration,
+        intermediate: Duration,
+    ) -> anyhow::Result<Rotator> {
         Rotator::new(
             self.pki.clone(),
             crate::pki::RENEW_FRACTION,
             self.cluster_ca(),
             self.other_ca(),
+            self.intermediate_files(),
+            intermediate,
             self.plans(admin),
         )
     }
@@ -152,9 +170,10 @@ fn connector(ca_der: &[u8], identity: Option<&Leaf>) -> tokio_rustls::TlsConnect
                 rcgen::KeyPair::from_pem(std::str::from_utf8(&leaf.key_pem).unwrap()).unwrap();
             builder
                 .with_client_auth_cert(
-                    vec![rustls::pki_types::CertificateDer::from(
-                        leaf.cert_der.clone(),
-                    )],
+                    leaf.chain_ders()
+                        .into_iter()
+                        .map(rustls::pki_types::CertificateDer::from)
+                        .collect(),
                     rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
                 )
                 .unwrap()
@@ -212,7 +231,12 @@ fn leaves_rotate_at_two_thirds_of_lifetime_and_not_before() {
     let new = r.leaf(SERVING_LEAF);
     assert_ne!(new.cert_der, old.cert_der);
     assert!(
-        leaf_cert_chain_validates_at(&new.cert_der, &h.cluster_ca().cert_der, h.pki.clock.now()),
+        leaf_cert_chain_validates_at(
+            &new.cert_der,
+            &h.cluster_ca().cert_der,
+            &[r.intermediate_der()],
+            h.pki.clock.now()
+        ),
         "the rotated serving cert must chain to the CA clients already trust"
     );
 }
@@ -450,3 +474,5 @@ fn failed_rotation_is_recorded_for_operators_until_a_later_rotation_succeeds() {
         "a successful rotation must clear the failure so the Warning Event stops"
     );
 }
+
+mod intermediate;
