@@ -21,7 +21,10 @@ use u7s_store::{SqliteStore, Store};
 
 use crate::apf;
 use crate::keys::object_key;
-use crate::metrics::record_request_total;
+use crate::metrics::{
+    record_request_total, AUTHENTICATION_ATTEMPTS, AUTHENTICATION_FAILURES_TOTAL,
+    AUTHORIZATION_ATTEMPTS_TOTAL,
+};
 use crate::node_authz::{self, NodeGraph};
 use crate::rbac::{AuthzRequest, RbacIndex};
 use crate::sa_keys::SaKeyring;
@@ -46,6 +49,11 @@ const DELETION_LEEWAY_SECS: i64 = 60;
 /// handshake. Injected into request extensions by `serve_tls` in main.rs.
 #[derive(Clone, Debug)]
 pub struct PeerCertificate(pub Vec<u8>);
+
+/// TCP peer address of the connection, injected by the accept loop so rejection logs can
+/// name the client.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerAddr(pub std::net::SocketAddr);
 
 // ---------------------------------------------------------------------------
 // UserInfo
@@ -1161,6 +1169,58 @@ fn unauthorized_response() -> Response<Body> {
         .unwrap()
 }
 
+/// Coarse cause of a rejected bearer token, safe to use as a metric label and log field.
+/// Never derived from token contents beyond its shape.
+fn bad_token_reason(auth_header: Option<&str>) -> &'static str {
+    match bearer_token(auth_header) {
+        Some(t) if t.starts_with("eyJ") && t.split('.').count() == 3 => "invalid_jwt",
+        _ => "unknown_token",
+    }
+}
+
+/// Stamps `x-request-id` on a rejection that never reaches ContentTypeLayer and logs it
+/// with the caller's identity and peer, so a probe can be traced after the fact. The
+/// request, authorization header and token are never logged.
+fn log_denial(
+    mut resp: Response<Body>,
+    kind: &'static str,
+    user: Option<&UserInfo>,
+    verb: &str,
+    resource: &str,
+    peer: Option<PeerAddr>,
+) -> Response<Body> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
+        resp.headers_mut().insert("x-request-id", v);
+    }
+    tracing::info!(
+        kind,
+        status = resp.status().as_u16(),
+        username = ?user.map_or("system:unauthenticated", |u| u.username.as_str()),
+        groups = ?user.map(|u| &u.groups),
+        verb,
+        resource = ?resource,
+        peer = ?peer.map(|p| p.0),
+        request_id,
+        "request rejected"
+    );
+    resp
+}
+
+fn impersonation_denied(caller: &UserInfo, target: &str, peer: Option<PeerAddr>) -> Response<Body> {
+    AUTHORIZATION_ATTEMPTS_TOTAL
+        .with_label_values(&["denied"])
+        .inc();
+    log_denial(
+        forbidden_response(&caller.username, "impersonate", target),
+        "forbidden",
+        Some(caller),
+        "impersonate",
+        target,
+        peer,
+    )
+}
+
 fn forbidden_response(user: &str, verb: &str, resource: &str) -> Response<Body> {
     let status = Status {
         kind: "Status",
@@ -1383,6 +1443,7 @@ where
             // 1. Authenticate. Extract the header value up front (see authenticate's doc
             // comment for why it takes Option<&str> rather than &Request<Body>).
             let peer_cert = req.extensions().get::<PeerCertificate>().cloned();
+            let peer = req.extensions().get::<PeerAddr>().copied();
             let auth_header = req
                 .headers()
                 .get("authorization")
@@ -1391,11 +1452,19 @@ where
                 begin_token_verification(auth_header, &token_map, sig_cache.as_ref())
             else {
                 record_request_total(method_to_verb(req.method()), "", "", "", "", "429");
-                return Ok(axum::response::IntoResponse::into_response(
-                    Status::too_many_requests_retry_after(
-                        "Too many requests, please try again later.".to_owned(),
-                        1,
+                AUTHENTICATION_ATTEMPTS.with_label_values(&["error"]).inc();
+                return Ok(log_denial(
+                    axum::response::IntoResponse::into_response(
+                        Status::too_many_requests_retry_after(
+                            "Too many requests, please try again later.".to_owned(),
+                            1,
+                        ),
                     ),
+                    "authn_busy",
+                    None,
+                    method_to_verb(req.method()),
+                    "",
+                    peer,
                 ));
             };
             let authenticated_user = match authenticate(
@@ -1410,6 +1479,9 @@ where
             {
                 AuthnResult::Identified(u) => {
                     drop(verification);
+                    AUTHENTICATION_ATTEMPTS
+                        .with_label_values(&["success"])
+                        .inc();
                     u
                 }
                 AuthnResult::BadToken => {
@@ -1423,7 +1495,21 @@ where
                         req.uri().query(),
                     );
                     record_request_total(verb, "", "", "", "", "401");
-                    return Ok(unauthorized_response());
+                    let reason = bad_token_reason(auth_header);
+                    AUTHENTICATION_ATTEMPTS
+                        .with_label_values(&["failure"])
+                        .inc();
+                    AUTHENTICATION_FAILURES_TOTAL
+                        .with_label_values(&[reason])
+                        .inc();
+                    return Ok(log_denial(
+                        unauthorized_response(),
+                        reason,
+                        None,
+                        verb,
+                        &parsed.resource,
+                        peer,
+                    ));
                 }
             };
 
@@ -1505,10 +1591,10 @@ where
                     })
                 };
                 if !allowed {
-                    return Ok(forbidden_response(
-                        &authenticated_user.username,
-                        "impersonate",
+                    return Ok(impersonation_denied(
+                        &authenticated_user,
                         &impersonate_user,
+                        peer,
                     ));
                 }
 
@@ -1525,11 +1611,7 @@ where
                         name: Some(group),
                         non_resource_url: None,
                     }) {
-                        return Ok(forbidden_response(
-                            &authenticated_user.username,
-                            "impersonate",
-                            group,
-                        ));
+                        return Ok(impersonation_denied(&authenticated_user, group, peer));
                     }
                 }
 
@@ -1555,11 +1637,7 @@ where
                         name: Some(uid),
                         non_resource_url: None,
                     }) {
-                        return Ok(forbidden_response(
-                            &authenticated_user.username,
-                            "impersonate",
-                            uid,
-                        ));
+                        return Ok(impersonation_denied(&authenticated_user, uid, peer));
                     }
                 }
 
@@ -1599,11 +1677,7 @@ where
                             name: Some(value),
                             non_resource_url: None,
                         }) {
-                            return Ok(forbidden_response(
-                                &authenticated_user.username,
-                                "impersonate",
-                                value,
-                            ));
+                            return Ok(impersonation_denied(&authenticated_user, value, peer));
                         }
                     }
                 }
@@ -1727,8 +1801,22 @@ where
                     scope,
                     "403",
                 );
-                return Ok(forbidden_response(&user.username, verb, &parsed.resource));
+                AUTHORIZATION_ATTEMPTS_TOTAL
+                    .with_label_values(&["denied"])
+                    .inc();
+                let target = non_resource_url.unwrap_or(&parsed.resource);
+                return Ok(log_denial(
+                    forbidden_response(&user.username, verb, &parsed.resource),
+                    "forbidden",
+                    Some(&user),
+                    verb,
+                    target,
+                    peer,
+                ));
             }
+            AUTHORIZATION_ATTEMPTS_TOTAL
+                .with_label_values(&["allowed"])
+                .inc();
 
             // 2a. Classify the request against the cached FlowSchemas/
             // PriorityLevelConfigurations, before `user` moves into the request
@@ -6238,6 +6326,95 @@ mod tests {
                 "{user} {method} {uri}: RBAC must authorize the verb the handler will run"
             );
         }
+    }
+
+    /// A 401 or 403 that leaves only a status code in a metric cannot be traced to a client:
+    /// operators need who (username/groups), what, from where (peer) and a request id that
+    /// matches the response header, plus counters to alert on, without the token leaking.
+    #[tokio::test]
+    async fn denials_are_logged_with_user_and_peer_and_counted_without_leaking_the_token() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
+
+        let mut tokens = HashMap::new();
+        tokens.insert(
+            "denied-token-value".to_owned(),
+            UserInfo {
+                username: "denied-user".to_owned(),
+                uid: "9".to_owned(),
+                groups: vec!["denied-group".to_owned()],
+                extra: Default::default(),
+            },
+        );
+        let app = Router::new()
+            .route("/api/v1/pods", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                Arc::new(RbacIndex::new()),
+                tokens,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(DiscoveryCache::new()),
+            ));
+        let peer: std::net::SocketAddr = "203.0.113.7:51234".parse().unwrap();
+        let send = |token: &'static str| {
+            let mut req = Request::builder()
+                .uri("/api/v1/pods")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(PeerAddr(peer));
+            app.clone().oneshot(req)
+        };
+
+        let failures = AUTHENTICATION_FAILURES_TOTAL.with_label_values(&["unknown_token"]);
+        let denied = AUTHORIZATION_ATTEMPTS_TOTAL.with_label_values(&["denied"]);
+        let (f0, d0) = (failures.get(), denied.get());
+
+        let r401 = send("guessed-secret-token").await.unwrap();
+        let r403 = send("denied-token-value").await.unwrap();
+        assert_eq!(r401.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(r403.status(), StatusCode::FORBIDDEN);
+
+        assert!(
+            failures.get() > f0,
+            "token guessing must be countable per reason, or it is invisible beyond the global 401 rate"
+        );
+        assert!(
+            denied.get() > d0,
+            "authz probing must be countable, or an under-privileged caller leaves no alertable signal"
+        );
+
+        let log = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let line_403 = log
+            .lines()
+            .find(|l| l.contains("request rejected") && l.contains("denied-user"))
+            .unwrap_or_else(|| panic!("no 403 log line; log was: {log}"));
+        assert!(
+            line_403.contains("203.0.113.7:51234") && line_403.contains("denied-group"),
+            "403 log must name peer and groups so the client can be identified: {line_403}"
+        );
+        let rid = r403.headers()["x-request-id"].to_str().unwrap();
+        assert!(
+            line_403.contains(rid),
+            "logged request id must equal the x-request-id the client saw: {line_403}"
+        );
+        assert!(
+            log.lines()
+                .any(|l| l.contains("request rejected") && l.contains("unknown_token")),
+            "401 must be logged with its reason; log was: {log}"
+        );
+        assert!(
+            !log.contains("guessed-secret-token") && !log.contains("denied-token-value"),
+            "credentials must never reach the log; log was: {log}"
+        );
     }
 
     /// After AuthLayer denies a request outright — bad credential or RBAC denial — the

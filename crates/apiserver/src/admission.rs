@@ -1774,6 +1774,7 @@ async fn invoke_mutating_webhook<S: Store>(
                     })
                     .unwrap_or("admission webhook denied the request")
                     .to_string();
+                crate::metrics::record_admission_rejected("MutatingAdmissionWebhook");
                 return Err(Status::forbidden(format!(
                     "admission webhook \"{}\" denied the request: {message}",
                     webhook.name
@@ -2977,6 +2978,7 @@ async fn run_validating_admission_policies<S: Store>(
                         // Real Kubernetes: default reason is Invalid (422 Unprocessable Entity).
                         // Only reason="Forbidden" maps to 403. The conformance test polls for
                         // apierrors.IsInvalid (HTTP 422) — any other code fails the test.
+                        crate::metrics::record_admission_rejected("ValidatingAdmissionPolicy");
                         let err = if reason == "Forbidden" {
                             Status::forbidden(message)
                         } else {
@@ -3193,6 +3195,7 @@ pub async fn run_validating_webhooks<S: Store>(
                             })
                             .unwrap_or("admission webhook denied the request")
                             .to_string();
+                        crate::metrics::record_admission_rejected("ValidatingAdmissionWebhook");
                         return Err(Status::forbidden(format!(
                             "admission webhook \"{}\" denied the request: {message}",
                             webhook.name
