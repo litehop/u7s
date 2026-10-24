@@ -261,7 +261,7 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
             {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    tracing::warn!("TLS accept error: {e}");
+                    tracing::warn!(peer = %peer_addr, "TLS accept error: {e}");
                     return;
                 }
                 Err(_) => {
@@ -296,6 +296,8 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
                     if let Some(cert) = peer_cert.as_ref().as_ref() {
                         req.extensions_mut().insert(cert.clone());
                     }
+                    req.extensions_mut()
+                        .insert(crate::auth::PeerAddr(peer_addr));
                     let (parts, body) = app.call(req).await.unwrap().into_parts();
                     // The guard lives as long as the response body, so a watch or log
                     // stream keeps the connection out of the idle window.

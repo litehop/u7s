@@ -41,7 +41,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Layer;
 use tower_service::Service;
 
-use crate::auth::{is_long_running_request, UserInfo};
+use crate::auth::{is_long_running_request, PeerAddr, UserInfo};
 use crate::state::is_system_priority_username;
 use crate::status::Status;
 
@@ -339,11 +339,16 @@ fn too_many_requests_response(req: &Request<Body>, limit_kind: &str) -> Response
     // No other log line ever sees this request — InflightLayer runs before
     // ContentTypeLayer's access log, so a rejected request would otherwise
     // vanish from apiserver.log entirely.
+    crate::metrics::INFLIGHT_REJECTED_TOTAL
+        .with_label_values(&[limit_kind])
+        .inc();
     tracing::warn!(
         method = %req.method(),
         uri = %req.uri(),
         limit_kind,
         user_agent,
+        username = ?req.extensions().get::<UserInfo>().map(|u| u.username.as_str()),
+        peer = ?req.extensions().get::<PeerAddr>().map(|p| p.0),
         "inflight limit reached, returning 429",
     );
     // Retry-After/retryAfterSeconds make client-go back off instead of retrying hot.
@@ -831,16 +836,32 @@ mod tests {
         let _permits = exhaust(&layer.inflight);
         let mut svc = layer.layer(OkService);
 
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::POST)
             .uri("/api/v1/namespaces")
             .header("user-agent", "e2e.test/v1.34.0")
             .body(Body::empty())
             .unwrap();
+        req.extensions_mut().insert(UserInfo {
+            username: "noisy-tenant".to_owned(),
+            ..Default::default()
+        });
+        req.extensions_mut()
+            .insert(PeerAddr("198.51.100.9:4242".parse().unwrap()));
+        let rejected = crate::metrics::INFLIGHT_REJECTED_TOTAL.with_label_values(&["inflight"]);
+        let before = rejected.get();
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            rejected.get() > before,
+            "429s must be countable per pool or saturation can only be inferred from logs"
+        );
 
         let log = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("noisy-tenant") && log.contains("198.51.100.9:4242"),
+            "429 log must name the user and peer to identify an abusive client; log was: {log}"
+        );
         assert!(
             log.contains("POST") && log.contains("/api/v1/namespaces"),
             "429 rejection log must record method and uri so operators can identify which \

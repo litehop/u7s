@@ -1337,6 +1337,7 @@ pub async fn check_resource_quota<S: Store>(
                             limit = %limit_str,
                             "quota: request rejected — hard limit exceeded"
                         );
+                        crate::metrics::record_admission_rejected("ResourceQuota");
                         return Err(Status::forbidden(format!(
                             "exceeded quota: {quota_name}, requested: \
                              {quota_resource}={incoming}, used: {quota_resource}={existing}, \
@@ -1378,6 +1379,7 @@ pub async fn check_resource_quota<S: Store>(
                             limit = %limit_str,
                             "quota: request rejected — hard limit exceeded"
                         );
+                        crate::metrics::record_admission_rejected("ResourceQuota");
                         return Err(Status::forbidden(format!(
                             "exceeded quota: {quota_name}, requested: {quota_resource}=1, \
                              used: {quota_resource}={current}, limited: {quota_resource}={hard_limit}"
@@ -1432,6 +1434,7 @@ pub async fn check_resource_quota<S: Store>(
                                 limit = %limit_str,
                                 "quota: request rejected — hard limit exceeded"
                             );
+                            crate::metrics::record_admission_rejected("ResourceQuota");
                             return Err(Status::forbidden(format!(
                                 "exceeded quota: {quota_name}, requested: \
                                  {quota_resource}={req_str}, used: {quota_resource}={used_str}, \
@@ -1941,10 +1944,17 @@ mod tests {
         )
         .await;
 
+        let rejected =
+            crate::metrics::ADMISSION_REJECTED_TOTAL.with_label_values(&["ResourceQuota"]);
+        let before = rejected.get();
         let err =
             check_resource_quota(&state, "default", "resource.k8s.io", "resourceclaims", None)
                 .await
                 .expect_err("quota at limit must deny the second claim");
+        assert!(
+            rejected.get() > before,
+            "a quota denial must be countable per plugin or tenants hitting limits are invisible"
+        );
         assert_eq!(
             err.1.message,
             "exceeded quota: object-count, requested: count/resourceclaims.resource.k8s.io=1, \
