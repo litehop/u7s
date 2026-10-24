@@ -1766,8 +1766,7 @@ fn out_of_cost_budget(
 }
 
 enum RuntimeCost {
-    /// Counted cost the rule is charged: its upper bound when that fits what is left,
-    /// else the replay's count.
+    /// The replay's counted cost, which fits the limit and what the object has left.
     Within(u64),
     /// The replay finished and counted more than the limit.
     OverLimit,
@@ -1779,12 +1778,13 @@ enum RuntimeCost {
 }
 
 /// Decides before `program` runs against a request whether its cost stays within
-/// `CALL_COST_LIMIT`. The upper bound bills every branch and iteration, so it can exceed
-/// what the evaluator runs once `&&`, `exists` and friends stop early; only then is the
-/// program replayed against the real values, on a budgeted thread since a replay does the
-/// work it is measuring. A replay that cannot finish in time is itself the evidence of a
-/// runaway program. Every CEL program that executes against request data (rules and
-/// `messageExpression`s) must pass through here first.
+/// `CALL_COST_LIMIT` and what is left of the object's budget, and returns the cost to
+/// charge. Like upstream it charges the cost actually incurred, not the static upper bound
+/// (which bills every branch and iteration even when `&&`, `exists` and friends stop
+/// early), so the program is always replayed against the real values, on a budgeted thread
+/// since a replay does the work it is measuring. A replay that cannot finish in time is
+/// itself the evidence of a runaway program. Every CEL program that executes against
+/// request data (rules and `messageExpression`s) must pass through here first.
 fn check_runtime_cost(
     program: &std::sync::Arc<cel::Program>,
     schema: &serde_json::Value,
@@ -1794,21 +1794,6 @@ fn check_runtime_cost(
     build_ctx: impl FnOnce() -> cel::Context<'static, 'static>,
 ) -> RuntimeCost {
     let remaining = run.remaining.get();
-    let data_node = |value| crate::handlers::cel_cost::Node::Data {
-        value,
-        schema: Some(schema),
-    };
-    let upper_bound_cost = crate::handlers::cel_cost::estimate_for_write(
-        program,
-        data_node(self_value),
-        old_self_value.map(data_node),
-        None,
-        None,
-    );
-    let call_limit = crate::handlers::cel_cost::CALL_COST_LIMIT;
-    if upper_bound_cost <= call_limit.min(remaining) {
-        return RuntimeCost::Within(upper_bound_cost);
-    }
     let replay = (self_value.clone(), old_self_value.cloned(), schema.clone());
     let replay_ctx = build_ctx();
     let rule_program = std::sync::Arc::clone(program);
@@ -13526,21 +13511,71 @@ mod tests {
         serde_json::json!({ "spec": { "items": vec![1; 50] } })
     }
 
+    /// (static upper bound, replayed actual) cost of `rule` over `spec`.
+    fn rule_costs(rule: &str, spec: &serde_json::Value, schema: &serde_json::Value) -> (u64, u64) {
+        let program = cel::Program::compile(rule).unwrap();
+        let node = || crate::handlers::cel_cost::Node::Data {
+            value: spec,
+            schema: Some(schema),
+        };
+        let mut ctx = cel::Context::default();
+        register_cel_extensions(&mut ctx);
+        ctx.add_variable_from_value("self", json_to_cel_value(schema, spec).unwrap());
+        let cost =
+            |ctx| crate::handlers::cel_cost::estimate_for_write(&program, node(), None, ctx, None);
+        (cost(None), cost(Some(&ctx)))
+    }
+
     /// Counted cost of one `BUDGET_RULE` evaluation, as the validator charges it.
-    fn budget_rule_cost() -> u64 {
-        let program = cel::Program::compile(BUDGET_RULE).unwrap();
-        let spec = per_object_budget_obj()["spec"].clone();
+    fn budget_rule_cost(obj: &serde_json::Value) -> u64 {
         let schema = per_object_budget_schema(1, None)["properties"]["spec"].clone();
-        crate::handlers::cel_cost::estimate_for_write(
-            &program,
-            crate::handlers::cel_cost::Node::Data {
-                value: &spec,
-                schema: Some(&schema),
-            },
-            None,
-            None,
-            None,
-        )
+        rule_costs(BUDGET_RULE, &obj["spec"], &schema).1
+    }
+
+    /// Upstream charges what a rule actually cost, so a rule that short-circuits is cheap
+    /// however large its static upper bound; charging the bound rejected writes upstream
+    /// accepts.
+    #[test]
+    fn per_object_budget_charges_actual_cost_not_the_static_upper_bound() {
+        const SHORT: &str = "self.flag || self.items.all(x, x >= 0)";
+        const FULL: &str = "self.items.all(x, x >= 0)";
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [{ "rule": SHORT }, { "rule": FULL }],
+                "properties": {
+                    "flag": { "type": "boolean" },
+                    "items": { "type": "array", "items": { "type": "integer" } }
+                }
+            } }
+        });
+        let obj = serde_json::json!({ "spec": { "flag": true, "items": vec![1; 500] } });
+        let spec_schema = &schema["properties"]["spec"];
+        let (short_upper, short_actual) = rule_costs(SHORT, &obj["spec"], spec_schema);
+        let (_, full_actual) = rule_costs(FULL, &obj["spec"], spec_schema);
+        assert!(
+            short_actual * 3 < short_upper,
+            "precondition: the first rule must short-circuit \
+             (upper {short_upper}, actual {short_actual})"
+        );
+        let exact = CelBudgets {
+            per_cr: short_actual + full_actual,
+            ..UNBOUNDED_BUDGETS
+        };
+        check_schema_budgeted(&obj, schema.clone(), &exact).expect(
+            "the rules' actual costs fit the budget; billing the first rule's bound would not",
+        );
+        let short = CelBudgets {
+            per_cr: short_actual + full_actual - 1,
+            ..UNBOUNDED_BUDGETS
+        };
+        let err = check_schema_budgeted(&obj, schema, &short).unwrap_err();
+        assert!(
+            err.1.message.contains("running out of cost budget"),
+            "{}",
+            err.1.message
+        );
     }
 
     /// Every rule is under the per-rule limit, yet together they can cost a request far
@@ -13548,8 +13583,8 @@ mod tests {
     /// with this exact detail.
     #[test]
     fn rules_summing_past_the_per_object_budget_stop_with_the_upstream_message() {
-        let one = budget_rule_cost();
         let obj = per_object_budget_obj();
+        let one = budget_rule_cost(&obj);
         let enough = CelBudgets {
             per_cr: 3 * one,
             ..UNBOUNDED_BUDGETS
@@ -13577,7 +13612,7 @@ mod tests {
         let mut obj = per_object_budget_obj();
         obj["spec"]["items"][0] = serde_json::json!(-1);
         let budgets = CelBudgets {
-            per_cr: budget_rule_cost(),
+            per_cr: budget_rule_cost(&obj),
             ..UNBOUNDED_BUDGETS
         };
         let err = check_schema_budgeted(&obj, schema.clone(), &budgets).unwrap_err();
