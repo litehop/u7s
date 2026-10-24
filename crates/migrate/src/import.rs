@@ -669,29 +669,28 @@ fn crd_established(crd: &Value) -> bool {
         .any(|c| c["type"] == "Established" && c["status"] == "True")
 }
 
-/// The apiserver service proxy resolves the URL port against the Endpoints
-/// ports, which carry the target port, not the Service port; address the
-/// port by name when it has one, else by its numeric target.
-fn proxy_port(svc: &Value, port: u16) -> String {
-    let p = svc["spec"]["ports"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|p| p["port"].as_u64() == Some(u64::from(port)));
-    match p {
-        Some(p) => match (p["name"].as_str(), p["targetPort"].as_u64()) {
-            (Some(n), _) if !n.is_empty() => n.to_string(),
-            (_, Some(t)) => t.to_string(),
-            _ => port.to_string(),
-        },
-        None => port.to_string(),
-    }
+/// The apiserver service proxy takes the Service port (not the target port).
+fn backend_proxy_path(b: &Backend) -> String {
+    format!(
+        "/api/v1/namespaces/{}/services/https:{}:{}/proxy/{}",
+        b.namespace,
+        b.service,
+        b.port,
+        b.path.trim_start_matches('/')
+    )
 }
 
 /// Any answer from the backend proves its TLS port serves; the proxy's own
-/// 502/503/504 mean it could not reach one.
-fn proxied_backend_answered(status: u16) -> bool {
-    !matches!(status, 502..=504)
+/// 502/503/504 mean it could not reach one. A 401/403 is the apiserver refusing
+/// the importing identity, which says nothing about the backend.
+fn proxied_backend_answered(status: u16, path: &str) -> anyhow::Result<bool> {
+    if matches!(status, 401 | 403) {
+        bail!(
+            "GET {path}: {status}: the importing identity is not authorized for services/proxy, \
+             so backend readiness cannot be probed"
+        );
+    }
+    Ok(!matches!(status, 502..=504))
 }
 
 /// A u7s apiserver reached over the Kubernetes API.
@@ -837,7 +836,7 @@ impl Cluster for Live {
 
     async fn backend_serving(&self, b: &Backend) -> anyhow::Result<bool> {
         let svc_path = format!("/api/v1/namespaces/{}/services/{}", b.namespace, b.service);
-        let (status, body) = self
+        let (status, _) = self
             .src
             .client
             .request(Method::GET, &svc_path, None)
@@ -845,15 +844,9 @@ impl Cluster for Live {
         if status.as_u16() != 200 {
             return Ok(false);
         }
-        let port = proxy_port(&serde_json::from_str(&body)?, b.port);
-        let path = format!(
-            "/api/v1/namespaces/{}/services/https:{}:{port}/proxy/{}",
-            b.namespace,
-            b.service,
-            b.path.trim_start_matches('/')
-        );
+        let path = backend_proxy_path(b);
         let (status, _) = self.src.client.request(Method::GET, &path, None).await?;
-        Ok(proxied_backend_answered(status.as_u16()))
+        proxied_backend_answered(status.as_u16(), &path)
     }
 }
 
@@ -1279,24 +1272,44 @@ mod tests {
     }
 
     #[test]
-    fn proxy_port_addresses_the_target_port_because_the_proxy_matches_endpoint_ports() {
-        let svc = json!({"spec":{"ports":[
-            {"port":443,"targetPort":8443},
-            {"name":"metrics","port":9090,"targetPort":9091}]}});
-        assert_eq!(proxy_port(&svc, 443), "8443");
-        assert_eq!(proxy_port(&svc, 9090), "metrics");
-        assert_eq!(proxy_port(&svc, 1), "1");
+    fn proxy_path_carries_the_service_port_because_the_apiserver_maps_it_to_the_target_port() {
+        let b = Backend {
+            namespace: "app".into(),
+            service: "hook".into(),
+            port: 443,
+            path: "/validate".into(),
+            webhook: "c/w".into(),
+        };
+        assert_eq!(
+            backend_proxy_path(&b),
+            "/api/v1/namespaces/app/services/https:hook:443/proxy/validate",
+            "the Service port must pass through unchanged: a target port or port name would \
+             break unnamed ports and string targetPorts"
+        );
     }
 
     #[test]
     fn proxy_gateway_errors_mean_not_serving_but_any_backend_answer_means_serving() {
         for s in [502, 503, 504] {
-            assert!(!proxied_backend_answered(s));
+            assert!(!proxied_backend_answered(s, "/p").unwrap());
         }
         for s in [200, 400, 404, 405] {
             assert!(
-                proxied_backend_answered(s),
+                proxied_backend_answered(s, "/p").unwrap(),
                 "a webhook server answers GET with 4xx; that still proves its TLS port is up"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_authz_refusal_is_a_hard_error_naming_services_proxy() {
+        for s in [401, 403] {
+            let e = proxied_backend_answered(s, "/p").unwrap_err().to_string();
+            assert!(
+                e.contains("services/proxy"),
+                "treating a refused probe as serving would let the import patch references to a \
+                 backend that was never checked; the operator must learn which permission is \
+                 missing: {e}"
             );
         }
     }
