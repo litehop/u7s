@@ -26,50 +26,161 @@ thread_local! {
     pub(crate) static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// cel-go's default `MaxRecursionDepth`; Kubernetes does not override it.
+pub(crate) const MAX_RECURSION_DEPTH: usize = 250;
+
+/// cel-go's default `ExpressionSizeCodePointLimit`; Kubernetes does not override it.
+const MAX_EXPRESSION_CODE_POINTS: usize = 100_000;
+
+/// Stack for the thread that parses and walks an untrusted expression. Sized for the
+/// worst accepted input (100k code points, parsed before the depth check can reject it),
+/// not for a request thread's 512 KiB; untouched pages cost no memory.
+pub(crate) const PARSE_STACK_SIZE: usize = 256 << 20;
+
+/// Longest expression that is parsed on the calling thread: it cannot nest deeply
+/// enough to threaten a request thread's small stack.
+const IN_PLACE_PARSE_MAX_LEN: usize = 100;
+
+/// Parses `expr` with `parse` under cel-go's size and depth limits, on a thread with
+/// `stack_size` of stack so no accepted or rejected input can overflow a request thread.
+/// `ast` exposes the tree whose depth is bounded; a too-deep result is dropped on the
+/// parse thread, where a deep drop has the stack to run.
+pub(crate) fn parse_bounded<T: Send>(
+    expr: &str,
+    stack_size: usize,
+    parse: impl FnOnce() -> Result<T, String> + Send,
+    ast: impl FnOnce(&T) -> &IdedExpr + Send,
+) -> Result<T, String> {
+    let code_points = expr.chars().count();
+    if code_points > MAX_EXPRESSION_CODE_POINTS {
+        return Err(format!(
+            "compilation failed: ERROR: <input>:-1:0: expression code point size exceeds \
+             limit: size: {code_points}, limit {MAX_EXPRESSION_CODE_POINTS}"
+        ));
+    }
+    let run = move || {
+        let parsed = parse()?;
+        if depth_exceeds(ast(&parsed), MAX_RECURSION_DEPTH) {
+            return Err(
+                "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded".into(),
+            );
+        }
+        Ok(parsed)
+    };
+    if expr.len() <= IN_PLACE_PARSE_MAX_LEN {
+        return run();
+    }
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(stack_size)
+            .spawn_scoped(s, run)
+            .map_err(|e| format!("compilation failed: {e}"))?
+            .join()
+            .map_err(|_| "compilation failed: parser panicked".to_string())
+    })?
+}
+
+/// Whether `root` nests deeper than `max` levels, walked with an explicit stack so the
+/// check itself cannot overflow on the tree it is rejecting.
+fn depth_exceeds(root: &IdedExpr, max: usize) -> bool {
+    let mut pending = vec![(root, 1usize)];
+    while let Some((e, depth)) = pending.pop() {
+        if depth > max {
+            return true;
+        }
+        let d = depth + 1;
+        match &e.expr {
+            Expr::Call(c) => {
+                pending.extend(c.target.iter().map(|t| (&**t, d)));
+                pending.extend(c.args.iter().map(|a| (a, d)));
+            }
+            Expr::Select(s) => pending.push((&s.operand, d)),
+            Expr::List(l) => pending.extend(l.elements.iter().map(|a| (a, d))),
+            Expr::Map(m) => pending.extend(m.entries.iter().flat_map(|e| entry_children(e, d))),
+            Expr::Struct(s) => pending.extend(s.entries.iter().flat_map(|e| entry_children(e, d))),
+            Expr::Comprehension(c) => pending.extend(
+                [
+                    &c.iter_range,
+                    &c.accu_init,
+                    &c.loop_cond,
+                    &c.loop_step,
+                    &c.result,
+                ]
+                .into_iter()
+                .map(|x| (x, d)),
+            ),
+            Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => {}
+        }
+    }
+    false
+}
+
+fn entry_children(e: &cel::common::ast::IdedEntryExpr, depth: usize) -> Vec<(&IdedExpr, usize)> {
+    match &e.expr {
+        EntryExpr::StructField(f) => vec![(&f.value, depth)],
+        EntryExpr::MapEntry(m) => vec![(&m.key, depth), (&m.value, depth)],
+    }
+}
+
 fn parse_with_stack(expr: &str, stack_size: usize) -> Result<IdedExpr, String> {
     #[cfg(test)]
     PARSE_COUNT.with(|c| c.set(c.get() + 1));
-    let parse = || {
-        cel::parser::Parser::new()
-            .enable_optional_syntax(true)
-            .enable_ident_escape_syntax(true)
-            .parse(expr)
-    };
-    // The generated parser recurses up to its 96-level cap on a request thread's small
-    // stack; an expression too short to nest deeply than ~50 levels parses in place.
-    if expr.len() <= 100 {
-        parse()
-    } else {
-        std::thread::scope(|s| {
-            std::thread::Builder::new()
-                .stack_size(stack_size)
-                .spawn_scoped(s, parse)
-                .map_err(|e| format!("compilation failed: {e}"))?
-                .join()
-                .map_err(|_| "compilation failed: parser panicked".to_string())
-        })?
-    }
-    .map_err(|e| format!("compilation failed: {e}"))
+    parse_bounded(
+        expr,
+        stack_size,
+        || {
+            cel::parser::Parser::new()
+                .max_recursion_depth(MAX_RECURSION_DEPTH as u16)
+                .enable_optional_syntax(true)
+                .enable_ident_escape_syntax(true)
+                .parse(expr)
+                .map_err(|e| format!("compilation failed: {e}"))
+        },
+        |e| e,
+    )
 }
 
 pub(crate) fn parse(expr: &str) -> Result<IdedExpr, String> {
-    parse_with_stack(expr, 32 << 20)
+    parse_with_stack(expr, PARSE_STACK_SIZE)
+}
+
+/// Compiles a CRD rule under cel-go's size and depth limits. `Program::compile` has no
+/// depth option beyond the parser's own 96-level cap, which does not bound member chains.
+pub(crate) fn compile_program(source: &str) -> Result<cel::Program, String> {
+    parse_bounded(
+        source,
+        PARSE_STACK_SIZE,
+        || cel::Program::compile(source).map_err(|e| e.to_string()),
+        |p| p.expression(),
+    )
 }
 
 /// The reference and function checks cel-go's checker performs, against `roots`.
-fn check(ast: &IdedExpr, roots: &[&str]) -> Result<(), String> {
-    match first_undeclared_ref(ast, &mut Vec::new(), roots) {
+/// The walk recurses once per AST level, so a long `expr` is checked on the parse stack.
+fn check(expr: &str, ast: &IdedExpr, roots: &[&str]) -> Result<(), String> {
+    let walk = || match first_undeclared_ref(ast, &mut Vec::new(), roots) {
         Some(name) => Err(format!(
             "compilation failed: undeclared reference to '{name}' (in container '')"
         )),
         None => Ok(()),
+    };
+    if expr.len() <= IN_PLACE_PARSE_MAX_LEN {
+        return walk();
     }
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(PARSE_STACK_SIZE)
+            .spawn_scoped(s, walk)
+            .map_err(|e| format!("compilation failed: {e}"))?
+            .join()
+            .map_err(|_| "compilation failed: checker panicked".to_string())
+    })?
 }
 
 /// Compile-step analogue: parse errors must stay distinct from eval errors, since the
 /// evaluator absorbs eval errors in `a || true`, which a syntax error must never be.
 pub(crate) fn check_syntax(expr: &str, roots: &[&str]) -> Result<(), String> {
-    check(&parse(expr)?, roots)
+    check(expr, &parse(expr)?, roots)
 }
 
 #[cfg(test)]
@@ -78,7 +189,7 @@ pub(crate) fn check_syntax_with_stack(
     roots: &[&str],
     stack_size: usize,
 ) -> Result<(), String> {
-    check(&parse_with_stack(expr, stack_size)?, roots)
+    check(expr, &parse_with_stack(expr, stack_size)?, roots)
 }
 
 type Cache = HashMap<Box<str>, Arc<Parsed>>;
@@ -117,7 +228,7 @@ pub(crate) fn parse_cached(expr: &str, roots: &[&'static str]) -> Result<Arc<Par
     if let Some((_, v)) = verdicts.iter().find(|(r, _)| r == roots) {
         return v.clone().map(|()| parsed.clone());
     }
-    let verdict = check(&parsed.ast, roots);
+    let verdict = check(expr, &parsed.ast, roots);
     verdicts.push((roots.to_vec(), verdict.clone()));
     drop(verdicts);
     verdict.map(|()| parsed)
