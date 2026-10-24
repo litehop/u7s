@@ -133,7 +133,7 @@ jobs:
   # scripts/conformance/run-all.sh --pki-test-lifetime on the Lima fleet.
   pki-rotation-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     permissions:
       contents: read
     steps:
@@ -154,6 +154,9 @@ jobs:
         env:
           U7S_PKI_TEST_LIFETIME_SECS: "120"
           U7S_PKI_TEST_SA_ROTATION_SECS: "120"
+          # 3x the leaf lifetime so the leaves it signs are never clamped; rotates at 240s and
+          # then every 240s, re-issuing every leaf under the new intermediate each time.
+          U7S_PKI_TEST_INTERMEDIATE_LIFETIME_SECS: "360"
         run: |
           W="$PWD/temp/pki-e2e"
           mkdir -p "$W/manifests"
@@ -177,6 +180,17 @@ jobs:
           ./target/release/u7s-scheduler --kubeconfig "$W/kubeconfig-scheduler" >"$W/scheduler.log" 2>&1 &
           sleep 2
           pgrep -f "u7s-scheduler.*$W/kubeconfig" >/dev/null || { cat "$W/scheduler.log"; exit 1; }
+
+      - name: PKI rotation e2e helper logic
+        run: |
+          scripts/e2e-pki-rotation/test-leaf-rotation-logic.sh
+          scripts/e2e-pki-rotation/test-intermediate-rotation-logic.sh
+
+      - name: Intermediate rotation e2e
+        run: |
+          scripts/e2e-pki-rotation/intermediate-rotation.sh \
+            --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443 \
+            --scheduler --intermediate-lifetime 360
 
       - name: Leaf rotation e2e (3 iterations)
         run: |
