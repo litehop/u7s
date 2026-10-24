@@ -990,6 +990,14 @@ pub(crate) fn apply_json_patch(
     obj: &mut serde_json::Value,
     patch: &serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
+    apply_json_patch_typed(obj, patch).map_err(Into::into)
+}
+
+/// Same as `apply_json_patch`, but keeps a failed `test` distinguishable from other errors.
+pub(crate) fn apply_json_patch_typed(
+    obj: &mut serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<(), JsonPatchError> {
     let ops = patch.as_array().ok_or_else(|| {
         Status::unprocessable_entity("JSON patch must be an array of operations".into())
     })?;
@@ -1014,7 +1022,7 @@ fn apply_one_json_patch_op(
     obj: &mut serde_json::Value,
     op: &serde_json::Value,
     undo_log: &mut Vec<UndoOp>,
-) -> Result<(), crate::status::StatusError> {
+) -> Result<(), JsonPatchError> {
     let op_str = op["op"].as_str().ok_or_else(|| {
         Status::unprocessable_entity("each JSON patch operation must have an 'op' field".into())
     })?;
@@ -1031,13 +1039,30 @@ fn apply_one_json_patch_op(
                     Status::unprocessable_entity("'add' operation requires a 'value' field".into())
                 })?
                 .clone();
-            let segs = json_pointer_segments(path);
-            // Plan the inverse before mutating: read-only, so it never observes a
-            // half-applied `add` (add is atomic within itself — see `plan_add_undo`).
-            let undo = plan_add_undo(obj, &segs);
-            // RFC 6902 §4.1: 'add' creates intermediate objects when missing.
-            json_patch_add(obj, path, value)?;
-            undo_log.push(undo);
+            add_with_undo(obj, path, value, undo_log)?;
+        }
+        "copy" | "move" => {
+            let from = op["from"].as_str().ok_or_else(|| {
+                Status::unprocessable_entity(format!(
+                    "'{op_str}' operation requires a 'from' field"
+                ))
+            })?;
+            if op_str == "move" {
+                let from_segs = json_pointer_segments(from);
+                let path_segs = json_pointer_segments(path);
+                if from_segs.len() < path_segs.len() && path_segs.starts_with(&from_segs) {
+                    return Err(Status::unprocessable_entity(format!(
+                        "'move' from location '{from}' must not be a proper prefix of path '{path}'"
+                    ))
+                    .into());
+                }
+            }
+            let value = json_patch_get(obj, from)?.clone();
+            if op_str == "move" {
+                json_patch_remove(obj, from)?;
+                undo_log.push(UndoOp::Add(from.to_string(), value.clone()));
+            }
+            add_with_undo(obj, path, value, undo_log)?;
         }
         "replace" => {
             let value = op
@@ -1063,19 +1088,78 @@ fn apply_one_json_patch_op(
             let expected = op.get("value").ok_or_else(|| {
                 Status::unprocessable_entity("'test' operation requires a 'value' field".into())
             })?;
-            let actual = json_patch_get(obj, path)?;
+            let actual = json_patch_get_for_test(obj, path)?;
             if actual != expected {
-                return Err(Status::unprocessable_entity(format!(
-                    "'test' operation failed: value at path '{path}' does not match expected value"
+                return Err(JsonPatchError::TestFailed(Status::unprocessable_entity(
+                    format!("'test' operation failed: value at path '{path}' does not match expected value"),
                 )));
             }
         }
         other => {
             return Err(Status::unprocessable_entity(format!(
-                "unsupported JSON patch operation '{other}'; supported: add, remove, replace, test"
-            )));
+                "unsupported JSON patch operation '{other}'; supported: add, remove, replace, \
+                 move, copy, test"
+            ))
+            .into());
         }
     }
+    Ok(())
+}
+
+/// Failure of a single JSON Patch operation. `TestFailed` is distinguished from other
+/// errors because upstream's MutatingAdmissionPolicy treats a failed `test` as "patch does
+/// not apply" while every other failure is an error.
+#[derive(Debug)]
+pub(crate) enum JsonPatchError {
+    TestFailed(crate::status::StatusError),
+    Invalid(crate::status::StatusError),
+}
+
+impl From<crate::status::StatusError> for JsonPatchError {
+    fn from(e: crate::status::StatusError) -> Self {
+        Self::Invalid(e)
+    }
+}
+
+impl From<JsonPatchError> for crate::status::StatusError {
+    fn from(e: JsonPatchError) -> Self {
+        match e {
+            JsonPatchError::TestFailed(e) | JsonPatchError::Invalid(e) => e,
+        }
+    }
+}
+
+/// Value a `test` compares against. Mirrors evanphx/json-patch: a key absent from an
+/// existing object reads as `null` (so `test` against a non-null value fails rather than
+/// erroring), while a missing parent or an out-of-range array index is an error.
+fn json_patch_get_for_test<'a>(
+    obj: &'a serde_json::Value,
+    path: &str,
+) -> Result<&'a serde_json::Value, crate::status::StatusError> {
+    let segs = json_pointer_segments(path);
+    let Some((last, parent)) = segs.split_last() else {
+        return Ok(obj);
+    };
+    let parent_val = json_patch_get(obj, &join_pointer(parent))?;
+    match parent_val {
+        serde_json::Value::Object(map) => Ok(map.get(last).unwrap_or(&serde_json::Value::Null)),
+        _ => json_patch_get(obj, path),
+    }
+}
+
+fn add_with_undo(
+    obj: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+    undo_log: &mut Vec<UndoOp>,
+) -> Result<(), crate::status::StatusError> {
+    let segs = json_pointer_segments(path);
+    // Plan the inverse before mutating: read-only, so it never observes a
+    // half-applied `add` (add is atomic within itself — see `plan_add_undo`).
+    let undo = plan_add_undo(obj, &segs);
+    // RFC 6902 §4.1: 'add' creates intermediate objects when missing.
+    json_patch_add(obj, path, value)?;
+    undo_log.push(undo);
     Ok(())
 }
 
@@ -1569,6 +1653,48 @@ mod tests {
     // apply-in-place-with-no-rollback implementation: a failed patch that half-applies
     // would corrupt the stored object for every client that reads it next.
 
+    /// A user `move` of a node into its own descendant must be rejected and leave the
+    /// object intact; otherwise `kubectl patch` silently deletes the subtree.
+    #[test]
+    fn apply_json_patch_move_into_own_descendant_is_rejected_without_mutation() {
+        let mut obj = serde_json::json!({"data": {"k": "v"}});
+        let before = obj.clone();
+        let patch = serde_json::json!([{"op": "move", "from": "/data", "path": "/data/x"}]);
+        apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(obj, before);
+        // moving a node onto itself or a sibling is still fine
+        let patch = serde_json::json!([{"op": "move", "from": "/data/k", "path": "/data/j"}]);
+        apply_json_patch(&mut obj, &patch).unwrap();
+        assert_eq!(obj, serde_json::json!({"data": {"j": "v"}}));
+    }
+
+    /// `test` on a key absent from an existing object is a *failed test* (typed, so MAP
+    /// can skip), whereas a missing parent is a plain error; user PATCH errors on both.
+    #[test]
+    fn apply_json_patch_test_on_absent_key_is_test_failed_but_absent_parent_is_invalid() {
+        let mut obj = serde_json::json!({"metadata": {"labels": {"a": "b"}}});
+        let absent_key = serde_json::json!([
+            {"op": "test", "path": "/metadata/labels/zz", "value": "x"}
+        ]);
+        assert!(matches!(
+            apply_json_patch_typed(&mut obj, &absent_key),
+            Err(JsonPatchError::TestFailed(_))
+        ));
+        apply_json_patch(&mut obj, &absent_key).unwrap_err();
+        let absent_parent = serde_json::json!([
+            {"op": "test", "path": "/metadata/nope/zz", "value": "x"}
+        ]);
+        assert!(matches!(
+            apply_json_patch_typed(&mut obj, &absent_parent),
+            Err(JsonPatchError::Invalid(_))
+        ));
+        let absent_key_null = serde_json::json!([
+            {"op": "test", "path": "/metadata/labels/zz", "value": null}
+        ]);
+        apply_json_patch(&mut obj, &absent_key_null)
+            .expect("an absent key equals null, as in evanphx/json-patch");
+    }
+
     /// A successful 'replace' followed by a failing op must roll the replace back, not
     /// just reject the failing op — otherwise a client retrying the whole patch after a
     /// 422 would silently build on a value the server already (wrongly) committed.
@@ -1640,6 +1766,23 @@ mod tests {
         assert_eq!(
             obj, before,
             "a rolled-back overwriting 'add' must restore the pre-overwrite value"
+        );
+    }
+
+    /// A successful 'move' followed by a failing op must put the moved value back at its
+    /// source and remove it from the destination, or a rejected patch loses data.
+    #[test]
+    fn apply_json_patch_undo_log_reverts_move_on_later_failure() {
+        let mut obj = serde_json::json!({"a": {"x": 1}, "b": {}});
+        let before = obj.clone();
+        let patch = serde_json::json!([
+            {"op": "move", "from": "/a/x", "path": "/b/y"},
+            {"op": "test", "path": "/b/y", "value": 2}
+        ]);
+        apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(
+            obj, before,
+            "rolled-back 'move' must restore source and destination"
         );
     }
 

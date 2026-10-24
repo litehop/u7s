@@ -592,10 +592,11 @@ pub fn load(plan: &str, objects: &str) -> anyhow::Result<(Plan, Vec<Value>)> {
         &std::fs::read_to_string(plan).with_context(|| format!("reading {plan}"))?,
     )
     .with_context(|| format!("parsing {plan}"))?;
-    let objs: Vec<Value> = serde_json::from_str(
-        &std::fs::read_to_string(objects).with_context(|| format!("reading {objects}"))?,
-    )
-    .with_context(|| format!("parsing {objects}"))?;
+    let objs: Vec<Value> =
+        serde_json::from_str(&std::fs::read_to_string(objects).with_context(|| {
+            format!("reading {objects} (re-run `u7s migrate export` to produce it)")
+        })?)
+        .with_context(|| format!("parsing {objects}"))?;
     Ok((plan, objs))
 }
 
