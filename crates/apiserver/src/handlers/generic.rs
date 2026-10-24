@@ -1649,9 +1649,9 @@ mod tests {
 
     #[test]
     fn json_patch_invalid_op_returns_422() {
-        // Unsupported operations like 'copy' must return 422 (not 415 or 400)
+        // Unsupported operations like 'bogus' must return 422 (not 415 or 400)
         let mut obj = serde_json::json!({"a": 1});
-        let patch = serde_json::json!([{"op": "copy", "from": "/a", "path": "/b"}]);
+        let patch = serde_json::json!([{"op": "bogus", "path": "/b"}]);
         let err = apply_json_patch(&mut obj, &patch).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
