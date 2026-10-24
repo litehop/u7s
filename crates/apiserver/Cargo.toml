@@ -41,8 +41,7 @@ anyhow          = "1"
 async-stream    = "0.3"
 futures-core    = "0.3"
 futures-util    = "0.3"
-jsonwebtoken    = { version = "11", features = ["rust_crypto"] }
-rsa             = "0.9"
+jsonwebtoken    = { version = "11", features = ["aws_lc_rs"] }
 aws-lc-rs       = { version = "1", default-features = false, features = ["aws-lc-sys"] }
 x509-cert = { version = "0.3", features = ["pem"] }
 uuid        = { version = "1", features = ["v4"] }
@@ -60,6 +59,8 @@ u7s-version     = { path = "../version" }
 u7s-proto-generated = { path = "../proto-generated" }
 prometheus      = { version = "0.14", default-features = false, features = ["process"] }
 chrono-tz       = "0.10"
+chrono          = { version = "0.4", default-features = false, features = ["alloc"] }
+regex           = "1"
 dhat            = { version = "0.3", optional = true }
 rlimit          = "0.11"
 socket2         = "0.6"

@@ -145,7 +145,6 @@ pub(crate) fn make_state_with_store(store: Arc<SqliteStore>) -> AppState {
     AppState::new(
         store,
         None,
-        None,
         std::collections::HashMap::new(),
         "https://localhost:6443".into(),
     )

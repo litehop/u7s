@@ -1,8 +1,7 @@
-//! In-memory cache of RS256 signature-verification outcomes for inbound service-account
-//! JWTs — added because every Bearer-token request re-runs the full RSA modular
-//! exponentiation (`num_bigint_dig::biguint::monty::montgomery`, 4.4% of apiserver
-//! self-time per the 2026-08-06 samply triage), even when the exact same token is
-//! presented hundreds of times per minute by the same client.
+//! In-memory cache of ES256 signature-verification outcomes for inbound service-account
+//! JWTs — every Bearer-token request otherwise re-runs the full signature verification,
+//! even when the exact same token is presented hundreds of times per minute by the same
+//! client.
 //!
 //! # What is cached
 //!
@@ -80,10 +79,9 @@ struct Entry {
     /// caching"). Kept as an explicit field (rather than the entry's mere presence meaning
     /// "valid") so `SigCache::get`'s return type stays self-describing at call sites.
     signature_valid: bool,
-    /// Reserved for a future SA-key-rotation scheme keyed by JWT `kid`. Always `None` today:
-    /// u7s has exactly one `sa_decoding_key` (`state.rs`) and never sets a `kid` header
-    /// (`oidc.rs`), so there is nothing to key rotation-invalidation on yet. Not read anywhere
-    /// today — kept only so adding rotation later doesn't require an `Entry` shape change.
+    /// Unused: key retirement is enforced by resolving the token's `kid` against the live
+    /// keyring before this cache is consulted, so a retired key's tokens miss regardless of
+    /// what is cached.
     #[allow(dead_code)]
     kid: Option<String>,
     /// Monotonic instant at which this entry stops being servable. Computed once at insert

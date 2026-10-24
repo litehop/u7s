@@ -39,6 +39,8 @@ pub(crate) const CEL_TYPE_IDENTS: &[&str] = &[
     "null_type",
     "type",
     "dyn",
+    "timestamp",
+    "duration",
 ];
 
 fn ty_of(schema: &J, is_root: bool) -> Ty<'_> {

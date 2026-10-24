@@ -1,5 +1,0 @@
-[advisories]
-ignore = [
-    # rsa Marvin attack, no fixed version; fix is moving SA signing to aws-lc-rs
-    "RUSTSEC-2023-0071",
-]

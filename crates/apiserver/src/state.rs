@@ -97,9 +97,12 @@ pub const WATCH_RETRY_AFTER_SECONDS: u64 = 1;
 /// Identities whose watches bypass both the per-client and global caps, so a tenant
 /// exhausting the pool cannot lock out the control plane (and the controller-manager's
 /// 100+ watches fit): the provisioned admin (CN=admin, O=system:masters), kubelets
-/// (`system:node:<name>`, O=system:nodes), the controller-manager and the scheduler.
-/// Mirrors upstream APF's exempt (system:masters), system-nodes and system-leader-election
-/// flow schemas. Matched on username, which is only as trustworthy as the cluster CA's
+/// (`system:node:<name>`, O=system:nodes), the controller-manager, the scheduler and the
+/// kube-system ServiceAccounts the controller-manager runs its controllers as.
+/// Mirrors upstream APF's exempt (system:masters), system-nodes, system-leader-election and
+/// kube-system-service-accounts (workload-high) flow schemas. Minting a kube-system
+/// ServiceAccount (or its token) needs write access to kube-system, which is already a
+/// control-plane grant. Matched on username, which is only as trustworthy as the cluster CA's
 /// issuance: a principal allowed to approve and sign `kubernetes.io/kube-apiserver-client`
 /// CSRs can mint a certificate with any CN here (upstream's signer likewise forbids only
 /// O=system:masters), so that RBAC grant is effectively a control-plane grant.
@@ -108,6 +111,7 @@ pub fn is_system_priority_username(username: &str) -> bool {
         username,
         "admin" | "system:kube-controller-manager" | "system:kube-scheduler"
     ) || username.starts_with("system:node:")
+        || username.starts_with("system:serviceaccount:kube-system:")
 }
 
 /// Watch stream concurrency limiter: a semaphore per authenticated username plus one
@@ -863,10 +867,8 @@ pub struct AppState<S = SqliteStore> {
     /// docs for the freshness model. Populated at startup by `init_node_graph` and kept
     /// current by hooks in `handlers::pods` and `handlers::resource`'s owner-cascade deletes.
     pub node_graph: Arc<NodeGraph>,
-    /// RSA signing key for service-account JWTs. None when SA key is unavailable.
-    pub sa_key: Option<Arc<jsonwebtoken::EncodingKey>>,
-    /// RSA public key for verifying inbound SA JWTs. None when SA key is unavailable.
-    pub sa_decoding_key: Option<Arc<jsonwebtoken::DecodingKey>>,
+    /// Service-account signing and verification keys (ES256, rotated). None when unavailable.
+    pub sa_keys: Option<crate::sa_keys::SaKeyring>,
     /// Static bearer-token map loaded from --token-auth-file. Empty when not configured.
     pub token_map: Arc<HashMap<String, UserInfo>>,
     /// Advertised server address returned in /api discovery (e.g. "https://1.2.3.4:6443").
@@ -908,22 +910,15 @@ pub struct AppState<S = SqliteStore> {
     /// Address of the konnectivity HTTP CONNECT proxy used to reach pod IPs from the Mac host.
     /// Format: "host:port" (e.g. "127.0.0.1:8135"). None when konnectivity is not configured.
     pub konnectivity_proxy_addr: Option<String>,
-    /// Concatenated PEM (cert + key) used as the mTLS client cert when calling admission webhooks.
-    /// Stored here so the per-webhook reqwest::Client can present the same identity as the shared
-    /// webhook_client when talking to the konnectivity proxy (which requires mTLS).
-    pub webhook_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
     /// Concatenated PEM (cert + key) presented to AGGREGATED BACKENDS (not to u7s itself)
     /// by `handlers::aggregation::build_backend_client`. Signed by the dedicated front-proxy
-    /// CA (`TlsMaterial::proxy_client_cert_pem`'s doc), the same identity
-    /// `webhook_identity_pem` presents (never the admin cert). An aggregated backend trusts this one specifically via `requestheader-client-ca-file`
-    /// to assert X-Remote-User/-Group identity. Not part of `AppStateConfig`: no test caller
+    /// CA (`TlsMaterial::proxy_client_cert_pem`'s doc), never the admin cert. An aggregated backend
+    /// trusts this one specifically via `requestheader-client-ca-file` to assert
+    /// X-Remote-User/-Group identity. Webhook callouts present it only to konnectivity-server, and
+    /// only when konnectivity is configured. Not part of `AppStateConfig`: no test caller
     /// needs a non-default value at construction time, so `run()` sets this field directly
     /// after construction, same pattern as `node_kubelet_ports`/`sa_sig_cache`.
     pub proxy_client_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
-    /// PEM-encoded RSA public key for the SA signing key.
-    /// Stored so the OIDC JWKS endpoint can serve the public key material without
-    /// holding a reference to the private key. None when SA key is unavailable.
-    pub sa_public_key_pem: Option<Arc<Vec<u8>>>,
     /// In-memory cache for the 5 admission configuration object sets.
     /// See `AdmissionConfigCache` for the invalidation strategy.
     pub admission_cache: Arc<AdmissionConfigCache>,
@@ -989,14 +984,10 @@ pub struct AppState<S = SqliteStore> {
 /// on the old `new_with_ca_and_kubelet_identity_and_address` constructor.
 pub struct AppStateConfig<S> {
     pub store: Arc<S>,
-    pub sa_key: Option<jsonwebtoken::EncodingKey>,
-    pub sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+    pub sa_keys: Option<crate::sa_keys::SaKeyring>,
     pub token_map: HashMap<String, UserInfo>,
     pub server_address: String,
     pub cluster_ca_der: Option<Vec<u8>>,
-    /// Concatenated PEM bytes of (cert, key) for admission webhook mTLS.
-    /// In production: `TlsMaterial::webhook_client_identity_pem`.
-    pub webhook_identity_pem: Option<Vec<u8>>,
     pub service_ip_allocator: Option<ServiceIpAllocator>,
     /// Concatenated PEM bytes of (cert, key) for the kubelet proxy client cert.
     /// In production: `kubelet_client_cert_pem + kubelet_client_key_pem` from `TlsMaterial`.
@@ -1012,9 +1003,6 @@ pub struct AppStateConfig<S> {
     /// konnectivity so that pod IPs inside the VM are reachable from the Mac host.
     /// Format: "host:port" (e.g. "127.0.0.1:8135"). None disables the proxy.
     pub konnectivity_proxy_addr: Option<String>,
-    /// PEM-encoded RSA public key companion to `sa_key`.
-    /// Passed here so `AppState` can serve it via the OIDC JWKS endpoint.
-    pub sa_public_key_pem: Option<Vec<u8>>,
 }
 
 // Manual Clone so we don't impose S: Clone (Arc<S> is always Clone).
@@ -1025,8 +1013,7 @@ impl<S> Clone for AppState<S> {
             resource_registry: self.resource_registry.clone(),
             rbac_index: self.rbac_index.clone(),
             node_graph: self.node_graph.clone(),
-            sa_key: self.sa_key.clone(),
-            sa_decoding_key: self.sa_decoding_key.clone(),
+            sa_keys: self.sa_keys.clone(),
             token_map: self.token_map.clone(),
             server_address: self.server_address.clone(),
             watch_limit: self.watch_limit.clone(),
@@ -1040,9 +1027,7 @@ impl<S> Clone for AppState<S> {
             service_ip_allocator: self.service_ip_allocator.clone(),
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
-            webhook_identity_pem: self.webhook_identity_pem.clone(),
             proxy_client_identity_pem: self.proxy_client_identity_pem.clone(),
-            sa_public_key_pem: self.sa_public_key_pem.clone(),
             admission_cache: self.admission_cache.clone(),
             apiservice_cache: self.apiservice_cache.clone(),
             discovery_cache: self.discovery_cache.clone(),
@@ -1105,26 +1090,22 @@ impl<S: Store> AppState<S> {
     #[cfg(test)]
     pub fn new(
         store: Arc<S>,
-        sa_key: Option<jsonwebtoken::EncodingKey>,
-        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+        sa_keys: Option<crate::sa_keys::SaKeyring>,
         token_map: HashMap<String, UserInfo>,
         server_address: String,
     ) -> Self {
         Self::new_with_config(AppStateConfig {
             store,
-            sa_key,
-            sa_decoding_key,
+            sa_keys,
             token_map,
             server_address,
             cluster_ca_der: None,
-            webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         })
     }
 
@@ -1133,9 +1114,6 @@ impl<S: Store> AppState<S> {
     /// When `cluster_ca_der` is `Some`, the client trusts only that CA (not the system
     /// root store). This closes the SSRF/exfiltration vector where any user with webhook
     /// RBAC could route admission traffic to an arbitrary HTTPS server.
-    ///
-    /// When `webhook_identity_pem` is `Some`, the client presents an mTLS client
-    /// certificate so webhook servers can verify they are talking to the apiserver.
     ///
     /// When `konnectivity_proxy_addr` is `Some`, all requests are sent through an HTTP
     /// CONNECT proxy at that address. This is how the Mac-side apiserver reaches pod IPs
@@ -1147,7 +1125,6 @@ impl<S: Store> AppState<S> {
     /// that never make real HTTPS connections.
     fn build_webhook_client(
         cluster_ca_der: Option<&[u8]>,
-        webhook_identity_pem: Option<&[u8]>,
         konnectivity_proxy_addr: Option<&str>,
     ) -> Result<reqwest::Client, String> {
         let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
@@ -1161,17 +1138,6 @@ impl<S: Store> AppState<S> {
             let cert = reqwest::Certificate::from_der(ca_der)
                 .map_err(|e| format!("webhook client: failed to parse cluster CA DER: {e}"))?;
             builder = builder.tls_certs_only([cert]);
-        }
-
-        if let Some(identity_pem) = webhook_identity_pem {
-            match reqwest::Identity::from_pem(identity_pem) {
-                Ok(identity) => {
-                    builder = builder.identity(identity);
-                }
-                Err(e) => {
-                    tracing::error!("webhook client: failed to build mTLS identity from PEM: {e}; proceeding without client cert");
-                }
-            }
         }
 
         if let Some(addr) = konnectivity_proxy_addr {
@@ -1232,19 +1198,6 @@ impl<S: Store> AppState<S> {
             .ok()
     }
 
-    /// Present `pem` (cert + key) on admission webhook calls from now on; in-flight calls
-    /// finish on the old client.
-    pub fn set_webhook_identity(&self, pem: Vec<u8>) -> Result<(), String> {
-        let client = Self::build_webhook_client(
-            self.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-            Some(&pem),
-            self.konnectivity_proxy_addr.as_deref(),
-        )?;
-        self.webhook_client.set(client);
-        self.webhook_identity_pem.set(Some(Arc::new(pem)));
-        Ok(())
-    }
-
     /// Present `pem` (cert + key) to kubelets from now on.
     pub fn set_kubelet_identity(&self, pem: Vec<u8>) {
         self.kubelet_client.set(Self::build_kubelet_client(
@@ -1265,7 +1218,6 @@ impl<S: Store> AppState<S> {
         let registry = build_registry();
         let webhook_client = Self::build_webhook_client(
             cfg.cluster_ca_der.as_deref(),
-            cfg.webhook_identity_pem.as_deref(),
             cfg.konnectivity_proxy_addr.as_deref(),
         )
         .expect("corrupt cluster CA or invalid webhook client configuration — cannot start");
@@ -1288,8 +1240,7 @@ impl<S: Store> AppState<S> {
             resource_registry: Arc::new(registry),
             rbac_index: Arc::new(RbacIndex::new()),
             node_graph: Arc::new(NodeGraph::new()),
-            sa_key: cfg.sa_key.map(Arc::new),
-            sa_decoding_key: cfg.sa_decoding_key.map(Arc::new),
+            sa_keys: cfg.sa_keys,
             token_map: Arc::new(cfg.token_map),
             server_address: cfg.server_address,
             watch_limit: WatchLimitState::new(),
@@ -1308,11 +1259,9 @@ impl<S: Store> AppState<S> {
             service_ip_allocator: cfg.service_ip_allocator.map(Arc::new),
             continue_token_key: Arc::new(continue_token_key),
             konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,
-            webhook_identity_pem: Swap::new(cfg.webhook_identity_pem.map(Arc::new)),
             // Not part of AppStateConfig: see the field's own doc — run() sets this
             // directly after construction, same pattern as node_kubelet_ports above.
             proxy_client_identity_pem: Swap::new(None),
-            sa_public_key_pem: cfg.sa_public_key_pem.map(Arc::new),
             admission_cache: Arc::new(AdmissionConfigCache::new()),
             apiservice_cache: Arc::new(ApiServiceCache::new()),
             discovery_cache: Arc::new(DiscoveryCache::new()),
@@ -2114,6 +2063,27 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn priority_is_limited_to_kube_system_service_accounts() {
+        for u in [
+            "system:serviceaccount:kube-system:deployment-controller",
+            "system:kube-controller-manager",
+        ] {
+            assert!(
+                is_system_priority_username(u),
+                "{u} runs control-plane controllers"
+            );
+        }
+        for u in [
+            "system:serviceaccount:default:deployment-controller",
+            "system:serviceaccount:kube-system-evil:x",
+            "system:serviceaccount:kube-system",
+            "kube-system:x",
+        ] {
+            assert!(!is_system_priority_username(u), "{u} is tenant-mintable");
+        }
+    }
+
     // Regression test for the other half of the CrConversionCache memory-growth bug (the
     // namespace-cascade eviction gap has its own regression test in handlers/namespaces.rs):
     // even with every eviction call site wired correctly, a cluster whose CRs are converted
@@ -2589,7 +2559,7 @@ mod tests {
         let ca_der = cert.cert.der().to_vec();
 
         // Must succeed — if CA DER is valid, client construction returns Ok.
-        let _client = AppState::<SqliteStore>::build_webhook_client(Some(&ca_der), None, None)
+        let _client = AppState::<SqliteStore>::build_webhook_client(Some(&ca_der), None)
             .expect("valid CA DER must produce Ok client");
     }
 
@@ -2600,7 +2570,7 @@ mod tests {
     /// after the security fix is applied.
     #[test]
     fn build_webhook_client_succeeds_with_no_ca_no_identity() {
-        let _client = AppState::<SqliteStore>::build_webhook_client(None, None, None)
+        let _client = AppState::<SqliteStore>::build_webhook_client(None, None)
             .expect("no-CA no-identity must produce Ok client");
     }
 
@@ -2612,58 +2582,8 @@ mod tests {
     /// If this panics, all webhook calls fail when the proxy is configured.
     #[test]
     fn build_webhook_client_succeeds_with_konnectivity_proxy_addr() {
-        let _client =
-            AppState::<SqliteStore>::build_webhook_client(None, None, Some("127.0.0.1:8135"))
-                .expect("konnectivity proxy must produce Ok client");
-    }
-
-    /// build_webhook_client succeeds when given a valid PEM identity (cert + key).
-    ///
-    /// The production path uses the front-proxy-client cert + key. This test
-    /// verifies that a real PEM cert+key pair produced by rcgen is accepted by
-    /// reqwest::Identity::from_pem. Without mTLS identity, webhook servers cannot
-    /// verify the caller is the apiserver.
-    #[test]
-    fn build_webhook_client_succeeds_with_valid_identity_pem() {
-        use rcgen::{CertificateParams, KeyPair};
-
-        // Generate a CA.
-        let ca_key = KeyPair::generate().expect("ca key");
-        let mut ca_params = rcgen::CertificateParams::default();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "test-ca");
-        let ca_cert_der = ca_params
-            .self_signed(&ca_key)
-            .expect("self-sign CA")
-            .der()
-            .to_vec();
-        let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
-
-        // Generate a leaf cert signed by that CA.
-        let leaf_key = KeyPair::generate().expect("leaf key");
-        let mut leaf_params = CertificateParams::default();
-        leaf_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "apiserver");
-        let leaf_cert_der = leaf_params
-            .signed_by(&leaf_key, &ca_issuer)
-            .expect("sign leaf")
-            .der()
-            .to_vec();
-
-        // Build PEM identity: cert PEM + key PEM concatenated.
-        let mut identity_pem = pem_encode_cert(&leaf_cert_der);
-        identity_pem.extend_from_slice(leaf_key.serialize_pem().as_bytes());
-
-        // Must succeed: valid CA DER + valid identity PEM.
-        let _client = AppState::<SqliteStore>::build_webhook_client(
-            Some(&ca_cert_der),
-            Some(&identity_pem),
-            None,
-        )
-        .expect("valid CA DER + valid identity PEM must produce Ok client");
+        let _client = AppState::<SqliteStore>::build_webhook_client(None, Some("127.0.0.1:8135"))
+            .expect("konnectivity proxy must produce Ok client");
     }
 
     /// build_webhook_client returns Err when given invalid CA DER bytes.
@@ -2678,26 +2598,12 @@ mod tests {
     fn build_webhook_client_fails_with_invalid_ca_der() {
         // Garbage bytes are not valid DER — Certificate::from_der must return Err.
         let bad_der: &[u8] = b"this is not valid DER";
-        let result = AppState::<SqliteStore>::build_webhook_client(Some(bad_der), None, None);
+        let result = AppState::<SqliteStore>::build_webhook_client(Some(bad_der), None);
         assert!(
             result.is_err(),
             "invalid CA DER must cause Err so the server fails at startup \
              rather than falling back to the system trust store"
         );
-    }
-
-    /// Inline PEM encoder for test use — mirrors tls::pem_encode.
-    fn pem_encode_cert(der: &[u8]) -> Vec<u8> {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let encoded = b64.encode(der);
-        let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
-        for chunk in encoded.as_bytes().chunks(64) {
-            out.push_str(std::str::from_utf8(chunk).unwrap());
-            out.push('\n');
-        }
-        out.push_str("-----END CERTIFICATE-----\n");
-        out.into_bytes()
     }
 
     // ---------------------------------------------------------------------------
@@ -2709,19 +2615,16 @@ mod tests {
         let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
         AppState::new_with_config(AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: None,
-            webhook_identity_pem: None,
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         })
     }
 
@@ -2854,19 +2757,16 @@ mod tests {
         let alloc = ServiceIpAllocator::from_cidr("10.96.0.0/12").expect("valid CIDR");
         let state = AppState::new_with_config(AppStateConfig {
             store: Arc::new(store),
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_der: None,
-            webhook_identity_pem: None,
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         });
 
         let kube_dns_ip: Ipv4Addr = "10.96.0.10".parse().unwrap();
@@ -2959,7 +2859,6 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let state: AppState<SqliteStore> = AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
